@@ -849,7 +849,8 @@ impl Dataset {
         let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
-        let new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        new_schema.set_field_id(self.manifest.max_field_id());
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
@@ -1638,7 +1639,8 @@ impl Dataset {
             }
         }
 
-        let schema = self.schema().merge(output_schema.as_ref())?;
+        let mut schema = self.schema().merge(output_schema.as_ref())?;
+        schema.set_field_id(self.manifest.max_field_id());
 
         let fragments = self
             .add_columns_impl(read_columns, mapper, result_checkpoint, None)

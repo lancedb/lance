@@ -159,7 +159,9 @@ impl Updater {
             if self.write_schema.is_none() {
                 // Need to infer the schema.
                 let output_schema = batch.schema();
-                self.final_schema = Some(self.fragment.schema().merge(output_schema.as_ref())?);
+                let mut final_schema = self.fragment.schema().merge(output_schema.as_ref())?;
+                final_schema.set_field_id(self.fragment.dataset().manifest.max_field_id());
+                self.final_schema = Some(final_schema);
                 self.final_schema.as_ref().unwrap().validate()?;
                 self.write_schema = Some(
                     self.final_schema

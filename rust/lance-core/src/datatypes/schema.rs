@@ -426,8 +426,19 @@ impl Schema {
         Ok(())
     }
 
-    fn set_field_id(&mut self) {
-        let mut current_id = self.max_field_id().unwrap_or(-1) + 1;
+    /// Set the field IDs that are unspecified (that is, -1).
+    ///
+    /// If this schema is on an existing dataset, pass the result of
+    /// `Manifest::max_field_id` to `max_existing_id`. If for some reason that
+    /// id is lower than the maximum field id in this schema, the field IDs will
+    /// be reassigned starting from the maximum field id in this schema.
+    ///
+    /// If this schema is not associated with a dataset, pass `None` to
+    /// `max_existing_id`. This is the same as passing `Self::max_field_id()`.
+    pub fn set_field_id(&mut self, max_existing_id: Option<i32>) {
+        let schema_max_id = self.max_field_id().unwrap_or(-1);
+        let max_existing_id = max_existing_id.unwrap_or(-1);
+        let mut current_id = schema_max_id.max(max_existing_id) + 1;
         self.fields
             .iter_mut()
             .for_each(|f| f.set_id(-1, &mut current_id));
@@ -455,7 +466,6 @@ impl Schema {
                 location: location!(),
             })
         } else {
-            self.set_field_id();
             Ok(())
         }
     }
@@ -490,11 +500,10 @@ impl Schema {
             .chain(other.metadata.iter())
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let mut schema = Self {
+        let schema = Self {
             fields: merged_fields,
             metadata,
         };
-        schema.set_field_id();
         Ok(schema)
     }
 }
@@ -527,7 +536,7 @@ impl TryFrom<&ArrowSchema> for Schema {
                 .collect::<Result<_>>()?,
             metadata: schema.metadata.clone(),
         };
-        schema.set_field_id();
+        schema.set_field_id(None);
 
         Ok(schema)
     }
@@ -609,7 +618,8 @@ mod tests {
             ),
             ArrowField::new("c", DataType::Float64, false),
         ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.set_field_id(None);
         let projected = schema.project_by_ids(&[2, 4, 5]);
 
         let expected_arrow_schema = ArrowSchema::new(vec![
@@ -841,13 +851,23 @@ mod tests {
         // It is already assigned with field ids.
         assert_eq!(to_merged.max_field_id(), Some(1));
 
-        let merged = schema.merge(&to_merged).unwrap();
+        let mut merged = schema.merge(&to_merged).unwrap();
         assert_eq!(merged.max_field_id(), Some(7));
 
         let field = merged.field("d").unwrap();
-        assert_eq!(field.id, 6);
+        assert_eq!(field.id, -1);
         let field = merged.field("e").unwrap();
-        assert_eq!(field.id, 7);
+        assert_eq!(field.id, -1);
+
+        assert_eq!(merged.max_field_id(), Some(6));
+
+        // Need to explicitly assign field ids. Testing we can pass a larger
+        // field id to set_field_id.
+        merged.set_field_id(Some(7));
+        let field = merged.field("d").unwrap();
+        assert_eq!(field.id, 8);
+        let field = merged.field("e").unwrap();
+        assert_eq!(field.id, 9);
     }
 
     #[test]

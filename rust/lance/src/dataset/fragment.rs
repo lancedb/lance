@@ -1337,7 +1337,8 @@ mod tests {
             assert_eq!(new_fragment.files.len(), 2);
 
             // Scan again
-            let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
+            let mut full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
+            full_schema.set_field_id(None);
             let before_version = dataset.version().version;
 
             let op = Operation::Overwrite {
