@@ -56,12 +56,9 @@ use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::PQIndex;
 use crate::{dataset::ROW_ID, Dataset};
 use crate::{utils, Result};
-<<<<<<< HEAD
-=======
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 const HNSW_PARTITIONS_BUILD_PARRALLEL: usize = 16;
->>>>>>> cf9c5c5be576b99819cb316c6cce4822e9fc0dda
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(
