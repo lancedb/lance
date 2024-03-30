@@ -852,14 +852,12 @@ mod tests {
         assert_eq!(to_merged.max_field_id(), Some(1));
 
         let mut merged = schema.merge(&to_merged).unwrap();
-        assert_eq!(merged.max_field_id(), Some(7));
+        assert_eq!(merged.max_field_id(), Some(5));
 
         let field = merged.field("d").unwrap();
         assert_eq!(field.id, -1);
         let field = merged.field("e").unwrap();
         assert_eq!(field.id, -1);
-
-        assert_eq!(merged.max_field_id(), Some(6));
 
         // Need to explicitly assign field ids. Testing we can pass a larger
         // field id to set_field_id.
@@ -868,6 +866,7 @@ mod tests {
         assert_eq!(field.id, 8);
         let field = merged.field("e").unwrap();
         assert_eq!(field.id, 9);
+        assert_eq!(merged.max_field_id(), Some(9));
     }
 
     #[test]
@@ -893,7 +892,8 @@ mod tests {
             ArrowField::new("d", DataType::Int32, false),
             ArrowField::new("e", DataType::Binary, false),
         ]);
-        let merged = schema.merge(&to_merged_arrow_schema).unwrap();
+        let mut merged = schema.merge(&to_merged_arrow_schema).unwrap();
+        merged.set_field_id(None);
         assert_eq!(merged.max_field_id(), Some(7));
 
         let field = merged.field("d").unwrap();
@@ -965,7 +965,8 @@ mod tests {
             .id = 4;
         expected_schema.fields[0].child_mut("f2").unwrap().id = 3;
 
-        let result = schema1.merge(&schema2).unwrap();
+        let mut result = schema1.merge(&schema2).unwrap();
+        result.set_field_id(None);
         assert_eq!(result, expected_schema);
     }
 
