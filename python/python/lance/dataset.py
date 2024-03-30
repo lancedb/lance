@@ -1282,11 +1282,11 @@ class LanceDataset(pa.dataset.Dataset):
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
 
-        If ``index_type`` is "DISKANN", then the following parameters are optional:
-
-        - **r**: out-degree bound
-        - **l**: number of levels in the graph.
-        - **alpha**: distance threshold for the graph.
+        Optional parameters for "IVF_HNSW_PQ":
+        - **max_level**: the maximum number of levels in the graph.
+        - **m**: the number of edges per node in the graph.
+        - **m_max**: the maximum number of edges per node in the graph.
+        - **ef_construction**: the number of nodes to examine during the construction.
 
         Examples
         --------
@@ -1369,12 +1369,13 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        if index_type not in ["IVF_PQ", "DISKANN"]:
+        if index_type not in ["IVF_PQ", "IVF_HNSW_PQ"]:
             raise NotImplementedError(
-                f"Only IVF_PQ or DiskANN index_types supported. Got {index_type}"
+                f"Only [IVF_PQ, IVF_HNSW_PQ] index types supported. "
+                f"Got {index_type}"
             )
-        if index_type == "IVF_PQ":
-            if num_partitions is None or num_sub_vectors is None:
+        if index_type.startswith("IVF"):
+            if num_partitions is None:
                 raise ValueError(
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
                 )
@@ -1386,7 +1387,6 @@ class LanceDataset(pa.dataset.Dataset):
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
             kwargs["num_partitions"] = num_partitions
-            kwargs["num_sub_vectors"] = num_sub_vectors
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids
@@ -1432,6 +1432,13 @@ class LanceDataset(pa.dataset.Dataset):
                     [ivf_centroids], ["_ivf_centroids"]
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
+
+        if "PQ" in index_type:
+            if num_sub_vectors is None:
+                raise ValueError(
+                    "num_partitions and num_sub_vectors are required for IVF_PQ"
+                )
+            kwargs["num_sub_vectors"] = num_sub_vectors
 
             if pq_codebook is not None:
                 # User provided IVF centroids
