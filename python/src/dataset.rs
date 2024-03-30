@@ -889,7 +889,24 @@ impl Dataset {
         let params: Box<dyn IndexParams> = if index_type == "BTREE" {
             Box::<ScalarIndexParams>::default()
         } else {
-            let mut m_type = MetricType::L2;
+            Self::prepare_vector_index_params(&index_type, kwargs)
+        };
+
+        let replace = replace.unwrap_or(true);
+
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(
+            None,
+            new_self.create_index(&columns, idx_type, name, params.as_ref(), replace),
+        )?
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+
+        Ok(())
+    }
+
+    fn prepare_vector_index_params(index_type: &str, kwargs: Option<&PyDict>) -> Result<Box<dyn IndexParams>> {
+        let mut m_type = MetricType::L2;
             let mut ivf_params = IvfBuildParams::default();
             let mut pq_params = PQBuildParams::default();
             let mut hnsw_params = HnswBuildParams::default();
@@ -1016,19 +1033,6 @@ impl Dataset {
                     )))
                 }
             }
-        };
-
-        let replace = replace.unwrap_or(true);
-
-        let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(
-            None,
-            new_self.create_index(&columns, idx_type, name, params.as_ref(), replace),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = Arc::new(new_self);
-
-        Ok(())
     }
 
     fn count_fragments(&self) -> usize {

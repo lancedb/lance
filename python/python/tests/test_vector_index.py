@@ -352,7 +352,7 @@ def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
         num_partitions=4,
         num_sub_vectors=16,
     )
-    assert ann_ds.has_index
+    assert ann_ds.list_indices()[0]["index_type"] == "IVF_HNSW_PQ"
 
 
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
