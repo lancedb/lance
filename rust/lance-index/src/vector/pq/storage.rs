@@ -144,6 +144,10 @@ impl IvfProductQuantizationStorage {
         &self.metadata
     }
 
+    pub fn codebooks(&self) -> &Arc<Float32Array> {
+        &self.codebook
+    }
+
     pub async fn load_partition(&self, part_id: usize) -> Result<ProductQuantizationStorage> {
         let range = self.ivf.row_range(part_id);
         ProductQuantizationStorage::load_partition(

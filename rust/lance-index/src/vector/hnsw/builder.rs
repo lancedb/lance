@@ -20,6 +20,7 @@ use std::sync::Arc;
 use lance_core::Result;
 use log::{info, log_enabled, Level::Info};
 use rand::{thread_rng, Rng};
+use serde::{Deserialize, Serialize};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, select_neighbors_heuristic, HNSW};
@@ -29,7 +30,7 @@ use crate::vector::hnsw::HnswLevel;
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
 /// Parameters of building HNSW index
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswBuildParams {
     /// max level of
     pub max_level: u16,
@@ -277,9 +278,9 @@ impl HNSWBuilder {
             .collect::<Result<Vec<_>>>()?;
         Ok(HNSW::from_builder(
             graphs,
-            self.entry_point,
             self.vectors.metric_type(),
-            self.params.use_select_heuristic,
+            self.entry_point,
+            self.params.clone(),
         ))
     }
 }

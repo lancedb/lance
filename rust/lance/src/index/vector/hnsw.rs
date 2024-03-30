@@ -101,6 +101,10 @@ impl HNSWIndex {
         &self.partition_storage
     }
 
+    pub fn metadata(&self) -> HnswMetadata {
+        self.partition_metadata.as_ref().unwrap()[0].clone()
+    }
+
     fn get_partition_metadata(&self, partition_id: usize) -> Result<HnswMetadata> {
         match self.partition_metadata {
             Some(ref metadata) => Ok(metadata[partition_id].clone()),

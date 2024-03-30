@@ -53,7 +53,7 @@ use lance_index::{
         },
         pq::{
             storage::{ProductQuantizationMetadata, PQ_METADTA_KEY},
-            PQBuildParams, ProductQuantizer,
+            PQBuildParams, ProductQuantizer, ProductQuantizerImpl,
         },
         Query, DIST_COL, PQ_CODE_COLUMN,
     },
@@ -72,6 +72,7 @@ use lance_linalg::{
     distance::{Cosine, DistanceType, Dot, MetricType, L2},
     MatrixView,
 };
+use lance_table::io::manifest::ManifestDescribing;
 use log::{debug, info};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -81,6 +82,8 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
+
+use self::{builder::build_hnsw_partitions, io::write_hnsw_index_partitions};
 
 use super::{
     pq::{build_pq_model, PQIndex},
@@ -249,9 +252,7 @@ impl std::fmt::Debug for IVFIndex {
 ///
 /// Returns (new_uuid, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
-    object_store: &ObjectStore,
-    index_dir: &Path,
-    dataset_version: u64,
+    dataset: &Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
@@ -266,8 +267,12 @@ pub(crate) async fn optimize_vector_indices(
     }
 
     let new_uuid = Uuid::new_v4();
-    let index_file = index_dir.child(new_uuid.to_string()).child(INDEX_FILE_NAME);
-    let mut writer = object_store.create(&index_file).await?;
+    let object_store = dataset.object_store();
+    let index_file = dataset
+        .indices_dir()
+        .child(new_uuid.to_string())
+        .child(INDEX_FILE_NAME);
+    let writer = object_store.create(&index_file).await?;
 
     let first_idx = existing_indices[0]
         .as_any()
@@ -277,7 +282,7 @@ pub(crate) async fn optimize_vector_indices(
             location: location!(),
         })?;
 
-    let merged = if let Some(pq_index) = first_idx.as_any().downcast_ref::<PQIndex>() {
+    let merged = if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
         optimize_ivf_pq_indices(
             first_idx,
             pq_index,
@@ -286,11 +291,17 @@ pub(crate) async fn optimize_vector_indices(
             existing_indices,
             options,
             writer,
-            dataset_version,
+            dataset.version().version,
         )
         .await?
-    } else if let Some(hnsw_index) = first_idx.as_any().downcast_ref::<HNSWIndex>() {
+    } else if let Some(hnsw_index) = first_idx.sub_index.as_any().downcast_ref::<HNSWIndex>() {
+        let aux_file = dataset
+            .indices_dir()
+            .child(new_uuid.to_string())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        let aux_writer = object_store.create(&aux_file).await?;
         optimize_ivf_hnsw_indices(
+            dataset,
             first_idx,
             hnsw_index,
             vector_column,
@@ -298,7 +309,7 @@ pub(crate) async fn optimize_vector_indices(
             existing_indices,
             options,
             writer,
-            dataset_version,
+            aux_writer,
         )
         .await?
     } else {
@@ -394,6 +405,7 @@ async fn optimize_ivf_pq_indices(
 }
 
 async fn optimize_ivf_hnsw_indices(
+    dataset: &Dataset,
     first_idx: &IVFIndex,
     hnsw_index: &HNSWIndex,
     vector_column: &str,
@@ -401,10 +413,21 @@ async fn optimize_ivf_hnsw_indices(
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
     mut writer: ObjectWriter,
-    dataset_version: u64,
+    mut aux_writer: ObjectWriter,
 ) -> Result<usize> {
     let metric_type = first_idx.metric_type;
     let dim = first_idx.ivf.dimension();
+
+    let pq_storage = hnsw_index.storage();
+    let pq_metadata = pq_storage.metadata();
+    let pq = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
+        pq_metadata.num_sub_vectors,
+        pq_metadata.num_bits,
+        pq_metadata.dimension,
+        pq_storage.codebooks().clone(),
+        metric_type,
+    ));
+    let pq_index = PQIndex::new(pq.clone(), metric_type);
 
     // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
     let ivf = lance_index::vector::ivf::new_ivf_with_pq(
@@ -453,24 +476,103 @@ async fn optimize_ivf_hnsw_indices(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    write_pq_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
-    let metadata = IvfPQIndexMetadata {
-        name: format!("_{}_idx", vector_column),
-        column: vector_column.to_string(),
-        dimension: dim as u32,
-        dataset_version,
-        metric_type,
-        ivf: ivf_mut,
-        pq: pq_index.pq.clone(),
-        transforms: vec![],
-    };
 
-    let metadata = pb::Index::try_from(&metadata)?;
-    let pos = writer.write_protobuf(&metadata).await?;
-    // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
-    // change it to latest version value after refactoring the IVF_PQ
-    writer.write_magics(pos, 0, 1, MAGIC).await?;
-    writer.shutdown().await?;
+    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
+    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let mut writer =
+        FileWriter::<ManifestDescribing>::with_object_writer(writer, schema, &Default::default())?;
+    writer.add_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        json!(IndexMetadata {
+            index_type: "IVF_HNSW_PQ".to_string(),
+            distance_type: metric_type.to_string(),
+        })
+        .to_string()
+        .as_str(),
+    );
+
+    let schema = Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        arrow_schema::Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
+                pq.num_sub_vectors() as i32,
+            ),
+            false,
+        ),
+    ]);
+    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let mut aux_writer = FileWriter::<ManifestDescribing>::with_object_writer(
+        aux_writer,
+        schema,
+        &Default::default(),
+    )?;
+    aux_writer.add_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        json!(IndexMetadata {
+            index_type: "PQ".to_string(),
+            distance_type: metric_type.to_string(),
+        })
+        .to_string()
+        .as_str(),
+    );
+    let mat = MatrixView::<Float32Type>::new(
+        Arc::new(
+            pq.codebook_as_fsl()
+                .values()
+                .as_primitive::<Float32Type>()
+                .clone(),
+        ),
+        pq.dimension(),
+    );
+    let codebook_tensor = pb::Tensor::from(&mat);
+    let codebook_pos = aux_writer.tell().await?;
+    aux_writer
+        .object_writer
+        .write_protobuf(&codebook_tensor)
+        .await?;
+    aux_writer.add_metadata(
+        PQ_METADTA_KEY,
+        json!(ProductQuantizationMetadata {
+            codebook_position: codebook_pos,
+            num_bits: pq.num_bits(),
+            num_sub_vectors: pq.num_sub_vectors(),
+            dimension: pq.dimension(),
+        })
+        .to_string()
+        .as_str(),
+    );
+
+    let (hnsw_metadata, aux_ivf) = write_hnsw_index_partitions(
+        dataset,
+        vector_column,
+        metric_type,
+        &hnsw_index.metadata().params,
+        &mut writer,
+        Some(&mut aux_writer),
+        &mut ivf_mut,
+        pq,
+        shuffled,
+        Some(&indices_to_merge),
+    )
+    .await?;
+
+    // Add the metadata of HNSW partitions
+    let hnsw_metadata_json = json!(hnsw_metadata);
+    writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
+
+    // Convert ['Ivf'] to [`IvfData`] for new index format
+    let mut ivf_data = IvfData::with_centroids(ivf_mut.centroids.clone());
+    for length in ivf_mut.lengths {
+        ivf_data.add_partition(length);
+    }
+    ivf_data.write(&mut writer).await?;
+    writer.finish().await?;
+
+    // Write the aux file
+    aux_ivf.write(&mut aux_writer).await?;
+    aux_writer.finish().await?;
 
     Ok(existing_indices.len() - start_pos)
 }
@@ -1333,7 +1435,7 @@ async fn write_ivf_hnsw_file(
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: "IVF_HNSW".to_string(),
+            index_type: "IVF_HNSW_PQ".to_string(),
             distance_type: distance_type.to_string(),
         })
         .to_string()

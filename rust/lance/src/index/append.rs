@@ -125,16 +125,8 @@ pub async fn merge_indices<'a>(
                 Some(scanner.try_into_stream().await?)
             };
 
-            optimize_vector_indices(
-                &dataset.object_store,
-                &dataset.indices_dir(),
-                dataset.version().version,
-                new_data_stream,
-                &column.name,
-                &indices,
-                options,
-            )
-            .await
+            optimize_vector_indices(&dataset, new_data_stream, &column.name, &indices, options)
+                .await
         }
     }?;
 
