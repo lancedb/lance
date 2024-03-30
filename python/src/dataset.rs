@@ -889,7 +889,7 @@ impl Dataset {
         let params: Box<dyn IndexParams> = if index_type == "BTREE" {
             Box::<ScalarIndexParams>::default()
         } else {
-            Self::prepare_vector_index_params(&index_type, kwargs)
+            Self::prepare_vector_index_params(&index_type, kwargs)?
         };
 
         let replace = replace.unwrap_or(true);
