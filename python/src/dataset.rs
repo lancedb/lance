@@ -1250,11 +1250,9 @@ fn prepare_vector_index_params(
             pq_params,
         ))),
 
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "Index type '{index_type}' is not supported."
-            )))
-        }
+        _ => Err(PyValueError::new_err(format!(
+            "Index type '{index_type}' is not supported."
+        ))),
     }
 }
 
