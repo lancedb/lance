@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::str;
 use std::sync::Arc;
 
@@ -271,6 +272,7 @@ impl Dataset {
         index_cache_size: Option<usize>,
         metadata_cache_size: Option<usize>,
         commit_handler: Option<PyObject>,
+        storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams {
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
@@ -286,21 +288,23 @@ impl Dataset {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
         }
-        let dataset = if let Some(ver) = version {
-            RT.runtime
-                .block_on(LanceDataset::checkout_with_params(&uri, ver, &params))
-        } else {
-            RT.runtime.block_on(
-                DatasetBuilder::from_uri(&uri)
-                    .with_read_params(params)
-                    .load(),
-            )
-        };
+
+        let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
+        if let Some(ver) = version {
+            builder = builder.with_version(ver);
+        }
+        if let Some(storage_options) = storage_options {
+            builder = builder.with_storage_options(storage_options);
+        }
+
+        let dataset = RT.runtime.block_on(builder.load());
+
         match dataset {
             Ok(ds) => Ok(Self {
                 uri,
                 ds: Arc::new(ds),
             }),
+            // TODO: return an appropriate error type, such as IOError or NotFound.
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
     }
@@ -1146,24 +1150,26 @@ impl Dataset {
 }
 
 #[pyfunction(name = "_write_dataset")]
-pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<bool> {
+pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
-    if reader.is_instance_of::<Scanner>() {
+    let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let batches = RT
             .block_on(Some(py), scanner.to_reader())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
-    }
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+    };
+    Ok(Dataset {
+        uri,
+        ds: Arc::new(ds),
+    })
 }
 
 fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
@@ -1207,6 +1213,16 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(progress) = options.get_item("progress")? {
             if !progress.is_none() {
                 p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
+            }
+        }
+
+        if let Some(storage_options) = options.get_item("storage_options")? {
+            let storage_options = storage_options.extract::<Option<HashMap<String, String>>>()?;
+            if let Some(storage_options) = storage_options {
+                p.store_params = Some(ObjectStoreParams {
+                    storage_options: Some(storage_options),
+                    ..Default::default()
+                });
             }
         }
 
