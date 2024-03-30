@@ -905,40 +905,43 @@ impl Dataset {
         Ok(())
     }
 
-    fn prepare_vector_index_params(index_type: &str, kwargs: Option<&PyDict>) -> Result<Box<dyn IndexParams>> {
+    fn prepare_vector_index_params(
+        index_type: &str,
+        kwargs: Option<&PyDict>,
+    ) -> Result<Box<dyn IndexParams>> {
         let mut m_type = MetricType::L2;
-            let mut ivf_params = IvfBuildParams::default();
-            let mut pq_params = PQBuildParams::default();
-            let mut hnsw_params = HnswBuildParams::default();
+        let mut ivf_params = IvfBuildParams::default();
+        let mut pq_params = PQBuildParams::default();
+        let mut hnsw_params = HnswBuildParams::default();
 
-            if let Some(kwargs) = kwargs {
-                // Parse metric type
-                if let Some(mt) = kwargs.get_item("metric_type")? {
-                    m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
-                        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        if let Some(kwargs) = kwargs {
+            // Parse metric type
+            if let Some(mt) = kwargs.get_item("metric_type")? {
+                m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+
+            // Parse IVF params
+            if let Some(n) = kwargs.get_item("num_partitions")? {
+                ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
+            };
+
+            if let Some(c) = kwargs.get_item("ivf_centroids")? {
+                let batch = RecordBatch::from_pyarrow(c)?;
+                if "_ivf_centroids" != batch.schema().field(0).name() {
+                    return Err(PyValueError::new_err(
+                        "Expected '_ivf_centroids' as the first column name.",
+                    ));
                 }
+                let centroids = as_fixed_size_list_array(batch.column(0));
+                ivf_params.centroids = Some(Arc::new(centroids.clone()))
+            };
 
-                // Parse IVF params
-                if let Some(n) = kwargs.get_item("num_partitions")? {
-                    ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
-                };
+            if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
+                ivf_params.precomputed_partitons_file = Some(f.to_string());
+            };
 
-                if let Some(c) = kwargs.get_item("ivf_centroids")? {
-                    let batch = RecordBatch::from_pyarrow(c)?;
-                    if "_ivf_centroids" != batch.schema().field(0).name() {
-                        return Err(PyValueError::new_err(
-                            "Expected '_ivf_centroids' as the first column name.",
-                        ));
-                    }
-                    let centroids = as_fixed_size_list_array(batch.column(0));
-                    ivf_params.centroids = Some(Arc::new(centroids.clone()))
-                };
-
-                if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
-                    ivf_params.precomputed_partitons_file = Some(f.to_string());
-                };
-
-                match (
+            match (
                     kwargs.get_item("precomputed_shuffle_buffers")?,
                     kwargs.get_item("precomputed_shuffle_buffers_path")?
                 ) {
@@ -963,76 +966,76 @@ impl Dataset {
                     }
                 }
 
-                // Parse PQ params
-                if let Some(n) = kwargs.get_item("num_bits")? {
-                    pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
-                };
+            // Parse PQ params
+            if let Some(n) = kwargs.get_item("num_bits")? {
+                pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
+            };
 
-                if let Some(n) = kwargs.get_item("num_sub_vectors")? {
-                    pq_params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
-                };
+            if let Some(n) = kwargs.get_item("num_sub_vectors")? {
+                pq_params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
+            };
 
-                if let Some(o) = kwargs.get_item("use_opq")? {
-                    #[cfg(not(feature = "opq"))]
-                    if PyAny::downcast::<PyBool>(o)?.extract()? {
-                        return Err(PyValueError::new_err(
-                            "Feature 'opq' is not installed.".to_string(),
-                        ));
-                    }
-                    pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
-                };
-
-                if let Some(c) = kwargs.get_item("pq_codebook")? {
-                    let batch = RecordBatch::from_pyarrow(c)?;
-                    if "_pq_codebook" != batch.schema().field(0).name() {
-                        return Err(PyValueError::new_err(
-                            "Expected '_pq_codebook' as the first column name.",
-                        ));
-                    }
-                    let codebook = as_fixed_size_list_array(batch.column(0));
-                    pq_params.codebook = Some(codebook.values().clone())
-                };
-
-                if let Some(o) = kwargs.get_item("max_opq_iterations")? {
-                    pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
-                };
-
-                // Parse HNSW params
-                if let Some(max_level) = kwargs.get_item("max_level")? {
-                    hnsw_params.max_level = PyAny::downcast::<PyInt>(max_level)?.extract()?;
+            if let Some(o) = kwargs.get_item("use_opq")? {
+                #[cfg(not(feature = "opq"))]
+                if PyAny::downcast::<PyBool>(o)?.extract()? {
+                    return Err(PyValueError::new_err(
+                        "Feature 'opq' is not installed.".to_string(),
+                    ));
                 }
+                pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
+            };
 
-                if let Some(m) = kwargs.get_item("m")? {
-                    hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
+            if let Some(c) = kwargs.get_item("pq_codebook")? {
+                let batch = RecordBatch::from_pyarrow(c)?;
+                if "_pq_codebook" != batch.schema().field(0).name() {
+                    return Err(PyValueError::new_err(
+                        "Expected '_pq_codebook' as the first column name.",
+                    ));
                 }
+                let codebook = as_fixed_size_list_array(batch.column(0));
+                pq_params.codebook = Some(codebook.values().clone())
+            };
 
-                if let Some(m_max) = kwargs.get_item("m_max")? {
-                    hnsw_params.m_max = PyAny::downcast::<PyInt>(m_max)?.extract()?;
-                }
+            if let Some(o) = kwargs.get_item("max_opq_iterations")? {
+                pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
+            };
 
-                if let Some(ef_c) = kwargs.get_item("ef_construction")? {
-                    hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
-                }
+            // Parse HNSW params
+            if let Some(max_level) = kwargs.get_item("max_level")? {
+                hnsw_params.max_level = PyAny::downcast::<PyInt>(max_level)?.extract()?;
             }
 
-            match index_type.as_str() {
-                "IVF_PQ" => Box::new(VectorIndexParams::with_ivf_pq_params(
-                    m_type, ivf_params, pq_params,
-                )),
-
-                "IVF_HNSW_PQ" => Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
-                    m_type,
-                    ivf_params,
-                    hnsw_params,
-                    pq_params,
-                )),
-
-                _ => {
-                    return Err(PyValueError::new_err(format!(
-                        "Index type '{index_type}' is not supported."
-                    )))
-                }
+            if let Some(m) = kwargs.get_item("m")? {
+                hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
             }
+
+            if let Some(m_max) = kwargs.get_item("m_max")? {
+                hnsw_params.m_max = PyAny::downcast::<PyInt>(m_max)?.extract()?;
+            }
+
+            if let Some(ef_c) = kwargs.get_item("ef_construction")? {
+                hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
+            }
+        }
+
+        match index_type.as_str() {
+            "IVF_PQ" => Box::new(VectorIndexParams::with_ivf_pq_params(
+                m_type, ivf_params, pq_params,
+            )),
+
+            "IVF_HNSW_PQ" => Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
+                m_type,
+                ivf_params,
+                hnsw_params,
+                pq_params,
+            )),
+
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Index type '{index_type}' is not supported."
+                )))
+            }
+        }
     }
 
     fn count_fragments(&self) -> usize {
