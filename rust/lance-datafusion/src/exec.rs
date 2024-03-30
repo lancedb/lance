@@ -23,7 +23,7 @@ use datafusion::{
     execution::{
         context::{SessionConfig, SessionContext, SessionState},
         disk_manager::DiskManagerConfig,
-        memory_pool::GreedyMemoryPool,
+        memory_pool::FairSpillPool,
         runtime_env::{RuntimeConfig, RuntimeEnv},
         TaskContext,
     },
@@ -175,9 +175,8 @@ pub fn execute_plan(
     let mut runtime_config = RuntimeConfig::new();
     if options.use_spilling {
         runtime_config.disk_manager = DiskManagerConfig::NewOs;
-        runtime_config.memory_pool = Some(Arc::new(GreedyMemoryPool::new(
-            options.mem_pool_size as usize,
-        )));
+        runtime_config.memory_pool =
+            Some(Arc::new(FairSpillPool::new(options.mem_pool_size as usize)));
     }
     let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
     let session_state = SessionState::new_with_config_rt(session_config, runtime_env);

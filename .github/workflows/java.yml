@@ -35,7 +35,7 @@ jobs:
           workspaces: java/java-jni
       - name: Run cargo fmt
         run: cargo fmt --check
-        working-directory: ./java/lance-jni
+        working-directory: ./java/core/lance-jni
       - name: Install dependencies
         run: |
           sudo apt update
@@ -56,7 +56,7 @@ jobs:
       - name: Java Style Check
         run: mvn checkstyle:check
       - name: Rust Clippy
-        working-directory: java/lance-jni
+        working-directory: java/core/lance-jni
         run: cargo clippy --all-targets -- -D warnings
       - name: Build with Maven with Java 11
         run: mvn package -DskipTests=true

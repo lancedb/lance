@@ -59,7 +59,7 @@ impl Default for HnswBuildParams {
             max_level: 7,
             m: 20,
             m_max: 30,
-            ef_construction: 25,
+            ef_construction: 100,
             extend_candidates: false,
             log_base: 10.0,
             use_select_heuristic: true,

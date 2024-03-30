@@ -39,7 +39,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
-use self::hnsw::HNSWIndex;
+use self::hnsw::{HNSWIndex, HNSWIndexOptions};
 use self::{
     ivf::{build_ivf_hnsw_index, build_ivf_pq_index, remap_index_file, IVFIndex},
     pq::PQIndex,
@@ -410,10 +410,12 @@ pub(crate) async fn open_vector_index_v2(
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW" => {
             let ivf_data = IvfData::load(&reader).await?;
+            let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::try_new(
                 HNSW::empty(),
                 reader.object_reader.clone(),
                 aux_reader.into(),
+                options,
             )
             .await?;
             let pb_ivf = pb::Ivf::try_from(&ivf_data)?;
@@ -436,6 +438,11 @@ pub(crate) async fn open_vector_index_v2(
             })
         }
     };
+
+    dataset
+        .session
+        .index_cache
+        .insert_vector(uuid, index.clone());
 
     Ok(index)
 }

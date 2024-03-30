@@ -131,7 +131,7 @@ It can also be created by calling :func:`lance.arrow.ImageArray.from_array` and 
 it an array of encoded images already read into :class:`pyarrow.BinaryArray` or by
 calling :func:`lance.arrow.ImageTensorArray.to_encoded`.
 
-A :func:`lance.arrow.EncodedImageArray.image_to_tensor` method is provided to decode
+A :func:`lance.arrow.EncodedImageArray.to_tensor` method is provided to decode
 encoded images and return them as :class:`lance.arrow.FixedShapeImageTensorArray`, from
 which they can be converted to numpy arrays or TensorFlow tensors.
 For decoding images, it will first attempt to use a decoder provided via the optional
@@ -145,7 +145,7 @@ order. If neither library or custom decoder is available an exception will be ra
 
     uris = [os.path.join(os.path.dirname(__file__), "images/1.png")]
     encoded_images = ImageURIArray.from_uris(uris).read_uris()
-    print(encoded_images.image_to_tensor())
+    print(encoded_images.to_tensor())
 
     def tensorflow_decoder(images):
         import tensorflow as tf
@@ -153,7 +153,7 @@ order. If neither library or custom decoder is available an exception will be ra
 
         return np.stack(tf.io.decode_png(img.as_py(), channels=3) for img in images.storage)
 
-    print(encoded_images.image_to_tensor(tensorflow_decoder))
+    print(encoded_images.to_tensor(tensorflow_decoder))
 
 .. testoutput::
 
@@ -173,7 +173,7 @@ each pixel is represented by three values (channels) as per
 Images from this array can be read out as numpy arrays individually or stacked together
 into a single 4 dimensional numpy array shaped (batch_size, height, width, channels).
 
-It can be created by calling :func:`lance.arrow.EncodedImageArray.image_to_tensor` on a
+It can be created by calling :func:`lance.arrow.EncodedImageArray.to_tensor` on a
 previously existing :class:`lance.arrow.EncodedImageArray`. This will decode encoded
 images and return them as a :class:`lance.arrow.FixedShapeImageTensorArray`. It can also be
 created by calling :func:`lance.arrow.ImageArray.from_array` and passing in a
@@ -198,7 +198,7 @@ encode to PNG. If neither library is available it will raise an exception.
         return pa.array(encoded_images, type=pa.binary())
 
     uris = [os.path.join(os.path.dirname(__file__), "images/1.png")]
-    tensor_images = ImageURIArray.from_uris(uris).read_uris().image_to_tensor()
+    tensor_images = ImageURIArray.from_uris(uris).read_uris().to_tensor()
     print(tensor_images.to_encoded())
     print(tensor_images.to_encoded(jpeg_encoder))
 

@@ -136,6 +136,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         arm-build: "true"
+        manylinux: "2_24"
     - uses: ./.github/workflows/run_tests
     # Make sure wheels are not included in the Rust cache
     - name: Delete wheels

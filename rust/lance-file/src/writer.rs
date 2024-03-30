@@ -146,11 +146,20 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         })
     }
 
+    /// Return the schema of the file writer.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     /// Write a [RecordBatch] to the open file.
     /// All RecordBatch will be treated as one RecordBatch on disk
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+
         for batch in batches {
             // Compare, ignore metadata and dictionary
             //   dictionary should have been checked earlier and could be an expensive check
