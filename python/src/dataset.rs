@@ -908,7 +908,7 @@ impl Dataset {
     fn prepare_vector_index_params(
         index_type: &str,
         kwargs: Option<&PyDict>,
-    ) -> Result<Box<dyn IndexParams>> {
+    ) -> PyResult<Box<dyn IndexParams>> {
         let mut m_type = MetricType::L2;
         let mut ivf_params = IvfBuildParams::default();
         let mut pq_params = PQBuildParams::default();
@@ -1018,7 +1018,7 @@ impl Dataset {
             }
         }
 
-        match index_type.as_str() {
+        match index_type {
             "IVF_PQ" => Box::new(VectorIndexParams::with_ivf_pq_params(
                 m_type, ivf_params, pq_params,
             )),
