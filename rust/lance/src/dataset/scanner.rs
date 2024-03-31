@@ -962,11 +962,6 @@ impl Scanner {
             plan = Arc::new(ProjectionExec::try_new(plan, physical_schema)?);
         }
 
-        println!(
-            "Execution plan before optimization: {}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(true),
-        );
-
         // Stage 7: final projection
         plan = Arc::new(DFProjectionExec::try_new(self.output_expr()?, plan)?);
 
@@ -975,10 +970,6 @@ impl Scanner {
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
-        println!(
-            "Execution plan AFTER optimization: {}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(true),
-        );
 
         debug!("Execution plan:\n{:?}", plan);
 
@@ -989,34 +980,31 @@ impl Scanner {
     async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::IO {
-                message: "No nearest query".to_string(),
+                message: "KNN: no nearest query".to_string(),
                 location: location!(),
             });
         };
 
         // Santity check
         let schema = self.dataset.schema();
-        if let Some(field) = schema.field(&q.column) {
-            match field.data_type() {
-                DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
-                _ => {
-                    return Err(Error::IO {
-                        message: format!(
-                            "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
-                            q.column, field.data_type(),
-                        ),
-                        location: location!(),
-                    });
-                }
-            }
-        } else {
+        let Some(field) = schema.field(&q.column) else {
             return Err(Error::IO {
                 message: format!("Vector search error: column {} not found", q.column),
                 location: location!(),
             });
+        };
+        if !matches!(field.data_type(), DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating())
+        {
+            return Err(Error::IO {
+                message: format!(
+                    "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
+                    q.column, field.data_type(),
+                ),
+                location: location!(),
+            });
         }
 
-        let column_id = self.dataset.schema().field_id(q.column.as_str())?;
+        let column_id = field.id;
         let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
         let indices = if use_index {
             self.dataset.load_indices().await?
@@ -1051,7 +1039,8 @@ impl Scanner {
                 self.flat_knn(knn_node_with_vector, &q)?
             } else {
                 ann_node
-            }; // vector, _distance, _rowid
+            }; // vector*, _distance, _rowid
+            println!("ANN node schema: {:?}", knn_node.schema());
 
             knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
 
@@ -1082,7 +1071,7 @@ impl Scanner {
     /// Combine ANN results with KNN results for data appended after index creation
     async fn knn_combined(
         &self,
-        q: &&Query,
+        q: &Query,
         index: &Index,
         knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &FilterPlan,
@@ -1121,7 +1110,7 @@ impl Scanner {
             let topk_appended = self.flat_knn(scan_node, q)?;
 
             // To do a union, we need to make the schemas match. Right now
-            // knn_node: _distance, _rowid, vector
+            // knn_node: _distance, _rowid, vector*
             // topk_appended: vector, <filter columns?>, _rowid, _distance
             let new_schema = Schema::try_from(
                 &topk_appended
@@ -1131,6 +1120,7 @@ impl Scanner {
             )?;
             let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
             assert_eq!(topk_appended.schema(), knn_node.schema());
+
             // union
             let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
             // Enforce only 1 partition.
@@ -1138,10 +1128,18 @@ impl Scanner {
                 Arc::new(unioned),
                 datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
             )?;
-            // then we do a flat search on KNN(new data) + ANN(indexed data)
-            return self.flat_knn(Arc::new(unioned), q);
-        }
 
+            let sort_expr = PhysicalSortExpr {
+                expr: expressions::col(DIST_COL, unioned.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            };
+            return Ok(Arc::new(
+                SortExec::new(vec![sort_expr], Arc::new(unioned)).with_fetch(Some(q.k)),
+            ));
+        }
         Ok(knn_node)
     }
 
