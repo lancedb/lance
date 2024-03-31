@@ -206,11 +206,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_f32_sq8() {
-        let dim = 16;
         let mut sq: ScalarQuantizerImpl<Float32Type> = ScalarQuantizerImpl::new(8, MetricType::L2);
         let float_values = Vec::from_iter((0..16).map(|v| v as f32));
         let float_array = Float32Array::from_iter_values(float_values.clone());
-        let vectors = FixedSizeListArray::try_new_from_values(float_array, dim as i32).unwrap();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(float_array, float_values.len() as i32)
+                .unwrap();
 
         sq.update_bounds(&vectors).unwrap();
         assert_eq!(sq.lower_bound, float_values[0]);
@@ -231,11 +232,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_f64_sq8() {
-        let dim = 16;
         let mut sq: ScalarQuantizerImpl<Float64Type> = ScalarQuantizerImpl::new(8, MetricType::L2);
         let float_values = Vec::from_iter((0..16).map(|v| v as f64));
         let float_array = Float64Array::from_iter_values(float_values.clone());
-        let vectors = FixedSizeListArray::try_new_from_values(float_array, dim as i32).unwrap();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(float_array, float_values.len() as i32)
+                .unwrap();
 
         sq.update_bounds(&vectors).unwrap();
         assert_eq!(sq.lower_bound, float_values[0]);
