@@ -163,10 +163,11 @@ impl VectorIndex for HNSWIndex {
             )
         };
 
-        let ef = query.k + query.k / 2;
+        let k = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let ef = k + k / 2;
         let results = self.hnsw.search(
             query.key.as_primitive::<Float32Type>().as_slice(),
-            query.k,
+            k,
             ef,
             bitmap,
         )?;
