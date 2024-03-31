@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
@@ -59,8 +59,7 @@ pub struct ScalarQuantizerImpl<T: ArrowFloatType + Dot + L2> {
     /// Distance type.
     pub metric_type: MetricType,
 
-    pub lower_bound: T::Native,
-    pub upper_bound: T::Native,
+    pub bounds: Range<T::Native>,
 }
 
 impl<T: ArrowFloatType + Dot + L2> ScalarQuantizerImpl<T> {
@@ -68,26 +67,20 @@ impl<T: ArrowFloatType + Dot + L2> ScalarQuantizerImpl<T> {
         Self {
             num_bits,
             metric_type,
-            lower_bound: T::MAX,
-            upper_bound: T::MIN,
+            bounds: Range::<T::Native> {
+                start: T::MAX,
+                end: T::MIN,
+            },
         }
     }
 
-    pub fn with_bounds(
-        num_bits: u16,
-        metric_type: MetricType,
-        bounds: (T::Native, T::Native),
-    ) -> Self {
+    pub fn with_bounds(num_bits: u16, metric_type: MetricType, bounds: Range<T::Native>) -> Self {
         let mut sq = Self::new(num_bits, metric_type);
-        sq.lower_bound = bounds.0;
-        sq.upper_bound = bounds.1;
+        sq.bounds = bounds;
         sq
     }
 
-    pub fn update_bounds(
-        &mut self,
-        vectors: &FixedSizeListArray,
-    ) -> Result<(T::Native, T::Native)> {
+    pub fn update_bounds(&mut self, vectors: &FixedSizeListArray) -> Result<Range<T::Native>> {
         let data = vectors
             .values()
             .as_any()
@@ -101,13 +94,11 @@ impl<T: ArrowFloatType + Dot + L2> ScalarQuantizerImpl<T> {
             })?
             .as_slice();
 
-        (self.lower_bound, self.upper_bound) = data
+        self.bounds = data
             .iter()
-            .fold((self.lower_bound, self.upper_bound), |f, v| {
-                (f.0.min(*v), f.1.max(*v))
-            });
+            .fold(self.bounds.clone(), |f, v| f.start.min(*v)..f.end.max(*v));
 
-        Ok((self.lower_bound, self.upper_bound))
+        Ok(self.bounds.clone())
     }
 }
 
@@ -145,11 +136,15 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ScalarQuantizer for ScalarQuantizer
         let builder: Vec<u8> = data
             .iter()
             .map(|v| {
-                let range = self.upper_bound - self.lower_bound;
-                ((*v - self.lower_bound) * T::Native::from_u32(255).unwrap() / range)
-                    .round()
-                    .to_u8()
-                    .unwrap()
+                let range = self.bounds.end - self.bounds.start;
+                match *v {
+                    v if v < self.bounds.start => 0,
+                    v if v > self.bounds.end => 255,
+                    _ => ((*v - self.bounds.start) * T::Native::from_u32(255).unwrap() / range)
+                        .round()
+                        .to_u8()
+                        .unwrap(),
+                }
             })
             .collect();
 
@@ -188,8 +183,8 @@ mod tests {
                 .unwrap();
 
         sq.update_bounds(&vectors).unwrap();
-        assert_eq!(sq.lower_bound, float_values[0]);
-        assert_eq!(sq.upper_bound, float_values.last().cloned().unwrap());
+        assert_eq!(sq.bounds.start, float_values[0]);
+        assert_eq!(sq.bounds.end, float_values.last().cloned().unwrap());
 
         let sq_code = sq.transform(&vectors).await.unwrap();
         let sq_values = sq_code
@@ -214,8 +209,8 @@ mod tests {
                 .unwrap();
 
         sq.update_bounds(&vectors).unwrap();
-        assert_eq!(sq.lower_bound, float_values[0]);
-        assert_eq!(sq.upper_bound, float_values.last().cloned().unwrap());
+        assert_eq!(sq.bounds.start, float_values[0]);
+        assert_eq!(sq.bounds.end, float_values.last().cloned().unwrap());
 
         let sq_code = sq.transform(&vectors).await.unwrap();
         let sq_values = sq_code
@@ -240,8 +235,8 @@ mod tests {
                 .unwrap();
 
         sq.update_bounds(&vectors).unwrap();
-        assert_eq!(sq.lower_bound, float_values[0]);
-        assert_eq!(sq.upper_bound, float_values.last().cloned().unwrap());
+        assert_eq!(sq.bounds.start, float_values[0]);
+        assert_eq!(sq.bounds.end, float_values.last().cloned().unwrap());
 
         let sq_code = sq.transform(&vectors).await.unwrap();
         let sq_values = sq_code
