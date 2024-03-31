@@ -1039,8 +1039,7 @@ impl Scanner {
                 self.flat_knn(knn_node_with_vector, &q)?
             } else {
                 ann_node
-            }; // vector*, _distance, _rowid
-            println!("ANN node schema: {:?}", knn_node.schema());
+            }; // vector(*), _distance, _rowid
 
             knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
 
@@ -1112,14 +1111,19 @@ impl Scanner {
             // To do a union, we need to make the schemas match. Right now
             // knn_node: _distance, _rowid, vector*
             // topk_appended: vector, <filter columns?>, _rowid, _distance
+
+            let mut project_idx = vec![2 + num_filter_columns, 1 + num_filter_columns];
+            if knn_node.schema().column_with_name(&q.column).is_some() {
+                // If ANN node already load vectors, we keep vector column from the flat search node.
+                project_idx.push(0);
+            }
             let new_schema = Schema::try_from(
                 &topk_appended
                     .schema()
-                    .project(&[2 + num_filter_columns, 1 + num_filter_columns])?
+                    .project(&project_idx)?
                     .with_metadata(knn_node.schema().metadata.clone()),
             )?;
             let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
-            assert_eq!(topk_appended.schema(), knn_node.schema());
 
             // union
             let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
@@ -3544,7 +3548,7 @@ mod test {
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 42),
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=42), expr=...
       KNNIndex: name=..., k=42, deltas=1",
         )
@@ -3584,13 +3588,14 @@ mod test {
                     .with_row_id())
             },
             "Projection: fields=[s, vec, _distance, _rowid]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    FilterExec: i@3 > 10
-      Take: columns=\"_distance, _rowid, vec, i\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
+    FilterExec: i@2 > 10
+      Take: columns=\"_distance, _rowid, i\"
         SortExec: TopK(fetch=17), expr=...
           KNNIndex: name=..., k=17, deltas=1",
         )
-        .await?;
+        .await
+        .expect("with filter and projection");
 
         // with prefilter
         assert_plan_equals(
@@ -3602,31 +3607,41 @@ mod test {
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=17), expr=...
       KNNIndex: name=..., k=17, deltas=1
         FilterExec: i@0 > 10
           LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
         )
-        .await?;
+        .await
+        .expect("with prefilter");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plans_with_new_data() -> Result<()> {
+        let mut dataset = TestVectorDataset::new().await?;
+        dataset.make_vector_index().await?;
         dataset.append_new_data().await?;
+
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 5),
             // TODO: we could write an optimizer rule to eliminate the last Projection
             // by doing it as part of the last Take. This would likely have minimal impact though.
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
+  Take: columns=\"_distance, _rowid, i, s, vec\"
+    SortExec: TopK(fetch=5), expr=...
       RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
         UnionExec
-          Projection: fields=[_distance, _rowid, vec]
+          Projection: fields=[_distance, _rowid]
             KNNFlat: k=5 metric=l2
               LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1",
+          SortExec: TopK(fetch=5), expr=...
+            KNNIndex: name=..., k=5, deltas=1",
         )
         .await?;
 
@@ -3635,18 +3650,17 @@ mod test {
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 5)?.filter("i > 10"),
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    FilterExec: i@3 > 10
-      Take: columns=\"_distance, _rowid, vec, i\"
-        KNNFlat: k=5 metric=l2
+  Take: columns=\"_distance, _rowid, i, s, vec\"
+    FilterExec: i@2 > 10
+      Take: columns=\"_distance, _rowid, i\"
+        SortExec: TopK(fetch=5), expr=[_distance@0 ASC NULLS LAST]
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
-              Projection: fields=[_distance, _rowid, vec]
+              Projection: fields=[_distance, _rowid]
                 KNNFlat: k=5 metric=l2
                   LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
-              Take: columns=\"_distance, _rowid, vec\"
-                SortExec: TopK(fetch=5), expr=...
-                  KNNIndex: name=..., k=5, deltas=1",
+              SortExec: TopK(fetch=5), expr=...
+                KNNIndex: name=..., k=5, deltas=1",
         )
         .await?;
 
@@ -3655,34 +3669,40 @@ mod test {
             &dataset.dataset,
             |scan| {
                 Ok(scan
-                    .nearest("vec", &q, 5)?
+                    .nearest("vec", &q, 13)?
                     .filter("i > 10")?
                     .prefilter(true))
             },
             // TODO: i is scanned on both sides but is projected away mid-plan
             // only to be taken again later. We should fix this.
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
+  Take: columns=\"_distance, _rowid, i, s, vec\"
+    SortExec: TopK(fetch=13), expr=...
       RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
         UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
+          Projection: fields=[_distance, _rowid]
+            KNNFlat: k=13 metric=l2
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1
-                FilterExec: i@0 > 10
-                  LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
+          SortExec: TopK(fetch=13), expr=...
+            KNNIndex: name=..., k=13, deltas=1
+              FilterExec: i@0 > 10
+                LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
         )
         .await?;
 
-        // ANN with scalar index
-        // ---------------------------------------------------------------------
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ann_with_scalar_index() -> Result<()> {
+        let mut dataset = TestVectorDataset::new().await?;
+
         // Make sure both indices are up-to-date to start
         dataset.make_vector_index().await?;
         dataset.make_scalar_index().await?;
+
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
 
         assert_plan_equals(
             &dataset.dataset,
@@ -3693,7 +3713,7 @@ mod test {
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=5), expr=...
       KNNIndex: name=..., k=5, deltas=1
         ScalarIndexQuery: query=i > 10",
@@ -3707,22 +3727,24 @@ mod test {
             |scan| {
                 Ok(scan
                     .nearest("vec", &q, 5)?
+                    .refine(1)
                     .filter("i > 10")?
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
+    SortExec: TopK(fetch=5), expr=...
       RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
         UnionExec
           Projection: fields=[_distance, _rowid, vec]
             KNNFlat: k=5 metric=l2
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1
-                ScalarIndexQuery: query=i > 10",
+          KNNFlat: k=5 metric=l2
+            Take: columns=\"_distance, _rowid, vec\"
+              SortExec: TopK(fetch=5), expr=...
+                KNNIndex: name=..., k=5, deltas=1
+                  ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
@@ -3737,18 +3759,17 @@ mod test {
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
+  Take: columns=\"_distance, _rowid, i, s, vec\"
+    SortExec: TopK(fetch=5), expr=...
       RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
         UnionExec
-          Projection: fields=[_distance, _rowid, vec]
+          Projection: fields=[_distance, _rowid]
             KNNFlat: k=5 metric=l2
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1
-                ScalarIndexQuery: query=i > 10",
+          SortExec: TopK(fetch=5), expr=...
+            KNNIndex: name=..., k=5, deltas=1
+              ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
