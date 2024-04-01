@@ -23,6 +23,9 @@ use lance_linalg::distance::{Dot, MetricType, L2};
 use num_traits::*;
 use snafu::{location, Location};
 
+pub mod storage;
+pub mod transform;
+
 #[async_trait::async_trait]
 pub trait ScalarQuantizer: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
@@ -161,7 +164,7 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ScalarQuantizer for ScalarQuantizer
 
     /// Whether to use residual as input or not.
     fn use_residual(&self) -> bool {
-        true
+        false
     }
 }
 
