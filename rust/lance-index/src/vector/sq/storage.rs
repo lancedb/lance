@@ -92,7 +92,7 @@ impl ScalarQuantizationStorage {
             batch
                 .column_by_name(ROW_ID)
                 .ok_or(Error::Index {
-                    message: format!("Row ID column not found in the batch"),
+                    message: "Row ID column not found in the batch".to_owned(),
                     location: location!(),
                 })?
                 .as_any()
@@ -104,7 +104,7 @@ impl ScalarQuantizationStorage {
             batch
                 .column_by_name(SQ_CODE_COLUMN)
                 .ok_or(Error::Index {
-                    message: format!("SQ code column not found in the batch"),
+                    message: "SQ code column not found in the batch".to_owned(),
                     location: location!(),
                 })?
                 .as_fixed_size_list()
