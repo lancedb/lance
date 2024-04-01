@@ -25,6 +25,7 @@ pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
 pub mod pq;
+pub mod quantizer;
 pub mod residual;
 pub mod sq;
 pub mod transform;

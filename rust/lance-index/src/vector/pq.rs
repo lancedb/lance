@@ -36,6 +36,7 @@ pub(crate) mod utils;
 use self::distance::{build_distance_table_l2, compute_l2_distance};
 pub use self::utils::num_centroids;
 use super::pb;
+use super::quantizer::Quantizer;
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
@@ -44,26 +45,16 @@ use utils::get_sub_vector_centroids;
 pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 
-    /// Transform a vector column to PQ code column.
-    ///
-    /// Parameters
-    /// ----------
-    /// *data*: vector array, must be a `FixedSizeListArray`
-    ///
-    /// Returns
-    /// -------
-    ///   PQ code column
-    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
-
     /// Compute the distance between query vector to the PQ code.
     ///
     fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array>;
 
-    /// Get the centroids for one sub-vector.
-    fn num_bits(&self) -> u32;
+    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
 
     /// Number of sub-vectors
     fn num_sub_vectors(&self) -> usize;
+
+    fn num_bits(&self) -> u32;
 
     fn dimension(&self) -> usize;
 
@@ -323,6 +314,21 @@ impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
 }
 
 #[async_trait]
+impl<T: ArrowFloatType + Dot + L2 + 'static> Quantizer<T> for ProductQuantizerImpl<T> {
+    async fn quantize(&self, data: &dyn Array) -> Result<ArrayRef> {
+        self.transform(data).await
+    }
+
+    fn code_dim(&self) -> usize {
+        self.num_sub_vectors
+    }
+
+    fn code_bits(&self) -> u16 {
+        self.num_bits as u16
+    }
+}
+
+#[async_trait]
 impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
     fn as_any(&self) -> &dyn Any {
         self
@@ -424,12 +430,12 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantiz
         }
     }
 
-    fn num_bits(&self) -> u32 {
-        self.num_bits
-    }
-
     fn num_sub_vectors(&self) -> usize {
         self.num_sub_vectors
+    }
+
+    fn num_bits(&self) -> u32 {
+        self.num_bits
     }
 
     fn dimension(&self) -> usize {
@@ -457,7 +463,7 @@ impl TryFrom<&dyn ProductQuantizer> for pb::Pq {
         let fsl = pq.codebook_as_fsl();
         let tensor = pb::Tensor::try_from(&fsl)?;
         Ok(Self {
-            num_bits: pq.num_bits(),
+            num_bits: pq.num_bits() as u32,
             num_sub_vectors: pq.num_sub_vectors() as u32,
             dimension: pq.dimension() as u32,
             codebook: vec![],

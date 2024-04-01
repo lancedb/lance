@@ -23,6 +23,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use num_traits::Float;
 use snafu::{location, Location};
 
 pub use builder::IvfBuildParams;
@@ -41,7 +42,9 @@ use crate::vector::{
     transform::Transformer,
 };
 
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+use super::sq::transform::SQTransformer;
+use super::sq::ScalarQuantizer;
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN, SQ_CODE_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
@@ -168,6 +171,71 @@ pub fn new_ivf_with_pq(
     }
 }
 
+pub fn new_ivf_with_sq(
+    centroids: &dyn Array,
+    dimension: usize,
+    metric_type: MetricType,
+    vector_column: &str,
+    sq: ScalarQuantizer,
+    range: Option<Range<u32>>,
+) -> Result<Arc<dyn Ivf>> {
+    let ivf = match centroids.data_type() {
+        DataType::Float16 => new_ivf_with_sq_impl::<Float16Type>(
+            centroids.as_primitive(),
+            dimension,
+            metric_type,
+            vector_column,
+            sq,
+            range,
+        ),
+        DataType::Float32 => new_ivf_with_sq_impl::<Float32Type>(
+            centroids.as_primitive(),
+            dimension,
+            metric_type,
+            vector_column,
+            sq,
+            range,
+        ),
+        DataType::Float64 => new_ivf_with_sq_impl::<Float64Type>(
+            centroids.as_primitive(),
+            dimension,
+            metric_type,
+            vector_column,
+            sq,
+            range,
+        ),
+        _ => {
+            return Err(Error::Index {
+                message: format!(
+                    "new_ivf_with_sq: centroids is not expected type: {}",
+                    centroids.data_type()
+                ),
+                location: location!(),
+            })
+        }
+    };
+
+    Ok(ivf)
+}
+
+fn new_ivf_with_sq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(
+    centroids: &T::ArrayType,
+    dimension: usize,
+    metric_type: MetricType,
+    vector_column: &str,
+    sq: ScalarQuantizer,
+    range: Option<Range<u32>>,
+) -> Arc<dyn Ivf> {
+    let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
+    Arc::new(IvfImpl::<T>::new_with_sq(
+        mat,
+        metric_type,
+        vector_column,
+        sq,
+        range,
+    ))
+}
+
 /// IVF - IVF file partition
 ///
 #[async_trait]
@@ -291,6 +359,47 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
                 PQ_CODE_COLUMN,
             )));
         };
+        Self {
+            centroids: centroids.clone(),
+            metric_type,
+            transforms,
+            ivf_transform,
+        }
+    }
+
+    fn new_with_sq(
+        centroids: MatrixView<T>,
+        metric_type: MetricType,
+        vector_column: &str,
+        sq: ScalarQuantizer,
+        range: Option<Range<u32>>,
+    ) -> Self {
+        let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
+
+        let mt = if metric_type == MetricType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
+        } else {
+            metric_type
+        };
+
+        let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), mt, vector_column));
+        transforms.push(ivf_transform.clone());
+
+        if let Some(range) = range {
+            transforms.push(Arc::new(transform::PartitionFilter::new(
+                PART_ID_COLUMN,
+                range,
+            )));
+        }
+
+        transforms.push(Arc::new(SQTransformer::<T>::new(
+            sq,
+            vector_column.to_owned(),
+            SQ_CODE_COLUMN.to_owned(),
+        )));
         Self {
             centroids: centroids.clone(),
             metric_type,

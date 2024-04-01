@@ -55,7 +55,13 @@ use lance_index::{
             storage::{ProductQuantizationMetadata, PQ_METADTA_KEY},
             PQBuildParams, ProductQuantizer,
         },
-        Query, DIST_COL, PQ_CODE_COLUMN,
+        quantizer::Quantizer,
+        sq::{
+            builder::SQBuildParams,
+            storage::{ScalarQuantizationMetadata, SQ_METADATA_KEY},
+            ScalarQuantizer,
+        },
+        Query, DIST_COL, PQ_CODE_COLUMN, SQ_CODE_COLUMN,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -87,7 +93,7 @@ use super::{
     utils::maybe_sample_training_data,
     VectorIndex,
 };
-use crate::dataset::builder::DatasetBuilder;
+use crate::{dataset::builder::DatasetBuilder, index::vector::sq::build_sq_model};
 use crate::{
     dataset::Dataset,
     index::{
@@ -760,7 +766,7 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     Ok(field)
 }
 
-fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
+fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
     if ivf.precomputed_partitons_file.is_some() && ivf.centroids.is_none() {
         return Err(Error::Index {
             message: "precomputed_partitions_file requires centroids to be set".to_string(),
@@ -768,15 +774,9 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
         });
     }
 
-    if ivf.precomputed_shuffle_buffers.is_some()
-        && (
-            // If either centroids or codebook is not set, precomputed_shuffle can't be used.
-            ivf.centroids.is_none() || pq.codebook.is_none()
-        )
-    {
+    if ivf.precomputed_shuffle_buffers.is_some() && ivf.centroids.is_none() {
         return Err(Error::Index {
-            message: "precomputed_shuffle_buffers requires centroids AND codebook to be set"
-                .to_string(),
+            message: "precomputed_shuffle_buffers requires centroids to be set".to_string(),
             location: location!(),
         });
     }
@@ -786,6 +786,18 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
             message:
                 "precomputed_shuffle_buffers and precomputed_partitons_file are mutually exclusive"
                     .to_string(),
+            location: location!(),
+        });
+    }
+
+    Ok(())
+}
+
+fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
+    sanity_check_ivf_params(ivf)?;
+    if ivf.precomputed_shuffle_buffers.is_some() && pq.codebook.is_none() {
+        return Err(Error::Index {
+            message: "precomputed_shuffle_buffers requires codebooks to be set".to_string(),
             location: location!(),
         });
     }
@@ -905,6 +917,40 @@ async fn build_ivf_model_and_pq(
     Ok((ivf_model, pq))
 }
 
+async fn build_ivf_model_and_sq(
+    dataset: &Dataset,
+    column: &str,
+    metric_type: MetricType,
+    ivf_params: &IvfBuildParams,
+    sq_params: &SQBuildParams,
+) -> Result<(Ivf, ScalarQuantizer)> {
+    sanity_check_ivf_params(ivf_params)?;
+
+    info!(
+        "Building vector index: IVF{},SQ{}, metric={}",
+        ivf_params.num_partitions, sq_params.num_bits, metric_type,
+    );
+
+    let field = sanity_check(dataset, column)?;
+    let dim = if let DataType::FixedSizeList(_, d) = field.data_type() {
+        d as usize
+    } else {
+        return Err(Error::Index {
+            message: format!(
+                "VectorIndex requires the column data type to be fixed size list of floats, got {}",
+                field.data_type()
+            ),
+            location: location!(),
+        });
+    };
+
+    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
+
+    let sq = build_sq_model(dataset, column, metric_type, sq_params).await?;
+
+    Ok((ivf_model, sq))
+}
+
 async fn scan_index_field_stream(
     dataset: &Dataset,
     column: &str,
@@ -965,7 +1011,7 @@ pub async fn build_ivf_pq_index(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn build_ivf_hnsw_index(
+pub async fn build_ivf_hnsw_pq_index(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
@@ -980,7 +1026,7 @@ pub async fn build_ivf_hnsw_index(
     let stream = scan_index_field_stream(dataset, column).await?;
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
-    write_ivf_hnsw_file(
+    write_ivf_hnsw_pq_file(
         dataset,
         column,
         index_name,
@@ -988,6 +1034,41 @@ pub async fn build_ivf_hnsw_index(
         &[],
         ivf_model,
         pq,
+        metric_type,
+        hnsw_params,
+        stream,
+        precomputed_partitions,
+        ivf_params.shuffle_partition_batches,
+        ivf_params.shuffle_partition_concurrency,
+        ivf_params.precomputed_shuffle_buffers.clone(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn build_ivf_hnsw_sq_index(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    uuid: &str,
+    metric_type: MetricType,
+    ivf_params: &IvfBuildParams,
+    hnsw_params: &HnswBuildParams,
+    sq_params: &SQBuildParams,
+) -> Result<()> {
+    let (ivf_model, sq) =
+        build_ivf_model_and_sq(dataset, column, metric_type, ivf_params, sq_params).await?;
+    let stream = scan_index_field_stream(dataset, column).await?;
+    let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
+
+    write_ivf_hnsw_sq_file(
+        dataset,
+        column,
+        index_name,
+        uuid,
+        &[],
+        ivf_model,
+        sq,
         metric_type,
         hnsw_params,
         stream,
@@ -1189,7 +1270,7 @@ async fn write_ivf_pq_file(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn write_ivf_hnsw_file(
+async fn write_ivf_hnsw_pq_file(
     dataset: &Dataset,
     column: &str,
     _index_name: &str,
@@ -1280,7 +1361,7 @@ async fn write_ivf_hnsw_file(
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
 
-    let (hnsw_metadata, aux_ivf) = builder::build_hnsw_partitions(
+    let (hnsw_metadata, aux_ivf) = builder::build_hnsw_pq_partitions(
         dataset,
         &mut writer,
         Some(&mut aux_writer),
@@ -1288,6 +1369,118 @@ async fn write_ivf_hnsw_file(
         column,
         &mut ivf,
         pq.clone(),
+        distance_type,
+        hnsw_params,
+        0..num_partitions,
+        precomputed_partitons,
+        shuffle_partition_batches,
+        shuffle_partition_concurrency,
+        precomputed_shuffle_buffers,
+    )
+    .await?;
+    info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());
+
+    // Add the metadata of HNSW partitions
+    let hnsw_metadata_json = json!(hnsw_metadata);
+    writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
+
+    // Convert ['Ivf'] to [`IvfData`] for new index format
+    let mut ivf_data = IvfData::with_centroids(ivf.centroids.clone());
+    for length in ivf.lengths {
+        ivf_data.add_partition(length);
+    }
+    ivf_data.write(&mut writer).await?;
+    writer.finish().await?;
+
+    // Write the aux file
+    aux_ivf.write(&mut aux_writer).await?;
+    aux_writer.finish().await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_ivf_hnsw_sq_file(
+    dataset: &Dataset,
+    column: &str,
+    _index_name: &str,
+    uuid: &str,
+    _transformers: &[Box<dyn Transformer>],
+    mut ivf: Ivf,
+    sq: ScalarQuantizer,
+    distance_type: DistanceType,
+    hnsw_params: &HnswBuildParams,
+    stream: impl RecordBatchStream + Unpin + 'static,
+    precomputed_partitons: Option<HashMap<u64, u32>>,
+    shuffle_partition_batches: usize,
+    shuffle_partition_concurrency: usize,
+    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
+) -> Result<()> {
+    let object_store = dataset.object_store();
+    let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
+    let writer = object_store.create(&path).await?;
+
+    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
+    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
+    writer.add_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        json!(IndexMetadata {
+            index_type: "IVF_HNSW".to_string(),
+            distance_type: distance_type.to_string(),
+        })
+        .to_string()
+        .as_str(),
+    );
+
+    let aux_path = dataset
+        .indices_dir()
+        .child(uuid)
+        .child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_writer = object_store.create(&aux_path).await?;
+    let schema = Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        arrow_schema::Field::new(
+            SQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
+                ivf.dimension() as i32,
+            ),
+            false,
+        ),
+    ]);
+    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let mut aux_writer =
+        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+    aux_writer.add_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        json!(IndexMetadata {
+            index_type: "SQ".to_string(),
+            distance_type: distance_type.to_string(),
+        })
+        .to_string()
+        .as_str(),
+    );
+    aux_writer.add_metadata(
+        SQ_METADATA_KEY,
+        json!(ScalarQuantizationMetadata {
+            num_bits: sq.num_bits(),
+            bounds: sq.bounds(),
+        })
+        .to_string()
+        .as_str(),
+    );
+
+    let start = std::time::Instant::now();
+    let num_partitions = ivf.num_partitions() as u32;
+
+    let (hnsw_metadata, aux_ivf) = builder::build_hnsw_sq_partitions(
+        dataset,
+        &mut writer,
+        Some(&mut aux_writer),
+        stream,
+        column,
+        &mut ivf,
+        sq,
         distance_type,
         hnsw_params,
         0..num_partitions,

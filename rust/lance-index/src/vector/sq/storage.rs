@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{ops::Range, sync::Arc};
+use std::{cmp::min, ops::Range, sync::Arc};
 
 use arrow::{array::AsArray, datatypes::Float32Type};
 use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
 use half::f16;
 use itertools::Itertools;
 use lance_core::{Error, Result, ROW_ID};
-use lance_file::reader::FileReader;
+use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::{DistanceType, MetricType};
-use lance_table::format::SelfDescribingFileReader;
+use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use num_traits::FromPrimitive;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};

@@ -29,11 +29,15 @@ use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
+use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::storage::ProductQuantizationStorage;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::sq::storage::ScalarQuantizationStorage;
+use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::SQ_CODE_COLUMN;
 use lance_index::vector::{
     graph::memory::InMemoryVectorStorage,
     hnsw::{builder::HnswBuildParams, HNSWBuilder, HnswMetadata},
@@ -64,7 +68,8 @@ async fn merge_streams(
     streams_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
     new_streams: &mut [Pin<Box<Peekable<impl Stream<Item = Result<RecordBatch>>>>>],
     part_id: u32,
-    pq_array: &mut Vec<Arc<dyn Array>>,
+    code_column: &str,
+    code_array: &mut Vec<Arc<dyn Array>>,
     row_id_array: &mut Vec<Arc<dyn Array>>,
 ) -> Result<()> {
     while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {
@@ -90,9 +95,9 @@ async fn merge_streams(
             }
         };
 
-        let pq_codes = Arc::new(
+        let codes = Arc::new(
             batch
-                .column_by_name(PQ_CODE_COLUMN)
+                .column_by_name(code_column)
                 .expect("pq code column not found")
                 .as_fixed_size_list()
                 .clone(),
@@ -104,7 +109,7 @@ async fn merge_streams(
                 .as_primitive::<UInt64Type>()
                 .clone(),
         );
-        pq_array.push(pq_codes);
+        code_array.push(codes);
         row_id_array.push(row_ids);
 
         match stream.peek().await {
@@ -217,6 +222,7 @@ pub(super) async fn write_pq_partitions(
             &mut streams_heap,
             &mut new_streams,
             part_id,
+            PQ_CODE_COLUMN,
             &mut pq_array,
             &mut row_id_array,
         )
@@ -241,7 +247,7 @@ pub(super) async fn write_pq_partitions(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn write_hnsw_index_partitions(
+pub(super) async fn write_hnsw_pq_index_partitions(
     dataset: &Dataset,
     column: &str,
     metric_type: MetricType,
@@ -305,6 +311,7 @@ pub(super) async fn write_hnsw_index_partitions(
             &mut streams_heap,
             &mut new_streams,
             part_id as u32,
+            PQ_CODE_COLUMN,
             &mut pq_array,
             &mut row_id_array,
         )
@@ -516,6 +523,282 @@ fn build_hnsw_index(
             pq.dimension(),
             metric_type,
         )?;
+
+        Some(pq_store)
+    } else {
+        None
+    };
+
+    Ok((hnsw, pq_storage))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn write_hnsw_sq_index_partitions(
+    dataset: &Dataset,
+    column: &str,
+    metric_type: MetricType,
+    hnsw_params: &HnswBuildParams,
+    writer: &mut FileWriter<ManifestDescribing>,
+    mut auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
+    ivf: &mut Ivf,
+    sq: ScalarQuantizer,
+    streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
+    _existing_indices: Option<&[&IVFIndex]>,
+) -> Result<(Vec<HnswMetadata>, IvfData)> {
+    let dataset = Arc::new(dataset.clone());
+    let column = Arc::new(column.to_owned());
+    let hnsw_params = Arc::new(hnsw_params.clone());
+
+    let mut streams_heap = BinaryHeap::new();
+    let mut new_streams = vec![];
+    if let Some(streams) = streams {
+        for stream in streams {
+            let mut stream = Box::pin(stream.peekable());
+
+            match stream.as_mut().peek().await {
+                Some(Ok(batch)) => {
+                    let part_ids: &UInt32Array = batch
+                        .column_by_name(PART_ID_COLUMN)
+                        .expect("part id column not found")
+                        .as_primitive();
+                    let part_id = part_ids.values()[0];
+                    streams_heap.push((Reverse(part_id), new_streams.len()));
+                    new_streams.push(stream);
+                }
+                Some(Err(e)) => {
+                    return Err(Error::IO {
+                        message: format!("failed to read batch: {}", e),
+                        location: location!(),
+                    });
+                }
+                None => {
+                    return Err(Error::IO {
+                        message: "failed to read batch: end of stream".to_string(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+    }
+
+    let object_store = ObjectStore::local();
+    let mut part_files = Vec::with_capacity(ivf.num_partitions());
+    let mut aux_part_files = Vec::with_capacity(ivf.num_partitions());
+    let tmp_part_dir = Path::from_filesystem_path(TempDir::new()?)?;
+    let mut tasks = Vec::with_capacity(ivf.num_partitions());
+    let sem = Arc::new(Semaphore::new(HNSW_PARTITIONS_BUILD_PARRALLEL));
+    for part_id in 0..ivf.num_partitions() {
+        part_files.push(tmp_part_dir.child(format!("hnsw_part_{}", part_id)));
+        aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));
+
+        let mut code_array: Vec<Arc<dyn Array>> = vec![];
+        let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
+        merge_streams(
+            &mut streams_heap,
+            &mut new_streams,
+            part_id as u32,
+            SQ_CODE_COLUMN,
+            &mut code_array,
+            &mut row_id_array,
+        )
+        .await?;
+
+        let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
+        let part_writer = FileWriter::<ManifestDescribing>::try_new(
+            &object_store,
+            part_file,
+            Schema::try_from(writer.schema())?,
+            &Default::default(),
+        )
+        .await?;
+
+        let aux_part_writer = match auxiliary_writer.as_ref() {
+            Some(writer) => Some(
+                FileWriter::<ManifestDescribing>::try_new(
+                    &object_store,
+                    aux_part_file,
+                    Schema::try_from(writer.schema())?,
+                    &Default::default(),
+                )
+                .await?,
+            ),
+            None => None,
+        };
+
+        let dataset = dataset.clone();
+        let column = column.clone();
+        let hnsw_params = hnsw_params.clone();
+        let sq = sq.clone();
+        let sem = sem.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore error");
+
+            log::debug!("Building HNSW partition {}", part_id);
+            let result = build_hnsw_sq_partition(
+                dataset,
+                column,
+                metric_type,
+                hnsw_params,
+                part_writer,
+                aux_part_writer,
+                sq,
+                row_id_array,
+                code_array,
+            )
+            .await;
+            log::debug!("Finished building HNSW partition {}", part_id);
+            result
+        }));
+    }
+
+    let mut aux_ivf = IvfData::empty();
+    let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
+    for (part_id, task) in tasks.into_iter().enumerate() {
+        let length = task.await??;
+
+        let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
+        let part_reader =
+            FileReader::try_new_self_described(&object_store, part_file, None).await?;
+
+        let offset = writer.tell().await?;
+        let batches = futures::stream::iter(0..part_reader.num_batches())
+            .map(|batch_id| {
+                part_reader.read_batch(
+                    batch_id as i32,
+                    ReadBatchParams::RangeFull,
+                    part_reader.schema(),
+                    None,
+                )
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+        writer.write(&batches).await?;
+        ivf.add_partition(offset, length as u32);
+        hnsw_metadata.push(serde_json::from_str(
+            part_reader.schema().metadata[HNSW_METADATA_KEY].as_str(),
+        )?);
+
+        if let Some(aux_writer) = auxiliary_writer.as_mut() {
+            let aux_part_reader =
+                FileReader::try_new_self_described(&object_store, aux_part_file, None).await?;
+
+            let batches = futures::stream::iter(0..aux_part_reader.num_batches())
+                .map(|batch_id| {
+                    aux_part_reader.read_batch(
+                        batch_id as i32,
+                        ReadBatchParams::RangeFull,
+                        aux_part_reader.schema(),
+                        None,
+                    )
+                })
+                .buffered(num_cpus::get())
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            aux_writer.write(&batches).await?;
+            aux_ivf.add_partition(num_rows as u32);
+        }
+    }
+
+    Ok((hnsw_metadata, aux_ivf))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_hnsw_sq_partition(
+    dataset: Arc<Dataset>,
+    column: Arc<String>,
+    metric_type: MetricType,
+    hnsw_params: Arc<HnswBuildParams>,
+    mut writer: FileWriter<ManifestDescribing>,
+    mut aux_writer: Option<FileWriter<ManifestDescribing>>,
+    sq: ScalarQuantizer,
+    row_id_array: Vec<Arc<dyn Array>>,
+    code_array: Vec<Arc<dyn Array>>,
+) -> Result<usize> {
+    let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
+    let mut vector_batches = Vec::with_capacity(row_id_array.len());
+    for row_ids in row_id_array.iter() {
+        let array = dataset
+            .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
+            .await?
+            .column_by_name(column.as_ref())
+            .expect("row id column not found")
+            .clone();
+        vector_batches.push(array);
+    }
+
+    let build_with_aux = aux_writer.is_some();
+    let (hnsw, sq_storage) = utils::tokio::spawn_cpu(move || {
+        build_hnsw_sq_index(
+            metric_type,
+            (*hnsw_params).clone(),
+            row_id_array,
+            code_array,
+            vector_batches,
+            build_with_aux,
+            sq,
+        )
+    })
+    .await?;
+
+    writer.add_metadata(
+        HNSW_METADATA_KEY,
+        serde_json::to_string(&hnsw.metadata())?.as_str(),
+    );
+    let length = hnsw.write_levels(&mut writer).await?;
+    writer.finish().await?;
+
+    if let Some(code_storage) = sq_storage {
+        let aux_writer = aux_writer.as_mut().unwrap();
+        aux_writer
+            .write_record_batch(code_storage.batch().clone())
+            .await?;
+        aux_writer.finish().await?;
+    }
+
+    Ok(length)
+}
+
+fn build_hnsw_sq_index(
+    metric_type: MetricType,
+    hnsw_params: HnswBuildParams,
+    row_ids_array: Vec<Arc<dyn Array>>,
+    code_array: Vec<Arc<dyn Array>>,
+    vector_array: Vec<Arc<dyn Array>>,
+    build_with_aux: bool,
+    sq: ScalarQuantizer,
+) -> Result<(HNSW, Option<ScalarQuantizationStorage>)> {
+    let vector_arrs = vector_array
+        .iter()
+        .map(|arr| arr.as_ref())
+        .collect::<Vec<_>>();
+    let fsl = arrow_select::concat::concat(&vector_arrs)?;
+    std::mem::drop(vector_array);
+
+    let mat = Arc::new(MatrixView::<Float32Type>::try_from(
+        fsl.as_fixed_size_list(),
+    )?);
+    let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
+    let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params, vec_store);
+    let hnsw = hnsw_builder.build()?;
+
+    let pq_storage = if build_with_aux {
+        let code_arrs = code_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let code_column = concat(&code_arrs)?;
+        std::mem::drop(code_array);
+
+        let row_ids_arrs = row_ids_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let row_ids_column = concat(&row_ids_arrs)?;
+        std::mem::drop(row_ids_array);
+
+        let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
+            (ROW_ID, row_ids_column, true),
+            (SQ_CODE_COLUMN, code_column, false),
+        ])?;
+        let pq_store =
+            ScalarQuantizationStorage::new(sq.num_bits(), metric_type, sq.bounds(), pq_batch)?;
 
         Some(pq_store)
     } else {

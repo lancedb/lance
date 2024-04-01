@@ -24,6 +24,9 @@ use lance_linalg::distance::MetricType;
 use num_traits::*;
 use snafu::{location, Location};
 
+use super::quantizer::Quantizer;
+
+pub mod builder;
 pub mod storage;
 pub mod transform;
 
@@ -31,12 +34,15 @@ pub mod transform;
 ///
 //
 // TODO: move this to be pub(crate) once we have a better way to test it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ScalarQuantizer {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
     pub num_bits: u16,
+
+    /// Original dimension of the vectors.
+    pub dim: usize,
 
     /// Distance type.
     pub metric_type: MetricType,
@@ -45,9 +51,10 @@ pub struct ScalarQuantizer {
 }
 
 impl ScalarQuantizer {
-    pub fn new(num_bits: u16, metric_type: MetricType) -> Self {
+    pub fn new(num_bits: u16, dim: usize, metric_type: MetricType) -> Self {
         Self {
             num_bits,
+            dim,
             metric_type,
             bounds: Range::<f64> {
                 start: f64::MAX,
@@ -56,10 +63,19 @@ impl ScalarQuantizer {
         }
     }
 
-    pub fn with_bounds(num_bits: u16, metric_type: MetricType, bounds: Range<f64>) -> Self {
-        let mut sq = Self::new(num_bits, metric_type);
+    pub fn with_bounds(
+        num_bits: u16,
+        dim: usize,
+        metric_type: MetricType,
+        bounds: Range<f64>,
+    ) -> Self {
+        let mut sq = Self::new(num_bits, dim, metric_type);
         sq.bounds = bounds;
         sq
+    }
+
+    pub fn num_bits(&self) -> u16 {
+        self.num_bits
     }
 
     pub fn update_bounds<T: ArrowFloatType>(
@@ -86,7 +102,19 @@ impl ScalarQuantizer {
         Ok(self.bounds.clone())
     }
 
-    async fn transform<T: ArrowFloatType>(&self, data: &dyn Array) -> Result<ArrayRef> {
+    pub fn bounds(&self) -> Range<f64> {
+        self.bounds.clone()
+    }
+
+    /// Whether to use residual as input or not.
+    pub fn use_residual(&self) -> bool {
+        false
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: ArrowFloatType> Quantizer<T> for ScalarQuantizer {
+    async fn quantize(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
             .ok_or(Error::Index {
@@ -119,14 +147,13 @@ impl ScalarQuantizer {
         )?))
     }
 
-    /// Get the centroids for each dimension.
-    pub fn num_bits(&self) -> u16 {
-        self.num_bits
+    // For SQ, the code dimension is the same as the original dimension.
+    fn code_dim(&self) -> usize {
+        self.dim
     }
 
-    /// Whether to use residual as input or not.
-    pub fn use_residual(&self) -> bool {
-        false
+    fn code_bits(&self) -> u16 {
+        self.num_bits
     }
 }
 
@@ -157,12 +184,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_f16_sq8() {
-        let mut sq = ScalarQuantizer::new(8, MetricType::L2);
         let float_values = Vec::from_iter((0..16).map(|v| f16::from_usize(v).unwrap()));
         let float_array = Float16Array::from_iter_values(float_values.clone());
         let vectors =
             FixedSizeListArray::try_new_from_values(float_array, float_values.len() as i32)
                 .unwrap();
+        let mut sq = ScalarQuantizer::new(8, float_values.len(), MetricType::L2);
 
         sq.update_bounds::<Float16Type>(&vectors).unwrap();
         assert_eq!(sq.bounds.start, float_values[0].to_f64());
@@ -171,7 +198,9 @@ mod tests {
             float_values.last().cloned().unwrap().to_f64()
         );
 
-        let sq_code = sq.transform::<Float16Type>(&vectors).await.unwrap();
+        let sq_code = Quantizer::<Float16Type>::quantize(&sq, &vectors)
+            .await
+            .unwrap();
         let sq_values = sq_code
             .as_fixed_size_list()
             .values()
@@ -186,12 +215,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_f32_sq8() {
-        let mut sq = ScalarQuantizer::new(8, MetricType::L2);
         let float_values = Vec::from_iter((0..16).map(|v| v as f32));
         let float_array = Float32Array::from_iter_values(float_values.clone());
         let vectors =
             FixedSizeListArray::try_new_from_values(float_array, float_values.len() as i32)
                 .unwrap();
+        let mut sq = ScalarQuantizer::new(8, float_values.len(), MetricType::L2);
 
         sq.update_bounds::<Float32Type>(&vectors).unwrap();
         assert_eq!(sq.bounds.start, float_values[0].to_f64().unwrap());
@@ -200,7 +229,9 @@ mod tests {
             float_values.last().cloned().unwrap().to_f64().unwrap()
         );
 
-        let sq_code = sq.transform::<Float32Type>(&vectors).await.unwrap();
+        let sq_code = Quantizer::<Float32Type>::quantize(&sq, &vectors)
+            .await
+            .unwrap();
         let sq_values = sq_code
             .as_fixed_size_list()
             .values()
@@ -215,18 +246,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_f64_sq8() {
-        let mut sq = ScalarQuantizer::new(8, MetricType::L2);
         let float_values = Vec::from_iter((0..16).map(|v| v as f64));
         let float_array = Float64Array::from_iter_values(float_values.clone());
         let vectors =
             FixedSizeListArray::try_new_from_values(float_array, float_values.len() as i32)
                 .unwrap();
+        let mut sq = ScalarQuantizer::new(8, float_values.len(), MetricType::L2);
 
         sq.update_bounds::<Float64Type>(&vectors).unwrap();
         assert_eq!(sq.bounds.start, float_values[0]);
         assert_eq!(sq.bounds.end, float_values.last().cloned().unwrap());
 
-        let sq_code = sq.transform::<Float64Type>(&vectors).await.unwrap();
+        let sq_code = Quantizer::<Float64Type>::quantize(&sq, &vectors)
+            .await
+            .unwrap();
         let sq_values = sq_code
             .as_fixed_size_list()
             .values()

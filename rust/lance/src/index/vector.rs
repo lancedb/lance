@@ -21,6 +21,7 @@ use std::{any::Any, collections::HashMap};
 pub mod hnsw;
 pub mod ivf;
 pub mod pq;
+pub mod sq;
 mod traits;
 mod utils;
 
@@ -41,7 +42,7 @@ use uuid::Uuid;
 
 use self::hnsw::{HNSWIndex, HNSWIndexOptions};
 use self::{
-    ivf::{build_ivf_hnsw_index, build_ivf_pq_index, remap_index_file, IVFIndex},
+    ivf::{build_ivf_hnsw_pq_index, build_ivf_pq_index, remap_index_file, IVFIndex},
     pq::PQIndex,
 };
 
@@ -231,7 +232,7 @@ pub(crate) async fn build_vector_index(
                 location: location!(),
             });
         };
-        build_ivf_hnsw_index(
+        build_ivf_hnsw_pq_index(
             dataset,
             column,
             name,
