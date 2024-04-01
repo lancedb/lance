@@ -545,8 +545,6 @@ impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerato
     }
 
     fn element_size_bytes(&self) -> Option<ByteCount> {
-        // We can't say 1/8th of a byte and 1 byte would be a pretty extreme over-count so let's leave
-        // it at None until someone needs this.  Then we can probably special case this (e.g. make a ByteCount::ONE_BIT)
         Self::byte_width().map(ByteCount::from).ok()
     }
 }
