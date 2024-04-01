@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cmp::min, ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc};
 
 use arrow::{array::AsArray, datatypes::Float32Type};
 use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use async_trait::async_trait;
 use half::f16;
 use itertools::Itertools;
 use lance_core::{Error, Result, ROW_ID};
-use lance_file::{reader::FileReader, writer::FileWriter};
+use lance_file::reader::FileReader;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::{DistanceType, MetricType};
-use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
+use lance_table::format::SelfDescribingFileReader;
 use num_traits::FromPrimitive;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,7 @@ use snafu::{location, Location};
 use crate::{
     vector::{
         graph::{storage::DistCalculator, VectorStorage},
+        quantizer::{QuantizerMetadata, QuantizerStorage},
         SQ_CODE_COLUMN,
     },
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
@@ -46,8 +48,9 @@ pub struct ScalarQuantizationMetadata {
     pub bounds: Range<f64>,
 }
 
-impl ScalarQuantizationMetadata {
-    pub fn load(reader: &FileReader) -> Result<Self> {
+#[async_trait]
+impl QuantizerMetadata for ScalarQuantizationMetadata {
+    async fn load(reader: &FileReader) -> Result<Self> {
         let metadata_str = reader
             .schema()
             .metadata
@@ -66,6 +69,7 @@ impl ScalarQuantizationMetadata {
     }
 }
 
+#[derive(Clone)]
 pub struct ScalarQuantizationStorage {
     metric_type: MetricType,
 
@@ -145,31 +149,6 @@ impl ScalarQuantizationStorage {
         &self.sq_codes
     }
 
-    /// Load a partition of SQ storage from disk.
-    ///
-    /// Parameters
-    /// ----------
-    /// - *reader: file reader
-    /// - *range: row range of the partition
-    /// - *metric_type: metric type of the vectors
-    /// - *metadata: scalar quantization metadata
-    pub async fn load_partition(
-        reader: &FileReader,
-        range: std::ops::Range<usize>,
-        metric_type: MetricType,
-        metadata: &ScalarQuantizationMetadata,
-    ) -> Result<Self> {
-        let schema = reader.schema();
-        let batch = reader.read_range(range, schema, None).await?;
-
-        Self::new(
-            metadata.num_bits,
-            metric_type,
-            metadata.bounds.clone(),
-            batch,
-        )
-    }
-
     pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         let reader = FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
@@ -190,10 +169,38 @@ impl ScalarQuantizationStorage {
                 location: location!(),
             })?;
         let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
+        let metadata = ScalarQuantizationMetadata::load(&reader).await?;
 
-        let sq_matadata = ScalarQuantizationMetadata::load(&reader)?;
+        Self::load_partition(&reader, 0..reader.len(), metric_type, &metadata).await
+    }
+}
 
-        Self::load_partition(&reader, 0..reader.len(), metric_type, &sq_matadata).await
+#[async_trait]
+impl QuantizerStorage for ScalarQuantizationStorage {
+    type Metadata = ScalarQuantizationMetadata;
+    /// Load a partition of SQ storage from disk.
+    ///
+    /// Parameters
+    /// ----------
+    /// - *reader: file reader
+    /// - *range: row range of the partition
+    /// - *metric_type: metric type of the vectors
+    /// - *metadata: scalar quantization metadata
+    async fn load_partition(
+        reader: &FileReader,
+        range: std::ops::Range<usize>,
+        metric_type: MetricType,
+        metadata: &Self::Metadata,
+    ) -> Result<Self> {
+        let schema = reader.schema();
+        let batch = reader.read_range(range, schema, None).await?;
+
+        Self::new(
+            metadata.num_bits,
+            metric_type,
+            metadata.bounds.clone(),
+            batch,
+        )
     }
 }
 

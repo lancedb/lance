@@ -36,7 +36,6 @@ pub(crate) mod utils;
 use self::distance::{build_distance_table_l2, compute_l2_distance};
 pub use self::utils::num_centroids;
 use super::pb;
-use super::quantizer::Quantizer;
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
@@ -69,7 +68,7 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 ///
 //
 // TODO: move this to be pub(crate) once we have a better way to test it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
     /// Number of bits for the centroids.
     ///
@@ -314,21 +313,6 @@ impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
 }
 
 #[async_trait]
-impl<T: ArrowFloatType + Dot + L2 + 'static> Quantizer<T> for ProductQuantizerImpl<T> {
-    async fn quantize(&self, data: &dyn Array) -> Result<ArrayRef> {
-        self.transform(data).await
-    }
-
-    fn code_dim(&self) -> usize {
-        self.num_sub_vectors
-    }
-
-    fn code_bits(&self) -> u16 {
-        self.num_bits as u16
-    }
-}
-
-#[async_trait]
 impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
     fn as_any(&self) -> &dyn Any {
         self
@@ -463,7 +447,7 @@ impl TryFrom<&dyn ProductQuantizer> for pb::Pq {
         let fsl = pq.codebook_as_fsl();
         let tensor = pb::Tensor::try_from(&fsl)?;
         Ok(Self {
-            num_bits: pq.num_bits() as u32,
+            num_bits: pq.num_bits(),
             num_sub_vectors: pq.num_sub_vectors() as u32,
             dimension: pq.dimension() as u32,
             codebook: vec![],

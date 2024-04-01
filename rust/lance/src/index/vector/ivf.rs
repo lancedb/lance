@@ -55,7 +55,6 @@ use lance_index::{
             storage::{ProductQuantizationMetadata, PQ_METADTA_KEY},
             PQBuildParams, ProductQuantizer,
         },
-        quantizer::Quantizer,
         sq::{
             builder::SQBuildParams,
             storage::{ScalarQuantizationMetadata, SQ_METADATA_KEY},
@@ -1296,7 +1295,7 @@ async fn write_ivf_hnsw_pq_file(
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: "IVF_HNSW".to_string(),
+            index_type: "IVF_HNSW_PQ".to_string(),
             distance_type: distance_type.to_string(),
         })
         .to_string()
@@ -1353,6 +1352,7 @@ async fn write_ivf_hnsw_pq_file(
             num_bits: pq.num_bits(),
             num_sub_vectors: pq.num_sub_vectors(),
             dimension: pq.dimension(),
+            codebook: None,
         })
         .to_string()
         .as_str(),
@@ -1425,7 +1425,7 @@ async fn write_ivf_hnsw_sq_file(
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: "IVF_HNSW".to_string(),
+            index_type: "IVF_HNSW_SQ".to_string(),
             distance_type: distance_type.to_string(),
         })
         .to_string()

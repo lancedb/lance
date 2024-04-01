@@ -515,7 +515,7 @@ impl Transaction {
             Manifest::new(schema, Arc::new(final_fragments))
         };
 
-        manifest.tag = self.tag.clone();
+        manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
             apply_feature_flags(&mut manifest);

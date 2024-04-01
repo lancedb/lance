@@ -24,8 +24,6 @@ use lance_linalg::distance::MetricType;
 use num_traits::*;
 use snafu::{location, Location};
 
-use super::quantizer::Quantizer;
-
 pub mod builder;
 pub mod storage;
 pub mod transform;
@@ -102,19 +100,7 @@ impl ScalarQuantizer {
         Ok(self.bounds.clone())
     }
 
-    pub fn bounds(&self) -> Range<f64> {
-        self.bounds.clone()
-    }
-
-    /// Whether to use residual as input or not.
-    pub fn use_residual(&self) -> bool {
-        false
-    }
-}
-
-#[async_trait::async_trait]
-impl<T: ArrowFloatType> Quantizer<T> for ScalarQuantizer {
-    async fn quantize(&self, data: &dyn Array) -> Result<ArrayRef> {
+    async fn transform<T: ArrowFloatType>(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
             .ok_or(Error::Index {
@@ -147,13 +133,13 @@ impl<T: ArrowFloatType> Quantizer<T> for ScalarQuantizer {
         )?))
     }
 
-    // For SQ, the code dimension is the same as the original dimension.
-    fn code_dim(&self) -> usize {
-        self.dim
+    pub fn bounds(&self) -> Range<f64> {
+        self.bounds.clone()
     }
 
-    fn code_bits(&self) -> u16 {
-        self.num_bits
+    /// Whether to use residual as input or not.
+    pub fn use_residual(&self) -> bool {
+        false
     }
 }
 
@@ -198,9 +184,7 @@ mod tests {
             float_values.last().cloned().unwrap().to_f64()
         );
 
-        let sq_code = Quantizer::<Float16Type>::quantize(&sq, &vectors)
-            .await
-            .unwrap();
+        let sq_code = sq.transform::<Float16Type>(&vectors).await.unwrap();
         let sq_values = sq_code
             .as_fixed_size_list()
             .values()
@@ -229,9 +213,7 @@ mod tests {
             float_values.last().cloned().unwrap().to_f64().unwrap()
         );
 
-        let sq_code = Quantizer::<Float32Type>::quantize(&sq, &vectors)
-            .await
-            .unwrap();
+        let sq_code = sq.transform::<Float32Type>(&vectors).await.unwrap();
         let sq_values = sq_code
             .as_fixed_size_list()
             .values()
@@ -257,9 +239,7 @@ mod tests {
         assert_eq!(sq.bounds.start, float_values[0]);
         assert_eq!(sq.bounds.end, float_values.last().cloned().unwrap());
 
-        let sq_code = Quantizer::<Float64Type>::quantize(&sq, &vectors)
-            .await
-            .unwrap();
+        let sq_code = sq.transform::<Float64Type>(&vectors).await.unwrap();
         let sq_values = sq_code
             .as_fixed_size_list()
             .values()

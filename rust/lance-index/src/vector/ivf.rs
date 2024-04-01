@@ -23,7 +23,6 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use num_traits::Float;
 use snafu::{location, Location};
 
 pub use builder::IvfBuildParams;
