@@ -32,6 +32,7 @@ pub mod utils;
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
+pub const SQ_CODE_COLUMN: &str = "__sq_code";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 pub const DIST_COL: &str = "_distance";
 
