@@ -1041,7 +1041,7 @@ impl Scanner {
                 ann_node
             }; // vector(*), _distance, _rowid
 
-            knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
+            knn_node = self.knn_combined(q, index, knn_node, filter_plan).await?;
 
             Ok(knn_node)
         } else {
@@ -1111,19 +1111,16 @@ impl Scanner {
             // To do a union, we need to make the schemas match. Right now
             // knn_node: _distance, _rowid, vector*
             // topk_appended: vector, <filter columns?>, _rowid, _distance
-
-            let mut project_idx = vec![2 + num_filter_columns, 1 + num_filter_columns];
-            if knn_node.schema().column_with_name(&q.column).is_some() {
-                // If ANN node already load vectors, we keep vector column from the flat search node.
-                project_idx.push(0);
-            }
             let new_schema = Schema::try_from(
                 &topk_appended
                     .schema()
-                    .project(&project_idx)?
+                    .project(&[2 + num_filter_columns, 1 + num_filter_columns, 0])?
                     .with_metadata(knn_node.schema().metadata.clone()),
             )?;
             let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
+            // assert_eq!(topk_appended.schema(), knn_node.schema());
+            // let topk_schema = Schema::try_from(knn_node.schema().as_ref())?;
+            // let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(topk_schema))?;
 
             // union
             let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
@@ -1856,6 +1853,8 @@ mod test {
             if let Some(filter) = case.filter {
                 scanner.filter(filter).unwrap();
             }
+
+            println!("Explain: {}", scanner.explain_plan(true).await.unwrap());
 
             let result = scanner
                 .try_into_stream()

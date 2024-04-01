@@ -61,21 +61,25 @@ impl Take {
         batch_readahead: usize,
     ) -> Self {
         let (tx, rx) = mpsc::channel(4);
+        println!("Take: child schema: {:?}", child.schema());
 
         let bg_thread = tokio::spawn(
             async move {
+                let s = child.schema().clone().to_string();
+                println!("Take: child schema: {}", s);
                 if let Err(e) = child
                     .zip(stream::repeat_with(|| {
                         (dataset.clone(), projection.clone())
                     }))
                     .map(|(batch, (dataset, extra))| async move {
+                        println!("Take: batch: {:?}",batch);
                         Self::take_batch(batch?, dataset, extra).await
                     })
                     .buffered(batch_readahead)
                     .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
                     .try_for_each(|b| async {
                         if tx.send(Ok(b)).await.is_err() {
-                        // If channel is closed, make sure we return an error to end the stream. 
+                        // If channel is closed, make sure we return an error to end the stream.
                         return Err(DataFusionError::Internal(
                             "ExecNode(Take): channel closed".to_string(),
                         ));
@@ -291,6 +295,11 @@ impl ExecutionPlan for TakeExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        println!(
+            "TakeExec: inner ndoe: {:#?}, \nself schema: {:#}\n\n",
+            self.input,
+            self.schema()
+        );
         let input_stream = self.input.execute(partition, context)?;
         Ok(Box::pin(Take::new(
             self.dataset.clone(),
