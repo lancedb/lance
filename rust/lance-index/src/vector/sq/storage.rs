@@ -14,17 +14,29 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{RecordBatch, UInt64Array, UInt8Array};
+use arrow::{array::AsArray, datatypes::Float32Type};
+use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use half::f16;
+use itertools::Itertools;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::{DistanceType, MetricType};
 use lance_table::format::SelfDescribingFileReader;
+use num_traits::FromPrimitive;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
-use crate::{vector::SQ_CODE_COLUMN, IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use crate::{
+    vector::{
+        graph::{storage::DistCalculator, VectorStorage},
+        SQ_CODE_COLUMN,
+    },
+    IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
+};
+
+use super::scale_to_u8;
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
 
@@ -66,7 +78,7 @@ pub struct ScalarQuantizationStorage {
 
     // Helper fields, references to the batch
     row_ids: Arc<UInt64Array>,
-    sq_codes: Arc<UInt8Array>,
+    sq_codes: Arc<FixedSizeListArray>,
 }
 
 impl ScalarQuantizationStorage {
@@ -75,11 +87,14 @@ impl ScalarQuantizationStorage {
         metric_type: MetricType,
         bounds: Range<f64>,
         batch: RecordBatch,
-    ) -> Self {
+    ) -> Result<Self> {
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
-                .unwrap()
+                .ok_or(Error::Index {
+                    message: format!("Row ID column not found in the batch"),
+                    location: location!(),
+                })?
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap()
@@ -88,21 +103,22 @@ impl ScalarQuantizationStorage {
         let sq_codes = Arc::new(
             batch
                 .column_by_name(SQ_CODE_COLUMN)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .unwrap()
+                .ok_or(Error::Index {
+                    message: format!("SQ code column not found in the batch"),
+                    location: location!(),
+                })?
+                .as_fixed_size_list()
                 .clone(),
         );
 
-        Self {
+        Ok(Self {
             num_bits,
             metric_type,
             bounds,
             batch,
             row_ids,
             sq_codes,
-        }
+        })
     }
 
     pub fn num_bits(&self) -> u16 {
@@ -121,11 +137,11 @@ impl ScalarQuantizationStorage {
         &self.batch
     }
 
-    pub fn row_ids(&self) -> &Arc<UInt64Array> {
-        &self.row_ids
+    pub fn row_ids(&self) -> &[u64] {
+        self.row_ids.values()
     }
 
-    pub fn sq_codes(&self) -> &Arc<UInt8Array> {
+    pub fn sq_codes(&self) -> &Arc<FixedSizeListArray> {
         &self.sq_codes
     }
 
@@ -133,7 +149,10 @@ impl ScalarQuantizationStorage {
     ///
     /// Parameters
     /// ----------
-    /// - *reader: &FileReader
+    /// - *reader: file reader
+    /// - *range: row range of the partition
+    /// - *metric_type: metric type of the vectors
+    /// - *metadata: scalar quantization metadata
     pub async fn load_partition(
         reader: &FileReader,
         range: std::ops::Range<usize>,
@@ -143,12 +162,12 @@ impl ScalarQuantizationStorage {
         let schema = reader.schema();
         let batch = reader.read_range(range, schema, None).await?;
 
-        Ok(Self::new(
+        Self::new(
             metadata.num_bits,
             metric_type,
             metadata.bounds.clone(),
             batch,
-        ))
+        )
     }
 
     pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
@@ -175,5 +194,89 @@ impl ScalarQuantizationStorage {
         let sq_matadata = ScalarQuantizationMetadata::load(&reader)?;
 
         Self::load_partition(&reader, 0..reader.len(), metric_type, &sq_matadata).await
+    }
+}
+
+impl VectorStorage for ScalarQuantizationStorage {
+    fn len(&self) -> usize {
+        self.batch.num_rows()
+    }
+
+    fn row_ids(&self) -> &[u64] {
+        self.row_ids.values()
+    }
+
+    /// Return the metric type of the vectors.
+    fn metric_type(&self) -> MetricType {
+        self.metric_type
+    }
+
+    /// Create a [DistCalculator] to compute the distance between the query.
+    ///
+    /// Using dist calcualtor can be more efficient as it can pre-compute some
+    /// values.
+    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator> {
+        Box::new(SQDistCalculator::new(
+            query,
+            self.sq_codes.clone(),
+            self.bounds.clone(),
+            self.metric_type,
+        ))
+    }
+}
+
+struct SQDistCalculator {
+    distance_type: DistanceType,
+    query_sq_code: Vec<f16>,
+
+    // flatten sq codes
+    sq_codes: Arc<FixedSizeListArray>,
+}
+
+impl SQDistCalculator {
+    fn new(
+        query: &[f32],
+        sq_codes: Arc<FixedSizeListArray>,
+        bounds: Range<f64>,
+        distance_type: DistanceType,
+    ) -> Self {
+        // TODO: support f16/f64
+        let query_sq_code = scale_to_u8::<Float32Type>(query, bounds)
+            .into_iter()
+            .map(|v| f16::from_u8(v).unwrap())
+            .collect_vec();
+
+        Self {
+            distance_type,
+            query_sq_code,
+            sq_codes,
+        }
+    }
+
+    fn get_sq_code(&self, id: u32) -> &[u8] {
+        let dim = self.sq_codes.value_length() as usize;
+        let values: &[u8] = self
+            .sq_codes
+            .values()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap()
+            .values();
+        &values[id as usize * dim..(id as usize + 1) * dim]
+    }
+}
+
+impl DistCalculator for SQDistCalculator {
+    fn distance(&self, ids: &[u32]) -> Vec<f32> {
+        ids.iter()
+            .map(|&id| {
+                let sq_code = self
+                    .get_sq_code(id)
+                    .iter()
+                    .map(|v| f16::from_u8(*v).unwrap())
+                    .collect_vec();
+                self.distance_type.func()(&self.query_sq_code, &sq_code)
+            })
+            .collect()
     }
 }
