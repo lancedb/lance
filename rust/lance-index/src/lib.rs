@@ -52,6 +52,9 @@ pub trait Index: Send + Sync {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any;
 
+    /// Cast to mut [Any]
+    fn as_mut_any(&mut self) -> &mut dyn Any;
+
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index>;
 

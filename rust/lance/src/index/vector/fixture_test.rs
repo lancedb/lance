@@ -62,6 +62,10 @@ mod test {
             self
         }
 
+        fn as_mut_any(&mut self) -> &mut dyn Any {
+            self
+        }
+
         /// Cast to [Index]
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
@@ -116,6 +120,10 @@ mod test {
 
         fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
             Ok(())
+        }
+
+        fn cast(&mut self, _to: &Field) -> Result<()> {
+            todo!()
         }
 
         /// The metric type of this vector index.

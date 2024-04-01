@@ -67,6 +67,8 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 
     fn dimension(&self) -> usize;
 
+    fn metric_type(&self) -> MetricType;
+
     // TODO: move to pub(crate) once the refactor of lance::index to lance-index is done.
     fn codebook_as_fsl(&self) -> FixedSizeListArray;
 
@@ -434,6 +436,10 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantiz
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    fn metric_type(&self) -> MetricType {
+        self.metric_type
     }
 
     fn codebook_as_fsl(&self) -> FixedSizeListArray {
