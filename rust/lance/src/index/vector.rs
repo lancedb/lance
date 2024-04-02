@@ -32,7 +32,7 @@ use arrow::datatypes::Float32Type;
 use lance_file::reader::FileReader;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
-use lance_index::vector::pq::{ProductQuantizer, ProductQuantizerImpl};
+use lance_index::vector::pq::ProductQuantizerImpl;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
