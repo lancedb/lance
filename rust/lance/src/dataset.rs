@@ -850,7 +850,7 @@ impl Dataset {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(self.manifest.max_field_id());
+        new_schema.set_field_id(Some(self.manifest.max_field_id()));
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
@@ -1640,7 +1640,7 @@ impl Dataset {
         }
 
         let mut schema = self.schema().merge(output_schema.as_ref())?;
-        schema.set_field_id(self.manifest.max_field_id());
+        schema.set_field_id(Some(self.manifest.max_field_id()));
 
         let fragments = self
             .add_columns_impl(read_columns, mapper, result_checkpoint, None)
@@ -1739,7 +1739,7 @@ impl Dataset {
         // Mapping of old to new fields that need to be casted.
         let mut cast_fields: Vec<(Field, Field)> = Vec::new();
 
-        let mut next_field_id = self.manifest.max_field_id().unwrap_or_default() + 1;
+        let mut next_field_id = self.manifest.max_field_id() + 1;
 
         for alteration in alterations {
             let field_src = self.schema().field(&alteration.path).ok_or_else(|| {
@@ -3216,7 +3216,7 @@ mod tests {
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, None).await?;
-        assert_eq!(dataset.manifest.max_field_id(), Some(0));
+        assert_eq!(dataset.manifest.max_field_id(), 0);
 
         // Test we can add 1 column, drop it, then add another column. Validate
         // the field ids are as expected.
@@ -3226,10 +3226,10 @@ mod tests {
                 Some(vec!["i".into()]),
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), Some(1));
+        assert_eq!(dataset.manifest.max_field_id(), 1);
 
         dataset.drop_columns(&["x"]).await?;
-        assert_eq!(dataset.manifest.max_field_id(), Some(0));
+        assert_eq!(dataset.manifest.max_field_id(), 0);
 
         dataset
             .add_columns(
@@ -3237,7 +3237,7 @@ mod tests {
                 Some(vec!["i".into()]),
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), Some(1));
+        assert_eq!(dataset.manifest.max_field_id(), 1);
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_data = RecordBatch::try_new(
@@ -3249,7 +3249,7 @@ mod tests {
         )?;
         assert_eq!(data, expected_data);
         dataset.drop_columns(&["y"]).await?;
-        assert_eq!(dataset.manifest.max_field_id(), Some(0));
+        assert_eq!(dataset.manifest.max_field_id(), 0);
 
         // Test we can add 2 columns, drop 1, then add another column. Validate
         // the field ids are as expected.
@@ -3262,12 +3262,12 @@ mod tests {
                 Some(vec!["i".into()]),
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), Some(2));
+        assert_eq!(dataset.manifest.max_field_id(), 2);
 
         dataset.drop_columns(&["b"]).await?;
         // Even though we dropped a column, we still have the fragment with a and
         // b. So it should still act as if that field id is still in play.
-        assert_eq!(dataset.manifest.max_field_id(), Some(2));
+        assert_eq!(dataset.manifest.max_field_id(), 2);
 
         dataset
             .add_columns(
@@ -3275,7 +3275,7 @@ mod tests {
                 Some(vec!["i".into()]),
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), Some(3));
+        assert_eq!(dataset.manifest.max_field_id(), 3);
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = Arc::new(ArrowSchema::new(vec![

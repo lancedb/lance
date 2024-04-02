@@ -205,7 +205,17 @@ async fn migrate_manifest(
 ///
 /// See test dataset v0.10.5/corrupt_schema
 fn fix_schema(manifest: &mut Manifest) -> Result<()> {
-    let mut field_id_seed = manifest.max_field_id().unwrap_or(-1) + 1;
+    // We can short-circuit if there is only one file per fragment or no fragments.
+    if manifest
+        .fragments
+        .first()
+        .map(|f| f.files.len() <= 1)
+        .unwrap_or(true)
+    {
+        return Ok(());
+    }
+
+    let mut field_id_seed = manifest.max_field_id() + 1;
     let mut seen_fields = HashSet::new();
     // This map is for transforming the data files' field lists
     let mut file_field_mapping: HashMap<(usize, usize), i32> = HashMap::new();

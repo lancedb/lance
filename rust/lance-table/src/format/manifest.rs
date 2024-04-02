@@ -188,8 +188,8 @@ impl Manifest {
     ///
     /// This is different than [Schema::max_field_id] because it also considers
     /// the field ids in the data files that have been dropped from the schema.
-    pub fn max_field_id(&self) -> Option<i32> {
-        let schema_max_id = self.schema.max_field_id();
+    pub fn max_field_id(&self) -> i32 {
+        let schema_max_id = self.schema.max_field_id().unwrap_or(-1);
         let fragment_max_id = self.fragments.first().and_then(|f| {
             f.files
                 .iter()
@@ -197,14 +197,8 @@ impl Manifest {
                 .max()
                 .cloned()
         });
-        match (schema_max_id, fragment_max_id) {
-            (None, None) => None,
-            (Some(schema_max_id), None) => Some(schema_max_id),
-            (None, Some(fragment_max_id)) => Some(fragment_max_id),
-            (Some(schema_max_id), Some(fragment_max_id)) => {
-                Some(schema_max_id.max(fragment_max_id))
-            }
-        }
+        let fragment_max_id = fragment_max_id.unwrap_or(-1);
+        schema_max_id.max(fragment_max_id)
     }
 
     /// Return the fragments that are newer than the given manifest.
