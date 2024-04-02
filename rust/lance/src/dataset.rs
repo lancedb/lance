@@ -849,7 +849,8 @@ impl Dataset {
         let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
-        let new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        new_schema.set_field_id(Some(self.manifest.max_field_id()));
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
@@ -1638,7 +1639,8 @@ impl Dataset {
             }
         }
 
-        let schema = self.schema().merge(output_schema.as_ref())?;
+        let mut schema = self.schema().merge(output_schema.as_ref())?;
+        schema.set_field_id(Some(self.manifest.max_field_id()));
 
         let fragments = self
             .add_columns_impl(read_columns, mapper, result_checkpoint, None)
@@ -1737,7 +1739,7 @@ impl Dataset {
         // Mapping of old to new fields that need to be casted.
         let mut cast_fields: Vec<(Field, Field)> = Vec::new();
 
-        let mut next_field_id = new_schema.max_field_id().unwrap_or_default() + 1;
+        let mut next_field_id = self.manifest.max_field_id() + 1;
 
         for alteration in alterations {
             let field_src = self.schema().field(&alteration.path).ok_or_else(|| {
@@ -3200,6 +3202,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_drop_add_columns() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        // Test we can add 1 column, drop it, then add another column. Validate
+        // the field ids are as expected.
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("x".into(), "i + 1".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        dataset.drop_columns(&["x"]).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("y".into(), "2 * i".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_data = RecordBatch::try_new(
+            Arc::new(schema.try_with_column(Field::new("y", DataType::Int32, false))?),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![2, 4])),
+            ],
+        )?;
+        assert_eq!(data, expected_data);
+        dataset.drop_columns(&["y"]).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        // Test we can add 2 columns, drop 1, then add another column. Validate
+        // the field ids are as expected.
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![
+                    ("a".into(), "i + 3".into()),
+                    ("b".into(), "i + 7".into()),
+                ]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 2);
+
+        dataset.drop_columns(&["b"]).await?;
+        // Even though we dropped a column, we still have the fragment with a and
+        // b. So it should still act as if that field id is still in play.
+        assert_eq!(dataset.manifest.max_field_id(), 2);
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("c".into(), "i + 11".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let expected_data = RecordBatch::try_new(
+            expected_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(Int32Array::from(vec![12, 13])),
+            ],
+        )?;
+        assert_eq!(data, expected_data);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_merge() {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
@@ -4086,6 +4183,45 @@ mod tests {
 
         let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
         assert_eq!(row_count, 1900);
+    }
+
+    #[tokio::test]
+    async fn test_fix_v0_10_5_corrupt_schema() {
+        // Schemas could be corrupted by successive calls to `add_columns` and
+        // `drop_columns`. We should be able to detect this by checking for
+        // duplicate field ids. We should be able to fix this in new commits
+        // by dropping unused data files and re-writing the schema.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.10.5/corrupt_schema").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        let validate_res = dataset.validate().await;
+        assert!(validate_res.is_err());
+
+        // Force a migration.
+        dataset.delete("false").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            data["b"]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[0, 4]
+        );
+        assert_eq!(
+            data["c"]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[0, 5]
+        );
     }
 
     #[tokio::test]

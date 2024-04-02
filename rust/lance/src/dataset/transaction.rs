@@ -497,6 +497,20 @@ impl Transaction {
             Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
 
+                // We might have removed all fields for certain data files, so
+                // we should remove the data files that are no longer relevant.
+                let remaining_field_ids = schema
+                    .fields_pre_order()
+                    .map(|f| f.id)
+                    .collect::<HashSet<_>>();
+                for fragment in final_fragments.iter_mut() {
+                    fragment.files.retain(|file| {
+                        file.fields
+                            .iter()
+                            .any(|field_id| remaining_field_ids.contains(field_id))
+                    });
+                }
+
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
                 Self::retain_relevant_indices(&mut final_indices, &schema)
