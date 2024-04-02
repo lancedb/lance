@@ -50,6 +50,11 @@ pub(super) async fn build_sq_model(
 
     log::info!("Start train SQ: params={:#?}", params);
     let sq = params.build(&training_data, MetricType::L2)?;
-    log::info!("Trained SQ in: {} seconds", start.elapsed().as_secs_f32());
+    log::info!(
+        "Trained SQ{}[{:?}] in: {} seconds",
+        sq.num_bits(),
+        sq.bounds(),
+        start.elapsed().as_secs_f32()
+    );
     Ok(sq)
 }
