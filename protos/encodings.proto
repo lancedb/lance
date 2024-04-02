@@ -1,0 +1,169 @@
+// Copyright 2024 Lance Developers.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package lance.encodings;
+ 
+// This file contains a specification for encodings that can be used
+// to store and load Arrow data into a Lance file.
+//
+// # Types
+//
+// This file assumes the user wants to load data into Arrow arrays and
+// explains how to map Arrow arrays into Lance files.  Encodings are divided
+// into "array encoding" (which maps to an Arrow array and may contain multiple
+// buffers) and "buffer encoding" (which encodes a single buffer of data).
+//
+// # Encoding Tree
+//
+// Most encodings are layered on top of each other.  These form a tree of
+// encodings with a single root node.  To encode an array you will typically
+// start with the root node and then take the output from that root encoding
+// and feed it into child encodings.  The decoding process works in reverse.
+//
+// # Multi-column Encodings
+//
+// Some Arrow arrays will map to more than one column of Lance data.  For
+// example, struct arrays and list arrays.  This file only contains encodings
+// for a single column.  However, it does describe how multi-column arrays can
+// be encoded.
+
+// A pointer to a buffer in a Lance file
+//
+// A writer can place a buffer in three different locations.  The buffer
+// can go in the data page, in the column metadata, or in the file metadata.
+// The writer is free to choose whatever is most appropriate (for example, a dictionary
+// that is shared across all pages in a column will probably go in the column
+// metadata).  This specification does not dictate where the buffer should go.
+message Buffer {
+    // The index of the buffer in the collection of buffers
+    uint32 buffer_index = 1;
+    // The collection holding the buffer
+    enum BufferType {
+      // The buffer is stored in the data page itself
+      page = 0;
+      // The buffer is stored in the column metadata
+      column = 1;
+      // The buffer is stored in the file metadata
+      file = 2;
+    };
+    BufferType buffer_type = 2;
+}
+
+// Encodings that decode into a single buffer of values
+message BufferEncoding {
+  oneof buffer_encoding {
+      Value value = 1;
+      Bitmap bitmap = 2;
+      // TODO: Constant, RunEnd, Dictionary, BitPacking
+      //       FoR, ...
+  }
+}
+
+// A buffer encoding where each row is a fixed number of bytes
+message Value {
+    // The buffer of values
+    Buffer buffer = 1;
+    // The number of bytes per value
+    uint64 bytes_per_value = 2;
+}
+
+// A buffer encoding for boolean data where each row is 1 bit
+// 
+// The data is stored with bit-endianess (e.g. what Arrow uses for validity
+// bitmaps and boolean arrays)
+message Bitmap {
+    // The buffer of values
+    Buffer buffer = 1;
+}
+
+// An array encoding for primitive fields where the validity information
+// is stored in a separate bitmap
+//
+// "primitive" fields are any field which can be represented in Arrow by
+// a fixed-size buffer of values and a validity buffer.  This includes
+// the fields you would expect (integers, floats, temporal types) as
+// well as null, boolean, and fixed size list/string/binary types.
+message Basic {
+  message NoNull {
+    BufferEncoding values = 1;
+  }
+  message AllNull {}
+  message SomeNull {
+    BufferEncoding validity = 1;
+    BufferEncoding values = 2;
+  }
+  oneof nullability {
+    // The array has no nulls and there is a single buffer needed
+    NoNull no_nulls = 1;
+    // The array may have nulls and we need two buffers
+    SomeNull some_nulls = 2;
+    // All values are null (no buffers needed)
+    AllNull all_nulls = 3;
+  }
+}
+
+// An array encoding for variable-length list fields
+message List {
+    // An array containing the offsets into an items array.
+    //
+    // This array will have (num_rows + 1), will have a data
+    // type of uint64, and will never have nulls.
+    //
+    // offsets[0] will always be 0.
+    //
+    // If the incoming list at index i is not null then offsets[i+1]
+    // will contain offsets[i] + len(list)
+    //
+    // If the incoming list at index i is null then offsets[i+1] will
+    // contain offsets[i] + num_items
+    //
+    // The length of the list at index i can then be found from
+    // the calculation (offsets[i+1] - offsets[i]) % num_items.  If
+    // the length is 0 the list is:
+    //   * offsets[i+1] == offsets[i] -> empty list
+    //   * offsets[i+1] == num_items + offsets[i+1] -> null list
+    //
+    // The offsets array is always a uint64 array (even if the arrow type it
+    // maps to is using int32 or int64 offsets).  However, this array is an
+    // unsigned integer array with range [0, 2 * num_items] and so it should
+    // be bit packed accordingly.
+    ArrayEncoding offsets = 1;
+}
+
+// An array encoding for fixed-size list fields
+message FixedSizeList {
+  /// The number of items in each list
+  uint32 dimension = 1;
+  /// The items in the list
+  ArrayEncoding items = 2;
+}
+
+// An array encoding for shredded structs that will never be null
+//
+// There is no actual data in this column.
+//
+// TODO: Struct validity bitmaps will be placed here.
+message SimpleStruct {}
+
+// Encodings that decode into an Arrow array
+message ArrayEncoding {
+    oneof array_encoding {
+        Basic basic = 1;
+        FixedSizeList fixed_size_list = 2;
+        List list = 3;
+        SimpleStruct struct = 4;
+    }
+}
