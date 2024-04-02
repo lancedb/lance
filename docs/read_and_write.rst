@@ -482,6 +482,10 @@ and Google Cloud Storage. Which object store to use is determined by the URI sch
 the dataset path. For example, ``s3://bucket/path`` will use S3, ``az://bucket/path``
 will use Azure, and ``gs://bucket/path`` will use GCS.
 
+.. versionadded:: 0.10.7
+
+  Passing options directly to storage options.
+
 These object stores take additional configuration objects. There are two ways to
 specify these configurations: by setting environment variables or by passing them
 to the ``storage_options`` parameter of :py:meth:`lance.dataset` and
@@ -531,11 +535,22 @@ These options apply to all object stores.
    * - ``proxy_ca_certificate``
      - PEM-formatted CA certificate for proxy connections
    * - ``proxy_excludes``
-     - List of hosts that bypass proxy
+     - List of hosts that bypass proxy. This is a comma separated list of domains
+       and IP masks. Any subdomain of the provided domain will be bypassed. For 
+       example, ``example.com, 192.168.1.0/24`` would bypass ``https://api.example.com``,
+       ``https://www.example.com``, and any IP in the range ``192.168.1.0/24``.
 
 
 S3 Configuration
 ~~~~~~~~~~~~~~~~
+
+S3 (and S3-compatible stores) have additional configuration options that configure
+authorization and S3-specific features (such as server-side encryption). Region
+is a required parameter.
+
+AWS credentials can be set in the environment variables ``AWS_ACCESS_KEY_ID``,
+``AWS_SECRET_ACCESS_KEY``, and ``AWS_SESSION_TOKEN``. Alternatively, they can be
+passed as parameters to the ``storage_options`` parameter:
 
 .. code-block:: python
 
@@ -553,7 +568,8 @@ S3 Configuration
 If you are using AWS SSO, you can specify the ``AWS_PROFILE`` environment variable.
 It cannot be specified in the ``storage_options`` parameter.
 
-These keys can be used as both environment variables or keys in the ``storage_options`` parameter:
+The following keys can be used as both environment variables or keys in the
+``storage_options`` parameter:
 
 .. list-table::
    :widths: 30 70
@@ -578,7 +594,7 @@ These keys can be used as both environment variables or keys in the ``storage_op
      - Whether to use S3 Express One Zone endpoints. Default, ``False``. See more
        details below.
    * - ``aws_server_side_encryption``
-     - The server-side encryption algorithm to use. Must be one of "AES256",
+     - The server-side encryption algorithm to use. Must be one of ``"AES256"``,
        ``"aws:kms"``, or ``"aws:kms:dsse"``. Default, ``None``.
    * - ``aws_sse_kms_key_id``
      - The KMS key ID to use for server-side encryption. If set,
@@ -709,6 +725,10 @@ For details on how this feature works, please see :ref:`external-manifest-store`
 Google Cloud Storage Configuration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+GCS credentials are configured by setting the ``GOOGLE_SERVICE_ACCOUNT`` environment
+variable to the path of a JSON file containing the service account credentials.
+Alternatively, you can pass the path to the JSON file in the ``storage_options``
+
 .. code-block:: python
 
   import lance
@@ -726,7 +746,8 @@ Google Cloud Storage Configuration
   you can set the environment variable ``HTTP1_ONLY`` to ``false``.
 
 
-These keys can be used as both environment variables or keys in the ``storage_options`` parameter:
+The following keys can be used as both environment variables or keys in the
+``storage_options`` parameter:
 
 .. source: https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html
 
@@ -746,6 +767,10 @@ These keys can be used as both environment variables or keys in the ``storage_op
 
 Azure Blob Storage Configuration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Azure Blob Storage credentials can be configured by setting the ``AZURE_STORAGE_ACCOUNT_NAME``
+and ``AZURE_STORAGE_ACCOUNT_KEY`` environment variables. Alternatively, you can pass
+the account name and key in the ``storage_options`` parameter:
 
 .. code-block:: python
 
