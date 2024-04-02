@@ -31,7 +31,7 @@ use lance_index::{
         graph::NEIGHBORS_FIELD,
         hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
-        pq::storage::IvfProductQuantizationStorage,
+        quantizer::{IvfQuantizationStorage, Quantizer},
         Query, DIST_COL,
     },
     Index, IndexType,
@@ -55,23 +55,23 @@ pub(crate) struct HNSWIndexOptions {
 }
 
 #[derive(Clone)]
-pub(crate) struct HNSWIndex {
+pub(crate) struct HNSWIndex<Q: Quantizer> {
     hnsw: HNSW,
 
     // TODO: move these into IVFIndex after the refactor is complete
-    partition_storage: IvfProductQuantizationStorage,
+    partition_storage: IvfQuantizationStorage<Q>,
     partition_metadata: Option<Vec<HnswMetadata>>,
 
     options: HNSWIndexOptions,
 }
 
-impl Debug for HNSWIndex {
+impl<Q: Quantizer> Debug for HNSWIndex<Q> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.hnsw.fmt(f)
     }
 }
 
-impl HNSWIndex {
+impl<Q: Quantizer> HNSWIndex<Q> {
     pub async fn try_new(
         hnsw: HNSW,
         reader: Arc<dyn Reader>,
@@ -88,10 +88,10 @@ impl HNSWIndex {
             None => None,
         };
 
-        let ivf_pq_store = IvfProductQuantizationStorage::open(aux_reader).await?;
+        let ivf_store = IvfQuantizationStorage::open(aux_reader).await?;
         Ok(Self {
             hnsw,
-            partition_storage: ivf_pq_store,
+            partition_storage: ivf_store,
             partition_metadata,
             options,
         })
@@ -109,7 +109,7 @@ impl HNSWIndex {
 }
 
 #[async_trait]
-impl Index for HNSWIndex {
+impl<Q: Quantizer + Send + Sync + 'static> Index for HNSWIndex<Q> {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any {
         self
@@ -143,7 +143,7 @@ impl Index for HNSWIndex {
 }
 
 #[async_trait]
-impl VectorIndex for HNSWIndex {
+impl<Q: Quantizer + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let row_ids = self.hnsw.storage().row_ids();

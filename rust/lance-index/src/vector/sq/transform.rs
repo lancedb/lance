@@ -29,15 +29,26 @@ use lance_core::{Error, Result};
 
 use super::ScalarQuantizer;
 
-pub struct SQTransformer<T: ArrowFloatType + Send> {
+pub struct SQTransformer<T: ArrowFloatType> {
     quantizer: ScalarQuantizer,
     input_column: String,
     output_column: String,
 
-    _mark: PhantomData<T>,
+    _mark: PhantomData<fn() -> T>,
 }
 
-impl<T: ArrowFloatType + Send> Debug for SQTransformer<T> {
+impl<T: ArrowFloatType> SQTransformer<T> {
+    pub fn new(quantizer: ScalarQuantizer, input_column: String, output_column: String) -> Self {
+        Self {
+            quantizer,
+            input_column,
+            output_column,
+            _mark: PhantomData,
+        }
+    }
+}
+
+impl<T: ArrowFloatType> Debug for SQTransformer<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -48,7 +59,7 @@ impl<T: ArrowFloatType + Send> Debug for SQTransformer<T> {
 }
 
 #[async_trait::async_trait]
-impl<T: ArrowFloatType + Send + Sync> Transformer for SQTransformer<T> {
+impl<T: ArrowFloatType> Transformer for SQTransformer<T> {
     async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let input = batch
             .column_by_name(&self.input_column)

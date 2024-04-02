@@ -26,7 +26,7 @@ use lance::index::vector::VectorIndexParams;
 use lance::Dataset;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
-use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::{distance::MetricType, MatrixView};
 
@@ -89,13 +89,13 @@ async fn main() {
 
     let mut ivf_params = IvfBuildParams::new(128);
     ivf_params.sample_rate = 20480;
-    let pq_params = PQBuildParams::default();
     let hnsw_params = HnswBuildParams::default()
         .ef_construction(100)
         .num_edges(15)
         .max_num_edges(30);
+    let pq_params = SQBuildParams::default();
     let params =
-        VectorIndexParams::with_ivf_hnsw_pq_params(metric_type, ivf_params, hnsw_params, pq_params);
+        VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf_params, hnsw_params, pq_params);
     println!("{:?}", params);
 
     if args.create_index {

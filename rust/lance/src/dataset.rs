@@ -1765,7 +1765,7 @@ impl Dataset {
 
             let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
             if let Some(rename) = &alteration.rename {
-                field_dest.name = rename.clone();
+                field_dest.name.clone_from(rename);
             }
             if let Some(nullable) = alteration.nullable {
                 field_dest.nullable = nullable;

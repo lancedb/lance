@@ -348,7 +348,7 @@ impl Field {
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
-            f.children = self.children.clone()
+            f.children.clone_from(&self.children)
         } else {
             let first = path_components[0];
             for c in self.children.as_slice() {
