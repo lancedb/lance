@@ -426,7 +426,8 @@ impl Schema {
         Ok(())
     }
 
-    /// Set the field IDs that are unspecified (that is, -1).
+    /// Walk through the fields and assign a new field id to each field that does
+    /// not have one (e.g. is set to -1)
     ///
     /// If this schema is on an existing dataset, pass the result of
     /// `Manifest::max_field_id` to `max_existing_id`. If for some reason that
