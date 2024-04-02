@@ -4186,6 +4186,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fix_v0_10_5_corrupt_schema() {
+        // Schemas could be corrupted by successive calls to `add_columns` and
+        // `drop_columns`. We should be able to detect this by checking for
+        // duplicate field ids. We should be able to fix this in new commits
+        // by dropping unused data files and re-writing the schema.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.10.5/corrupt_schema").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        let validate_res = dataset.validate().await;
+        assert!(validate_res.is_err());
+
+        // Force a migration.
+        dataset.delete("false").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            data["b"]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[0, 4]
+        );
+        assert_eq!(
+            data["c"]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[0, 5]
+        );
+    }
+
+    #[tokio::test]
     async fn test_bfloat16_roundtrip() -> Result<()> {
         let inner_field = Arc::new(
             Field::new("item", DataType::FixedSizeBinary(2), true).with_metadata(

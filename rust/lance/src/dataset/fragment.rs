@@ -15,6 +15,7 @@
 //! Wraps a Fragment of the dataset.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -330,10 +331,28 @@ impl FileFragment {
     ///
     /// Verifies:
     /// * All data files exist and have the same length
+    /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
     /// * `Fragment.physical_rows` matches length of file
     /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
     pub async fn validate(&self) -> Result<()> {
+        let mut seen_fields = HashSet::new();
+        for field_id in self.metadata.files.iter().flat_map(|f| f.fields.iter()) {
+            if !seen_fields.insert(field_id) {
+                return Err(Error::corrupt_file(
+                    self.dataset
+                        .data_dir()
+                        .child(self.metadata.files[0].path.as_str()),
+                    format!(
+                        "Field id {} is duplicated in fragment {}",
+                        field_id,
+                        self.id()
+                    ),
+                    location!(),
+                ));
+            }
+        }
+
         let get_lengths = self
             .metadata
             .files

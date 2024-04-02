@@ -1,5 +1,3 @@
-import shutil
-
 import lance
 import pyarrow as pa
 

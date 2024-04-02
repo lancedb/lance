@@ -33,6 +33,7 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest, WriterVersion};
@@ -196,6 +197,71 @@ async fn migrate_manifest(
 
     manifest.fragments =
         Arc::new(migrate_fragments(dataset, &manifest.fragments, recompute_stats).await?);
+
+    Ok(())
+}
+
+/// Fix schema in case of duplicate field ids.
+///
+/// See test dataset v0.10.5/corrupt_schema
+fn fix_schema(manifest: &mut Manifest) -> Result<()> {
+    let mut field_id_seed = manifest.max_field_id().unwrap_or(-1) + 1;
+    let mut seen_fields = HashSet::new();
+    // This map is for transforming the data files' field lists
+    let mut file_field_mapping: HashMap<(usize, usize), i32> = HashMap::new();
+    // This map is for transforming the schema
+    let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
+    // Need to create a mapping from (data_file_dx, field_pos) -> field_id + a mapping from old_field_id -> new_field_id
+    let field_ids = manifest.fragments.first().map(|frag| {
+        frag.files
+            .iter()
+            .enumerate()
+            .flat_map(|(f_pos, f)| std::iter::repeat(f_pos).zip(f.fields.iter().enumerate()))
+    });
+    for (f_pos, (field_pos, field_id)) in field_ids.unwrap() {
+        if !seen_fields.insert(field_id) {
+            let new_field_id = field_id_seed;
+            field_id_seed += 1;
+
+            file_field_mapping.insert((f_pos, field_pos), new_field_id);
+            old_field_id_mapping.insert(*field_id, new_field_id);
+        }
+    }
+
+    if file_field_mapping.is_empty() {
+        return Ok(());
+    }
+
+    let mut fragments = manifest.fragments.as_ref().clone();
+
+    // Apply mapping to fragment files list
+    for fragment in fragments.iter_mut() {
+        for ((file_pos, field_pos), new_field_id) in &file_field_mapping {
+            fragment.files[*file_pos].fields[*field_pos] = *new_field_id;
+        }
+    }
+
+    // Apply mapping to the schema
+    for (old_field_id, new_field_id) in &old_field_id_mapping {
+        let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
+        field.id = *new_field_id;
+    }
+
+    // Drop data files that are no longer in use.
+    let remaining_field_ids = manifest
+        .schema
+        .fields_pre_order()
+        .map(|f| f.id)
+        .collect::<HashSet<_>>();
+    for fragment in fragments.iter_mut() {
+        fragment.files.retain(|file| {
+            file.fields
+                .iter()
+                .any(|field_id| remaining_field_ids.contains(field_id))
+        });
+    }
+
+    manifest.fragments = Arc::new(fragments);
 
     Ok(())
 }
@@ -367,6 +433,8 @@ pub(crate) async fn commit_transaction(
         let recompute_stats = previous_writer_version.is_none();
 
         migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
+
+        fix_schema(&mut manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
 
