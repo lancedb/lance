@@ -211,19 +211,21 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     let mut file_field_mapping: HashMap<(usize, usize), i32> = HashMap::new();
     // This map is for transforming the schema
     let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
-    // Need to create a mapping from (data_file_dx, field_pos) -> field_id + a mapping from old_field_id -> new_field_id
-    let field_ids = manifest.fragments.first().map(|frag| {
-        frag.files
+    let field_ids = if let Some(fragment) = manifest.fragments.first() {
+        fragment
+            .files
             .iter()
             .enumerate()
             .flat_map(|(f_pos, f)| std::iter::repeat(f_pos).zip(f.fields.iter().enumerate()))
-    });
-    for (f_pos, (field_pos, field_id)) in field_ids.unwrap() {
+    } else {
+        return Ok(());
+    };
+    for (file_pos, (field_pos, field_id)) in field_ids {
         if !seen_fields.insert(field_id) {
             let new_field_id = field_id_seed;
             field_id_seed += 1;
 
-            file_field_mapping.insert((f_pos, field_pos), new_field_id);
+            file_field_mapping.insert((file_pos, field_pos), new_field_id);
             old_field_id_mapping.insert(*field_id, new_field_id);
         }
     }
