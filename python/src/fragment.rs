@@ -181,6 +181,7 @@ impl FileFragment {
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
         batch_size: Option<usize>,
         filter: Option<String>,
         limit: Option<i64>,
@@ -189,11 +190,26 @@ impl FileFragment {
         batch_readahead: Option<usize>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
-        if let Some(cols) = columns {
-            scanner
-                .project(&cols)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both `columns` and `columns_with_transform`",
+                ));
+            }
+            (Some(cols), None) => {
+                scanner
+                    .project(&cols)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            (None, Some(cols_with_transform)) => {
+                scanner
+                    .project_with_transform(&cols_with_transform)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            (None, None) => {}
         }
+
         if let Some(batch_size) = batch_size {
             scanner.batch_size(batch_size);
         }

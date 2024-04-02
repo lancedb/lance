@@ -261,14 +261,22 @@ class LanceFragment(pa.dataset.Fragment):
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
+
+        columns_arg = {}
+        if isinstance(columns, dict):
+            # convert to list of tuples
+            columns_arg = {"columns_with_transform": list(columns.items())}
+        elif isinstance(columns, list):
+            columns_arg = {"columns": columns}
+
         s = self._fragment.scanner(
-            columns=columns,
             batch_size=batch_size,
             filter=filter_str,
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
             batch_readahead=batch_readahead,
+            **columns_arg,
         )
         from .dataset import LanceScanner
 
