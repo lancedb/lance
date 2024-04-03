@@ -611,10 +611,9 @@ class LanceDataset(pa.dataset.Dataset):
             The total number of rows in the dataset.
 
         """
-        if filter is None:
-            return self._ds.count_rows()
-        else:
-            return self.scanner(filter=filter).count_rows()
+        if filter is pa.compute.Expression:
+            raise ValueError("pa.compute.Expression is not supported yet")
+        return self._ds.count_rows(filter)
 
     def join(
         self,

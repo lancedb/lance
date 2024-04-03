@@ -920,7 +920,11 @@ impl Dataset {
         if let Some(filter) = filter {
             let mut scanner = self.scan();
             scanner.filter(&filter)?;
-            Ok(scanner.count_rows().await? as usize)
+            Ok(scanner
+                .project::<String>(&[])?
+                .with_row_id() // TODO: fix scan plan to not require row_id for count_rows.
+                .count_rows()
+                .await? as usize)
         } else {
             let cnts = stream::iter(self.get_fragments())
                 .map(|f| async move { f.count_rows().await })
@@ -2947,9 +2951,16 @@ mod tests {
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.validate().await.unwrap();
         assert_eq!(10, dataset.fragments().len());
         assert_eq!(400, dataset.count_rows(None).await.unwrap());
-        dataset.validate().await.unwrap();
+        assert_eq!(
+            200,
+            dataset
+                .count_rows(Some("i < 200".to_string()))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
