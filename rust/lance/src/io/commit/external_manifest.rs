@@ -194,7 +194,7 @@ mod test {
             .load()
             .await
             .unwrap();
-        assert_eq!(ds.count_rows().await.unwrap(), 100);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 100);
     }
 
     #[cfg(not(windows))]
@@ -247,7 +247,7 @@ mod test {
                 .load()
                 .await
                 .unwrap();
-            assert_eq!(ds.count_rows().await.unwrap(), 60);
+            assert_eq!(ds.count_rows(None).await.unwrap(), 60);
         }
     }
 
@@ -309,7 +309,7 @@ mod test {
         // Open without external store handler, should not see the out-of-sync commit
         let ds = DatasetBuilder::from_uri(ds_uri).load().await.unwrap();
         assert_eq!(ds.version().version, 5);
-        assert_eq!(ds.count_rows().await.unwrap(), 50);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 50);
 
         // Open with external store handler, should sync the out-of-sync commit on open
         let ds = DatasetBuilder::from_uri(ds_uri)
@@ -318,11 +318,11 @@ mod test {
             .await
             .unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
         // Open without external store handler again, should see the newly sync'd commit
         let ds = DatasetBuilder::from_uri(ds_uri).load().await.unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
     }
 }

@@ -564,7 +564,7 @@ impl Dataset {
 
     fn count_rows(&self) -> PyResult<usize> {
         RT.runtime
-            .block_on(self.ds.count_rows())
+            .block_on(self.ds.count_rows(None))
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 

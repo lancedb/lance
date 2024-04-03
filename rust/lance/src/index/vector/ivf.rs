@@ -970,7 +970,7 @@ async fn load_precomputed_partitions_if_available(
             let ds = DatasetBuilder::from_uri(file).load().await?;
             let stream = ds.scan().try_into_stream().await?;
             Ok(Some(
-                load_precomputed_partitions(stream, ds.count_rows().await?).await?,
+                load_precomputed_partitions(stream, ds.count_rows(None).await?).await?,
             ))
         }
         None => Ok(None),

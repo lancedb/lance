@@ -915,14 +915,20 @@ impl Dataset {
     ///
     /// It offers a fast path of counting rows by just computing via metadata.
     #[instrument(skip_all)]
-    pub async fn count_rows(&self) -> Result<usize> {
-        // Open file to read metadata.
-        let counts = stream::iter(self.get_fragments())
-            .map(|f| async move { f.count_rows().await })
-            .buffer_unordered(16)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(counts.iter().sum())
+    pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        // TODO: consolidate the count_rows into Scanner plan.
+        if let Some(filter) = filter {
+            let mut scanner = self.scan();
+            scanner.filter(&filter)?;
+            Ok(scanner.count_rows().await? as usize)
+        } else {
+            let cnts = stream::iter(self.get_fragments())
+                .map(|f| async move { f.count_rows().await })
+                .buffer_unordered(16)
+                .try_collect::<Vec<_>>()
+                .await?;
+            Ok(cnts.iter().sum())
+        }
     }
 
     #[instrument(skip_all, fields(num_rows=row_indices.len()))]
@@ -1234,7 +1240,7 @@ impl Dataset {
     /// Sample `n` rows from the dataset.
     pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
-        let num_rows = self.count_rows().await?;
+        let num_rows = self.count_rows(None).await?;
         let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
         self.take(&ids, projection).await
     }
@@ -2179,7 +2185,7 @@ mod tests {
         let result = Dataset::write(reader, test_uri, None).await.unwrap();
 
         // check dataset empty
-        assert_eq!(result.count_rows().await.unwrap(), 0);
+        assert_eq!(result.count_rows(None).await.unwrap(), 0);
         // Since the dataset is empty, will return None.
         assert_eq!(result.manifest.max_fragment_id(), None);
 
@@ -2219,7 +2225,7 @@ mod tests {
         let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
         // check num rows is 10
-        assert_eq!(actual_ds.count_rows().await.unwrap(), 10);
+        assert_eq!(actual_ds.count_rows(None).await.unwrap(), 10);
         // Max fragment id is still 0 since we only have 1 fragment.
         assert_eq!(actual_ds.manifest.max_fragment_id(), Some(0));
         // check expected batch is correct
@@ -2256,7 +2262,7 @@ mod tests {
         let result = Dataset::write(reader, test_uri, None).await.unwrap();
 
         // check dataset empty
-        assert_eq!(result.count_rows().await.unwrap(), 0);
+        assert_eq!(result.count_rows(None).await.unwrap(), 0);
         // Since the dataset is empty, will return None.
         assert_eq!(result.manifest.max_fragment_id(), None);
     }
@@ -2289,7 +2295,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(dataset.count_rows().await.unwrap(), num_rows);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), num_rows);
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 10);
@@ -2793,7 +2799,7 @@ mod tests {
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 400);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
         let projection = Schema::try_from(schema.as_ref()).unwrap();
         let values = dataset
             .take(
@@ -2862,7 +2868,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(dataset.count_rows().await.unwrap(), 400);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
         let projection = Schema::try_from(schema.as_ref()).unwrap();
         let indices = &[
             5_u64 << 32,        // 200
@@ -2942,7 +2948,7 @@ mod tests {
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(10, dataset.fragments().len());
-        assert_eq!(400, dataset.count_rows().await.unwrap());
+        assert_eq!(400, dataset.count_rows(None).await.unwrap());
         dataset.validate().await.unwrap();
     }
 
@@ -3968,7 +3974,7 @@ mod tests {
 
         // Assert num rows, deletions, and physical rows are all correct.
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 90);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 90);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
         let total_physical_rows = futures::stream::iter(dataset.get_fragments())
             .then(|f| async move { f.physical_rows().await })
@@ -3994,7 +4000,7 @@ mod tests {
             .unwrap();
 
         // Assert num rows, deletions, and physical rows are all correct.
-        assert_eq!(dataset.count_rows().await.unwrap(), 95);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 95);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
         let total_physical_rows = futures::stream::iter(dataset.get_fragments())
             .then(|f| async move { f.physical_rows().await })
@@ -4037,7 +4043,7 @@ mod tests {
         // Assert num rows, deletions, and physical rows are all correct, even
         // though stats are bad.
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 92);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 92);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
         let total_physical_rows = futures::stream::iter(dataset.get_fragments())
             .then(|f| async move { f.physical_rows().await })
@@ -4080,7 +4086,7 @@ mod tests {
             })
             .collect();
         assert_eq!(num_deletions, vec![Some(10), None, None]);
-        assert_eq!(dataset.count_rows().await.unwrap(), 97);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 97);
 
         // Scan data and assert it is as expected.
         let expected = RecordBatch::try_new(

@@ -1195,7 +1195,7 @@ mod tests {
             .unwrap();
 
         // Check that the data is as expected
-        assert_eq!(ds.count_rows().await.unwrap(), 2048);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 2048);
 
         let source = Box::new(RecordBatchIterator::new(
             source_batches.clone().into_iter().map(Ok),
@@ -1213,6 +1213,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(ds.count_rows().await.unwrap(), 2048);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 2048);
     }
 }

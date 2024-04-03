@@ -731,7 +731,7 @@ mod tests {
 
         async fn count_rows(&self) -> Result<usize> {
             let db = self.open().await?;
-            let count = db.count_rows().await?;
+            let count = db.count_rows(None).await?;
             Ok(count)
         }
     }
