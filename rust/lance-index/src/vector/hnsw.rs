@@ -17,7 +17,7 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -48,7 +48,7 @@ use super::graph::{
     builder::GraphBuilder,
     greedy_search,
     storage::{DistCalculator, VectorStorage},
-    Graph, OrderedFloat, OrderedNode, NEIGHBORS_COL, NEIGHBORS_FIELD,
+    Graph, OrderedFloat, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use super::ivf::storage::IvfData;
 use crate::vector::graph::beam_search;
@@ -477,10 +477,14 @@ impl HNSW {
 ///
 /// Algorithm 3 in the HNSW paper.
 fn select_neighbors(
-    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
+    orderd_candidates: &BinaryHeap<(OrderedFloat, u32)>,
     k: usize,
 ) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
-    orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
+    orderd_candidates
+        .iter()
+        .sorted()
+        .take(k)
+        .map(|(d, u)| (*d, *u))
 }
 
 /// Algorithm 4 in the HNSW paper.
@@ -491,26 +495,22 @@ fn select_neighbors(
 fn select_neighbors_heuristic(
     graph: &dyn Graph,
     query: &[f32],
-    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
+    orderd_candidates: &BinaryHeap<(OrderedFloat, u32)>,
     k: usize,
     extend_candidates: bool,
 ) -> impl Iterator<Item = (OrderedFloat, u32)> {
-    let mut heap: BinaryHeap<OrderedNode> = BinaryHeap::from_iter(
-        orderd_candidates
-            .iter()
-            .map(|(&d, &u)| OrderedNode { id: u, dist: d }),
-    );
+    let mut heap = orderd_candidates.clone();
 
     if extend_candidates {
         let dist_calc = graph.storage().dist_calculator(query);
         let mut visited = HashSet::with_capacity(orderd_candidates.len() * 64);
-        visited.extend(orderd_candidates.values());
-        orderd_candidates.iter().for_each(|(_, &u)| {
-            if let Some(neighbors) = graph.neighbors(u) {
+        visited.extend(orderd_candidates.iter().map(|(_, u)| *u));
+        orderd_candidates.iter().sorted().rev().for_each(|(_, u)| {
+            if let Some(neighbors) = graph.neighbors(*u) {
                 neighbors.for_each(|n| {
                     if !visited.contains(&n) {
                         let d: OrderedFloat = dist_calc.distance(&[n])[0].into();
-                        heap.push((d, n).into());
+                        heap.push((d, n));
                     }
                     visited.insert(n);
                 });
@@ -518,7 +518,7 @@ fn select_neighbors_heuristic(
         });
     }
 
-    heap.into_sorted_vec().into_iter().take(k).map(|n| n.into())
+    heap.into_sorted_vec().into_iter().take(k)
 }
 
 #[cfg(test)]
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_select_neighbors() {
-        let candidates: BTreeMap<OrderedFloat, u32> =
+        let candidates: BinaryHeap<(OrderedFloat, u32)> =
             (1..6).map(|i| (OrderedFloat(i as f32), i)).collect();
 
         let result = select_neighbors(&candidates, 3).collect::<Vec<_>>();

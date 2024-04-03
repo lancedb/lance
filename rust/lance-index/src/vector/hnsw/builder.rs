@@ -230,7 +230,7 @@ impl HNSWBuilder {
                 cur_level.prune(nb, self.params.m_max)?;
             }
             cur_level.prune(node, self.params.m_max)?;
-            ep = candidates.values().copied().collect();
+            ep = candidates.iter().map(|(_, node)| *node).collect();
         }
 
         if level > self.levels.len() as u16 {

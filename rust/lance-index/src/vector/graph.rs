@@ -15,7 +15,8 @@
 //! Generic Graph implementation.
 //!
 
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
@@ -171,7 +172,7 @@ pub trait Graph {
 ///
 /// Returns
 /// -------
-/// A sorted list of ``(dist, node_id)`` pairs.
+/// A descending sorted list of ``(dist, node_id)`` pairs.
 ///
 pub(super) fn beam_search(
     graph: &dyn Graph,
@@ -180,26 +181,31 @@ pub(super) fn beam_search(
     k: usize,
     dist_calc: Option<Arc<dyn DistCalculator>>,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
-) -> Result<BTreeMap<OrderedFloat, u32>> {
+) -> Result<BinaryHeap<(OrderedFloat, u32)>> {
     let mut visited: HashSet<_> = start.iter().copied().collect();
     let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
-    let mut candidates: BTreeMap<OrderedFloat, _> = dist_calc
+    let mut candidates: BinaryHeap<Reverse<(OrderedFloat, u32)>> = dist_calc
         .distance(start)
         .iter()
         .zip(start)
-        .map(|(&dist, id)| (dist.into(), *id))
-        .collect::<BTreeMap<_, _>>();
-    let mut results = candidates
+        .map(|(&dist, id)| Reverse((dist.into(), *id)))
+        .collect();
+    let mut results: BinaryHeap<(OrderedFloat, u32)> = candidates
         .clone()
         .into_iter()
-        .filter(|node| bitset.map(|bitset| bitset.contains(node.1)).unwrap_or(true))
-        .collect::<BTreeMap<_, _>>();
+        .filter(|node| {
+            bitset
+                .map(|bitset| bitset.contains(node.0 .1))
+                .unwrap_or(true)
+        })
+        .map(|v| v.0)
+        .collect();
 
     while !candidates.is_empty() {
-        let (dist, current) = candidates.pop_first().expect("candidates is empty");
+        let (dist, current) = candidates.pop().expect("candidates is empty").0;
         let furthest = results
-            .last_key_value()
-            .map(|kv| *kv.0)
+            .peek()
+            .map(|kv| kv.0)
             .unwrap_or(OrderedFloat(f32::INFINITY));
         if dist > furthest {
             break;
@@ -215,21 +221,21 @@ pub(super) fn beam_search(
             }
             visited.insert(neighbor);
             let furthest = results
-                .last_key_value()
-                .map(|kv| *kv.0)
+                .peek()
+                .map(|kv| kv.0)
                 .unwrap_or(OrderedFloat(f32::INFINITY));
             let dist = dist_calc.distance(&[neighbor])[0].into();
-            if dist < furthest || results.len() < k {
+            if dist <= furthest || results.len() < k {
                 if bitset
                     .map(|bitset| bitset.contains(neighbor))
                     .unwrap_or(true)
                 {
-                    results.insert(dist, neighbor);
+                    results.push((dist, neighbor));
                     if results.len() > k {
-                        results.pop_last();
+                        results.pop();
                     }
                 }
-                candidates.insert(dist, neighbor);
+                candidates.push(Reverse((dist, neighbor)));
             }
         }
     }
