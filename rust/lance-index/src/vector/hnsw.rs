@@ -476,10 +476,10 @@ impl HNSW {
 /// Select neighbors from the ordered candidate list.
 ///
 /// Algorithm 3 in the HNSW paper.
-fn select_neighbors<'a>(
-    orderd_candidates: &'a BinaryHeap<(OrderedFloat, u32)>,
+fn select_neighbors(
+    orderd_candidates: &BinaryHeap<(OrderedFloat, u32)>,
     k: usize,
-) -> impl Iterator<Item = (OrderedFloat, u32)> + 'a {
+) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
     orderd_candidates
         .iter()
         .sorted()
