@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
                 dataset.version().version,
                 dataset.versions().await.unwrap().len()
             );
-            println!("Total records: {}", dataset.count_rows().await.unwrap());
+            println!("Total records: {}", dataset.count_rows(None).await.unwrap());
             println!("Schema:\n{}", dataset.schema());
 
             Ok(())
