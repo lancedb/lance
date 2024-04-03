@@ -217,39 +217,39 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
 
     let mut field_id_seed = manifest.max_field_id() + 1;
     let mut seen_fields = HashSet::new();
-    // This map is for transforming the data files' field lists
-    let mut file_field_mapping: HashMap<(usize, usize), i32> = HashMap::new();
-    // This map is for transforming the schema
     let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
     let field_ids = if let Some(fragment) = manifest.fragments.first() {
-        fragment
-            .files
-            .iter()
-            .enumerate()
-            .flat_map(|(f_pos, f)| std::iter::repeat(f_pos).zip(f.fields.iter().enumerate()))
+        fragment.files.iter().flat_map(|file| file.fields.iter())
     } else {
         return Ok(());
     };
-    for (file_pos, (field_pos, field_id)) in field_ids {
+    for field_id in field_ids {
         if !seen_fields.insert(field_id) {
-            let new_field_id = field_id_seed;
+            old_field_id_mapping.insert(*field_id, field_id_seed);
             field_id_seed += 1;
-
-            file_field_mapping.insert((file_pos, field_pos), new_field_id);
-            old_field_id_mapping.insert(*field_id, new_field_id);
         }
     }
 
-    if file_field_mapping.is_empty() {
+    if old_field_id_mapping.is_empty() {
         return Ok(());
     }
 
     let mut fragments = manifest.fragments.as_ref().clone();
 
     // Apply mapping to fragment files list
-    for fragment in fragments.iter_mut() {
-        for ((file_pos, field_pos), new_field_id) in &file_field_mapping {
-            fragment.files[*file_pos].fields[*field_pos] = *new_field_id;
+    for fragment in fragments.iter_mut().rev() {
+        let mut seen_fields = HashSet::new();
+        for field_id in fragment
+            .files
+            .iter_mut()
+            .rev()
+            .flat_map(|file| file.fields.iter_mut())
+        {
+            if let Some(new_field_id) = old_field_id_mapping.get(field_id) {
+                if seen_fields.insert(*field_id) {
+                    *field_id = *new_field_id;
+                }
+            }
         }
     }
 

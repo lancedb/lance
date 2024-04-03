@@ -3412,6 +3412,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_cols_then_append() -> Result<()> {
+        // Validate we can merge, then append, creating a dataset with varying
+        // number of data files between fragments. Then perform another operation.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch1 =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch1)], schema.clone()),
+            test_uri,
+            None,
+        )
+        .await?;
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("x".into(), "i + 1".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("x", DataType::Int32, false),
+        ]));
+        let batch2 = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4])),
+                Arc::new(Int32Array::from(vec![4, 5])),
+            ],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch2)], new_schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        dataset.validate().await?;
+
+        // Validate we can still perform new operations on this dataset.
+        dataset.delete("i = 1").await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_delete() {
         fn sequence_data(range: Range<u32>) -> RecordBatch {
             let schema = Arc::new(ArrowSchema::new(vec![Field::new(
