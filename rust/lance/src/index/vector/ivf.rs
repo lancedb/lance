@@ -2353,7 +2353,8 @@ mod tests {
         let ivf_params =
             IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
 
-        let pq_params = PQBuildParams::default();
+        let mut pq_params = PQBuildParams::default();
+        pq_params.num_sub_vectors = DIM;
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             MetricType::L2,
@@ -2417,6 +2418,7 @@ mod tests {
 
         let gt = ground_truth(&mat, query.values(), k);
         let recall = results.intersection(&gt).count() as f32 / k as f32;
+        println!("recall: {}", recall);
         assert!(
             recall >= 0.8,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
@@ -2503,6 +2505,7 @@ mod tests {
 
         let gt = ground_truth(&mat, query.values(), k);
         let recall = results.intersection(&gt).count() as f32 / k as f32;
+        println!("recall: {}", recall);
         assert!(
             recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
