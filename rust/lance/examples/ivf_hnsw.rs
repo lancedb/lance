@@ -107,7 +107,7 @@ async fn main() {
         println!("build={:.3}s", now.elapsed().as_secs_f32());
     }
 
-    println!("Loaded {} batches", dataset.count_rows().await.unwrap());
+    println!("Loaded {} records", dataset.count_rows(None).await.unwrap());
 
     let q = dataset
         .take(&[0], &dataset.schema().project(&[column]).unwrap())

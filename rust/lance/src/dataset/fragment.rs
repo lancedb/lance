@@ -1251,7 +1251,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
         let dataset = create_dataset(test_uri).await;
         let schema = dataset.schema();
-        let dataset_rows = dataset.count_rows().await.unwrap();
+        let dataset_rows = dataset.count_rows(None).await.unwrap();
 
         let mut paths: Vec<String> = Vec::new();
         for f in dataset.get_fragments() {
@@ -1278,7 +1278,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
+        assert_eq!(new_dataset.count_rows(None).await.unwrap(), dataset_rows);
 
         // Fragments will have number of rows recorded in metadata, even though
         // we passed `None` when constructing the `FileFragment`.
@@ -1326,12 +1326,12 @@ mod tests {
             let test_uri = test_dir.path().to_str().unwrap();
             let mut dataset = create_dataset(test_uri).await;
             dataset.validate().await.unwrap();
-            assert_eq!(dataset.count_rows().await.unwrap(), 200);
+            assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 
             if with_delete {
                 dataset.delete("i >= 15 and i < 20").await.unwrap();
                 dataset.validate().await.unwrap();
-                assert_eq!(dataset.count_rows().await.unwrap(), 195);
+                assert_eq!(dataset.count_rows(None).await.unwrap(), 195);
             }
 
             let fragment = &mut dataset.get_fragment(0).unwrap();
@@ -1371,7 +1371,7 @@ mod tests {
 
             // We only kept the first fragment of 40 rows
             assert_eq!(
-                dataset.count_rows().await.unwrap(),
+                dataset.count_rows(None).await.unwrap(),
                 if with_delete { 35 } else { 40 }
             );
             assert_eq!(dataset.version().version, before_version + 1);
@@ -1412,12 +1412,12 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
         let mut dataset = create_dataset(test_uri).await;
         dataset.validate().await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 200);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 
         let deleted_range = 15..20;
         dataset.delete("i >= 15 and i < 20").await.unwrap();
         dataset.validate().await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 195);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 195);
 
         // Create data to merge: merge in double the data
         let schema = Arc::new(ArrowSchema::new(vec![

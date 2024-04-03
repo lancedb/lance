@@ -473,6 +473,18 @@ def test_count_fragments(tmp_path: Path):
     assert count_fragments == 1
 
 
+def test_count_rows(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    count_rows = dataset.count_rows()
+    assert count_rows == 100
+
+    assert dataset.count_rows(filter="a < 50") == 50
+
+
 def test_get_fragments(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

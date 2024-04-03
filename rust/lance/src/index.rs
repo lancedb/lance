@@ -402,7 +402,7 @@ impl DatasetIndexExt for Dataset {
         }
         let num_unindexed_fragments = unindexed_fragments.len();
         let num_indexed_fragments = self.fragments().len() - num_unindexed_fragments;
-        let num_indexed_rows = self.count_rows().await? - num_unindexed_rows;
+        let num_indexed_rows = self.count_rows(None).await? - num_unindexed_rows;
 
         let stats = json!({
             "index_type": indices_stats[0]["index_type"],

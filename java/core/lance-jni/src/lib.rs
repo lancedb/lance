@@ -127,7 +127,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_countRows(
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, "nativeDatasetHandle") };
     match dataset_guard {
         Ok(dataset) => dataset
-            .count_rows()
+            .count_rows(None)
             .expect("Faild to get the row count from dataset's metadata.")
             as jint,
         Err(_) => -1,
