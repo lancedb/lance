@@ -4212,7 +4212,7 @@ mod tests {
                 .downcast_ref::<Int64Array>()
                 .unwrap()
                 .values(),
-            &[0, 4]
+            &[0, 4, 8, 12]
         );
         assert_eq!(
             data["c"]
@@ -4220,7 +4220,7 @@ mod tests {
                 .downcast_ref::<Int64Array>()
                 .unwrap()
                 .values(),
-            &[0, 5]
+            &[0, 5, 10, 15]
         );
     }
 
