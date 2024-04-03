@@ -627,6 +627,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
         "s3" | "s3+ddb" => {
             storage_options.with_env_s3();
             let storage_options = storage_options.as_s3_options();
+            dbg!(&storage_options);
 
             // if url.scheme() == "s3+ddb" && options.commit_handler.is_some() {
             //     return Err(Error::InvalidInput {

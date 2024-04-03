@@ -47,6 +47,7 @@ build-backend = "maturin"
 
 [project.optional-dependencies]
 tests = [
+    "boto3",
     "datasets",
     "duckdb; python_version<'3.12'", # TODO: remove when duckdb supports 3.12
     "ml_dtypes",

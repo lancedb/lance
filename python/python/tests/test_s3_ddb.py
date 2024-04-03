@@ -11,7 +11,14 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+"""
+Integration tests with S3 and DynamoDB.
 
+See DEVELOPMENT.md under heading "Integration Tests" for more information.
+"""
+
+import copy
+import time
 import uuid
 from concurrent import futures
 from concurrent.futures import ThreadPoolExecutor
@@ -21,32 +28,113 @@ import lance
 import pyarrow as pa
 import pytest
 
+# These are all keys that are accepted by storage_options
+CONFIG = {
+    "allow_http": "true",
+    "aws_access_key_id": "ACCESSKEY",
+    "aws_secret_access_key": "SECRETKEY",
+    "aws_endpoint": "http://localhost:9000",
+    "dynamodb_endpoint": "http://localhost:8000",
+    "aws_region": "us-west-2",
+}
+
+
+def get_boto3_client(*args, **kwargs):
+    import boto3
+
+    return boto3.client(
+        *args,
+        region_name=CONFIG["aws_region"],
+        aws_access_key_id=CONFIG["aws_access_key_id"],
+        aws_secret_access_key=CONFIG["aws_secret_access_key"],
+        **kwargs,
+    )
+
+
+@pytest.fixture(scope="module")
+def s3_bucket():
+    s3 = get_boto3_client("s3", endpoint_url=CONFIG["aws_endpoint"])
+    bucket_name = "lance-integtest"
+    # if bucket exists, delete it
+    try:
+        # Delete all objects first
+        for obj in s3.list_objects(Bucket=bucket_name).get("Contents", []):
+            s3.delete_object(Bucket=bucket_name, Key=obj["Key"])
+        s3.delete_bucket(Bucket=bucket_name)
+    except s3.exceptions.NoSuchBucket:
+        pass
+    s3.create_bucket(Bucket=bucket_name)
+    yield bucket_name
+    s3.delete_bucket(Bucket=bucket_name)
+
+
+@pytest.fixture(scope="module")
+def ddb_table():
+    dynamodb = get_boto3_client("dynamodb", endpoint_url=CONFIG["dynamodb_endpoint"])
+    table_name = "lance-integtest"
+    # if table exists, delete it
+    try:
+        dynamodb.delete_table(TableName=table_name)
+        # smh dynamodb is async
+        time.sleep(0.5)
+    except dynamodb.exceptions.ResourceNotFoundException:
+        pass
+    dynamodb.create_table(
+        TableName=table_name,
+        KeySchema=[
+            {"AttributeName": "base_uri", "KeyType": "HASH"},
+            {"AttributeName": "version", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "base_uri", "AttributeType": "S"},
+            {"AttributeName": "version", "AttributeType": "N"},
+        ],
+        ProvisionedThroughput={"ReadCapacityUnits": 10, "WriteCapacityUnits": 10},
+    )
+
+    time.sleep(1)
+    yield table_name
+    dynamodb.delete_table(TableName=table_name)
+
 
 @pytest.mark.integration
-def test_s3_ddb_create_and_append(s3_bucket: str, ddb_table: str):
+@pytest.mark.parametrize("use_env", [True, False])
+def test_s3_ddb_create_and_append(
+    s3_bucket: str, ddb_table: str, use_env: bool, monkeypatch
+):
+    storage_options = copy.deepcopy(CONFIG)
+    if use_env:
+        for key, value in storage_options.items():
+            monkeypatch.setenv(key.upper(), value)
+        storage_options = None
+
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     table_name = uuid.uuid4().hex
     table_dir = f"s3+ddb://{s3_bucket}/{table_name}?ddbTableName={ddb_table}"
-    lance.write_dataset(table1, table_dir)
-    assert len(lance.dataset(table_dir).versions()) == 1
+    ds = lance.write_dataset(table1, table_dir, storage_options=storage_options)
+    assert len(ds.versions()) == 1
 
     table2 = pa.Table.from_pylist([{"a": 100, "b": 2000}])
 
     # can detect existing dataset
     with pytest.raises(OSError, match="Dataset already exists"):
-        lance.write_dataset(table2, table_dir)
+        lance.write_dataset(table2, table_dir, storage_options=storage_options)
 
-    lance.write_dataset(table2, table_dir, mode="append")
+    ds = lance.write_dataset(
+        table2, table_dir, mode="append", storage_options=storage_options
+    )
 
-    assert len(lance.dataset(table_dir).versions()) == 2
-    assert lance.dataset(table_dir).count_rows() == 3
+    assert len(ds.versions()) == 2
+    assert ds.count_rows() == 3
 
     # can checkout
-    assert lance.dataset(table_dir, version=1).count_rows() == 2
-    assert lance.dataset(table_dir, version=2).count_rows() == 3
+    ds = ds.checkout_version(1)
+    assert ds.count_rows() == 2
+    ds = ds.checkout_version(2)
+    assert ds.count_rows() == 3
 
     with pytest.raises(ValueError, match="Not found"):
-        lance.dataset(table_dir, version=3)
+        ds.checkout_version(3)
 
 
 @pytest.mark.integration
