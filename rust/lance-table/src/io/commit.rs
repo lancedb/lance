@@ -324,6 +324,8 @@ pub async fn commit_handler_from_url(
     };
 
     match url.scheme() {
+        // TODO: for Cloudflare R2 and Minio, we can provide a PutIfNotExist commit handler
+        // See: https://docs.rs/object_store/latest/object_store/aws/enum.S3ConditionalPut.html#variant.ETagMatch
         "s3" => Ok(Arc::new(UnsafeCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::InvalidInput {
