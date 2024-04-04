@@ -1292,7 +1292,7 @@ class LanceDataset(pa.dataset.Dataset):
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
 
-        Optional parameters for "IVF_HNSW_PQ":
+        Optional parameters for "IVF_HNSW_*":
         - **max_level**: the maximum number of levels in the graph.
         - **m**: the number of edges per node in the graph.
         - **m_max**: the maximum number of edges per node in the graph.
@@ -1379,10 +1379,10 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        if index_type not in ["IVF_PQ", "IVF_HNSW_PQ"]:
+        valid_index_types = ["IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+        if index_type not in valid_index_types:
             raise NotImplementedError(
-                f"Only [IVF_PQ, IVF_HNSW_PQ] index types supported. "
-                f"Got {index_type}"
+                f"Only {valid_index_types} index types supported. " f"Got {index_type}"
             )
         if index_type.startswith("IVF"):
             if num_partitions is None:

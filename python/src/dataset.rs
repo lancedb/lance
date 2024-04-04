@@ -40,6 +40,7 @@ use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     DatasetIndexExt, IndexParams, IndexType,
@@ -881,7 +882,7 @@ impl Dataset {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
             "BTREE" => IndexType::Scalar,
-            "IVF_PQ" | "IVF_HNSW_PQ" => IndexType::Vector,
+            "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -1147,14 +1148,23 @@ fn prepare_vector_index_params(
 ) -> PyResult<Box<dyn IndexParams>> {
     let mut m_type = MetricType::L2;
     let mut ivf_params = IvfBuildParams::default();
-    let mut pq_params = PQBuildParams::default();
     let mut hnsw_params = HnswBuildParams::default();
+    let mut pq_params = PQBuildParams::default();
+    let mut sq_params = SQBuildParams::default();
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
         if let Some(mt) = kwargs.get_item("metric_type")? {
             m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        // Parse sample rate
+        if let Some(sample_rate) = kwargs.get_item("sample_rate")? {
+            let sample_rate = PyAny::downcast::<PyInt>(sample_rate)?.extract()?;
+            ivf_params.sample_rate = sample_rate;
+            pq_params.sample_rate = sample_rate;
+            sq_params.sample_rate = sample_rate;
         }
 
         // Parse IVF params
@@ -1202,6 +1212,23 @@ fn prepare_vector_index_params(
                 }
             }
 
+        // Parse HNSW params
+        if let Some(max_level) = kwargs.get_item("max_level")? {
+            hnsw_params.max_level = PyAny::downcast::<PyInt>(max_level)?.extract()?;
+        }
+
+        if let Some(m) = kwargs.get_item("m")? {
+            hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
+        }
+
+        if let Some(m_max) = kwargs.get_item("m_max")? {
+            hnsw_params.m_max = PyAny::downcast::<PyInt>(m_max)?.extract()?;
+        }
+
+        if let Some(ef_c) = kwargs.get_item("ef_construction")? {
+            hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
+        }
+
         // Parse PQ params
         if let Some(n) = kwargs.get_item("num_bits")? {
             pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
@@ -1235,23 +1262,6 @@ fn prepare_vector_index_params(
         if let Some(o) = kwargs.get_item("max_opq_iterations")? {
             pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
         };
-
-        // Parse HNSW params
-        if let Some(max_level) = kwargs.get_item("max_level")? {
-            hnsw_params.max_level = PyAny::downcast::<PyInt>(max_level)?.extract()?;
-        }
-
-        if let Some(m) = kwargs.get_item("m")? {
-            hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
-        }
-
-        if let Some(m_max) = kwargs.get_item("m_max")? {
-            hnsw_params.m_max = PyAny::downcast::<PyInt>(m_max)?.extract()?;
-        }
-
-        if let Some(ef_c) = kwargs.get_item("ef_construction")? {
-            hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
-        }
     }
 
     match index_type {
@@ -1264,6 +1274,13 @@ fn prepare_vector_index_params(
             ivf_params,
             hnsw_params,
             pq_params,
+        ))),
+
+        "IVF_HNSW_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_sq_params(
+            m_type,
+            ivf_params,
+            hnsw_params,
+            sq_params,
         ))),
 
         _ => Err(PyValueError::new_err(format!(
