@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use lance_core::Result;
 use object_store::{path::Path, ObjectStore};
 
@@ -44,6 +45,27 @@ impl CloudObjectReader {
             block_size,
         })
     }
+
+    // Retries for the initial request are handled by object store, but
+    // there are no retries for failures that occur during the streaming
+    // of the response body. Thus we add an outer retry loop here.
+    async fn do_with_retry<'a, O>(
+        &self,
+        f: impl Fn() -> BoxFuture<'a, std::result::Result<O, object_store::Error>>,
+    ) -> Result<O> {
+        let mut retries = 3;
+        loop {
+            match f().await {
+                Ok(val) => return Ok(val),
+                Err(err) => {
+                    if retries == 0 {
+                        return Err(err.into());
+                    }
+                    retries -= 1;
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -58,24 +80,14 @@ impl Reader for CloudObjectReader {
 
     /// Object/File Size.
     async fn size(&self) -> Result<usize> {
-        Ok(self.object_store.head(&self.path).await?.size)
+        let meta = self
+            .do_with_retry(|| self.object_store.head(&self.path))
+            .await?;
+        Ok(meta.size)
     }
 
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
-        // Retries for the initial request are handled by object store, but
-        // there are no retries for failures that occur during the streaming
-        // of the response body. Thus we add an outer retry loop here.
-        let mut retries = 3;
-        loop {
-            match self.object_store.get_range(&self.path, range.clone()).await {
-                Ok(bytes) => return Ok(bytes),
-                Err(err) => {
-                    if retries == 0 {
-                        return Err(err.into());
-                    }
-                    retries -= 1;
-                }
-            }
-        }
+        self.do_with_retry(|| self.object_store.get_range(&self.path, range.clone()))
+            .await
     }
 }
