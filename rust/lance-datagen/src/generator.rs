@@ -1078,10 +1078,12 @@ const MS_PER_DAY: i64 = 86400000;
 
 pub mod array {
 
+    use arrow::datatypes::{
+        Int16Type, Int64Type, Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType,
+    };
     use arrow_array::types::{
         Decimal128Type, Decimal256Type, DurationMicrosecondType, DurationMillisecondType,
         DurationNanosecondType, DurationSecondType, Float16Type, Float32Type, Float64Type,
-        Int16Type, Int32Type, Int64Type, Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType,
         IntervalYearMonthType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     };
     use arrow_array::{
@@ -1091,7 +1093,6 @@ pub mod array {
     };
     use arrow_schema::{IntervalUnit, TimeUnit};
     use chrono::Utc;
-    use rand::distributions::Uniform;
     use rand::prelude::Distribution;
 
     use super::*;
@@ -1621,10 +1622,8 @@ pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{
-        types::{Float32Type, Int16Type, Int32Type, Int8Type, UInt32Type},
-        BooleanArray, Float32Array, Int16Array, Int32Array, Int8Array, UInt32Array,
-    };
+    use arrow::datatypes::{Float32Type, Int16Type, Int8Type, UInt32Type};
+    use arrow_array::{BooleanArray, Float32Array, Int16Array, Int32Array, Int8Array, UInt32Array};
 
     use super::*;
 

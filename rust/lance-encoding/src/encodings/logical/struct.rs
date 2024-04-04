@@ -126,7 +126,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                         next_page = &field_scheduler[status.page_offset as usize];
                     }
 
-                    let page_range_start = status.rows_to_skip as u32;
+                    let page_range_start = status.rows_to_skip;
                     let page_rows_remaining = next_page.num_rows() - page_range_start;
                     let rows_to_take = status.rows_to_take.min(page_rows_remaining);
                     let page_range = page_range_start..(page_range_start + rows_to_take);
