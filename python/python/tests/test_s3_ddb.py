@@ -57,14 +57,19 @@ def s3_bucket():
     bucket_name = "lance-integtest"
     # if bucket exists, delete it
     try:
-        # Delete all objects first
-        for obj in s3.list_objects(Bucket=bucket_name).get("Contents", []):
-            s3.delete_object(Bucket=bucket_name, Key=obj["Key"])
-        s3.delete_bucket(Bucket=bucket_name)
+        delete_bucket(s3, bucket_name)
     except s3.exceptions.NoSuchBucket:
         pass
     s3.create_bucket(Bucket=bucket_name)
     yield bucket_name
+
+    delete_bucket(s3, bucket_name)
+
+
+def delete_bucket(s3, bucket_name):
+    # Delete all objects first
+    for obj in s3.list_objects(Bucket=bucket_name).get("Contents", []):
+        s3.delete_object(Bucket=bucket_name, Key=obj["Key"])
     s3.delete_bucket(Bucket=bucket_name)
 
 
@@ -102,6 +107,8 @@ def ddb_table():
 def test_s3_ddb_create_and_append(
     s3_bucket: str, ddb_table: str, use_env: bool, monkeypatch
 ):
+    # Test with and without environment variables, so we can validate it works
+    # either way you provide them.
     storage_options = copy.deepcopy(CONFIG)
     if use_env:
         for key, value in storage_options.items():
@@ -141,7 +148,11 @@ def test_s3_ddb_create_and_append(
 def test_s3_ddb_concurrent_commit(
     s3_bucket: str,
     ddb_table: str,
+    monkeypatch,
 ):
+    for key, value in CONFIG.items():
+        monkeypatch.setenv(key.upper(), value)
+
     table = pa.Table.from_pylist([{"a": -1}])
     table_name = uuid.uuid4().hex
     table_dir = f"s3+ddb://{s3_bucket}/{table_name}?ddbTableName={ddb_table}"
@@ -169,7 +180,12 @@ def test_s3_ddb_concurrent_commit(
 
 
 @pytest.mark.integration
-def test_s3_ddb_concurrent_commit_more_than_five(s3_bucket: str, ddb_table: str):
+def test_s3_ddb_concurrent_commit_more_than_five(
+    s3_bucket: str, ddb_table: str, monkeypatch
+):
+    for key, value in CONFIG.items():
+        monkeypatch.setenv(key.upper(), value)
+
     table = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     table_name = uuid.uuid4().hex
     table_dir = f"s3+ddb://{s3_bucket}/{table_name}?ddbTableName={ddb_table}"
