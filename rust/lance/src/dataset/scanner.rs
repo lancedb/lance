@@ -1489,11 +1489,10 @@ impl From<DatasetRecordBatchStream> for SendableRecordBatchStream {
 #[cfg(test)]
 mod test {
 
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
     use std::vec;
 
     use arrow::array::as_primitive_array;
-    use arrow::compute::concat_batches;
     use arrow::datatypes::Int32Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
@@ -1502,14 +1501,12 @@ mod test {
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{ArrowError, DataType};
+    use arrow_schema::ArrowError;
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
-    use futures::TryStreamExt;
     use half::f16;
-    use lance_core::ROW_ID;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
-    use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use tempfile::{tempdir, TempDir};
 

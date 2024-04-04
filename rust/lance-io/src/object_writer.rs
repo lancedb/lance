@@ -93,8 +93,7 @@ impl AsyncWrite for ObjectWriter {
 #[cfg(test)]
 mod tests {
 
-    use object_store::{memory::InMemory, path::Path};
-    use tokio::io::AsyncWriteExt;
+    use object_store::memory::InMemory;
 
     use super::*;
 

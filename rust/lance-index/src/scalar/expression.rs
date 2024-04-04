@@ -500,18 +500,14 @@ pub fn apply_scalar_indices(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::ops::Bound;
 
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{Field, Schema};
     use datafusion::error::Result as DFResult;
     use datafusion_common::{config::ConfigOptions, TableReference};
-    use datafusion_common::{Column, DFSchema, ScalarValue};
-    use datafusion_expr::{AggregateUDF, Expr, ScalarUDF, TableSource, WindowUDF};
+    use datafusion_common::{Column, DFSchema};
+    use datafusion_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
     use datafusion_sql::planner::{ContextProvider, PlannerContext, SqlToRel};
     use datafusion_sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
-
-    use crate::scalar::expression::apply_scalar_indices;
-    use crate::scalar::ScalarQuery;
 
     use super::*;
 

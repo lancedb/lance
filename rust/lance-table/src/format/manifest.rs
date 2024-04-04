@@ -484,9 +484,7 @@ impl SelfDescribingFileReader for FileReader {
 mod tests {
     use super::*;
 
-    use super::Fragment;
     use arrow_schema::{Field, Schema as ArrowSchema};
-    use lance_core::datatypes::Schema;
 
     #[test]
     fn test_writer_version() {

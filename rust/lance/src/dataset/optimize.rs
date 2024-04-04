@@ -926,7 +926,6 @@ mod tests {
     use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
-    use futures::TryStreamExt;
     use tempfile::tempdir;
 
     use super::*;

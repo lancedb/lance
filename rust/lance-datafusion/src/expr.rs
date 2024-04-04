@@ -541,10 +541,8 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
 mod tests {
     use super::*;
 
-    use arrow_schema::{Field, TimeUnit};
+    use arrow_schema::Field;
     use datafusion::logical_expr::{BinaryExpr, Operator};
-    use datafusion_common::Column;
-    use prost::Message;
     use substrait_expr::{
         builder::{schema::SchemaBuildersExt, BuilderParams, ExpressionsBuilder},
         functions::functions_comparison::FunctionsComparisonExt,

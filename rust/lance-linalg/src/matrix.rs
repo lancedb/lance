@@ -383,7 +383,6 @@ mod tests {
     #[cfg(feature = "opq")]
     use approx::assert_relative_eq;
     use arrow_array::types::{Float32Type, Float64Type};
-    use lance_arrow::FixedSizeListArrayExt;
 
     use super::*;
 

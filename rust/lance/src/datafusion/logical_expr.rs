@@ -219,7 +219,6 @@ mod tests {
     use super::*;
 
     use arrow_schema::{Field, Schema as ArrowSchema};
-    use datafusion::scalar::ScalarValue;
 
     #[test]
     fn test_resolve_large_utf8() {

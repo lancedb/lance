@@ -293,7 +293,6 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::Float32Array;
     use proptest::prelude::*;
 
     use crate::test_utils::{

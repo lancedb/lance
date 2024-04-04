@@ -21,7 +21,6 @@ use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
 use lance_table::format::Index;
 
 // Extends Lance Dataset with secondary index.
-///
 #[async_trait]
 pub trait DatasetIndexExt {
     /// Create indices on columns.

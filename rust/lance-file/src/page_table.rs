@@ -151,7 +151,6 @@ mod tests {
     use super::*;
 
     use lance_io::local::LocalObjectReader;
-    use tempfile;
 
     #[test]
     fn test_set_page_info() {

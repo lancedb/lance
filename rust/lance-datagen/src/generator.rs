@@ -614,39 +614,6 @@ impl ArrayGenerator for RandomBinaryGenerator {
     }
 }
 
-// A function that converts an array from one type to another
-type WrapFn = Box<
-    dyn Fn(Arc<dyn arrow_array::Array>) -> Result<Arc<dyn arrow_array::Array>, ArrowError>
-        + Send
-        + Sync,
->;
-
-struct WrappedGenerator {
-    generator: Box<dyn ArrayGenerator>,
-    data_type: DataType,
-    element_size_bytes: Option<ByteCount>,
-    wrap_fn: WrapFn,
-}
-
-impl ArrayGenerator for WrappedGenerator {
-    fn generate(
-        &mut self,
-        length: RowCount,
-        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
-        let array = self.generator.generate(length, rng)?;
-        (self.wrap_fn)(array)
-    }
-
-    fn data_type(&self) -> &DataType {
-        &self.data_type
-    }
-
-    fn element_size_bytes(&self) -> Option<ByteCount> {
-        self.element_size_bytes
-    }
-}
-
 pub struct CycleBinaryGenerator<T: ByteArrayType> {
     values: Vec<u8>,
     lengths: Vec<usize>,
@@ -1059,18 +1026,17 @@ const MS_PER_DAY: i64 = 86400000;
 pub mod array {
 
     use arrow_array::types::{
-        ArrowPrimitiveType, Decimal128Type, Decimal256Type, DurationMicrosecondType,
-        DurationMillisecondType, DurationNanosecondType, DurationSecondType, Float16Type,
-        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, IntervalDayTimeType,
-        IntervalMonthDayNanoType, IntervalYearMonthType, UInt16Type, UInt32Type, UInt64Type,
-        UInt8Type,
+        Decimal128Type, Decimal256Type, DurationMicrosecondType, DurationMillisecondType,
+        DurationNanosecondType, DurationSecondType, Float16Type, Float32Type, Float64Type,
+        Int16Type, Int32Type, Int64Type, Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType,
+        IntervalYearMonthType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     };
     use arrow_array::{
-        ArrowNativeTypeOp, Date32Array, Date64Array, PrimitiveArray, Time32MillisecondArray,
-        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray,
+        ArrowNativeTypeOp, Date32Array, Date64Array, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
     };
-    use arrow_schema::{Fields, IntervalUnit, TimeUnit};
+    use arrow_schema::{IntervalUnit, TimeUnit};
     use chrono::Utc;
     use rand::distributions::Uniform;
     use rand::prelude::Distribution;
@@ -1573,7 +1539,7 @@ mod tests {
 
     use arrow_array::{
         types::{Float32Type, Int16Type, Int32Type, Int8Type, UInt32Type},
-        BooleanArray, Float32Array, Int16Array, Int32Array, Int8Array, StringArray, UInt32Array,
+        BooleanArray, Float32Array, Int16Array, Int32Array, Int8Array, UInt32Array,
     };
 
     use super::*;

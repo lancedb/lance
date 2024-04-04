@@ -653,14 +653,14 @@ impl FragmentScanner {
 #[cfg(test)]
 mod test {
     use arrow_array::{
-        types::{Float32Type, Int32Type, UInt64Type},
+        types::{Float32Type, Int32Type},
         ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
         RecordBatchIterator, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::TimeUnit;
     use arrow_select::concat::concat_batches;
-    use datafusion::prelude::{col, lit, Column, SessionContext};
+    use datafusion::prelude::{lit, Column, SessionContext};
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use tempfile::tempdir;
 

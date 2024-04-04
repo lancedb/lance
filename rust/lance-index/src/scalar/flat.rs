@@ -274,7 +274,6 @@ impl ScalarIndex for FlatIndex {
 mod tests {
     use super::*;
     use arrow_array::types::Int32Type;
-    use arrow_array::types::UInt64Type;
     use datafusion_common::ScalarValue;
     use lance_datagen::{array, gen, RowCount};
 

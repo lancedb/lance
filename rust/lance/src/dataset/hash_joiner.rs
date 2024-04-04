@@ -229,8 +229,6 @@ mod tests {
 
     use super::*;
 
-    use std::sync::Arc;
-
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
 

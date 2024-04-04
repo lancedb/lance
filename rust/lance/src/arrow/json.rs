@@ -284,10 +284,7 @@ impl ArrowJsonExt for Schema {
 mod test {
     use super::*;
 
-    use std::sync::Arc;
-
     use arrow_schema::TimeUnit;
-    use serde_json;
     use serde_json::{json, Value};
 
     fn assert_type_json_str(dt: DataType, val: Value) {

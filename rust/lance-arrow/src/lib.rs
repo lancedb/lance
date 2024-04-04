@@ -590,8 +590,7 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Int32Array, StringArray, StructArray};
-    use arrow_schema::{DataType, Field};
+    use arrow_array::{Int32Array, StringArray};
 
     #[test]
     fn test_merge_recursive() {
