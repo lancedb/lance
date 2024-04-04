@@ -1,10 +1,17 @@
 use arrow_array::ArrayRef;
 use arrow_buffer::Buffer;
-
+use arrow_schema::{DataType, Field, Schema};
 use futures::future::BoxFuture;
 use lance_core::Result;
+use std::sync::Arc;
 
-use crate::format::pb;
+use crate::{
+    encodings::{
+        logical::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder},
+        physical::basic::BasicEncoder,
+    },
+    format::pb,
+};
 
 /// An encoded buffer
 pub struct EncodedBuffer {
@@ -119,4 +126,78 @@ pub trait FieldEncoder {
     fn flush(&mut self) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>>;
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
+}
+
+pub struct BatchEncoder {
+    pub field_encoders: Vec<Box<dyn FieldEncoder>>,
+}
+
+impl BatchEncoder {
+    fn get_encoder_for_field(
+        field: &Field,
+        cache_bytes_per_column: u64,
+        col_idx: &mut u32,
+    ) -> Result<Box<dyn FieldEncoder>> {
+        match field.data_type() {
+            DataType::Boolean
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Duration(_)
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Int8
+            | DataType::Interval(_)
+            | DataType::Null
+            | DataType::RunEndEncoded(_, _)
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::UInt8 => {
+                let my_col_idx = *col_idx;
+                *col_idx += 1;
+                Ok(Box::new(PrimitiveFieldEncoder::new(
+                    cache_bytes_per_column,
+                    Arc::new(BasicEncoder::new(my_col_idx)),
+                )))
+            }
+            DataType::List(inner_type) => {
+                let my_col_idx = *col_idx;
+                *col_idx += 1;
+                let inner_encoding =
+                    Self::get_encoder_for_field(inner_type, cache_bytes_per_column, col_idx)?;
+                Ok(Box::new(ListFieldEncoder::new(
+                    inner_encoding,
+                    cache_bytes_per_column,
+                    my_col_idx,
+                )))
+            }
+            _ => todo!(),
+        }
+    }
+
+    pub fn try_new(schema: &Schema, cache_bytes_per_column: u64) -> Result<Self> {
+        let mut col_idx = 0;
+        let field_encoders = schema
+            .fields
+            .iter()
+            .map(|field| Self::get_encoder_for_field(field, cache_bytes_per_column, &mut col_idx))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { field_encoders })
+    }
+
+    pub fn num_columns(&self) -> u32 {
+        self.field_encoders
+            .iter()
+            .map(|field_encoder| field_encoder.num_columns())
+            .sum::<u32>()
+    }
 }
