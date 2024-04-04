@@ -218,3 +218,17 @@ def test_s3_ddb_concurrent_commit_more_than_five(
 
     assert len(lance.dataset(table_dir).versions()) == expected_version
     assert lance.dataset(table_dir).count_rows() == expected_version * 2
+
+
+@pytest.mark.integration
+def test_s3_unsafe(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    del storage_options["dynamodb_endpoint"]
+
+    uri = f"s3://{s3_bucket}/test_unsafe"
+    data = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(data, uri, storage_options=storage_options)
+
+    assert len(ds.versions()) == 1
+    assert ds.count_rows() == 3
+    assert ds.to_table() == data
