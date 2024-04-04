@@ -760,15 +760,13 @@ impl TreeNodeVisitor for ColumnCapturingVisitor {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
         StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray,
     };
-    use arrow_schema::{DataType, Field, Fields, Schema};
-    use datafusion::logical_expr::{col, lit, Cast, GetFieldAccess, GetIndexedField};
+    use arrow_schema::{DataType, Fields, Schema};
+    use datafusion::logical_expr::{lit, Cast};
 
     #[test]
     fn test_parse_filter_simple() {

@@ -2034,32 +2034,25 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::sync::Mutex;
     use std::vec;
-    use std::{ops::Range, sync::Mutex};
 
     use super::*;
     use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::WriteMode::Overwrite;
-    use crate::datatypes::Schema;
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
 
     use arrow_array::types::Int64Type;
     use arrow_array::{
-        builder::StringDictionaryBuilder,
-        cast::{as_string_array, as_struct_array},
-        types::Int32Type,
-        ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
-        Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
-        UInt32Array,
+        builder::StringDictionaryBuilder, cast::as_string_array, types::Int32Type, ArrayRef,
+        DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
+        RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
     use arrow_array::{FixedSizeListArray, Float16Array, Float64Array, ListArray};
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
-    use arrow_select::take::take;
-    use futures::stream::TryStreamExt;
+    use arrow_schema::{Field, Fields as ArrowFields, Schema as ArrowSchema};
     use half::f16;
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, RowCount};

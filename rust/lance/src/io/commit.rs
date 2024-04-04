@@ -502,14 +502,13 @@ pub(crate) async fn commit_transaction(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::{
         CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
@@ -518,9 +517,8 @@ mod tests {
 
     use super::*;
 
-    use crate::dataset::{transaction::Operation, WriteMode, WriteParams};
+    use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
-    use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler

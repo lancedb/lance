@@ -64,8 +64,10 @@ pub trait ManifestProvider {
 }
 
 /// Implementation of ManifestProvider that does not store the schema
+#[cfg(test)]
 pub(crate) struct NotSelfDescribing {}
 
+#[cfg(test)]
 #[async_trait]
 impl ManifestProvider for NotSelfDescribing {
     async fn store_schema(_: &mut ObjectWriter, _: &Schema) -> Result<Option<usize>> {
@@ -738,10 +740,9 @@ mod tests {
     };
     use arrow_buffer::i256;
     use arrow_schema::{
-        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema, TimeUnit,
+        Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema, TimeUnit,
     };
     use arrow_select::concat::concat_batches;
-    use object_store::path::Path;
 
     use crate::reader::FileReader;
 

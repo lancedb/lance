@@ -16,8 +16,6 @@
 //!
 //! run with `cargo run --release --example hnsw`
 
-use std::collections::HashSet;
-
 use arrow::array::AsArray;
 use arrow_array::types::Float32Type;
 use clap::Parser;
@@ -28,7 +26,7 @@ use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{DatasetIndexExt, IndexType};
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::distance::MetricType;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -63,6 +61,7 @@ struct Args {
     metric_type: String,
 }
 
+#[cfg(test)]
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
     let mut dists = vec![];
     for i in 0..mat.num_rows() {

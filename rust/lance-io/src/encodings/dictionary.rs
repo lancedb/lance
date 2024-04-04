@@ -219,9 +219,8 @@ impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
 mod tests {
     use super::*;
 
-    use crate::encodings::plain::PlainEncoder;
     use crate::local::LocalObjectReader;
-    use arrow_array::{Array, StringArray};
+    use arrow_array::StringArray;
     use arrow_buffer::ArrowNativeType;
     use tokio::io::AsyncWriteExt;
 

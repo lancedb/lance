@@ -835,13 +835,9 @@ impl Merger {
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{
-        types::UInt32Type, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
-    };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{types::UInt32Type, RecordBatchIterator, StringArray, UInt32Array};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
-    use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::IndexType;
     use tempfile::tempdir;

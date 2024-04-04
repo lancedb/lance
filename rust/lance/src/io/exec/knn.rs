@@ -482,18 +482,15 @@ impl ExecutionPlan for KNNIndexExec {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-
     use arrow_array::RecordBatchIterator;
     use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use futures::TryStreamExt;
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
     use crate::arrow::*;
-    use crate::dataset::{Dataset, WriteParams};
+    use crate::dataset::WriteParams;
     use crate::io::exec::testing::TestingExec;
 
     #[tokio::test]

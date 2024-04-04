@@ -36,16 +36,12 @@
 use std::fmt::Debug;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
-use aws_credential_types::provider::error::CredentialsError;
-use aws_credential_types::provider::ProvideCredentials;
 use futures::{
     future::{self, BoxFuture},
     stream::BoxStream,
     StreamExt, TryStreamExt,
 };
-use object_store::aws::AwsCredentialProvider;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore};
 use snafu::{location, Location};
 use url::Url;
@@ -249,9 +245,11 @@ pub trait CommitHandler: Debug + Send + Sync {
 }
 
 /// Adapt an object_store credentials into AWS SDK creds
+#[cfg(dynamodb)]
 #[derive(Debug)]
 struct OSObjectStoreToAwsCredAdaptor(AwsCredentialProvider);
 
+#[cfg(dynamodb)]
 impl ProvideCredentials for OSObjectStoreToAwsCredAdaptor {
     fn provide_credentials<'a>(
         &'a self,

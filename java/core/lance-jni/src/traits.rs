@@ -61,10 +61,13 @@ impl FromJString for JString<'_> {
 }
 
 pub trait JMapExt {
+    #[allow(dead_code)]
     fn get_string(&self, env: &mut JNIEnv, key: &str) -> Result<Option<String>>;
 
+    #[allow(dead_code)]
     fn get_i32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i32>>;
 
+    #[allow(dead_code)]
     fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>>;
 
     #[allow(dead_code)]

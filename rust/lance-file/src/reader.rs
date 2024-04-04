@@ -941,9 +941,9 @@ mod tests {
     use arrow_array::{
         builder::{Int32Builder, LargeListBuilder, ListBuilder, StringBuilder},
         cast::{as_string_array, as_struct_array},
-        types::{Int32Type, UInt8Type},
-        Array, BooleanArray, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray,
-        NullArray, StringArray, StructArray, UInt32Array, UInt8Array,
+        types::UInt8Type,
+        Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, StringArray,
+        UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use roaring::RoaringBitmap;
