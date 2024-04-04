@@ -809,7 +809,8 @@ class LanceDataset(pa.dataset.Dataset):
         elif isinstance(transforms, dict):
             for k, v in transforms.items():
                 if not isinstance(k, str):
-                    raise TypeError(f"Column names must be a string. Got {type(k)}")
+                    raise TypeError(
+                        f"Column names must be a string. Got {type(k)}")
                 if not isinstance(v, str):
                     raise TypeError(
                         f"Column expressions must be a string. Got {type(k)}"
@@ -1369,9 +1370,10 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        if index_type not in ["IVF_PQ", "IVF_HNSW_PQ"]:
+        valid_index_types = ["IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+        if index_type not in valid_index_types:
             raise NotImplementedError(
-                f"Only [IVF_PQ, IVF_HNSW_PQ] index types supported. "
+                f"Only {valid_index_types} index types supported. "
                 f"Got {index_type}"
             )
         if index_type.startswith("IVF"):
@@ -1426,7 +1428,8 @@ class LanceDataset(pa.dataset.Dataset):
                         )
                     dim = ivf_centroids.shape[1]
                     values = pa.array(ivf_centroids.reshape(-1))
-                    ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
+                    ivf_centroids = pa.FixedSizeListArray.from_arrays(
+                        values, dim)
                 # Convert it to RecordBatch because Rust side only accepts RecordBatch.
                 ivf_centroids_batch = pa.RecordBatch.from_arrays(
                     [ivf_centroids], ["_ivf_centroids"]
@@ -1567,7 +1570,8 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
+        _Dataset.commit(base_uri, operation._to_inner(),
+                        read_version, commit_lock)
         return LanceDataset(base_uri)
 
     def validate(self):
@@ -1793,7 +1797,8 @@ class LanceOperation:
             LanceOperation._validate_fragments(self.updated_fragments)
 
         def _to_inner(self):
-            raw_updated_fragments = [f._metadata for f in self.updated_fragments]
+            raw_updated_fragments = [
+                f._metadata for f in self.updated_fragments]
             return _Operation.delete(
                 raw_updated_fragments, self.deleted_fragment_ids, self.predicate
             )
@@ -1967,7 +1972,8 @@ class ScannerBuilder:
                         pos = counter
                         counter += 1
                         fields_without_lists.append(
-                            pa.field(f"__unlikely_name_placeholder_{pos}", pa.int8())
+                            pa.field(
+                                f"__unlikely_name_placeholder_{pos}", pa.int8())
                         )
                     else:
                         fields_without_lists.append(field)
@@ -2035,7 +2041,8 @@ class ScannerBuilder:
         q = _coerce_query_vector(q)
 
         if self.ds.schema.get_field_index(column) < 0:
-            raise ValueError(f"Embedding column {column} is not in the dataset")
+            raise ValueError(
+                f"Embedding column {column} is not in the dataset")
 
         column_field = self.ds.schema.field(column)
         column_type = column_field.type
@@ -2056,7 +2063,8 @@ class ScannerBuilder:
         if nprobes is not None and int(nprobes) <= 0:
             raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
         if refine_factor is not None and int(refine_factor) < 1:
-            raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
+            raise ValueError(
+                f"Refine factor must be 1 or more got {refine_factor}")
         self._nearest = {
             "column": column,
             "q": q,
@@ -2388,7 +2396,8 @@ def write_dataset(
 
     if commit_lock:
         if not callable(commit_lock):
-            raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+            raise TypeError(
+                f"commit_lock must be a function, got {type(commit_lock)}")
         params["commit_handler"] = commit_lock
 
     uri = os.fspath(uri) if isinstance(uri, Path) else uri
@@ -2517,7 +2526,8 @@ def _casting_recordbatch_iter(
         if batch.schema != schema:
             try:
                 # RecordBatch doesn't have a cast method, but table does.
-                batch = pa.Table.from_batches([batch]).cast(schema).to_batches()[0]
+                batch = pa.Table.from_batches(
+                    [batch]).cast(schema).to_batches()[0]
             except pa.lib.ArrowInvalid:
                 raise ValueError(
                     f"Input RecordBatch iterator yielded a batch with schema that "
@@ -2667,5 +2677,6 @@ class BatchUDFCheckpoint:
             "INSERT INTO fragments (fragment_id, data) VALUES (?, ?)",
             (fragment_id, fragment),
         )
-        conn.execute("DELETE FROM batches WHERE fragment_id = ?", (fragment_id,))
+        conn.execute("DELETE FROM batches WHERE fragment_id = ?",
+                     (fragment_id,))
         conn.commit()

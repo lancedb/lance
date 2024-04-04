@@ -877,7 +877,7 @@ impl Dataset {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
             "BTREE" => IndexType::Scalar,
-            "IVF_PQ" | "IVF_HNSW_PQ" => IndexType::Vector,
+            "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
