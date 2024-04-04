@@ -276,32 +276,15 @@ pub struct DecodeBatchScheduler {
 
 impl DecodeBatchScheduler {
     fn is_primitive(data_type: &DataType) -> bool {
-        match data_type {
-            DataType::Boolean
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::Duration(_)
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Int8
-            | DataType::Interval(_)
-            | DataType::Null
-            | DataType::RunEndEncoded(_, _)
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Timestamp(_, _)
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::UInt8 => true,
-            DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
-            _ => false,
+        if data_type.is_primitive() {
+            true
+        } else {
+            match data_type {
+                // DataType::is_primitive doesn't consider these primitive but we do
+                DataType::Boolean | DataType::Null => true,
+                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                _ => false,
+            }
         }
     }
 
