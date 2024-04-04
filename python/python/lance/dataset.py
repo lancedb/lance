@@ -1282,7 +1282,7 @@ class LanceDataset(pa.dataset.Dataset):
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
 
-        Optional parameters for "IVF_HNSW_PQ":
+        Optional parameters for "IVF_HNSW_*":
         - **max_level**: the maximum number of levels in the graph.
         - **m**: the number of edges per node in the graph.
         - **m_max**: the maximum number of edges per node in the graph.
