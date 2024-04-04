@@ -64,6 +64,7 @@ use {
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
+    std::time::{Duration, SystemTime},
 };
 
 use crate::format::{Index, Manifest};
@@ -248,11 +249,11 @@ pub trait CommitHandler: Debug + Send + Sync {
 }
 
 /// Adapt an object_store credentials into AWS SDK creds
-#[cfg(dynamodb)]
+#[cfg(feature = "dynamodb")]
 #[derive(Debug)]
 struct OSObjectStoreToAwsCredAdaptor(AwsCredentialProvider);
 
-#[cfg(dynamodb)]
+#[cfg(feature = "dynamodb")]
 impl ProvideCredentials for OSObjectStoreToAwsCredAdaptor {
     fn provide_credentials<'a>(
         &'a self,
