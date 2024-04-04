@@ -699,7 +699,6 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
     match url.scheme() {
         "s3" | "s3+ddb" => {
             storage_options.with_env_s3();
-            let storage_options = storage_options.as_s3_options();
 
             // if url.scheme() == "s3+ddb" && options.commit_handler.is_some() {
             //     return Err(Error::InvalidInput {
@@ -709,19 +708,8 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             //     });
             // }
 
-            // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
-            url.set_scheme("s3").map_err(|()| Error::Internal {
-                message: "could not set scheme".into(),
-                location: location!(),
-            })?;
-
-            url.set_query(None);
-
-            // If the endpoint is not set, we can assume this is an AWS S3 endpoint.
-            // (Not Cloudflare R2 or Minio or similar.)
-
+            let storage_options = storage_options.as_s3_options();
             let region = resolve_s3_region(&url, &storage_options).await?;
-
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
@@ -729,6 +717,14 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 region,
             )
             .await?;
+
+            // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
+            url.set_scheme("s3").map_err(|()| Error::Internal {
+                message: "could not set scheme".into(),
+                location: location!(),
+            })?;
+
+            url.set_query(None);
 
             // we can't use parse_url_opts here because we need to manually set the credentials provider
             let mut builder = AmazonS3Builder::new();
@@ -739,7 +735,6 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
                 .with_region(region);
-
             let store = builder.build()?;
 
             Ok(ObjectStore {
