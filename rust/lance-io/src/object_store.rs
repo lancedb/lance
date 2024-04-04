@@ -212,7 +212,7 @@ async fn resolve_s3_region(
         let mut client_options = ClientOptions::default();
         for (key, value) in storage_options {
             if let AmazonS3ConfigKey::Client(client_key) = key {
-                client_options = client_options.with_config(client_key.clone(), value.clone());
+                client_options = client_options.with_config(*client_key, value.clone());
             }
         }
 
