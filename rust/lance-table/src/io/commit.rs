@@ -58,8 +58,11 @@ use lance_io::object_store::ObjectStoreParams;
 use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
     aws_credential_types::cache::CredentialsCache,
+    aws_credential_types::provider::error::CredentialsError,
+    aws_credential_types::provider::ProvideCredentials,
     lance_io::object_store::{build_aws_credential, StorageOptions},
     object_store::aws::AmazonS3ConfigKey,
+    object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
 };
 
