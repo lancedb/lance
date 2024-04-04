@@ -31,34 +31,65 @@ impl DenseBitmapScheduler {
 }
 
 impl PhysicalPageScheduler for DenseBitmapScheduler {
-    fn schedule_range(
+    fn schedule_ranges(
         &self,
-        range: Range<u32>,
+        ranges: &[Range<u32>],
         scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
-        debug_assert_ne!(range.start, range.end);
-        let start = self.buffer_offset + range.start as u64 / 8;
-        let bit_offset = range.start % 8;
-        let end = self.buffer_offset + (range.end as u64 / 8) + 1;
-        let byte_range = start..end;
+        let mut min = u64::MAX;
+        let mut max = 0;
+        let chunk_reqs = ranges
+            .iter()
+            .map(|range| {
+                debug_assert_ne!(range.start, range.end);
+                dbg!(range);
+                let start = self.buffer_offset + range.start as u64 / 8;
+                let bit_offset = range.start % 8;
+                let end = self.buffer_offset + range.end.div_ceil(8) as u64;
+                let byte_range = start..end;
+                min = min.min(start);
+                max = max.max(end);
+                (byte_range, bit_offset, range.end - range.start)
+            })
+            .collect::<Vec<_>>();
 
-        trace!("Scheduling I/O for range {:?}", byte_range);
-        let bytes = scheduler.submit_request(vec![byte_range]);
+        let byte_ranges = chunk_reqs
+            .iter()
+            .map(|(range, _, _)| range.clone())
+            .collect::<Vec<_>>();
+        trace!(
+            "Scheduling I/O for {} ranges across byte range {}..{}",
+            byte_ranges.len(),
+            min,
+            max
+        );
+        let bytes = scheduler.submit_request(byte_ranges);
 
         async move {
             let bytes = bytes.await?;
-            Ok(Box::new(BitmapDecoder {
-                data: bytes,
-                bit_offset,
-            }) as Box<dyn PhysicalPageDecoder>)
+            let chunks = bytes
+                .into_iter()
+                .zip(chunk_reqs.into_iter())
+                .map(|(bytes, (_, bit_offset, length))| BitmapData {
+                    data: bytes,
+                    bit_offset,
+                    length: length,
+                })
+                .collect::<Vec<_>>();
+            Ok(Box::new(BitmapDecoder { chunks }) as Box<dyn PhysicalPageDecoder>)
         }
         .boxed()
     }
 }
 
-struct BitmapDecoder {
-    data: Vec<Bytes>,
+struct BitmapData {
+    data: Bytes,
     bit_offset: u32,
+    length: u32,
+}
+
+struct BitmapDecoder {
+    chunks: Vec<BitmapData>,
 }
 
 impl PhysicalPageDecoder for BitmapDecoder {
@@ -68,28 +99,20 @@ impl PhysicalPageDecoder for BitmapDecoder {
     }
 
     fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [BytesMut]) {
-        let mut bytes_to_fully_skip = rows_to_skip as u64 / 8;
-        let mut bits_to_skip = (rows_to_skip % 8) + self.bit_offset;
-        if bits_to_skip > 8 {
-            bits_to_skip -= 8;
-            bytes_to_fully_skip += 1;
-        }
+        let mut rows_to_skip = rows_to_skip;
 
         let mut dest_builder = BooleanBufferBuilder::new(num_rows as usize);
 
         let mut rows_remaining = num_rows;
-        for buf in &self.data {
-            let buf_len = buf.len() as u64;
-            if bytes_to_fully_skip > buf_len {
-                bytes_to_fully_skip -= buf_len;
+        for chunk in &self.chunks {
+            if chunk.length <= rows_to_skip {
+                rows_to_skip -= chunk.length;
             } else {
-                let num_vals = (buf_len * 8) as u32;
-                let num_vals_to_take = rows_remaining.min(num_vals);
-                let start = (bytes_to_fully_skip * 8) as usize + bits_to_skip as usize;
-                let end = start + num_vals_to_take as usize;
-                dest_builder.append_packed_range(start..end, buf);
-                bytes_to_fully_skip = 0;
-                bits_to_skip = 0;
+                let start = rows_to_skip + chunk.bit_offset;
+                let num_vals_to_take = rows_remaining.min(chunk.length);
+                let end = start + num_vals_to_take;
+                dest_builder.append_packed_range(start as usize..end as usize, &chunk.data);
+                rows_to_skip = 0;
                 rows_remaining -= num_vals_to_take;
             }
         }
@@ -152,9 +175,14 @@ impl BufferEncoder for BitmapEncoder {
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field};
+    use bytes::{Bytes, BytesMut};
 
+    use crate::decoder::PhysicalPageDecoder;
     use crate::encodings::physical::basic::BasicEncoder;
+    use crate::encodings::physical::bitmap::BitmapData;
     use crate::testing::check_round_trip_array_encoding;
+
+    use super::BitmapDecoder;
 
     #[test_log::test(tokio::test)]
     async fn test_bitmap_boolean() {
@@ -162,5 +190,27 @@ mod tests {
         let field = Field::new("", DataType::Boolean, false);
 
         check_round_trip_array_encoding(encoder, field).await;
+    }
+
+    #[test]
+    fn test_bitmap_decoder_edge_cases() {
+        // Regression for a case where the row skip and the bit offset
+        // require us to read from the second Bytes instead of the first
+        let decoder = BitmapDecoder {
+            chunks: vec![
+                BitmapData {
+                    data: Bytes::from_static(&[0b11111111]),
+                    bit_offset: 4,
+                    length: 4,
+                },
+                BitmapData {
+                    data: Bytes::from_static(&[0b00000000]),
+                    bit_offset: 4,
+                    length: 4,
+                },
+            ],
+        };
+        let mut dest = vec![BytesMut::with_capacity(1)];
+        decoder.decode_into(5, 1, &mut dest);
     }
 }

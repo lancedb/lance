@@ -45,17 +45,23 @@ impl FslPageScheduler {
 }
 
 impl LogicalPageScheduler for FslPageScheduler {
-    fn schedule_range(
+    fn schedule_ranges(
         &self,
-        range: Range<u32>,
+        ranges: &[Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
     ) -> Result<()> {
-        let expanded_range = (range.start * self.dimension)..(range.end * self.dimension);
-        trace!("Scheduling range {:?} from items scheduler", expanded_range);
+        let expanded_ranges = ranges
+            .iter()
+            .map(|range| (range.start * self.dimension)..(range.end * self.dimension))
+            .collect::<Vec<_>>();
+        trace!(
+            "Scheduling expanded ranges {:?} from items scheduler",
+            expanded_ranges
+        );
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.items_scheduler
-            .schedule_range(expanded_range, scheduler, &tx)?;
+            .schedule_ranges(&expanded_ranges, scheduler, &tx)?;
         let inner_page_decoder = rx.blocking_recv().unwrap();
         sink.send(Box::new(FslPageDecoder {
             inner: inner_page_decoder,
@@ -63,6 +69,22 @@ impl LogicalPageScheduler for FslPageScheduler {
         }))
         .unwrap();
         Ok(())
+    }
+
+    fn schedule_take(
+        &self,
+        indices: &[u32],
+        scheduler: &Arc<dyn EncodingsIo>,
+        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+    ) -> Result<()> {
+        self.schedule_ranges(
+            &indices
+                .iter()
+                .map(|&idx| idx..(idx + 1))
+                .collect::<Vec<_>>(),
+            scheduler,
+            sink,
+        )
     }
 
     fn num_rows(&self) -> u32 {

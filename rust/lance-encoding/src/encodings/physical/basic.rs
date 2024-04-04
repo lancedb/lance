@@ -59,21 +59,24 @@ impl BasicPageScheduler {
 }
 
 impl PhysicalPageScheduler for BasicPageScheduler {
-    fn schedule_range(
+    fn schedule_ranges(
         &self,
-        range: std::ops::Range<u32>,
+        ranges: &[std::ops::Range<u32>],
         scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let validity_future = match &self.validity_decoder {
             PageValidity::NoNull => None,
             PageValidity::SomeNull(validity_decoder) => {
-                trace!("Scheduling range {:?} from validity", range);
-                Some(validity_decoder.schedule_range(range.clone(), scheduler))
+                trace!("Scheduling ranges {:?} from validity", ranges);
+                Some(
+                    validity_decoder
+                        .schedule_ranges(&ranges.iter().cloned().collect::<Vec<_>>(), scheduler),
+                )
             }
         };
 
-        trace!("Scheduling range {:?} from values", range);
-        let values_future = self.values_decoder.schedule_range(range, scheduler);
+        trace!("Scheduling range {:?} from values", ranges);
+        let values_future = self.values_decoder.schedule_ranges(ranges, scheduler);
 
         async move {
             let validity = match validity_future {

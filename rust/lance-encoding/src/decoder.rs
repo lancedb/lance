@@ -483,9 +483,38 @@ impl DecodeBatchScheduler {
         let range = range.start as u32..range.end as u32;
 
         self.root_scheduler
-            .schedule_range(range.clone(), scheduler, &sink)?;
+            .schedule_ranges(&[range.clone()], scheduler, &sink)?;
 
         trace!("Finished scheduling of range {:?}", range);
+        Ok(())
+    }
+
+    /// Schedules the load of selected rows
+    ///
+    /// # Arguments
+    ///
+    /// * `indices` - The row indices to load (these must be in ascending order!)
+    /// * `sink` - A channel to send the decode tasks
+    /// * `scheduler` An I/O scheduler to issue I/O requests
+    pub async fn schedule_take(
+        &mut self,
+        indices: &[u32],
+        sink: mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        scheduler: &Arc<dyn EncodingsIo>,
+    ) -> Result<()> {
+        debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
+        trace!(
+            "Scheduling take of {} rows [{}]",
+            indices.len(),
+            if indices.len() == 1 {
+                indices[0].to_string()
+            } else {
+                format!("{}, ..., {}", indices[0], indices[indices.len() - 1])
+            }
+        );
+        self.root_scheduler
+            .schedule_take(&indices, scheduler, &sink)?;
+        trace!("Finished scheduling take of {} rows", indices.len());
         Ok(())
     }
 }
@@ -622,17 +651,18 @@ pub trait PhysicalPageDecoder: Send + Sync {
 ///
 /// See [`crate::decoder`] for more information
 pub trait PhysicalPageScheduler: Send + Sync + std::fmt::Debug {
-    /// Schedules a batch of I/O to load the data needed for the requested range
+    /// Schedules a batch of I/O to load the data needed for the requested ranges
     ///
     /// Returns a future that will yield a decoder once the data has been loaded
     ///
     /// # Arguments
     ///
     /// * `range` - the range of row offsets (relative to start of page) requested
+    ///             these must be ordered and must not overlap
     /// * `scheduler` - a scheduler to submit the I/O request to
-    fn schedule_range(
+    fn schedule_ranges(
         &self,
-        range: Range<u32>,
+        ranges: &[Range<u32>],
         scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
@@ -661,10 +691,21 @@ pub trait PhysicalPageScheduler: Send + Sync + std::fmt::Debug {
 ///
 /// See [`crate::decoder`] for more information
 pub trait LogicalPageScheduler: Send + Sync + std::fmt::Debug {
-    /// Schedules I/O for the requested portion of the page.
-    fn schedule_range(
+    /// Schedules I/O for the requested portions of the page.
+    ///
+    /// Note: `ranges` must be ordered and non-overlapping
+    /// TODO: Support unordered or overlapping ranges in file scheduler
+    fn schedule_ranges(
         &self,
-        range: Range<u32>,
+        ranges: &[Range<u32>],
+        scheduler: &Arc<dyn EncodingsIo>,
+        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+    ) -> Result<()>;
+    /// Schedules I/O for the requested rows (identified by row offsets from start of page)
+    /// TODO: implement this using schedule_ranges
+    fn schedule_take(
+        &self,
+        indices: &[u32],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
     ) -> Result<()>;
