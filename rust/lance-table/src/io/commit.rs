@@ -372,6 +372,7 @@ pub async fn commit_handler_from_url(
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
+                Some(&storage_options),
                 region,
             )
             .await?;
@@ -395,6 +396,7 @@ pub async fn commit_handler_from_url(
     }
 }
 
+#[cfg(feature = "dynamodb")]
 fn get_dynamodb_endpoint(storage_options: &StorageOptions) -> Option<String> {
     if let Some(endpoint) = storage_options.0.get("dynamodb_endpoint") {
         Some(endpoint.to_string())

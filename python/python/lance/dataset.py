@@ -169,6 +169,7 @@ class LanceDataset(pa.dataset.Dataset):
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ):
+        breakpoint()
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._ds = _Dataset(
@@ -190,6 +191,12 @@ class LanceDataset(pa.dataset.Dataset):
     def __setstate__(self, state):
         self._uri, version = state
         self._ds = _Dataset(self._uri, version)
+
+    def __copy__(self):
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._uri = self._uri
+        ds._ds = copy.copy(self._ds)
+        return ds
 
     def __len__(self):
         return self.count_rows()
