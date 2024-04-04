@@ -1143,6 +1143,14 @@ fn prepare_vector_index_params(
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
+        // Parse sample rate
+        if let Some(sample_rate) = kwargs.get_item("sample_rate")? {
+            let sample_rate = PyAny::downcast::<PyInt>(sample_rate)?.extract()?;
+            ivf_params.sample_rate = sample_rate;
+            pq_params.sample_rate = sample_rate;
+            sq_params.sample_rate = sample_rate;
+        }
+
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
             ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
@@ -1238,11 +1246,6 @@ fn prepare_vector_index_params(
         if let Some(o) = kwargs.get_item("max_opq_iterations")? {
             pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
         };
-
-        // Parse SQ params
-        if let Some(sample_rate) = kwargs.get_item("sample_rate")? {
-            sq_params.sample_rate = PyAny::downcast::<PyInt>(sample_rate)?.extract()?;
-        }
     }
 
     match index_type {

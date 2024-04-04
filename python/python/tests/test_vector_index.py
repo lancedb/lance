@@ -67,8 +67,7 @@ def indexed_dataset(tmp_path):
 def run(ds, q=None, assert_func=None):
     if q is None:
         q = np.random.randn(128)
-    project = [None, ["price"], ["vector", "price"],
-               ["vector", "meta", "price"]]
+    project = [None, ["price"], ["vector", "price"], ["vector", "meta", "price"]]
     refine = [None, 1, 2]
     filters = [None, pc.field("price") > 50.0]
     times = []
@@ -185,8 +184,7 @@ def test_index_with_pq_codebook(tmp_path):
         ivf_centroids=np.random.randn(1, 128).astype(np.float32),
         pq_codebook=pq_codebook,
     )
-    validate_vector_index(
-        dataset, "vector", refine_factor=10, pass_threshold=0.99)
+    validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
 
     pq_codebook = pa.FixedShapeTensorArray.from_numpy_ndarray(pq_codebook)
 
@@ -199,8 +197,7 @@ def test_index_with_pq_codebook(tmp_path):
         pq_codebook=pq_codebook,
         replace=True,
     )
-    validate_vector_index(
-        dataset, "vector", refine_factor=10, pass_threshold=0.99)
+    validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
 
 
 @pytest.mark.cuda
@@ -276,8 +273,7 @@ def test_create_index_unsupported_accelerator(tmp_path):
 
 
 def test_use_index(dataset, tmp_path):
-    ann_ds = lance.write_dataset(
-        dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
@@ -317,18 +313,15 @@ def test_nearest_errors(dataset, tmp_path):
         )
 
     df = pd.DataFrame({"a": [5], "b": [10]})
-    ds = lance.write_dataset(pa.Table.from_pandas(df),
-                             tmp_path / "dataset.lance")
+    ds = lance.write_dataset(pa.Table.from_pandas(df), tmp_path / "dataset.lance")
 
     with pytest.raises(TypeError, match="must be a vector"):
-        ds.to_table(
-            nearest={"column": "a", "q": np.random.randn(128), "k": 10})
+        ds.to_table(nearest={"column": "a", "q": np.random.randn(128), "k": 10})
 
 
 def test_has_index(dataset, tmp_path):
     assert not dataset.has_index
-    ann_ds = lance.write_dataset(
-        dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
@@ -339,8 +332,7 @@ def test_has_index(dataset, tmp_path):
 
 def test_create_dot_index(dataset, tmp_path):
     assert not dataset.has_index
-    ann_ds = lance.write_dataset(
-        dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
         "vector",
         index_type="IVF_PQ",
@@ -353,8 +345,7 @@ def test_create_dot_index(dataset, tmp_path):
 
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
     assert not dataset.has_index
-    ann_ds = lance.write_dataset(
-        dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
         "vector",
         index_type="IVF_HNSW_PQ",
@@ -366,8 +357,7 @@ def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
 
 def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
     assert not dataset.has_index
-    ann_ds = lance.write_dataset(
-        dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
         "vector",
         index_type="IVF_HNSW_SQ",
@@ -662,13 +652,11 @@ def test_vector_with_nans(tmp_path: Path):
         replace=True,
     )
     tbl = ds.to_table(
-        nearest={"column": "vector",
-                 "q": data[0:DIM], "k": TOTAL, "nprobes": 2},
+        nearest={"column": "vector", "q": data[0:DIM], "k": TOTAL, "nprobes": 2},
         with_row_id=True,
     )
     assert len(tbl) == TOTAL - 1
-    assert 1 not in tbl["_rowid"].to_numpy(
-    ), "Row with ID 1 is not in the index"
+    assert 1 not in tbl["_rowid"].to_numpy(), "Row with ID 1 is not in the index"
 
 
 def test_validate_vector_index(tmp_path: Path):
