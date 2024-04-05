@@ -19,7 +19,7 @@ use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::format::MAGIC;
 use crate::format::MAJOR_VERSION;
-use crate::format::MINOR_VERSION_TWO;
+use crate::format::MINOR_VERSION_NEXT;
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
@@ -302,7 +302,7 @@ impl FileWriter {
         self.writer.write_u32_le(num_global_buffers).await?;
         self.writer.write_u32_le(self.num_columns).await?;
         self.writer.write_u16_le(MAJOR_VERSION as u16).await?;
-        self.writer.write_u16_le(MINOR_VERSION_TWO).await?;
+        self.writer.write_u16_le(MINOR_VERSION_NEXT).await?;
         self.writer.write_all(MAGIC).await?;
 
         // 7. close the writer

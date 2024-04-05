@@ -19,7 +19,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
-    format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION_TWO},
+    format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION_NEXT},
 };
 
 use super::io::LanceEncodingsIo;
@@ -90,7 +90,7 @@ impl FileReader {
         let major_version = cursor.read_u16::<LittleEndian>()?;
         let minor_version = cursor.read_u16::<LittleEndian>()?;
 
-        if major_version != MAJOR_VERSION as u16 || minor_version != MINOR_VERSION_TWO {
+        if major_version != MAJOR_VERSION as u16 || minor_version != MINOR_VERSION_NEXT {
             return Err(Error::IO {
                 message: format!(
                     "Attempt to use the lance v0.2 reader to read a file with version {}.{}",
@@ -231,7 +231,7 @@ impl FileReader {
         println!();
         println!(
             "File version           : {}.{}",
-            MAJOR_VERSION, MINOR_VERSION_TWO
+            MAJOR_VERSION, MINOR_VERSION_NEXT
         );
         println!("Data bytes             : {}", footer.column_meta_start);
         println!(
