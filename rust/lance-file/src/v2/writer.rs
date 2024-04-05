@@ -23,13 +23,6 @@ use crate::format::MINOR_VERSION_NEXT;
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
-    /// The field ids to collect statistics for.
-    ///
-    /// If None, will collect for all fields in the schema (that support stats).
-    /// If an empty vector, will not collect any statistics.
-    ///
-    // TODO: Not yet implemented
-    pub collect_stats_for_fields: Option<Vec<i32>>,
     /// How many bytes to use for buffering column data
     ///
     /// When data comes in small batches the writer will buffer column data so that
@@ -45,18 +38,6 @@ pub struct FileWriterOptions {
     /// The default will use 8MiB per column which should be reasonable for most cases.
     // TODO: Do we need to be able to set this on a per-column basis?
     pub data_cache_bytes: Option<u64>,
-    /// How many bytes to use for buffering data to write
-    ///
-    /// After data has been encoded it is placed into an I/O cache while we wait for it
-    /// to be written to disk.  If data is arriving quickly and your I/O is very jittery
-    /// then you might want to increase this value.  However, the default of 128MiB should
-    /// be sufficient for most cases.
-    ///
-    /// If data is arriving slowly or write speed is not important you can turn this down
-    /// all the way to zero to eliminate I/O caching entirely and free up some RAM.  In this
-    /// mode each write will block until its data has been flushed.  This prevents any
-    /// interleaving of encoding and writing.
-    pub io_cache_bytes: Option<u64>,
 }
 
 pub struct FileWriter {
