@@ -47,6 +47,7 @@ build-backend = "maturin"
 
 [project.optional-dependencies]
 tests = [
+    "boto3",
     "datasets",
     "duckdb; python_version<'3.12'", # TODO: remove when duckdb supports 3.12
     "ml_dtypes",
@@ -84,6 +85,8 @@ markers = [
 filterwarnings = [
     'error::FutureWarning',
     'error::DeprecationWarning',
+    # Boto3
+    'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
     # Pandas 2.2 on Python 2.12
     'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
     # Pytorch 2.2 on Python 2.12

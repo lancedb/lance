@@ -289,24 +289,21 @@ async fn build_dynamodb_external_store(
     table_name: &str,
     creds: AwsCredentialProvider,
     region: &str,
+    endpoint: Option<String>,
     app_name: &str,
 ) -> Result<Arc<dyn ExternalManifestStore>> {
-    use std::env;
-
     use super::commit::dynamodb::DynamoDBExternalManifestStore;
     use aws_sdk_dynamodb::{config::Region, Client};
 
-    let dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
+    let mut dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
         .region(Some(Region::new(region.to_string())))
         .credentials_provider(OSObjectStoreToAwsCredAdaptor(creds))
         // caching should be handled by passed AwsCredentialProvider
         .credentials_cache(CredentialsCache::no_caching());
 
-    let dynamodb_config = match env::var("DYNAMODB_ENDPOINT") {
-        Ok(endpoint) => dynamodb_config.endpoint_url(endpoint),
-        _ => dynamodb_config,
-    };
-
+    if let Some(endpoint) = endpoint {
+        dynamodb_config = dynamodb_config.endpoint_url(endpoint);
+    }
     let client = Client::from_conf(dynamodb_config.build());
 
     DynamoDBExternalManifestStore::new_external_store(client.into(), table_name, app_name).await
@@ -329,6 +326,8 @@ pub async fn commit_handler_from_url(
     };
 
     match url.scheme() {
+        // TODO: for Cloudflare R2 and Minio, we can provide a PutIfNotExist commit handler
+        // See: https://docs.rs/object_store/latest/object_store/aws/enum.S3ConditionalPut.html#variant.ETagMatch
         "s3" => Ok(Arc::new(UnsafeCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::InvalidInput {
@@ -366,8 +365,10 @@ pub async fn commit_handler_from_url(
                 }
             };
             let options = options.clone().unwrap_or_default();
-            let storage_options =
-                StorageOptions(options.storage_options.unwrap_or_default()).as_s3_options();
+            let storage_options = StorageOptions(options.storage_options.unwrap_or_default());
+            let dynamo_endpoint = get_dynamodb_endpoint(&storage_options);
+            let storage_options = storage_options.as_s3_options();
+
             let region = storage_options
                 .get(&AmazonS3ConfigKey::Region)
                 .map(|s| s.to_string());
@@ -375,6 +376,7 @@ pub async fn commit_handler_from_url(
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
+                Some(&storage_options),
                 region,
             )
             .await?;
@@ -384,6 +386,7 @@ pub async fn commit_handler_from_url(
                     table_name,
                     aws_creds.clone(),
                     &region,
+                    dynamo_endpoint,
                     "lancedb",
                 )
                 .await?,
@@ -394,6 +397,15 @@ pub async fn commit_handler_from_url(
             message: format!("Unsupported URI scheme: {}", unknown_scheme),
             location: location!(),
         }),
+    }
+}
+
+#[cfg(feature = "dynamodb")]
+fn get_dynamodb_endpoint(storage_options: &StorageOptions) -> Option<String> {
+    if let Some(endpoint) = storage_options.0.get("dynamodb_endpoint") {
+        Some(endpoint.to_string())
+    } else {
+        std::env::var("DYNAMODB_ENDPOINT").ok()
     }
 }
 

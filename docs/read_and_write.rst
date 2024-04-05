@@ -545,8 +545,7 @@ S3 Configuration
 ~~~~~~~~~~~~~~~~
 
 S3 (and S3-compatible stores) have additional configuration options that configure
-authorization and S3-specific features (such as server-side encryption). Region
-is a required parameter.
+authorization and S3-specific features (such as server-side encryption).
 
 AWS credentials can be set in the environment variables ``AWS_ACCESS_KEY_ID``,
 ``AWS_SECRET_ACCESS_KEY``, and ``AWS_SESSION_TOKEN``. Alternatively, they can be
@@ -558,7 +557,6 @@ passed as parameters to the ``storage_options`` parameter:
   ds = lance.dataset(
       "s3://bucket/path",
       storage_options={
-          "region": "us-east-1",
           "access_key_id": "my-access-key",
           "secret_access_key": "my-secret-key",
           "session_token": "my-session-token",
@@ -578,7 +576,8 @@ The following keys can be used as both environment variables or keys in the
    * - Key
      - Description
    * - ``aws_region`` / ``region``
-     - The AWS region to use. This is currently required.
+     - The AWS region the bucket is in. This can be automatically detected when
+       using AWS S3, but must be specified for S3-compatible stores.
    * - ``aws_access_key_id`` / ``access_key_id``
      - The AWS access key ID to use.
    * - ``aws_secret_access_key`` / ``secret_access_key``
