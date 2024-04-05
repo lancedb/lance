@@ -163,8 +163,16 @@ impl<Q: Quantizer + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             )
         };
 
-        let k = query.k * query.refine_factor.unwrap_or(1) as usize;
-        let ef = k + k / 2;
+        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+        let k = query.k * refine_factor;
+        let ef = query.ef.unwrap_or(k + k / 2);
+        if ef < k {
+            return Err(Error::Index {
+                message: "ef must be greater than or equal to k".to_string(),
+                location: location!(),
+            });
+        }
+
         let results = self.hnsw.search(
             query.key.as_primitive::<Float32Type>().as_slice(),
             k,

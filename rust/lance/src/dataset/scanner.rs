@@ -475,6 +475,7 @@ impl Scanner {
             key: key.into(),
             k,
             nprobes: 1,
+            ef: None,
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: true,
