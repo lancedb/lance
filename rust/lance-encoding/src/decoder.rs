@@ -513,7 +513,7 @@ impl DecodeBatchScheduler {
             }
         );
         self.root_scheduler
-            .schedule_take(&indices, scheduler, &sink)?;
+            .schedule_take(indices, scheduler, &sink)?;
         trace!("Finished scheduling take of {} rows", indices.len());
         Ok(())
     }

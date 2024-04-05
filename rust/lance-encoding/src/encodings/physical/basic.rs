@@ -68,10 +68,7 @@ impl PhysicalPageScheduler for BasicPageScheduler {
             PageValidity::NoNull => None,
             PageValidity::SomeNull(validity_decoder) => {
                 trace!("Scheduling ranges {:?} from validity", ranges);
-                Some(
-                    validity_decoder
-                        .schedule_ranges(&ranges.iter().cloned().collect::<Vec<_>>(), scheduler),
-                )
+                Some(validity_decoder.schedule_ranges(ranges, scheduler))
             }
         };
 

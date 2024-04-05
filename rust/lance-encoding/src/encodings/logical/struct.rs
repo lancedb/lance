@@ -408,7 +408,7 @@ impl ChildState {
             self.rows_available += newly_avail;
             self.rows_unawaited -= newly_avail;
             trace!("The new await loaded {} rows", newly_avail);
-            return Ok(remaining == rows_to_wait);
+            Ok(remaining == rows_to_wait)
         } else {
             Ok(true)
         }

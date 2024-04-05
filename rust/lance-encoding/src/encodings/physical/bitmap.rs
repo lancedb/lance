@@ -42,7 +42,6 @@ impl PhysicalPageScheduler for DenseBitmapScheduler {
             .iter()
             .map(|range| {
                 debug_assert_ne!(range.start, range.end);
-                dbg!(range);
                 let start = self.buffer_offset + range.start as u64 / 8;
                 let bit_offset = range.start % 8;
                 let end = self.buffer_offset + range.end.div_ceil(8) as u64;
@@ -69,11 +68,11 @@ impl PhysicalPageScheduler for DenseBitmapScheduler {
             let bytes = bytes.await?;
             let chunks = bytes
                 .into_iter()
-                .zip(chunk_reqs.into_iter())
+                .zip(chunk_reqs)
                 .map(|(bytes, (_, bit_offset, length))| BitmapData {
                     data: bytes,
                     bit_offset,
-                    length: length,
+                    length,
                 })
                 .collect::<Vec<_>>();
             Ok(Box::new(BitmapDecoder { chunks }) as Box<dyn PhysicalPageDecoder>)

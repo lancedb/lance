@@ -83,7 +83,7 @@ async fn test_decode(
         let batch = batch.await.unwrap().unwrap();
         let actual = batch.column(0);
         let expected_size = (BATCH_SIZE as usize).min(expected.len() - offset);
-        let expected = expected.slice(offset, expected_size as usize);
+        let expected = expected.slice(offset, expected_size);
         assert_eq!(expected.data_type(), actual.data_type());
         assert_eq!(&expected, actual);
         offset += BATCH_SIZE as usize;
@@ -191,7 +191,7 @@ pub async fn check_round_trip_field_encoding(mut encoder: impl FieldEncoder, fie
             vec![1000, 2000, 3000],
             vec![2000, 2001, 2002, 2003, 2004],
             // Big take that spans multiple pages and generates multiple output batches
-            (100..500).into_iter().map(|i| i * 3).collect::<Vec<_>>(),
+            (100..500).map(|i| i * 3).collect::<Vec<_>>(),
         ] {
             let num_rows = indices.len() as u64;
             let indices_arr = UInt32Array::from(indices.clone());
