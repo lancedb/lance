@@ -434,6 +434,7 @@ impl DecodeBatchScheduler {
                     fields.clone(),
                 ))]
             }
+            // Still need support for string / binary / dictionary / RLE
             _ => todo!(),
         }
     }

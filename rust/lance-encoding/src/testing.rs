@@ -213,7 +213,5 @@ pub async fn check_round_trip_field_encoding(mut encoder: impl FieldEncoder, fie
             )
             .await;
         }
-
-        // Test large take that is bigger than batch size
     }
 }

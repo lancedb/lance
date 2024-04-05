@@ -261,7 +261,7 @@ impl LogicalPageScheduler for ListPageScheduler {
 }
 
 /// As soon as the first call to decode comes in we wait for all indirect I/O to
-/// complete.  TODO: We could potentially be lazier here, to investigate.
+/// complete.
 ///
 /// Once the indirect I/O is finished we pull items out of `unawaited`, wait them
 /// (this wait should return immedately) and then push them into `item_decoders`.
