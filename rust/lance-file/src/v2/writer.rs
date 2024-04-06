@@ -82,9 +82,9 @@ impl FileWriter {
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
-        let mut buffer_offsets = Vec::with_capacity(encoded_page.buffers.len());
-        let mut buffer_sizes = Vec::with_capacity(encoded_page.buffers.len());
-        for buffer in encoded_page.buffers {
+        let mut buffer_offsets = Vec::with_capacity(encoded_page.array.buffers.len());
+        let mut buffer_sizes = Vec::with_capacity(encoded_page.array.buffers.len());
+        for buffer in encoded_page.array.buffers {
             buffer_offsets.push(self.writer.tell().await? as u64);
             buffer_sizes.push(
                 buffer
@@ -101,7 +101,7 @@ impl FileWriter {
                 self.writer.write_all(part).await?;
             }
         }
-        let encoded_encoding = Any::from_msg(&encoded_page.encoding)?;
+        let encoded_encoding = Any::from_msg(&encoded_page.array.encoding)?;
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,

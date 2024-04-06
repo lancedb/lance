@@ -16,7 +16,6 @@ use log::trace;
 use crate::{
     decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
     encoder::{EncodedPage, FieldEncoder},
-    encodings::physical::basic::BasicEncoder,
 };
 
 use super::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder};
@@ -142,11 +141,14 @@ pub struct Utf8FieldEncoder {
 
 impl Utf8FieldEncoder {
     pub fn new(cache_bytes_per_column: u64, column_index: u32) -> Self {
-        let bytes_encoder = Arc::new(BasicEncoder::new(column_index + 1));
-        let items_encoder = Box::new(PrimitiveFieldEncoder::new(
-            cache_bytes_per_column,
-            bytes_encoder,
-        ));
+        let items_encoder = Box::new(
+            PrimitiveFieldEncoder::try_new(
+                cache_bytes_per_column,
+                &DataType::UInt8,
+                column_index + 1,
+            )
+            .unwrap(),
+        );
         Self {
             varbin_encoder: Box::new(ListFieldEncoder::new(
                 items_encoder,
@@ -190,15 +192,11 @@ impl FieldEncoder for Utf8FieldEncoder {
 mod tests {
     use arrow_schema::{DataType, Field};
 
-    use crate::{
-        encodings::logical::utf8::Utf8FieldEncoder, testing::check_round_trip_field_encoding,
-    };
+    use crate::testing::check_round_trip_encoding;
 
     #[test_log::test(tokio::test)]
     async fn test_utf8() {
-        let encoder = Utf8FieldEncoder::new(4096, 0);
         let field = Field::new("", DataType::Utf8, false);
-
-        check_round_trip_field_encoding(encoder, field).await;
+        check_round_trip_encoding(field).await;
     }
 }
