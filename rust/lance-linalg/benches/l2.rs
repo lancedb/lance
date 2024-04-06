@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::repeat_with;
+
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
-    Float32Array,
+    Float32Array, UInt8Array,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use num_traits::{AsPrimitive, Float};
@@ -25,7 +27,9 @@ use pprof::criterion::{Output, PProfProfiler};
 use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_linalg::distance::{l2::l2, l2_distance_batch, L2};
 use lance_testing::datagen::generate_random_array_with_seed;
+use rand::Rng;
 
+const DIMENSION: usize = 1024;
 const TOTAL: usize = 1024 * 1024; // 1M vectors
 
 /// Naive scalar implementation of L2 distance.
@@ -74,8 +78,6 @@ fn run_bench<T: ArrowFloatType + L2>(c: &mut Criterion) {
 }
 
 fn bench_distance(c: &mut Criterion) {
-    const DIMENSION: usize = 1024;
-
     run_bench::<Float16Type>(c);
     run_bench::<Float32Type>(c);
     let key: Float32Array = generate_random_array_with_seed::<Float32Type>(DIMENSION, [0; 32]);
@@ -101,17 +103,46 @@ fn bench_small_distance(c: &mut Criterion) {
     });
 }
 
+fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
+    key.iter()
+        .zip(target.iter())
+        .map(|(&x, &y)| (x as i16 - y as i16).pow(2))
+        .sum::<i16>() as f32
+}
+
+fn bench_uint_distance(c: &mut Criterion) {
+    let mut rng = rand::thread_rng();
+    let key = repeat_with(|| rng.gen::<u8>())
+        .take(DIMENSION)
+        .collect::<Vec<_>>();
+    let target = repeat_with(|| rng.gen::<u8>())
+        .take(TOTAL * DIMENSION)
+        .collect::<Vec<_>>();
+    println!("Target size: {}", target.len());
+
+    c.bench_function("L2(uint8, scalar)", |b| {
+        b.iter(|| {
+            black_box(
+                target
+                    .chunks_exact(DIMENSION)
+                    .map(|tgt| l2_distance_uint_scalar(&key, tgt))
+                    .collect::<Vec<_>>(),
+            );
+        });
+    });
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_distance, bench_small_distance);
+    targets = bench_distance, bench_small_distance, bench_uint_distance);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_distance, bench_small_distance);
+    targets = bench_distance, bench_small_distance, bench_uint_distance);
 criterion_main!(benches);
