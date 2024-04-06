@@ -7,6 +7,7 @@ use lance_core::Result;
 use crate::{
     encodings::logical::{
         list::ListFieldEncoder, primitive::PrimitiveFieldEncoder, r#struct::StructFieldEncoder,
+        utf8::Utf8FieldEncoder,
     },
     format::pb,
 };
@@ -223,7 +224,15 @@ impl BatchEncoder {
                     header_col_idx,
                 )))
             }
-            _ => todo!("Encoders for data type {}", field.data_type()),
+            DataType::Utf8 => {
+                let my_col_idx = *col_idx;
+                *col_idx += 2;
+                Ok(Box::new(Utf8FieldEncoder::new(
+                    cache_bytes_per_column,
+                    my_col_idx,
+                )))
+            }
+            _ => todo!("Implement encoding for field type: {:?}", field.data_type()),
         }
     }
 

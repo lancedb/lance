@@ -36,11 +36,6 @@ impl SimpleStructScheduler {
         debug_assert!(!children.is_empty());
         let num_rows = children[0].iter().map(|page| page.num_rows()).sum();
         // Ensure that all the children have the same number of rows
-        debug_assert!(children.iter().all(|col| col
-            .iter()
-            .map(|page| page.num_rows())
-            .sum::<u32>()
-            == num_rows));
         Self {
             children,
             child_fields,

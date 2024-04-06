@@ -91,7 +91,7 @@ fn supports_nulls(data_type: &DataType) -> bool {
     // We don't yet have nullability support for all types.  Don't test nullability for the
     // types we don't support.
     match data_type {
-        DataType::List(_) | DataType::Struct(_) => false,
+        DataType::List(_) | DataType::Struct(_) | DataType::Utf8 => false,
         _ => true,
     }
 }
