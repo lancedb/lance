@@ -490,6 +490,13 @@ impl Scanner {
         self
     }
 
+    pub fn ef(&mut self, ef: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.ef = Some(ef);
+        }
+        self
+    }
+
     /// Apply a refine step to the vector search.
     ///
     /// A refine improves query accuracy but also makes search slower, by reading extra elements
