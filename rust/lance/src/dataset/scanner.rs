@@ -475,6 +475,7 @@ impl Scanner {
             key: key.into(),
             k,
             nprobes: 1,
+            ef: None,
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: true,
@@ -485,6 +486,13 @@ impl Scanner {
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.nprobes = n;
+        }
+        self
+    }
+
+    pub fn ef(&mut self, ef: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.ef = Some(ef);
         }
         self
     }

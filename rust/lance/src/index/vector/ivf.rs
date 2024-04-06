@@ -1771,6 +1771,7 @@ mod tests {
                     key: Arc::new(row),
                     k: 5,
                     nprobes: 1,
+                    ef: None,
                     refine_factor: None,
                     metric_type: MetricType::L2,
                     use_index: true,
