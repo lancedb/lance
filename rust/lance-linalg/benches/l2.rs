@@ -16,18 +16,18 @@ use std::iter::repeat_with;
 
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
-    Float32Array, UInt8Array,
+    Float32Array,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use num_traits::{AsPrimitive, Float};
+use rand::Rng;
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_arrow::{ArrowFloatType, FloatArray};
-use lance_linalg::distance::{l2::l2, l2_distance_batch, L2};
+use lance_linalg::distance::{l2::l2, l2_distance_batch, l2_distance_uint_scalar, L2};
 use lance_testing::datagen::generate_random_array_with_seed;
-use rand::Rng;
 
 const DIMENSION: usize = 1024;
 const TOTAL: usize = 1024 * 1024; // 1M vectors
@@ -103,11 +103,28 @@ fn bench_small_distance(c: &mut Criterion) {
     });
 }
 
-fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
-    key.iter()
-        .zip(target.iter())
-        .map(|(&x, &y)| (x as i16 - y as i16).pow(2))
-        .sum::<i16>() as f32
+fn l2_distance_uint_scalar_auto_vectorized(key: &[u8], target: &[u8]) -> f32 {
+    let mut sum = 0;
+    const LANE: usize = 16;
+    let x_chunks = key.chunks_exact(LANE);
+    let y_chunks = target.chunks_exact(LANE);
+
+    let x_reminder = x_chunks.remainder();
+    let y_reminder = y_chunks.remainder();
+
+    for (x, y) in x_chunks.zip(y_chunks) {
+        let mut s: u32 = 0;
+        for i in 0..LANE {
+            s += (x[i].abs_diff(y[i]) as u32).pow(2);
+        }
+        sum += s;
+    }
+    sum += x_reminder
+        .iter()
+        .zip(y_reminder)
+        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+        .sum::<u32>();
+    sum as f32
 }
 
 fn bench_uint_distance(c: &mut Criterion) {
@@ -118,7 +135,6 @@ fn bench_uint_distance(c: &mut Criterion) {
     let target = repeat_with(|| rng.gen::<u8>())
         .take(TOTAL * DIMENSION)
         .collect::<Vec<_>>();
-    println!("Target size: {}", target.len());
 
     c.bench_function("L2(uint8, scalar)", |b| {
         b.iter(|| {
@@ -126,6 +142,17 @@ fn bench_uint_distance(c: &mut Criterion) {
                 target
                     .chunks_exact(DIMENSION)
                     .map(|tgt| l2_distance_uint_scalar(&key, tgt))
+                    .collect::<Vec<_>>(),
+            );
+        });
+    });
+
+    c.bench_function("L2(uint8, auto-vectorization)", |b| {
+        b.iter(|| {
+            black_box(
+                target
+                    .chunks_exact(DIMENSION)
+                    .map(|tgt| l2_distance_uint_scalar_auto_vectorized(&key, tgt))
                     .collect::<Vec<_>>(),
             );
         });

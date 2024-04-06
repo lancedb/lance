@@ -63,6 +63,15 @@ where
     T::ArrowType::l2(from, to)
 }
 
+/// Calculate L2 distance between two uint8 slices.
+#[inline]
+pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
+    key.iter()
+        .zip(target.iter())
+        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+        .sum::<u32>() as f32
+}
+
 /// Calculate the L2 distance between two vectors, using scalar operations.
 ///
 /// It relies on LLVM for auto-vectorization and unrolling.
