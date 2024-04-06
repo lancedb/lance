@@ -1,6 +1,7 @@
 use arrow_array::{cast::AsArray, ArrayRef};
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
+use log::trace;
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
@@ -28,15 +29,26 @@ impl FixedListScheduler {
 }
 
 impl PhysicalPageScheduler for FixedListScheduler {
-    fn schedule_range(
+    fn schedule_ranges(
         &self,
-        range: std::ops::Range<u32>,
+        ranges: &[std::ops::Range<u32>],
         scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
-        let expanded_range = (range.start * self.dimension)..(range.end * self.dimension);
+        let expanded_ranges = ranges
+            .iter()
+            .map(|range| (range.start * self.dimension)..(range.end * self.dimension))
+            .collect::<Vec<_>>();
+        trace!(
+            "Expanding {} fsl ranges across {}..{} to item ranges across {}..{}",
+            ranges.len(),
+            ranges[0].start,
+            ranges[ranges.len() - 1].end,
+            expanded_ranges[0].start,
+            expanded_ranges[expanded_ranges.len() - 1].end
+        );
         let inner_page_decoder = self
             .items_scheduler
-            .schedule_range(expanded_range, scheduler);
+            .schedule_ranges(&expanded_ranges, scheduler);
         let dimension = self.dimension;
         async move {
             let items_decoder = inner_page_decoder.await?;

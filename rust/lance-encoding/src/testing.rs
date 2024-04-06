@@ -1,16 +1,17 @@
 use std::{ops::Range, sync::Arc};
 
+use arrow_array::{Array, UInt32Array};
 use arrow_schema::{Field, Schema};
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use log::trace;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::Result;
 use lance_datagen::{array, gen, RowCount};
 
 use crate::{
-    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, PageInfo},
+    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, LogicalPageDecoder, PageInfo},
     encoder::{ArrayEncoder, EncodedPage, FieldEncoder},
     encodings::logical::primitive::PrimitiveFieldEncoder,
     EncodingsIo,
@@ -55,6 +56,37 @@ pub async fn check_round_trip_array_encoding(encoder: impl ArrayEncoder + 'stati
     for page_size_bytes in [1024, 4 * 1024, 1024 * 1024] {
         let field_encoder = PrimitiveFieldEncoder::new(page_size_bytes, array_encoder.clone());
         check_round_trip_field_encoding(field_encoder, field.clone()).await
+    }
+}
+
+async fn test_decode(
+    num_rows: u64,
+    schema: &Schema,
+    column_infos: &[ColumnInfo],
+    expected: Arc<dyn Array>,
+    schedule_fn: impl FnOnce(
+        DecodeBatchScheduler,
+        UnboundedSender<Box<dyn LogicalPageDecoder>>,
+    ) -> BoxFuture<'static, Result<()>>,
+) {
+    let decode_scheduler = DecodeBatchScheduler::new(schema, column_infos, &Vec::new());
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    schedule_fn(decode_scheduler, tx).await.unwrap();
+
+    const BATCH_SIZE: u32 = 100;
+    let mut decode_stream = BatchDecodeStream::new(rx, BATCH_SIZE, num_rows).into_stream();
+
+    let mut offset = 0;
+    while let Some(batch) = decode_stream.next().await {
+        let batch = batch.await.unwrap().unwrap();
+        let actual = batch.column(0);
+        let expected_size = (BATCH_SIZE as usize).min(expected.len() - offset);
+        let expected = expected.slice(offset, expected_size);
+        assert_eq!(expected.data_type(), actual.data_type());
+        assert_eq!(&expected, actual);
+        offset += BATCH_SIZE as usize;
     }
 }
 
@@ -131,31 +163,55 @@ pub async fn check_round_trip_field_encoding(mut encoder: impl FieldEncoder, fie
             .collect::<Vec<_>>();
         let schema = Schema::new(vec![field.clone()]);
 
+        // Test range scheduling
         for range in [0..500, 100..1100, 8000..8500] {
+            let range = range.start as u64..range.end as u64;
             let num_rows = range.end - range.start;
-            let schema = schema.clone();
-            let mut decode_scheduler =
-                DecodeBatchScheduler::new(&schema, &column_infos, &Vec::new());
+            let expected = data.slice(range.start as usize, num_rows as usize);
+            let scheduler = scheduler.clone();
+            test_decode(
+                num_rows,
+                &schema,
+                &column_infos,
+                expected,
+                |mut decode_scheduler, tx| {
+                    async move { decode_scheduler.schedule_range(range, tx, &scheduler).await }
+                        .boxed()
+                },
+            )
+            .await;
+        }
 
-            let (tx, rx) = mpsc::unbounded_channel();
-
-            decode_scheduler
-                .schedule_range(range.clone(), tx, &scheduler)
-                .await
-                .unwrap();
-
-            const BATCH_SIZE: u32 = 100;
-            let mut decode_stream = BatchDecodeStream::new(rx, BATCH_SIZE, num_rows).into_stream();
-
-            let mut offset = range.start as usize;
-            while let Some(batch) = decode_stream.next().await {
-                let batch = batch.await.unwrap().unwrap();
-                let actual = batch.column(0);
-                let expected = data.slice(offset, BATCH_SIZE as usize);
-                assert_eq!(expected.data_type(), actual.data_type());
-                assert_eq!(&expected, actual);
-                offset += BATCH_SIZE as usize;
-            }
+        // Test take scheduling
+        for indices in [
+            vec![100],
+            vec![0],
+            vec![9999],
+            vec![100, 1100, 5000],
+            vec![1000, 2000, 3000],
+            vec![2000, 2001, 2002, 2003, 2004],
+            // Big take that spans multiple pages and generates multiple output batches
+            (100..500).map(|i| i * 3).collect::<Vec<_>>(),
+        ] {
+            let num_rows = indices.len() as u64;
+            let indices_arr = UInt32Array::from(indices.clone());
+            let expected = arrow_select::take::take(&data, &indices_arr, None).unwrap();
+            let scheduler = scheduler.clone();
+            test_decode(
+                num_rows,
+                &schema,
+                &column_infos,
+                expected,
+                |mut decode_scheduler, tx| {
+                    async move {
+                        decode_scheduler
+                            .schedule_take(&indices, tx, &scheduler)
+                            .await
+                    }
+                    .boxed()
+                },
+            )
+            .await;
         }
     }
 }

@@ -30,17 +30,31 @@ impl ValuePageScheduler {
 }
 
 impl PhysicalPageScheduler for ValuePageScheduler {
-    fn schedule_range(
+    fn schedule_ranges(
         &self,
-        range: std::ops::Range<u32>,
+        ranges: &[std::ops::Range<u32>],
         scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
-        let start = self.buffer_offset + (range.start as u64 * self.bytes_per_value);
-        let end = self.buffer_offset + (range.end as u64 * self.bytes_per_value);
-        let byte_range = start..end;
+        let mut min = u64::MAX;
+        let mut max = 0;
+        let byte_ranges = ranges
+            .iter()
+            .map(|range| {
+                let start = self.buffer_offset + (range.start as u64 * self.bytes_per_value);
+                let end = self.buffer_offset + (range.end as u64 * self.bytes_per_value);
+                min = min.min(start);
+                max = max.max(end);
+                start..end
+            })
+            .collect::<Vec<_>>();
 
-        trace!("Scheduling I/O for range {:?}", byte_range);
-        let bytes = scheduler.submit_request(vec![byte_range]);
+        trace!(
+            "Scheduling I/O for {} ranges spread across byte range {}..{}",
+            byte_ranges.len(),
+            min,
+            max
+        );
+        let bytes = scheduler.submit_request(byte_ranges);
         let bytes_per_value = self.bytes_per_value;
 
         async move {
@@ -78,7 +92,7 @@ impl PhysicalPageDecoder for ValuePageDecoder {
             if bytes_to_skip > buf_len {
                 bytes_to_skip -= buf_len;
             } else {
-                let bytes_to_take_here = buf_len.min(bytes_to_take);
+                let bytes_to_take_here = (buf_len - bytes_to_skip).min(bytes_to_take);
                 bytes_to_take -= bytes_to_take_here;
                 let start = bytes_to_skip as usize;
                 let end = start + bytes_to_take_here as usize;
