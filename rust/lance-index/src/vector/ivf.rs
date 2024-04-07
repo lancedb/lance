@@ -41,6 +41,7 @@ use crate::vector::{
     transform::Transformer,
 };
 
+use super::quantizer::Quantizer;
 use super::sq::transform::SQTransformer;
 use super::sq::ScalarQuantizer;
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN, SQ_CODE_COLUMN};
@@ -233,6 +234,24 @@ fn new_ivf_with_sq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveTy
         sq,
         range,
     ))
+}
+
+pub fn new_ivf_with_quantizer(
+    centroids: &dyn Array,
+    dimension: usize,
+    metric_type: MetricType,
+    vector_column: &str,
+    quantizer: Quantizer,
+    range: Option<Range<u32>>,
+) -> Result<Arc<dyn Ivf>> {
+    match quantizer {
+        Quantizer::Product(pq) => {
+            new_ivf_with_pq(centroids, dimension, metric_type, vector_column, pq, range)
+        }
+        Quantizer::Scalar(sq) => {
+            new_ivf_with_sq(centroids, dimension, metric_type, vector_column, sq, range)
+        }
+    }
 }
 
 /// IVF - IVF file partition

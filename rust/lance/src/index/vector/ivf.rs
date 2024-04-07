@@ -40,6 +40,7 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
+use lance_index::vector::quantizer::{QuantizationMetadata, Quantizer};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
@@ -52,15 +53,13 @@ use lance_index::{
             IvfBuildParams,
         },
         pq::{
-            storage::{ProductQuantizationMetadata, PQ_METADTA_KEY},
             PQBuildParams, ProductQuantizer,
         },
         sq::{
             builder::SQBuildParams,
-            storage::{ScalarQuantizationMetadata, SQ_METADATA_KEY},
             ScalarQuantizer,
         },
-        Query, DIST_COL, PQ_CODE_COLUMN, SQ_CODE_COLUMN,
+        Query, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -1025,14 +1024,14 @@ pub async fn build_ivf_hnsw_pq_index(
     let stream = scan_index_field_stream(dataset, column).await?;
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
-    write_ivf_hnsw_pq_file(
+    write_ivf_hnsw_file(
         dataset,
         column,
         index_name,
         uuid,
         &[],
         ivf_model,
-        pq,
+        Quantizer::Product(pq),
         metric_type,
         hnsw_params,
         stream,
@@ -1060,14 +1059,14 @@ pub async fn build_ivf_hnsw_sq_index(
     let stream = scan_index_field_stream(dataset, column).await?;
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
-    write_ivf_hnsw_sq_file(
+    write_ivf_hnsw_file(
         dataset,
         column,
         index_name,
         uuid,
         &[],
         ivf_model,
-        sq,
+        Quantizer::Scalar(sq),
         metric_type,
         hnsw_params,
         stream,
@@ -1269,14 +1268,14 @@ async fn write_ivf_pq_file(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn write_ivf_hnsw_pq_file(
+async fn write_ivf_hnsw_file(
     dataset: &Dataset,
     column: &str,
     _index_name: &str,
     uuid: &str,
     _transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
-    pq: Arc<dyn ProductQuantizer>,
+    quantizer: Quantizer,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     stream: impl RecordBatchStream + Unpin + 'static,
@@ -1295,7 +1294,7 @@ async fn write_ivf_hnsw_pq_file(
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: "IVF_HNSW_PQ".to_string(),
+            index_type: format!("IVF_HNSW_{}", quantizer.typ()),
             distance_type: distance_type.to_string(),
         })
         .to_string()
@@ -1310,10 +1309,10 @@ async fn write_ivf_hnsw_pq_file(
     let schema = Schema::new(vec![
         ROW_ID_FIELD.clone(),
         arrow_schema::Field::new(
-            PQ_CODE_COLUMN,
+            quantizer.column(),
             DataType::FixedSizeList(
                 Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
-                pq.num_sub_vectors() as i32,
+                quantizer.code_dim() as i32,
             ),
             false,
         ),
@@ -1324,163 +1323,59 @@ async fn write_ivf_hnsw_pq_file(
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: "PQ".to_string(),
+            index_type: quantizer.typ(),
             distance_type: distance_type.to_string(),
         })
         .to_string()
         .as_str(),
     );
-    let mat = MatrixView::<Float32Type>::new(
-        Arc::new(
-            pq.codebook_as_fsl()
-                .values()
-                .as_primitive::<Float32Type>()
-                .clone(),
-        ),
-        pq.dimension(),
-    );
-    let codebook_tensor = pb::Tensor::from(&mat);
-    let codebook_pos = aux_writer.tell().await?;
-    aux_writer
-        .object_writer
-        .write_protobuf(&codebook_tensor)
-        .await?;
+
+    // For PQ, we need to store the codebook
+    let quantization_metadata = match &quantizer {
+        Quantizer::Product(pq) => {
+            let mat = MatrixView::<Float32Type>::new(
+                Arc::new(
+                    pq.codebook_as_fsl()
+                        .values()
+                        .as_primitive::<Float32Type>()
+                        .clone(),
+                ),
+                pq.dimension(),
+            );
+            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_pos = aux_writer.tell().await?;
+            aux_writer
+                .object_writer
+                .write_protobuf(&codebook_tensor)
+                .await?;
+
+            Some(QuantizationMetadata {
+                codebook_position: Some(codebook_pos),
+                ..Default::default()
+            })
+        }
+        Quantizer::Scalar(_) => None,
+    };
+
     aux_writer.add_metadata(
-        PQ_METADTA_KEY,
-        json!(ProductQuantizationMetadata {
-            codebook_position: codebook_pos,
-            num_bits: pq.num_bits(),
-            num_sub_vectors: pq.num_sub_vectors(),
-            dimension: pq.dimension(),
-            codebook: None,
-        })
-        .to_string()
-        .as_str(),
+        quantizer.metadata_key(),
+        quantizer
+            .metadata(quantization_metadata)?
+            .to_string()
+            .as_str(),
     );
 
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
 
-    let (hnsw_metadata, aux_ivf) = builder::build_hnsw_pq_partitions(
+    let (hnsw_metadata, aux_ivf) = builder::build_hnsw_partitions(
         dataset,
         &mut writer,
         Some(&mut aux_writer),
         stream,
         column,
         &mut ivf,
-        pq.clone(),
-        distance_type,
-        hnsw_params,
-        0..num_partitions,
-        precomputed_partitons,
-        shuffle_partition_batches,
-        shuffle_partition_concurrency,
-        precomputed_shuffle_buffers,
-    )
-    .await?;
-    info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());
-
-    // Add the metadata of HNSW partitions
-    let hnsw_metadata_json = json!(hnsw_metadata);
-    writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
-
-    // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::with_centroids(ivf.centroids.clone());
-    for length in ivf.lengths {
-        ivf_data.add_partition(length);
-    }
-    ivf_data.write(&mut writer).await?;
-    writer.finish().await?;
-
-    // Write the aux file
-    aux_ivf.write(&mut aux_writer).await?;
-    aux_writer.finish().await?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn write_ivf_hnsw_sq_file(
-    dataset: &Dataset,
-    column: &str,
-    _index_name: &str,
-    uuid: &str,
-    _transformers: &[Box<dyn Transformer>],
-    mut ivf: Ivf,
-    sq: ScalarQuantizer,
-    distance_type: DistanceType,
-    hnsw_params: &HnswBuildParams,
-    stream: impl RecordBatchStream + Unpin + 'static,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
-    shuffle_partition_batches: usize,
-    shuffle_partition_concurrency: usize,
-    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
-) -> Result<()> {
-    let object_store = dataset.object_store();
-    let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
-    let writer = object_store.create(&path).await?;
-
-    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
-    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
-    writer.add_metadata(
-        INDEX_METADATA_SCHEMA_KEY,
-        json!(IndexMetadata {
-            index_type: "IVF_HNSW_SQ".to_string(),
-            distance_type: distance_type.to_string(),
-        })
-        .to_string()
-        .as_str(),
-    );
-
-    let aux_path = dataset
-        .indices_dir()
-        .child(uuid)
-        .child(INDEX_AUXILIARY_FILE_NAME);
-    let aux_writer = object_store.create(&aux_path).await?;
-    let schema = Schema::new(vec![
-        ROW_ID_FIELD.clone(),
-        arrow_schema::Field::new(
-            SQ_CODE_COLUMN,
-            DataType::FixedSizeList(
-                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
-                ivf.dimension() as i32,
-            ),
-            false,
-        ),
-    ]);
-    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer =
-        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
-    aux_writer.add_metadata(
-        INDEX_METADATA_SCHEMA_KEY,
-        json!(IndexMetadata {
-            index_type: "SQ".to_string(),
-            distance_type: distance_type.to_string(),
-        })
-        .to_string()
-        .as_str(),
-    );
-    aux_writer.add_metadata(
-        SQ_METADATA_KEY,
-        json!(ScalarQuantizationMetadata {
-            num_bits: sq.num_bits(),
-            bounds: sq.bounds(),
-        })
-        .to_string()
-        .as_str(),
-    );
-
-    let start = std::time::Instant::now();
-    let num_partitions = ivf.num_partitions() as u32;
-
-    let (hnsw_metadata, aux_ivf) = builder::build_hnsw_sq_partitions(
-        dataset,
-        &mut writer,
-        Some(&mut aux_writer),
-        stream,
-        column,
-        &mut ivf,
-        sq,
+        quantizer,
         distance_type,
         hnsw_params,
         0..num_partitions,

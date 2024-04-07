@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::FixedSizeListArray;
 use async_trait::async_trait;
 use lance_arrow::ArrowFloatType;
 use lance_core::{Error, Result};
@@ -25,23 +26,101 @@ use snafu::{location, Location};
 
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
+use super::pq::storage::PQ_METADTA_KEY;
+use super::pq::ProductQuantizer;
+use super::sq::storage::SQ_METADATA_KEY;
 use super::{
     graph::VectorStorage,
     ivf::storage::IvfData,
     pq::{
         storage::{ProductQuantizationMetadata, ProductQuantizationStorage},
-        ProductQuantizer, ProductQuantizerImpl,
+        ProductQuantizerImpl,
     },
     sq::{
         storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage},
         ScalarQuantizer,
     },
 };
+use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
-pub trait Quantizer {
+pub trait Quantization {
     type Metadata: QuantizerMetadata + Send + Sync;
     type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStorage;
+
+    fn column(&self) -> &'static str;
+    fn metadata_key(&self) -> &'static str;
+    fn quantization_type(&self) -> String;
 }
+
+#[derive(Debug, Clone)]
+pub enum Quantizer {
+    Product(Arc<dyn ProductQuantizer>),
+    Scalar(ScalarQuantizer),
+}
+
+impl Quantizer {
+    pub fn code_dim(&self) -> usize {
+        match self {
+            Self::Product(pq) => pq.num_sub_vectors(),
+            Self::Scalar(sq) => sq.dim,
+        }
+    }
+
+    pub fn column(&self) -> &'static str {
+        match self {
+            Self::Product(pq) => pq.column(),
+            Self::Scalar(sq) => sq.column(),
+        }
+    }
+
+    pub fn metadata_key(&self) -> &'static str {
+        match self {
+            Self::Product(pq) => pq.metadata_key(),
+            Self::Scalar(sq) => sq.metadata_key(),
+        }
+    }
+
+    pub fn typ(&self) -> String {
+        match self {
+            Self::Product(pq) => pq.quantization_type(),
+            Self::Scalar(sq) => sq.quantization_type(),
+        }
+    }
+
+    pub fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+        let args = args.unwrap_or_default();
+        let value = match self {
+            Self::Product(pq) => {
+                let codebook_position = args.codebook_position.ok_or(Error::Index {
+                    message: "codebook_position not found".to_owned(),
+                    location: location!(),
+                })?;
+                serde_json::to_value(ProductQuantizationMetadata {
+                    codebook_position,
+                    num_bits: pq.num_bits(),
+                    num_sub_vectors: pq.num_sub_vectors(),
+                    dimension: pq.dimension(),
+                    codebook: args.codebook,
+                })?
+            }
+
+            Self::Scalar(sq) => serde_json::to_value(ScalarQuantizationMetadata {
+                num_bits: sq.num_bits(),
+                bounds: sq.bounds(),
+            })?,
+        };
+
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QuantizationMetadata {
+    // For PQ
+    pub codebook_position: Option<usize>,
+    pub codebook: Option<FixedSizeListArray>,
+}
+
 
 #[async_trait]
 pub trait QuantizerMetadata: Clone + Sized {
@@ -60,23 +139,59 @@ pub trait QuantizerStorage: Clone + Sized {
     ) -> Result<Self>;
 }
 
-impl Quantizer for ScalarQuantizer {
+impl Quantization for ScalarQuantizer {
     type Metadata = ScalarQuantizationMetadata;
     type Storage = ScalarQuantizationStorage;
+
+    fn column(&self) -> &'static str {
+        SQ_CODE_COLUMN
+    }
+
+    fn metadata_key(&self) -> &'static str {
+        SQ_METADATA_KEY
+    }
+
+    fn quantization_type(&self) -> String {
+        "SQ".to_owned()
+    }
 }
 
-impl Quantizer for dyn ProductQuantizer {
+impl Quantization for dyn ProductQuantizer {
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
+
+    fn column(&self) -> &'static str {
+        PQ_CODE_COLUMN
+    }
+
+    fn metadata_key(&self) -> &'static str {
+        PQ_METADTA_KEY
+    }
+
+    fn quantization_type(&self) -> String {
+        "PQ".to_owned()
+    }
 }
 
-impl<T: ArrowFloatType + Dot + L2> Quantizer for ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + Dot + L2> Quantization for ProductQuantizerImpl<T> {
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
+
+    fn column(&self) -> &'static str {
+        PQ_CODE_COLUMN
+    }
+
+    fn metadata_key(&self) -> &'static str {
+        PQ_METADTA_KEY
+    }
+
+    fn quantization_type(&self) -> String {
+        "PQ".to_owned()
+    }
 }
 
 /// Loader to load partitioned PQ storage from disk.
-pub struct IvfQuantizationStorage<Q: Quantizer> {
+pub struct IvfQuantizationStorage<Q: Quantization> {
     reader: FileReader,
 
     metric_type: MetricType,
@@ -85,7 +200,7 @@ pub struct IvfQuantizationStorage<Q: Quantizer> {
     ivf: IvfData,
 }
 
-impl<Q: Quantizer> Clone for IvfQuantizationStorage<Q> {
+impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {
     fn clone(&self) -> Self {
         Self {
             reader: self.reader.clone(),
@@ -97,7 +212,7 @@ impl<Q: Quantizer> Clone for IvfQuantizationStorage<Q> {
 }
 
 #[allow(dead_code)]
-impl<Q: Quantizer> IvfQuantizationStorage<Q> {
+impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
     ///
     ///
