@@ -121,7 +121,6 @@ pub struct QuantizationMetadata {
     pub codebook: Option<FixedSizeListArray>,
 }
 
-
 #[async_trait]
 pub trait QuantizerMetadata: Clone + Sized {
     async fn load(reader: &FileReader) -> Result<Self>;

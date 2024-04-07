@@ -52,13 +52,8 @@ use lance_index::{
             storage::{IvfData, IVF_PARTITION_KEY},
             IvfBuildParams,
         },
-        pq::{
-            PQBuildParams, ProductQuantizer,
-        },
-        sq::{
-            builder::SQBuildParams,
-            ScalarQuantizer,
-        },
+        pq::{PQBuildParams, ProductQuantizer},
+        sq::{builder::SQBuildParams, ScalarQuantizer},
         Query, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
