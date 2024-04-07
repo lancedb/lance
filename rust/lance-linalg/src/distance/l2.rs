@@ -461,4 +461,22 @@ mod tests {
             do_l2_test(&x, &y)?;
         }
     }
+
+    #[test]
+    fn test_uint8_l2_edge_cases() {
+        let q = vec![0_u8; 2048];
+        let v = vec![0_u8; 2048];
+        assert_eq!(l2_distance_uint_scalar(&q, &v), 0.0);
+
+        let q = vec![0_u8; 2048];
+        let v = vec![255_u8; 2048];
+        assert_eq!(
+            l2_distance_uint_scalar(&q, &v),
+            (255_u32.pow(2) * 2048) as f32
+        );
+        assert_eq!(
+            l2_distance_uint_scalar(&v, &q),
+            (255_u32.pow(2) * 2048) as f32
+        );
+    }
 }
