@@ -180,7 +180,7 @@ impl BatchEncoder {
                     my_col_idx,
                 )))
             }
-            _ => todo!(),
+            _ => todo!("Implement encoding for field type: {:?}", field.data_type()),
         }
     }
 

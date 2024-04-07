@@ -197,7 +197,7 @@ use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use bytes::BytesMut;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -213,6 +213,7 @@ use crate::encodings::logical::fixed_size_list::FslPageScheduler;
 use crate::encodings::logical::list::ListPageScheduler;
 use crate::encodings::logical::primitive::PrimitivePageScheduler;
 use crate::encodings::logical::r#struct::SimpleStructScheduler;
+use crate::encodings::logical::utf8::Utf8PageScheduler;
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
 use crate::EncodingsIo;
@@ -416,6 +417,20 @@ impl DecodeBatchScheduler {
                     })
                     .collect::<Vec<_>>()
             }
+            DataType::Utf8 => {
+                let list_decoders = Self::create_field_scheduler(
+                    &DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+                    column_infos,
+                    buffers,
+                );
+                list_decoders
+                    .into_iter()
+                    .map(|list_decoder| {
+                        Box::new(Utf8PageScheduler::new(list_decoder))
+                            as Box<dyn LogicalPageScheduler>
+                    })
+                    .collect::<Vec<_>>()
+            }
             DataType::Struct(fields) => {
                 let column_info = column_infos.next().unwrap();
                 Self::check_simple_struct(column_info).unwrap();
@@ -435,7 +450,7 @@ impl DecodeBatchScheduler {
                 ))]
             }
             // Still need support for string / binary / dictionary / RLE
-            _ => todo!(),
+            _ => todo!("Decoder support for data type {:?}", data_type),
         }
     }
 
