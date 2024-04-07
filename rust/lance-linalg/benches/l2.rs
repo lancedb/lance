@@ -12,20 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::repeat_with;
+
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
     Float32Array,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use num_traits::{AsPrimitive, Float};
+use rand::Rng;
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_arrow::{ArrowFloatType, FloatArray};
-use lance_linalg::distance::{l2::l2, l2_distance_batch, L2};
+use lance_linalg::distance::{l2::l2, l2_distance_batch, l2_distance_uint_scalar, L2};
 use lance_testing::datagen::generate_random_array_with_seed;
 
+const DIMENSION: usize = 1024;
 const TOTAL: usize = 1024 * 1024; // 1M vectors
 
 /// Naive scalar implementation of L2 distance.
@@ -74,8 +78,6 @@ fn run_bench<T: ArrowFloatType + L2>(c: &mut Criterion) {
 }
 
 fn bench_distance(c: &mut Criterion) {
-    const DIMENSION: usize = 1024;
-
     run_bench::<Float16Type>(c);
     run_bench::<Float32Type>(c);
     let key: Float32Array = generate_random_array_with_seed::<Float32Type>(DIMENSION, [0; 32]);
@@ -101,17 +103,73 @@ fn bench_small_distance(c: &mut Criterion) {
     });
 }
 
+fn l2_distance_uint_scalar_auto_vectorized(key: &[u8], target: &[u8]) -> f32 {
+    let mut sum = 0;
+    const LANE: usize = 16;
+    let x_chunks = key.chunks_exact(LANE);
+    let y_chunks = target.chunks_exact(LANE);
+
+    let x_reminder = x_chunks.remainder();
+    let y_reminder = y_chunks.remainder();
+
+    for (x, y) in x_chunks.zip(y_chunks) {
+        let mut s: u32 = 0;
+        for i in 0..LANE {
+            s += (x[i].abs_diff(y[i]) as u32).pow(2);
+        }
+        sum += s;
+    }
+    sum += x_reminder
+        .iter()
+        .zip(y_reminder)
+        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+        .sum::<u32>();
+    sum as f32
+}
+
+fn bench_uint_distance(c: &mut Criterion) {
+    let mut rng = rand::thread_rng();
+    let key = repeat_with(|| rng.gen::<u8>())
+        .take(DIMENSION)
+        .collect::<Vec<_>>();
+    let target = repeat_with(|| rng.gen::<u8>())
+        .take(TOTAL * DIMENSION)
+        .collect::<Vec<_>>();
+
+    c.bench_function("L2(uint8, scalar)", |b| {
+        b.iter(|| {
+            black_box(
+                target
+                    .chunks_exact(DIMENSION)
+                    .map(|tgt| l2_distance_uint_scalar(&key, tgt))
+                    .collect::<Vec<_>>(),
+            );
+        });
+    });
+
+    c.bench_function("L2(uint8, auto-vectorization)", |b| {
+        b.iter(|| {
+            black_box(
+                target
+                    .chunks_exact(DIMENSION)
+                    .map(|tgt| l2_distance_uint_scalar_auto_vectorized(&key, tgt))
+                    .collect::<Vec<_>>(),
+            );
+        });
+    });
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_distance, bench_small_distance);
+    targets = bench_distance, bench_small_distance, bench_uint_distance);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_distance, bench_small_distance);
+    targets = bench_distance, bench_small_distance, bench_uint_distance);
 criterion_main!(benches);
