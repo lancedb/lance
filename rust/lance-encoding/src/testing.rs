@@ -1,7 +1,7 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::{Array, UInt32Array};
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use log::trace;
@@ -12,8 +12,7 @@ use lance_datagen::{array, gen, RowCount};
 
 use crate::{
     decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, LogicalPageDecoder, PageInfo},
-    encoder::{ArrayEncoder, EncodedPage, FieldEncoder},
-    encodings::logical::primitive::PrimitiveFieldEncoder,
+    encoder::{BatchEncoder, EncodedPage, FieldEncoder},
     EncodingsIo,
 };
 
@@ -24,8 +23,8 @@ pub(crate) struct SimulatedScheduler {
 impl SimulatedScheduler {
     pub fn new(data: Vec<EncodedPage>) -> Self {
         let mut bytes = BytesMut::new();
-        for arr in data.into_iter() {
-            for buf in arr.buffers.into_iter() {
+        for page in data.into_iter() {
+            for buf in page.array.buffers {
                 for part in buf.parts.into_iter() {
                     bytes.extend(part.iter())
                 }
@@ -37,6 +36,11 @@ impl SimulatedScheduler {
     }
 
     fn satisfy_request(&self, req: Range<u64>) -> Bytes {
+        println!(
+            "Satisfy request {:?} from bytes of size {}",
+            req,
+            self.data.len()
+        );
         self.data.slice(req.start as usize..req.end as usize)
     }
 }
@@ -48,14 +52,6 @@ impl EncodingsIo for SimulatedScheduler {
             .map(|range| self.satisfy_request(range))
             .collect::<Vec<_>>()))
         .boxed()
-    }
-}
-
-pub async fn check_round_trip_array_encoding(encoder: impl ArrayEncoder + 'static, field: Field) {
-    let array_encoder = Arc::new(encoder);
-    for page_size_bytes in [1024, 4 * 1024, 1024 * 1024] {
-        let field_encoder = PrimitiveFieldEncoder::new(page_size_bytes, array_encoder.clone());
-        check_round_trip_field_encoding(field_encoder, field.clone()).await
     }
 }
 
@@ -90,128 +86,159 @@ async fn test_decode(
     }
 }
 
-pub async fn check_round_trip_field_encoding(mut encoder: impl FieldEncoder, field: Field) {
-    let data = gen()
-        .col(None, array::rand_type(field.data_type()))
-        .into_batch_rows(RowCount::from(10000))
-        .unwrap()
-        .column(0)
-        .clone();
+pub async fn check_round_trip_encoding(field: Field) {
+    let mut col_idx = 0;
+    let encoder = BatchEncoder::get_encoder_for_field(&field, 4096, &mut col_idx).unwrap();
+    check_round_trip_field_encoding(encoder, field).await
+}
 
-    let num_rows = data.len();
+fn supports_nulls(data_type: &DataType) -> bool {
+    // We don't yet have nullability support for all types.  Don't test nullability for the
+    // types we don't support.
+    match data_type {
+        DataType::List(_) | DataType::Struct(_) => false,
+        _ => true,
+    }
+}
 
-    for num_ingest_batches in [1, 5, 10] {
-        let rows_per_batch = num_rows / num_ingest_batches;
-        trace!(
-            "Testing with {} rows divided across {} batches for {} rows per batch",
-            num_rows,
-            num_ingest_batches,
-            rows_per_batch
-        );
+async fn check_round_trip_field_encoding(mut encoder: Box<dyn FieldEncoder>, field: Field) {
+    for null_rate in [None, Some(0.5)] {
+        let field = if null_rate.is_some() {
+            if !supports_nulls(field.data_type()) {
+                continue;
+            }
+            field.clone().with_nullable(true)
+        } else {
+            field.clone().with_nullable(false)
+        };
+        let mut generator = gen().col(None, array::rand_type(field.data_type()));
+        if let Some(null_rate) = null_rate {
+            generator.with_random_nulls(null_rate);
+        }
+        let data = generator
+            .into_batch_rows(RowCount::from(10000))
+            .unwrap()
+            .column(0)
+            .clone();
 
-        let mut offset = 0;
-        let mut all_encoded_pages = Vec::new();
-        let mut page_infos: Vec<Vec<Arc<PageInfo>>> =
-            vec![Vec::new(); encoder.num_columns() as usize];
-        let mut buffer_offset = 0;
+        let num_rows = data.len();
 
-        let mut simulate_write = |encoded_page: EncodedPage| {
-            trace!("Encoded page {:?}", encoded_page);
-            let buffer_offsets = encoded_page
-                .buffers
-                .iter()
-                .map(|buf| {
-                    let offset = buffer_offset;
-                    buffer_offset += buf.parts.iter().map(|part| part.len() as u64).sum::<u64>();
-                    offset
-                })
-                .collect::<Vec<_>>();
+        for num_ingest_batches in [1, 5, 10] {
+            let rows_per_batch = num_rows / num_ingest_batches;
+            trace!(
+                "Testing with {} rows divided across {} batches for {} rows per batch",
+                num_rows,
+                num_ingest_batches,
+                rows_per_batch
+            );
 
-            let page_info = PageInfo {
-                num_rows: encoded_page.num_rows,
-                encoding: encoded_page.encoding.clone(),
-                buffer_offsets: Arc::new(buffer_offsets.clone()),
+            let mut offset = 0;
+            let mut all_encoded_pages = Vec::new();
+            let mut page_infos: Vec<Vec<Arc<PageInfo>>> =
+                vec![Vec::new(); encoder.num_columns() as usize];
+            let mut buffer_offset = 0;
+
+            let mut simulate_write = |mut encoded_page: EncodedPage| {
+                trace!("Encoded page {:?}", encoded_page);
+                encoded_page.array.buffers.sort_by_key(|b| b.index);
+                let buffer_offsets = encoded_page
+                    .array
+                    .buffers
+                    .iter()
+                    .map(|buf| {
+                        let offset = buffer_offset;
+                        buffer_offset +=
+                            buf.parts.iter().map(|part| part.len() as u64).sum::<u64>();
+                        offset
+                    })
+                    .collect::<Vec<_>>();
+
+                let page_info = PageInfo {
+                    num_rows: encoded_page.num_rows,
+                    encoding: encoded_page.array.encoding.clone(),
+                    buffer_offsets: Arc::new(buffer_offsets.clone()),
+                };
+
+                let col_idx = encoded_page.column_idx as usize;
+                all_encoded_pages.push(encoded_page);
+                page_infos[col_idx].push(Arc::new(page_info));
             };
 
-            let col_idx = encoded_page.column_idx as usize;
-            all_encoded_pages.push(encoded_page);
-            page_infos[col_idx].push(Arc::new(page_info));
-        };
+            for _ in 0..num_ingest_batches {
+                let data = data.slice(offset, rows_per_batch);
 
-        for _ in 0..num_ingest_batches {
-            let data = data.slice(offset, rows_per_batch);
+                for encode_task in encoder.maybe_encode(data).unwrap() {
+                    let encoded_page = encode_task.await.unwrap();
+                    simulate_write(encoded_page);
+                }
 
-            for encode_task in encoder.maybe_encode(data).unwrap() {
+                offset += rows_per_batch;
+            }
+
+            for encode_task in encoder.flush().unwrap() {
                 let encoded_page = encode_task.await.unwrap();
                 simulate_write(encoded_page);
             }
 
-            offset += rows_per_batch;
-        }
+            let scheduler =
+                Arc::new(SimulatedScheduler::new(all_encoded_pages)) as Arc<dyn EncodingsIo>;
 
-        for encode_task in encoder.flush().unwrap() {
-            let encoded_page = encode_task.await.unwrap();
-            simulate_write(encoded_page);
-        }
+            let column_infos = page_infos
+                .into_iter()
+                .map(|page_infos| ColumnInfo::new(page_infos, Vec::new()))
+                .collect::<Vec<_>>();
+            let schema = Schema::new(vec![field.clone()]);
 
-        let scheduler =
-            Arc::new(SimulatedScheduler::new(all_encoded_pages)) as Arc<dyn EncodingsIo>;
+            // Test range scheduling
+            for range in [0..500, 100..1100, 8000..8500] {
+                let range = range.start as u64..range.end as u64;
+                let num_rows = range.end - range.start;
+                let expected = data.slice(range.start as usize, num_rows as usize);
+                let scheduler = scheduler.clone();
+                test_decode(
+                    num_rows,
+                    &schema,
+                    &column_infos,
+                    expected,
+                    |mut decode_scheduler, tx| {
+                        async move { decode_scheduler.schedule_range(range, tx, &scheduler).await }
+                            .boxed()
+                    },
+                )
+                .await;
+            }
 
-        let column_infos = page_infos
-            .into_iter()
-            .map(|page_infos| ColumnInfo::new(page_infos, Vec::new()))
-            .collect::<Vec<_>>();
-        let schema = Schema::new(vec![field.clone()]);
-
-        // Test range scheduling
-        for range in [0..500, 100..1100, 8000..8500] {
-            let range = range.start as u64..range.end as u64;
-            let num_rows = range.end - range.start;
-            let expected = data.slice(range.start as usize, num_rows as usize);
-            let scheduler = scheduler.clone();
-            test_decode(
-                num_rows,
-                &schema,
-                &column_infos,
-                expected,
-                |mut decode_scheduler, tx| {
-                    async move { decode_scheduler.schedule_range(range, tx, &scheduler).await }
+            // Test take scheduling
+            for indices in [
+                vec![100],
+                vec![0],
+                vec![9999],
+                vec![100, 1100, 5000],
+                vec![1000, 2000, 3000],
+                vec![2000, 2001, 2002, 2003, 2004],
+                // Big take that spans multiple pages and generates multiple output batches
+                (100..500).map(|i| i * 3).collect::<Vec<_>>(),
+            ] {
+                let num_rows = indices.len() as u64;
+                let indices_arr = UInt32Array::from(indices.clone());
+                let expected = arrow_select::take::take(&data, &indices_arr, None).unwrap();
+                let scheduler = scheduler.clone();
+                test_decode(
+                    num_rows,
+                    &schema,
+                    &column_infos,
+                    expected,
+                    |mut decode_scheduler, tx| {
+                        async move {
+                            decode_scheduler
+                                .schedule_take(&indices, tx, &scheduler)
+                                .await
+                        }
                         .boxed()
-                },
-            )
-            .await;
-        }
-
-        // Test take scheduling
-        for indices in [
-            vec![100],
-            vec![0],
-            vec![9999],
-            vec![100, 1100, 5000],
-            vec![1000, 2000, 3000],
-            vec![2000, 2001, 2002, 2003, 2004],
-            // Big take that spans multiple pages and generates multiple output batches
-            (100..500).map(|i| i * 3).collect::<Vec<_>>(),
-        ] {
-            let num_rows = indices.len() as u64;
-            let indices_arr = UInt32Array::from(indices.clone());
-            let expected = arrow_select::take::take(&data, &indices_arr, None).unwrap();
-            let scheduler = scheduler.clone();
-            test_decode(
-                num_rows,
-                &schema,
-                &column_infos,
-                expected,
-                |mut decode_scheduler, tx| {
-                    async move {
-                        decode_scheduler
-                            .schedule_take(&indices, tx, &scheduler)
-                            .await
-                    }
-                    .boxed()
-                },
-            )
-            .await;
+                    },
+                )
+                .await;
+            }
         }
     }
 }
