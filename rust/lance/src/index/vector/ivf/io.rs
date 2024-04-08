@@ -107,7 +107,10 @@ async fn merge_streams(
             let codes = Arc::new(
                 batch
                     .column_by_name(column)
-                    .expect(format!("code column {} not found", column).as_str())
+                    .ok_or_else(|| Error::Index {
+                        message: format!("code column {} not found", column),
+                        location: location!(),
+                    })?
                     .as_fixed_size_list()
                     .clone(),
             );
