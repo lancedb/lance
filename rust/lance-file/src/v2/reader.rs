@@ -43,7 +43,8 @@ pub struct FileReader {
 
 struct Footer {
     column_meta_start: u64,
-    // We don't use this today because we get here by subtracting backward from global_buf_start
+    // We don't use this today because we always load metadata for every column
+    // and don't yet support "metadata projection"
     #[allow(dead_code)]
     column_meta_offsets_start: u64,
     global_buff_start: u64,
