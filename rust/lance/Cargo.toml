@@ -102,6 +102,7 @@ cli = ["clap", "lzma-sys/static"]
 tensorflow = ["tfrecord"]
 dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
+substrait = ["lance-datafusion/substrait"]
 
 [[bin]]
 name = "lq"
