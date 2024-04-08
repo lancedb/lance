@@ -47,9 +47,25 @@ pub trait Quantization {
     type Metadata: QuantizerMetadata + Send + Sync;
     type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStorage;
 
+    fn code_dim(&self) -> usize;
     fn column(&self) -> &'static str;
     fn metadata_key(&self) -> &'static str;
-    fn quantization_type(&self) -> String;
+    fn quantization_type(&self) -> QuantizationType;
+    fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value>;
+}
+
+pub enum QuantizationType {
+    Product,
+    Scalar,
+}
+
+impl std::fmt::Display for QuantizationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Product => write!(f, "PQ"),
+            Self::Scalar => write!(f, "SQ"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +96,7 @@ impl Quantizer {
         }
     }
 
-    pub fn typ(&self) -> String {
+    pub fn quantization_type(&self) -> QuantizationType {
         match self {
             Self::Product(pq) => pq.quantization_type(),
             Self::Scalar(sq) => sq.quantization_type(),
@@ -88,29 +104,10 @@ impl Quantizer {
     }
 
     pub fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
-        let args = args.unwrap_or_default();
-        let value = match self {
-            Self::Product(pq) => {
-                let codebook_position = args.codebook_position.ok_or(Error::Index {
-                    message: "codebook_position not found".to_owned(),
-                    location: location!(),
-                })?;
-                serde_json::to_value(ProductQuantizationMetadata {
-                    codebook_position,
-                    num_bits: pq.num_bits(),
-                    num_sub_vectors: pq.num_sub_vectors(),
-                    dimension: pq.dimension(),
-                    codebook: args.codebook,
-                })?
-            }
-
-            Self::Scalar(sq) => serde_json::to_value(ScalarQuantizationMetadata {
-                num_bits: sq.num_bits(),
-                bounds: sq.bounds(),
-            })?,
-        };
-
-        Ok(value)
+        match self {
+            Self::Product(pq) => pq.metadata(args),
+            Self::Scalar(sq) => sq.metadata(args),
+        }
     }
 }
 
@@ -142,6 +139,10 @@ impl Quantization for ScalarQuantizer {
     type Metadata = ScalarQuantizationMetadata;
     type Storage = ScalarQuantizationStorage;
 
+    fn code_dim(&self) -> usize {
+        self.dim
+    }
+
     fn column(&self) -> &'static str {
         SQ_CODE_COLUMN
     }
@@ -150,8 +151,15 @@ impl Quantization for ScalarQuantizer {
         SQ_METADATA_KEY
     }
 
-    fn quantization_type(&self) -> String {
-        "SQ".to_owned()
+    fn quantization_type(&self) -> QuantizationType {
+        QuantizationType::Scalar
+    }
+
+    fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(ScalarQuantizationMetadata {
+            num_bits: self.num_bits(),
+            bounds: self.bounds(),
+        })?)
     }
 }
 
@@ -159,6 +167,10 @@ impl Quantization for dyn ProductQuantizer {
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
 
+    fn code_dim(&self) -> usize {
+        self.num_sub_vectors()
+    }
+
     fn column(&self) -> &'static str {
         PQ_CODE_COLUMN
     }
@@ -167,14 +179,34 @@ impl Quantization for dyn ProductQuantizer {
         PQ_METADTA_KEY
     }
 
-    fn quantization_type(&self) -> String {
-        "PQ".to_owned()
+    fn quantization_type(&self) -> QuantizationType {
+        QuantizationType::Product
+    }
+
+    fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+        let args = args.unwrap_or_default();
+
+        let codebook_position = args.codebook_position.ok_or(Error::Index {
+            message: "codebook_position not found".to_owned(),
+            location: location!(),
+        })?;
+        Ok(serde_json::to_value(ProductQuantizationMetadata {
+            codebook_position,
+            num_bits: self.num_bits(),
+            num_sub_vectors: self.num_sub_vectors(),
+            dimension: self.dimension(),
+            codebook: args.codebook,
+        })?)
     }
 }
 
-impl<T: ArrowFloatType + Dot + L2> Quantization for ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + Dot + L2 + 'static> Quantization for ProductQuantizerImpl<T> {
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
+
+    fn code_dim(&self) -> usize {
+        self.num_sub_vectors()
+    }
 
     fn column(&self) -> &'static str {
         PQ_CODE_COLUMN
@@ -184,8 +216,24 @@ impl<T: ArrowFloatType + Dot + L2> Quantization for ProductQuantizerImpl<T> {
         PQ_METADTA_KEY
     }
 
-    fn quantization_type(&self) -> String {
-        "PQ".to_owned()
+    fn quantization_type(&self) -> QuantizationType {
+        QuantizationType::Product
+    }
+
+    fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+        let args = args.unwrap_or_default();
+
+        let codebook_position = args.codebook_position.ok_or(Error::Index {
+            message: "codebook_position not found".to_owned(),
+            location: location!(),
+        })?;
+        Ok(serde_json::to_value(ProductQuantizationMetadata {
+            codebook_position,
+            num_bits: self.num_bits(),
+            num_sub_vectors: self.num_sub_vectors(),
+            dimension: self.dimension(),
+            codebook: args.codebook,
+        })?)
     }
 }
 

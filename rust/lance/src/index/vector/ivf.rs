@@ -1289,7 +1289,7 @@ async fn write_ivf_hnsw_file(
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: format!("IVF_HNSW_{}", quantizer.typ()),
+            index_type: format!("IVF_HNSW_{}", quantizer.quantization_type()),
             distance_type: distance_type.to_string(),
         })
         .to_string()
@@ -1318,7 +1318,7 @@ async fn write_ivf_hnsw_file(
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: quantizer.typ(),
+            index_type: quantizer.quantization_type().to_string(),
             distance_type: distance_type.to_string(),
         })
         .to_string()

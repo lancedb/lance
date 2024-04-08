@@ -43,7 +43,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::MetricType;
-use lance_linalg::kernels::{normalize_arrow, normalize_fsl};
+use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
