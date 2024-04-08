@@ -39,11 +39,6 @@ impl SimulatedScheduler {
     }
 
     fn satisfy_request(&self, req: Range<u64>) -> Bytes {
-        println!(
-            "Satisfy request {:?} from bytes of size {}",
-            req,
-            self.data.len()
-        );
         self.data.slice(req.start as usize..req.end as usize)
     }
 }
@@ -105,7 +100,7 @@ fn supports_nulls(data_type: &DataType) -> bool {
 }
 
 async fn check_round_trip_field_encoding(mut encoder: Box<dyn FieldEncoder>, field: Field) {
-    for null_rate in [None, Some(0.5)] {
+    for null_rate in [None, Some(0.5), Some(1.0)] {
         let field = if null_rate.is_some() {
             if !supports_nulls(field.data_type()) {
                 continue;
