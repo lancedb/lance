@@ -41,10 +41,9 @@ use crate::vector::{
     transform::Transformer,
 };
 
-use super::quantizer::Quantizer;
-use super::sq::transform::SQTransformer;
 use super::sq::ScalarQuantizer;
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN, SQ_CODE_COLUMN};
+use super::transform::RemoveColumn;
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
@@ -231,7 +230,6 @@ fn new_ivf_with_sq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveTy
         mat,
         metric_type,
         vector_column,
-        sq,
         range,
     ))
 }
@@ -389,7 +387,6 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
         centroids: MatrixView<T>,
         metric_type: MetricType,
         vector_column: &str,
-        sq: ScalarQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
@@ -413,11 +410,9 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
             )));
         }
 
-        transforms.push(Arc::new(SQTransformer::<T>::new(
-            sq,
-            vector_column.to_owned(),
-            SQ_CODE_COLUMN.to_owned(),
-        )));
+        // For SQ we will transofrm the vector to SQ code while building the index,
+        // so simply drop the vector column now.
+        transforms.push(Arc::new(RemoveColumn::new(vector_column)));
         Self {
             centroids: centroids.clone(),
             metric_type,

@@ -167,6 +167,27 @@ impl Transformer for KeepFiniteVectors {
     }
 }
 
+#[derive(Debug)]
+pub struct RemoveColumn {
+    column: String,
+}
+
+impl RemoveColumn {
+    pub fn new(column: &str) -> Self {
+        Self {
+            column: column.to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl Transformer for RemoveColumn {
+    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        Ok(batch.drop_column(&self.column)?)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
