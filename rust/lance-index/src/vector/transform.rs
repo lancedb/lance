@@ -168,11 +168,11 @@ impl Transformer for KeepFiniteVectors {
 }
 
 #[derive(Debug)]
-pub struct RemoveColumn {
+pub struct DropColumn {
     column: String,
 }
 
-impl RemoveColumn {
+impl DropColumn {
     pub fn new(column: &str) -> Self {
         Self {
             column: column.to_owned(),
@@ -181,7 +181,7 @@ impl RemoveColumn {
 }
 
 #[async_trait]
-impl Transformer for RemoveColumn {
+impl Transformer for DropColumn {
     async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         Ok(batch.drop_column(&self.column)?)
     }
@@ -192,7 +192,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::{FixedSizeListArray, Float16Array, Float32Array};
+    use arrow_array::{FixedSizeListArray, Float16Array, Float32Array, Int32Array};
     use arrow_schema::Schema;
     use half::f16;
     use lance_arrow::*;
@@ -282,5 +282,28 @@ mod tests {
             act_fsl.value(1).as_primitive::<Float32Type>().values()[..],
             [2.0 / 8.0_f32.sqrt(); 2]
         );
+    }
+
+    #[tokio::test]
+    async fn test_drop_column() {
+        let i32_array = Int32Array::from_iter_values([1, 2].into_iter());
+        let data = Float32Array::from_iter_values([1.0, 1.0, 2.0, 2.0].into_iter());
+        let fsl = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
+        let schema = Schema::new(vec![
+            Field::new("i32", DataType::Int32, false),
+            Field::new(
+                "v",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]);
+        let batch =
+            RecordBatch::try_new(schema.into(), vec![Arc::new(i32_array), Arc::new(fsl)]).unwrap();
+        let transformer = DropColumn::new("v");
+        let output = transformer.transform(&batch).await.unwrap();
+        assert!(output.column_by_name("v").is_none());
+
+        let dup_drop_result = transformer.transform(&output).await;
+        assert!(dup_drop_result.is_ok());
     }
 }

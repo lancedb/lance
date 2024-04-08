@@ -58,7 +58,9 @@ use crate::{dataset::ROW_ID, Dataset};
 use crate::{utils, Result};
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
-const HNSW_PARTITIONS_BUILD_PARRALLEL: usize = 16;
+lazy_static::lazy_static! {
+    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = num_cpus::get();
+}
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(
@@ -300,7 +302,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let mut aux_part_files = Vec::with_capacity(ivf.num_partitions());
     let tmp_part_dir = Path::from_filesystem_path(TempDir::new()?)?;
     let mut tasks = Vec::with_capacity(ivf.num_partitions());
-    let sem = Arc::new(Semaphore::new(HNSW_PARTITIONS_BUILD_PARRALLEL));
+    let sem = Arc::new(Semaphore::new(*HNSW_PARTITIONS_BUILD_PARALLEL));
     for part_id in 0..ivf.num_partitions() {
         part_files.push(tmp_part_dir.child(format!("hnsw_part_{}", part_id)));
         aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));

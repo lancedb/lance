@@ -141,6 +141,13 @@ pub(super) async fn build_hnsw_partitions(
         });
     }
 
+    if metric_type == MetricType::Dot {
+        return Err(Error::Index {
+            message: "HNSW index does not support dot product distance".to_string(),
+            location: location!(),
+        });
+    }
+
     let ivf_model = lance_index::vector::ivf::new_ivf_with_quantizer(
         ivf.centroids.values(),
         dim,

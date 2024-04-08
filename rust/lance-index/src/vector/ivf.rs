@@ -42,7 +42,7 @@ use crate::vector::{
 };
 
 use super::quantizer::Quantizer;
-use super::transform::RemoveColumn;
+use super::transform::DropColumn;
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
 pub mod builder;
@@ -407,7 +407,7 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
 
         // For SQ we will transofrm the vector to SQ code while building the index,
         // so simply drop the vector column now.
-        transforms.push(Arc::new(RemoveColumn::new(vector_column)));
+        transforms.push(Arc::new(DropColumn::new(vector_column)));
         Self {
             centroids: centroids.clone(),
             metric_type,
