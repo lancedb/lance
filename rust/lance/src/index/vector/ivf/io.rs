@@ -64,7 +64,7 @@ async fn merge_streams(
     streams_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
     new_streams: &mut [Pin<Box<Peekable<impl Stream<Item = Result<RecordBatch>>>>>],
     part_id: u32,
-    code_column: &str,
+    code_column: Option<&str>,
     code_array: &mut Vec<Arc<dyn Array>>,
     row_id_array: &mut Vec<Arc<dyn Array>>,
 ) -> Result<()> {
@@ -91,13 +91,6 @@ async fn merge_streams(
             }
         };
 
-        let codes = Arc::new(
-            batch
-                .column_by_name(code_column)
-                .expect("pq code column not found")
-                .as_fixed_size_list()
-                .clone(),
-        );
         let row_ids: Arc<dyn Array> = Arc::new(
             batch
                 .column_by_name(ROW_ID)
@@ -105,8 +98,18 @@ async fn merge_streams(
                 .as_primitive::<UInt64Type>()
                 .clone(),
         );
-        code_array.push(codes);
         row_id_array.push(row_ids);
+
+        if let Some(column) = code_column {
+            let codes = Arc::new(
+                batch
+                    .column_by_name(column)
+                    .expect(format!("code column {} not found", column).as_str())
+                    .as_fixed_size_list()
+                    .clone(),
+            );
+            code_array.push(codes);
+        }
 
         match stream.peek().await {
             Some(Ok(batch)) => {
@@ -218,7 +221,7 @@ pub(super) async fn write_pq_partitions(
             &mut streams_heap,
             &mut new_streams,
             part_id,
-            PQ_CODE_COLUMN,
+            Some(PQ_CODE_COLUMN),
             &mut pq_array,
             &mut row_id_array,
         )
@@ -303,11 +306,18 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         let mut code_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
+
+        // We don't transform vectors to SQ codes while shuffling,
+        // so we won't merge SQ codes from the stream.
+        let code_column = match &quantizer {
+            Quantizer::Product(pq) => Some(pq.column()),
+            Quantizer::Scalar(_) => None,
+        };
         merge_streams(
             &mut streams_heap,
             &mut new_streams,
             part_id as u32,
-            quantizer.column(),
+            code_column,
             &mut code_array,
             &mut row_id_array,
         )

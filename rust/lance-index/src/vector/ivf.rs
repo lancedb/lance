@@ -41,7 +41,7 @@ use crate::vector::{
     transform::Transformer,
 };
 
-use super::sq::ScalarQuantizer;
+use super::quantizer::Quantizer;
 use super::transform::RemoveColumn;
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
@@ -175,7 +175,6 @@ pub fn new_ivf_with_sq(
     dimension: usize,
     metric_type: MetricType,
     vector_column: &str,
-    sq: ScalarQuantizer,
     range: Option<Range<u32>>,
 ) -> Result<Arc<dyn Ivf>> {
     let ivf = match centroids.data_type() {
@@ -184,7 +183,6 @@ pub fn new_ivf_with_sq(
             dimension,
             metric_type,
             vector_column,
-            sq,
             range,
         ),
         DataType::Float32 => new_ivf_with_sq_impl::<Float32Type>(
@@ -192,7 +190,6 @@ pub fn new_ivf_with_sq(
             dimension,
             metric_type,
             vector_column,
-            sq,
             range,
         ),
         DataType::Float64 => new_ivf_with_sq_impl::<Float64Type>(
@@ -200,7 +197,6 @@ pub fn new_ivf_with_sq(
             dimension,
             metric_type,
             vector_column,
-            sq,
             range,
         ),
         _ => {
@@ -222,7 +218,6 @@ fn new_ivf_with_sq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveTy
     dimension: usize,
     metric_type: MetricType,
     vector_column: &str,
-    sq: ScalarQuantizer,
     range: Option<Range<u32>>,
 ) -> Arc<dyn Ivf> {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
@@ -246,8 +241,8 @@ pub fn new_ivf_with_quantizer(
         Quantizer::Product(pq) => {
             new_ivf_with_pq(centroids, dimension, metric_type, vector_column, pq, range)
         }
-        Quantizer::Scalar(sq) => {
-            new_ivf_with_sq(centroids, dimension, metric_type, vector_column, sq, range)
+        Quantizer::Scalar(_) => {
+            new_ivf_with_sq(centroids, dimension, metric_type, vector_column, range)
         }
     }
 }
