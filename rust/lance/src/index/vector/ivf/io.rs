@@ -43,6 +43,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::MetricType;
+use lance_linalg::kernels::{normalize_arrow, normalize_fsl};
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -440,20 +441,23 @@ async fn build_hnsw_quantization_partition(
     let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
     let mut vector_batches = Vec::with_capacity(row_ids_array.len());
     for row_ids in row_ids_array.iter() {
-        let array = dataset
+        let mut array = dataset
             .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
             .await?
             .column_by_name(column.as_ref())
             .expect("row id column not found")
             .clone();
+
+        if metric_type == MetricType::Cosine {
+            array = Arc::new(normalize_fsl(array.as_fixed_size_list())?);
+        }
         vector_batches.push(array);
     }
 
     let build_with_aux = aux_writer.is_some();
-    let (hnsw, fsl) = utils::tokio::spawn_cpu(move || {
-        build_hnsw_model(metric_type, (*hnsw_params).clone(), vector_batches)
-    })
-    .await?;
+    let (hnsw, fsl) =
+        utils::tokio::spawn_cpu(move || build_hnsw_model((*hnsw_params).clone(), vector_batches))
+            .await?;
 
     writer.add_metadata(
         HNSW_METADATA_KEY,
