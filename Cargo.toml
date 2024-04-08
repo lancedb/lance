@@ -109,9 +109,9 @@ parquet = "49.0"
 pin-project = "1.0"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
 proptest = "1.3.1"
-prost = "0.12"
-prost-build = "0.12"
-prost-types = "0.12"
+prost = "0.12.2"
+prost-build = "0.12.2"
+prost-types = "0.12.2"
 rand = { version = "0.8.3", features = ["small_rng"] }
 roaring = "0.10.1"
 rustc_version = "0.4"
