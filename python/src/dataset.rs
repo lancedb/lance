@@ -312,6 +312,10 @@ impl Dataset {
         }
     }
 
+    pub fn __copy__(&self) -> Self {
+        self.clone()
+    }
+
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());
@@ -817,7 +821,10 @@ impl Dataset {
     fn checkout_version(&self, version: u64) -> PyResult<Self> {
         let ds = RT
             .block_on(None, self.ds.checkout_version(version))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err| match err {
+                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
         Ok(Self {
             ds: Arc::new(ds),
             uri: self.uri.clone(),

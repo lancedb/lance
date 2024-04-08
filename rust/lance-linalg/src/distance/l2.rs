@@ -63,6 +63,15 @@ where
     T::ArrowType::l2(from, to)
 }
 
+/// Calculate L2 distance between two uint8 slices.
+#[inline]
+pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
+    key.iter()
+        .zip(target.iter())
+        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+        .sum::<u32>() as f32
+}
+
 /// Calculate the L2 distance between two vectors, using scalar operations.
 ///
 /// It relies on LLVM for auto-vectorization and unrolling.
@@ -293,7 +302,6 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::Float32Array;
     use proptest::prelude::*;
 
     use crate::test_utils::{
@@ -452,5 +460,23 @@ mod tests {
         fn test_l2_distance_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
             do_l2_test(&x, &y)?;
         }
+    }
+
+    #[test]
+    fn test_uint8_l2_edge_cases() {
+        let q = vec![0_u8; 2048];
+        let v = vec![0_u8; 2048];
+        assert_eq!(l2_distance_uint_scalar(&q, &v), 0.0);
+
+        let q = vec![0_u8; 2048];
+        let v = vec![255_u8; 2048];
+        assert_eq!(
+            l2_distance_uint_scalar(&q, &v),
+            (255_u32.pow(2) * 2048) as f32
+        );
+        assert_eq!(
+            l2_distance_uint_scalar(&v, &q),
+            (255_u32.pow(2) * 2048) as f32
+        );
     }
 }

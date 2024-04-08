@@ -22,7 +22,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
-use rand::{self, Rng};
+use rand::Rng;
 
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::vector::VectorIndexParams;

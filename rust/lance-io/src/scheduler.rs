@@ -256,7 +256,6 @@ impl FileScheduler {
 mod tests {
     use std::collections::VecDeque;
 
-    use object_store::path::Path;
     use rand::RngCore;
     use tempfile::tempdir;
 

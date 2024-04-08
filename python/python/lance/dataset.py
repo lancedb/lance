@@ -191,6 +191,12 @@ class LanceDataset(pa.dataset.Dataset):
         self._uri, version = state
         self._ds = _Dataset(self._uri, version)
 
+    def __copy__(self):
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._uri = self._uri
+        ds._ds = copy.copy(self._ds)
+        return ds
+
     def __len__(self):
         return self.count_rows()
 

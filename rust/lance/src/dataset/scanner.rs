@@ -44,7 +44,6 @@ use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
-use lance_datafusion::expr::parse_substrait;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -65,6 +64,9 @@ use crate::io::exec::{
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
+
+#[cfg(feature = "substrait")]
+use lance_datafusion::expr::parse_substrait;
 
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
@@ -345,6 +347,7 @@ impl Scanner {
     ///
     /// The message must contain exactly one expression and that expression
     /// must be a scalar expression whose return type is boolean.
+    #[cfg(feature = "substrait")]
     pub async fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
         let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
         let expr = parse_substrait(filter, schema.clone()).await?;
@@ -475,6 +478,7 @@ impl Scanner {
             key: key.into(),
             k,
             nprobes: 1,
+            ef: None,
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: true,
@@ -485,6 +489,13 @@ impl Scanner {
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.nprobes = n;
+        }
+        self
+    }
+
+    pub fn ef(&mut self, ef: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.ef = Some(ef);
         }
         self
     }
@@ -1489,11 +1500,10 @@ impl From<DatasetRecordBatchStream> for SendableRecordBatchStream {
 #[cfg(test)]
 mod test {
 
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
     use std::vec;
 
     use arrow::array::as_primitive_array;
-    use arrow::compute::concat_batches;
     use arrow::datatypes::Int32Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
@@ -1502,14 +1512,12 @@ mod test {
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{ArrowError, DataType};
+    use arrow_schema::ArrowError;
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
-    use futures::TryStreamExt;
     use half::f16;
-    use lance_core::ROW_ID;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
-    use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use tempfile::{tempdir, TempDir};
 

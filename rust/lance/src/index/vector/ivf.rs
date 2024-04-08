@@ -1574,8 +1574,8 @@ mod tests {
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
-    use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{RecordBatchIterator, RecordBatchReader, UInt64Array};
+    use arrow_schema::Field;
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
@@ -1587,9 +1587,7 @@ mod tests {
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
 
-    use crate::index::{
-        vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt, IndexType,
-    };
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
     const DIM: usize = 32;
 
@@ -1773,6 +1771,7 @@ mod tests {
                     key: Arc::new(row),
                     k: 5,
                     nprobes: 1,
+                    ef: None,
                     refine_factor: None,
                     metric_type: MetricType::L2,
                     use_index: true,

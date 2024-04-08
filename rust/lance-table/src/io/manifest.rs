@@ -200,11 +200,9 @@ impl ManifestProvider for ManifestDescribing {
 mod test {
     use arrow_array::{Int32Array, RecordBatch};
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use lance_core::datatypes::Schema;
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
     use lance_file::{reader::FileReader, writer::FileWriter};
     use rand::{distributions::Alphanumeric, Rng};

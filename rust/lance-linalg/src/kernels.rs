@@ -67,10 +67,7 @@ pub fn argmax_opt<T: Num + Bounded + PartialOrd>(
 ///
 /// Returns the index of the min value in the array.
 ///
-pub fn argmin<T: Num + PartialOrd + Copy>(iter: impl Iterator<Item = T>) -> Option<u32>
-where
-    T: Bounded,
-{
+pub fn argmin<T: Num + PartialOrd + Copy + Bounded>(iter: impl Iterator<Item = T>) -> Option<u32> {
     argmin_value(iter).map(|(idx, _)| idx)
 }
 

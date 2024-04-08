@@ -11,7 +11,6 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import os
 import sys
 
 import pytest
@@ -22,16 +21,6 @@ def provide_pandas(request, monkeypatch):
     if not request.param:
         monkeypatch.setitem(sys.modules, "pd", None)
     return request.param
-
-
-@pytest.fixture
-def s3_bucket() -> str:
-    return os.environ.get("TEST_S3_BUCKET", "lance-integtest")
-
-
-@pytest.fixture
-def ddb_table() -> str:
-    return os.environ.get("TEST_DDB_TABLE", "lance-integtest")
 
 
 def disable_items_with_mark(items, mark, reason):

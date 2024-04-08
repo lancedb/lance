@@ -195,14 +195,408 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::ArrayRef;
+use arrow_array::cast::AsArray;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, Schema};
 use bytes::BytesMut;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use log::trace;
+use snafu::{location, Location};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-use lance_core::Result;
+use lance_core::{Error, Result};
 
+use crate::encodings::logical::fixed_size_list::FslPageScheduler;
+use crate::encodings::logical::list::ListPageScheduler;
+use crate::encodings::logical::primitive::PrimitivePageScheduler;
+use crate::encodings::logical::r#struct::SimpleStructScheduler;
+use crate::encodings::physical::{ColumnBuffers, FileBuffers};
+use crate::format::pb;
 use crate::EncodingsIo;
+
+/// Metadata describing a page in a file
+///
+/// This is typically created by reading the metadata section of a Lance file
+#[derive(Debug)]
+pub struct PageInfo {
+    /// The number of rows in the page
+    pub num_rows: u32,
+    /// The encoding that explains the buffers in the page
+    pub encoding: pb::ArrayEncoding,
+    /// The offsets of the buffers in the file
+    pub buffer_offsets: Arc<Vec<u64>>,
+}
+
+/// Metadata describing a column in a file
+///
+/// This is typically created by reading the metadata section of a Lance file
+pub struct ColumnInfo {
+    /// The metadata for each page in the column
+    pub page_infos: Vec<Arc<PageInfo>>,
+    pub buffer_offsets: Vec<u64>,
+}
+
+impl ColumnInfo {
+    /// Create a new instance
+    pub fn new(page_infos: Vec<Arc<PageInfo>>, buffer_offsets: Vec<u64>) -> Self {
+        Self {
+            page_infos,
+            buffer_offsets,
+        }
+    }
+}
+
+/// The scheduler for decoding batches
+///
+/// Lance decoding is done in two steps, scheduling, and decoding.  The
+/// scheduling tends to be lightweight and should quickly figure what data
+/// is needed from the disk issue the appropriate I/O requests.  A decode task is
+/// created to eventually decode the data (once it is loaded) and scheduling
+/// moves on to scheduling the next page.
+///
+/// Meanwhile, it's expected that a decode stream will be setup to run at the
+/// same time.  Decode tasks take the data that is loaded and turn it into
+/// Arrow arrays.
+///
+/// This approach allows us to keep our I/O parallelism and CPU parallelism
+/// completely separate since those are often two very different values.
+///
+/// Backpressure should be achieved via the I/O service.  Requests that are
+/// issued will pile up if the decode stream is not polling quickly enough.
+/// The [`crate::EncodingsIo::submit_request`] function should return a pending
+/// future once there are too many I/O requests in flight.
+///
+/// TODO: Implement backpressure
+pub struct DecodeBatchScheduler {
+    root_scheduler: SimpleStructScheduler,
+}
+
+impl DecodeBatchScheduler {
+    fn is_primitive(data_type: &DataType) -> bool {
+        if data_type.is_primitive() {
+            true
+        } else {
+            match data_type {
+                // DataType::is_primitive doesn't consider these primitive but we do
+                DataType::Boolean | DataType::Null => true,
+                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                _ => false,
+            }
+        }
+    }
+
+    fn create_primitive_scheduler<'a>(
+        data_type: &DataType,
+        column_infos: &mut impl Iterator<Item = &'a ColumnInfo>,
+        buffers: FileBuffers,
+    ) -> Vec<Box<dyn LogicalPageScheduler>> {
+        // Primitive fields map to a single column
+        let column = column_infos.next().unwrap();
+        let column_buffers = ColumnBuffers {
+            file_buffers: buffers,
+            positions: &column.buffer_offsets,
+        };
+        column
+            .page_infos
+            .iter()
+            .cloned()
+            .map(|page_info| {
+                Box::new(PrimitivePageScheduler::new(
+                    data_type.clone(),
+                    page_info,
+                    column_buffers,
+                )) as Box<dyn LogicalPageScheduler>
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn check_simple_struct(column_info: &ColumnInfo) -> Result<()> {
+        if !column_info.page_infos.len() == 1 {
+            return Err(Error::InvalidInput { source: format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into(), location: location!() });
+        }
+        let encoding = &column_info.page_infos[0].encoding;
+        match encoding.array_encoding.as_ref().unwrap() {
+            pb::array_encoding::ArrayEncoding::Struct(_) => Ok(()),
+            _ => Err(Error::InvalidInput { source: format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into(), location: location!() }),
+        }
+    }
+    // This function is where the all important mapping from Arrow schema
+    // to decoders happens.  Note that the decoders can only be figured out
+    // using both the schema AND the column metadata.  In theory, one could
+    // infer the decoder / column type using only the column metadata.  However,
+    // field nullability would be missing / incorrect and its also not as easy
+    // as it sounds since pages can have different encodings and those encodings
+    // often have various layers.  Also, sometimes the inference is just impossible.
+    // For example, both Timestamp, Float64, Int64, and UInt64 will be encoded
+    // as 8-byte value encoding.  The only way to know the data type is to look
+    // at the schema.
+    //
+    // We also can't just guess the encoding based on the schema.  This is because
+    // there may be multiple different ways to encode a field and it may even
+    // change on a page-by-page basis.
+    //
+    // For example, if a field is a struct field then we expect a header
+    // column that could have one of a few different encodings.
+    //
+    // This could be encoded with "simple struct" and an empty header column
+    // followed by the shredded child columns.  It could be encoded as a nullable
+    // struct where the nulls are in a dense bitmap.  It could even be encoded
+    // as a packed (row-major) struct where there is only a single column containing
+    // all of the data!
+    //
+    // TODO: Still lots of research to do here in different ways that
+    // we can map schemas to buffers.
+    //
+    // Example: repetition levels - the validity bitmaps for nested
+    // fields are fatter (more than one bit per row) and contain
+    // validity information about parent fields (e.g. is this a
+    // struct-struct-null or struct-null-null or null-null-null?)
+    //
+    // Examples: sentinel-shredding - instead of creating a wider
+    // validity bitmap we assign more sentinels to each column.  So
+    // if the values of an int32 array have a max of 1000 then we can
+    // use 1001 to mean null int32 and 1002 to mean null parent.
+    //
+    // Examples: Sparse structs - the struct column has a validity
+    // bitmap that must be read if you plan on reading the struct
+    // or any nested field.  However, this could be a compressed
+    // bitmap stored in metadata.  A perk for this approach is that
+    // the child fields can then have a smaller size than the parent
+    // field.  E.g. if a struct is 1000 rows and 900 of them are
+    // null then there is one validity bitmap of length 1000 and
+    // 100 rows of each of the children.
+    //
+    // TODO: In the future, this will need to be more flexible if
+    // we want to allow custom encodings.  E.g. if the field's encoding
+    // is not an encoding we expect then we should delegate to a plugin.
+    fn create_field_scheduler<'a>(
+        data_type: &DataType,
+        column_infos: &mut impl Iterator<Item = &'a ColumnInfo>,
+        buffers: FileBuffers,
+    ) -> Vec<Box<dyn LogicalPageScheduler>> {
+        if Self::is_primitive(data_type) {
+            return Self::create_primitive_scheduler(data_type, column_infos, buffers);
+        }
+        match data_type {
+            DataType::FixedSizeList(inner, dimension) => {
+                // A fixed size list column could either be a physical or a logical decoder
+                // depending on the child data type.
+                if Self::is_primitive(inner.data_type()) {
+                    Self::create_primitive_scheduler(data_type, column_infos, buffers)
+                } else {
+                    let inner_schedulers =
+                        Self::create_field_scheduler(inner.data_type(), column_infos, buffers);
+                    inner_schedulers
+                        .into_iter()
+                        .map(|inner| {
+                            Box::new(FslPageScheduler::new(inner, *dimension as u32))
+                                as Box<dyn LogicalPageScheduler>
+                        })
+                        .collect::<Vec<_>>()
+                }
+            }
+            DataType::List(items_field) => {
+                let offsets = Self::create_field_scheduler(&DataType::Int32, column_infos, buffers);
+                let items =
+                    Self::create_field_scheduler(items_field.data_type(), column_infos, buffers);
+                // TODO: This may need to be more flexible in the future if an items page can
+                // be shared by multiple offsets pages.
+                offsets
+                    .into_iter()
+                    .zip(items)
+                    .map(|(offsets_page, items_page)| {
+                        Box::new(ListPageScheduler::new(
+                            offsets_page,
+                            vec![items_page],
+                            DataType::Int32,
+                        )) as Box<dyn LogicalPageScheduler>
+                    })
+                    .collect::<Vec<_>>()
+            }
+            DataType::Struct(fields) => {
+                let column_info = column_infos.next().unwrap();
+                Self::check_simple_struct(column_info).unwrap();
+                let child_schedulers = fields
+                    .iter()
+                    .map(|field| {
+                        Self::create_field_scheduler(field.data_type(), column_infos, buffers)
+                    })
+                    .collect::<Vec<_>>();
+                // For now, we don't record nullability for structs.  As a result, there is always
+                // only one "page" of struct data.  In the future, this will change.  A null-aware
+                // struct scheduler will need to first calculate how many rows are in the struct page
+                // and then find the child pages that overlap.  This should be doable.
+                vec![Box::new(SimpleStructScheduler::new(
+                    child_schedulers,
+                    fields.clone(),
+                ))]
+            }
+            // Still need support for string / binary / dictionary / RLE
+            _ => todo!(),
+        }
+    }
+
+    /// Creates a new decode scheduler with the expected schema and the column
+    /// metadata of the file.
+    ///
+    /// TODO: How does this work when doing projection?  Need to add tests.  Can
+    /// probably take care of this in lance-file by only passing in the appropriate
+    /// columns with the projected schema.
+    pub fn new(
+        schema: &Schema,
+        column_infos: &[ColumnInfo],
+        file_buffer_positions: &Vec<u64>,
+    ) -> Self {
+        let mut col_info_iter = column_infos.iter();
+        let buffers = FileBuffers {
+            positions: file_buffer_positions,
+        };
+        let field_schedulers = schema
+            .fields
+            .iter()
+            .map(|field| {
+                Self::create_field_scheduler(field.data_type(), &mut col_info_iter, buffers)
+            })
+            .collect::<Vec<_>>();
+        let root_scheduler = SimpleStructScheduler::new(field_schedulers, schema.fields.clone());
+        Self { root_scheduler }
+    }
+
+    /// Schedules the load of a range of rows
+    ///
+    /// # Arguments
+    ///
+    /// * `range` - The range of rows to load
+    /// * `sink` - A channel to send the decode tasks
+    /// * `scheduler` An I/O scheduler to issue I/O requests
+    pub async fn schedule_range(
+        &mut self,
+        range: Range<u64>,
+        sink: mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        scheduler: &Arc<dyn EncodingsIo>,
+    ) -> Result<()> {
+        let rows_to_read = range.end - range.start;
+        trace!("Scheduling range {:?} ({} rows)", range, rows_to_read);
+
+        let range = range.start as u32..range.end as u32;
+
+        self.root_scheduler
+            .schedule_ranges(&[range.clone()], scheduler, &sink)?;
+
+        trace!("Finished scheduling of range {:?}", range);
+        Ok(())
+    }
+
+    /// Schedules the load of selected rows
+    ///
+    /// # Arguments
+    ///
+    /// * `indices` - The row indices to load (these must be in ascending order!)
+    /// * `sink` - A channel to send the decode tasks
+    /// * `scheduler` An I/O scheduler to issue I/O requests
+    pub async fn schedule_take(
+        &mut self,
+        indices: &[u32],
+        sink: mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        scheduler: &Arc<dyn EncodingsIo>,
+    ) -> Result<()> {
+        debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
+        trace!(
+            "Scheduling take of {} rows [{}]",
+            indices.len(),
+            if indices.len() == 1 {
+                indices[0].to_string()
+            } else {
+                format!("{}, ..., {}", indices[0], indices[indices.len() - 1])
+            }
+        );
+        self.root_scheduler
+            .schedule_take(indices, scheduler, &sink)?;
+        trace!("Finished scheduling take of {} rows", indices.len());
+        Ok(())
+    }
+}
+
+/// A stream that takes scheduled jobs and generates decode tasks from them.
+pub struct BatchDecodeStream {
+    scheduled: mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
+    current: Option<Box<dyn LogicalPageDecoder>>,
+    rows_remaining: u64,
+    rows_per_batch: u32,
+}
+
+impl BatchDecodeStream {
+    /// Create a new instance of a batch decode stream
+    ///
+    /// # Arguments
+    ///
+    /// * `scheduled` - an incoming stream of decode tasks from a
+    ///   [`crate::decode::DecodeBatchScheduler`]
+    /// * `schema` - the scheam of the data to create
+    /// * `rows_per_batch` the number of rows to create before making a batch
+    /// * `num_rows` the total number of rows scheduled
+    /// * `num_columns` the total number of columns in the file
+    pub fn new(
+        scheduled: mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
+        rows_per_batch: u32,
+        num_rows: u64,
+    ) -> Self {
+        Self {
+            scheduled,
+            current: None,
+            rows_remaining: num_rows,
+            rows_per_batch,
+        }
+    }
+
+    async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
+        trace!("Draining batch task");
+        if self.rows_remaining == 0 {
+            return Ok(None);
+        }
+
+        let to_take = self.rows_remaining.min(self.rows_per_batch as u64) as u32;
+        self.rows_remaining -= to_take as u64;
+
+        if self.current.is_none() {
+            trace!("Loading new top-level page");
+            self.current = Some(self.scheduled.recv().await.unwrap());
+        }
+        let current = self.current.as_mut().unwrap();
+        let avail = current.avail();
+        trace!("Top level page has {} rows already available", avail);
+        if avail < to_take {
+            current.wait(to_take, &mut self.scheduled).await?;
+        }
+        let next_task = current.drain(to_take)?;
+        if !next_task.has_more {
+            self.current = None;
+        }
+        Ok(Some(next_task))
+    }
+
+    fn task_to_batch(task: NextDecodeTask) -> Result<RecordBatch> {
+        let struct_arr = task.task.decode()?;
+        Ok(RecordBatch::from(struct_arr.as_struct()))
+    }
+
+    pub fn into_stream(self) -> BoxStream<'static, JoinHandle<Result<RecordBatch>>> {
+        let stream = futures::stream::unfold(self, |mut slf| async move {
+            let next_task = slf.next_batch_task().await;
+            let next_task = next_task.transpose().map(|next_task| {
+                tokio::spawn(async move {
+                    let next_task = next_task?;
+                    Self::task_to_batch(next_task)
+                })
+            });
+            next_task.map(|next_task| (next_task, slf))
+        });
+        stream.boxed()
+    }
+}
 
 /// A decoder for single-column encodings of primitive data (this includes fixed size
 /// lists of primitive data)
@@ -258,17 +652,18 @@ pub trait PhysicalPageDecoder: Send + Sync {
 ///
 /// See [`crate::decoder`] for more information
 pub trait PhysicalPageScheduler: Send + Sync + std::fmt::Debug {
-    /// Schedules a batch of I/O to load the data needed for the requested range
+    /// Schedules a batch of I/O to load the data needed for the requested ranges
     ///
     /// Returns a future that will yield a decoder once the data has been loaded
     ///
     /// # Arguments
     ///
     /// * `range` - the range of row offsets (relative to start of page) requested
+    ///             these must be ordered and must not overlap
     /// * `scheduler` - a scheduler to submit the I/O request to
-    fn schedule_range(
+    fn schedule_ranges(
         &self,
-        range: Range<u32>,
+        ranges: &[Range<u32>],
         scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
@@ -297,10 +692,21 @@ pub trait PhysicalPageScheduler: Send + Sync + std::fmt::Debug {
 ///
 /// See [`crate::decoder`] for more information
 pub trait LogicalPageScheduler: Send + Sync + std::fmt::Debug {
-    /// Schedules I/O for the requested portion of the page.
-    fn schedule_range(
+    /// Schedules I/O for the requested portions of the page.
+    ///
+    /// Note: `ranges` must be ordered and non-overlapping
+    /// TODO: Support unordered or overlapping ranges in file scheduler
+    fn schedule_ranges(
         &self,
-        range: Range<u32>,
+        ranges: &[Range<u32>],
+        scheduler: &Arc<dyn EncodingsIo>,
+        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+    ) -> Result<()>;
+    /// Schedules I/O for the requested rows (identified by row offsets from start of page)
+    /// TODO: implement this using schedule_ranges
+    fn schedule_take(
+        &self,
+        indices: &[u32],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
     ) -> Result<()>;

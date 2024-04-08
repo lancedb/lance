@@ -1025,14 +1025,11 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
-    use futures::TryStreamExt;
-    use lance_core::ROW_ID_FIELD;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     use super::*;
     use crate::dataset::transaction::Operation;
-    use crate::dataset::{WriteParams, ROW_ID};
 
     async fn create_dataset(test_uri: &str) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![

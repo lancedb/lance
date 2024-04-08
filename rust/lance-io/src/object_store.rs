@@ -34,7 +34,7 @@ use object_store::{
     aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory, CredentialProvider,
     Error as ObjectStoreError, Result as ObjectStoreResult,
 };
-use object_store::{parse_url_opts, DynObjectStore};
+use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredentialProvider};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
 use snafu::{location, Location};
@@ -186,40 +186,113 @@ impl CredentialProvider for AwsCredentialAdapter {
     }
 }
 
+/// Figure out the S3 region of the bucket.
+///
+/// This resolves in order of precedence:
+/// 1. The region provided in the storage options
+/// 2. (If endpoint is not set), the region returned by the S3 API for the bucket
+///
+/// It can return None if no region is provided and the endpoint is set.
+async fn resolve_s3_region(
+    url: &Url,
+    storage_options: &HashMap<AmazonS3ConfigKey, String>,
+) -> Result<Option<String>> {
+    if let Some(region) = storage_options.get(&AmazonS3ConfigKey::Region) {
+        Ok(Some(region.clone()))
+    } else if storage_options.get(&AmazonS3ConfigKey::Endpoint).is_none() {
+        // If no endpoint is set, we can assume this is AWS S3 and the region
+        // can be resolved from the bucket.
+        let bucket = url.host_str().ok_or_else(|| {
+            Error::invalid_input(
+                format!("Could not parse bucket from url: {}", url),
+                location!(),
+            )
+        })?;
+
+        let mut client_options = ClientOptions::default();
+        for (key, value) in storage_options {
+            if let AmazonS3ConfigKey::Client(client_key) = key {
+                client_options = client_options.with_config(*client_key, value.clone());
+            }
+        }
+
+        let bucket_region =
+            object_store::aws::resolve_bucket_region(bucket, &client_options).await?;
+        Ok(Some(bucket_region))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Build AWS credentials
+///
+/// This resolves credentials from the following sources in order:
+/// 1. An explicit `credentials` provider
+/// 2. Explicit credentials in storage_options (as in `aws_access_key_id`,
+///    `aws_secret_access_key`, `aws_session_token`)
+/// 3. The default credential provider chain from AWS SDK.
+///
 /// `credentials_refresh_offset` is the amount of time before expiry to refresh credentials.
 pub async fn build_aws_credential(
     credentials_refresh_offset: Duration,
     credentials: Option<AwsCredentialProvider>,
+    storage_options: Option<&HashMap<AmazonS3ConfigKey, String>>,
     region: Option<String>,
 ) -> Result<(AwsCredentialProvider, String)> {
+    // TODO: make this return no credential provider not using AWS
     use aws_config::meta::region::RegionProviderChain;
     const DEFAULT_REGION: &str = "us-west-2";
-    let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
-    let region = region.unwrap_or(
-        region_provider
+
+    let region = if let Some(region) = region {
+        region
+    } else {
+        RegionProviderChain::default_provider()
+            .or_else(DEFAULT_REGION)
             .region()
             .await
             .map(|r| r.as_ref().to_string())
-            .unwrap_or(DEFAULT_REGION.to_string()),
-    );
+            .unwrap_or(DEFAULT_REGION.to_string())
+    };
 
-    let creds = match credentials {
-        Some(creds) => creds,
-        None => {
-            let credentials_provider = DefaultCredentialsChain::builder()
-                .region(region_provider.region().await)
-                .build()
-                .await;
+    if let Some(creds) = credentials {
+        Ok((creds, region))
+    } else if let Some(creds) = storage_options.and_then(extract_static_s3_credentials) {
+        Ok((Arc::new(creds), region))
+    } else {
+        let credentials_provider = DefaultCredentialsChain::builder().build().await;
 
+        Ok((
             Arc::new(AwsCredentialAdapter::new(
                 Arc::new(credentials_provider),
                 credentials_refresh_offset,
-            ))
-        }
-    };
+            )),
+            region,
+        ))
+    }
+}
 
-    Ok((creds, region))
+fn extract_static_s3_credentials(
+    options: &HashMap<AmazonS3ConfigKey, String>,
+) -> Option<StaticCredentialProvider<ObjectStoreAwsCredential>> {
+    let key_id = options
+        .get(&AmazonS3ConfigKey::AccessKeyId)
+        .map(|s| s.to_string());
+    let secret_key = options
+        .get(&AmazonS3ConfigKey::SecretAccessKey)
+        .map(|s| s.to_string());
+    let token = options
+        .get(&AmazonS3ConfigKey::Token)
+        .map(|s| s.to_string());
+    match (key_id, secret_key, token) {
+        (Some(key_id), Some(secret_key), token) => {
+            Some(StaticCredentialProvider::new(ObjectStoreAwsCredential {
+                key_id,
+                secret_key,
+                token,
+            }))
+        }
+        _ => None,
+    }
 }
 
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
@@ -636,13 +709,11 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             // }
 
             let storage_options = storage_options.as_s3_options();
-            let region = storage_options
-                .get(&AmazonS3ConfigKey::Region)
-                .map(|s| s.to_string());
-
+            let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
+                Some(&storage_options),
                 region,
             )
             .await?;
@@ -663,8 +734,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             builder = builder
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
-                .with_region(region)
-                .with_allow_http(true);
+                .with_region(region);
             let store = builder.build()?;
 
             Ok(ObjectStore {

@@ -198,6 +198,7 @@ mod test {
                 key: Arc::new(Float32Array::from(query)),
                 k: 1,
                 nprobes: 1,
+                ef: None,
                 refine_factor: None,
                 metric_type: metric,
                 use_index: true,

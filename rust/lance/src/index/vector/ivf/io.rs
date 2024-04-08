@@ -813,7 +813,7 @@ mod tests {
     use super::*;
 
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
-    use arrow_array::{RecordBatch, RecordBatchIterator};
+    use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
     use lance_index::IndexType;
     use lance_testing::datagen::generate_random_array;
