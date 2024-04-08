@@ -18,24 +18,29 @@ use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow_array::{cast::AsArray, ArrayRef};
-use arrow_schema::{DataType, Schema, TimeUnit};
-use datafusion::{
-    datasource::empty::EmptyTable, execution::context::SessionContext, logical_expr::Expr,
-};
-use datafusion_common::{
-    tree_node::{Transformed, TreeNode},
-    Column, DataFusionError, ScalarValue, TableReference,
-};
-use prost::Message;
-use snafu::{location, Location};
+use arrow_schema::{DataType, TimeUnit};
+use datafusion_common::ScalarValue;
 
-use datafusion_substrait::substrait::proto::{
-    expression_reference::ExprType,
-    plan_rel::RelType,
-    read_rel::{NamedTable, ReadType},
-    rel, ExtendedExpression, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
+#[cfg(feature = "substrait")]
+use {
+    arrow_schema::Schema,
+    datafusion::{
+        datasource::empty::EmptyTable, execution::context::SessionContext, logical_expr::Expr,
+    },
+    datafusion_common::{
+        tree_node::{Transformed, TreeNode},
+        Column, DataFusionError, TableReference,
+    },
+    datafusion_substrait::substrait::proto::{
+        expression_reference::ExprType,
+        plan_rel::RelType,
+        read_rel::{NamedTable, ReadType},
+        rel, ExtendedExpression, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
+    },
+    lance_core::{Error, Result},
+    prost::Message,
+    snafu::{location, Location},
 };
-use lance_core::{Error, Result};
 
 const MS_PER_DAY: i64 = 86400000;
 
@@ -422,6 +427,7 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
 /// Convert a Substrait ExtendedExpressions message into a DF Expr
 ///
 /// The ExtendedExpressions message must contain a single scalar expression
+#[cfg(feature = "substrait")]
 pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<Expr> {
     let envelope = ExtendedExpression::decode(expr)?;
     if envelope.referred_expr.is_empty() {
@@ -541,12 +547,15 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
 mod tests {
     use super::*;
 
-    use arrow_schema::Field;
-    use datafusion::logical_expr::{BinaryExpr, Operator};
-    use substrait_expr::{
-        builder::{schema::SchemaBuildersExt, BuilderParams, ExpressionsBuilder},
-        functions::functions_comparison::FunctionsComparisonExt,
-        helpers::{literals::literal, schema::SchemaInfo},
+    #[cfg(feature = "substrait")]
+    use {
+        arrow_schema::Field,
+        datafusion::logical_expr::{BinaryExpr, Operator},
+        substrait_expr::{
+            builder::{schema::SchemaBuildersExt, BuilderParams, ExpressionsBuilder},
+            functions::functions_comparison::FunctionsComparisonExt,
+            helpers::{literals::literal, schema::SchemaInfo},
+        },
     };
 
     #[test]
@@ -824,6 +833,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "substrait")]
     #[tokio::test]
     async fn test_substrait_conversion() {
         let schema = SchemaInfo::new_full()

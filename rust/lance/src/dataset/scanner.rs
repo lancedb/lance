@@ -44,7 +44,6 @@ use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
-use lance_datafusion::expr::parse_substrait;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -65,6 +64,9 @@ use crate::io::exec::{
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
+
+#[cfg(feature = "substrait")]
+use lance_datafusion::expr::parse_substrait;
 
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
@@ -345,6 +347,7 @@ impl Scanner {
     ///
     /// The message must contain exactly one expression and that expression
     /// must be a scalar expression whose return type is boolean.
+    #[cfg(feature = "substrait")]
     pub async fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
         let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
         let expr = parse_substrait(filter, schema.clone()).await?;

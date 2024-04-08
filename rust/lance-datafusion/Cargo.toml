@@ -18,7 +18,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-physical-expr.workspace = true
-datafusion-substrait.workspace = true
+datafusion-substrait = { version = "36.0", optional = true }
 futures.workspace = true
 lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }
@@ -27,5 +27,7 @@ snafu.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-substrait-expr.workspace = true
+substrait-expr = { version = "0.2.1" }
 
+[features]
+substrait = ["dep:datafusion-substrait"]
