@@ -8,7 +8,7 @@ use log::trace;
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
-    encoder::{ArrayEncoder, EncodedPage},
+    encoder::{ArrayEncoder, EncodedArray},
     format::pb,
     EncodingsIo,
 };
@@ -83,6 +83,10 @@ impl PhysicalPageDecoder for FixedListDecoder {
         self.items_decoder
             .decode_into(rows_to_skip, num_rows, dest_buffers);
     }
+
+    fn num_buffers(&self) -> u32 {
+        self.items_decoder.num_buffers()
+    }
 }
 
 #[derive(Debug)]
@@ -101,15 +105,14 @@ impl FslEncoder {
 }
 
 impl ArrayEncoder for FslEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedPage> {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let inner_arrays = arrays
             .iter()
             .map(|arr| arr.as_fixed_size_list().values().clone())
             .collect::<Vec<_>>();
-        let items_page = self.items_encoder.encode(&inner_arrays)?;
-        Ok(EncodedPage {
+        let items_page = self.items_encoder.encode(&inner_arrays, buffer_index)?;
+        Ok(EncodedArray {
             buffers: items_page.buffers,
-            num_rows: items_page.num_rows / self.dimension,
             encoding: pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::FixedSizeList(Box::new(
                     pb::FixedSizeList {
@@ -118,7 +121,6 @@ impl ArrayEncoder for FslEncoder {
                     },
                 ))),
             },
-            column_idx: items_page.column_idx,
         })
     }
 }
@@ -129,22 +131,16 @@ mod tests {
 
     use arrow_schema::{DataType, Field};
 
-    use crate::encodings::physical::basic::BasicEncoder;
-    use crate::encodings::physical::fixed_size_list::FslEncoder;
     use crate::encodings::physical::value::tests::PRIMITIVE_TYPES;
-    use crate::testing::check_round_trip_array_encoding;
+    use crate::testing::check_round_trip_encoding;
 
     #[test_log::test(tokio::test)]
     async fn test_value_fsl_primitive() {
         for data_type in PRIMITIVE_TYPES {
-            let encoder = FslEncoder::new(Box::new(BasicEncoder::new(0)), 16);
             let inner_field = Field::new("item", data_type.clone(), true);
-            let field = Field::new(
-                "",
-                DataType::FixedSizeList(Arc::new(inner_field), 16),
-                false,
-            );
-            check_round_trip_array_encoding(encoder, field).await;
+            let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
+            let field = Field::new("", data_type, false);
+            check_round_trip_encoding(field).await;
         }
     }
 }

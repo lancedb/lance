@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::ArrayRef;
-use arrow_schema::DataType;
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, BooleanArray};
+use arrow_buffer::BooleanBuffer;
 use futures::{future::BoxFuture, FutureExt};
-use lance_arrow::DataTypeExt;
 use log::trace;
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
-    encoder::{ArrayEncoder, BufferEncoder, EncodedBuffer, EncodedPage},
+    encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
 };
 
 use lance_core::Result;
 
-use super::{bitmap::BitmapEncoder, value::ValueEncoder};
+use super::buffers::BitmapBufferEncoder;
 
 enum DataValidity {
     NoNull,
@@ -115,6 +116,10 @@ impl PhysicalPageDecoder for BasicPageDecoder {
         self.values
             .decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..]);
     }
+
+    fn num_buffers(&self) -> u32 {
+        1 + self.values.num_buffers()
+    }
 }
 
 #[derive(Debug)]
@@ -125,95 +130,74 @@ enum PageValidity {
 
 #[derive(Debug)]
 pub struct BasicEncoder {
-    column_index: u32,
+    values_encoder: Box<dyn ArrayEncoder>,
 }
 
 impl BasicEncoder {
-    pub fn new(column_index: u32) -> Self {
-        Self { column_index }
-    }
-
-    fn encode_values(
-        arrays: &[ArrayRef],
-        buffer_index: u32,
-    ) -> Result<(EncodedBuffer, pb::BufferEncoding)> {
-        if *arrays[0].data_type() == DataType::Boolean {
-            let values = BitmapEncoder::default().encode(arrays)?;
-            Ok((
-                values,
-                pb::BufferEncoding {
-                    buffer_encoding: Some(pb::buffer_encoding::BufferEncoding::Bitmap(
-                        pb::Bitmap {
-                            buffer: Some(pb::Buffer {
-                                buffer_index,
-                                buffer_type: pb::buffer::BufferType::Page as i32,
-                            }),
-                        },
-                    )),
-                },
-            ))
-        } else {
-            let bytes_per_value = arrays[0].data_type().byte_width() as u64;
-            debug_assert!(bytes_per_value > 0);
-            let values = ValueEncoder::default().encode(arrays)?;
-            Ok((
-                values,
-                pb::BufferEncoding {
-                    buffer_encoding: Some(pb::buffer_encoding::BufferEncoding::Value(pb::Value {
-                        buffer: Some(pb::Buffer {
-                            buffer_index,
-                            buffer_type: pb::buffer::BufferType::Page as i32,
-                        }),
-                        bytes_per_value,
-                    })),
-                },
-            ))
-        }
+    pub fn new(values_encoder: Box<dyn ArrayEncoder>) -> Self {
+        Self { values_encoder }
     }
 }
 
 impl ArrayEncoder for BasicEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedPage> {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let (null_count, row_count) = arrays
             .iter()
             .map(|arr| (arr.null_count() as u32, arr.len() as u32))
             .fold((0, 0), |acc, val| (acc.0 + val.0, acc.1 + val.1));
         let (buffers, nullability) = if null_count == 0 {
-            let (values_buffer, values_encoding) = Self::encode_values(arrays, 0)?;
-            let encoding = pb::basic::Nullability::NoNulls(pb::basic::NoNull {
-                values: Some(values_encoding),
-            });
-            (vec![values_buffer], encoding)
+            let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
+            let encoding = pb::nullable::Nullability::NoNulls(Box::new(pb::nullable::NoNull {
+                values: Some(Box::new(arr_encoding.encoding)),
+            }));
+            (arr_encoding.buffers, encoding)
         } else if null_count == row_count {
-            let encoding = pb::basic::Nullability::AllNulls(pb::basic::AllNull {});
+            let encoding = pb::nullable::Nullability::AllNulls(pb::nullable::AllNull {});
             (vec![], encoding)
         } else {
-            let validity_encoding = pb::BufferEncoding {
-                buffer_encoding: Some(pb::buffer_encoding::BufferEncoding::Bitmap(pb::Bitmap {
-                    buffer: Some(pb::Buffer {
-                        buffer_index: 0,
-                        buffer_type: pb::buffer::BufferType::Page as i32,
-                    }),
-                })),
-            };
-            let (values_buffer, values_encoding) = Self::encode_values(arrays, 1)?;
-            let encoding = pb::basic::Nullability::SomeNulls(pb::basic::SomeNull {
-                validity: Some(validity_encoding),
-                values: Some(values_encoding),
+            let validity_as_arrays = arrays
+                .iter()
+                .map(|arr| {
+                    if let Some(nulls) = arr.nulls() {
+                        Arc::new(BooleanArray::new(nulls.inner().clone(), None)) as ArrayRef
+                    } else {
+                        let buff = BooleanBuffer::new_set(arr.len());
+                        Arc::new(BooleanArray::new(buff, None)) as ArrayRef
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let validity_buffer_index = *buffer_index;
+            *buffer_index += 1;
+            let validity = BitmapBufferEncoder::default().encode(
+                &validity_as_arrays,
+                validity_buffer_index,
+                pb::buffer::BufferType::Page,
+            )?;
+
+            let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
+            let encoding = pb::nullable::Nullability::SomeNulls(Box::new(pb::nullable::SomeNull {
+                validity: Some(validity.encoding),
+                values: Some(Box::new(arr_encoding.encoding)),
+            }));
+
+            let mut buffers = arr_encoding.buffers;
+            buffers.push(EncodedArrayBuffer {
+                parts: validity.parts,
+                index: validity_buffer_index,
             });
-            let validity = BitmapEncoder::default().encode(arrays)?;
-            (vec![validity, values_buffer], encoding)
+            (buffers, encoding)
         };
 
-        Ok(EncodedPage {
+        Ok(EncodedArray {
             buffers,
             encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::Basic(pb::Basic {
-                    nullability: Some(nullability),
-                })),
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::Nullable(Box::new(
+                    pb::Nullable {
+                        nullability: Some(nullability),
+                    },
+                ))),
             },
-            num_rows: row_count,
-            column_idx: self.column_index,
         })
     }
 }

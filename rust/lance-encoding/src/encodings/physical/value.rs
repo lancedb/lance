@@ -2,17 +2,22 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::ArrayRef;
+use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
+use snafu::{location, Location};
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
-    encoder::{BufferEncoder, EncodedBuffer},
+    encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
+    format::pb,
     EncodingsIo,
 };
 
-use lance_core::Result;
+use lance_core::{Error, Result};
+
+use super::buffers::{BitmapBufferEncoder, FlatBufferEncoder};
 
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
@@ -104,20 +109,56 @@ impl PhysicalPageDecoder for ValuePageDecoder {
             }
         }
     }
+
+    fn num_buffers(&self) -> u32 {
+        1
+    }
 }
 
-#[derive(Debug, Default)]
-pub struct ValueEncoder {}
+#[derive(Debug)]
+pub struct ValueEncoder {
+    buffer_encoder: Box<dyn BufferEncoder>,
+}
 
-impl BufferEncoder for ValueEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
-        let parts = arrays
-            .iter()
-            .map(|arr| arr.to_data().buffers()[0].clone())
-            .collect::<Vec<_>>();
-        Ok(EncodedBuffer {
-            is_data: true,
-            parts,
+impl ValueEncoder {
+    pub fn try_new(data_type: &DataType) -> Result<Self> {
+        if data_type.is_primitive() {
+            Ok(Self {
+                buffer_encoder: Box::new(FlatBufferEncoder::default()),
+            })
+        } else if *data_type == DataType::Boolean {
+            Ok(Self {
+                buffer_encoder: Box::new(BitmapBufferEncoder::default()),
+            })
+        } else {
+            Err(Error::invalid_input(
+                format!("Cannot use value encoded to encode {}", data_type),
+                location!(),
+            ))
+        }
+    }
+}
+
+impl ArrayEncoder for ValueEncoder {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
+        let index = *buffer_index;
+        *buffer_index += 1;
+
+        let encoded_buffer =
+            self.buffer_encoder
+                .encode(arrays, index, pb::buffer::BufferType::Page)?;
+        let array_bufs = vec![EncodedArrayBuffer {
+            parts: encoded_buffer.parts,
+            index,
+        }];
+
+        Ok(EncodedArray {
+            buffers: array_bufs,
+            encoding: pb::ArrayEncoding {
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::Value(pb::Value {
+                    buffer: Some(encoded_buffer.encoding),
+                })),
+            },
         })
     }
 }
@@ -128,8 +169,7 @@ pub(crate) mod tests {
 
     use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
 
-    use crate::encodings::physical::basic::BasicEncoder;
-    use crate::testing::check_round_trip_array_encoding;
+    use crate::testing::check_round_trip_encoding;
 
     pub const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Date32,
@@ -157,10 +197,8 @@ pub(crate) mod tests {
     #[test_log::test(tokio::test)]
     async fn test_value_primitive() {
         for data_type in PRIMITIVE_TYPES {
-            let encoder = BasicEncoder::new(0);
             let field = Field::new("", data_type.clone(), false);
-
-            check_round_trip_array_encoding(encoder, field).await;
+            check_round_trip_encoding(field).await;
         }
     }
 }

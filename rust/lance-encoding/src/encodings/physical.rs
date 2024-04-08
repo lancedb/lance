@@ -10,6 +10,7 @@ use self::{
 
 pub mod basic;
 pub mod bitmap;
+pub mod buffers;
 pub mod fixed_size_list;
 pub mod value;
 
@@ -52,9 +53,9 @@ fn decoder_from_buffer_encoding(
     buffers: &PageBuffers,
 ) -> Box<dyn PhysicalPageScheduler> {
     match encoding.buffer_encoding.as_ref().unwrap() {
-        pb::buffer_encoding::BufferEncoding::Value(value) => Box::new(ValuePageScheduler::new(
-            value.bytes_per_value,
-            get_buffer(value.buffer.as_ref().unwrap(), buffers),
+        pb::buffer_encoding::BufferEncoding::Flat(flat) => Box::new(ValuePageScheduler::new(
+            flat.bytes_per_value,
+            get_buffer(flat.buffer.as_ref().unwrap(), buffers),
         )),
         pb::buffer_encoding::BufferEncoding::Bitmap(bitmap) => Box::new(DenseBitmapScheduler::new(
             get_buffer(bitmap.buffer.as_ref().unwrap(), buffers),
@@ -68,24 +69,27 @@ pub fn decoder_from_array_encoding(
     buffers: &PageBuffers,
 ) -> Box<dyn PhysicalPageScheduler> {
     match encoding.array_encoding.as_ref().unwrap() {
-        pb::array_encoding::ArrayEncoding::Basic(basic) => {
+        pb::array_encoding::ArrayEncoding::Nullable(basic) => {
             match basic.nullability.as_ref().unwrap() {
-                pb::basic::Nullability::NoNulls(no_nulls) => {
+                pb::nullable::Nullability::NoNulls(no_nulls) => {
                     Box::new(BasicPageScheduler::new_non_nullable(
-                        decoder_from_buffer_encoding(no_nulls.values.as_ref().unwrap(), buffers),
+                        decoder_from_array_encoding(no_nulls.values.as_ref().unwrap(), buffers),
                     ))
                 }
-                pb::basic::Nullability::SomeNulls(some_nulls) => {
+                pb::nullable::Nullability::SomeNulls(some_nulls) => {
                     Box::new(BasicPageScheduler::new_nullable(
                         decoder_from_buffer_encoding(
                             some_nulls.validity.as_ref().unwrap(),
                             buffers,
                         ),
-                        decoder_from_buffer_encoding(some_nulls.values.as_ref().unwrap(), buffers),
+                        decoder_from_array_encoding(some_nulls.values.as_ref().unwrap(), buffers),
                     ))
                 }
-                pb::basic::Nullability::AllNulls(_) => todo!(),
+                pb::nullable::Nullability::AllNulls(_) => todo!(),
             }
+        }
+        pb::array_encoding::ArrayEncoding::Value(value) => {
+            decoder_from_buffer_encoding(value.buffer.as_ref().unwrap(), buffers)
         }
         pb::array_encoding::ArrayEncoding::FixedSizeList(fixed_size_list) => {
             let item_encoding = fixed_size_list.items.as_ref().unwrap();

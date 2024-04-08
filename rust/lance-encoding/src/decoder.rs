@@ -659,6 +659,7 @@ pub trait PhysicalPageDecoder: Send + Sync {
     /// * `num_rows` - how many rows to decode
     /// * `dest_buffers` - the output buffers to decode into
     fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [BytesMut]);
+    fn num_buffers(&self) -> u32;
 }
 
 /// A scheduler for single-column encodings of primitive data
