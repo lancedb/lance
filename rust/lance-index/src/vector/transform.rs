@@ -187,7 +187,6 @@ impl Transformer for RemoveColumn {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
