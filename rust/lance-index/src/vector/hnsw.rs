@@ -299,7 +299,7 @@ impl HNSW {
         vector_storage: Arc<dyn VectorStorage>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
-        if range.len() == 0 {
+        if range.is_empty() {
             return Ok(Self::empty());
         }
 
