@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use pyo3::{
-    exceptions::{PyIOError, PyNotImplementedError, PyOSError, PyRuntimeError, PyValueError},
+    exceptions::{PyIOError, PyNotImplementedError, PyRuntimeError, PyValueError},
     PyResult,
 };
 
@@ -22,8 +22,6 @@ use lance::error::Error as LanceError;
 pub trait PythonErrorExt<T> {
     /// Convert to a python error based on the Lance error type
     fn infer_error(self) -> PyResult<T>;
-    /// Convert to OSError
-    fn os_error(self) -> PyResult<T>;
     /// Convert to RuntimeError
     fn runtime_error(self) -> PyResult<T>;
     /// Convert to ValueError
@@ -45,10 +43,6 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
                 _ => self.runtime_error(),
             },
         }
-    }
-
-    fn os_error(self) -> PyResult<T> {
-        self.map_err(|err| PyOSError::new_err(err.to_string()))
     }
 
     fn runtime_error(self) -> PyResult<T> {

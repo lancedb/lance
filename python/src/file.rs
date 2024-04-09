@@ -166,7 +166,7 @@ pub struct LanceFileWriter {
 
 impl LanceFileWriter {
     async fn open(uri_or_path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let (object_store, path) = if let Ok(_) = Url::parse(&uri_or_path) {
+        let (object_store, path) = if Url::parse(&uri_or_path).is_ok() {
             ObjectStore::from_uri(&uri_or_path).await.infer_error()?
         } else {
             (
@@ -212,7 +212,7 @@ pub struct LanceFileReader {
 
 impl LanceFileReader {
     async fn open(uri_or_path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let (object_store, path) = if let Ok(_) = Url::parse(&uri_or_path) {
+        let (object_store, path) = if Url::parse(&uri_or_path).is_ok() {
             ObjectStore::from_uri(&uri_or_path).await.infer_error()?
         } else {
             (

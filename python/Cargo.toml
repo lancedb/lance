@@ -25,7 +25,11 @@ half = { version = "2.3", default-features = false, features = [
     "num-traits",
     "std",
 ] }
-lance = { path = "../rust/lance", features = ["tensorflow", "dynamodb", "substrait"] }
+lance = { path = "../rust/lance", features = [
+    "tensorflow",
+    "dynamodb",
+    "substrait",
+] }
 lance-arrow = { path = "../rust/lance-arrow" }
 lance-core = { path = "../rust/lance-core" }
 lance-datagen = { path = "../rust/lance-datagen", optional = true }

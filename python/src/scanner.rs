@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow::pyarrow::*;
 use arrow_array::RecordBatchReader;
 use pyo3::prelude::*;
-use pyo3::{pyclass, PyObject, PyResult};
+use pyo3::{pyclass};
 
 use ::lance::dataset::scanner::Scanner as LanceScanner;
 use pyo3::exceptions::PyValueError;
