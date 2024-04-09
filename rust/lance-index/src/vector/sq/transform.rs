@@ -72,7 +72,7 @@ impl<T: ArrowFloatType> Transformer for SQTransformer<T> {
             })?;
         let batch = batch.drop_column(&self.input_column)?;
 
-        let sq_code = self.quantizer.transform::<T>(input).await?;
+        let sq_code = self.quantizer.transform::<T>(input)?;
         let sq_field = Field::new(&self.output_column, sq_code.data_type().clone(), false);
         let batch = batch.try_with_column(sq_field, Arc::new(sq_code))?;
         Ok(batch)

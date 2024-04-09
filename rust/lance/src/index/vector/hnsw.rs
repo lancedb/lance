@@ -31,7 +31,7 @@ use lance_index::{
         graph::NEIGHBORS_FIELD,
         hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
-        quantizer::{IvfQuantizationStorage, Quantizer},
+        quantizer::{IvfQuantizationStorage, Quantization},
         Query, DIST_COL,
     },
     Index, IndexType,
@@ -55,7 +55,7 @@ pub(crate) struct HNSWIndexOptions {
 }
 
 #[derive(Clone)]
-pub(crate) struct HNSWIndex<Q: Quantizer> {
+pub(crate) struct HNSWIndex<Q: Quantization> {
     hnsw: HNSW,
 
     // TODO: move these into IVFIndex after the refactor is complete
@@ -65,13 +65,13 @@ pub(crate) struct HNSWIndex<Q: Quantizer> {
     options: HNSWIndexOptions,
 }
 
-impl<Q: Quantizer> Debug for HNSWIndex<Q> {
+impl<Q: Quantization> Debug for HNSWIndex<Q> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.hnsw.fmt(f)
     }
 }
 
-impl<Q: Quantizer> HNSWIndex<Q> {
+impl<Q: Quantization> HNSWIndex<Q> {
     pub async fn try_new(
         hnsw: HNSW,
         reader: Arc<dyn Reader>,
@@ -109,7 +109,7 @@ impl<Q: Quantizer> HNSWIndex<Q> {
 }
 
 #[async_trait]
-impl<Q: Quantizer + Send + Sync + 'static> Index for HNSWIndex<Q> {
+impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any {
         self
@@ -143,7 +143,7 @@ impl<Q: Quantizer + Send + Sync + 'static> Index for HNSWIndex<Q> {
 }
 
 #[async_trait]
-impl<Q: Quantizer + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
+impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let row_ids = self.hnsw.storage().row_ids();

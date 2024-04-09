@@ -26,7 +26,6 @@ use snafu::{location, Location};
 
 pub mod builder;
 pub mod storage;
-pub mod transform;
 
 /// Scalar Quantization, optimized for [Apache Arrow] buffer memory layout.
 ///
@@ -100,7 +99,7 @@ impl ScalarQuantizer {
         Ok(self.bounds.clone())
     }
 
-    async fn transform<T: ArrowFloatType>(&self, data: &dyn Array) -> Result<ArrayRef> {
+    pub fn transform<T: ArrowFloatType>(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
             .ok_or(Error::Index {
@@ -184,7 +183,7 @@ mod tests {
             float_values.last().cloned().unwrap().to_f64()
         );
 
-        let sq_code = sq.transform::<Float16Type>(&vectors).await.unwrap();
+        let sq_code = sq.transform::<Float16Type>(&vectors).unwrap();
         let sq_values = sq_code
             .as_fixed_size_list()
             .values()
@@ -213,7 +212,7 @@ mod tests {
             float_values.last().cloned().unwrap().to_f64().unwrap()
         );
 
-        let sq_code = sq.transform::<Float32Type>(&vectors).await.unwrap();
+        let sq_code = sq.transform::<Float32Type>(&vectors).unwrap();
         let sq_values = sq_code
             .as_fixed_size_list()
             .values()
@@ -239,7 +238,7 @@ mod tests {
         assert_eq!(sq.bounds.start, float_values[0]);
         assert_eq!(sq.bounds.end, float_values.last().cloned().unwrap());
 
-        let sq_code = sq.transform::<Float64Type>(&vectors).await.unwrap();
+        let sq_code = sq.transform::<Float64Type>(&vectors).unwrap();
         let sq_values = sq_code
             .as_fixed_size_list()
             .values()
