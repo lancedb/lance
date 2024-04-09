@@ -144,7 +144,7 @@ impl GraphBuilder {
             .neighbors;
 
         let pruned_neighbors =
-            select_neighbors_heuristic(&self, vector, neighbors, max_edges, false).collect();
+            select_neighbors_heuristic(self, vector, neighbors, max_edges, false).collect();
 
         self.nodes
             .entry(node)

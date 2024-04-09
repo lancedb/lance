@@ -497,7 +497,7 @@ pub(crate) fn select_neighbors_heuristic(
     let mut w = orderd_candidates
         .iter()
         .cloned()
-        .map(|n| Reverse(n))
+        .map(Reverse)
         .collect::<BinaryHeap<_>>();
 
     if extend_candidates {
@@ -524,13 +524,13 @@ pub(crate) fn select_neighbors_heuristic(
         .as_any()
         .downcast_ref::<InMemoryVectorStorage>()
         .unwrap();
-    while w.len() > 0 && results.len() < k {
+    while !w.is_empty() && results.len() < k {
         let u = w.pop().unwrap().0;
 
         if results.is_empty()
             || results
                 .iter()
-                .any(|v| u.dist < OrderedFloat(storage.distance_between(u.id, v.id)))
+                .all(|v| u.dist < OrderedFloat(storage.distance_between(u.id, v.id)))
         {
             results.push(u);
         } else {
