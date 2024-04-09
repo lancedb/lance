@@ -212,11 +212,11 @@ use tokio::task::JoinHandle;
 
 use lance_core::{Error, Result};
 
+use crate::encodings::logical::binary::BinaryPageScheduler;
 use crate::encodings::logical::fixed_size_list::FslPageScheduler;
 use crate::encodings::logical::list::ListPageScheduler;
 use crate::encodings::logical::primitive::PrimitivePageScheduler;
 use crate::encodings::logical::r#struct::SimpleStructScheduler;
-use crate::encodings::logical::utf8::Utf8PageScheduler;
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
 use crate::EncodingsIo;
@@ -420,7 +420,7 @@ impl DecodeBatchScheduler {
                     })
                     .collect::<Vec<_>>()
             }
-            DataType::Utf8 => {
+            DataType::Utf8 | DataType::Binary => {
                 let list_decoders = Self::create_field_scheduler(
                     &DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
                     column_infos,
@@ -429,7 +429,7 @@ impl DecodeBatchScheduler {
                 list_decoders
                     .into_iter()
                     .map(|list_decoder| {
-                        Box::new(Utf8PageScheduler::new(list_decoder))
+                        Box::new(BinaryPageScheduler::new(list_decoder, data_type.clone()))
                             as Box<dyn LogicalPageScheduler>
                     })
                     .collect::<Vec<_>>()
