@@ -146,6 +146,14 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
 impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
+            arrow_schema::Field::new(ROW_ID, DataType::UInt64, true),
+        ]));
+
+        if self.hnsw.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
         let row_ids = self.hnsw.storage().row_ids();
         let bitmap = if pre_filter.is_empty() {
             None
@@ -183,10 +191,6 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.0 as usize]));
         let distances = Arc::new(Float32Array::from_iter_values(results.iter().map(|x| x.1)));
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, true),
-        ]));
         Ok(RecordBatch::try_new(
             schema,
             vec![distances, Arc::new(row_ids)],

@@ -2402,6 +2402,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_ivf_hnsw_with_empty_partition() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // the generate_test_dataset function generates a dataset with 1000 vectors,
+        // so 1001 partitions will have at least one empty partition
+        let nlist = 1001;
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let centroids = generate_random_array(nlist * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let ivf_params =
+            IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
+
+        let sq_params = SQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::L2,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let indexes = dataset
+            .object_store()
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap();
+        assert_eq!(indexes.len(), 1);
+
+        let uuid = &indexes[0];
+        let index_path = dataset
+            .indices_dir()
+            .child(uuid.as_str())
+            .child(INDEX_FILE_NAME);
+        let aux_path = dataset
+            .indices_dir()
+            .child(uuid.as_str())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        assert!(dataset.object_store().exists(&index_path).await.unwrap());
+        assert!(dataset.object_store().exists(&aux_path).await.unwrap());
+
+        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
+        let query = vector_array.value(0);
+        let query = query.as_primitive::<Float32Type>();
+        let k = 100;
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .nearest("vector", query, k)
+            .unwrap()
+            .nprobs(nlist)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(1, results.len());
+        assert_eq!(k, results[0].num_rows());
+
+        let results = results[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap() as u32)
+            .collect::<HashSet<_>>();
+
+        let gt = ground_truth(&mat, query.values(), k);
+        let recall = results.intersection(&gt).count() as f32 / k as f32;
+        assert!(
+            recall >= 0.9,
+            "recall: {}\n results: {:?}\n\ngt: {:?}",
+            recall,
+            results.iter().sorted().collect_vec(),
+            gt.iter().sorted().collect_vec()
+        );
+    }
+
+    #[tokio::test]
     async fn test_check_cosine_normalization() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
