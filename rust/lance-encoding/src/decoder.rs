@@ -644,7 +644,14 @@ pub trait PhysicalPageDecoder: Send + Sync {
     /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
     /// * `num_rows` - how many rows to decode
     /// * `buffers` - A mutable slice of "capacities" (as described above), one per buffer
-    fn update_capacity(&self, rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]);
+    /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
+    fn update_capacity(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        buffers: &mut [(u64, bool)],
+        all_null: &mut bool,
+    );
     /// Decodes the data into the requested buffers.
     ///
     /// You can assume that the capacity will have already been configured on the `BytesMut`

@@ -79,7 +79,13 @@ struct ValuePageDecoder {
 }
 
 impl PhysicalPageDecoder for ValuePageDecoder {
-    fn update_capacity(&self, _rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]) {
+    fn update_capacity(
+        &self,
+        _rows_to_skip: u32,
+        num_rows: u32,
+        buffers: &mut [(u64, bool)],
+        _all_null: &mut bool,
+    ) {
         buffers[0].0 = self.bytes_per_value * num_rows as u64;
         buffers[0].1 = true;
     }

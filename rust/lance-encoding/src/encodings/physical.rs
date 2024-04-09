@@ -82,7 +82,9 @@ pub fn decoder_from_array_encoding(
                         decoder_from_array_encoding(some_nulls.values.as_ref().unwrap(), buffers),
                     ))
                 }
-                pb::nullable::Nullability::AllNulls(_) => todo!(),
+                pb::nullable::Nullability::AllNulls(_) => {
+                    Box::new(BasicPageScheduler::new_all_null())
+                }
             }
         }
         pb::array_encoding::ArrayEncoding::Value(value) => {
