@@ -202,6 +202,10 @@ impl QuantizerStorage for ScalarQuantizationStorage {
 }
 
 impl VectorStorage for ScalarQuantizationStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn len(&self) -> usize {
         self.batch.num_rows()
     }
@@ -247,27 +251,26 @@ impl SQDistCalculator {
             sq_codes,
         }
     }
-
-    fn get_sq_code(&self, id: u32) -> &[u8] {
-        let dim = self.sq_codes.value_length() as usize;
-        let values: &[u8] = self
-            .sq_codes
-            .values()
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .unwrap()
-            .values();
-        &values[id as usize * dim..(id as usize + 1) * dim]
-    }
 }
 
 impl DistCalculator for SQDistCalculator {
     fn distance(&self, ids: &[u32]) -> Vec<f32> {
         ids.iter()
             .map(|&id| {
-                let sq_code = self.get_sq_code(id);
+                let sq_code = get_sq_code(&self.sq_codes, id);
                 l2_distance_uint_scalar(sq_code, &self.query_sq_code)
             })
             .collect()
     }
+}
+
+fn get_sq_code(sq_codes: &FixedSizeListArray, id: u32) -> &[u8] {
+    let dim = sq_codes.value_length() as usize;
+    let values: &[u8] = sq_codes
+        .values()
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .unwrap()
+        .values();
+    &values[id as usize * dim..(id as usize + 1) * dim]
 }

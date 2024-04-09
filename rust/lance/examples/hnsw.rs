@@ -111,7 +111,7 @@ async fn main() {
             .search(q, k, args.ef, None)
             .unwrap()
             .iter()
-            .map(|(i, _)| *i)
+            .map(|node| node.id)
             .collect();
         let search_time = now.elapsed().as_micros();
         println!(

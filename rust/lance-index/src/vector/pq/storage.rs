@@ -405,6 +405,10 @@ impl QuantizerStorage for ProductQuantizationStorage {
 }
 
 impl VectorStorage for ProductQuantizationStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn len(&self) -> usize {
         self.batch.num_rows()
     }
