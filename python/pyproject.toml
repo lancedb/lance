@@ -49,13 +49,13 @@ build-backend = "maturin"
 tests = [
     "boto3",
     "datasets",
-    "duckdb; python_version<'3.12'", # TODO: remove when duckdb supports 3.12
+    "duckdb",
     "ml_dtypes",
     "pillow",
     "pandas",
     "polars[pyarrow,pandas]",
     "pytest",
-    "tensorflow; python_version<'3.12'", # TODO: remove when tensorflow supports 3.12
+    "tensorflow",
     "tqdm",
 ]
 dev = ["ruff==0.2.2"]
