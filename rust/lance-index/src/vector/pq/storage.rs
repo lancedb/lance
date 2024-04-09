@@ -221,6 +221,9 @@ impl ProductQuantizationStorage {
         })
     }
 
+    pub fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
     /// Build a PQ storage from ProductQuantizer and a RecordBatch.
     ///
     /// Parameters

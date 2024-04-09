@@ -41,9 +41,9 @@ use crate::vector::{
     transform::Transformer,
 };
 
-use super::sq::transform::SQTransformer;
-use super::sq::ScalarQuantizer;
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN, SQ_CODE_COLUMN};
+use super::quantizer::Quantizer;
+use super::transform::DropColumn;
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
@@ -175,7 +175,6 @@ pub fn new_ivf_with_sq(
     dimension: usize,
     metric_type: MetricType,
     vector_column: &str,
-    sq: ScalarQuantizer,
     range: Option<Range<u32>>,
 ) -> Result<Arc<dyn Ivf>> {
     let ivf = match centroids.data_type() {
@@ -184,7 +183,6 @@ pub fn new_ivf_with_sq(
             dimension,
             metric_type,
             vector_column,
-            sq,
             range,
         ),
         DataType::Float32 => new_ivf_with_sq_impl::<Float32Type>(
@@ -192,7 +190,6 @@ pub fn new_ivf_with_sq(
             dimension,
             metric_type,
             vector_column,
-            sq,
             range,
         ),
         DataType::Float64 => new_ivf_with_sq_impl::<Float64Type>(
@@ -200,7 +197,6 @@ pub fn new_ivf_with_sq(
             dimension,
             metric_type,
             vector_column,
-            sq,
             range,
         ),
         _ => {
@@ -222,7 +218,6 @@ fn new_ivf_with_sq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveTy
     dimension: usize,
     metric_type: MetricType,
     vector_column: &str,
-    sq: ScalarQuantizer,
     range: Option<Range<u32>>,
 ) -> Arc<dyn Ivf> {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
@@ -230,9 +225,26 @@ fn new_ivf_with_sq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveTy
         mat,
         metric_type,
         vector_column,
-        sq,
         range,
     ))
+}
+
+pub fn new_ivf_with_quantizer(
+    centroids: &dyn Array,
+    dimension: usize,
+    metric_type: MetricType,
+    vector_column: &str,
+    quantizer: Quantizer,
+    range: Option<Range<u32>>,
+) -> Result<Arc<dyn Ivf>> {
+    match quantizer {
+        Quantizer::Product(pq) => {
+            new_ivf_with_pq(centroids, dimension, metric_type, vector_column, pq, range)
+        }
+        Quantizer::Scalar(_) => {
+            new_ivf_with_sq(centroids, dimension, metric_type, vector_column, range)
+        }
+    }
 }
 
 /// IVF - IVF file partition
@@ -370,7 +382,6 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
         centroids: MatrixView<T>,
         metric_type: MetricType,
         vector_column: &str,
-        sq: ScalarQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
@@ -394,11 +405,9 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
             )));
         }
 
-        transforms.push(Arc::new(SQTransformer::<T>::new(
-            sq,
-            vector_column.to_owned(),
-            SQ_CODE_COLUMN.to_owned(),
-        )));
+        // For SQ we will transofrm the vector to SQ code while building the index,
+        // so simply drop the vector column now.
+        transforms.push(Arc::new(DropColumn::new(vector_column)));
         Self {
             centroids: centroids.clone(),
             metric_type,
