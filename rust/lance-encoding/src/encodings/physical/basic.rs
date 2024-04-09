@@ -19,9 +19,54 @@ use lance_core::Result;
 
 use super::buffers::BitmapBufferEncoder;
 
+struct DataDecoders {
+    validity: Box<dyn PhysicalPageDecoder>,
+    values: Box<dyn PhysicalPageDecoder>,
+}
+
 enum DataValidity {
-    NoNull,
-    SomeNull(Box<dyn PhysicalPageDecoder>),
+    // Neither validity nor values
+    AllNull,
+    // Values only
+    NoNull(Box<dyn PhysicalPageDecoder>),
+    // Validity and values
+    SomeNull(DataDecoders),
+}
+
+impl DataValidity {
+    fn values_decoder(&self) -> Option<&Box<dyn PhysicalPageDecoder>> {
+        match self {
+            DataValidity::AllNull => None,
+            DataValidity::SomeNull(decoders) => Some(&decoders.values),
+            DataValidity::NoNull(values) => Some(values),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DataSchedulers {
+    validity: Box<dyn PhysicalPageScheduler>,
+    values: Box<dyn PhysicalPageScheduler>,
+}
+
+#[derive(Debug)]
+enum SchedulerValidity {
+    // Values only
+    NoNull(Box<dyn PhysicalPageScheduler>),
+    // Validity and values
+    SomeNull(DataSchedulers),
+    // Neither validity nor values
+    AllNull,
+}
+
+impl SchedulerValidity {
+    fn values_scheduler(&self) -> Option<&Box<dyn PhysicalPageScheduler>> {
+        match self {
+            SchedulerValidity::AllNull => None,
+            SchedulerValidity::NoNull(values) => Some(values),
+            SchedulerValidity::SomeNull(schedulers) => Some(&schedulers.values),
+        }
+    }
 }
 
 /// A physical scheduler for "basic" fields.  These are fields that have an optional
@@ -37,8 +82,7 @@ enum DataValidity {
 // sentinel encoding instead.
 #[derive(Debug)]
 pub struct BasicPageScheduler {
-    validity_decoder: PageValidity,
-    values_decoder: Box<dyn PhysicalPageScheduler>,
+    mode: SchedulerValidity,
 }
 
 impl BasicPageScheduler {
@@ -48,16 +92,28 @@ impl BasicPageScheduler {
         values_decoder: Box<dyn PhysicalPageScheduler>,
     ) -> Self {
         Self {
-            validity_decoder: PageValidity::SomeNull(validity_decoder),
-            values_decoder,
+            mode: SchedulerValidity::SomeNull(DataSchedulers {
+                validity: validity_decoder,
+                values: values_decoder,
+            }),
         }
     }
 
     /// Create a new instance that does not need a validity bitmap because no item is null
     pub fn new_non_nullable(values_decoder: Box<dyn PhysicalPageScheduler>) -> Self {
         Self {
-            validity_decoder: PageValidity::NoNull,
-            values_decoder,
+            mode: SchedulerValidity::NoNull(values_decoder),
+        }
+    }
+
+    /// Create a new instance where all values are null
+    ///
+    /// It may seem strange we need `values_decoder` here but Arrow requires that value
+    /// buffers still be allocated / sized even if everything is null.  So we need the value
+    /// decoder to calculate the capcity of the garbage buffer.
+    pub fn new_all_null() -> Self {
+        Self {
+            mode: SchedulerValidity::AllNull,
         }
     }
 }
@@ -68,64 +124,92 @@ impl PhysicalPageScheduler for BasicPageScheduler {
         ranges: &[std::ops::Range<u32>],
         scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
-        let validity_future = match &self.validity_decoder {
-            PageValidity::NoNull => None,
-            PageValidity::SomeNull(validity_decoder) => {
+        let validity_future = match &self.mode {
+            SchedulerValidity::NoNull(_) | SchedulerValidity::AllNull => None,
+            SchedulerValidity::SomeNull(schedulers) => {
                 trace!("Scheduling ranges {:?} from validity", ranges);
-                Some(validity_decoder.schedule_ranges(ranges, scheduler))
+                Some(schedulers.validity.schedule_ranges(ranges, scheduler))
             }
         };
 
-        trace!("Scheduling range {:?} from values", ranges);
-        let values_future = self.values_decoder.schedule_ranges(ranges, scheduler);
+        let values_future = if let Some(values_scheduler) = self.mode.values_scheduler() {
+            trace!("Scheduling range {:?} from values", ranges);
+            Some(values_scheduler.schedule_ranges(ranges, scheduler).boxed())
+        } else {
+            trace!("No values fetch needed since values all null");
+            None
+        };
 
         async move {
-            let validity = match validity_future {
-                None => DataValidity::NoNull,
-                Some(fut) => DataValidity::SomeNull(fut.await?),
+            let mode = match (values_future, validity_future) {
+                (None, None) => DataValidity::AllNull,
+                (Some(values_future), None) => DataValidity::NoNull(values_future.await?),
+                (Some(values_future), Some(validity_future)) => {
+                    DataValidity::SomeNull(DataDecoders {
+                        values: values_future.await?,
+                        validity: validity_future.await?,
+                    })
+                }
+                _ => unreachable!(),
             };
-            let values = values_future.await?;
-            Ok(Box::new(BasicPageDecoder { validity, values }) as Box<dyn PhysicalPageDecoder>)
+            Ok(Box::new(BasicPageDecoder { mode }) as Box<dyn PhysicalPageDecoder>)
         }
         .boxed()
     }
 }
 
 struct BasicPageDecoder {
-    validity: DataValidity,
-    values: Box<dyn PhysicalPageDecoder>,
+    mode: DataValidity,
 }
 
 impl PhysicalPageDecoder for BasicPageDecoder {
-    fn update_capacity(&self, rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]) {
+    fn update_capacity(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        buffers: &mut [(u64, bool)],
+        all_null: &mut bool,
+    ) {
         // No need to look at the validity decoder to know the dest buffer size since it is boolean
         buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
         // The validity buffer is only required if we have some nulls
-        buffers[0].1 = match self.validity {
-            DataValidity::NoNull => false,
-            DataValidity::SomeNull(_) => true,
-        };
-        self.values
-            .update_capacity(rows_to_skip, num_rows, &mut buffers[1..]);
+        buffers[0].1 = matches!(self.mode, DataValidity::SomeNull(_));
+        if let Some(values) = self.mode.values_decoder() {
+            values.update_capacity(rows_to_skip, num_rows, &mut buffers[1..], all_null);
+        } else {
+            *all_null = true;
+        }
     }
 
     fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [bytes::BytesMut]) {
-        if let DataValidity::SomeNull(validity_decoder) = &self.validity {
-            validity_decoder.decode_into(rows_to_skip, num_rows, &mut dest_buffers[..1]);
+        match &self.mode {
+            DataValidity::SomeNull(decoders) => {
+                decoders
+                    .validity
+                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[..1]);
+                decoders
+                    .values
+                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..]);
+            }
+            // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
+            // other pages needed the buffer, in which case we need to fill our section
+            DataValidity::AllNull => {
+                dest_buffers[0].fill(0);
+            }
+            DataValidity::NoNull(values) => {
+                dest_buffers[0].fill(1);
+                values.decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..]);
+            }
         }
-        self.values
-            .decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..]);
     }
 
     fn num_buffers(&self) -> u32 {
-        1 + self.values.num_buffers()
+        1 + self
+            .mode
+            .values_decoder()
+            .map(|val| val.num_buffers())
+            .unwrap_or(0)
     }
-}
-
-#[derive(Debug)]
-enum PageValidity {
-    NoNull,
-    SomeNull(Box<dyn PhysicalPageScheduler>),
 }
 
 #[derive(Debug)]

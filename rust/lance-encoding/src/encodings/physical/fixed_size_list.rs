@@ -70,11 +70,17 @@ pub struct FixedListDecoder {
 }
 
 impl PhysicalPageDecoder for FixedListDecoder {
-    fn update_capacity(&self, rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]) {
+    fn update_capacity(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        buffers: &mut [(u64, bool)],
+        all_null: &mut bool,
+    ) {
         let rows_to_skip = rows_to_skip * self.dimension;
         let num_rows = num_rows * self.dimension;
         self.items_decoder
-            .update_capacity(rows_to_skip, num_rows, buffers);
+            .update_capacity(rows_to_skip, num_rows, buffers, all_null);
     }
 
     fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [bytes::BytesMut]) {

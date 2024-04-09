@@ -139,11 +139,18 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
         // There are two buffers, the validity buffer and the values buffer
         // We start by assuming the validity buffer will not be required
         let mut capacities = vec![(0, false); self.physical_decoder.num_buffers() as usize];
+        let mut all_null = false;
         self.physical_decoder.update_capacity(
             self.rows_to_skip,
             self.rows_to_take,
             &mut capacities,
+            &mut all_null,
         );
+
+        if all_null {
+            return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));
+        }
+
         // At this point we know the size needed for each buffer
         let mut bufs = capacities
             .into_iter()

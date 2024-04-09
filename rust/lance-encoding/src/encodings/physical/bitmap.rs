@@ -92,7 +92,13 @@ struct BitmapDecoder {
 }
 
 impl PhysicalPageDecoder for BitmapDecoder {
-    fn update_capacity(&self, _rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]) {
+    fn update_capacity(
+        &self,
+        _rows_to_skip: u32,
+        num_rows: u32,
+        buffers: &mut [(u64, bool)],
+        _all_null: &mut bool,
+    ) {
         buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
         buffers[0].1 = true;
     }
