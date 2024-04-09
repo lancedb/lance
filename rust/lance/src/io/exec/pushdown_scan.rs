@@ -25,7 +25,7 @@ use datafusion::logical_expr::col;
 use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::physical_plan::ColumnarValue;
+use datafusion::physical_plan::{ColumnarValue, ExecutionMode, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     physical_plan::{
@@ -34,6 +34,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID_FIELD;
@@ -93,6 +94,8 @@ pub struct LancePushdownScanExec {
     predicate_projection: Arc<Schema>,
     predicate: Expr,
     config: ScanConfig,
+    properties: PlanProperties,
+    schema: SchemaRef,
 }
 
 impl LancePushdownScanExec {
@@ -120,6 +123,24 @@ impl LancePushdownScanExec {
             ));
         }
 
+        let schema: ArrowSchema = projection.as_ref().into();
+        let schema = if config.with_row_id {
+            let mut fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields.len() + 1);
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
+            fields.extend(schema.fields.iter().cloned());
+            Arc::new(ArrowSchema::new(fields))
+        } else {
+            Arc::new(schema)
+        };
+
+        let eq_props = EquivalenceProperties::new(schema.clone());
+        let execution_mode = ExecutionMode::Bounded;
+        let properties = PlanProperties::new(
+            eq_props,
+            Partitioning::UnknownPartitioning(1),
+            execution_mode,
+        );
+
         Ok(Self {
             dataset,
             fragments,
@@ -127,6 +148,8 @@ impl LancePushdownScanExec {
             predicate,
             predicate_projection,
             config,
+            properties,
+            schema,
         })
     }
 }
@@ -137,23 +160,11 @@ impl ExecutionPlan for LancePushdownScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        let schema: ArrowSchema = self.projection.as_ref().into();
-        if self.config.with_row_id {
-            let mut fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields.len() + 1);
-            fields.push(Arc::new(ROW_ID_FIELD.clone()));
-            fields.extend(schema.fields.iter().cloned());
-            Arc::new(ArrowSchema::new(fields))
-        } else {
-            Arc::new(schema)
-        }
+        self.schema.clone()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

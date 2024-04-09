@@ -19,10 +19,12 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
+        ExecutionPlan, Partitioning, PlanProperties,
     },
     scalar::ScalarValue,
 };
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{
     utils::{address::RowAddress, mask::RowIdTreeMap},
@@ -47,6 +49,11 @@ use crate::{
 
 lazy_static::lazy_static! {
     pub static ref SCALAR_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![Field::new("result".to_string(), DataType::Binary, true)]));
+    pub static ref SCALAR_INDEX_PROPERTIES: Arc<PlanProperties> = Arc::new(PlanProperties::new(
+        EquivalenceProperties::new(SCALAR_INDEX_SCHEMA.clone()),
+        Partitioning::RoundRobinBatch(1),
+        ExecutionMode::Bounded,
+    ));
 }
 
 #[async_trait]
@@ -110,15 +117,6 @@ impl ExecutionPlan for ScalarIndexExec {
         SCALAR_INDEX_SCHEMA.clone()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        // No guarantee a scalar index scan will return row ids in any meaningful order
-        None
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -149,10 +147,15 @@ impl ExecutionPlan for ScalarIndexExec {
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         todo!()
     }
+
+    fn properties(&self) -> &PlanProperties {
+        &SCALAR_INDEX_PROPERTIES
+    }
 }
 
 lazy_static::lazy_static! {
     pub static ref INDEX_LOOKUP_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
+
 }
 
 /// An execution node that translates index values into row addresses
@@ -163,6 +166,7 @@ pub struct MapIndexExec {
     dataset: Arc<Dataset>,
     column_name: String,
     input: Arc<dyn ExecutionPlan>,
+    properties: PlanProperties,
 }
 
 impl DisplayAs for MapIndexExec {
@@ -177,10 +181,17 @@ impl DisplayAs for MapIndexExec {
 
 impl MapIndexExec {
     pub fn new(dataset: Arc<Dataset>, column_name: String, input: Arc<dyn ExecutionPlan>) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
+            input.properties().output_partitioning().clone(),
+            ExecutionMode::Bounded,
+        );
+
         Self {
             dataset,
             column_name,
             input,
+            properties,
         }
     }
 
@@ -257,13 +268,8 @@ impl ExecutionPlan for MapIndexExec {
         INDEX_LOOKUP_SCHEMA.clone()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion_physical_expr::PhysicalSortExpr]> {
-        // The output does have an implicit ordering but nothing we can express with PhysicalSortExpr
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -298,6 +304,11 @@ impl ExecutionPlan for MapIndexExec {
 
 lazy_static::lazy_static! {
     pub static ref MATERIALIZE_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
+    pub static ref MATERIALIZE_INDEX_PROPERTIES: Arc<PlanProperties> = Arc::new(PlanProperties::new(
+        EquivalenceProperties::new(MATERIALIZE_INDEX_SCHEMA.clone()),
+        Partitioning::RoundRobinBatch(1),
+        ExecutionMode::Bounded,
+    ));
 }
 
 /// An execution node that performs a scalar index search and materializes the mask into row ids
@@ -452,13 +463,8 @@ impl ExecutionPlan for MaterializeIndexExec {
         MATERIALIZE_INDEX_SCHEMA.clone()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        // No guarantee a scalar index scan will return row ids in any meaningful order
-        None
+    fn properties(&self) -> &PlanProperties {
+        MATERIALIZE_INDEX_PROPERTIES.as_ref()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

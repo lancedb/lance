@@ -142,14 +142,6 @@ impl ExecutionPlan for ReplayExec {
         self.input.schema()
     }
 
-    fn output_partitioning(&self) -> datafusion_physical_expr::Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion_physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![self.input.clone()]
     }
@@ -187,6 +179,10 @@ impl ExecutionPlan for ReplayExec {
                 stream: to_return,
             }))
         }
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        self.input.properties()
     }
 }
 

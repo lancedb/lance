@@ -249,14 +249,6 @@ impl ExecutionPlan for TakeExec {
         ArrowSchema::from(&self.output_schema).into()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![self.input.clone()]
     }
@@ -303,6 +295,10 @@ impl ExecutionPlan for TakeExec {
 
     fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {
         self.input.statistics()
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        self.input.properties()
     }
 }
 

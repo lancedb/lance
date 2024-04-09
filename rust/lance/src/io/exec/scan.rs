@@ -23,9 +23,10 @@ use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
-    SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+    RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::Stream;
 use futures::{stream, Future};
 use futures::{StreamExt, TryStreamExt};
@@ -219,6 +220,8 @@ pub struct LanceScanExec {
     with_row_id: bool,
     with_make_deletions_null: bool,
     ordered_output: bool,
+    properties: PlanProperties,
+    schema: SchemaRef,
 }
 
 impl DisplayAs for LanceScanExec {
@@ -256,8 +259,21 @@ impl LanceScanExec {
         fragment_readahead: usize,
         with_row_id: bool,
         with_make_deletions_null: bool,
-        ordered_ouput: bool,
+        ordered_output: bool,
     ) -> Self {
+        let schema: ArrowSchema = projection.as_ref().into();
+        let schema = if with_row_id {
+            let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
+            Arc::new(ArrowSchema::new(fields))
+        } else {
+            Arc::new(schema)
+        };
+        let eq_props = EquivalenceProperties::new(schema.clone());
+        let execution_mode = ExecutionMode::Bounded;
+        let partitioning = Partitioning::UnknownPartitioning(1);
+        let properties = PlanProperties::new(eq_props, partitioning, execution_mode);
+
         Self {
             dataset,
             fragments,
@@ -267,7 +283,9 @@ impl LanceScanExec {
             fragment_readahead,
             with_row_id,
             with_make_deletions_null,
-            ordered_output: ordered_ouput,
+            ordered_output,
+            schema,
+            properties,
         }
     }
 }
@@ -278,22 +296,11 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        let schema: ArrowSchema = self.projection.as_ref().into();
-        if self.with_row_id {
-            let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
-            fields.push(Arc::new(ROW_ID_FIELD.clone()));
-            Arc::new(ArrowSchema::new(fields))
-        } else {
-            Arc::new(schema)
-        }
+        self.schema.clone()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     /// Scan is the leaf node, so returns an empty vector.

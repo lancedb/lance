@@ -28,12 +28,12 @@ use datafusion::{
         TaskContext,
     },
     physical_plan::{
-        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan,
-        SendableRecordBatchStream,
+        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan,
+        PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_common::DataFusionError;
-use datafusion_physical_expr::Partitioning;
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
 use lance_arrow::SchemaExt;
 use lance_core::Result;
@@ -47,15 +47,22 @@ pub struct OneShotExec {
     // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
     // can still function after exhuasted
     schema: Arc<ArrowSchema>,
+    properties: PlanProperties,
 }
 
 impl OneShotExec {
     /// Create a new instance from a given stream
     pub fn new(stream: SendableRecordBatchStream) -> Self {
         let schema = stream.schema().clone();
+        let eq_properties = EquivalenceProperties::new(schema.clone());
+        let partitioning = Partitioning::RoundRobinBatch(1);
+        let execution_mode = ExecutionMode::Bounded;
+        let properties = PlanProperties::new(eq_properties, partitioning, execution_mode);
+
         Self {
             stream: Mutex::new(Some(stream)),
             schema,
+            properties,
         }
     }
 }
@@ -106,14 +113,6 @@ impl ExecutionPlan for OneShotExec {
         self.schema.clone()
     }
 
-    fn output_partitioning(&self) -> datafusion_physical_expr::Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion_physical_expr::PhysicalSortExpr]> {
-        None
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -146,6 +145,10 @@ impl ExecutionPlan for OneShotExec {
 
     fn statistics(&self) -> datafusion_common::Result<datafusion_common::Statistics> {
         todo!()
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.properties
     }
 }
 
@@ -182,7 +185,7 @@ pub fn execute_plan(
     let session_state = SessionState::new_with_config_rt(session_config, runtime_env);
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
-    assert_eq!(plan.output_partitioning().partition_count(), 1);
+    assert_eq!(plan.properties().output_partitioning().partition_count(), 1);
     Ok(plan.execute(0, session_state.task_ctx())?)
 }
 

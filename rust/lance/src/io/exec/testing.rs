@@ -52,11 +52,7 @@ impl ExecutionPlan for TestingExec {
         self.batches[0].schema()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        todo!()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
         todo!()
     }
 

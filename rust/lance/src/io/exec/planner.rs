@@ -22,7 +22,7 @@ use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
-use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{
@@ -220,6 +220,18 @@ impl ContextProvider for LanceContextProvider {
 
     fn options(&self) -> &datafusion::config::ConfigOptions {
         &self.options
+    }
+
+    fn udfs_names(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn udafs_names(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn udwfs_names(&self) -> Vec<String> {
+        vec![]
     }
 }
 
@@ -728,9 +740,9 @@ struct ColumnCapturingVisitor {
 }
 
 impl TreeNodeVisitor for ColumnCapturingVisitor {
-    type N = Expr;
+    type Node = Expr;
 
-    fn pre_visit(&mut self, node: &Self::N) -> DFResult<VisitRecursion> {
+    fn f_down(&mut self, node: &Self::Node) -> DFResult<TreeNodeRecursion> {
         match node {
             Expr::Column(Column { name, .. }) => {
                 let mut path = name.clone();
@@ -752,7 +764,7 @@ impl TreeNodeVisitor for ColumnCapturingVisitor {
             }
         }
 
-        Ok(VisitRecursion::Continue)
+        Ok(TreeNodeRecursion::Continue)
     }
 }
 

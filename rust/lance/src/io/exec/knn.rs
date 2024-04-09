@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -27,6 +27,8 @@ use datafusion::physical_plan::{
     stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
 };
+use datafusion::physical_plan::{ExecutionMode, PlanProperties};
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -211,12 +213,8 @@ impl ExecutionPlan for KNNFlatExec {
         ))
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        self.input.properties()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -356,6 +354,8 @@ pub struct KNNIndexExec {
     indices: Vec<Index>,
     /// The vector query to execute.
     query: Query,
+    schema: SchemaRef,
+    properties: PlanProperties,
 }
 
 impl DisplayAs for KNNIndexExec {
@@ -399,11 +399,22 @@ impl KNNIndexExec {
             });
         };
 
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(DIST_COL, DataType::Float32, true),
+            ROW_ID_FIELD.clone(),
+        ]));
+        let partitioning = Partitioning::RoundRobinBatch(1);
+        let eq_properties = EquivalenceProperties::new(schema.clone());
+        let execution_mode = ExecutionMode::Bounded;
+        let properties = PlanProperties::new(eq_properties, partitioning, execution_mode);
+
         Ok(Self {
             dataset,
             indices: indices.to_vec(),
             query: query.clone(),
             prefilter_source,
+            properties,
+            schema,
         })
     }
 }
@@ -414,18 +425,11 @@ impl ExecutionPlan for KNNIndexExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new(DIST_COL, DataType::Float32, true),
-            ROW_ID_FIELD.clone(),
-        ]))
+        self.schema.clone()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

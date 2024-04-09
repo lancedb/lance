@@ -437,13 +437,14 @@ impl MergeInsertJob {
         let target_key = Column::new_with_schema(&index_column, target.schema().as_ref())?;
         let joined = Arc::new(
             HashJoinExec::try_new(
-                shared_input,
-                target,
-                vec![(Arc::new(target_key), Arc::new(source_key))],
-                None,
-                &JoinType::Full,
-                PartitionMode::CollectLeft,
-                true,
+                shared_input,                                       // left
+                target,                                             // right
+                vec![(Arc::new(target_key), Arc::new(source_key))], // on
+                None,                                               // filter
+                &JoinType::Full,                                    // join type
+                None,                                               // projection
+                PartitionMode::CollectLeft,                         // partition mode
+                true,                                               // null eq null
             )
             .unwrap(),
         );

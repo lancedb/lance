@@ -162,14 +162,9 @@ impl ExecutionPlan for ProjectionExec {
         arrow_schema.into()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        self.input.output_partitioning()
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        self.input.properties()
     }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![self.input.clone()]
     }

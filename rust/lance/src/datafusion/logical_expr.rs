@@ -16,11 +16,7 @@
 
 use arrow_schema::DataType;
 
-use datafusion::logical_expr::ScalarFunctionDefinition;
-use datafusion::logical_expr::{
-    expr::ScalarFunction, BinaryExpr, BuiltinScalarFunction, GetFieldAccess, GetIndexedField,
-    Operator,
-};
+use datafusion::logical_expr::{BinaryExpr, GetFieldAccess, GetIndexedField, Operator};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use lance_arrow::DataTypeExt;
@@ -200,14 +196,14 @@ pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
 ///
 /// - *expr*: a datafusion logical expression
 pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
+    // todo!()
     match expr {
         // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
         // instead of hardcoding coerce method for each function
-        Expr::ScalarFunction(ScalarFunction {
-            func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::RegexpMatch),
-            ..
-        }) => Ok(Expr::IsNotNull(Box::new(expr))),
-
+        // Expr::ScalarFunction(ScalarFunction {
+        //     func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::RegexpMatch),
+        //     ..
+        // }) => Ok(Expr::IsNotNull(Box::new(expr))),
         _ => Ok(expr),
     }
 }

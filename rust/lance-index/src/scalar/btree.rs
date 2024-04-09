@@ -507,6 +507,8 @@ impl Ord for OrderableScalarValue {
             (Dictionary(_, _), _) => panic!("Attempt to compare Dictionary with non-Dictionary"),
             (Null, Null) => Ordering::Equal,
             (Null, _) => todo!(),
+            (Union(_, _, _), Union(_, _, _)) => panic!("Attempt to compare Union with Union"),
+            (Union(_, _, _), _) => panic!("Attempt to compare Union with non-Union"),
         }
     }
 }

@@ -30,10 +30,10 @@ use arrow_array::{
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
         UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, OffsetSizeTrait, PrimitiveArray,
-    RecordBatch, StructArray,
+    Array, ArrayRef, ArrowNumericType, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use datafusion_common::arrow::array::ArrowPrimitiveType;
 use datafusion_common::ScalarValue;
 use lance_arrow::{as_fixed_size_binary_array, DataTypeExt};
 use lance_core::datatypes::{Field, Schema};

@@ -697,11 +697,12 @@ impl Scanner {
         let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
         let count_expr = create_aggregate_expr(
             &AggregateFunction::Count,
-            false,
+            false, // distinct
             &[one],
             &[],
             &plan.schema(),
-            "",
+            "",    // name
+            false, // ignore nulls
         )?;
         let plan_schema = plan.schema().clone();
         let count_plan = Arc::new(AggregateExec::try_new(

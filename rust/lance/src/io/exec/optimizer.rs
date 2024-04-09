@@ -41,11 +41,12 @@ impl PhysicalOptimizerRule for CoalesceTake {
                 let child = &take.children()[0];
                 if let Some(exec_child) = child.as_any().downcast_ref::<TakeExec>() {
                     let upstream_plan = exec_child.children();
-                    return Ok(Transformed::Yes(plan.with_new_children(upstream_plan)?));
+                    return Ok(Transformed::yes(plan.with_new_children(upstream_plan)?));
                 }
             }
-            Ok(Transformed::No(plan))
+            Ok(Transformed::no(plan))
         })
+        .map(|plan| plan.data)
     }
 
     fn name(&self) -> &str {
@@ -71,7 +72,7 @@ impl PhysicalOptimizerRule for SimplifyProjection {
             if let Some(proj) = plan.as_any().downcast_ref::<DFProjectionExec>() {
                 let children = &proj.children();
                 if children.len() != 1 {
-                    return Ok(Transformed::No(plan));
+                    return Ok(Transformed::no(plan));
                 }
 
                 let input = &children[0];
@@ -81,7 +82,7 @@ impl PhysicalOptimizerRule for SimplifyProjection {
 
                 // output has differnet schema, projection needed
                 if input.schema() != proj.schema() {
-                    return Ok(Transformed::No(plan));
+                    return Ok(Transformed::no(plan));
                 }
 
                 if proj.expr().iter().enumerate().all(|(index, (expr, name))| {
@@ -92,11 +93,12 @@ impl PhysicalOptimizerRule for SimplifyProjection {
                         false
                     }
                 }) {
-                    return Ok(Transformed::Yes(input.clone()));
+                    return Ok(Transformed::yes(input.clone()));
                 }
             }
-            Ok(Transformed::No(plan))
+            Ok(Transformed::no(plan))
         })
+        .map(|plan| plan.data)
     }
 
     fn name(&self) -> &str {
