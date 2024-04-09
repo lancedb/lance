@@ -18,6 +18,7 @@ from lance.file import LanceFileReader, LanceFileWriter
 
 def test_file_writer(tmp_path):
     path = tmp_path / "foo.lance"
+    print(path)
     schema = pa.schema([pa.field("a", pa.int64())])
     with LanceFileWriter(str(path), schema) as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))

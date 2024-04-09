@@ -35,6 +35,7 @@ pub struct ObjectWriter {
 
     // TODO: pub(crate)
     pub multipart_id: MultipartId,
+    path: Path,
 
     cursor: usize,
 }
@@ -54,11 +55,20 @@ impl ObjectWriter {
             writer,
             multipart_id,
             cursor: 0,
+            path: path.clone(),
         })
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        Ok(self.writer.as_mut().shutdown().await?)
+        Ok(self
+            .writer
+            .as_mut()
+            .shutdown()
+            .await
+            .map_err(|e| Error::IO {
+                message: format!("failed to shutdown object writer for {}: {}", self.path, e),
+                location: location!(),
+            })?)
     }
 }
 
