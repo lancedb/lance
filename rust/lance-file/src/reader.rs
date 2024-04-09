@@ -342,7 +342,7 @@ impl FileReader {
         projection: &Schema,
         deletion_vector: Option<&DeletionVector>,
     ) -> Result<RecordBatch> {
-        if range.len() == 0 {
+        if range.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(self.schema().into())));
         }
         let range_in_batches = self.metadata.range_to_batches(range)?;
