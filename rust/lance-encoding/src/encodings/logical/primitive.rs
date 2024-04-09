@@ -198,7 +198,7 @@ impl PrimitiveFieldDecodeTask {
         };
 
         let data_buffer = buffer_iter.next().unwrap().freeze();
-        let data_buffer = Buffer::from(data_buffer);
+        let data_buffer = Buffer::from_bytes(data_buffer.into());
         let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
 
         // The with_data_type is needed here to recover the parameters for types like Decimal/Timestamp

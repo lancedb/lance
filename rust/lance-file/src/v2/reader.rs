@@ -468,9 +468,13 @@ impl FileReader {
         &self,
         params: ReadBatchParams,
         batch_size: u32,
+        batch_readahead: u32,
     ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
         let tasks_stream = self.read_tasks(params, batch_size)?;
-        let batch_stream = tasks_stream.map(|task| task.task).buffered(16).boxed();
+        let batch_stream = tasks_stream
+            .map(|task| task.task)
+            .buffered(batch_readahead as usize)
+            .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::new(self.file_schema.clone()),
             batch_stream,
@@ -576,7 +580,7 @@ mod tests {
                 .unwrap();
 
             let mut batch_stream = file_reader
-                .read_stream(lance_io::ReadBatchParams::RangeFull, read_size)
+                .read_stream(lance_io::ReadBatchParams::RangeFull, read_size, 16)
                 .unwrap();
 
             let mut total_remaining = 1000 * 100;
