@@ -1,4 +1,4 @@
-use std::{io::Cursor, ops::Range, sync::Arc};
+use std::{io::Cursor, ops::Range, pin::Pin, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
@@ -14,7 +14,11 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 use lance_encoding::format::pb as pbenc;
-use lance_io::{scheduler::FileScheduler, ReadBatchParams};
+use lance_io::{
+    scheduler::FileScheduler,
+    stream::{RecordBatchStream, RecordBatchStreamAdapter},
+    ReadBatchParams,
+};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -24,6 +28,15 @@ use crate::{
 
 use super::io::LanceEncodingsIo;
 
+// For now, we don't use global buffers for anything other than schema.  If we
+// use these later we should make them lazily loaded and then cached once loaded.
+//
+// We store their position / length for debugging purposes
+pub struct BufferDescriptor {
+    pub position: u64,
+    pub size: u64,
+}
+
 // TODO: Caching
 pub struct CachedFileMetadata {
     /// The schema of the file
@@ -32,6 +45,15 @@ pub struct CachedFileMetadata {
     pub column_metadatas: Vec<pbfile::ColumnMetadata>,
     /// The number of rows in the file
     pub num_rows: u64,
+    pub file_buffers: Vec<BufferDescriptor>,
+    /// The number of bytes contained in the data page section of the file
+    pub num_data_bytes: u64,
+    /// The number of bytes contained in the column metadata section of the file
+    pub num_column_metadata_bytes: u64,
+    /// The number of bytes contained in the global buffer section of the file
+    pub num_global_buffer_bytes: u64,
+    pub major_version: u16,
+    pub minor_version: u16,
 }
 
 pub struct FileReader {
@@ -39,6 +61,7 @@ pub struct FileReader {
     file_schema: Schema,
     column_infos: Vec<ColumnInfo>,
     num_rows: u64,
+    metadata: Arc<CachedFileMetadata>,
 }
 
 struct Footer {
@@ -51,11 +74,17 @@ struct Footer {
     global_buff_offsets_start: u64,
     num_global_buffers: u32,
     num_columns: u32,
+    major_version: u16,
+    minor_version: u16,
 }
 
 const FOOTER_LEN: usize = 48;
 
 impl FileReader {
+    pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
+        &self.metadata
+    }
+
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
         let file_size = scheduler.reader().size().await? as u64;
         let begin = if file_size < scheduler.reader().block_size() as u64 {
@@ -118,6 +147,8 @@ impl FileReader {
             global_buff_offsets_start,
             num_global_buffers,
             num_columns,
+            major_version,
+            minor_version,
         })
     }
 
@@ -216,55 +247,65 @@ impl FileReader {
         // Next, read the metadata for the columns
         let column_metadatas = Self::read_all_column_metadata(scheduler, &footer).await?;
 
-        Ok(CachedFileMetadata {
-            file_schema: Schema::from(&schema),
-            column_metadatas,
-            num_rows,
-        })
-    }
+        let footer_start = file_len - FOOTER_LEN as u64;
+        let num_data_bytes = footer.column_meta_start;
+        let num_column_metadata_bytes = footer.global_buff_start - footer.column_meta_start;
+        let num_global_buffer_bytes = footer_start - footer.global_buff_start;
 
-    pub async fn print_all_metadata(scheduler: &FileScheduler) -> Result<()> {
-        // 1. read and print the footer
-        let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
-        let footer = Self::decode_footer(&tail_bytes)?;
-
-        println!("# Footer");
-        println!();
-        println!(
-            "File version           : {}.{}",
-            MAJOR_VERSION, MINOR_VERSION_NEXT
-        );
-        println!("Data bytes             : {}", footer.column_meta_start);
-        println!(
-            "Col. meta size (padded): {}",
-            footer.column_meta_offsets_start - footer.column_meta_start
-        );
-        println!(
-            "Glo. buff size (padded): {}",
-            footer.global_buff_offsets_start - footer.global_buff_start
-        );
-
-        let all_metadata_bytes =
-            Self::get_all_meta_bytes(tail_bytes, file_len, scheduler, &footer).await?;
-        let meta_offset = footer.column_meta_start;
-
-        // 2. print the global buffers
         let global_bufs_table_nbytes = footer.num_global_buffers as usize * 16;
         let global_bufs_table_start = (footer.global_buff_offsets_start - meta_offset) as usize;
         let global_bufs_table_end = global_bufs_table_start + global_bufs_table_nbytes;
         let global_bufs_table =
             all_metadata_bytes.slice(global_bufs_table_start..global_bufs_table_end);
         let mut global_bufs_cursor = Cursor::new(&global_bufs_table);
-        println!("Global buffers:");
+
+        let mut global_buffers = Vec::with_capacity(footer.num_global_buffers as usize);
         for _ in 0..footer.num_global_buffers {
             let buf_pos = global_bufs_cursor.read_u64::<LittleEndian>()? - meta_offset;
             let buf_size = global_bufs_cursor.read_u64::<LittleEndian>()?;
-            println!(" * {}..{}", buf_pos, buf_pos + buf_size);
+            global_buffers.push(BufferDescriptor {
+                position: buf_pos,
+                size: buf_size,
+            });
         }
 
-        let col_meta = Self::read_all_column_metadata(scheduler, &footer).await?;
+        Ok(CachedFileMetadata {
+            file_schema: Schema::from(&schema),
+            column_metadatas,
+            num_rows,
+            num_data_bytes,
+            num_column_metadata_bytes,
+            num_global_buffer_bytes,
+            file_buffers: global_buffers,
+            major_version: footer.major_version,
+            minor_version: footer.minor_version,
+        })
+    }
+
+    pub async fn print_all_metadata(metadata: &CachedFileMetadata) -> Result<()> {
+        // 1. read and print the footer
+        println!("# Footer");
+        println!();
+        println!(
+            "File version           : {}.{}",
+            MAJOR_VERSION, MINOR_VERSION_NEXT
+        );
+        println!("Data bytes             : {}", metadata.num_data_bytes);
+        println!("Col. meta bytes: {}", metadata.num_column_metadata_bytes);
+        println!("Glo. data bytes: {}", metadata.num_global_buffer_bytes);
+
+        // 2. print the global buffers
+        println!("Global buffers:");
+        for file_buffer in &metadata.file_buffers {
+            println!(
+                " * {}..{}",
+                file_buffer.position,
+                file_buffer.position + file_buffer.size
+            );
+        }
+
         println!("Columns:");
-        for (idx, col) in col_meta.iter().enumerate() {
+        for (idx, col) in metadata.column_metadatas.iter().enumerate() {
             println!(" * Column {}", idx);
             println!();
             println!("   Buffers:");
@@ -354,6 +395,7 @@ impl FileReader {
             column_infos,
             file_schema: file_metadata.file_schema.clone(),
             num_rows,
+            metadata: file_metadata,
         })
     }
 
@@ -383,7 +425,7 @@ impl FileReader {
         &self,
         params: ReadBatchParams,
         batch_size: u32,
-    ) -> BoxStream<'static, Result<RecordBatch>> {
+    ) -> Pin<Box<dyn RecordBatchStream>> {
         let futures_stream = match params {
             ReadBatchParams::Indices(_) => todo!(),
             ReadBatchParams::Range(range) => {
@@ -403,12 +445,55 @@ impl FileReader {
             }
             ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size).await,
         };
-        futures_stream
+        let batch_stream = futures_stream
             .buffered(16)
             // JoinHandle returns Result<Result<...>> where the outer Result means the thread
             // task panic'd so we propagate that panic here.
             .map(|res_res| res_res.unwrap())
-            .boxed()
+            .boxed();
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(self.file_schema.clone()),
+            batch_stream,
+        ))
+    }
+}
+
+/// Inspects a page and returns a String describing the page's encoding
+pub fn describe_encoding(page: &pbfile::column_metadata::Page) -> String {
+    if let Some(encoding) = &page.encoding {
+        if let Some(style) = &encoding.style {
+            match style {
+                pbfile::encoding::Style::Deferred(deferred) => {
+                    format!(
+                        "DeferredEncoding(pos={},size={})",
+                        deferred.buffer_location, deferred.buffer_length
+                    )
+                }
+                pbfile::encoding::Style::Direct(direct) => {
+                    if let Some(encoding) = &direct.encoding {
+                        if encoding.type_url == "/lance.encodings.ArrayEncoding" {
+                            let encoding = encoding.to_msg::<pbenc::ArrayEncoding>();
+                            match encoding {
+                                Ok(encoding) => {
+                                    format!("{:#?}", encoding)
+                                }
+                                Err(err) => {
+                                    format!("Unsupported(decode_err={})", err)
+                                }
+                            }
+                        } else {
+                            format!("Unrecognized(type_url={})", encoding.type_url)
+                        }
+                    } else {
+                        "MISSING DIRECT VALUE".to_string()
+                    }
+                }
+            }
+        } else {
+            "MISSING STYLE".to_string()
+        }
+    } else {
+        "MISSING".to_string()
     }
 }
 
@@ -459,11 +544,6 @@ mod tests {
             file_writer.write_batch(batch).await.unwrap();
         }
         file_writer.finish().await.unwrap();
-
-        let file_scheduler = scheduler.open_file(&tmp_path).await.unwrap();
-        FileReader::print_all_metadata(&file_scheduler)
-            .await
-            .unwrap();
 
         for read_size in [32, 1024, 1024 * 1024] {
             let file_scheduler = scheduler.open_file(&tmp_path).await.unwrap();

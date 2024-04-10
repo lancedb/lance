@@ -17,7 +17,7 @@ use std::str;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::{ToPyArrow, *};
+use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
