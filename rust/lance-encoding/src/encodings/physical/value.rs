@@ -130,11 +130,11 @@ impl ValueEncoder {
     pub fn try_new(data_type: &DataType) -> Result<Self> {
         if data_type.is_primitive() {
             Ok(Self {
-                buffer_encoder: Box::new(FlatBufferEncoder::default()),
+                buffer_encoder: Box::<FlatBufferEncoder>::default(),
             })
         } else if *data_type == DataType::Boolean {
             Ok(Self {
-                buffer_encoder: Box::new(BitmapBufferEncoder::default()),
+                buffer_encoder: Box::<BitmapBufferEncoder>::default(),
             })
         } else {
             Err(Error::invalid_input(

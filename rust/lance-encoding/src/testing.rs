@@ -93,10 +93,10 @@ pub async fn check_round_trip_encoding(field: Field) {
 fn supports_nulls(data_type: &DataType) -> bool {
     // We don't yet have nullability support for all types.  Don't test nullability for the
     // types we don't support.
-    match data_type {
-        DataType::List(_) | DataType::Struct(_) | DataType::Utf8 => false,
-        _ => true,
-    }
+    !matches!(
+        data_type,
+        DataType::List(_) | DataType::Struct(_) | DataType::Utf8
+    )
 }
 
 async fn check_round_trip_field_encoding(mut encoder: Box<dyn FieldEncoder>, field: Field) {

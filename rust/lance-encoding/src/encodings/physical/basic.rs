@@ -24,21 +24,21 @@ struct DataDecoders {
     values: Box<dyn PhysicalPageDecoder>,
 }
 
-enum DataValidity {
+enum DataNullStatus {
     // Neither validity nor values
-    AllNull,
+    All,
     // Values only
-    NoNull(Box<dyn PhysicalPageDecoder>),
+    None(Box<dyn PhysicalPageDecoder>),
     // Validity and values
-    SomeNull(DataDecoders),
+    Some(DataDecoders),
 }
 
-impl DataValidity {
-    fn values_decoder(&self) -> Option<&Box<dyn PhysicalPageDecoder>> {
+impl DataNullStatus {
+    fn values_decoder(&self) -> Option<&dyn PhysicalPageDecoder> {
         match self {
-            DataValidity::AllNull => None,
-            DataValidity::SomeNull(decoders) => Some(&decoders.values),
-            DataValidity::NoNull(values) => Some(values),
+            Self::All => None,
+            Self::Some(decoders) => Some(decoders.values.as_ref()),
+            Self::None(values) => Some(values.as_ref()),
         }
     }
 }
@@ -50,21 +50,21 @@ struct DataSchedulers {
 }
 
 #[derive(Debug)]
-enum SchedulerValidity {
+enum SchedulerNullStatus {
     // Values only
-    NoNull(Box<dyn PhysicalPageScheduler>),
+    None(Box<dyn PhysicalPageScheduler>),
     // Validity and values
-    SomeNull(DataSchedulers),
+    Some(DataSchedulers),
     // Neither validity nor values
-    AllNull,
+    All,
 }
 
-impl SchedulerValidity {
-    fn values_scheduler(&self) -> Option<&Box<dyn PhysicalPageScheduler>> {
+impl SchedulerNullStatus {
+    fn values_scheduler(&self) -> Option<&dyn PhysicalPageScheduler> {
         match self {
-            SchedulerValidity::AllNull => None,
-            SchedulerValidity::NoNull(values) => Some(values),
-            SchedulerValidity::SomeNull(schedulers) => Some(&schedulers.values),
+            Self::All => None,
+            Self::None(values) => Some(values.as_ref()),
+            Self::Some(schedulers) => Some(schedulers.values.as_ref()),
         }
     }
 }
@@ -82,7 +82,7 @@ impl SchedulerValidity {
 // sentinel encoding instead.
 #[derive(Debug)]
 pub struct BasicPageScheduler {
-    mode: SchedulerValidity,
+    mode: SchedulerNullStatus,
 }
 
 impl BasicPageScheduler {
@@ -92,7 +92,7 @@ impl BasicPageScheduler {
         values_decoder: Box<dyn PhysicalPageScheduler>,
     ) -> Self {
         Self {
-            mode: SchedulerValidity::SomeNull(DataSchedulers {
+            mode: SchedulerNullStatus::Some(DataSchedulers {
                 validity: validity_decoder,
                 values: values_decoder,
             }),
@@ -102,7 +102,7 @@ impl BasicPageScheduler {
     /// Create a new instance that does not need a validity bitmap because no item is null
     pub fn new_non_nullable(values_decoder: Box<dyn PhysicalPageScheduler>) -> Self {
         Self {
-            mode: SchedulerValidity::NoNull(values_decoder),
+            mode: SchedulerNullStatus::None(values_decoder),
         }
     }
 
@@ -113,7 +113,7 @@ impl BasicPageScheduler {
     /// decoder to calculate the capcity of the garbage buffer.
     pub fn new_all_null() -> Self {
         Self {
-            mode: SchedulerValidity::AllNull,
+            mode: SchedulerNullStatus::All,
         }
     }
 }
@@ -125,8 +125,8 @@ impl PhysicalPageScheduler for BasicPageScheduler {
         scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let validity_future = match &self.mode {
-            SchedulerValidity::NoNull(_) | SchedulerValidity::AllNull => None,
-            SchedulerValidity::SomeNull(schedulers) => {
+            SchedulerNullStatus::None(_) | SchedulerNullStatus::All => None,
+            SchedulerNullStatus::Some(schedulers) => {
                 trace!("Scheduling ranges {:?} from validity", ranges);
                 Some(schedulers.validity.schedule_ranges(ranges, scheduler))
             }
@@ -142,10 +142,10 @@ impl PhysicalPageScheduler for BasicPageScheduler {
 
         async move {
             let mode = match (values_future, validity_future) {
-                (None, None) => DataValidity::AllNull,
-                (Some(values_future), None) => DataValidity::NoNull(values_future.await?),
+                (None, None) => DataNullStatus::All,
+                (Some(values_future), None) => DataNullStatus::None(values_future.await?),
                 (Some(values_future), Some(validity_future)) => {
-                    DataValidity::SomeNull(DataDecoders {
+                    DataNullStatus::Some(DataDecoders {
                         values: values_future.await?,
                         validity: validity_future.await?,
                     })
@@ -159,7 +159,7 @@ impl PhysicalPageScheduler for BasicPageScheduler {
 }
 
 struct BasicPageDecoder {
-    mode: DataValidity,
+    mode: DataNullStatus,
 }
 
 impl PhysicalPageDecoder for BasicPageDecoder {
@@ -173,7 +173,7 @@ impl PhysicalPageDecoder for BasicPageDecoder {
         // No need to look at the validity decoder to know the dest buffer size since it is boolean
         buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
         // The validity buffer is only required if we have some nulls
-        buffers[0].1 = matches!(self.mode, DataValidity::SomeNull(_));
+        buffers[0].1 = matches!(self.mode, DataNullStatus::Some(_));
         if let Some(values) = self.mode.values_decoder() {
             values.update_capacity(rows_to_skip, num_rows, &mut buffers[1..], all_null);
         } else {
@@ -183,7 +183,7 @@ impl PhysicalPageDecoder for BasicPageDecoder {
 
     fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [bytes::BytesMut]) {
         match &self.mode {
-            DataValidity::SomeNull(decoders) => {
+            DataNullStatus::Some(decoders) => {
                 decoders
                     .validity
                     .decode_into(rows_to_skip, num_rows, &mut dest_buffers[..1]);
@@ -193,10 +193,10 @@ impl PhysicalPageDecoder for BasicPageDecoder {
             }
             // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
             // other pages needed the buffer, in which case we need to fill our section
-            DataValidity::AllNull => {
+            DataNullStatus::All => {
                 dest_buffers[0].fill(0);
             }
-            DataValidity::NoNull(values) => {
+            DataNullStatus::None(values) => {
                 dest_buffers[0].fill(1);
                 values.decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..]);
             }
