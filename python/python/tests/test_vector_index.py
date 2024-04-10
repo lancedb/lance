@@ -703,3 +703,35 @@ def test_dynamic_projection_with_vectors_index(tmp_path: Path):
     casted = np.stack(res["vec_f16"].to_numpy())
 
     assert (original.astype(np.float16) == casted).all()
+
+
+def test_index_cast_centroids(tmp_path):
+    tbl = create_table(nvec=1000)
+
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator=torch.device("cpu"),
+    )
+
+    # Get the centroids
+    index_name = dataset.list_indices()[0]["name"]
+    index_stats = dataset.stats.index_stats(index_name)
+    centroids = index_stats["indices"][0]["centroids"]
+    values = pa.array([x for arr in centroids for x in arr], pa.float32())
+    centroids = pa.FixedSizeListArray.from_arrays(values, 128)
+
+    dataset.alter_columns(dict(path="vector", data_type=pa.list_(pa.float16(), 128)))
+
+    # centroids are f32, but the column is now f16
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator=torch.device("cpu"),
+        ivf_centroids=centroids,
+    )
