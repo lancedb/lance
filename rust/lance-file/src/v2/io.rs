@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use futures::{future::BoxFuture, FutureExt};
 use lance_encoding::EncodingsIo;
 use lance_io::scheduler::FileScheduler;

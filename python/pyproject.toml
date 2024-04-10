@@ -67,7 +67,7 @@ benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
 
 [tool.ruff]
-lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "CPY001", "B019"]
+lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 
 [tool.ruff.lint.per-file-ignores]
 "*.pyi" = ["E301", "E302"]

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use arrow_array::ArrayRef;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};

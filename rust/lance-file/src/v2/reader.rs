@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::{io::Cursor, ops::Range, pin::Pin, sync::Arc};
 
 use arrow_array::RecordBatch;
