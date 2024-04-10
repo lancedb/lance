@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::ffi::FFI_ArrowSchema;
+use arrow::array::{RecordBatch, StructArray};
+use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
@@ -25,6 +26,7 @@ use snafu::{location, Location};
 use lance::dataset::{fragment::FileFragment, scanner::Scanner};
 use lance_io::ffi::to_ffi_arrow_array_stream;
 
+use crate::traits::SingleRecordBatchReader;
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     error::{Error, Result},
@@ -76,7 +78,84 @@ impl FragmentScanner {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Fragment_createNative(
+pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray(
+    mut env: JNIEnv,
+    _obj: JObject,
+    dataset_uri: JString,
+    arrow_array_addr: jlong,
+    arrow_schema_addr: jlong,
+    fragment_id: JObject,        // Optional<Integer>
+    max_rows_per_file: JObject,  // Optional<Integer>
+    max_rows_per_group: JObject, // Optional<Integer>
+    max_bytes_per_file: JObject, // Optional<Long>
+    mode: JObject,               // Optional<String>
+) -> jint {
+    let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
+    let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
+
+    let c_array = unsafe { FFI_ArrowArray::from_raw(c_array_ptr) };
+    let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
+    let data_type = ok_or_throw_with_return!(
+        env,
+        DataType::try_from(&c_schema).map_err(|e| {
+            Error::Arrow {
+                message: e.to_string(),
+                location: location!(),
+            }
+        }),
+        -1
+    );
+
+    let array_data = ok_or_throw_with_return!(
+        env,
+        unsafe {
+            from_ffi_and_data_type(c_array, data_type).map_err(|e| Error::Arrow {
+                message: e.to_string(),
+                location: location!(),
+            })
+        },
+        -1
+    );
+
+    let record_batch = RecordBatch::from(StructArray::from(array_data));
+    let batch_schema = record_batch.schema().clone();
+    let reader = SingleRecordBatchReader::new(Some(record_batch), batch_schema);
+
+    let path_str: String = ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), -1);
+    let fragment_id_opts = ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), -1);
+
+    let write_params = ok_or_throw_with_return!(
+        env,
+        extract_write_params(
+            &mut env,
+            &max_rows_per_file,
+            &max_rows_per_group,
+            &max_bytes_per_file,
+            &mode
+        ),
+        -1
+    );
+
+    match RT.block_on(FileFragment::create(
+        &path_str,
+        fragment_id_opts.unwrap_or(0) as usize,
+        reader,
+        Some(write_params),
+    )) {
+        Ok(fragment) => fragment.id as jint,
+        Err(e) => {
+            Error::IO {
+                message: e.to_string(),
+                location: location!(),
+            }
+            .throw(&mut env);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream(
     mut env: JNIEnv,
     _obj: JObject,
     dataset_uri: JString,

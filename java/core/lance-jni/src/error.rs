@@ -47,6 +47,10 @@ pub enum Error {
     Arrow { message: String, location: Location },
     #[snafu(display("Index error: {}, location", message))]
     Index { message: String, location: Location },
+    #[snafu(display("Dataset not found error: {}", path))]
+    DatasetNotFound { path: String },
+    #[snafu(display("Dataset already exists error: {}", uri))]
+    DatasetAlreadyExists { uri: String },
     #[snafu(display("Unknown error"))]
     Other { message: String },
 }
@@ -59,9 +63,11 @@ impl Error {
                 self.throw_as(env, JavaException::IllegalArgumentException)
             }
             Self::IO { .. } | Self::Index { .. } => self.throw_as(env, JavaException::IOException),
-            Self::Arrow { .. } | Self::Other { .. } | Self::Jni { .. } => {
-                self.throw_as(env, JavaException::RuntimeException)
-            }
+            Self::Arrow { .. }
+            | Self::DatasetNotFound { .. }
+            | Self::DatasetAlreadyExists { .. }
+            | Self::Other { .. }
+            | Self::Jni { .. } => self.throw_as(env, JavaException::RuntimeException),
         }
     }
 
@@ -93,6 +99,14 @@ impl From<Utf8Error> for Error {
 impl From<lance::Error> for Error {
     fn from(source: lance::Error) -> Self {
         match source {
+            lance::Error::DatasetNotFound {
+                path,
+                source: _,
+                location: _,
+            } => Self::DatasetNotFound { path },
+            lance::Error::DatasetAlreadyExists { uri, location: _ } => {
+                Self::DatasetAlreadyExists { uri }
+            }
             lance::Error::IO { message, location } => Self::IO { message, location },
             lance::Error::Arrow { message, location } => Self::Arrow { message, location },
             lance::Error::Index { message, location } => Self::Index { message, location },

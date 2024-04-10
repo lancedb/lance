@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
+use arrow::array::{RecordBatch, RecordBatchReader};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
 use jni::objects::{JMap, JObject, JString, JValue};
 use jni::JNIEnv;
 
@@ -118,5 +122,34 @@ impl JMapExt for JMap<'_, '_, '_> {
 
     fn get_f64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f64>> {
         get_map_value(env, self, key)
+    }
+}
+
+pub struct SingleRecordBatchReader {
+    record_batch: Option<RecordBatch>,
+    schema: Arc<Schema>,
+}
+
+impl SingleRecordBatchReader {
+    // Public constructor method
+    pub fn new(record_batch: Option<RecordBatch>, schema: Arc<Schema>) -> Self {
+        Self {
+            record_batch,
+            schema,
+        }
+    }
+}
+
+impl Iterator for SingleRecordBatchReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.record_batch.take().map(Ok)
+    }
+}
+
+impl RecordBatchReader for SingleRecordBatchReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
