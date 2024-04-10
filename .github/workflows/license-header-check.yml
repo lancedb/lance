@@ -1,4 +1,4 @@
-name: Build and run Rust tests
+name: Check license headers
 on:
   push:
     branches:
