@@ -18,11 +18,28 @@ from lance.file import LanceFileReader, LanceFileWriter
 
 def test_file_writer(tmp_path):
     path = tmp_path / "foo.lance"
-    print(path)
     schema = pa.schema([pa.field("a", pa.int64())])
     with LanceFileWriter(str(path), schema) as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))
     assert len(path.read_bytes()) > 0
+
+
+def test_aborted_write(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    del writer
+    assert not path.exists()
+
+
+def test_multiple_close(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    writer.close()
+    writer.close()
 
 
 def test_round_trip(tmp_path):

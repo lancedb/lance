@@ -401,27 +401,6 @@ impl ObjectStore {
         ))
     }
 
-    fn new_from_path(str_path: &str) -> Result<(Self, Path)> {
-        let expanded = tilde(str_path).to_string();
-        let expanded_path = StdPath::new(&expanded);
-
-        if !expanded_path.try_exists()? {
-            std::fs::create_dir_all(expanded_path)?;
-        }
-
-        let expanded_path = expanded_path.canonicalize()?;
-
-        Ok((
-            Self {
-                inner: Arc::new(LocalFileSystem::new()).traced(),
-                scheme: String::from("file"),
-                base_path: Path::from_absolute_path(&expanded_path)?,
-                block_size: 4 * 1024, // 4KB block size
-            },
-            Path::from_filesystem_path(&expanded_path)?,
-        ))
-    }
-
     async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
         configure_store(url.as_str(), params).await
     }
@@ -769,7 +748,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 block_size: 64 * 1024,
             })
         }
-        "file" => Ok(ObjectStore::new_from_path(url.path())?.0),
+        "file" => Ok(ObjectStore::from_path(url.path())?.0),
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),

@@ -24,8 +24,11 @@ use lance_file::v2::{
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::scheduler::StoreScheduler;
-use object_store::path::Path;
-use pyo3::{exceptions::PyRuntimeError, pyclass, pymethods, IntoPy, PyObject, PyResult, Python};
+use object_store::path::{Path, PathPart};
+use pyo3::{
+    exceptions::{PyIOError, PyRuntimeError, PyValueError},
+    pyclass, pymethods, IntoPy, PyObject, PyResult, Python,
+};
 use serde::Serialize;
 use url::Url;
 
@@ -166,14 +169,7 @@ pub struct LanceFileWriter {
 
 impl LanceFileWriter {
     async fn open(uri_or_path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let (object_store, path) = if Url::parse(&uri_or_path).is_ok() {
-            ObjectStore::from_uri(&uri_or_path).await.infer_error()?
-        } else {
-            (
-                ObjectStore::local(),
-                Path::parse(uri_or_path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-            )
-        };
+        let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
         let object_writer = object_store.create(&path).await.infer_error()?;
         let inner = FileWriter::try_new(
             object_writer,
@@ -205,6 +201,40 @@ impl LanceFileWriter {
     }
 }
 
+fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
+    let mut parts = path.parts().collect::<Vec<_>>();
+    if parts.len() == 0 {
+        return Err(PyValueError::new_err(format!(
+            "Path {} is not a valid path to a file",
+            path,
+        )));
+    }
+    let filename = parts.pop().unwrap().as_ref().to_owned();
+    Ok((Path::from_iter(parts), filename))
+}
+
+// The ObjectStore::from_uri_or_path expects a path to a directory (and it creates it if it does
+// not exist).  We are given a path to a file and so we need to strip the last component
+// before creating the object store.  We then return the object store and the new relative path
+// to the file.
+async fn object_store_from_uri_or_path(uri_or_path: String) -> PyResult<(ObjectStore, Path)> {
+    if let Ok(mut url) = Url::parse(&uri_or_path) {
+        let path = object_store::path::Path::parse(url.path())
+            .map_err(|e| PyIOError::new_err(format!("Invalid URL path `{}`: {}", url.path(), e)))?;
+        let (parent_path, filename) = path_to_parent(&path)?;
+        url.set_path(&parent_path.to_string());
+
+        let (object_store, dir_path) = ObjectStore::from_uri(url.as_str()).await.infer_error()?;
+        let child_path = dir_path.child(filename);
+        Ok((object_store, child_path))
+    } else {
+        let path = Path::parse(&uri_or_path)
+            .map_err(|e| PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path, e)))?;
+        let object_store = ObjectStore::local();
+        Ok((object_store, path))
+    }
+}
+
 #[pyclass]
 pub struct LanceFileReader {
     inner: Box<FileReader>,
@@ -212,14 +242,7 @@ pub struct LanceFileReader {
 
 impl LanceFileReader {
     async fn open(uri_or_path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let (object_store, path) = if Url::parse(&uri_or_path).is_ok() {
-            ObjectStore::from_uri(&uri_or_path).await.infer_error()?
-        } else {
-            (
-                ObjectStore::local(),
-                Path::parse(uri_or_path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-            )
-        };
+        let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
         let scheduler = StoreScheduler::new(Arc::new(object_store), 8);
         let file = scheduler.open_file(&path).await.infer_error()?;
         let inner = FileReader::try_open(file, schema.0.clone())
