@@ -40,7 +40,10 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::vector::quantizer::{QuantizationMetadata, Quantizer};
+use lance_index::vector::{
+    graph::VectorStorage,
+    quantizer::{Quantization, QuantizationMetadata, Quantizer},
+};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
@@ -61,7 +64,6 @@ use lance_index::{
 use lance_io::{
     encodings::plain::PlainEncoder,
     local::to_local_path,
-    object_store::ObjectStore,
     object_writer::ObjectWriter,
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
@@ -71,7 +73,6 @@ use lance_linalg::{
     distance::{Cosine, DistanceType, Dot, MetricType, L2},
     MatrixView,
 };
-use lance_table::io::manifest::ManifestDescribing;
 use log::{debug, info};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -82,9 +83,10 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
-use self::{builder::build_hnsw_partitions, io::write_hnsw_index_partitions};
+use self::io::write_hnsw_quantization_index_partitions;
 
 use super::{
+    hnsw::HNSWIndex,
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
     VectorIndex,
@@ -293,7 +295,11 @@ pub(crate) async fn optimize_vector_indices(
             dataset.version().version,
         )
         .await?
-    } else if let Some(hnsw_index) = first_idx.sub_index.as_any().downcast_ref::<HNSWIndex>() {
+    } else if let Some(hnsw_sq) = first_idx
+        .sub_index
+        .as_any()
+        .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
+    {
         let aux_file = dataset
             .indices_dir()
             .child(new_uuid.to_string())
@@ -302,7 +308,7 @@ pub(crate) async fn optimize_vector_indices(
         optimize_ivf_hnsw_indices(
             dataset,
             first_idx,
-            hnsw_index,
+            hnsw_sq,
             vector_column,
             unindexed,
             existing_indices,
@@ -403,38 +409,25 @@ async fn optimize_ivf_pq_indices(
     Ok(existing_indices.len() - start_pos)
 }
 
-async fn optimize_ivf_hnsw_indices(
+async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     dataset: &Dataset,
     first_idx: &IVFIndex,
-    hnsw_index: &HNSWIndex,
+    hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-    mut writer: ObjectWriter,
-    mut aux_writer: ObjectWriter,
+    writer: ObjectWriter,
+    aux_writer: ObjectWriter,
 ) -> Result<usize> {
-    let metric_type = first_idx.metric_type;
-    let dim = first_idx.ivf.dimension();
-
-    let pq_storage = hnsw_index.storage();
-    let pq_metadata = pq_storage.metadata();
-    let pq = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
-        pq_metadata.num_sub_vectors,
-        pq_metadata.num_bits,
-        pq_metadata.dimension,
-        pq_storage.codebooks().clone(),
-        metric_type,
-    ));
-    let pq_index = PQIndex::new(pq.clone(), metric_type);
-
-    // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
-    let ivf = lance_index::vector::ivf::new_ivf_with_pq(
+    let distance_type = first_idx.metric_type;
+    let quantizer = hnsw_index.quantizer().clone();
+    let ivf = lance_index::vector::ivf::new_ivf_with_quantizer(
         first_idx.ivf.centroids.values(),
         first_idx.ivf.dimension(),
-        metric_type,
+        distance_type,
         vector_column,
-        pq_index.pq.clone(),
+        quantizer.clone(),
         None,
     )?;
 
@@ -447,7 +440,7 @@ async fn optimize_ivf_hnsw_indices(
                 ivf,
                 None,
                 first_idx.ivf.num_partitions() as u32,
-                pq_index.pq.num_sub_vectors(),
+                quantizer.code_dim(),
                 10000,
                 2,
                 None,
@@ -476,82 +469,90 @@ async fn optimize_ivf_hnsw_indices(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Prepare the HNSW writer
     let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut writer =
-        FileWriter::<ManifestDescribing>::with_object_writer(writer, schema, &Default::default())?;
+    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: "IVF_HNSW_PQ".to_string(),
-            distance_type: metric_type.to_string(),
+            index_type: format!("IVF_HNSW_{}", quantizer.quantization_type()),
+            distance_type: distance_type.to_string(),
         })
         .to_string()
         .as_str(),
     );
 
+    // Prepare the quantization storage writer
     let schema = Schema::new(vec![
         ROW_ID_FIELD.clone(),
         arrow_schema::Field::new(
-            PQ_CODE_COLUMN,
+            quantizer.column(),
             DataType::FixedSizeList(
                 Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
-                pq.num_sub_vectors() as i32,
+                quantizer.code_dim() as i32,
             ),
             false,
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer = FileWriter::<ManifestDescribing>::with_object_writer(
-        aux_writer,
-        schema,
-        &Default::default(),
-    )?;
+    let mut aux_writer =
+        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: "PQ".to_string(),
-            distance_type: metric_type.to_string(),
-        })
-        .to_string()
-        .as_str(),
-    );
-    let mat = MatrixView::<Float32Type>::new(
-        Arc::new(
-            pq.codebook_as_fsl()
-                .values()
-                .as_primitive::<Float32Type>()
-                .clone(),
-        ),
-        pq.dimension(),
-    );
-    let codebook_tensor = pb::Tensor::from(&mat);
-    let codebook_pos = aux_writer.tell().await?;
-    aux_writer
-        .object_writer
-        .write_protobuf(&codebook_tensor)
-        .await?;
-    aux_writer.add_metadata(
-        PQ_METADTA_KEY,
-        json!(ProductQuantizationMetadata {
-            codebook_position: codebook_pos,
-            num_bits: pq.num_bits(),
-            num_sub_vectors: pq.num_sub_vectors(),
-            dimension: pq.dimension(),
+            index_type: quantizer.quantization_type().to_string(),
+            distance_type: distance_type.to_string(),
         })
         .to_string()
         .as_str(),
     );
 
-    let (hnsw_metadata, aux_ivf) = write_hnsw_index_partitions(
+    // Write the metadata of quantizer
+    let quantization_metadata = match &quantizer {
+        Quantizer::Product(pq) => {
+            let mat = MatrixView::<Float32Type>::new(
+                Arc::new(
+                    pq.codebook_as_fsl()
+                        .values()
+                        .as_primitive::<Float32Type>()
+                        .clone(),
+                ),
+                pq.dimension(),
+            );
+            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_pos = aux_writer.tell().await?;
+            aux_writer
+                .object_writer
+                .write_protobuf(&codebook_tensor)
+                .await?;
+
+            Some(QuantizationMetadata {
+                codebook_position: Some(codebook_pos),
+                ..Default::default()
+            })
+        }
+        Quantizer::Scalar(_) => None,
+    };
+
+    aux_writer.add_metadata(
+        quantizer.metadata_key(),
+        quantizer
+            .metadata(quantization_metadata)?
+            .to_string()
+            .as_str(),
+    );
+
+    let hnsw_params = &hnsw_index.metadata().params;
+    let (hnsw_metadata, aux_ivf) = write_hnsw_quantization_index_partitions(
         dataset,
         vector_column,
-        metric_type,
-        &hnsw_index.metadata().params,
+        distance_type,
+        hnsw_params,
         &mut writer,
         Some(&mut aux_writer),
         &mut ivf_mut,
-        pq,
+        quantizer,
         shuffled,
         Some(&indices_to_merge),
     )
@@ -735,6 +736,10 @@ impl VectorIndex for IVFIndex {
             message: "Flat index does not support load".to_string(),
             location: location!(),
         })
+    }
+
+    fn storage(&self) -> &dyn VectorStorage {
+        todo!("this method is for only IVF_HNSW_* index");
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

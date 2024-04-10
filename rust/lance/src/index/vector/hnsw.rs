@@ -28,10 +28,10 @@ use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_index::{
     vector::{
-        graph::NEIGHBORS_FIELD,
+        graph::{VectorStorage, NEIGHBORS_FIELD},
         hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
-        quantizer::{IvfQuantizationStorage, Quantization},
+        quantizer::{IvfQuantizationStorage, Quantization, Quantizer},
         Query, DIST_COL,
     },
     Index, IndexType,
@@ -97,8 +97,8 @@ impl<Q: Quantization> HNSWIndex<Q> {
         })
     }
 
-    pub fn storage(&self) -> &IvfProductQuantizationStorage {
-        &self.partition_storage
+    pub fn quantizer(&self) -> &Quantizer {
+        self.partition_storage.quantizer()
     }
 
     pub fn metadata(&self) -> HnswMetadata {
@@ -277,6 +277,10 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),
         }))
+    }
+
+    fn storage(&self) -> &dyn VectorStorage {
+        self.hnsw.storage()
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

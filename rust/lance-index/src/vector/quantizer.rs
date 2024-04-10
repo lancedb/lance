@@ -14,13 +14,14 @@
 
 use std::sync::Arc;
 
-use arrow_array::FixedSizeListArray;
+use arrow::datatypes::Float32Type;
+use arrow_array::{FixedSizeListArray, Float32Array};
 use async_trait::async_trait;
 use lance_arrow::ArrowFloatType;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
-use lance_linalg::distance::{Dot, MetricType, L2};
+use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_table::format::SelfDescribingFileReader;
 use snafu::{location, Location};
 
@@ -52,6 +53,7 @@ pub trait Quantization {
     fn metadata_key(&self) -> &'static str;
     fn quantization_type(&self) -> QuantizationType;
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value>;
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer>;
 }
 
 pub enum QuantizationType {
@@ -111,6 +113,18 @@ impl Quantizer {
     }
 }
 
+impl From<Arc<dyn ProductQuantizer>> for Quantizer {
+    fn from(pq: Arc<dyn ProductQuantizer>) -> Self {
+        Self::Product(pq)
+    }
+}
+
+impl From<ScalarQuantizer> for Quantizer {
+    fn from(sq: ScalarQuantizer) -> Self {
+        Self::Scalar(sq)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct QuantizationMetadata {
     // For PQ
@@ -157,9 +171,18 @@ impl Quantization for ScalarQuantizer {
 
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
         Ok(serde_json::to_value(ScalarQuantizationMetadata {
+            dim: self.dim,
             num_bits: self.num_bits(),
             bounds: self.bounds(),
         })?)
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, _: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::Scalar(ScalarQuantizer::with_bounds(
+            metadata.num_bits,
+            metadata.dim,
+            metadata.bounds.clone(),
+        )))
     }
 }
 
@@ -198,6 +221,28 @@ impl Quantization for dyn ProductQuantizer {
             codebook: args.codebook,
         })?)
     }
+
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::Product(Arc::new(ProductQuantizerImpl::<
+            Float32Type,
+        >::new(
+            metadata.num_sub_vectors,
+            metadata.num_bits,
+            metadata.dimension,
+            Arc::new(
+                metadata
+                    .codebook
+                    .as_ref()
+                    .unwrap()
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .clone(),
+            ),
+            distance_type,
+        ))))
+    }
 }
 
 impl<T: ArrowFloatType + Dot + L2 + 'static> Quantization for ProductQuantizerImpl<T> {
@@ -235,6 +280,28 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> Quantization for ProductQuantizerIm
             codebook: args.codebook,
         })?)
     }
+
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::Product(Arc::new(
+            ProductQuantizerImpl::<T>::new(
+                metadata.num_sub_vectors,
+                metadata.num_bits,
+                metadata.dimension,
+                Arc::new(
+                    metadata
+                        .codebook
+                        .as_ref()
+                        .unwrap()
+                        .values()
+                        .as_any()
+                        .downcast_ref::<T::ArrayType>()
+                        .unwrap()
+                        .clone(),
+                ),
+                distance_type,
+            ),
+        )))
+    }
 }
 
 /// Loader to load partitioned PQ storage from disk.
@@ -242,6 +309,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     reader: FileReader,
 
     metric_type: MetricType,
+    quantizer: Quantizer,
     metadata: Q::Metadata,
 
     ivf: IvfData,
@@ -252,6 +320,7 @@ impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {
         Self {
             reader: self.reader.clone(),
             metric_type: self.metric_type,
+            quantizer: self.quantizer.clone(),
             metadata: self.metadata.clone(),
             ivf: self.ivf.clone(),
         }
@@ -287,12 +356,22 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let ivf_data = IvfData::load(&reader).await?;
 
         let metadata = Q::Metadata::load(&reader).await?;
+        let quantizer = Q::from_metadata(&metadata, metric_type)?;
         Ok(Self {
             reader,
             metric_type,
+            quantizer,
             metadata,
             ivf: ivf_data,
         })
+    }
+
+    pub fn quantizer(&self) -> &Quantizer {
+        &self.quantizer
+    }
+
+    pub fn metadata(&self) -> &Q::Metadata {
+        &self.metadata
     }
 
     /// Get the number of partitions in the storage.

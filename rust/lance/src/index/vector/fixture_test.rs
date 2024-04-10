@@ -29,7 +29,10 @@ mod test {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::{vector::Query, Index, IndexType};
+    use lance_index::{
+        vector::{graph::VectorStorage, Query},
+        Index, IndexType,
+    };
     use lance_io::{local::LocalObjectReader, traits::Reader};
     use lance_linalg::distance::MetricType;
     use roaring::RoaringBitmap;
@@ -112,6 +115,10 @@ mod test {
             _length: usize,
         ) -> Result<Box<dyn VectorIndex>> {
             Ok(Box::new(self.clone()))
+        }
+
+        fn storage(&self) -> &dyn VectorStorage {
+            todo!("this method is for only IVF_HNSW_* index");
         }
 
         fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

@@ -25,6 +25,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
+use lance_index::vector::graph::VectorStorage;
 use lance_index::{
     vector::{pq::ProductQuantizer, Query, DIST_COL},
     Index, IndexType,
@@ -241,6 +242,10 @@ impl VectorIndex for PQIndex {
             pq: self.pq.clone(),
             metric_type: self.metric_type,
         }))
+    }
+
+    fn storage(&self) -> &dyn VectorStorage {
+        todo!("this method is for only IVF_HNSW_* index");
     }
 
     fn check_can_remap(&self) -> Result<()> {
