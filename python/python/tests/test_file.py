@@ -21,7 +21,9 @@ def test_file_writer(tmp_path):
     schema = pa.schema([pa.field("a", pa.int64())])
     with LanceFileWriter(str(path), schema) as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))
-    assert len(path.read_bytes()) > 0
+    reader = LanceFileReader(str(path), schema)
+    metadata = reader.metadata()
+    assert metadata.num_rows == 3
 
 
 def test_aborted_write(tmp_path):
