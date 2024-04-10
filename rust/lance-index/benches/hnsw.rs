@@ -55,7 +55,7 @@ fn bench_hnsw(c: &mut Criterion) {
                     .search(query, K, 300, None)
                     .unwrap()
                     .iter()
-                    .map(|(i, _)| *i)
+                    .map(|node| node.id)
                     .collect();
 
                 assert_eq!(uids.len(), K);

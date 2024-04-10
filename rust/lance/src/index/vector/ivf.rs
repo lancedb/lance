@@ -40,6 +40,7 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
+use lance_index::vector::quantizer::{QuantizationMetadata, Quantizer};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
@@ -51,11 +52,9 @@ use lance_index::{
             storage::{IvfData, IVF_PARTITION_KEY},
             IvfBuildParams,
         },
-        pq::{
-            storage::{ProductQuantizationMetadata, PQ_METADTA_KEY},
-            PQBuildParams, ProductQuantizer, ProductQuantizerImpl,
-        },
-        Query, DIST_COL, PQ_CODE_COLUMN,
+        pq::{PQBuildParams, ProductQuantizer},
+        sq::{builder::SQBuildParams, ScalarQuantizer},
+        Query, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -90,7 +89,7 @@ use super::{
     utils::maybe_sample_training_data,
     VectorIndex,
 };
-use crate::{dataset::builder::DatasetBuilder, index::vector::hnsw::HNSWIndex};
+use crate::{dataset::builder::DatasetBuilder, index::vector::sq::build_sq_model};
 use crate::{
     dataset::Dataset,
     index::{
@@ -980,7 +979,7 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     Ok(field)
 }
 
-fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
+fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
     if ivf.precomputed_partitons_file.is_some() && ivf.centroids.is_none() {
         return Err(Error::Index {
             message: "precomputed_partitions_file requires centroids to be set".to_string(),
@@ -988,15 +987,9 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
         });
     }
 
-    if ivf.precomputed_shuffle_buffers.is_some()
-        && (
-            // If either centroids or codebook is not set, precomputed_shuffle can't be used.
-            ivf.centroids.is_none() || pq.codebook.is_none()
-        )
-    {
+    if ivf.precomputed_shuffle_buffers.is_some() && ivf.centroids.is_none() {
         return Err(Error::Index {
-            message: "precomputed_shuffle_buffers requires centroids AND codebook to be set"
-                .to_string(),
+            message: "precomputed_shuffle_buffers requires centroids to be set".to_string(),
             location: location!(),
         });
     }
@@ -1006,6 +999,18 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
             message:
                 "precomputed_shuffle_buffers and precomputed_partitons_file are mutually exclusive"
                     .to_string(),
+            location: location!(),
+        });
+    }
+
+    Ok(())
+}
+
+fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
+    sanity_check_ivf_params(ivf)?;
+    if ivf.precomputed_shuffle_buffers.is_some() && pq.codebook.is_none() {
+        return Err(Error::Index {
+            message: "precomputed_shuffle_buffers requires codebooks to be set".to_string(),
             location: location!(),
         });
     }
@@ -1125,6 +1130,40 @@ async fn build_ivf_model_and_pq(
     Ok((ivf_model, pq))
 }
 
+async fn build_ivf_model_and_sq(
+    dataset: &Dataset,
+    column: &str,
+    metric_type: MetricType,
+    ivf_params: &IvfBuildParams,
+    sq_params: &SQBuildParams,
+) -> Result<(Ivf, ScalarQuantizer)> {
+    sanity_check_ivf_params(ivf_params)?;
+
+    info!(
+        "Building vector index: IVF{},SQ{}, metric={}",
+        ivf_params.num_partitions, sq_params.num_bits, metric_type,
+    );
+
+    let field = sanity_check(dataset, column)?;
+    let dim = if let DataType::FixedSizeList(_, d) = field.data_type() {
+        d as usize
+    } else {
+        return Err(Error::Index {
+            message: format!(
+                "VectorIndex requires the column data type to be fixed size list of floats, got {}",
+                field.data_type()
+            ),
+            location: location!(),
+        });
+    };
+
+    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
+
+    let sq = build_sq_model(dataset, column, metric_type, sq_params).await?;
+
+    Ok((ivf_model, sq))
+}
+
 async fn scan_index_field_stream(
     dataset: &Dataset,
     column: &str,
@@ -1145,7 +1184,7 @@ async fn load_precomputed_partitions_if_available(
             let ds = DatasetBuilder::from_uri(file).load().await?;
             let stream = ds.scan().try_into_stream().await?;
             Ok(Some(
-                load_precomputed_partitions(stream, ds.count_rows().await?).await?,
+                load_precomputed_partitions(stream, ds.count_rows(None).await?).await?,
             ))
         }
         None => Ok(None),
@@ -1185,7 +1224,7 @@ pub async fn build_ivf_pq_index(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn build_ivf_hnsw_index(
+pub async fn build_ivf_hnsw_pq_index(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
@@ -1207,7 +1246,42 @@ pub async fn build_ivf_hnsw_index(
         uuid,
         &[],
         ivf_model,
-        pq,
+        Quantizer::Product(pq),
+        metric_type,
+        hnsw_params,
+        stream,
+        precomputed_partitions,
+        ivf_params.shuffle_partition_batches,
+        ivf_params.shuffle_partition_concurrency,
+        ivf_params.precomputed_shuffle_buffers.clone(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn build_ivf_hnsw_sq_index(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    uuid: &str,
+    metric_type: MetricType,
+    ivf_params: &IvfBuildParams,
+    hnsw_params: &HnswBuildParams,
+    sq_params: &SQBuildParams,
+) -> Result<()> {
+    let (ivf_model, sq) =
+        build_ivf_model_and_sq(dataset, column, metric_type, ivf_params, sq_params).await?;
+    let stream = scan_index_field_stream(dataset, column).await?;
+    let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
+
+    write_ivf_hnsw_file(
+        dataset,
+        column,
+        index_name,
+        uuid,
+        &[],
+        ivf_model,
+        Quantizer::Scalar(sq),
         metric_type,
         hnsw_params,
         stream,
@@ -1416,7 +1490,7 @@ async fn write_ivf_hnsw_file(
     uuid: &str,
     _transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
-    pq: Arc<dyn ProductQuantizer>,
+    quantizer: Quantizer,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     stream: impl RecordBatchStream + Unpin + 'static,
@@ -1435,7 +1509,7 @@ async fn write_ivf_hnsw_file(
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: "IVF_HNSW_PQ".to_string(),
+            index_type: format!("IVF_HNSW_{}", quantizer.quantization_type()),
             distance_type: distance_type.to_string(),
         })
         .to_string()
@@ -1450,10 +1524,10 @@ async fn write_ivf_hnsw_file(
     let schema = Schema::new(vec![
         ROW_ID_FIELD.clone(),
         arrow_schema::Field::new(
-            PQ_CODE_COLUMN,
+            quantizer.column(),
             DataType::FixedSizeList(
                 Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
-                pq.num_sub_vectors() as i32,
+                quantizer.code_dim() as i32,
             ),
             false,
         ),
@@ -1464,37 +1538,46 @@ async fn write_ivf_hnsw_file(
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
-            index_type: "PQ".to_string(),
+            index_type: quantizer.quantization_type().to_string(),
             distance_type: distance_type.to_string(),
         })
         .to_string()
         .as_str(),
     );
-    let mat = MatrixView::<Float32Type>::new(
-        Arc::new(
-            pq.codebook_as_fsl()
-                .values()
-                .as_primitive::<Float32Type>()
-                .clone(),
-        ),
-        pq.dimension(),
-    );
-    let codebook_tensor = pb::Tensor::from(&mat);
-    let codebook_pos = aux_writer.tell().await?;
-    aux_writer
-        .object_writer
-        .write_protobuf(&codebook_tensor)
-        .await?;
+
+    // For PQ, we need to store the codebook
+    let quantization_metadata = match &quantizer {
+        Quantizer::Product(pq) => {
+            let mat = MatrixView::<Float32Type>::new(
+                Arc::new(
+                    pq.codebook_as_fsl()
+                        .values()
+                        .as_primitive::<Float32Type>()
+                        .clone(),
+                ),
+                pq.dimension(),
+            );
+            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_pos = aux_writer.tell().await?;
+            aux_writer
+                .object_writer
+                .write_protobuf(&codebook_tensor)
+                .await?;
+
+            Some(QuantizationMetadata {
+                codebook_position: Some(codebook_pos),
+                ..Default::default()
+            })
+        }
+        Quantizer::Scalar(_) => None,
+    };
+
     aux_writer.add_metadata(
-        PQ_METADTA_KEY,
-        json!(ProductQuantizationMetadata {
-            codebook_position: codebook_pos,
-            num_bits: pq.num_bits(),
-            num_sub_vectors: pq.num_sub_vectors(),
-            dimension: pq.dimension(),
-        })
-        .to_string()
-        .as_str(),
+        quantizer.metadata_key(),
+        quantizer
+            .metadata(quantization_metadata)?
+            .to_string()
+            .as_str(),
     );
 
     let start = std::time::Instant::now();
@@ -1507,7 +1590,7 @@ async fn write_ivf_hnsw_file(
         stream,
         column,
         &mut ivf,
-        pq.clone(),
+        quantizer,
         distance_type,
         hnsw_params,
         0..num_partitions,
@@ -1601,8 +1684,8 @@ mod tests {
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
-    use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{RecordBatchIterator, RecordBatchReader, UInt64Array};
+    use arrow_schema::Field;
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
@@ -1614,9 +1697,7 @@ mod tests {
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
 
-    use crate::index::{
-        vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt, IndexType,
-    };
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
     const DIM: usize = 32;
 
@@ -1800,6 +1881,7 @@ mod tests {
                     key: Arc::new(row),
                     k: 5,
                     nprobes: 1,
+                    ef: None,
                     refine_factor: None,
                     metric_type: MetricType::L2,
                     use_index: true,
@@ -2368,7 +2450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_ivf_hnsw() {
+    async fn test_create_ivf_hnsw_pq() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2446,6 +2528,92 @@ mod tests {
         let recall = results.intersection(&gt).count() as f32 / k as f32;
         assert!(
             recall >= 0.8,
+            "recall: {}\n results: {:?}\n\ngt: {:?}",
+            recall,
+            results.iter().sorted().collect_vec(),
+            gt.iter().sorted().collect_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let nlist = 4;
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let centroids = generate_random_array(nlist * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let ivf_params =
+            IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
+
+        let sq_params = SQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::L2,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let indexes = dataset
+            .object_store()
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap();
+        assert_eq!(indexes.len(), 1);
+
+        let uuid = &indexes[0];
+        let index_path = dataset
+            .indices_dir()
+            .child(uuid.as_str())
+            .child(INDEX_FILE_NAME);
+        let aux_path = dataset
+            .indices_dir()
+            .child(uuid.as_str())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        assert!(dataset.object_store().exists(&index_path).await.unwrap());
+        assert!(dataset.object_store().exists(&aux_path).await.unwrap());
+
+        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
+        let query = vector_array.value(0);
+        let query = query.as_primitive::<Float32Type>();
+        let k = 100;
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .nearest("vector", query, k)
+            .unwrap()
+            .nprobs(nlist)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(1, results.len());
+        assert_eq!(k, results[0].num_rows());
+
+        let results = results[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap() as u32)
+            .collect::<HashSet<_>>();
+
+        let gt = ground_truth(&mat, query.values(), k);
+        let recall = results.intersection(&gt).count() as f32 / k as f32;
+        assert!(
+            recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results.iter().sorted().collect_vec(),

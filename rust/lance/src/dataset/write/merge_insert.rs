@@ -835,13 +835,9 @@ impl Merger {
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{
-        types::UInt32Type, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
-    };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{types::UInt32Type, RecordBatchIterator, StringArray, UInt32Array};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
-    use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::IndexType;
     use tempfile::tempdir;
@@ -1195,7 +1191,7 @@ mod tests {
             .unwrap();
 
         // Check that the data is as expected
-        assert_eq!(ds.count_rows().await.unwrap(), 2048);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 2048);
 
         let source = Box::new(RecordBatchIterator::new(
             source_batches.clone().into_iter().map(Ok),
@@ -1213,6 +1209,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(ds.count_rows().await.unwrap(), 2048);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 2048);
     }
 }

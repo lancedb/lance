@@ -31,7 +31,7 @@ use lance_index::{
         graph::NEIGHBORS_FIELD,
         hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
-        pq::storage::IvfProductQuantizationStorage,
+        quantizer::{IvfQuantizationStorage, Quantization},
         Query, DIST_COL,
     },
     Index, IndexType,
@@ -55,23 +55,23 @@ pub(crate) struct HNSWIndexOptions {
 }
 
 #[derive(Clone)]
-pub(crate) struct HNSWIndex {
+pub(crate) struct HNSWIndex<Q: Quantization> {
     hnsw: HNSW,
 
     // TODO: move these into IVFIndex after the refactor is complete
-    partition_storage: IvfProductQuantizationStorage,
+    partition_storage: IvfQuantizationStorage<Q>,
     partition_metadata: Option<Vec<HnswMetadata>>,
 
     options: HNSWIndexOptions,
 }
 
-impl Debug for HNSWIndex {
+impl<Q: Quantization> Debug for HNSWIndex<Q> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.hnsw.fmt(f)
     }
 }
 
-impl HNSWIndex {
+impl<Q: Quantization> HNSWIndex<Q> {
     pub async fn try_new(
         hnsw: HNSW,
         reader: Arc<dyn Reader>,
@@ -88,10 +88,10 @@ impl HNSWIndex {
             None => None,
         };
 
-        let ivf_pq_store = IvfProductQuantizationStorage::open(aux_reader).await?;
+        let ivf_store = IvfQuantizationStorage::open(aux_reader).await?;
         Ok(Self {
             hnsw,
-            partition_storage: ivf_pq_store,
+            partition_storage: ivf_store,
             partition_metadata,
             options,
         })
@@ -117,7 +117,7 @@ impl HNSWIndex {
 }
 
 #[async_trait]
-impl Index for HNSWIndex {
+impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any {
         self
@@ -151,7 +151,7 @@ impl Index for HNSWIndex {
 }
 
 #[async_trait]
-impl VectorIndex for HNSWIndex {
+impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let row_ids = self.hnsw.storage().row_ids();
@@ -171,16 +171,27 @@ impl VectorIndex for HNSWIndex {
             )
         };
 
-        let ef = query.k + query.k / 2;
+        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+        let k = query.k * refine_factor;
+        let ef = query.ef.unwrap_or(k + k / 2);
+        if ef < k {
+            return Err(Error::Index {
+                message: "ef must be greater than or equal to k".to_string(),
+                location: location!(),
+            });
+        }
+
         let results = self.hnsw.search(
             query.key.as_primitive::<Float32Type>().as_slice(),
-            query.k,
+            k,
             ef,
             bitmap,
         )?;
 
-        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.0 as usize]));
-        let distances = Arc::new(Float32Array::from_iter_values(results.iter().map(|x| x.1)));
+        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.id as usize]));
+        let distances = Arc::new(Float32Array::from_iter_values(
+            results.iter().map(|x| x.dist.0),
+        ));
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(DIST_COL, DataType::Float32, true),

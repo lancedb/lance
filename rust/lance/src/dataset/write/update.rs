@@ -361,7 +361,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{Int64Array, RecordBatchIterator, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
     use tempfile::{tempdir, TempDir};

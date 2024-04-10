@@ -348,7 +348,7 @@ impl Field {
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
-            f.children = self.children.clone()
+            f.children.clone_from(&self.children)
         } else {
             let first = path_components[0];
             for c in self.children.as_slice() {
@@ -763,7 +763,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
-    use arrow_schema::{DataType, Fields, TimeUnit};
+    use arrow_schema::{Fields, TimeUnit};
 
     #[test]
     fn arrow_field_to_field() {

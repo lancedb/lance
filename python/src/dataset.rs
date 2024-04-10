@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::str;
 use std::sync::Arc;
 
@@ -39,6 +40,7 @@ use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     DatasetIndexExt, IndexParams, IndexType,
@@ -272,6 +274,7 @@ impl Dataset {
         index_cache_size: Option<usize>,
         metadata_cache_size: Option<usize>,
         commit_handler: Option<PyObject>,
+        storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams {
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
@@ -287,23 +290,29 @@ impl Dataset {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
         }
-        let dataset = if let Some(ver) = version {
-            RT.runtime
-                .block_on(LanceDataset::checkout_with_params(&uri, ver, &params))
-        } else {
-            RT.runtime.block_on(
-                DatasetBuilder::from_uri(&uri)
-                    .with_read_params(params)
-                    .load(),
-            )
-        };
+
+        let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
+        if let Some(ver) = version {
+            builder = builder.with_version(ver);
+        }
+        if let Some(storage_options) = storage_options {
+            builder = builder.with_storage_options(storage_options);
+        }
+
+        let dataset = RT.runtime.block_on(builder.load());
+
         match dataset {
             Ok(ds) => Ok(Self {
                 uri,
                 ds: Arc::new(ds),
             }),
+            // TODO: return an appropriate error type, such as IOError or NotFound.
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
+    }
+
+    pub fn __copy__(&self) -> Self {
+        self.clone()
     }
 
     #[getter(schema)]
@@ -558,9 +567,9 @@ impl Dataset {
         Ok(Scanner::new(scan))
     }
 
-    fn count_rows(&self) -> PyResult<usize> {
+    fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
         RT.runtime
-            .block_on(self.ds.count_rows())
+            .block_on(self.ds.count_rows(filter))
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -811,7 +820,10 @@ impl Dataset {
     fn checkout_version(&self, version: u64) -> PyResult<Self> {
         let ds = RT
             .block_on(None, self.ds.checkout_version(version))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err| match err {
+                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
         Ok(Self {
             ds: Arc::new(ds),
             uri: self.uri.clone(),
@@ -877,7 +889,7 @@ impl Dataset {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
             "BTREE" => IndexType::Scalar,
-            "IVF_PQ" | "IVF_HNSW_PQ" => IndexType::Vector,
+            "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -1054,24 +1066,26 @@ impl Dataset {
 }
 
 #[pyfunction(name = "_write_dataset")]
-pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<bool> {
+pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
-    if reader.is_instance_of::<Scanner>() {
+    let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let batches = RT
             .block_on(Some(py), scanner.to_reader())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
-    }
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+    };
+    Ok(Dataset {
+        uri,
+        ds: Arc::new(ds),
+    })
 }
 
 fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
@@ -1118,6 +1132,16 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
             }
         }
 
+        if let Some(storage_options) = options.get_item("storage_options")? {
+            let storage_options = storage_options.extract::<Option<HashMap<String, String>>>()?;
+            if let Some(storage_options) = storage_options {
+                p.store_params = Some(ObjectStoreParams {
+                    storage_options: Some(storage_options),
+                    ..Default::default()
+                });
+            }
+        }
+
         p.commit_handler = get_commit_handler(options);
 
         Some(p)
@@ -1131,14 +1155,23 @@ fn prepare_vector_index_params(
 ) -> PyResult<Box<dyn IndexParams>> {
     let mut m_type = MetricType::L2;
     let mut ivf_params = IvfBuildParams::default();
-    let mut pq_params = PQBuildParams::default();
     let mut hnsw_params = HnswBuildParams::default();
+    let mut pq_params = PQBuildParams::default();
+    let mut sq_params = SQBuildParams::default();
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
         if let Some(mt) = kwargs.get_item("metric_type")? {
             m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        // Parse sample rate
+        if let Some(sample_rate) = kwargs.get_item("sample_rate")? {
+            let sample_rate = PyAny::downcast::<PyInt>(sample_rate)?.extract()?;
+            ivf_params.sample_rate = sample_rate;
+            pq_params.sample_rate = sample_rate;
+            sq_params.sample_rate = sample_rate;
         }
 
         // Parse IVF params
@@ -1186,6 +1219,23 @@ fn prepare_vector_index_params(
                 }
             }
 
+        // Parse HNSW params
+        if let Some(max_level) = kwargs.get_item("max_level")? {
+            hnsw_params.max_level = PyAny::downcast::<PyInt>(max_level)?.extract()?;
+        }
+
+        if let Some(m) = kwargs.get_item("m")? {
+            hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
+        }
+
+        if let Some(m_max) = kwargs.get_item("m_max")? {
+            hnsw_params.m_max = PyAny::downcast::<PyInt>(m_max)?.extract()?;
+        }
+
+        if let Some(ef_c) = kwargs.get_item("ef_construction")? {
+            hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
+        }
+
         // Parse PQ params
         if let Some(n) = kwargs.get_item("num_bits")? {
             pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
@@ -1219,23 +1269,6 @@ fn prepare_vector_index_params(
         if let Some(o) = kwargs.get_item("max_opq_iterations")? {
             pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
         };
-
-        // Parse HNSW params
-        if let Some(max_level) = kwargs.get_item("max_level")? {
-            hnsw_params.max_level = PyAny::downcast::<PyInt>(max_level)?.extract()?;
-        }
-
-        if let Some(m) = kwargs.get_item("m")? {
-            hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
-        }
-
-        if let Some(m_max) = kwargs.get_item("m_max")? {
-            hnsw_params.m_max = PyAny::downcast::<PyInt>(m_max)?.extract()?;
-        }
-
-        if let Some(ef_c) = kwargs.get_item("ef_construction")? {
-            hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
-        }
     }
 
     match index_type {
@@ -1248,6 +1281,13 @@ fn prepare_vector_index_params(
             ivf_params,
             hnsw_params,
             pq_params,
+        ))),
+
+        "IVF_HNSW_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_sq_params(
+            m_type,
+            ivf_params,
+            hnsw_params,
+            sq_params,
         ))),
 
         _ => Err(PyValueError::new_err(format!(

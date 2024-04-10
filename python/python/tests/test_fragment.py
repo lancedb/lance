@@ -81,6 +81,20 @@ def test_scan_fragment(tmp_path: Path):
     assert actual == expected
 
 
+def test_scan_fragment_with_dynamic_projection(tmp_path: Path):
+    tab = pa.table({"a": range(100), "b": range(100, 200)})
+    ds = write_dataset(tab, tmp_path)
+    frag = ds.get_fragments()[0]
+
+    actual = frag.to_table(
+        columns={"b_proj": "b"},
+        filter="a >= 2",
+        offset=20,
+    )
+    expected = pa.table({"b_proj": range(122, 200)})
+    assert actual == expected
+
+
 def test_write_fragments(tmp_path: Path):
     # This will be split across two files if we set the max_bytes_per_file to 1024
     tab = pa.table({

@@ -86,7 +86,7 @@ impl ProxyObjectStorePolicy {
     }
 
     pub fn clear_before_policy(&mut self, name: &str) {
-        self.before_policies.remove(&name.to_string());
+        self.before_policies.remove(name);
     }
 
     pub fn set_obj_meta_policy(&mut self, name: &str, policy: ObjectMetaPolicyFn) {

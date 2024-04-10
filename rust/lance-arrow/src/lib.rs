@@ -24,7 +24,7 @@ use arrow_array::{
     UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
 use arrow_select::take::take;
 use rand::prelude::*;
 
@@ -131,6 +131,11 @@ impl DataTypeExt for DataType {
             Self::Duration(_) => 8,
             Self::Decimal128(_, _) => 16,
             Self::Decimal256(_, _) => 32,
+            Self::Interval(unit) => match unit {
+                IntervalUnit::YearMonth => 4,
+                IntervalUnit::DayTime => 8,
+                IntervalUnit::MonthDayNano => 16,
+            },
             Self::FixedSizeBinary(s) => *s as usize,
             Self::FixedSizeList(dt, s) => *s as usize * dt.data_type().byte_width(),
             _ => panic!("Does not support get byte width on type {self}"),
@@ -585,8 +590,7 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Int32Array, StringArray, StructArray};
-    use arrow_schema::{DataType, Field};
+    use arrow_array::{Int32Array, StringArray};
 
     #[test]
     fn test_merge_recursive() {

@@ -50,6 +50,10 @@ impl InMemoryVectorStorage {
 }
 
 impl VectorStorage for InMemoryVectorStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn len(&self) -> usize {
         self.vectors.num_rows()
     }

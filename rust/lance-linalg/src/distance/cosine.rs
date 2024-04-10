@@ -365,7 +365,6 @@ mod tests {
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
     };
     use approx::assert_relative_eq;
-    use arrow_array::Float32Array;
     use proptest::prelude::*;
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {

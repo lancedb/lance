@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
+
 use lance_linalg::distance::MetricType;
 
 pub trait DistCalculator {
@@ -26,6 +28,8 @@ pub trait DistCalculator {
 ///
 /// TODO: should we rename this to "VectorDistance"?;
 pub trait VectorStorage: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
     fn len(&self) -> usize;
 
     /// Returns true if this graph is empty.

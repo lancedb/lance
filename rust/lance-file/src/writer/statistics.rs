@@ -945,15 +945,14 @@ impl StatisticsBuilder {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        builder::StringDictionaryBuilder, make_array, new_empty_array, new_null_array,
-        types::ArrowPrimitiveType, BinaryArray, BooleanArray, Date32Array, Date64Array, Datum,
-        Decimal128Array, DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
-        DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-        LargeStringArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-        UInt32Array, UInt64Array, UInt8Array,
+        builder::StringDictionaryBuilder, make_array, new_empty_array, new_null_array, BinaryArray,
+        BooleanArray, Date32Array, Date64Array, Datum, Decimal128Array, DictionaryArray,
+        DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
+        DurationSecondArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array,
+        Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_select::interleave::interleave;
     use num_traits::One;

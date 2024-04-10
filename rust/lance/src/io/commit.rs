@@ -33,6 +33,7 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest, WriterVersion};
@@ -196,6 +197,83 @@ async fn migrate_manifest(
 
     manifest.fragments =
         Arc::new(migrate_fragments(dataset, &manifest.fragments, recompute_stats).await?);
+
+    Ok(())
+}
+
+/// Fix schema in case of duplicate field ids.
+///
+/// See test dataset v0.10.5/corrupt_schema
+fn fix_schema(manifest: &mut Manifest) -> Result<()> {
+    // We can short-circuit if there is only one file per fragment or no fragments.
+    if manifest
+        .fragments
+        .first()
+        .map(|f| f.files.len() <= 1)
+        .unwrap_or(true)
+    {
+        return Ok(());
+    }
+
+    let mut field_id_seed = manifest.max_field_id() + 1;
+    let mut seen_fields = HashSet::new();
+    let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
+    let field_ids = if let Some(fragment) = manifest.fragments.first() {
+        fragment.files.iter().flat_map(|file| file.fields.iter())
+    } else {
+        return Ok(());
+    };
+    for field_id in field_ids {
+        if !seen_fields.insert(field_id) {
+            old_field_id_mapping.insert(*field_id, field_id_seed);
+            field_id_seed += 1;
+        }
+    }
+
+    if old_field_id_mapping.is_empty() {
+        return Ok(());
+    }
+
+    let mut fragments = manifest.fragments.as_ref().clone();
+
+    // Apply mapping to fragment files list
+    for fragment in fragments.iter_mut().rev() {
+        let mut seen_fields = HashSet::new();
+        for field_id in fragment
+            .files
+            .iter_mut()
+            .rev()
+            .flat_map(|file| file.fields.iter_mut())
+        {
+            if let Some(new_field_id) = old_field_id_mapping.get(field_id) {
+                if seen_fields.insert(*field_id) {
+                    *field_id = *new_field_id;
+                }
+            }
+        }
+    }
+
+    // Apply mapping to the schema
+    for (old_field_id, new_field_id) in &old_field_id_mapping {
+        let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
+        field.id = *new_field_id;
+    }
+
+    // Drop data files that are no longer in use.
+    let remaining_field_ids = manifest
+        .schema
+        .fields_pre_order()
+        .map(|f| f.id)
+        .collect::<HashSet<_>>();
+    for fragment in fragments.iter_mut() {
+        fragment.files.retain(|file| {
+            file.fields
+                .iter()
+                .any(|field_id| remaining_field_ids.contains(field_id))
+        });
+    }
+
+    manifest.fragments = Arc::new(fragments);
 
     Ok(())
 }
@@ -368,6 +446,8 @@ pub(crate) async fn commit_transaction(
 
         migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
 
+        fix_schema(&mut manifest)?;
+
         migrate_indices(&dataset, &mut indices).await?;
 
         // Try to commit the manifest
@@ -422,14 +502,13 @@ pub(crate) async fn commit_transaction(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::{
         CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
@@ -438,9 +517,8 @@ mod tests {
 
     use super::*;
 
-    use crate::dataset::{transaction::Operation, WriteMode, WriteParams};
+    use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
-    use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler

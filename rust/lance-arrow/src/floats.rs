@@ -95,6 +95,8 @@ pub trait ArrowFloatType: Debug {
         + Display;
 
     const FLOAT_TYPE: FloatType;
+    const MIN: Self::Native;
+    const MAX: Self::Native;
 
     /// Arrow Float Array Type.
     type ArrayType: FloatArray<Self>;
@@ -140,6 +142,8 @@ impl ArrowFloatType for BFloat16Type {
     type Native = bf16;
 
     const FLOAT_TYPE: FloatType = FloatType::BFloat16;
+    const MIN: Self::Native = bf16::MIN;
+    const MAX: Self::Native = bf16::MAX;
 
     type ArrayType = BFloat16Array;
 }
@@ -148,6 +152,8 @@ impl ArrowFloatType for Float16Type {
     type Native = f16;
 
     const FLOAT_TYPE: FloatType = FloatType::Float16;
+    const MIN: Self::Native = f16::MIN;
+    const MAX: Self::Native = f16::MAX;
 
     type ArrayType = Float16Array;
 }
@@ -156,6 +162,8 @@ impl ArrowFloatType for Float32Type {
     type Native = f32;
 
     const FLOAT_TYPE: FloatType = FloatType::Float32;
+    const MIN: Self::Native = f32::MIN;
+    const MAX: Self::Native = f32::MAX;
 
     type ArrayType = Float32Array;
 }
@@ -164,6 +172,8 @@ impl ArrowFloatType for Float64Type {
     type Native = f64;
 
     const FLOAT_TYPE: FloatType = FloatType::Float64;
+    const MIN: Self::Native = f64::MIN;
+    const MAX: Self::Native = f64::MAX;
 
     type ArrayType = Float64Array;
 }

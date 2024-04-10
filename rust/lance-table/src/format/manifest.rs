@@ -184,6 +184,23 @@ impl Manifest {
         }
     }
 
+    /// Get the max used field id
+    ///
+    /// This is different than [Schema::max_field_id] because it also considers
+    /// the field ids in the data files that have been dropped from the schema.
+    pub fn max_field_id(&self) -> i32 {
+        let schema_max_id = self.schema.max_field_id().unwrap_or(-1);
+        let fragment_max_id = self.fragments.first().and_then(|f| {
+            f.files
+                .iter()
+                .flat_map(|file| file.fields.as_slice())
+                .max()
+                .cloned()
+        });
+        let fragment_max_id = fragment_max_id.unwrap_or(-1);
+        schema_max_id.max(fragment_max_id)
+    }
+
     /// Return the fragments that are newer than the given manifest.
     /// Note this does not support recycling of fragment ids.
     pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {
@@ -467,9 +484,7 @@ impl SelfDescribingFileReader for FileReader {
 mod tests {
     use super::*;
 
-    use super::Fragment;
     use arrow_schema::{Field, Schema as ArrowSchema};
-    use lance_core::datatypes::Schema;
 
     #[test]
     fn test_writer_version() {

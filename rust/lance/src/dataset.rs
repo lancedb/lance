@@ -849,7 +849,8 @@ impl Dataset {
         let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
-        let new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        new_schema.set_field_id(Some(self.manifest.max_field_id()));
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
@@ -914,14 +915,24 @@ impl Dataset {
     ///
     /// It offers a fast path of counting rows by just computing via metadata.
     #[instrument(skip_all)]
-    pub async fn count_rows(&self) -> Result<usize> {
-        // Open file to read metadata.
-        let counts = stream::iter(self.get_fragments())
-            .map(|f| async move { f.count_rows().await })
-            .buffer_unordered(16)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(counts.iter().sum())
+    pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        // TODO: consolidate the count_rows into Scanner plan.
+        if let Some(filter) = filter {
+            let mut scanner = self.scan();
+            scanner.filter(&filter)?;
+            Ok(scanner
+                .project::<String>(&[])?
+                .with_row_id() // TODO: fix scan plan to not require row_id for count_rows.
+                .count_rows()
+                .await? as usize)
+        } else {
+            let cnts = stream::iter(self.get_fragments())
+                .map(|f| async move { f.count_rows().await })
+                .buffer_unordered(16)
+                .try_collect::<Vec<_>>()
+                .await?;
+            Ok(cnts.iter().sum())
+        }
     }
 
     #[instrument(skip_all, fields(num_rows=row_indices.len()))]
@@ -1233,7 +1244,7 @@ impl Dataset {
     /// Sample `n` rows from the dataset.
     pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
-        let num_rows = self.count_rows().await?;
+        let num_rows = self.count_rows(None).await?;
         let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
         self.take(&ids, projection).await
     }
@@ -1638,7 +1649,8 @@ impl Dataset {
             }
         }
 
-        let schema = self.schema().merge(output_schema.as_ref())?;
+        let mut schema = self.schema().merge(output_schema.as_ref())?;
+        schema.set_field_id(Some(self.manifest.max_field_id()));
 
         let fragments = self
             .add_columns_impl(read_columns, mapper, result_checkpoint, None)
@@ -1737,7 +1749,7 @@ impl Dataset {
         // Mapping of old to new fields that need to be casted.
         let mut cast_fields: Vec<(Field, Field)> = Vec::new();
 
-        let mut next_field_id = new_schema.max_field_id().unwrap_or_default() + 1;
+        let mut next_field_id = self.manifest.max_field_id() + 1;
 
         for alteration in alterations {
             let field_src = self.schema().field(&alteration.path).ok_or_else(|| {
@@ -1765,7 +1777,7 @@ impl Dataset {
 
             let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
             if let Some(rename) = &alteration.rename {
-                field_dest.name = rename.clone();
+                field_dest.name.clone_from(rename);
             }
             if let Some(nullable) = alteration.nullable {
                 field_dest.nullable = nullable;
@@ -2022,32 +2034,25 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::sync::Mutex;
     use std::vec;
-    use std::{ops::Range, sync::Mutex};
 
     use super::*;
     use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::WriteMode::Overwrite;
-    use crate::datatypes::Schema;
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
 
     use arrow_array::types::Int64Type;
     use arrow_array::{
-        builder::StringDictionaryBuilder,
-        cast::{as_string_array, as_struct_array},
-        types::Int32Type,
-        ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
-        Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
-        UInt32Array,
+        builder::StringDictionaryBuilder, cast::as_string_array, types::Int32Type, ArrayRef,
+        DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
+        RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
     use arrow_array::{FixedSizeListArray, Float16Array, Float64Array, ListArray};
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
-    use arrow_select::take::take;
-    use futures::stream::TryStreamExt;
+    use arrow_schema::{Field, Fields as ArrowFields, Schema as ArrowSchema};
     use half::f16;
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, RowCount};
@@ -2177,7 +2182,7 @@ mod tests {
         let result = Dataset::write(reader, test_uri, None).await.unwrap();
 
         // check dataset empty
-        assert_eq!(result.count_rows().await.unwrap(), 0);
+        assert_eq!(result.count_rows(None).await.unwrap(), 0);
         // Since the dataset is empty, will return None.
         assert_eq!(result.manifest.max_fragment_id(), None);
 
@@ -2217,7 +2222,7 @@ mod tests {
         let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
         // check num rows is 10
-        assert_eq!(actual_ds.count_rows().await.unwrap(), 10);
+        assert_eq!(actual_ds.count_rows(None).await.unwrap(), 10);
         // Max fragment id is still 0 since we only have 1 fragment.
         assert_eq!(actual_ds.manifest.max_fragment_id(), Some(0));
         // check expected batch is correct
@@ -2254,7 +2259,7 @@ mod tests {
         let result = Dataset::write(reader, test_uri, None).await.unwrap();
 
         // check dataset empty
-        assert_eq!(result.count_rows().await.unwrap(), 0);
+        assert_eq!(result.count_rows(None).await.unwrap(), 0);
         // Since the dataset is empty, will return None.
         assert_eq!(result.manifest.max_fragment_id(), None);
     }
@@ -2287,7 +2292,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(dataset.count_rows().await.unwrap(), num_rows);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), num_rows);
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 10);
@@ -2791,7 +2796,7 @@ mod tests {
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 400);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
         let projection = Schema::try_from(schema.as_ref()).unwrap();
         let values = dataset
             .take(
@@ -2860,7 +2865,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(dataset.count_rows().await.unwrap(), 400);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
         let projection = Schema::try_from(schema.as_ref()).unwrap();
         let indices = &[
             5_u64 << 32,        // 200
@@ -2939,9 +2944,16 @@ mod tests {
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(10, dataset.fragments().len());
-        assert_eq!(400, dataset.count_rows().await.unwrap());
         dataset.validate().await.unwrap();
+        assert_eq!(10, dataset.fragments().len());
+        assert_eq!(400, dataset.count_rows(None).await.unwrap());
+        assert_eq!(
+            200,
+            dataset
+                .count_rows(Some("i < 200".to_string()))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3195,6 +3207,101 @@ mod tests {
 
         assert_eq!(dataset.version().version, 3);
         assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drop_add_columns() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        // Test we can add 1 column, drop it, then add another column. Validate
+        // the field ids are as expected.
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("x".into(), "i + 1".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        dataset.drop_columns(&["x"]).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("y".into(), "2 * i".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_data = RecordBatch::try_new(
+            Arc::new(schema.try_with_column(Field::new("y", DataType::Int32, false))?),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![2, 4])),
+            ],
+        )?;
+        assert_eq!(data, expected_data);
+        dataset.drop_columns(&["y"]).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        // Test we can add 2 columns, drop 1, then add another column. Validate
+        // the field ids are as expected.
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![
+                    ("a".into(), "i + 3".into()),
+                    ("b".into(), "i + 7".into()),
+                ]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 2);
+
+        dataset.drop_columns(&["b"]).await?;
+        // Even though we dropped a column, we still have the fragment with a and
+        // b. So it should still act as if that field id is still in play.
+        assert_eq!(dataset.manifest.max_field_id(), 2);
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("c".into(), "i + 11".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let expected_data = RecordBatch::try_new(
+            expected_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(Int32Array::from(vec![12, 13])),
+            ],
+        )?;
+        assert_eq!(data, expected_data);
 
         Ok(())
     }
@@ -3871,7 +3978,7 @@ mod tests {
 
         // Assert num rows, deletions, and physical rows are all correct.
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 90);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 90);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
         let total_physical_rows = futures::stream::iter(dataset.get_fragments())
             .then(|f| async move { f.physical_rows().await })
@@ -3897,7 +4004,7 @@ mod tests {
             .unwrap();
 
         // Assert num rows, deletions, and physical rows are all correct.
-        assert_eq!(dataset.count_rows().await.unwrap(), 95);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 95);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
         let total_physical_rows = futures::stream::iter(dataset.get_fragments())
             .then(|f| async move { f.physical_rows().await })
@@ -3940,7 +4047,7 @@ mod tests {
         // Assert num rows, deletions, and physical rows are all correct, even
         // though stats are bad.
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 92);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 92);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
         let total_physical_rows = futures::stream::iter(dataset.get_fragments())
             .then(|f| async move { f.physical_rows().await })
@@ -3983,7 +4090,7 @@ mod tests {
             })
             .collect();
         assert_eq!(num_deletions, vec![Some(10), None, None]);
-        assert_eq!(dataset.count_rows().await.unwrap(), 97);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 97);
 
         // Scan data and assert it is as expected.
         let expected = RecordBatch::try_new(
@@ -4086,6 +4193,45 @@ mod tests {
 
         let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
         assert_eq!(row_count, 1900);
+    }
+
+    #[tokio::test]
+    async fn test_fix_v0_10_5_corrupt_schema() {
+        // Schemas could be corrupted by successive calls to `add_columns` and
+        // `drop_columns`. We should be able to detect this by checking for
+        // duplicate field ids. We should be able to fix this in new commits
+        // by dropping unused data files and re-writing the schema.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.10.5/corrupt_schema").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        let validate_res = dataset.validate().await;
+        assert!(validate_res.is_err());
+
+        // Force a migration.
+        dataset.delete("false").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            data["b"]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[0, 4, 8, 12]
+        );
+        assert_eq!(
+            data["c"]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[0, 5, 10, 15]
+        );
     }
 
     #[tokio::test]

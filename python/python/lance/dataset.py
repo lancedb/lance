@@ -167,11 +167,18 @@ class LanceDataset(pa.dataset.Dataset):
         index_cache_size: Optional[int] = None,
         metadata_cache_size: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
+        storage_options: Optional[Dict[str, str]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._ds = _Dataset(
-            uri, version, block_size, index_cache_size, metadata_cache_size, commit_lock
+            uri,
+            version,
+            block_size,
+            index_cache_size,
+            metadata_cache_size,
+            commit_lock,
+            storage_options,
         )
 
     def __reduce__(self):
@@ -183,6 +190,12 @@ class LanceDataset(pa.dataset.Dataset):
     def __setstate__(self, state):
         self._uri, version = state
         self._ds = _Dataset(self._uri, version)
+
+    def __copy__(self):
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._uri = self._uri
+        ds._ds = copy.copy(self._ds)
+        return ds
 
     def __len__(self):
         return self.count_rows()
@@ -604,10 +617,11 @@ class LanceDataset(pa.dataset.Dataset):
             The total number of rows in the dataset.
 
         """
-        if filter is None:
-            return self._ds.count_rows()
-        else:
+        if isinstance(filter, pa.compute.Expression):
+            # TODO: consolidate all to use scanner
             return self.scanner(filter=filter).count_rows()
+
+        return self._ds.count_rows(filter)
 
     def join(
         self,
@@ -628,8 +642,10 @@ class LanceDataset(pa.dataset.Dataset):
     def alter_columns(self, *alterations: Iterable[Dict[str, Any]]):
         """Alter column name, data type, and nullability.
 
-        Columns that are renamed can keep any indices that are on them. However, if
-        the column is cast to a different type, its indices will be dropped.
+        Columns that are renamed can keep any indices that are on them. If a
+        column has an IVF_PQ index, it can be kept if the column is casted to
+        another type. However, other index types don't support casting at this
+        time.
 
         Column types can be upcasted (such as int32 to int64) or downcasted
         (such as int64 to int32). However, downcasting will fail if there are
@@ -1282,7 +1298,7 @@ class LanceDataset(pa.dataset.Dataset):
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
 
-        Optional parameters for "IVF_HNSW_PQ":
+        Optional parameters for "IVF_HNSW_*":
         - **max_level**: the maximum number of levels in the graph.
         - **m**: the number of edges per node in the graph.
         - **m_max**: the maximum number of edges per node in the graph.
@@ -1369,10 +1385,10 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        if index_type not in ["IVF_PQ", "IVF_HNSW_PQ"]:
+        valid_index_types = ["IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+        if index_type not in valid_index_types:
             raise NotImplementedError(
-                f"Only [IVF_PQ, IVF_HNSW_PQ] index types supported. "
-                f"Got {index_type}"
+                f"Only {valid_index_types} index types supported. " f"Got {index_type}"
             )
         if index_type.startswith("IVF"):
             if num_partitions is None:
@@ -2328,6 +2344,7 @@ def write_dataset(
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
+    storage_options: Optional[Dict[str, str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2364,6 +2381,9 @@ def write_dataset(
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
+    storage_options : optional, dict
+        Extra options that make sense for a particular storage connection. This is
+        used to store connection parameters like credentials, endpoint, etc.
     """
     if _check_for_hugging_face(data_obj):
         # Huggingface datasets
@@ -2384,6 +2404,7 @@ def write_dataset(
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,
         "progress": progress,
+        "storage_options": storage_options,
     }
 
     if commit_lock:
@@ -2392,8 +2413,12 @@ def write_dataset(
         params["commit_handler"] = commit_lock
 
     uri = os.fspath(uri) if isinstance(uri, Path) else uri
-    _write_dataset(reader, uri, params)
-    return LanceDataset(uri)
+    inner_ds = _write_dataset(reader, uri, params)
+
+    ds = LanceDataset.__new__(LanceDataset)
+    ds._ds = inner_ds
+    ds._uri = uri
+    return ds
 
 
 def _coerce_reader(

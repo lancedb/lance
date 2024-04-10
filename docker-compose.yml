@@ -1,0 +1,21 @@
+version: "3.9"
+services:
+  minio:
+    image: lazybit/minio
+    ports:
+      - 9000:9000
+    environment:
+      - MINIO_ACCESS_KEY=ACCESSKEY
+      - MINIO_SECRET_KEY=SECRETKEY
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 5s
+      retries: 3
+      start_period: 10s
+  dynamodb-local:
+    image: amazon/dynamodb-local
+    ports:
+      - 8000:8000
+    environment:
+      - AWS_ACCESS_KEY_ID=ACCESSKEY
+      - AWS_SECRET_ACCESS_KEY=SECRETKEY

@@ -221,17 +221,18 @@ impl HNSWBuilder {
                 )
                 .collect()
             } else {
-                select_neighbors(&candidates, self.params.m).collect()
+                select_neighbors(&candidates, self.params.m)
+                    .cloned()
+                    .collect()
             };
 
-            for (distance, nb) in neighbors.iter() {
-                cur_level.connect(node, *nb, Some(*distance))?;
+            for neighbor in neighbors.iter() {
+                cur_level.connect(node, neighbor.id, Some(neighbor.dist))?;
             }
-            for (_, nb) in neighbors {
-                cur_level.prune(nb, self.params.m_max)?;
+            for neighbor in neighbors {
+                cur_level.prune(neighbor.id, self.params.m_max)?;
             }
-            cur_level.prune(node, self.params.m_max)?;
-            ep = candidates.values().copied().collect();
+            ep = candidates.iter().map(|node| node.id).collect();
         }
 
         if level > self.levels.len() as u16 {

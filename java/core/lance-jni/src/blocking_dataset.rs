@@ -41,8 +41,8 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
-    pub fn count_rows(&self) -> Result<usize> {
-        Ok(RT.block_on(self.inner.count_rows())?)
+    pub fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        Ok(RT.block_on(self.inner.count_rows(filter))?)
     }
 
     pub fn close(&self) {}

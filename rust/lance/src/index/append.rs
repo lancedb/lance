@@ -149,7 +149,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-        DatasetIndexExt, IndexType,
+        DatasetIndexExt,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;

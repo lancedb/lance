@@ -44,26 +44,16 @@ use utils::get_sub_vector_centroids;
 pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 
-    /// Transform a vector column to PQ code column.
-    ///
-    /// Parameters
-    /// ----------
-    /// *data*: vector array, must be a `FixedSizeListArray`
-    ///
-    /// Returns
-    /// -------
-    ///   PQ code column
-    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
-
     /// Compute the distance between query vector to the PQ code.
     ///
     fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array>;
 
-    /// Get the centroids for one sub-vector.
-    fn num_bits(&self) -> u32;
+    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
 
     /// Number of sub-vectors
     fn num_sub_vectors(&self) -> usize;
+
+    fn num_bits(&self) -> u32;
 
     fn dimension(&self) -> usize;
 
@@ -78,7 +68,7 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 ///
 //
 // TODO: move this to be pub(crate) once we have a better way to test it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
     /// Number of bits for the centroids.
     ///
@@ -424,12 +414,12 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantiz
         }
     }
 
-    fn num_bits(&self) -> u32 {
-        self.num_bits
-    }
-
     fn num_sub_vectors(&self) -> usize {
         self.num_sub_vectors
+    }
+
+    fn num_bits(&self) -> u32 {
+        self.num_bits
     }
 
     fn dimension(&self) -> usize {

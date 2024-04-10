@@ -478,8 +478,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{
-        cast::AsArray, new_empty_array, types::GenericStringType, BinaryArray, GenericStringArray,
-        LargeStringArray, OffsetSizeTrait, StringArray,
+        types::GenericStringType, BinaryArray, GenericStringArray, LargeStringArray, StringArray,
     };
     use arrow_select::concat::concat;
 

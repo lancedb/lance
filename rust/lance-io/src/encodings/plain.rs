@@ -59,7 +59,7 @@ pub struct PlainEncoder<'a> {
 }
 
 impl<'a> PlainEncoder<'a> {
-    pub fn new(writer: &'a mut dyn Writer, data_type: &'a DataType) -> PlainEncoder<'a> {
+    pub fn new(writer: &'a mut dyn Writer, data_type: &'a DataType) -> Self {
         PlainEncoder { writer, data_type }
     }
 
@@ -252,7 +252,7 @@ impl<'a> PlainDecoder<'a> {
         data_type: &'a DataType,
         position: usize,
         length: usize,
-    ) -> Result<PlainDecoder<'a>> {
+    ) -> Result<Self> {
         Ok(PlainDecoder {
             reader,
             data_type,
@@ -531,13 +531,9 @@ impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
 #[cfg(test)]
 mod tests {
     use std::ops::Deref;
-    use std::sync::Arc;
 
     use arrow_array::*;
-    use arrow_buffer::Buffer;
-    use arrow_schema::Field;
     use rand::prelude::*;
-    use tempfile;
 
     use super::*;
     use crate::local::LocalObjectReader;

@@ -17,7 +17,8 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -44,11 +45,13 @@ use snafu::{location, Location};
 
 use self::builder::{HnswBuildParams, HNSW_METADATA_KEY};
 
+use super::graph::memory::InMemoryVectorStorage;
+use super::graph::OrderedNode;
 use super::graph::{
     builder::GraphBuilder,
     greedy_search,
     storage::{DistCalculator, VectorStorage},
-    Graph, OrderedFloat, OrderedNode, NEIGHBORS_COL, NEIGHBORS_FIELD,
+    Graph, OrderedFloat, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use super::ivf::storage::IvfData;
 use crate::vector::graph::beam_search;
@@ -349,7 +352,7 @@ impl HNSW {
         k: usize,
         ef: usize,
         bitset: Option<RoaringBitmap>,
-    ) -> Result<Vec<(u32, f32)>> {
+    ) -> Result<Vec<OrderedNode>> {
         let mut ep = self.entry_point;
         let num_layers = self.levels.len();
 
@@ -368,9 +371,7 @@ impl HNSW {
             Some(dist_calc),
             bitset.as_ref(),
         )?;
-        Ok(select_neighbors(&candidates, k)
-            .map(|(d, u)| (u, d.into()))
-            .collect())
+        Ok(select_neighbors(&candidates, k).cloned().collect())
     }
 
     /// Returns the metadata of this [`HNSW`].
@@ -475,40 +476,38 @@ impl HNSW {
 ///
 /// Algorithm 3 in the HNSW paper.
 fn select_neighbors(
-    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
+    orderd_candidates: &BinaryHeap<OrderedNode>,
     k: usize,
-) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
-    orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
+) -> impl Iterator<Item = &OrderedNode> + '_ {
+    orderd_candidates.iter().sorted().take(k)
 }
 
 /// Algorithm 4 in the HNSW paper.
 ///
-///
-/// Modifies to the original algorithm:
-/// 1. Do not use keepPrunedConnections, we use a heap to capture nearest neighbors.
-fn select_neighbors_heuristic(
-    graph: &dyn Graph,
+/// NOTE: the result is not ordered
+pub(crate) fn select_neighbors_heuristic(
+    graph: &GraphBuilder,
     query: &[f32],
-    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
+    orderd_candidates: &BinaryHeap<OrderedNode>,
     k: usize,
     extend_candidates: bool,
-) -> impl Iterator<Item = (OrderedFloat, u32)> {
-    let mut heap: BinaryHeap<OrderedNode> = BinaryHeap::from_iter(
-        orderd_candidates
-            .iter()
-            .map(|(&d, &u)| OrderedNode { id: u, dist: d }),
-    );
+) -> impl Iterator<Item = OrderedNode> {
+    let mut w = orderd_candidates
+        .iter()
+        .cloned()
+        .map(Reverse)
+        .collect::<BinaryHeap<_>>();
 
     if extend_candidates {
         let dist_calc = graph.storage().dist_calculator(query);
-        let mut visited = HashSet::with_capacity(orderd_candidates.len() * 64);
-        visited.extend(orderd_candidates.values());
-        orderd_candidates.iter().for_each(|(_, &u)| {
-            if let Some(neighbors) = graph.neighbors(u) {
+        let mut visited = HashSet::with_capacity(orderd_candidates.len() * k);
+        visited.extend(orderd_candidates.iter().map(|node| node.id));
+        orderd_candidates.iter().sorted().rev().for_each(|node| {
+            if let Some(neighbors) = graph.neighbors(node.id) {
                 neighbors.for_each(|n| {
                     if !visited.contains(&n) {
                         let d: OrderedFloat = dist_calc.distance(&[n])[0].into();
-                        heap.push((d, n).into());
+                        w.push(Reverse((d, n).into()));
                     }
                     visited.insert(n);
                 });
@@ -516,14 +515,38 @@ fn select_neighbors_heuristic(
         });
     }
 
-    heap.into_sorted_vec().into_iter().take(k).map(|n| n.into())
+    let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
+    let mut discarded = Vec::new();
+    let storage = graph.storage();
+    let storage = storage
+        .as_any()
+        .downcast_ref::<InMemoryVectorStorage>()
+        .unwrap();
+    while !w.is_empty() && results.len() < k {
+        let u = w.pop().unwrap().0;
+
+        if results.is_empty()
+            || results
+                .iter()
+                .all(|v| u.dist < OrderedFloat(storage.distance_between(u.id, v.id)))
+        {
+            results.push(u);
+        } else {
+            discarded.push(u);
+        }
+    }
+
+    while results.len() < k && !discarded.is_empty() {
+        results.push(discarded.pop().unwrap());
+    }
+
+    results.into_iter()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::vector::graph::memory::InMemoryVectorStorage;
     use arrow_array::types::Float32Type;
     use lance_linalg::matrix::MatrixView;
     use lance_testing::datagen::generate_random_array;
@@ -531,29 +554,38 @@ mod tests {
 
     #[test]
     fn test_select_neighbors() {
-        let candidates: BTreeMap<OrderedFloat, u32> =
-            (1..6).map(|i| (OrderedFloat(i as f32), i)).collect();
+        let candidates: BinaryHeap<OrderedNode> =
+            (1..6).map(|i| (OrderedFloat(i as f32), i).into()).collect();
 
-        let result = select_neighbors(&candidates, 3).collect::<Vec<_>>();
+        let result = select_neighbors(&candidates, 3)
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
             result,
             vec![
-                (OrderedFloat(1.0), 1),
-                (OrderedFloat(2.0), 2),
-                (OrderedFloat(3.0), 3),
+                OrderedNode::new(1, OrderedFloat(1.0)),
+                OrderedNode::new(2, OrderedFloat(2.0)),
+                OrderedNode::new(3, OrderedFloat(3.0)),
             ]
         );
 
-        assert_eq!(select_neighbors(&candidates, 0).collect::<Vec<_>>(), vec![]);
+        assert_eq!(
+            select_neighbors(&candidates, 0)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![]
+        );
 
         assert_eq!(
-            select_neighbors(&candidates, 8).collect::<Vec<_>>(),
+            select_neighbors(&candidates, 8)
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![
-                (OrderedFloat(1.0), 1),
-                (OrderedFloat(2.0), 2),
-                (OrderedFloat(3.0), 3),
-                (OrderedFloat(4.0), 4),
-                (OrderedFloat(5.0), 5),
+                OrderedNode::new(1, OrderedFloat(1.0)),
+                OrderedNode::new(2, OrderedFloat(2.0)),
+                OrderedNode::new(3, OrderedFloat(3.0)),
+                OrderedNode::new(4, OrderedFloat(4.0)),
+                OrderedNode::new(5, OrderedFloat(5.0)),
             ]
         );
     }
@@ -630,7 +662,7 @@ mod tests {
             .search(q, K, 128, None)
             .unwrap()
             .iter()
-            .map(|(i, _)| *i)
+            .map(|node| node.id)
             .collect();
         let gt = ground_truth(&mat, q, K);
         let recall = results.intersection(&gt).count() as f32 / K as f32;

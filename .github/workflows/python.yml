@@ -79,7 +79,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: [ "8", "11", "12" ] # 3.11 because tensorflow does not support 3.12 yet.
+        python-minor-version: [ "8", "12" ]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-22.04"
     defaults:
@@ -206,14 +206,6 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ACCESSKEY
           AWS_SECRET_ACCESS_KEY: SECRETKEY
-    env:
-      AWS_ACCESS_KEY_ID: ACCESSKEY
-      AWS_SECRET_ACCESS_KEY: SECRETKEY
-      AWS_REGION: us-west-2
-      # this one is for s3
-      AWS_ENDPOINT: http://localhost:9000
-      # this one is for dynamodb
-      DYNAMODB_ENDPOINT: http://localhost:8000
     steps:
     - uses: actions/checkout@v4
       with:
@@ -223,16 +215,6 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: "3.12"
-    - name: create s3
-      run: aws s3 mb s3://lance-integtest --endpoint http://localhost:9000
-    - name: create ddb
-      run: |
-        aws dynamodb create-table \
-          --table-name lance-integtest \
-          --attribute-definitions '[{"AttributeName": "base_uri", "AttributeType": "S"}, {"AttributeName": "version", "AttributeType": "N"}]' \
-          --key-schema '[{"AttributeName": "base_uri", "KeyType": "HASH"}, {"AttributeName": "version", "KeyType": "RANGE"}]' \
-          --provisioned-throughput '{"ReadCapacityUnits": 10, "WriteCapacityUnits": 10}' \
-          --endpoint-url http://localhost:8000
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: python

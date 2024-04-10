@@ -180,6 +180,16 @@ impl From<prost::DecodeError> for Error {
     }
 }
 
+impl From<prost::EncodeError> for Error {
+    #[track_caller]
+    fn from(e: prost::EncodeError) -> Self {
+        Self::IO {
+            message: (e.to_string()),
+            location: std::panic::Location::caller().to_snafu_location(),
+        }
+    }
+}
+
 impl From<tokio::task::JoinError> for Error {
     #[track_caller]
     fn from(e: tokio::task::JoinError) -> Self {

@@ -25,12 +25,15 @@ pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
 pub mod pq;
+pub mod quantizer;
 pub mod residual;
+pub mod sq;
 pub mod transform;
 pub mod utils;
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
+pub const SQ_CODE_COLUMN: &str = "__sq_code";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 pub const DIST_COL: &str = "_distance";
 
@@ -51,6 +54,10 @@ pub struct Query {
 
     /// The number of probes to load and search.
     pub nprobes: usize,
+
+    /// The number of candidates to reserve while searching.
+    /// this is an optional parameter for HNSW related index types.
+    pub ef: Option<usize>,
 
     /// If presented, apply a refine step.
     /// TODO: should we support fraction / float number here?

@@ -24,11 +24,12 @@ use arrow_array::{
     FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_schema::SchemaRef;
+use async_trait::async_trait;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
-    traits::{Reader, WriteExt, Writer},
+    traits::{WriteExt, Writer},
     utils::read_message,
 };
 use lance_linalg::{distance::MetricType, MatrixView};
@@ -44,6 +45,7 @@ use crate::{
         graph::storage::{DistCalculator, VectorStorage},
         ivf::storage::IvfData,
         pq::transform::PQTransformer,
+        quantizer::{QuantizerMetadata, QuantizerStorage},
         transform::Transformer,
         PQ_CODE_COLUMN,
     },
@@ -58,12 +60,14 @@ pub struct ProductQuantizationMetadata {
     pub num_bits: u32,
     pub num_sub_vectors: usize,
     pub dimension: usize,
+
+    #[serde(skip)]
+    pub codebook: Option<FixedSizeListArray>,
 }
 
-impl ProductQuantizationMetadata {
-    /// Load metadata of PQ quantization from a Lance File.
-    ///
-    pub fn load(reader: &FileReader) -> Result<Self> {
+#[async_trait]
+impl QuantizerMetadata for ProductQuantizationMetadata {
+    async fn load(reader: &FileReader) -> Result<Self> {
         let metadata = reader
             .schema()
             .metadata
@@ -75,89 +79,15 @@ impl ProductQuantizationMetadata {
                 ),
                 location: location!(),
             })?;
-        serde_json::from_str(metadata).map_err(|_| Error::Index {
+        let mut metadata: Self = serde_json::from_str(metadata).map_err(|_| Error::Index {
             message: format!("Failed to parse PQ metadata: {}", metadata),
             location: location!(),
-        })
-    }
-}
+        })?;
 
-/// Loader to load partitioned PQ storage from disk.
-#[derive(Clone)]
-pub struct IvfProductQuantizationStorage {
-    reader: FileReader,
-    metric_type: MetricType,
-    codebook: Arc<Float32Array>,
-    metadata: ProductQuantizationMetadata,
-
-    ivf: IvfData,
-}
-
-#[allow(dead_code)]
-impl IvfProductQuantizationStorage {
-    /// Open a Loader.
-    ///
-    ///
-    pub async fn open(reader: Arc<dyn Reader>) -> Result<Self> {
-        let reader = FileReader::try_new_self_described_from_reader(reader, None).await?;
-        let schema = reader.schema();
-
-        let metadata_str = schema
-            .metadata
-            .get(INDEX_METADATA_SCHEMA_KEY)
-            .ok_or(Error::Index {
-                message: format!(
-                    "Reading PQ storage: index key {} not found",
-                    INDEX_METADATA_SCHEMA_KEY
-                ),
-                location: location!(),
-            })?;
-        let index_metadata: IndexMetadata =
-            serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-                message: format!("Failed to parse index metadata: {}", metadata_str),
-                location: location!(),
-            })?;
-        let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
-
-        let ivf_data = IvfData::load(&reader).await?;
-
-        let metadata = ProductQuantizationMetadata::load(&reader)?;
         let codebook_tensor: pb::Tensor =
             read_message(reader.object_reader.as_ref(), metadata.codebook_position).await?;
-        let fsl = FixedSizeListArray::try_from(&codebook_tensor)?;
-        let codebook = Arc::new(fsl.values().as_primitive::<Float32Type>().clone());
-        Ok(Self {
-            reader,
-            metric_type,
-            codebook,
-            metadata,
-            ivf: ivf_data,
-        })
-    }
-
-    /// Get the number of partitions in the storage.
-    pub fn num_partitions(&self) -> usize {
-        self.ivf.num_partitions()
-    }
-
-    pub fn metadata(&self) -> &ProductQuantizationMetadata {
-        &self.metadata
-    }
-
-    pub fn codebooks(&self) -> &Arc<Float32Array> {
-        &self.codebook
-    }
-
-    pub async fn load_partition(&self, part_id: usize) -> Result<ProductQuantizationStorage> {
-        let range = self.ivf.row_range(part_id);
-        ProductQuantizationStorage::load_partition(
-            &self.reader,
-            range,
-            self.metric_type,
-            self.codebook.clone(),
-            &self.metadata,
-        )
-        .await
+        metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+        Ok(metadata)
     }
 }
 
@@ -291,6 +221,9 @@ impl ProductQuantizationStorage {
         })
     }
 
+    pub fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
     /// Build a PQ storage from ProductQuantizer and a RecordBatch.
     ///
     /// Parameters
@@ -320,31 +253,6 @@ impl ProductQuantizationStorage {
             num_bits,
             num_sub_vectors,
             dimension,
-            metric_type,
-        )
-    }
-
-    /// Load a partition of PQ storage from disk.
-    ///
-    /// Parameters
-    /// ----------
-    /// - *reader: &FileReader
-    pub async fn load_partition(
-        reader: &FileReader,
-        range: std::ops::Range<usize>,
-        metric_type: MetricType,
-        codebook: Arc<Float32Array>,
-        metadata: &ProductQuantizationMetadata,
-    ) -> Result<Self> {
-        let schema = reader.schema();
-        let batch = reader.read_range(range, schema, None).await?;
-
-        Self::new(
-            codebook,
-            batch,
-            metadata.num_bits,
-            metadata.num_sub_vectors,
-            metadata.dimension,
             metric_type,
         )
     }
@@ -385,22 +293,8 @@ impl ProductQuantizationStorage {
             })?;
         let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
 
-        let pq_matadata = ProductQuantizationMetadata::load(&reader)?;
-        let codebook_tensor: pb::Tensor =
-            read_message(reader.object_reader.as_ref(), pq_matadata.codebook_position).await?;
-        let fsl = FixedSizeListArray::try_from(&codebook_tensor)?;
-
-        // Hard coded to float32 for now
-        let codebook = Arc::new(fsl.values().as_primitive::<Float32Type>().clone());
-
-        Self::load_partition(
-            &reader,
-            0..reader.len(),
-            metric_type,
-            codebook,
-            &pq_matadata,
-        )
-        .await
+        let metadata = ProductQuantizationMetadata::load(&reader).await?;
+        Self::load_partition(&reader, 0..reader.len(), metric_type, &metadata).await
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -446,6 +340,7 @@ impl ProductQuantizationStorage {
             num_bits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
+            codebook: None,
         };
 
         let index_metadata = IndexMetadata {
@@ -467,7 +362,53 @@ impl ProductQuantizationStorage {
     }
 }
 
+#[async_trait]
+impl QuantizerStorage for ProductQuantizationStorage {
+    type Metadata = ProductQuantizationMetadata;
+    /// Load a partition of PQ storage from disk.
+    ///
+    /// Parameters
+    /// ----------
+    /// - *reader: &FileReader
+    async fn load_partition(
+        reader: &FileReader,
+        range: std::ops::Range<usize>,
+        metric_type: MetricType,
+        metadata: &Self::Metadata,
+    ) -> Result<Self> {
+        // Hard coded to float32 for now
+        let codebook = Arc::new(
+            metadata
+                .codebook
+                .as_ref()
+                .ok_or(Error::Index {
+                    message: "Codebook not found in PQ metadata".to_string(),
+                    location: location!(),
+                })?
+                .values()
+                .as_primitive::<Float32Type>()
+                .clone(),
+        );
+
+        let schema = reader.schema();
+        let batch = reader.read_range(range, schema, None).await?;
+
+        Self::new(
+            codebook,
+            batch,
+            metadata.num_bits,
+            metadata.num_sub_vectors,
+            metadata.dimension,
+            metric_type,
+        )
+    }
+}
+
 impl VectorStorage for ProductQuantizationStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn len(&self) -> usize {
         self.batch.num_rows()
     }

@@ -245,6 +245,21 @@ As a result, a single instrumented async method may appear as many different
 spans in the UI.
 
 
+## Running S3 Integration tests
+
+The integration tests run against local minio and local dynamodb. To start the
+services, run
+
+```shell
+docker compose up
+```
+
+Then you can run the tests with
+
+```shell
+pytest --run-integration python/tests/test_s3_ddb.py
+```
+
 ## Building wheels locally
 
 ### Linux

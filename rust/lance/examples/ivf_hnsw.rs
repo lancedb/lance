@@ -16,8 +16,6 @@
 //!
 //! run with `cargo run --release --example hnsw`
 
-use std::collections::HashSet;
-
 use arrow::array::AsArray;
 use arrow_array::types::Float32Type;
 use clap::Parser;
@@ -26,9 +24,9 @@ use lance::index::vector::VectorIndexParams;
 use lance::Dataset;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
-use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{DatasetIndexExt, IndexType};
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::distance::MetricType;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -63,6 +61,7 @@ struct Args {
     metric_type: String,
 }
 
+#[cfg(test)]
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
     let mut dists = vec![];
     for i in 0..mat.num_rows() {
@@ -89,13 +88,13 @@ async fn main() {
 
     let mut ivf_params = IvfBuildParams::new(128);
     ivf_params.sample_rate = 20480;
-    let pq_params = PQBuildParams::default();
     let hnsw_params = HnswBuildParams::default()
         .ef_construction(100)
         .num_edges(15)
         .max_num_edges(30);
+    let pq_params = SQBuildParams::default();
     let params =
-        VectorIndexParams::with_ivf_hnsw_pq_params(metric_type, ivf_params, hnsw_params, pq_params);
+        VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf_params, hnsw_params, pq_params);
     println!("{:?}", params);
 
     if args.create_index {
@@ -107,7 +106,7 @@ async fn main() {
         println!("build={:.3}s", now.elapsed().as_secs_f32());
     }
 
-    println!("Loaded {} batches", dataset.count_rows().await.unwrap());
+    println!("Loaded {} records", dataset.count_rows(None).await.unwrap());
 
     let q = dataset
         .take(&[0], &dataset.schema().project(&[column]).unwrap())

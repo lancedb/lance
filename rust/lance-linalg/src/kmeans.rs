@@ -675,7 +675,6 @@ mod tests {
     use super::*;
 
     use arrow_array::types::Float32Type;
-    use arrow_array::Float32Array;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
 
