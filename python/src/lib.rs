@@ -35,6 +35,10 @@ use dataset::optimize::{
 };
 use dataset::MergeInsertBuilder;
 use env_logger::Env;
+use file::{
+    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
+    LanceFileWriter, LancePageMetadata,
+};
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
@@ -47,7 +51,9 @@ pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
+pub(crate) mod error;
 pub(crate) mod executor;
+pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod reader;
 pub(crate) mod scanner;
@@ -101,6 +107,12 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<FileFragment>()?;
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<MergeInsertBuilder>()?;
+    m.add_class::<LanceFileReader>()?;
+    m.add_class::<LanceFileWriter>()?;
+    m.add_class::<LanceFileMetadata>()?;
+    m.add_class::<LanceColumnMetadata>()?;
+    m.add_class::<LancePageMetadata>()?;
+    m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
