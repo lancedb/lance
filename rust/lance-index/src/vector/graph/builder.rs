@@ -21,6 +21,7 @@ use snafu::{location, Location};
 use super::OrderedNode;
 use super::{memory::InMemoryVectorStorage, Graph, GraphNode, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
+use crate::vector::hnsw::select_neighbors_heuristic;
 
 /// GraphNode during build.
 #[derive(Debug, Clone)]
@@ -42,15 +43,6 @@ impl GraphBuilderNode {
 
     fn add_neighbor(&mut self, distance: OrderedFloat, id: u32) {
         self.neighbors.push(OrderedNode { dist: distance, id });
-    }
-
-    /// Prune the node and only keep `max_edges` edges.
-    ///
-    /// Returns the ids of pruned neighbors.
-    fn prune(&mut self, max_edges: usize) {
-        while self.neighbors.len() > max_edges {
-            self.neighbors.pop();
-        }
     }
 }
 
@@ -99,7 +91,7 @@ impl Graph for GraphBuilder {
     }
 
     fn storage(&self) -> Arc<dyn VectorStorage> {
-        self.vectors.clone() as Arc<dyn VectorStorage>
+        self.vectors.clone()
     }
 }
 
@@ -140,11 +132,23 @@ impl GraphBuilder {
     }
 
     pub fn prune(&mut self, node: u32, max_edges: usize) -> Result<()> {
-        let node = self.nodes.get_mut(&node).ok_or_else(|| Error::Index {
-            message: format!("Node {} not found", node),
-            location: location!(),
-        })?;
-        node.prune(max_edges);
+        let vector = self.vectors.vector(node);
+
+        let neighbors = &self
+            .nodes
+            .get(&node)
+            .ok_or_else(|| Error::Index {
+                message: format!("Node {} not found", node),
+                location: location!(),
+            })?
+            .neighbors;
+
+        let pruned_neighbors =
+            select_neighbors_heuristic(self, vector, neighbors, max_edges, false).collect();
+
+        self.nodes
+            .entry(node)
+            .and_modify(|node| node.neighbors = pruned_neighbors);
         Ok(())
     }
 

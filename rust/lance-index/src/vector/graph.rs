@@ -63,7 +63,7 @@ impl<I> From<I> for GraphNode<I> {
 /// A wrapper for f32 to make it ordered, so that we can put it into
 /// a BTree or Heap
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) struct OrderedFloat(pub f32);
+pub struct OrderedFloat(pub f32);
 
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -92,9 +92,15 @@ impl From<OrderedFloat> for f32 {
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
-pub(crate) struct OrderedNode {
+pub struct OrderedNode {
     pub id: u32,
     pub dist: OrderedFloat,
+}
+
+impl OrderedNode {
+    pub fn new(id: u32, dist: OrderedFloat) -> Self {
+        Self { id, dist }
+    }
 }
 
 impl PartialOrd for OrderedNode {
@@ -181,37 +187,37 @@ pub(super) fn beam_search(
     k: usize,
     dist_calc: Option<Arc<dyn DistCalculator>>,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
-) -> Result<BinaryHeap<(OrderedFloat, u32)>> {
+) -> Result<BinaryHeap<OrderedNode>> {
     let mut visited: HashSet<_> = start.iter().copied().collect();
     let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
-    let mut candidates: BinaryHeap<Reverse<(OrderedFloat, u32)>> = dist_calc
+    let mut candidates: BinaryHeap<Reverse<OrderedNode>> = dist_calc
         .distance(start)
         .iter()
         .zip(start)
-        .map(|(&dist, id)| Reverse((dist.into(), *id)))
+        .map(|(&dist, id)| Reverse((dist.into(), *id).into()))
         .collect();
-    let mut results: BinaryHeap<(OrderedFloat, u32)> = candidates
+    let mut results: BinaryHeap<OrderedNode> = candidates
         .clone()
         .into_iter()
         .filter(|node| {
             bitset
-                .map(|bitset| bitset.contains(node.0 .1))
+                .map(|bitset| bitset.contains(node.0.id))
                 .unwrap_or(true)
         })
         .map(|v| v.0)
         .collect();
 
     while !candidates.is_empty() {
-        let (dist, current) = candidates.pop().expect("candidates is empty").0;
+        let current = candidates.pop().expect("candidates is empty").0;
         let furthest = results
             .peek()
-            .map(|kv| kv.0)
+            .map(|node| node.dist)
             .unwrap_or(OrderedFloat(f32::INFINITY));
-        if dist > furthest {
+        if current.dist > furthest {
             break;
         }
-        let neighbors = graph.neighbors(current).ok_or_else(|| Error::Index {
-            message: format!("Node {} does not exist in the graph", current),
+        let neighbors = graph.neighbors(current.id).ok_or_else(|| Error::Index {
+            message: format!("Node {} does not exist in the graph", current.id),
             location: location!(),
         })?;
 
@@ -222,7 +228,7 @@ pub(super) fn beam_search(
             visited.insert(neighbor);
             let furthest = results
                 .peek()
-                .map(|kv| kv.0)
+                .map(|node| node.dist)
                 .unwrap_or(OrderedFloat(f32::INFINITY));
             let dist = dist_calc.distance(&[neighbor])[0].into();
             if dist <= furthest || results.len() < k {
@@ -230,12 +236,12 @@ pub(super) fn beam_search(
                     .map(|bitset| bitset.contains(neighbor))
                     .unwrap_or(true)
                 {
-                    results.push((dist, neighbor));
+                    results.push((dist, neighbor).into());
                     if results.len() > k {
                         results.pop();
                     }
                 }
-                candidates.push(Reverse((dist, neighbor)));
+                candidates.push(Reverse((dist, neighbor).into()));
             }
         }
     }

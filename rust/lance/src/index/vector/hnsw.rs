@@ -180,8 +180,10 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             bitmap,
         )?;
 
-        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.0 as usize]));
-        let distances = Arc::new(Float32Array::from_iter_values(results.iter().map(|x| x.1)));
+        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.id as usize]));
+        let distances = Arc::new(Float32Array::from_iter_values(
+            results.iter().map(|x| x.dist.0),
+        ));
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
