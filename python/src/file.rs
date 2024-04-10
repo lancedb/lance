@@ -24,7 +24,7 @@ use lance_file::v2::{
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::scheduler::StoreScheduler;
-use object_store::path::{Path, PathPart};
+use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     pyclass, pymethods, IntoPy, PyObject, PyResult, Python,
@@ -203,7 +203,7 @@ impl LanceFileWriter {
 
 fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
     let mut parts = path.parts().collect::<Vec<_>>();
-    if parts.len() == 0 {
+    if parts.is_empty() {
         return Err(PyValueError::new_err(format!(
             "Path {} is not a valid path to a file",
             path,
@@ -222,7 +222,7 @@ async fn object_store_from_uri_or_path(uri_or_path: String) -> PyResult<(ObjectS
         let path = object_store::path::Path::parse(url.path())
             .map_err(|e| PyIOError::new_err(format!("Invalid URL path `{}`: {}", url.path(), e)))?;
         let (parent_path, filename) = path_to_parent(&path)?;
-        url.set_path(&parent_path.to_string());
+        url.set_path(parent_path.as_ref());
 
         let (object_store, dir_path) = ObjectStore::from_uri(url.as_str()).await.infer_error()?;
         let child_path = dir_path.child(filename);
