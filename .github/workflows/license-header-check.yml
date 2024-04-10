@@ -17,8 +17,8 @@ jobs:
       - name: Install license-header-checker
         run: curl -s https://raw.githubusercontent.com/lluissm/license-header-checker/master/install.sh | bash
       - name: Check license headers (rust)
-        run: ./bin/license-header-checker ./rust/license_header.txt -a rust rs && [[ -z `git status -s` ]]
+        run: ./bin/license-header-checker -a ./rust/license_header.txt rust rs && [[ -z `git status -s` ]]
       - name: Check license headers (python)
-        run: ./bin/license-header-checker ./python/license_header.txt -a python py && [[ -z `git status -s` ]]
+        run: ./bin/license-header-checker -a ./python/license_header.txt python py && [[ -z `git status -s` ]]
       - name: Check license headers (protos)
-        run: ./bin/license-header-checker ./protos/license_header.txt -a protos proto && [[ -z `git status -s` ]]
+        run: ./bin/license-header-checker -a ./protos/license_header.txt protos proto && [[ -z `git status -s` ]]
