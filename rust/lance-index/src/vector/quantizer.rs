@@ -178,7 +178,7 @@ impl Quantization for ScalarQuantizer {
     }
 
     fn from_metadata(metadata: &Self::Metadata, _: DistanceType) -> Result<Quantizer> {
-        Ok(Quantizer::Scalar(ScalarQuantizer::with_bounds(
+        Ok(Quantizer::Scalar(Self::with_bounds(
             metadata.num_bits,
             metadata.dim,
             metadata.bounds.clone(),
@@ -282,25 +282,23 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> Quantization for ProductQuantizerIm
     }
 
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
-        Ok(Quantizer::Product(Arc::new(
-            ProductQuantizerImpl::<T>::new(
-                metadata.num_sub_vectors,
-                metadata.num_bits,
-                metadata.dimension,
-                Arc::new(
-                    metadata
-                        .codebook
-                        .as_ref()
-                        .unwrap()
-                        .values()
-                        .as_any()
-                        .downcast_ref::<T::ArrayType>()
-                        .unwrap()
-                        .clone(),
-                ),
-                distance_type,
+        Ok(Quantizer::Product(Arc::new(Self::new(
+            metadata.num_sub_vectors,
+            metadata.num_bits,
+            metadata.dimension,
+            Arc::new(
+                metadata
+                    .codebook
+                    .as_ref()
+                    .unwrap()
+                    .values()
+                    .as_any()
+                    .downcast_ref::<T::ArrayType>()
+                    .unwrap()
+                    .clone(),
             ),
-        )))
+            distance_type,
+        ))))
     }
 }
 

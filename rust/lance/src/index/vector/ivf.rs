@@ -327,6 +327,7 @@ pub(crate) async fn optimize_vector_indices(
     Ok((new_uuid, merged))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn optimize_ivf_pq_indices(
     first_idx: &IVFIndex,
     pq_index: &PQIndex,
@@ -409,6 +410,7 @@ async fn optimize_ivf_pq_indices(
     Ok(existing_indices.len() - start_pos)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     dataset: &Dataset,
     first_idx: &IVFIndex,

@@ -319,7 +319,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         if let Some(&previous_indices) = existing_indices.as_ref() {
             for &idx in previous_indices.iter() {
-                let sub_index = idx.load_partition(part_id as usize, true).await?;
+                let sub_index = idx.load_partition(part_id, true).await?;
                 let row_ids = Arc::new(UInt64Array::from_iter_values(
                     sub_index.storage().row_ids().iter().cloned(),
                 ));
