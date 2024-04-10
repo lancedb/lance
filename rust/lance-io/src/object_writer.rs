@@ -60,15 +60,14 @@ impl ObjectWriter {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        Ok(self
-            .writer
+        self.writer
             .as_mut()
             .shutdown()
             .await
             .map_err(|e| Error::IO {
                 message: format!("failed to shutdown object writer for {}: {}", self.path, e),
                 location: location!(),
-            })?)
+            })
     }
 }
 
