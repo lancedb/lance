@@ -261,7 +261,7 @@ impl HNSWBuilder {
             self.levels.push(level);
         }
 
-        for i in 1..self.vectors.len() {
+        for i in kdam::tqdm!(1..self.vectors.len()) {
             self.insert(i as u32)?;
         }
 

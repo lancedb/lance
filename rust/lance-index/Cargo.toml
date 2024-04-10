@@ -48,6 +48,8 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
+lance-testing.workspace = true
+kdam = "~0.5"
 
 [dev-dependencies]
 approx.workspace = true
@@ -74,3 +76,6 @@ harness = false
 [[bench]]
 name = "hnsw"
 harness = false
+
+[[bin]]
+name = "hnsw_update"
