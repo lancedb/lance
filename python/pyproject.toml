@@ -56,6 +56,10 @@ tests = [
     "polars[pyarrow,pandas]",
     "pytest",
     "tensorflow",
+    # Remove when https://github.com/h5py/h5py/issues/2408 is resolved
+    # We don't need h5py but it is transitive from tensorflow and 3.11
+    # is missing wheels for arm so we need to prevent that version.
+    "h5py<3.11",
     "tqdm",
 ]
 dev = ["ruff==0.2.2"]
