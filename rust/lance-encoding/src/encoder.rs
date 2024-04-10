@@ -26,8 +26,6 @@ pub struct EncodedBuffer {
     /// For example, if we are asked to write 3 primitive arrays of 1000 rows and we can write them all
     /// as one page then this will be the value buffers from the 3 primitive arrays
     pub parts: Vec<Buffer>,
-    /// A description of the encoding used to encode the buffer
-    pub encoding: pb::BufferEncoding,
 }
 
 // Custom impl because buffers shouldn't be included in debug output
@@ -92,12 +90,7 @@ pub trait BufferEncoder: std::fmt::Debug + Send + Sync {
     /// This method may receive multiple chunks and should encode them all into
     /// a single EncodedBuffer (though that buffer may have multiple parts).  All
     /// parts will be written to the file as one contiguous block.
-    fn encode(
-        &self,
-        arrays: &[ArrayRef],
-        buffer_index: u32,
-        buffer_type: pb::buffer::BufferType,
-    ) -> Result<EncodedBuffer>;
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer>;
 }
 
 /// Encodes data from Arrow format into some kind of on-disk format

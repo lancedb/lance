@@ -2,41 +2,20 @@ use arrow_array::{cast::AsArray, ArrayRef};
 
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
-use lance_arrow::DataTypeExt;
 use lance_core::Result;
 
-use crate::{
-    encoder::{BufferEncoder, EncodedBuffer},
-    format::pb,
-};
+use crate::encoder::{BufferEncoder, EncodedBuffer};
 
 #[derive(Debug, Default)]
 pub struct FlatBufferEncoder {}
 
 impl BufferEncoder for FlatBufferEncoder {
-    fn encode(
-        &self,
-        arrays: &[ArrayRef],
-        buffer_index: u32,
-        buffer_type: pb::buffer::BufferType,
-    ) -> Result<EncodedBuffer> {
-        let bytes_per_value = arrays[0].data_type().byte_width() as u64;
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
         let parts = arrays
             .iter()
             .map(|arr| arr.to_data().buffers()[0].clone())
             .collect::<Vec<_>>();
-        Ok(EncodedBuffer {
-            parts,
-            encoding: pb::BufferEncoding {
-                buffer_encoding: Some(pb::buffer_encoding::BufferEncoding::Flat(pb::Flat {
-                    buffer: Some(pb::Buffer {
-                        buffer_index,
-                        buffer_type: buffer_type as i32,
-                    }),
-                    bytes_per_value,
-                })),
-            },
-        })
+        Ok(EncodedBuffer { parts })
     }
 }
 
@@ -45,12 +24,7 @@ impl BufferEncoder for FlatBufferEncoder {
 pub struct BitmapBufferEncoder {}
 
 impl BufferEncoder for BitmapBufferEncoder {
-    fn encode(
-        &self,
-        arrays: &[ArrayRef],
-        buffer_index: u32,
-        buffer_type: pb::buffer::BufferType,
-    ) -> Result<EncodedBuffer> {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
         debug_assert!(arrays
             .iter()
             .all(|arr| *arr.data_type() == DataType::Boolean));
@@ -71,17 +45,7 @@ impl BufferEncoder for BitmapBufferEncoder {
         }
         let buffer = builder.finish().into_inner();
         let parts = vec![buffer];
-        let buffer = EncodedBuffer {
-            parts,
-            encoding: pb::BufferEncoding {
-                buffer_encoding: Some(pb::buffer_encoding::BufferEncoding::Bitmap(pb::Bitmap {
-                    buffer: Some(pb::Buffer {
-                        buffer_index,
-                        buffer_type: buffer_type as i32,
-                    }),
-                })),
-            },
-        };
+        let buffer = EncodedBuffer { parts };
         Ok(buffer)
     }
 }

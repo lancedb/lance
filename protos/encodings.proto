@@ -51,33 +51,6 @@ message Buffer {
     BufferType buffer_type = 2;
 }
 
-// Encodings that decode into a single buffer of values
-message BufferEncoding {
-  oneof buffer_encoding {
-      Flat flat = 1;
-      Bitmap bitmap = 2;
-      // TODO: Constant, RunEnd, Dictionary, BitPacking
-      //       FoR, ...
-  }
-}
-
-// A buffer encoding where each row is a fixed number of bytes
-message Flat {
-    // The buffer of values
-    Buffer buffer = 1;
-    // The number of bytes per value
-    uint64 bytes_per_value = 2;
-}
-
-// A buffer encoding for boolean data where each row is 1 bit
-// 
-// The data is stored with bit-endianess (e.g. what Arrow uses for validity
-// bitmaps and boolean arrays)
-message Bitmap {
-    // The buffer of values
-    Buffer buffer = 1;
-}
-
 // An encoding that adds nullability to another array encoding
 //
 // This can wrap any array encoding and add nullability information
@@ -87,7 +60,7 @@ message Nullable {
   }
   message AllNull {}
   message SomeNull {
-    BufferEncoding validity = 1;
+    ArrayEncoding validity = 1;
     ArrayEncoding values = 2;
   }
   oneof nullability {
@@ -136,10 +109,13 @@ message FixedSizeList {
   ArrayEncoding items = 2;
 }
 
-// An encoding for arrays that fit in a single buffer
-message Value {
+// Fixed width items placed contiguously in a buffer
+message Flat {
+  // the number of bits per value, must be greater than 0, does
+  // not need to be a multiple of 8
+  uint64 bits_per_value = 1;
   // the buffer of values
-  BufferEncoding buffer = 1;
+  Buffer buffer = 2;
 }
 
 // An array encoding for shredded structs that will never be null
@@ -152,7 +128,7 @@ message SimpleStruct {}
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
-        Value value = 1;
+        Flat flat = 1;
         Nullable nullable = 2;
         FixedSizeList fixed_size_list = 3;
         List list = 4;

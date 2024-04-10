@@ -5,6 +5,7 @@ use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
+use lance_arrow::DataTypeExt;
 use log::trace;
 use snafu::{location, Location};
 
@@ -150,21 +151,30 @@ impl ArrayEncoder for ValueEncoder {
         let index = *buffer_index;
         *buffer_index += 1;
 
-        let encoded_buffer =
-            self.buffer_encoder
-                .encode(arrays, index, pb::buffer::BufferType::Page)?;
+        let encoded_buffer = self.buffer_encoder.encode(arrays)?;
         let array_bufs = vec![EncodedArrayBuffer {
             parts: encoded_buffer.parts,
             index,
         }];
 
+        let data_type = arrays[0].data_type();
+        let bits_per_value = match data_type {
+            DataType::Boolean => 1,
+            _ => 8 * data_type.byte_width() as u64,
+        };
+        let flat_encoding = pb::ArrayEncoding {
+            array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
+                bits_per_value,
+                buffer: Some(pb::Buffer {
+                    buffer_index: index,
+                    buffer_type: pb::buffer::BufferType::Page as i32,
+                }),
+            })),
+        };
+
         Ok(EncodedArray {
             buffers: array_bufs,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::Value(pb::Value {
-                    buffer: Some(encoded_buffer.encoding),
-                })),
-            },
+            encoding: flat_encoding,
         })
     }
 }

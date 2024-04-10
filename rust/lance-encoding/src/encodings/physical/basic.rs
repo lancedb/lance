@@ -253,15 +253,20 @@ impl ArrayEncoder for BasicEncoder {
 
             let validity_buffer_index = *buffer_index;
             *buffer_index += 1;
-            let validity = BitmapBufferEncoder::default().encode(
-                &validity_as_arrays,
-                validity_buffer_index,
-                pb::buffer::BufferType::Page,
-            )?;
+            let validity = BitmapBufferEncoder::default().encode(&validity_as_arrays)?;
+            let validity_encoding = Box::new(pb::ArrayEncoding {
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
+                    bits_per_value: 1,
+                    buffer: Some(pb::Buffer {
+                        buffer_index: validity_buffer_index,
+                        buffer_type: pb::buffer::BufferType::Page as i32,
+                    }),
+                })),
+            });
 
             let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
             let encoding = pb::nullable::Nullability::SomeNulls(Box::new(pb::nullable::SomeNull {
-                validity: Some(validity.encoding),
+                validity: Some(validity_encoding),
                 values: Some(Box::new(arr_encoding.encoding)),
             }));
 

@@ -136,8 +136,9 @@ struct PrimitiveFieldDecodeTask {
 
 impl DecodeArrayTask for PrimitiveFieldDecodeTask {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
-        // There are two buffers, the validity buffer and the values buffer
-        // We start by assuming the validity buffer will not be required
+        // We start by assuming that no buffers are required.  The number of buffers needed is based
+        // on the data type.  Most data types need two buffers but each layer of fixed-size-list, for
+        // example, adds another validity buffer
         let mut capacities = vec![(0, false); self.physical_decoder.num_buffers() as usize];
         let mut all_null = false;
         self.physical_decoder.update_capacity(

@@ -467,11 +467,7 @@ impl ListFieldEncoder {
                                 )),
                             },
                         };
-                        Ok(EncodedPage {
-                            array,
-                            column_idx: page.column_idx,
-                            num_rows: page.num_rows,
-                        })
+                        Ok(EncodedPage { array, ..page })
                     }
                     .boxed()
                 })
