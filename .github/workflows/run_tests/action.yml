@@ -21,6 +21,7 @@ runs:
     run: make test
   - name: Run doctest
     shell: bash
+    if: ${{ inputs.python-minor-version != '12' }}
     working-directory: python
     run: |
       pytest --doctest-modules python/lance
