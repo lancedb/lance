@@ -18,8 +18,7 @@ use lance_core::Result;
 
 use crate::{
     decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
-    encoder::{EncodedPage, FieldEncoder},
-    encodings::physical::basic::BasicEncoder,
+    encoder::{EncodedArray, EncodedPage, FieldEncoder},
     format::pb,
     EncodingsIo,
 };
@@ -429,10 +428,12 @@ impl ListFieldEncoder {
         column_index: u32,
     ) -> Self {
         Self {
-            indices_encoder: PrimitiveFieldEncoder::new(
+            indices_encoder: PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_columns,
-                Arc::new(BasicEncoder::new(column_index)),
-            ),
+                &DataType::Int32,
+                column_index,
+            )
+            .unwrap(),
             items_encoder,
         }
     }
@@ -456,18 +457,17 @@ impl ListFieldEncoder {
                 .map(|page_task| {
                     async move {
                         let page = page_task.await?;
-                        Ok(EncodedPage {
-                            buffers: page.buffers,
-                            column_idx: page.column_idx,
-                            num_rows: page.num_rows,
+                        let array = EncodedArray {
+                            buffers: page.array.buffers,
                             encoding: pb::ArrayEncoding {
                                 array_encoding: Some(pb::array_encoding::ArrayEncoding::List(
                                     Box::new(pb::List {
-                                        offsets: Some(Box::new(page.encoding)),
+                                        offsets: Some(Box::new(page.array.encoding)),
                                     }),
                                 )),
                             },
-                        })
+                        };
+                        Ok(EncodedPage { array, ..page })
                     }
                     .boxed()
                 })
@@ -522,23 +522,12 @@ mod tests {
 
     use arrow_schema::{DataType, Field};
 
-    use crate::{
-        encodings::{
-            logical::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder},
-            physical::basic::BasicEncoder,
-        },
-        testing::check_round_trip_field_encoding,
-    };
+    use crate::testing::check_round_trip_encoding;
 
     #[test_log::test(tokio::test)]
     async fn test_simple_list() {
         let data_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
-        let items_encoder = Box::new(PrimitiveFieldEncoder::new(
-            4096,
-            Arc::new(BasicEncoder::new(1)),
-        ));
-        let encoder = ListFieldEncoder::new(items_encoder, 4096, 0);
         let field = Field::new("", data_type, false);
-        check_round_trip_field_encoding(encoder, field).await;
+        check_round_trip_encoding(field).await;
     }
 }

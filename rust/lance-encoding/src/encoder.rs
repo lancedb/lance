@@ -6,25 +6,17 @@ use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, Schema};
 use futures::future::BoxFuture;
 use lance_core::Result;
-use std::sync::Arc;
 
 use crate::{
-    encodings::{
-        logical::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder},
-        physical::basic::BasicEncoder,
+    encodings::logical::{
+        list::ListFieldEncoder, primitive::PrimitiveFieldEncoder, r#struct::StructFieldEncoder,
+        utf8::Utf8FieldEncoder,
     },
     format::pb,
 };
 
 /// An encoded buffer
 pub struct EncodedBuffer {
-    /// If true, the buffer should be stored as "data"
-    /// If false, the buffer should be stored as "metadata"
-    ///
-    /// Metadata buffers are typically small buffers that should be cached.  For example,
-    /// this might be a small dictionary when data has been dictionary encoded.  Or it might
-    /// contain a skip block when data has been RLE encoded.
-    pub is_data: bool,
     /// Buffers that make up the encoded buffer
     ///
     /// All of these buffers should be written to the file as one contiguous buffer
@@ -40,22 +32,51 @@ pub struct EncodedBuffer {
 impl std::fmt::Debug for EncodedBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EncodedBuffer")
-            .field("is_data", &self.is_data)
             .field("len", &self.parts.iter().map(|p| p.len()).sum::<usize>())
             .finish()
     }
 }
 
+pub struct EncodedArrayBuffer {
+    /// The data making up the buffer
+    pub parts: Vec<Buffer>,
+    /// The index of the buffer in the page
+    pub index: u32,
+}
+
+// Custom impl because buffers shouldn't be included in debug output
+impl std::fmt::Debug for EncodedArrayBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedBuffer")
+            .field("len", &self.parts.iter().map(|p| p.len()).sum::<usize>())
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
+/// An encoded array
+///
+/// Maps to a single Arrow array
+///
+/// This may contain multiple buffers.  For example, a nullable int32 array will contain two buffers,
+/// one for the null bitmap and one for the values
+#[derive(Debug)]
+pub struct EncodedArray {
+    /// The encoded buffers
+    pub buffers: Vec<EncodedArrayBuffer>,
+    /// A description of the encoding used to encode the array
+    pub encoding: pb::ArrayEncoding,
+}
+
 /// An encoded page of data
 ///
-/// This maps to an Arrow Array and may contain multiple buffers
-/// For example, a nullable int32 page will contain two buffers, one for the null bitmap and one for the values
+/// Maps to a top-level array
+///
+/// For example, FixedSizeList<Int32> will have two EncodedArray instances and one EncodedPage
 #[derive(Debug)]
 pub struct EncodedPage {
-    /// The encoded buffers
-    pub buffers: Vec<EncodedBuffer>,
-    /// A description of the encoding used to encode the column
-    pub encoding: pb::ArrayEncoding,
+    // The encoded array data
+    pub array: EncodedArray,
     /// The number of rows in the encoded page
     pub num_rows: u32,
     /// The index of the column
@@ -96,7 +117,7 @@ pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
     ///
     /// The result should contain a description of the encoding that was chosen.
     /// This can be used to decode the data later.
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedPage>;
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray>;
 }
 
 /// Top level encoding trait to code any Arrow array type into one or more pages.
@@ -136,7 +157,7 @@ pub struct BatchEncoder {
 }
 
 impl BatchEncoder {
-    fn get_encoder_for_field(
+    pub(crate) fn get_encoder_for_field(
         field: &Field,
         cache_bytes_per_column: u64,
         col_idx: &mut u32,
@@ -164,13 +185,15 @@ impl BatchEncoder {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64
-            | DataType::UInt8 => {
+            | DataType::UInt8
+            | DataType::FixedSizeList(_, _) => {
                 let my_col_idx = *col_idx;
                 *col_idx += 1;
-                Ok(Box::new(PrimitiveFieldEncoder::new(
+                Ok(Box::new(PrimitiveFieldEncoder::try_new(
                     cache_bytes_per_column,
-                    Arc::new(BasicEncoder::new(my_col_idx)),
-                )))
+                    field.data_type(),
+                    my_col_idx,
+                )?))
             }
             DataType::List(inner_type) => {
                 let my_col_idx = *col_idx;
@@ -183,7 +206,29 @@ impl BatchEncoder {
                     my_col_idx,
                 )))
             }
-            _ => todo!("Implement encoding for field type: {:?}", field.data_type()),
+            DataType::Struct(fields) => {
+                let header_col_idx = *col_idx;
+                *col_idx += 1;
+                let children_encoders = fields
+                    .iter()
+                    .map(|field| {
+                        Self::get_encoder_for_field(field, cache_bytes_per_column, col_idx)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Box::new(StructFieldEncoder::new(
+                    children_encoders,
+                    header_col_idx,
+                )))
+            }
+            DataType::Utf8 => {
+                let my_col_idx = *col_idx;
+                *col_idx += 2;
+                Ok(Box::new(Utf8FieldEncoder::new(
+                    cache_bytes_per_column,
+                    my_col_idx,
+                )))
+            }
+            _ => todo!("Implement encoding for data type {}", field.data_type()),
         }
     }
 
