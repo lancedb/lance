@@ -48,6 +48,8 @@ cmake-build-*
 
 python/lance/_*.cpp
 
+bin/
+
 
 *.parquet
 *.parq

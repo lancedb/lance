@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Utilities and traits for decoding data
 //!
 //! There are two types of decoders, logical decoders and physical decoders.

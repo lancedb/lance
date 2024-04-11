@@ -45,12 +45,16 @@ jobs:
       with:
         fetch-depth: 0
         lfs: true
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.11  # Ray does not support 3.12 yet.
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: python
     - name: Install linting tools
       run: |
-        pip install ruff==0.2.2 maturin tensorflow tqdm
+        pip install ruff==0.2.2 maturin tensorflow tqdm ray[data]
         pip install torch --index-url https://download.pytorch.org/whl/cpu
     - name: Lint Python
       run: |
@@ -69,12 +73,12 @@ jobs:
         python -m venv venv
         source venv/bin/activate
         pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
+        pip install "ray[data]" maturin
         maturin develop --extras tests
     - name: Run doctest
       run: |
         source venv/bin/activate
         pytest --doctest-modules python/lance
-
   linux:
     timeout-minutes: 45
     strategy:

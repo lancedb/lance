@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Builder of Hnsw Graph.
 
@@ -177,7 +166,7 @@ impl HNSWBuilder {
 
     /// Insert one node.
     fn insert(&mut self, node: u32) -> Result<()> {
-        let vector = self.vectors.vector(node);
+        let query = self.vectors.vector(node);
         let level = self.random_level();
 
         let levels_to_search = if self.levels.len() > level as usize {
@@ -186,7 +175,6 @@ impl HNSWBuilder {
             0
         };
         let mut ep = self.entry_point;
-        let query = self.vectors.vector(self.entry_point);
 
         //
         // Search for entry point in paper.
@@ -197,7 +185,7 @@ impl HNSWBuilder {
         //  }
         // ```
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
-            ep = greedy_search(cur_level, ep, vector, None)?.1;
+            ep = greedy_search(cur_level, ep, query, None)?.1;
         }
 
         let mut ep = vec![ep];
@@ -206,7 +194,7 @@ impl HNSWBuilder {
             let candidates = beam_search(
                 cur_level,
                 &ep,
-                vector,
+                query,
                 self.params.ef_construction,
                 None,
                 None,

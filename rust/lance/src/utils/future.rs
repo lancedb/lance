@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use async_cell::sync::AsyncCell;
 use futures::Future;
 use snafu::{location, Location};

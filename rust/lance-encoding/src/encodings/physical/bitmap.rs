@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::ops::Range;
 
 use arrow_array::{cast::AsArray, ArrayRef};

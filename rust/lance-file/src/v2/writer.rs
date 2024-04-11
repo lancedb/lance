@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use arrow_array::RecordBatch;
 
 use arrow_schema::Schema;
@@ -289,5 +292,45 @@ impl FileWriter {
         // 7. close the writer
         self.writer.shutdown().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::types::Float64Type;
+    use arrow_array::RecordBatchReader;
+    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_io::object_store::ObjectStore;
+    use object_store::path::Path;
+
+    use crate::v2::writer::{FileWriter, FileWriterOptions};
+
+    #[tokio::test]
+    async fn test_basic_write() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = Path::parse(tmp_path).unwrap();
+        let tmp_path = tmp_path.child("some_file.lance");
+        let obj_store = Arc::new(ObjectStore::local());
+
+        let reader = gen()
+            .col(Some("score".to_string()), array::rand::<Float64Type>())
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(10));
+
+        let writer = obj_store.create(&tmp_path).await.unwrap();
+
+        let mut file_writer = FileWriter::try_new(
+            writer,
+            (*reader.schema()).clone(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        for batch in reader {
+            file_writer.write_batch(&batch.unwrap()).await.unwrap();
+        }
+        file_writer.finish().await.unwrap();
     }
 }

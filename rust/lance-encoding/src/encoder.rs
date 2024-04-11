@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use arrow_array::ArrayRef;
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, Schema};
@@ -106,7 +109,7 @@ pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
 /// column with three fields (a boolean field, an int32 field, and a 4096-dimension
 /// tensor field) the tensor field is likely to emit encoded pages much more frequently
 /// than the boolean field.
-pub trait FieldEncoder {
+pub trait FieldEncoder: Send {
     /// Buffer the data and, if there is enough data in the buffer to form a page, return
     /// an encoding task to encode the data.
     ///

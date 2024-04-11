@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use arrow_array::types::{Float32Type, Int16Type, Int32Type, Int64Type, Int8Type};
 use criterion::{
     criterion_group, criterion_main, measurement::Measurement, BenchmarkGroup, Criterion,

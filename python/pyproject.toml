@@ -12,13 +12,13 @@ keywords = [
     "data-science",
     "machine-learning",
     "arrow",
-    "data-analytics"
+    "data-analytics",
 ]
 categories = [
     "database-implementations",
     "data-structures",
     "development-tools",
-    "science"
+    "science",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -56,17 +56,22 @@ tests = [
     "polars[pyarrow,pandas]",
     "pytest",
     "tensorflow",
+    # Remove when https://github.com/h5py/h5py/issues/2408 is resolved
+    # We don't need h5py but it is transitive from tensorflow and 3.11
+    # is missing wheels for arm so we need to prevent that version.
+    "h5py<3.11",
     "tqdm",
 ]
 dev = ["ruff==0.2.2"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
+ray = ["ray[data]; python_version<'3.12'"]
 
 [tool.ruff]
-lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "CPY001", "B019"]
+lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 
 [tool.ruff.lint.per-file-ignores]
-"*.pyi" = ["E302"]
+"*.pyi" = ["E301", "E302"]
 
 [tool.mypy]
 python_version = "3.11"
