@@ -1,4 +1,4 @@
-Lance ❤️  Ray
+Lance ❤️ Ray
 --------------------
 
 Ray effortlessly scale up ML workload to large distributed compute environment.
