@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import logging
-from typing import TYPE_CHECKING, Iterable, List, Optional, Union, Literal, Tuple
 from itertools import chain
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Tuple, Union
 
 import pyarrow as pa
 
