@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::array::{RecordBatch, StructArray};
+use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::{DataType, Schema};
@@ -22,11 +22,11 @@ use jni::{
     JNIEnv,
 };
 use snafu::{location, Location};
+use std::iter::once;
 
 use lance::dataset::{fragment::FileFragment, scanner::Scanner};
 use lance_io::ffi::to_ffi_arrow_array_stream;
 
-use crate::traits::SingleRecordBatchReader;
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     error::{Error, Result},
@@ -119,7 +119,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray(
 
     let record_batch = RecordBatch::from(StructArray::from(array_data));
     let batch_schema = record_batch.schema().clone();
-    let reader = SingleRecordBatchReader::new(Some(record_batch), batch_schema);
+    let reader = RecordBatchIterator::new(once(Ok(record_batch)), batch_schema);
 
     let path_str: String = ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), -1);
     let fragment_id_opts = ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), -1);

@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::empty;
 use std::sync::Arc;
 
+use arrow::array::RecordBatchIterator;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::Schema;
@@ -24,7 +26,6 @@ use lazy_static::lazy_static;
 use snafu::{location, Location};
 use traits::IntoJava;
 
-use crate::traits::SingleRecordBatchReader;
 use crate::utils::extract_write_params;
 
 #[macro_export]
@@ -91,7 +92,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
             location: location!(),
         })
     );
-    let reader = SingleRecordBatchReader::new(None, Arc::new(schema));
+
+    let reader = RecordBatchIterator::new(empty(), Arc::new(schema));
 
     let path_str: String = ok_or_throw!(env, path.extract(&mut env));
 
