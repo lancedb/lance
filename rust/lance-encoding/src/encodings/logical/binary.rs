@@ -25,7 +25,7 @@ use super::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder};
 
 // TODO: Support large string, binary, large binary
 
-/// A logical scheduler for utf8 pages which assumes the data are encoded as List<u8>
+/// A logical scheduler for utf8/binary pages which assumes the data are encoded as List<u8>
 #[derive(Debug)]
 pub struct BinaryPageScheduler {
     varbin_scheduler: Box<dyn LogicalPageScheduler>,
@@ -49,7 +49,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
         scheduler: &Arc<dyn crate::EncodingsIo>,
         sink: &tokio::sync::mpsc::UnboundedSender<Box<dyn crate::decoder::LogicalPageDecoder>>,
     ) -> Result<()> {
-        trace!("Scheduling utf8 for {} ranges", ranges.len());
+        trace!("Scheduling binary for {} ranges", ranges.len());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         self.varbin_scheduler
             .schedule_ranges(ranges, scheduler, &tx)?;
@@ -71,7 +71,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
         scheduler: &Arc<dyn crate::EncodingsIo>,
         sink: &tokio::sync::mpsc::UnboundedSender<Box<dyn crate::decoder::LogicalPageDecoder>>,
     ) -> Result<()> {
-        trace!("Scheduling utf8 for {} indices", indices.len());
+        trace!("Scheduling binary for {} indices", indices.len());
         self.schedule_ranges(
             &indices
                 .iter()
@@ -106,7 +106,7 @@ impl LogicalPageDecoder for BinaryPageDecoder {
         Ok(NextDecodeTask {
             has_more: inner_task.has_more,
             num_rows: inner_task.num_rows,
-            task: Box::new(Utf8ArrayDecoder {
+            task: Box::new(BinaryArrayDecoder {
                 inner: inner_task.task,
                 data_type: self.data_type.clone(),
             }),
@@ -122,12 +122,12 @@ impl LogicalPageDecoder for BinaryPageDecoder {
     }
 }
 
-pub struct Utf8ArrayDecoder {
+pub struct BinaryArrayDecoder {
     inner: Box<dyn DecodeArrayTask>,
     data_type: DataType,
 }
 
-impl Utf8ArrayDecoder {
+impl BinaryArrayDecoder {
     fn from_list_array(data_type: &DataType, array: &GenericListArray<i32>) -> ArrayRef {
         let values = array
             .values()
@@ -151,7 +151,7 @@ impl Utf8ArrayDecoder {
     }
 }
 
-impl DecodeArrayTask for Utf8ArrayDecoder {
+impl DecodeArrayTask for BinaryArrayDecoder {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
         let data_type = self.data_type;
         let arr = self.inner.decode()?;
@@ -204,7 +204,7 @@ impl BinaryFieldEncoder {
         match array.data_type() {
             DataType::Utf8 => Self::byte_to_list_array(array.as_string::<i32>()),
             DataType::Binary => Self::byte_to_list_array(array.as_binary::<i32>()),
-            _ => panic!("Utf8 encoder does not support {}", array.data_type()),
+            _ => panic!("Binary encoder does not support {}", array.data_type()),
         }
     }
 }
