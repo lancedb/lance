@@ -65,6 +65,7 @@ tests = [
 dev = ["ruff==0.2.2"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
+ray = ["ray[data]"]
 
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
