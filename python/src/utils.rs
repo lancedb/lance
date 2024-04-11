@@ -31,8 +31,9 @@ use lance_linalg::{
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
+    exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
+    types::PyList,
 };
 
 use crate::RT;
@@ -144,7 +145,7 @@ pub struct HNSW {
 impl HNSW {
     #[staticmethod]
     #[pyo3(signature = (
-        vectors_array, 
+        vectors_array,
         max_level=7,
         m=20,
         m_max=40,
@@ -152,13 +153,13 @@ impl HNSW {
         use_select_heuristic=true,
     ))]
     fn build(
-        vectors_array: PyAny,
+        vectors_array: &PyAny,
         max_level: u16,
         m: usize,
         m_max: usize,
         ef_construction: usize,
         use_select_heuristic: bool,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Self> {
         let params = HnswBuildParams::default()
             .max_level(max_level)
             .num_edges(m)
@@ -166,24 +167,40 @@ impl HNSW {
             .ef_construction(ef_construction)
             .use_select_heuristic(use_select_heuristic);
 
-        let vectors_array = ArrayData::from_pyarrow(&vectors_array)?;
-        let vectors_array = FixedSizeListArray::from(data);
+        let vectors_array = vectors_array.downcast::<PyList>()?;
+        let mut data: Vec<Arc<dyn Array>> = Vec::with_capacity(vectors_array.len());
+        for vectors in vectors_array {
+            let vectors = ArrayData::from_pyarrow(vectors)?;
+            if !matches!(vectors.data_type(), DataType::FixedSizeList(_, _)) {
+                return Err(PyValueError::new_err("Must be a FixedSizeList"));
+            }
+            data.push(Arc::new(FixedSizeListArray::from(vectors)));
+        }
 
-        let (hnsw, fsl) = build_hnsw_model(params, vectors_array.downcast::<>())?;
+        let (hnsw, fsl) = build_hnsw_model(params.clone(), data)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self { params, hnsw, fsl })
     }
 
     #[pyo3(signature = (file_path))]
     fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
         let object_store = ObjectStore::local();
-        let path = Path::from_filesystem_path(file_path)?;
-        let writer = RT.block_on(Some(py),FileWriter::<ManifestDescribing>::try_new(
-            &object_store,
-            &path,
-            Schema::try_from(self.hnsw.schema().as_ref())?,
-            &Default::default(),
-        ))??;
-        RT.block_on(Some(py), self.hnsw.write(&mut writer))??;
+        let path =
+            Path::from_filesystem_path(file_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let mut writer = RT
+            .block_on(
+                Some(py),
+                FileWriter::<ManifestDescribing>::try_new(
+                    &object_store,
+                    &path,
+                    Schema::try_from(self.hnsw.schema().as_ref())
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                    &Default::default(),
+                ),
+            )?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        RT.block_on(Some(py), self.hnsw.write(&mut writer))?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(())
     }
 }

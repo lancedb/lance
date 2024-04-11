@@ -11,8 +11,7 @@ import pyarrow as pa
 from .dependencies import _check_for_numpy, _check_for_pandas
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
-from .lance import _KMeans
-from .lance import _HNSW
+from .lance import _HNSW, _KMeans
 
 if TYPE_CHECKING:
     ts_types = Union[datetime, pd.Timestamp, str]
