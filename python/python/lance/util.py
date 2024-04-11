@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Literal, Optional, Union, Iterator
+from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union
 
 import pyarrow as pa
 
