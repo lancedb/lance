@@ -35,27 +35,6 @@ class LanceDatasink(ray.data.Datasink):
     max_rows_per_file : int, optional
         The maximum number of rows per file. Default is 1024 * 1024.
 
-
-    Examples
-    --------
-
-    .. code-block:: python
-
-        import ray
-        import lance
-        import pyarrow as pa
-
-        ray.init()
-
-        schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
-        sink = lance.ray.sink.LanceDatasink("path/to/dataset", schema=schema)
-        (
-            ray.data
-            .range(10)
-            .map(lambda x: {"id": x["id"], "str": f"str-{x['id']}"})
-            .write_datasink(sink)
-        )
-
     """
 
     NAME = "Lance"
