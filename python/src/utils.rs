@@ -16,11 +16,15 @@ use std::sync::Arc;
 
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, UInt32Array,
+    cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, UInt32Array, UInt64Array,
 };
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use lance::{datatypes::Schema, index::vector::{hnsw::builder::*, sq}, io::ObjectStore};
+use lance::{
+    datatypes::Schema,
+    index::vector::{hnsw::builder::*, sq},
+    io::ObjectStore,
+};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -188,13 +192,33 @@ impl Hnsw {
 
 #[pyfunction(name = "_build_sq_storage")]
 fn build_sq_storage(
-    row_ids_array: &PyAny,
+    py: Python,
+    row_ids_array: &PyList,
     vectors: &PyAny,
     dim: usize,
     bounds: &PyTuple,
     file_path: &str,
 ) -> PyResult<PyObject> {
-    let quantizer = lance_index::vector::sq::ScalarQuantizer::with_bounds(8, dim, MetricType::L2, bounds[0]..bounds[1]);
-    let storage = sq::build_sq_storage(metric_type, row_ids_array, vectors, quantizer).map_err(|e| PyIOError::new_err(e.to_string()))?;
+    let mut row_ids_arr: Vec<Arc<dyn Array>> = Vec::with_capacity(row_ids_array.len());
+    for row_ids in row_ids_array {
+        let row_ids = ArrayData::from_pyarrow(row_ids)?;
+        if !matches!(row_ids.data_type(), DataType::UInt64) {
+            return Err(PyValueError::new_err("Must be a UInt64"));
+        }
+        row_ids_arr.push(Arc::new(UInt64Array::from(row_ids)));
+    }
+
+    let vectors = Arc::new(FixedSizeListArray::from(ArrayData::from_pyarrow(vectors)?));
+
+    let lower_bound = bounds.get_item(0)?.extract::<f64>()?;
+    let upper_bound = bounds.get_item(1)?.extract::<f64>()?;
+    let quantizer = lance_index::vector::sq::ScalarQuantizer::with_bounds(
+        8,
+        dim,
+        MetricType::L2,
+        lower_bound..upper_bound,
+    );
+    let storage = sq::build_sq_storage(MetricType::L2, row_ids_arr, vectors, quantizer)
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
     storage.batch().clone().to_pyarrow(py)
 }
