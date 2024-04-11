@@ -9,8 +9,8 @@ use lance_core::Result;
 
 use crate::{
     encodings::logical::{
-        list::ListFieldEncoder, primitive::PrimitiveFieldEncoder, r#struct::StructFieldEncoder,
-        utf8::Utf8FieldEncoder,
+        binary::BinaryFieldEncoder, list::ListFieldEncoder, primitive::PrimitiveFieldEncoder,
+        r#struct::StructFieldEncoder,
     },
     format::pb,
 };
@@ -220,10 +220,10 @@ impl BatchEncoder {
                     header_col_idx,
                 )))
             }
-            DataType::Utf8 => {
+            DataType::Utf8 | DataType::Binary => {
                 let my_col_idx = *col_idx;
                 *col_idx += 2;
-                Ok(Box::new(Utf8FieldEncoder::new(
+                Ok(Box::new(BinaryFieldEncoder::new(
                     cache_bytes_per_column,
                     my_col_idx,
                 )))
