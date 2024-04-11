@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import logging
-from typing import TYPE_CHECKING, Iterable, Union
+from typing import TYPE_CHECKING, Iterable, Optional, Union
 
 import pyarrow as pa
 
@@ -48,7 +48,7 @@ class LanceDatasink(ray.data.Datasink):
     def __init__(
         self,
         uri: str,
-        schema: pa.Schema | None = None,
+        schema: Optional[pa.Schema] = None,
         mode: str = "create",
         max_rows_per_file: int = 1024 * 1024,
         *args,
@@ -85,14 +85,13 @@ class LanceDatasink(ray.data.Datasink):
         from ..dependencies import _PANDAS_AVAILABLE
         from ..dependencies import pandas as pd
 
-        # TODO: use v2
+        # TODO: use v2 writer later.
         def record_batch_converter():
             for block in blocks:
                 if _PANDAS_AVAILABLE and isinstance(block, pd.DataFrame):
                     tbl = pa.Table.from_pandas(block, schema=self.schema)
                 else:
                     tbl = block
-                print("tbl", tbl)
                 yield from tbl.to_batches()
 
         reader = pa.RecordBatchReader.from_batches(
