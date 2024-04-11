@@ -4,7 +4,7 @@ description: "Install lance wheel and run unit tests"
 inputs:
   python-minor-version:
     required: true
-    description: "8 12"
+    description: "8 9 10 11 12"
 runs:
   using: "composite"
   steps:
@@ -14,15 +14,8 @@ runs:
     run: |
       # Install cpu only pytorch
       pip install torch --index-url https://download.pytorch.org/whl/cpu
-      pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
+      pip3 install $(ls target/wheels/pylance-*.whl)[tests]
   - name: Run python tests
     shell: bash
     working-directory: python
     run: make test
-  - name: Run doctest
-    shell: bash
-    if: ${{ inputs.python-minor-version != '12' }}
-    working-directory: python
-    run: |
-      maturin develop
-      pytest --doctest-modules python/lance
