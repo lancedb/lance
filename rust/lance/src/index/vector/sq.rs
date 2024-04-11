@@ -6,7 +6,10 @@ use std::sync::Arc;
 use arrow::{compute::concat, datatypes::Float32Type};
 use arrow_array::{Array, RecordBatch};
 use lance_core::{Result, ROW_ID};
-use lance_index::vector::{quantizer::Quantization, sq::{builder::SQBuildParams, storage::ScalarQuantizationStorage, ScalarQuantizer}};
+use lance_index::vector::{
+    quantizer::Quantization,
+    sq::{builder::SQBuildParams, storage::ScalarQuantizationStorage, ScalarQuantizer},
+};
 use lance_linalg::{distance::MetricType, kernels::normalize_fsl};
 
 use crate::{index::vector::utils::maybe_sample_training_data, Dataset};

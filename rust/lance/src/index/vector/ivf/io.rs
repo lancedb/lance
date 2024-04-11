@@ -39,8 +39,8 @@ use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
-use crate::index::vector::{hnsw::builder::build_hnsw_model, sq::build_sq_storage};
 use crate::index::vector::pq::PQIndex;
+use crate::index::vector::{hnsw::builder::build_hnsw_model, sq::build_sq_storage};
 use crate::{dataset::ROW_ID, Dataset};
 use crate::{utils, Result};
 
