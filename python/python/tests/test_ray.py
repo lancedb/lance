@@ -3,10 +3,9 @@
 
 from pathlib import Path
 
+import lance
 import pyarrow as pa
 import pytest
-
-import lance
 
 ray = pytest.importorskip("ray")
 
