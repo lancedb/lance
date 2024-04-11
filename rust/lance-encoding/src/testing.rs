@@ -95,7 +95,7 @@ fn supports_nulls(data_type: &DataType) -> bool {
     // types we don't support.
     !matches!(
         data_type,
-        DataType::List(_) | DataType::Struct(_) | DataType::Utf8
+        DataType::List(_) | DataType::Struct(_) | DataType::Utf8 | DataType::Binary
     )
 }
 
