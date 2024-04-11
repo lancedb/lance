@@ -20,7 +20,7 @@ use arrow_array::{
 };
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use lance::{datatypes::Schema, index::vector::hnsw::builder::*, io::ObjectStore};
+use lance::{datatypes::Schema, index::vector::{hnsw::builder::*, sq}, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -33,7 +33,7 @@ use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::PyList,
+    types::{PyList, PyTuple},
 };
 
 use crate::RT;
@@ -134,15 +134,15 @@ impl KMeans {
     }
 }
 
-#[pyclass(name = "_HNSW")]
-pub struct HNSW {
+#[pyclass(name = "_Hnsw")]
+pub struct Hnsw {
     params: HnswBuildParams,
     hnsw: lance_index::vector::hnsw::HNSW,
     fsl: Arc<dyn Array>,
 }
 
 #[pymethods]
-impl HNSW {
+impl Hnsw {
     #[staticmethod]
     #[pyo3(signature = (
         vectors_array,
@@ -153,7 +153,7 @@ impl HNSW {
         use_select_heuristic=true,
     ))]
     fn build(
-        vectors_array: &PyAny,
+        vectors_array: &PyList,
         max_level: u16,
         m: usize,
         m_max: usize,
@@ -167,7 +167,6 @@ impl HNSW {
             .ef_construction(ef_construction)
             .use_select_heuristic(use_select_heuristic);
 
-        let vectors_array = vectors_array.downcast::<PyList>()?;
         let mut data: Vec<Arc<dyn Array>> = Vec::with_capacity(vectors_array.len());
         for vectors in vectors_array {
             let vectors = ArrayData::from_pyarrow(vectors)?;
@@ -182,25 +181,20 @@ impl HNSW {
         Ok(Self { params, hnsw, fsl })
     }
 
-    #[pyo3(signature = (file_path))]
-    fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
-        let object_store = ObjectStore::local();
-        let path =
-            Path::from_filesystem_path(file_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let mut writer = RT
-            .block_on(
-                Some(py),
-                FileWriter::<ManifestDescribing>::try_new(
-                    &object_store,
-                    &path,
-                    Schema::try_from(self.hnsw.schema().as_ref())
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
-                    &Default::default(),
-                ),
-            )?
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        RT.block_on(Some(py), self.hnsw.write(&mut writer))?
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(())
+    fn vectors(&self, py: Python) -> PyResult<PyObject> {
+        self.fsl.to_data().to_pyarrow(py)
     }
+}
+
+#[pyfunction(name = "_build_sq_storage")]
+fn build_sq_storage(
+    row_ids_array: &PyAny,
+    vectors: &PyAny,
+    dim: usize,
+    bounds: &PyTuple,
+    file_path: &str,
+) -> PyResult<PyObject> {
+    let quantizer = lance_index::vector::sq::ScalarQuantizer::with_bounds(8, dim, MetricType::L2, bounds[0]..bounds[1]);
+    let storage = sq::build_sq_storage(metric_type, row_ids_array, vectors, quantizer).map_err(|e| PyIOError::new_err(e.to_string()))?;
+    storage.batch().clone().to_pyarrow(py)
 }

@@ -5,14 +5,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::array::AsArray;
-use arrow::datatypes::Float32Type;
-use arrow_array::Array;
 use lance_file::writer::FileWriter;
-use lance_index::vector::graph::memory::InMemoryVectorStorage;
-use lance_index::vector::hnsw::{HNSWBuilder, HNSW};
 use lance_index::vector::quantizer::Quantizer;
-use lance_linalg::MatrixView;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::{location, Location};

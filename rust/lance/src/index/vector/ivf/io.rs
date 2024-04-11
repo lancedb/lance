@@ -24,8 +24,6 @@ use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::storage::ProductQuantizationStorage;
 use lance_index::vector::quantizer::{Quantization as _, Quantizer};
-use lance_index::vector::sq::storage::ScalarQuantizationStorage;
-use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
@@ -41,7 +39,7 @@ use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
-use crate::index::vector::hnsw::builder::build_hnsw_model;
+use crate::index::vector::{hnsw::builder::build_hnsw_model, sq::build_sq_storage};
 use crate::index::vector::pq::PQIndex;
 use crate::{dataset::ROW_ID, Dataset};
 use crate::{utils, Result};
@@ -502,28 +500,6 @@ async fn build_hnsw_quantization_partition(
     }
 
     Ok(length)
-}
-
-fn build_sq_storage(
-    metric_type: MetricType,
-    row_ids_array: Vec<Arc<dyn Array>>,
-    vectors: Arc<dyn Array>,
-    sq: ScalarQuantizer,
-) -> Result<ScalarQuantizationStorage> {
-    let code_column = sq.transform::<Float32Type>(vectors.as_ref())?;
-    std::mem::drop(vectors);
-
-    let row_ids_arrs = row_ids_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-    let row_ids_column = concat(&row_ids_arrs)?;
-    std::mem::drop(row_ids_array);
-
-    let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
-        (ROW_ID, row_ids_column, true),
-        (sq.column(), code_column, false),
-    ])?;
-    let store = ScalarQuantizationStorage::new(sq.num_bits(), metric_type, sq.bounds(), pq_batch)?;
-
-    Ok(store)
 }
 
 #[cfg(test)]
