@@ -383,8 +383,8 @@ impl HNSW {
     }
 
     /// Write the HNSW graph to a Lance file.
-    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
-        self.write_levels(writer).await?;
+    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
+        let total_rows = self.write_levels(writer).await?;
 
         let index_metadata = json!(IndexMetadata {
             index_type: HNSW_TYPE.to_string(),
@@ -402,7 +402,7 @@ impl HNSW {
             serde_json::to_string(&hnsw_metadata)?,
         );
         writer.finish_with_metadata(&metadata).await?;
-        Ok(())
+        Ok(total_rows)
     }
 
     /// Write partitioned HNSWs to the file.

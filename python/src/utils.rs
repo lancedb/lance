@@ -20,11 +20,16 @@ use arrow_array::{
 };
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use lance::{datatypes::Schema, index::vector::hnsw::builder::*, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_file::writer::FileWriter;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::{
     distance::MetricType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
 };
+use lance_table::io::manifest::ManifestDescribing;
+use object_store::path::Path;
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
@@ -125,5 +130,58 @@ impl KMeans {
         } else {
             Ok(py.None())
         }
+    }
+}
+
+#[pyclass(name = "_HNSW")]
+pub struct HNSW {
+    params: HnswBuildParams,
+    hnsw: lance_index::vector::hnsw::HNSW,
+    fsl: Arc<dyn Array>,
+}
+
+#[pymethods]
+impl HNSW {
+    #[staticmethod]
+    #[pyo3(signature = (
+        vectors_array, 
+        max_level=7,
+        m=20,
+        m_max=40,
+        ef_construction=100,
+        use_select_heuristic=true,
+    ))]
+    fn build(
+        vectors_array: PyAny,
+        max_level: u16,
+        m: usize,
+        m_max: usize,
+        ef_construction: usize,
+        use_select_heuristic: bool,
+    ) -> PyResult<PyObject> {
+        let params = HnswBuildParams::default()
+            .max_level(max_level)
+            .num_edges(m)
+            .max_num_edges(m_max)
+            .ef_construction(ef_construction)
+            .use_select_heuristic(use_select_heuristic);
+
+        let (hnsw, fsl) = build_hnsw_model(params, vectors_array)?;
+        Ok(Self { params, hnsw, fsl })
+    }
+
+    #[pyo3(signature = (file_path))]
+    fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
+        let object_store = ObjectStore::local();
+        let path = Path::from_filesystem_path(file_path)?;
+        let writer = FileWriter::<ManifestDescribing>::try_new(
+            &object_store,
+            &path,
+            Schema::try_from(self.hnsw.schema().as_ref())?,
+            &Default::default(),
+        )
+        .await?;
+        RT.block_on(Some(py), self.hnsw.write(&mut writer))??;
+        Ok(())
     }
 }

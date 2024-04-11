@@ -12,6 +12,7 @@ from .dependencies import _check_for_numpy, _check_for_pandas
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .lance import _KMeans
+from .lance import _HNSW
 
 if TYPE_CHECKING:
     ts_types = Union[datetime, pd.Timestamp, str]
@@ -217,3 +218,27 @@ def validate_vector_index(
         raise ValueError(
             f"Vector index failed sanity check, only {passes}/{total} passed"
         )
+
+
+class HNSW:
+    _hnsw = None
+
+    def __init__(self, hnsw) -> None:
+        self._hnsw = hnsw
+
+    @staticmethod
+    def build(
+        vectors_array,
+        max_level=7,
+        m=20,
+        m_max=40,
+        ef_construction=100,
+        use_select_heuristic=True,
+    ) -> HNSW:
+        hnsw = _HNSW.build(
+            vectors_array, max_level, m, m_max, ef_construction, use_select_heuristic
+        )
+        return HNSW(hnsw)
+
+    def to_lance_file(self, file_path):
+        self._hnsw.to_lance_file(file_path)

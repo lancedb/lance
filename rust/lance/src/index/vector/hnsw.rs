@@ -38,6 +38,8 @@ use super::opq::train_opq;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 
+pub mod builder;
+
 #[derive(Clone)]
 pub(crate) struct HNSWIndexOptions {
     pub use_residual: bool,

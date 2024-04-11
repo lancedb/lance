@@ -40,8 +40,8 @@ use snafu::{location, Location};
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
-use super::builder::build_hnsw_model;
 use super::{IVFIndex, Ivf};
+use crate::index::vector::hnsw::builder::build_hnsw_model;
 use crate::index::vector::pq::PQIndex;
 use crate::{dataset::ROW_ID, Dataset};
 use crate::{utils, Result};
@@ -453,12 +453,7 @@ async fn build_hnsw_quantization_partition(
         utils::tokio::spawn_cpu(move || build_hnsw_model((*hnsw_params).clone(), vector_batches))
             .await?;
 
-    writer.add_metadata(
-        HNSW_METADATA_KEY,
-        serde_json::to_string(&hnsw.metadata())?.as_str(),
-    );
-    let length = hnsw.write_levels(&mut writer).await?;
-    writer.finish().await?;
+    let length = hnsw.write(&mut writer).await?;
     std::mem::drop(hnsw);
 
     let quantization_storage_batch = match quantizer {

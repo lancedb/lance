@@ -20,7 +20,7 @@ pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 /// Parameters of building HNSW index
 #[derive(Debug, Clone)]
 pub struct HnswBuildParams {
-    /// max level of
+    /// max level ofm
     pub max_level: u16,
 
     /// number of connections to establish while inserting new element
