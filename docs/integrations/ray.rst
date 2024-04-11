@@ -18,6 +18,8 @@ Ray effortlessly scale up ML workload to large distributed compute environment.
     import ray
     from lance.ray.sink import LanceDatasink
 
+    ray.init()
+
     sink = LanceDatasink("s3://bucket/to/data.lance")
     ray.data.range(10).map(
         lambda x: {"id": x["id"], "str": f"str-{x['id']}"}
