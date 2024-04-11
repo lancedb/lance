@@ -72,7 +72,8 @@ jobs:
       run: |
         python -m venv venv
         source venv/bin/activate
-        pip install torch tqdm "ray[data]" --index-url https://download.pytorch.org/whl/cpu
+        pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
+        pip install "ray[data]" maturin
         maturin develop --extras tests
     - name: Run doctest
       run: |
