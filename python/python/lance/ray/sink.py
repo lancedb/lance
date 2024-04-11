@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import logging
-from typing import TYPE_CHECKING, Iterable, Optional, Union
+from typing import TYPE_CHECKING, Iterable, List, Optional, Union
 
 import pyarrow as pa
 
@@ -122,7 +122,7 @@ class LanceDatasink(ray.data.Datasink):
             if self.schema is None:
                 self.schema = ds.schema
 
-    def on_write_complete(self, fragments: list[FragmentMetadata]):
+    def on_write_complete(self, fragments: List[FragmentMetadata]):
         logging.info(
             "%s.on_write_complete: committing %s fragments", self, len(fragments)
         )

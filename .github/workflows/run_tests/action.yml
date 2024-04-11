@@ -19,3 +19,7 @@ runs:
     shell: bash
     working-directory: python
     run: make test
+  - name: Run doctest
+    working-directory: python
+    run: |
+      pytest --doctest-modules python/lance

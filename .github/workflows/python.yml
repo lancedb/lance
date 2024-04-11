@@ -64,17 +64,6 @@ jobs:
       run: |
         cargo fmt --all -- --check
         cargo clippy --all-features --tests -- -D warnings
-    - name: Build
-      run: |
-        python -m venv venv
-        source venv/bin/activate
-        pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
-        maturin develop --extras tests
-    - name: Run doctest
-      run: |
-        source venv/bin/activate
-        pytest --doctest-modules python/lance
-
   linux:
     timeout-minutes: 45
     strategy:
