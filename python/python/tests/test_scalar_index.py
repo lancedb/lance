@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import os
 import random
 import string
 from datetime import date, datetime, timedelta
@@ -163,3 +164,28 @@ def test_indexed_vector_scan_postfilter(
     )
 
     assert scanner.to_table().num_rows == 0
+
+
+# We currently allow the memory pool default size to be configured with an
+# environment variable.  This test ensures that the environment variable
+# is respected.
+def test_lance_mem_pool_env_var(tmp_path):
+    strings = pa.array([f"string-{i}" * 10 for i in range(100 * 1024)])
+    table = pa.Table.from_arrays([strings], ["str"])
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Should succeed
+    dataset.create_scalar_index("str", index_type="BTREE")
+
+    try:
+        # Should fail if we intentionally use a very small memory pool
+        os.environ["LANCE_MEM_POOL_SIZE"] = "1024"
+        with pytest.raises(Exception):
+            dataset.create_scalar_index("str", index_type="BTREE", replace=True)
+
+        # Should succeed again since bypassing spilling takes precedence
+        os.environ["LANCE_BYPASS_SPILLING"] = "1"
+        dataset.create_scalar_index("str", index_type="BTREE", replace=True)
+    finally:
+        del os.environ["LANCE_MEM_POOL_SIZE"]
+        del os.environ["LANCE_BYPASS_SPILLING"]
