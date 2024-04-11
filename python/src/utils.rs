@@ -141,7 +141,6 @@ impl KMeans {
 
 #[pyclass(name = "_Hnsw")]
 pub struct Hnsw {
-    params: HnswBuildParams,
     hnsw: lance_index::vector::hnsw::HNSW,
     fsl: Arc<dyn Array>,
 }
@@ -181,9 +180,9 @@ impl Hnsw {
             data.push(Arc::new(FixedSizeListArray::from(vectors)));
         }
 
-        let (hnsw, fsl) = build_hnsw_model(params.clone(), data)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(Self { params, hnsw, fsl })
+        let (hnsw, fsl) =
+            build_hnsw_model(params, data).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(Self { hnsw, fsl })
     }
 
     #[pyo3(signature = (file_path))]

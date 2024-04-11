@@ -40,7 +40,7 @@ use file::{
     LanceFileWriter, LancePageMetadata,
 };
 use futures::StreamExt;
-use lance_index::{vector::hnsw::HNSW, DatasetIndexExt};
+use lance_index::DatasetIndexExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 
