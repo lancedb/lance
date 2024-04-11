@@ -166,7 +166,10 @@ impl HNSW {
             .ef_construction(ef_construction)
             .use_select_heuristic(use_select_heuristic);
 
-        let (hnsw, fsl) = build_hnsw_model(params, vectors_array)?;
+        let vectors_array = ArrayData::from_pyarrow(&vectors_array)?;
+        let vectors_array = FixedSizeListArray::from(data);
+
+        let (hnsw, fsl) = build_hnsw_model(params, vectors_array.downcast::<>())?;
         Ok(Self { params, hnsw, fsl })
     }
 
@@ -174,13 +177,12 @@ impl HNSW {
     fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
         let object_store = ObjectStore::local();
         let path = Path::from_filesystem_path(file_path)?;
-        let writer = FileWriter::<ManifestDescribing>::try_new(
+        let writer = RT.block_on(Some(py),FileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &path,
             Schema::try_from(self.hnsw.schema().as_ref())?,
             &Default::default(),
-        )
-        .await?;
+        ))??;
         RT.block_on(Some(py), self.hnsw.write(&mut writer))??;
         Ok(())
     }

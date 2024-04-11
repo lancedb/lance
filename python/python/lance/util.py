@@ -228,7 +228,7 @@ class HNSW:
 
     @staticmethod
     def build(
-        vectors_array,
+        vectors_array: list[pa.Array],
         max_level=7,
         m=20,
         m_max=40,
