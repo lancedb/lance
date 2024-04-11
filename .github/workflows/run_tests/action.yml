@@ -24,4 +24,5 @@ runs:
     if: ${{ inputs.python-minor-version != '12' }}
     working-directory: python
     run: |
+      maturin develop
       pytest --doctest-modules python/lance
