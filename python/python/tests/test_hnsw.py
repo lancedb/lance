@@ -5,9 +5,17 @@ import lance
 import pyarrow as pa
 
 
-def train_hnsw():
-    data = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
-    arrays = [pa.array(sublist, type=pa.float32()) for sublist in data]
-    vectors = pa.FixedSizeListArray.from_arrays(arrays, size=2)
-    hnsw = lance.util.HNSW.build(vectors)
-    hnsw.to_lance_file("hnsw.idx")
+def test_train_hnsw():
+    arrays = pa.array([1, 2, 3, 4], type=pa.float32())
+    vectors = pa.FixedSizeListArray.from_arrays(arrays, 2)
+    hnsw = lance.util.HNSW.build([vectors])
+    hnsw.to_lance_file("/tmp/hnsw.idx")
+
+
+def test_build_sq_storage():
+    arrays = pa.array([1, 2, 3, 4], type=pa.float32())
+    vectors = pa.FixedSizeListArray.from_arrays(arrays, 2)
+    hnsw = lance.util.HNSW.build([vectors])
+    hnsw.to_lance_file("/tmp/hnsw.idx")
+
+    lance.util.build_sq_storage()

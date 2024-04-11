@@ -11,7 +11,7 @@ import pyarrow as pa
 from .dependencies import _check_for_numpy, _check_for_pandas
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
-from .lance import _Hnsw, _KMeans, _build_sq_storage
+from .lance import _build_sq_storage, _Hnsw, _KMeans
 
 if TYPE_CHECKING:
     ts_types = Union[datetime, pd.Timestamp, str]
@@ -245,5 +245,8 @@ class HNSW:
     def vectors(self) -> pa.Array:
         return self._hnsw.vectors()
 
-def build_sq_storage(row_ids_array: list[pa.Array], vectors_array: pa.Array, dim, bounds: tuple) -> pa.RecordBatch:
-   return _build_sq_storage(row_ids_array, vectors_array, dim, bounds)
+
+def build_sq_storage(
+    row_ids_array: list[pa.Array], vectors_array: pa.Array, dim, bounds: tuple
+) -> pa.RecordBatch:
+    return _build_sq_storage(row_ids_array, vectors_array, dim, bounds)

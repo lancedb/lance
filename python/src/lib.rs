@@ -40,7 +40,7 @@ use file::{
     LanceFileWriter, LancePageMetadata,
 };
 use futures::StreamExt;
-use lance_index::DatasetIndexExt;
+use lance_index::{vector::hnsw::HNSW, DatasetIndexExt};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 
@@ -64,6 +64,8 @@ pub(crate) mod utils;
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::{cleanup_partial_writes, write_fragments};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
+use crate::utils::build_sq_storage;
+use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
 pub use dataset::{Dataset, Operation};
@@ -117,6 +119,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
     m.add_class::<KMeans>()?;
+    m.add_class::<Hnsw>()?;
     m.add_class::<PyCompactionTask>()?;
     m.add_class::<PyCompaction>()?;
     m.add_class::<PyCompactionPlan>()?;
@@ -133,6 +136,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
+    m.add_wrapped(wrap_pyfunction!(build_sq_storage))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
     Ok(())

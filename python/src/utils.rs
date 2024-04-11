@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, UInt32Array, UInt64Array,
+    cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
@@ -185,19 +186,39 @@ impl Hnsw {
         Ok(Self { params, hnsw, fsl })
     }
 
+    #[pyo3(signature = (file_path))]
+    fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
+        let object_store = ObjectStore::local();
+        let path = Path::parse(file_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let mut writer = RT
+            .block_on(
+                Some(py),
+                FileWriter::<ManifestDescribing>::try_new(
+                    &object_store,
+                    &path,
+                    Schema::try_from(self.hnsw.schema().as_ref())
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                    &Default::default(),
+                ),
+            )?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        RT.block_on(Some(py), self.hnsw.write(&mut writer))?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
     fn vectors(&self, py: Python) -> PyResult<PyObject> {
         self.fsl.to_data().to_pyarrow(py)
     }
 }
 
 #[pyfunction(name = "_build_sq_storage")]
-fn build_sq_storage(
+pub fn build_sq_storage(
     py: Python,
     row_ids_array: &PyList,
     vectors: &PyAny,
     dim: usize,
     bounds: &PyTuple,
-    file_path: &str,
 ) -> PyResult<PyObject> {
     let mut row_ids_arr: Vec<Arc<dyn Array>> = Vec::with_capacity(row_ids_array.len());
     for row_ids in row_ids_array {
