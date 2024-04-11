@@ -47,10 +47,10 @@ pub enum Error {
     Arrow { message: String, location: Location },
     #[snafu(display("Index error: {}, location", message))]
     Index { message: String, location: Location },
-    #[snafu(display("Dataset not found error: {}", path))]
-    DatasetNotFound { path: String },
-    #[snafu(display("Dataset already exists error: {}", uri))]
-    DatasetAlreadyExists { uri: String },
+    #[snafu(display("Dataset not found error: {}, location {}", path, location))]
+    DatasetNotFound { path: String, location: Location },
+    #[snafu(display("Dataset already exists error: {}, location {}", uri, location))]
+    DatasetAlreadyExists { uri: String, location: Location },
     #[snafu(display("Unknown error"))]
     Other { message: String },
 }
@@ -102,10 +102,10 @@ impl From<lance::Error> for Error {
             lance::Error::DatasetNotFound {
                 path,
                 source: _,
-                location: _,
-            } => Self::DatasetNotFound { path },
-            lance::Error::DatasetAlreadyExists { uri, location: _ } => {
-                Self::DatasetAlreadyExists { uri }
+                location,
+            } => Self::DatasetNotFound { path, location },
+            lance::Error::DatasetAlreadyExists { uri, location } => {
+                Self::DatasetAlreadyExists { uri, location }
             }
             lance::Error::IO { message, location } => Self::IO { message, location },
             lance::Error::Arrow { message, location } => Self::Arrow { message, location },
