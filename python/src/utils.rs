@@ -38,7 +38,7 @@ use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::{PyList, PyTuple},
+    types::{PyIterator, PyList, PyTuple},
 };
 
 use crate::RT;
@@ -157,7 +157,7 @@ impl Hnsw {
         use_select_heuristic=true,
     ))]
     fn build(
-        vectors_array: &PyList,
+        vectors_array: &PyIterator,
         max_level: u16,
         m: usize,
         m_max: usize,
@@ -171,9 +171,9 @@ impl Hnsw {
             .ef_construction(ef_construction)
             .use_select_heuristic(use_select_heuristic);
 
-        let mut data: Vec<Arc<dyn Array>> = Vec::with_capacity(vectors_array.len());
+        let mut data: Vec<Arc<dyn Array>> = Vec::new();
         for vectors in vectors_array {
-            let vectors = ArrayData::from_pyarrow(vectors)?;
+            let vectors = ArrayData::from_pyarrow(vectors?)?;
             if !matches!(vectors.data_type(), DataType::FixedSizeList(_, _)) {
                 return Err(PyValueError::new_err("Must be a FixedSizeList"));
             }
@@ -214,14 +214,14 @@ impl Hnsw {
 #[pyfunction(name = "_build_sq_storage")]
 pub fn build_sq_storage(
     py: Python,
-    row_ids_array: &PyList,
+    row_ids_array: &PyIterator,
     vectors: &PyAny,
     dim: usize,
     bounds: &PyTuple,
 ) -> PyResult<PyObject> {
-    let mut row_ids_arr: Vec<Arc<dyn Array>> = Vec::with_capacity(row_ids_array.len());
+    let mut row_ids_arr: Vec<Arc<dyn Array>> = Vec::new();
     for row_ids in row_ids_array {
-        let row_ids = ArrayData::from_pyarrow(row_ids)?;
+        let row_ids = ArrayData::from_pyarrow(row_ids?)?;
         if !matches!(row_ids.data_type(), DataType::UInt64) {
             return Err(PyValueError::new_err("Must be a UInt64"));
         }

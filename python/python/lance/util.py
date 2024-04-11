@@ -227,7 +227,7 @@ class HNSW:
 
     @staticmethod
     def build(
-        vectors_array: list[pa.Array],
+        vectors_array: Iterator[pa.Array],
         max_level=7,
         m=20,
         m_max=40,
@@ -247,6 +247,6 @@ class HNSW:
 
 
 def build_sq_storage(
-    row_ids_array: list[pa.Array], vectors_array: pa.Array, dim, bounds: tuple
+    row_ids_array: Iterator[pa.Array], vectors_array: pa.Array, dim, bounds: tuple
 ) -> pa.RecordBatch:
     return _build_sq_storage(row_ids_array, vectors_array, dim, bounds)
