@@ -210,7 +210,7 @@ impl WriterGenerator {
 
         // Use temporary ID 0; will assign ID later.
         let mut fragment = Fragment::new(0);
-        fragment.add_file(&data_file_path, &self.schema);
+        fragment.add_file_legacy(&data_file_path, &self.schema);
 
         let full_path = self.base_dir.child(DATA_DIR).child(data_file_path);
         let writer = FileWriter::try_new(

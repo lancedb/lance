@@ -179,13 +179,46 @@ message DataFile {
   string path = 1;
   // The ids of the fields/columns in this file.
   //
-  // IDs are assigned based on position in the file, offset by the max existing
-  // field id in the table (if any already). So when a fragment is first created
-  // with one file of N columns, the field ids will be 1, 2, ..., N. If a second,
-  // fragment is created with M columns, the field ids will be N+1, N+2, ..., N+M.
+  // In Lance v1 IDs are assigned based on position in the file, offset by the max
+  // existing field id in the table (if any already). So when a fragment is first
+  // created with one file of N columns, the field ids will be 1, 2, ..., N. If a
+  // second, fragment is created with M columns, the field ids will be N+1, N+2,
+  // ..., N+M.
   //
-  // These ids must be sorted and contiguous.
+  // In Lance v1 there is one field for each field in the input schema, this includes
+  // nested fields (both struct and list).  Fixed size list fields have only a single
+  // field id (these are not considered nested fields in Lance v1).
+  //
+  // This allows column offsets to be calculated from field IDs and the input schema.
+  //
+  // In Lance v2 the field IDs generally follow the same pattern but there is no
+  // way to calculate the column offset from the field ID.  This is because a given
+  // field could be encoded in many different ways, some of which occupy a different
+  // number of columns.  For example, a struct field could be encoded into N + 1 columns
+  // or it could be encoded into a single packed column.  To determine column offsets
+  // the column_offsets property should be used instead.
+  //
+  // In Lance v2 a nested field may or may not have its field id recorded here.  In the
+  // "packed struct" example above a nested field would not have a field id recorded here.
+  // If a nested field is not listed here then it is not possible for that field to be
+  // projected / individually loaded and the entire parent field must be loaded instead (this
+  // is the downside of the packed struct)
+  //
+  // In Lance v1 these ids must be sorted and contiguous.
   repeated int32 fields = 2;
+  // The offsets of the columns in the file.
+  //
+  // If the data file is version 1 then the offsets will be empty
+  //
+  // Otherwise there must be one entry for each field in `fields`.
+  repeated uint32 column_offsets = 3;
+  // The major file version used to create the file
+  uint32 file_major_version = 4;
+  // The minor file version used to create the file
+  //
+  // If both `file_major_version` and `file_minor_version` are set to 0,
+  // then this is a version 0.1 or version 0.2 file.
+  uint32 file_minor_version = 5;
 } // DataFile
 
 // Deletion File

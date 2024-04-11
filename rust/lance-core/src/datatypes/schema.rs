@@ -339,6 +339,10 @@ impl Schema {
             })
     }
 
+    pub fn top_level_field_ids(&self) -> Vec<i32> {
+        self.fields.iter().map(|f| f.id).collect()
+    }
+
     // Recursively collect all the field IDs, in pre-order traversal order.
     // TODO: pub(crate)
     pub fn field_ids(&self) -> Vec<i32> {

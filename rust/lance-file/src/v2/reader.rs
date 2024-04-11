@@ -5,6 +5,7 @@ use std::{io::Cursor, ops::Range, pin::Pin, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
+use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::{stream::BoxStream, StreamExt};
@@ -82,6 +83,17 @@ struct Footer {
 }
 
 const FOOTER_LEN: usize = 48;
+
+/// A trait for file readers to be implemented by both the v1 and v2 readers
+#[async_trait]
+pub trait GenericFileReader {
+    /// Reads the requested range of rows from the file, returning as a stream
+    async fn read_range(
+        &self,
+        range: Range<u64>,
+        batch_size: u32,
+    ) -> BoxStream<'static, JoinHandle<Result<RecordBatch>>>;
+}
 
 impl FileReader {
     pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
