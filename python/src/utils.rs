@@ -38,7 +38,7 @@ use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::{PyIterator, PyList, PyTuple},
+    types::{PyIterator, PyTuple},
 };
 
 use crate::RT;
