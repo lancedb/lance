@@ -16,6 +16,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::ipc::gen;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
@@ -389,6 +390,24 @@ impl FragmentMetadata {
             deletion
                 .map(|d| deletion_file_path(&Default::default(), self.inner.id, &d).to_string()),
         )
+    }
+
+    #[getter]
+    fn physical_rows(&self) -> Option<usize> {
+        self.inner.physical_rows
+    }
+
+    #[getter]
+    fn num_deletions(&self) -> Option<usize> {
+        self.inner
+            .deletion_file
+            .as_ref()
+            .and_then(|d| d.num_deleted_rows)
+    }
+
+    #[getter]
+    fn num_rows(&self) -> Option<usize> {
+        self.inner.num_rows()
     }
 
     #[getter]
