@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BinaryHeap};
+use std::collections::BinaryHeap;
 
-
+use super::OrderedFloat;
 use super::OrderedNode;
-use super::{OrderedFloat};
 
 /// GraphNode during build.
 #[derive(Debug, Clone)]

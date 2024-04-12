@@ -207,13 +207,14 @@ impl HNSWBuilder {
         for level in (0..=target_level).rev() {
             self.level_count[level as usize] += 1;
 
-            let (nearest, neighbors) = self.search_level(&ep, self.vectors.vector(node), level)?;
+            let (candidates, neighbors) =
+                self.search_level(&ep, self.vectors.vector(node), level)?;
             for neighbor in neighbors {
                 self.connect(node, neighbor.id, neighbor.dist, level);
                 self.prune(neighbor.id, level);
             }
 
-            ep[0] = nearest;
+            ep = candidates;
         }
 
         Ok(())
@@ -224,7 +225,7 @@ impl HNSWBuilder {
         ep: &[OrderedNode],
         query: &[f32],
         level: u16,
-    ) -> Result<(OrderedNode, Vec<OrderedNode>)> {
+    ) -> Result<(Vec<OrderedNode>, Vec<OrderedNode>)> {
         let cur_level = BuilderLevelView::new(level, self);
         let candidates = beam_search(
             &cur_level,
@@ -250,7 +251,7 @@ impl HNSWBuilder {
                 .collect()
         };
 
-        Ok((candidates[0].clone(), neighbors))
+        Ok((candidates, neighbors))
     }
 
     fn connect(&mut self, u: u32, v: u32, dist: OrderedFloat, level: u16) {
