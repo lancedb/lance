@@ -214,7 +214,7 @@ impl HNSWBuilder {
                 self.prune(neighbor.id, level);
             }
 
-            ep = candidates;
+            ep[0] = candidates[0].clone();
         }
 
         Ok(())
