@@ -40,7 +40,9 @@ def _pd_to_arrow(
     if isinstance(df, dict):
         return pa.Table.from_pydict(df, schema=schema)
     if _PANDAS_AVAILABLE and isinstance(df, pd.DataFrame):
-        return pa.Table.from_pandas(df, schema=schema)
+        tbl = pa.Table.from_pandas(df, schema=schema)
+        tbl.schema = tbl.schema.remove_metadata()
+        return tbl
     return df
 
 
@@ -58,7 +60,10 @@ def _write_fragment(
     if schema is None:
         first = next(stream)
         if _PANDAS_AVAILABLE and isinstance(first, pd.DataFrame):
-            schema = pa.Schema.from_pandas(first).drop_metadata()
+            schema = pa.Schema.from_pandas(first).remove_metadata()
+        elif isinstance(first, Dict):
+            tbl = pa.Table.from_pydict(first)
+            schema = tbl.schema.remove_metadata()
         else:
             schema = first.schema
         stream = chain([first], stream)
@@ -207,12 +212,18 @@ class LanceFragmentWriter:
     def __init__(
         self,
         uri: str,
+        *,
         transform: Callable[[pa.Table], Union[pa.Table, Generator]] = lambda x: x,
         schema: Optional[pa.Schema] = None,
+        max_rows_per_group: int = 1024,  # Only useful for v1 writer.
+        max_rows_per_file: int = 1024 * 1024,
     ):
         self.uri = uri
         self.schema = schema
         self.transform = transform
+
+        self.max_rows_per_group = max_rows_per_group
+        self.max_rows_per_file = max_rows_per_file
 
     def __call__(self, batch: Union[pa.Table, "pd.DataFrame"]) -> Dict[str, Any]:
         """Write a Batch to the Lance fragment."""
@@ -221,11 +232,19 @@ class LanceFragmentWriter:
         if not isinstance(transformed, Generator):
             transformed = (t for t in [transformed])
 
-        fragments = _write_fragment(transformed, self.uri, schema=self.schema)
-        return pa.Table.from_pydict({
-            "fragment": [cloudpickle.dumps(fragment) for fragment, _ in fragments],
-            "schema": [cloudpickle.dumps(schema) for _, schema in fragments],
-        })
+        fragments = _write_fragment(
+            transformed,
+            self.uri,
+            schema=self.schema,
+            max_rows_per_file=self.max_rows_per_file,
+            max_rows_per_group=self.max_rows_per_group,
+        )
+        return pa.Table.from_pydict(
+            {
+                "fragment": [cloudpickle.dumps(fragment) for fragment, _ in fragments],
+                "schema": [cloudpickle.dumps(schema) for _, schema in fragments],
+            }
+        )
 
 
 class LanceCommitter(_BaseLanceDatasink):
