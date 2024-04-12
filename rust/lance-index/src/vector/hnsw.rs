@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
 
-use self::builder::{HNSW_METADATA_KEY};
+use self::builder::HNSW_METADATA_KEY;
 
 use super::graph::memory::InMemoryVectorStorage;
 use super::graph::OrderedNode;
@@ -504,11 +504,7 @@ pub(crate) fn select_neighbors_heuristic(
     k: usize,
     extend_candidates: bool,
 ) -> impl Iterator<Item = OrderedNode> {
-    let mut w = candidates
-        .iter()
-        .cloned()
-        .map(Reverse)
-        .collect::<BinaryHeap<_>>();
+    let mut w = candidates.iter().cloned().collect::<Vec<_>>();
 
     if extend_candidates {
         let dist_calc = graph.storage().dist_calculator(query);
@@ -519,7 +515,7 @@ pub(crate) fn select_neighbors_heuristic(
                 neighbors.for_each(|n| {
                     if !visited.contains(&n) {
                         let d: OrderedFloat = dist_calc.distance(&[n])[0].into();
-                        w.push(Reverse((d, n).into()));
+                        w.push(OrderedNode::new(n, d));
                     }
                     visited.insert(n);
                 });
@@ -527,15 +523,18 @@ pub(crate) fn select_neighbors_heuristic(
         });
     }
 
+    w.sort();
+    w.reverse();
+
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
-    let mut discarded = Vec::new();
+    let mut discarded = Vec::with_capacity(k);
     let storage = graph.storage();
     let storage = storage
         .as_any()
         .downcast_ref::<InMemoryVectorStorage>()
         .unwrap();
     while !w.is_empty() && results.len() < k {
-        let u = w.pop().unwrap().0;
+        let u = w.pop().unwrap();
 
         if results.is_empty()
             || results
@@ -543,7 +542,7 @@ pub(crate) fn select_neighbors_heuristic(
                 .all(|v| u.dist < OrderedFloat(storage.distance_between(u.id, v.id)))
         {
             results.push(u);
-        } else {
+        } else if discarded.len() < k - results.len() {
             discarded.push(u);
         }
     }

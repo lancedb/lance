@@ -214,7 +214,7 @@ impl HNSWBuilder {
                 self.prune(neighbor.id, level);
             }
 
-            ep = candidates;
+            ep[0] = candidates[0].clone();
         }
 
         Ok(())
@@ -260,11 +260,13 @@ impl HNSWBuilder {
     }
 
     fn prune(&mut self, node: u32, level: u16) {
+        let level_neighbors = &self.nodes[node as usize].level_neighbors[level as usize];
+        if level_neighbors.len() <= self.params.m_max {
+            return;
+        }
+
         let level_view = BuilderLevelView::new(level, self);
-        let neighbors: Vec<OrderedNode> = self.nodes[node as usize].level_neighbors[level as usize]
-            .iter()
-            .cloned()
-            .collect();
+        let neighbors: Vec<OrderedNode> = level_neighbors.iter().cloned().collect();
 
         let new_neighbors = select_neighbors_heuristic(
             &level_view,
