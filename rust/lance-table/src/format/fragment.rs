@@ -345,7 +345,7 @@ mod tests {
             json!({
                 "id": 123,
                 "files":[
-                    {"path": "foobar.lance", "fields": [0]}],
+                    {"path": "foobar.lance", "fields": [0], "column_offsets": [], "file_major_version": 0, "file_minor_version": 0}],
                      "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                        "num_deleted_rows": 10},
                 "physical_rows": None::<usize>}),
