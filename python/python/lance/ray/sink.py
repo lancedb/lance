@@ -20,7 +20,7 @@ import cloudpickle
 import pyarrow as pa
 
 import lance
-from lance.fragment import FragmentMetadata, LanceFragment, write_fragments
+from lance.fragment import FragmentMetadata, write_fragments
 
 from ..dependencies import ray
 
@@ -221,11 +221,11 @@ class LanceFragmentWriter:
         if not isinstance(transformed, Generator):
             transformed = (t for t in [transformed])
 
-        fragment, schema = _write_fragment(transformed, self.uri, schema=self.schema)
+        fragments = _write_fragment(transformed, self.uri, schema=self.schema)
         return pa.Table.from_pydict(
             {
-                "fragment": [cloudpickle.dumps(fragment)],
-                "schema": [cloudpickle.dumps(schema)],
+                "fragment": [cloudpickle.dumps(fragment) for fragment, _ in fragments],
+                "schema": [cloudpickle.dumps(schema) for _, schema in fragments],
             }
         )
 
