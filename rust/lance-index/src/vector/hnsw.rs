@@ -504,6 +504,9 @@ pub(crate) fn select_neighbors_heuristic(
     k: usize,
     extend_candidates: bool,
 ) -> impl Iterator<Item = OrderedNode> {
+    if candidates.len() <= k {
+        return candidates.iter().cloned().collect_vec().into_iter();
+    }
     let mut w = candidates.iter().cloned().collect::<Vec<_>>();
 
     if extend_candidates {
@@ -523,8 +526,7 @@ pub(crate) fn select_neighbors_heuristic(
         });
     }
 
-    w.sort();
-    w.reverse();
+    w.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
     let mut discarded = Vec::with_capacity(k);
