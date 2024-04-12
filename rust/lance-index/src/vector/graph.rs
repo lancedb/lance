@@ -156,8 +156,8 @@ pub trait Graph {
 /// ----------
 /// graph : Graph
 ///  The graph to search.
-/// start : I
-///  The index starting point.
+/// start : &[OrderedNode]
+///  The starting point.
 /// query : &[f32]
 ///  The query vector.
 /// k : usize
@@ -171,20 +171,16 @@ pub trait Graph {
 ///
 pub(super) fn beam_search(
     graph: &dyn Graph,
-    start: &[u32],
+    start: &[OrderedNode],
     query: &[f32],
     k: usize,
     dist_calc: Option<Arc<dyn DistCalculator>>,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
-) -> Result<BinaryHeap<OrderedNode>> {
-    let mut visited: HashSet<_> = start.iter().copied().collect();
+) -> Result<Vec<OrderedNode>> {
+    let mut visited: HashSet<_> = start.iter().map(|node| node.id).collect();
     let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
-    let mut candidates: BinaryHeap<Reverse<OrderedNode>> = dist_calc
-        .distance(start)
-        .iter()
-        .zip(start)
-        .map(|(&dist, id)| Reverse((dist.into(), *id).into()))
-        .collect();
+    let mut candidates: BinaryHeap<Reverse<OrderedNode>> =
+        start.iter().cloned().map(Reverse).collect();
     let mut results: BinaryHeap<OrderedNode> = candidates
         .clone()
         .into_iter()
@@ -234,7 +230,8 @@ pub(super) fn beam_search(
             }
         }
     }
-    Ok(results)
+
+    Ok(results.into_sorted_vec())
 }
 
 /// Greedy search over a graph
@@ -256,13 +253,13 @@ pub(super) fn beam_search(
 ///
 pub(super) fn greedy_search(
     graph: &dyn Graph,
-    start: u32,
+    start: OrderedNode,
     query: &[f32],
     dist_calc: Option<Arc<dyn DistCalculator>>,
-) -> Result<(OrderedFloat, u32)> {
-    let mut current = start;
+) -> Result<OrderedNode> {
+    let mut current = start.id;
+    let mut closest_dist = start.dist.0;
     let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
-    let mut closest_dist = dist_calc.distance(&[start])[0];
     loop {
         let neighbors: Vec<_> = graph
             .neighbors(current)
@@ -288,7 +285,7 @@ pub(super) fn greedy_search(
         }
     }
 
-    Ok((OrderedFloat(closest_dist), current))
+    Ok(OrderedNode::new(current, closest_dist.into()))
 }
 
 #[cfg(test)]
