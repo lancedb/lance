@@ -21,10 +21,13 @@ pub struct DataFile {
     /// The ids of fields in this file.
     pub fields: Vec<i32>,
     /// The offsets of the fields listed in `fields`, empty in v1 files
+    #[serde(default)]
     pub column_offsets: Vec<u32>,
     /// The major version of the file format used to write this file.
+    #[serde(default)]
     pub file_major_version: u32,
     /// The minor version of the file format used to write this file.
+    #[serde(default)]
     pub file_minor_version: u32,
 }
 
