@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import pickle
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
@@ -16,7 +17,6 @@ from typing import (
     Union,
 )
 
-import cloudpickle
 import pyarrow as pa
 
 import lance
@@ -123,9 +123,9 @@ class _BaseLanceDatasink(ray.data.Datasink):
         schema = None
         for batch in write_results:
             for fragment_str, schema_str in batch:
-                fragment = cloudpickle.loads(fragment_str)
+                fragment = pickle.loads(fragment_str)
                 fragments.append(fragment)
-                schema = cloudpickle.loads(schema_str)
+                schema = pickle.loads(schema_str)
         if self.mode in set(["create", "overwrite"]):
             op = lance.LanceOperation.Overwrite(schema, fragments)
         elif self.mode == "append":
@@ -195,7 +195,7 @@ class LanceDatasink(_BaseLanceDatasink):
             max_rows_per_file=self.max_rows_per_file,
         )
         return [
-            (cloudpickle.dumps(fragment), cloudpickle.dumps(schema))
+            (pickle.dumps(fragment), pickle.dumps(schema))
             for fragment, schema in fragments_and_schema
         ]
 
@@ -240,8 +240,8 @@ class LanceFragmentWriter:
             max_rows_per_group=self.max_rows_per_group,
         )
         return pa.Table.from_pydict({
-            "fragment": [cloudpickle.dumps(fragment) for fragment, _ in fragments],
-            "schema": [cloudpickle.dumps(schema) for _, schema in fragments],
+            "fragment": [pickle.dumps(fragment) for fragment, _ in fragments],
+            "schema": [pickle.dumps(schema) for _, schema in fragments],
         })
 
 
