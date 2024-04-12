@@ -5,14 +5,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::array::AsArray;
-use arrow::datatypes::Float32Type;
-use arrow_array::Array;
 use lance_file::writer::FileWriter;
-use lance_index::vector::graph::memory::InMemoryVectorStorage;
-use lance_index::vector::hnsw::{HNSWBuilder, HNSW};
 use lance_index::vector::quantizer::Quantizer;
-use lance_linalg::MatrixView;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -172,27 +166,4 @@ pub(super) async fn build_hnsw_partitions(
         None,
     )
     .await
-}
-
-pub fn build_hnsw_model(
-    hnsw_params: HnswBuildParams,
-    vector_array: Vec<Arc<dyn Array>>,
-) -> Result<(HNSW, Arc<dyn Array>)> {
-    let vector_arrs = vector_array
-        .iter()
-        .map(|arr| arr.as_ref())
-        .collect::<Vec<_>>();
-    let fsl = arrow_select::concat::concat(&vector_arrs)?;
-    std::mem::drop(vector_array);
-
-    let mat = Arc::new(MatrixView::<Float32Type>::try_from(
-        fsl.as_fixed_size_list(),
-    )?);
-
-    // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
-    let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
-    let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params, vec_store);
-    let hnsw = hnsw_builder.build()?;
-
-    Ok((hnsw, fsl))
 }
