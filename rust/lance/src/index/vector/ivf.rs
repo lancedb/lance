@@ -34,7 +34,6 @@ use lance_index::vector::{
     quantizer::{Quantization, QuantizationMetadata, Quantizer},
 };
 use lance_index::{
-    optimize::OptimizeOptions,
     vector::{
         graph::NEIGHBORS_FIELD,
         hnsw::{builder::HnswBuildParams, VECTOR_ID_FIELD},
@@ -245,17 +244,9 @@ pub(crate) async fn optimize_vector_indices(
     dataset: &Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
-    existing_indices: &[Arc<dyn Index>],
-    options: &OptimizeOptions,
-) -> Result<(Uuid, usize)> {
-    // Senity check the indices
-    if existing_indices.is_empty() {
-        return Err(Error::Index {
-            message: "optimizing vector index: no existing index found".to_string(),
-            location: location!(),
-        });
-    }
-
+    reference_index: &dyn Index,
+    indices_to_merge: &[Arc<dyn Index>],
+) -> Result<Uuid> {
     let new_uuid = Uuid::new_v4();
     let object_store = dataset.object_store();
     let index_file = dataset
@@ -264,7 +255,7 @@ pub(crate) async fn optimize_vector_indices(
         .child(INDEX_FILE_NAME);
     let writer = object_store.create(&index_file).await?;
 
-    let first_idx = existing_indices[0]
+    let first_idx = reference_index
         .as_any()
         .downcast_ref::<IVFIndex>()
         .ok_or(Error::Index {
@@ -272,18 +263,17 @@ pub(crate) async fn optimize_vector_indices(
             location: location!(),
         })?;
 
-    let merged = if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
+    if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
         optimize_ivf_pq_indices(
             first_idx,
             pq_index,
             vector_column,
             unindexed,
-            existing_indices,
-            options,
+            indices_to_merge,
             writer,
             dataset.version().version,
         )
-        .await?
+        .await?;
     } else if let Some(hnsw_sq) = first_idx
         .sub_index
         .as_any()
@@ -300,12 +290,11 @@ pub(crate) async fn optimize_vector_indices(
             hnsw_sq,
             vector_column,
             unindexed,
-            existing_indices,
-            options,
+            indices_to_merge,
             writer,
             aux_writer,
         )
-        .await?
+        .await?;
     } else {
         return Err(Error::Index {
             message: "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
@@ -313,7 +302,7 @@ pub(crate) async fn optimize_vector_indices(
         });
     };
 
-    Ok((new_uuid, merged))
+    Ok(new_uuid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -322,15 +311,14 @@ async fn optimize_ivf_pq_indices(
     pq_index: &PQIndex,
     vector_column: &str,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn Index>],
-    options: &OptimizeOptions,
+    indices_to_merge: &[Arc<dyn Index>],
     mut writer: ObjectWriter,
     dataset_version: u64,
-) -> Result<usize> {
+) -> Result<()> {
     let metric_type = first_idx.metric_type;
     let dim = first_idx.ivf.dimension();
 
-    // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
+    // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf` implementations.
     let ivf = lance_index::vector::ivf::new_ivf_with_pq(
         first_idx.ivf.centroids.values(),
         first_idx.ivf.dimension(),
@@ -362,13 +350,7 @@ async fn optimize_ivf_pq_indices(
 
     let mut ivf_mut = Ivf::new(first_idx.ivf.centroids.clone());
 
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
-        0
-    } else {
-        existing_indices.len() - options.num_indices_to_merge
-    };
-
-    let indices_to_merge = existing_indices[start_pos..]
+    let indices_to_merge = indices_to_merge
         .iter()
         .map(|idx| {
             idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::Index {
@@ -396,7 +378,7 @@ async fn optimize_ivf_pq_indices(
     writer.write_magics(pos, 0, 1, MAGIC).await?;
     writer.shutdown().await?;
 
-    Ok(existing_indices.len() - start_pos)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -406,11 +388,10 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn Index>],
-    options: &OptimizeOptions,
+    indices_to_merge: &[Arc<dyn Index>],
     writer: ObjectWriter,
     aux_writer: ObjectWriter,
-) -> Result<usize> {
+) -> Result<()> {
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
     let ivf = lance_index::vector::ivf::new_ivf_with_quantizer(
@@ -444,13 +425,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     let mut ivf_mut = Ivf::new(first_idx.ivf.centroids.clone());
 
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
-        0
-    } else {
-        existing_indices.len() - options.num_indices_to_merge
-    };
-
-    let indices_to_merge = existing_indices[start_pos..]
+    let indices_to_merge = indices_to_merge
         .iter()
         .map(|idx| {
             idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::Index {
@@ -565,7 +540,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     aux_ivf.write(&mut aux_writer).await?;
     aux_writer.finish().await?;
 
-    Ok(existing_indices.len() - start_pos)
+    Ok(())
 }
 
 #[derive(Serialize)]

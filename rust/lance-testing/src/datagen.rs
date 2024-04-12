@@ -52,8 +52,8 @@ impl IncrementingInt32 {
         self
     }
 
-    pub fn named(mut self, name: String) -> Self {
-        self.name = Some(name);
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
         self
     }
 }
@@ -104,8 +104,8 @@ impl RandomVector {
         self
     }
 
-    pub fn named(mut self, name: String) -> Self {
-        self.name = Some(name);
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
         self
     }
 }

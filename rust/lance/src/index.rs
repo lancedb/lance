@@ -330,7 +330,7 @@ impl DatasetIndexExt for Dataset {
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
             let Some((new_id, removed, mut new_frag_ids)) =
-                merge_indices(dataset.clone(), deltas.as_slice(), options).await?
+                merge_indices(dataset.as_ref(), deltas.as_slice(), options).await?
             else {
                 continue;
             };
@@ -338,7 +338,7 @@ impl DatasetIndexExt for Dataset {
                 new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
             }
 
-            let last_idx = deltas.last().expect("Delte indices should not be empty");
+            let last_idx = deltas.last().expect("Delta indices should not be empty");
             let new_idx = IndexMetadata {
                 uuid: new_id,
                 name: last_idx.name.clone(), // Keep the same name
@@ -347,10 +347,12 @@ impl DatasetIndexExt for Dataset {
                 fragment_bitmap: Some(new_frag_ids),
             };
             removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
+            // To keep the existing deltas, we need to add them to the new list.
             if deltas.len() > removed.len() {
                 new_indices.extend(
-                    deltas[0..(deltas.len() - removed.len())]
+                    deltas
                         .iter()
+                        .filter(|idx| !removed.iter().any(|&r| r.uuid == idx.uuid))
                         .map(|&idx| idx.clone()),
                 );
             }
@@ -603,14 +605,19 @@ mod tests {
 
     use super::*;
 
+    use crate::index::scalar::ScalarIndexParams;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
+    use lance_index::optimize::{IndexHandling, NewDataHandling};
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
     use lance_linalg::distance::MetricType;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{
+        generate_random_array, some_indexable_batch, BatchGenerator, IncrementingInt32,
+        RandomVector,
+    };
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -800,7 +807,8 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0, // Just create index for delta
+                index_handling: IndexHandling::NewDelta,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -816,7 +824,8 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 2,
+                index_handling: IndexHandling::MergeAll,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -900,7 +909,8 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0, // Just create index for delta
+                new_data_handling: NewDataHandling::IndexAll,
+                index_handling: IndexHandling::NewDelta,
             })
             .await
             .unwrap();
@@ -915,7 +925,8 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 2,
+                index_handling: IndexHandling::MergeAll,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -926,5 +937,201 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
+    }
+    // Validate different NewDataHandling options for optimize_indices
+    #[tokio::test]
+    async fn test_optimize_index_data_handling() {
+        // Create a table with an index
+        let test_dir = tempdir().unwrap();
+        let data = some_indexable_batch();
+
+        let mut dataset = Dataset::write(data, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
+        dataset
+            .create_index(
+                &["indexable"],
+                IndexType::Vector,
+                Some("indexable_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Append 2 new fragments
+        dataset.append(some_indexable_batch(), None).await.unwrap();
+        dataset.append(some_indexable_batch(), None).await.unwrap();
+
+        // Validate that NewDataHandling::Ignore is a no-op
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                new_data_handling: NewDataHandling::Ignore,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("indexable_idx").await.unwrap())
+                .unwrap();
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 2);
+        assert_eq!(stats["num_indices"], 1);
+
+        // Validate that NewDataHandling::Fragments will only index the provided fragments
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                new_data_handling: NewDataHandling::Fragments(vec![1]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("indexable_idx").await.unwrap())
+                .unwrap();
+        assert_eq!(stats["num_indexed_fragments"], 2);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let covered_fragments = indices[0]
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect::<Vec<u32>>();
+        assert_eq!(covered_fragments, vec![0, 1]);
+
+        // Validate that DataHandling::IndexAll will index all fragments
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                new_data_handling: NewDataHandling::IndexAll,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("indexable_idx").await.unwrap())
+                .unwrap();
+        assert_eq!(stats["num_indexed_fragments"], 3);
+
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+        assert_eq!(stats["num_indices"], 1);
+    }
+
+    // TODO: Test more new data handling options
+    // TODO: test optimizing specific indices and specific fragments.
+    #[tokio::test]
+    async fn test_optimize_indices_target_frags() {
+        // Create a table with 2 indices: scalar and vector index.
+        let test_dir = tempdir().unwrap();
+        let vec = Box::new(RandomVector::new().named("vec"));
+        let id = Box::new(IncrementingInt32::new().named("id"));
+        let mut data_generator = BatchGenerator::new().col(vec).col(id);
+        let data = data_generator.batch(1024);
+        let mut dataset = Dataset::write(data, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        // An index on each.
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Create fragments with delta indices.
+        for _ in 0..2 {
+            dataset
+                .append(data_generator.batch(1024), None)
+                .await
+                .unwrap();
+
+            dataset
+                .optimize_indices(&OptimizeOptions {
+                    new_data_handling: NewDataHandling::IndexAll,
+                    index_handling: IndexHandling::NewDelta,
+                })
+                .await
+                .unwrap();
+        }
+
+        for idx_name in &["vec_idx", "id_idx"] {
+            let stats: serde_json::Value =
+                serde_json::from_str(&dataset.index_statistics(idx_name).await.unwrap()).unwrap();
+            assert_eq!(stats["num_indexed_fragments"], 3);
+            assert_eq!(stats["num_unindexed_fragments"], 0);
+            assert_eq!(stats["num_indices"], 3);
+        }
+
+        // Validate we can merge just some of the indices, in one go.
+        let indices = dataset.load_indices().await.unwrap();
+        let vec_idx = indices
+            .iter()
+            .filter(|idx| idx.name == "vec_idx")
+            .map(|idx| idx.uuid)
+            .collect::<Vec<_>>();
+        let id_idx = indices
+            .iter()
+            .filter(|idx| idx.name == "id_idx")
+            .map(|idx| idx.uuid)
+            .collect::<Vec<_>>();
+        // We will merge 2/3 from each index.
+        let indices_to_merge = vec_idx[0..2]
+            .iter()
+            .chain(id_idx[0..2].iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let indices_to_keep = [vec_idx[2], id_idx[2]];
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                index_handling: IndexHandling::MergeIndices(indices_to_merge.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        for idx_name in &["vec_idx", "id_idx"] {
+            let stats: serde_json::Value =
+                serde_json::from_str(&dataset.index_statistics(idx_name).await.unwrap()).unwrap();
+            assert_eq!(stats["num_indexed_fragments"], 3);
+            assert_eq!(stats["num_unindexed_fragments"], 0);
+            assert_eq!(stats["num_indices"], 2);
+        }
+        let indices = dataset.load_indices().await.unwrap();
+        let final_ids = indices.iter().map(|idx| idx.uuid).collect::<Vec<_>>();
+        // Should still have indices we didn't want to merge
+        assert!(
+            indices_to_keep.iter().all(|id| final_ids.contains(id)),
+            "Indices to keep: {:?}, final indices: {:?}",
+            indices_to_keep,
+            final_ids
+        );
+        // Should not have indices we wanted to merge
+        assert!(
+            indices_to_merge.iter().all(|id| !final_ids.contains(id)),
+            "Indices to merge: {:?}, final indices: {:?}",
+            indices_to_merge,
+            final_ids
+        );
     }
 }

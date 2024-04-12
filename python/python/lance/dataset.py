@@ -197,9 +197,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self._uri
 
     def list_indices(self) -> List[Dict[str, Any]]:
-        if getattr(self, "_list_indices_res", None) is None:
-            self._list_indices_res = self._ds.load_indices()
-        return self._list_indices_res
+        return self._ds.load_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -863,8 +861,6 @@ class LanceDataset(pa.dataset.Dataset):
         2  c
         """
         self._ds.drop_columns(columns)
-        # Indices might have changed
-        self._list_indices_res = None
 
     def delete(self, predicate: Union[str, pa.compute.Expression]):
         """
@@ -2286,7 +2282,12 @@ class DatasetOptimizer:
         )
         return Compaction.execute(self._dataset, opts)
 
-    def optimize_indices(self, **kwargs):
+    def optimize_indices(
+        self,
+        merge_indices: bool | int | List[str] = 1,
+        index_new_data: bool | List[int] = True,
+        **kwargs,
+    ):
         """Optimizes index performance.
 
         As new data arrives it is not added to existing indexes automatically.
@@ -2298,8 +2299,34 @@ class DatasetOptimizer:
         the new data to existing partitions.  This means an update is much quicker
         than retraining the entire index but may have less accuracy (especially
         if the new data exhibits new patterns, concepts, or trends)
+
+        Parameters
+        ----------
+        merge_indices: bool | int | List[str]
+            If True, all indices will be merged. If False, no indices will be
+            merged and instead a new index delta will be created. If an integer,
+            that number of indices will be merged. If a list of UUID strings,
+            those specific indices will be merged.
+        index_new_data: bool | List[int]
+            If True, all new data will be indexed. If False, no new data will be
+            indexed. If a list of fragment ids, those specific fragments will be
+            indexed.
         """
-        self._dataset._ds.optimize_indices(**kwargs)
+        # legacy parameter.
+        if "num_indices_to_merge" in kwargs:
+            warnings.warn(
+                "num_indices_to_merge is deprecated, use merge_indices instead",
+                DeprecationWarning,
+            )
+            num_indices_to_merge = kwargs.pop("num_indices_to_merge")
+            if num_indices_to_merge == 0:
+                merge_indices = False
+            else:
+                merge_indices = num_indices_to_merge
+
+        self._dataset._ds.optimize_indices(
+            merge_indices=merge_indices, index_new_data=index_new_data, **kwargs
+        )
 
 
 class DatasetStats(TypedDict):

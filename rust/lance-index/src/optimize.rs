@@ -1,28 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use uuid::Uuid;
+
+/// How to handle new unindexed data
+#[derive(Debug, Clone, PartialEq)]
+pub enum NewDataHandling {
+    /// Do not index new data
+    Ignore,
+    /// Index all unindexed data
+    IndexAll,
+    /// Index only new data in specified fragments. The fragments are
+    /// specified by their ids.
+    Fragments(Vec<u32>),
+}
+
+/// How to merge indices.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexHandling {
+    /// Put all new data into it's own delta index.
+    ///
+    /// If NewDataHandling::Ignore is used, this is a no-op.
+    NewDelta,
+    /// Merge new data and the latest N indices into a single index.
+    ///
+    /// If NewDataHandling::Ignore is used, this just merges the latest N indices.
+    /// Unless N=1, then this is a no-op.
+    MergeLatestN(usize),
+    /// Merge all indices into a single index.
+    MergeAll,
+    /// Merge new data and the indices with the specified UUIDs. Only indices with
+    /// the same name will be merged together. You can pass the UUIDs of the
+    /// deltas of multiple indices, and they will be merged together into one
+    /// index per name.
+    ///
+    /// If NewDataHandling::Ignore is used, this just merges the specified indices.
+    MergeIndices(Vec<Uuid>),
+}
+
 /// Options for optimizing all indices.
-#[derive(Debug)]
+///
+/// To create a delta index with new data, write:
+///
+/// ```rust
+/// OptimizeOptions {
+///     new_data_handling: NewDataHandling::IndexAll,
+///     merge_index_options: MergeIndexOptions::NewDelta,
+/// }
+/// ```
+///
+/// To merge all existing indices without adding new data, write:
+///
+/// ```rust
+/// OptimizeOptions {
+///    new_data_handling: NewDataHandling::Ignore,
+///    merge_index_options: MergeIndexOptions::MergeAll,
+/// }
+#[derive(Debug, Clone, PartialEq)]
 pub struct OptimizeOptions {
-    /// Number of delta indices to merge for one column. Default: 1.
-    ///
-    /// If `num_indices_to_merge` is 0, a new delta index will be created.
-    /// If `num_indices_to_merge` is 1, the delta updates will be merged into the latest index.
-    /// If `num_indices_to_merge` is more than 1, the delta updates and latest N indices
-    /// will be merged into one single index.
-    ///
-    /// It is up to the caller to decide how many indices to merge / keep. Callers can
-    /// find out how many indices are there by calling [`Dataset::index_statistics`].
-    ///
-    /// A common usage pattern will be that, the caller can keep a large snapshot of the index of the base version,
-    /// and accumulate a few delta indices, then merge them into the snapshot.
-    pub num_indices_to_merge: usize,
+    /// How to handle new unindexed data.
+    pub new_data_handling: NewDataHandling,
+
+    /// How to merge indices.
+    pub index_handling: IndexHandling,
 }
 
 impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
-            num_indices_to_merge: 1,
+            new_data_handling: NewDataHandling::IndexAll,
+            index_handling: IndexHandling::MergeLatestN(1),
         }
     }
 }

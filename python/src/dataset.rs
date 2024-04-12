@@ -40,7 +40,7 @@ use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore
 use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
-use lance_index::optimize::OptimizeOptions;
+use lance_index::optimize::{IndexHandling, NewDataHandling, OptimizeOptions};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
@@ -49,6 +49,7 @@ use lance_index::{
 };
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
+
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
@@ -62,6 +63,7 @@ use pyo3::{
     PyObject, PyResult,
 };
 use snafu::{location, Location};
+use uuid::Uuid;
 
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::schema::LanceSchema;
@@ -867,15 +869,52 @@ impl Dataset {
         })
     }
 
-    #[pyo3(signature = (**kwargs))]
-    fn optimize_indices(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
+    #[pyo3(signature = (merge_indices, index_new_data, **_kwargs))]
+    fn optimize_indices(
+        &mut self,
+        merge_indices: &PyAny,
+        index_new_data: &PyAny,
+        _kwargs: Option<&PyDict>,
+    ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let mut options: OptimizeOptions = Default::default();
-        if let Some(kwargs) = kwargs {
-            if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
-                options.num_indices_to_merge = num_indices_to_merge.extract()?;
+
+        if let Ok(merge_indices_bool) = merge_indices.extract::<bool>() {
+            if merge_indices_bool {
+                options.index_handling = IndexHandling::MergeAll;
+            } else {
+                options.index_handling = IndexHandling::NewDelta;
             }
+        } else if let Ok(merge_indices_int) = merge_indices.extract::<usize>() {
+            options.index_handling = IndexHandling::MergeLatestN(merge_indices_int as usize);
+        } else if let Ok(merge_indices_ids) = merge_indices.extract::<Vec<String>>() {
+            let index_ids = merge_indices_ids
+                .iter()
+                .map(|id_str| {
+                    Uuid::parse_str(id_str).map_err(|err| PyValueError::new_err(err.to_string()))
+                })
+                .collect::<PyResult<Vec<Uuid>>>()?;
+            options.index_handling = IndexHandling::MergeIndices(index_ids);
+        } else {
+            return Err(PyValueError::new_err(
+                "merge_indices must be a boolean value, integer, or list of str.",
+            ));
         }
+
+        if let Ok(index_new_data_bool) = index_new_data.extract::<bool>() {
+            if index_new_data_bool {
+                options.new_data_handling = NewDataHandling::IndexAll;
+            } else {
+                options.new_data_handling = NewDataHandling::Ignore;
+            }
+        } else if let Ok(index_new_data_ids) = index_new_data.extract::<Vec<u32>>() {
+            options.new_data_handling = NewDataHandling::Fragments(index_new_data_ids);
+        } else {
+            return Err(PyValueError::new_err(
+                "index_new_data must be a boolean value.",
+            ));
+        }
+
         RT.block_on(
             None,
             new_self
