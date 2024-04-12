@@ -222,12 +222,10 @@ class LanceFragmentWriter:
             transformed = (t for t in [transformed])
 
         fragments = _write_fragment(transformed, self.uri, schema=self.schema)
-        return pa.Table.from_pydict(
-            {
-                "fragment": [cloudpickle.dumps(fragment) for fragment, _ in fragments],
-                "schema": [cloudpickle.dumps(schema) for _, schema in fragments],
-            }
-        )
+        return pa.Table.from_pydict({
+            "fragment": [cloudpickle.dumps(fragment) for fragment, _ in fragments],
+            "schema": [cloudpickle.dumps(schema) for _, schema in fragments],
+        })
 
 
 class LanceCommitter(_BaseLanceDatasink):
