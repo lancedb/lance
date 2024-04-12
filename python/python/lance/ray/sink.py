@@ -20,7 +20,7 @@ import cloudpickle
 import pyarrow as pa
 
 import lance
-from lance.fragment import FragmentMetadata, LanceFragment
+from lance.fragment import FragmentMetadata, LanceFragment, write_fragments
 
 from ..dependencies import ray
 
@@ -45,7 +45,12 @@ def _pd_to_arrow(
 
 
 def _write_fragment(
-    stream: Iterable[pa.Table], uri: str, schema: Optional[pa.Schema] = None
+    stream: Iterable[Union[pa.Table, "pd.Pandas"]],
+    uri: str,
+    *,
+    schema: Optional[pa.Schema] = None,
+    max_rows_per_file: int = 1024 * 1024,
+    max_rows_per_group: int = 1024,  # Only useful for v1 writer.
 ) -> Tuple[FragmentMetadata, pa.Schema]:
     from ..dependencies import _PANDAS_AVAILABLE
     from ..dependencies import pandas as pd
@@ -53,7 +58,7 @@ def _write_fragment(
     if schema is None:
         first = next(stream)
         if _PANDAS_AVAILABLE and isinstance(first, pd.DataFrame):
-            schema = pa.Schema.from_pandas(first)
+            schema = pa.Schema.from_pandas(first).drop_metadata()
         else:
             schema = first.schema
         stream = chain([first], stream)
@@ -65,8 +70,14 @@ def _write_fragment(
 
     # TODO: use format v2.
     reader = pa.RecordBatchReader.from_batches(schema, record_batch_converter())
-    fragment = LanceFragment.create(uri, reader, fragment_id=0, schema=schema)
-    return (fragment, schema)
+    fragments = write_fragments(
+        reader,
+        uri,
+        schema=schema,
+        max_rows_per_file=max_rows_per_file,
+        max_rows_per_group=max_rows_per_group,
+    )
+    return [(fragment, schema) for fragment in fragments]
 
 
 class _BaseLanceDatasink(ray.data.Datasink):
@@ -87,6 +98,10 @@ class _BaseLanceDatasink(ray.data.Datasink):
         self.mode = mode
 
         self.read_version: int | None = None
+
+    @property
+    def supports_distributed_writes(self) -> bool:
+        return True
 
     def on_write_start(self):
         if self.mode == "append":
@@ -117,6 +132,9 @@ class LanceDatasink(_BaseLanceDatasink):
     """Lance Ray Datasink.
 
     Write a Ray dataset to lance.
+
+    If we expect to write larger-than-memory files,
+    we can use `LanceFragmentWriter` and `LanceCommitter`.
 
     Parameters
     ----------
@@ -163,10 +181,18 @@ class LanceDatasink(_BaseLanceDatasink):
     def write(
         self,
         blocks: Iterable[Union[pa.Table, "pd.DataFrame"]],
-        ctx,
+        _ctx,
     ):
-        fragment, schema = _write_fragment(blocks, self.uri, self.schema)
-        return [(cloudpickle.dumps(fragment), cloudpickle.dumps(schema))]
+        fragments_and_schema = _write_fragment(
+            blocks,
+            self.uri,
+            schema=self.schema,
+            max_rows_per_file=self.max_rows_per_file,
+        )
+        return [
+            (cloudpickle.dumps(fragment), cloudpickle.dumps(schema))
+            for fragment, schema in fragments_and_schema
+        ]
 
 
 class LanceFragmentWriter:
@@ -174,15 +200,17 @@ class LanceFragmentWriter:
 
     This Writer can be used in case to write large-than-memory data to lance,
     in distributed fashion.
+
+    Parameters
     """
 
     def __init__(
         self,
-        base_uri: str,
+        uri: str,
         transform: Callable[[pa.Table], Union[pa.Table, Generator]] = lambda x: x,
         schema: Optional[pa.Schema] = None,
     ):
-        self.base_uri = base_uri
+        self.uri = uri
         self.schema = schema
         self.transform = transform
 
@@ -193,7 +221,7 @@ class LanceFragmentWriter:
         if not isinstance(transformed, Generator):
             transformed = (t for t in [transformed])
 
-        fragment, schema = _write_fragment(transformed, self.base_uri, self.schema)
+        fragment, schema = _write_fragment(transformed, self.uri, schema=self.schema)
         return pa.Table.from_pydict(
             {
                 "fragment": [cloudpickle.dumps(fragment)],
@@ -205,7 +233,8 @@ class LanceFragmentWriter:
 class LanceCommitter(_BaseLanceDatasink):
     """Lance Commiter as Ray Datasink.
 
-    This is used with `LanceFragmentWriter` to write large-than-memory data to lance file.
+    This is used with `LanceFragmentWriter` to write large-than-memory data to
+    lance file.
     """
 
     @property
