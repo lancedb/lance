@@ -6,8 +6,7 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -507,7 +506,7 @@ pub(crate) fn select_neighbors_heuristic(
     if candidates.len() <= k {
         return candidates.iter().cloned().collect_vec().into_iter();
     }
-    let mut w = candidates.iter().cloned().collect::<Vec<_>>();
+    let mut w = candidates.to_vec();
 
     if extend_candidates {
         let dist_calc = graph.storage().dist_calculator(query);
