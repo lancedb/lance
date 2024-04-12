@@ -139,19 +139,10 @@ impl ExecutionPlan for OneShotExec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
-}
-
-impl Default for LanceExecutionOptions {
-    fn default() -> Self {
-        Self {
-            use_spilling: false,
-            mem_pool_size: None,
-        }
-    }
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
