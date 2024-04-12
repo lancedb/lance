@@ -431,9 +431,6 @@ impl FileReader {
     }
 }
 
-/// Adapts the FileReader to implement the same interface as the v2 reader
-pub struct FileReaderAdapter {}
-
 /// Stream desired full batches from the file.
 ///
 /// Parameters:
@@ -475,7 +472,7 @@ pub fn batches_stream(
 ///
 /// `schema` may only be empty if `with_row_id` is also true. This function
 /// panics otherwise.
-async fn read_batch(
+pub async fn read_batch(
     reader: &FileReader,
     params: &ReadBatchParams,
     schema: &Schema,

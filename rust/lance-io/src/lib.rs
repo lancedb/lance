@@ -78,3 +78,27 @@ impl From<&Self> for ReadBatchParams {
         params.clone()
     }
 }
+
+impl ReadBatchParams {
+    pub fn to_offsets(&self, base_offset: u32, length: u32, total_num_rows: u32) -> Vec<u32> {
+        match self {
+            Self::Indices(indices) => indices
+                .slice(base_offset as usize, length as usize)
+                .values()
+                .iter()
+                .copied()
+                .collect(),
+            Self::Range(r) => {
+                (r.start as u32 + base_offset..r.start as u32 + base_offset + length).collect()
+            }
+            Self::RangeFull => (base_offset..base_offset + length).collect(),
+            Self::RangeTo(r) => {
+                let start = r.end as u32 - total_num_rows + base_offset;
+                (start..start + length).collect()
+            }
+            Self::RangeFrom(r) => {
+                (r.start as u32 + base_offset..r.start as u32 + base_offset + length).collect()
+            }
+        }
+    }
+}
