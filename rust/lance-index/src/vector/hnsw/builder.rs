@@ -199,7 +199,7 @@ impl HNSWBuilder {
         // ```
         for level in (target_level + 1..self.params.max_level).rev() {
             let query = self.vectors.vector(node);
-            let cur_level = BuilderLevelView::new(level, self);
+            let cur_level = HnswLevelView::new(level, self);
             ep = greedy_search(&cur_level, ep, query, None)?;
         }
 
@@ -226,7 +226,7 @@ impl HNSWBuilder {
         query: &[f32],
         level: u16,
     ) -> Result<(Vec<OrderedNode>, Vec<OrderedNode>)> {
-        let cur_level = BuilderLevelView::new(level, self);
+        let cur_level = HnswLevelView::new(level, self);
         let candidates = beam_search(
             &cur_level,
             ep,
@@ -265,7 +265,7 @@ impl HNSWBuilder {
             return;
         }
 
-        let level_view = BuilderLevelView::new(level, self);
+        let level_view = HnswLevelView::new(level, self);
         let neighbors: Vec<OrderedNode> = level_neighbors.iter().cloned().collect();
 
         let new_neighbors = select_neighbors_heuristic(
@@ -306,18 +306,20 @@ impl HNSWBuilder {
     }
 }
 
-pub struct BuilderLevelView<'a> {
+// View of a level in HNSW graph.
+// This is used to iterate over neighbors in a specific level.
+pub(crate) struct HnswLevelView<'a> {
     level: u16,
     builder: &'a HNSWBuilder,
 }
 
-impl<'a> BuilderLevelView<'a> {
+impl<'a> HnswLevelView<'a> {
     fn new(level: u16, builder: &'a HNSWBuilder) -> Self {
         Self { level, builder }
     }
 }
 
-impl<'a> Graph for BuilderLevelView<'a> {
+impl<'a> Graph for HnswLevelView<'a> {
     fn len(&self) -> usize {
         self.builder.level_count[self.level as usize]
     }

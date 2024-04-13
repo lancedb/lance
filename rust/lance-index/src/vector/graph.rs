@@ -179,9 +179,12 @@ pub(super) fn beam_search(
 ) -> Result<Vec<OrderedNode>> {
     let mut visited: HashSet<_> = start.iter().map(|node| node.id).collect();
     let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
-    let mut candidates: BinaryHeap<Reverse<OrderedNode>> =
-        start.iter().cloned().map(Reverse).collect();
-    let mut results: BinaryHeap<OrderedNode> = candidates
+    let mut candidates = start
+        .iter()
+        .cloned()
+        .map(Reverse)
+        .collect::<BinaryHeap<_>>();
+    let mut results = candidates
         .clone()
         .into_iter()
         .filter(|node| {
@@ -190,7 +193,7 @@ pub(super) fn beam_search(
                 .unwrap_or(true)
         })
         .map(|v| v.0)
-        .collect();
+        .collect::<BinaryHeap<_>>();
 
     while !candidates.is_empty() {
         let current = candidates.pop().expect("candidates is empty").0;
