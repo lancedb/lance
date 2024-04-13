@@ -48,13 +48,14 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
+lance-testing.workspace = true
+kdam = "0"
 
 [dev-dependencies]
 approx.workspace = true
 clap = { workspace = true, features = ["derive"] }
 criterion.workspace = true
 lance-datagen.workspace = true
-lance-testing.workspace = true
 pprof.workspace = true
 tempfile.workspace = true
 datafusion-sql.workspace = true
@@ -74,3 +75,6 @@ harness = false
 [[bench]]
 name = "hnsw"
 harness = false
+
+[[bin]]
+name = "hnsw_diff"

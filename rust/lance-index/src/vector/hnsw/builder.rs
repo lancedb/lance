@@ -4,6 +4,7 @@
 //! Builder of Hnsw Graph.
 
 use std::cmp::min;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use lance_core::Result;
@@ -106,6 +107,109 @@ impl HnswBuildParams {
     }
 }
 
+#[derive(Clone)]
+enum NodesStorageMode {
+    NewBuild,
+    RecordingDiff,
+}
+
+#[derive(Clone)]
+struct GraphBuilderNodes {
+    nodes: Vec<GraphBuilderNode>,
+
+    diff_storage: HashMap<usize, GraphBuilderNode>,
+
+    mode: NodesStorageMode,
+}
+
+impl GraphBuilderNodes {
+    fn new(len: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(len),
+            diff_storage: HashMap::new(),
+            mode: NodesStorageMode::NewBuild,
+        }
+    }
+
+    fn record_diff(&mut self) {
+        self.mode = NodesStorageMode::RecordingDiff;
+    }
+
+    fn nodes(&self) -> impl Iterator<Item = &GraphBuilderNode> {
+        self.nodes.iter()
+    }
+
+    fn get(&self, node: usize) -> Option<&GraphBuilderNode> {
+        match self.diff_storage.get(&node) {
+            Some(node) => Some(node),
+            None => self.nodes.get(node),
+        }
+    }
+
+    fn get_mut_unchecked(&mut self, node: usize) -> &mut GraphBuilderNode {
+        match self.mode {
+            NodesStorageMode::NewBuild => self.nodes.get_mut(node).expect("unchecked"),
+            NodesStorageMode::RecordingDiff => self
+                .diff_storage
+                .entry(node)
+                .or_insert_with(|| self.nodes[node].clone()),
+        }
+    }
+
+    fn get_unchecked(&mut self, node: usize) -> &GraphBuilderNode {
+        match self.mode {
+            NodesStorageMode::NewBuild => self.nodes.get(node).expect("unchecked"),
+            NodesStorageMode::RecordingDiff => self
+                .diff_storage
+                .entry(node)
+                .or_insert_with(|| self.nodes[node].clone()),
+        }
+    }
+
+    fn push(&mut self, node: GraphBuilderNode) {
+        match self.mode {
+            NodesStorageMode::NewBuild => {
+                self.nodes.push(node);
+            }
+            NodesStorageMode::RecordingDiff => {
+                self.diff_storage.insert(node.id as usize, node);
+            }
+        }
+    }
+
+    fn add_neighbor(&mut self, u: u32, v: u32, dist: OrderedFloat, level: u16) {
+        self.get_mut_unchecked(u as usize)
+            .add_neighbor(v, dist, level);
+        self.get_mut_unchecked(v as usize)
+            .add_neighbor(u, dist, level);
+    }
+
+    fn level_neighbors(&mut self, node: u32, level: u16) -> &BinaryHeap<OrderedNode> {
+        &self.get_unchecked(node as usize).level_neighbors[level as usize]
+    }
+
+    fn set_level_neighbors(&mut self, node: u32, level: u16, neighbors: BinaryHeap<OrderedNode>) {
+        self.get_mut_unchecked(node as usize).level_neighbors[level as usize] = neighbors;
+    }
+
+    fn diff(&self) -> Vec<GraphBuilderNode> {
+        if matches!(self.mode, NodesStorageMode::NewBuild) {
+            return vec![];
+        }
+
+        let mut diff = self
+            .diff_storage
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect::<Vec<_>>();
+
+        // all ids are unique, unstable quick sort is good
+        diff.sort_unstable_by_key(|(id, _)| *id);
+
+        diff.into_iter().map(|x| x.1).collect()
+    }
+}
+
 /// Build a HNSW graph.
 ///
 /// Currently, the HNSW graph is fully built in memory.
@@ -120,7 +224,9 @@ pub struct HNSWBuilder {
     /// Vector storage for the graph.
     vectors: Arc<InMemoryVectorStorage>,
 
-    nodes: Vec<GraphBuilderNode>,
+    offset: usize,
+
+    nodes: GraphBuilderNodes,
     level_count: Vec<usize>,
 
     entry_point: u32,
@@ -140,12 +246,16 @@ impl HNSWBuilder {
         self.level_count[level]
     }
 
-    pub fn nodes(&self) -> &[GraphBuilderNode] {
-        &self.nodes
+    pub fn nodes(&self) -> impl Iterator<Item = &GraphBuilderNode> {
+        self.nodes.nodes()
     }
 
     pub fn storage(&self) -> Arc<InMemoryVectorStorage> {
         self.vectors.clone()
+    }
+
+    pub fn diff(&self) -> Vec<GraphBuilderNode> {
+        self.nodes.diff()
     }
 
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
@@ -156,10 +266,23 @@ impl HNSWBuilder {
         Self {
             params,
             vectors,
-            nodes: Vec::with_capacity(len),
+            offset: 0,
+            nodes: GraphBuilderNodes::new(len),
             level_count: vec![0; max_level as usize],
             entry_point: 0,
         }
+    }
+
+    pub fn set_vectors(&mut self, vectors: Arc<InMemoryVectorStorage>) {
+        self.vectors = vectors;
+    }
+
+    pub fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
+    }
+
+    pub fn record_diff(&mut self) {
+        self.nodes.record_diff();
     }
 
     /// New node's level
@@ -169,7 +292,7 @@ impl HNSWBuilder {
         let mut rng = thread_rng();
         // This is different to the paper.
         // We use log10 instead of log(e), so each layer has about 1/10 of its bottom layer.
-        let m = self.vectors.len();
+        let m = self.offset + self.vectors.len();
         min(
             (m as f32).log(self.params.log_base).ceil() as u16
                 - (rng.gen::<f32>() * m as f32)
@@ -255,18 +378,17 @@ impl HNSWBuilder {
     }
 
     fn connect(&mut self, u: u32, v: u32, dist: OrderedFloat, level: u16) {
-        self.nodes[u as usize].add_neighbor(v, dist, level);
-        self.nodes[v as usize].add_neighbor(u, dist, level);
+        self.nodes.add_neighbor(u, v, dist, level);
     }
 
     fn prune(&mut self, node: u32, level: u16) {
-        let level_neighbors = &self.nodes[node as usize].level_neighbors[level as usize];
+        let level_neighbors = self.nodes.level_neighbors(node, level);
         if level_neighbors.len() <= self.params.m_max {
             return;
         }
 
-        let level_view = HnswLevelView::new(level, self);
         let neighbors: Vec<OrderedNode> = level_neighbors.iter().cloned().collect();
+        let level_view = HnswLevelView::new(level, self);
 
         let new_neighbors = select_neighbors_heuristic(
             &level_view,
@@ -277,11 +399,10 @@ impl HNSWBuilder {
         )
         .collect();
 
-        self.nodes[node as usize].level_neighbors[level as usize] = new_neighbors;
+        self.nodes.set_level_neighbors(node, level, new_neighbors);
     }
 
-    /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
-    pub fn build(&mut self) -> Result<HNSW> {
+    pub fn index(&mut self) -> Result<()> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
             self.vectors.metric_type(),
@@ -290,19 +411,33 @@ impl HNSWBuilder {
             self.params.ef_construction
         );
 
-        self.nodes
-            .push(GraphBuilderNode::new(0, self.params.max_level as usize));
+        if self.offset == 0 {
+            self.nodes
+                .push(GraphBuilderNode::new(0, self.params.max_level as usize));
 
-        for i in 1..self.vectors.len() {
+            self.offset = 1;
+        }
+
+        for i in kdam::tqdm!(self.offset..self.vectors.len()) {
             self.insert(i as u32)?;
         }
 
-        Ok(HNSW::from_builder(
+        Ok(())
+    }
+
+    pub fn get_index(&self) -> HNSW {
+        HNSW::from_builder(
             self,
             self.entry_point,
             self.vectors.metric_type(),
             self.params.use_select_heuristic,
-        ))
+        )
+    }
+
+    /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
+    pub fn build(&mut self) -> Result<HNSW> {
+        self.index()?;
+        Ok(self.get_index())
     }
 }
 

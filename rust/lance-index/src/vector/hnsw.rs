@@ -33,6 +33,7 @@ use snafu::{location, Location};
 
 use self::builder::HNSW_METADATA_KEY;
 
+use super::graph::builder::GraphBuilderNode;
 use super::graph::memory::InMemoryVectorStorage;
 use super::graph::OrderedNode;
 use super::graph::{
@@ -282,12 +283,25 @@ impl HNSW {
         })
     }
 
-    fn from_builder(
-        builder: &HNSWBuilder,
-        entry_point: u32,
-        metric_type: MetricType,
-        use_select_heuristic: bool,
-    ) -> Self {
+    fn build_arrays_into_levels(
+        levels: Vec<(UInt32Builder, ListBuilder<UInt32Builder>)>,
+        storage: Arc<dyn VectorStorage>,
+    ) -> Vec<HnswLevel> {
+        levels
+            .into_iter()
+            .map(|(mut vid, mut nb)| {
+                let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
+                let batch = RecordBatch::try_new(
+                    schema.into(),
+                    vec![Arc::new(vid.finish()), Arc::new(nb.finish())],
+                )
+                .unwrap();
+                HnswLevel::new(batch, storage.clone())
+            })
+            .collect_vec()
+    }
+
+    fn levels_from_builder(builder: &HNSWBuilder) -> Vec<HnswLevel> {
         let mut levels = Vec::with_capacity(builder.num_levels());
         for level in 0..builder.num_levels() {
             let vector_id_builder = UInt32Builder::with_capacity(builder.num_nodes(level));
@@ -305,24 +319,77 @@ impl HNSW {
             }
         }
 
-        let levels = levels
-            .into_iter()
-            .map(|(mut vid, mut nb)| {
-                let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
-                let batch = RecordBatch::try_new(
-                    schema.into(),
-                    vec![Arc::new(vid.finish()), Arc::new(nb.finish())],
-                )
-                .unwrap();
-                HnswLevel::new(batch, builder.storage())
-            })
-            .collect_vec();
+        Self::build_arrays_into_levels(levels, builder.storage())
+    }
 
+    fn from_builder(
+        builder: &HNSWBuilder,
+        entry_point: u32,
+        metric_type: MetricType,
+        use_select_heuristic: bool,
+    ) -> Self {
         Self {
-            levels,
+            levels: Self::levels_from_builder(builder),
             distance_type: metric_type,
             entry_point,
             use_select_heuristic,
+        }
+    }
+
+    pub fn apply_diff(&self, diff: Vec<GraphBuilderNode>, storage: Arc<dyn VectorStorage>) -> Self {
+        let mut diff_map = HashMap::new();
+
+        for node in diff {
+            for (level, neighbors) in node.level_neighbors.iter().enumerate() {
+                diff_map.insert((level, node.id), neighbors.clone());
+            }
+        }
+
+        let mut levels: Vec<(UInt32Builder, ListBuilder<UInt32Builder>)> =
+            Vec::with_capacity(self.levels.len());
+
+        for (level_id, old_level) in self.levels.clone().iter().enumerate() {
+            let neighbors: &ListArray = old_level
+                .nodes
+                .column_by_name(NEIGHBORS_COL)
+                .expect("neighbors column not found")
+                .as_list();
+
+            let id_to_node = old_level
+                .nodes
+                .column_by_name(VECTOR_ID_COL)
+                .unwrap()
+                .as_primitive::<UInt32Type>();
+
+            let mut neighbors_builder = ListBuilder::new(UInt32Builder::new());
+            let mut vector_id_builder = UInt32Builder::with_capacity(1);
+
+            for (idx, &node_id) in id_to_node.values().iter().enumerate() {
+                let new_neighbors = if let Some(new_data) = diff_map.remove(&(level_id, node_id)) {
+                    Arc::new(UInt32Array::from_iter_values(new_data.iter().map(|n| n.id)))
+                } else {
+                    neighbors.value(idx)
+                };
+                neighbors_builder.append_value(new_neighbors.as_primitive::<UInt32Type>());
+            }
+
+            vector_id_builder.append_slice(id_to_node.values());
+
+            levels.push((vector_id_builder, neighbors_builder));
+        }
+
+        for ((level, id), neighbors) in diff_map {
+            let (vector_id_builder, neighbors_builder) = &mut levels[level];
+
+            vector_id_builder.append_value(id);
+            neighbors_builder.append_value(neighbors.iter().map(|n| Some(n.id)));
+        }
+
+        Self {
+            levels: Self::build_arrays_into_levels(levels, storage),
+            distance_type: self.distance_type,
+            entry_point: self.entry_point,
+            use_select_heuristic: self.use_select_heuristic,
         }
     }
 
