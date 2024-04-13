@@ -15,6 +15,7 @@ arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
 hex = "0.4.3"
 rand = { workspace = true }
 rand_xoshiro = "0.6.0"
