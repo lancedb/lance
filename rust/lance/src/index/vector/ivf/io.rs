@@ -7,13 +7,11 @@ use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
 use arrow::compute::concat;
-use arrow::datatypes::Float32Type;
 use arrow_array::{
     cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
-use futures::future::BoxFuture;
 use futures::stream::Peekable;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
 use lance_core::Error;
@@ -23,7 +21,6 @@ use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
-use lance_index::vector::pq::storage::ProductQuantizationStorage;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{Quantization as _, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
@@ -33,7 +30,6 @@ use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::MetricType;
-use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -466,7 +462,7 @@ async fn build_hnsw_quantization_partition(
         )),
     };
 
-    let (length, _) = tokio::join!(build_hnsw, build_store);
+    let (length, _) = futures::join!(build_hnsw, build_store);
     length
 }
 
@@ -494,6 +490,7 @@ async fn build_and_write_pq_storage(
     .await?;
 
     writer.write_record_batch(storage.batch().clone()).await?;
+    writer.finish().await?;
     Ok(())
 }
 
@@ -511,6 +508,7 @@ async fn build_and_write_sq_storage(
     .await?;
 
     writer.write_record_batch(storage.batch().clone()).await?;
+    writer.finish().await?;
     Ok(())
 }
 
