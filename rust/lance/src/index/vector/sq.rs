@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow::{datatypes::Float32Type};
+use arrow::datatypes::Float32Type;
 use arrow_array::{Array, RecordBatch};
 use lance_core::{Result, ROW_ID};
 use lance_index::vector::{
