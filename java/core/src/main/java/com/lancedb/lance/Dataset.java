@@ -15,14 +15,24 @@
 package com.lancedb.lance;
 
 import io.questdb.jar.jni.JarJniLoader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.channels.Channels;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
  * Class representing a Lance dataset, interfacing with the native lance library. This class
@@ -42,17 +52,46 @@ public class Dataset implements Closeable {
   private Dataset() {}
 
   /**
+   * Creates an empty dataset.
+   *
+   * @param allocator the buffer allocator
+   * @param path dataset uri
+   * @param schema dataset schema
+   * @param params write params
+   * @return Dataset
+   */
+  public static Dataset create(BufferAllocator allocator, String path, Schema schema,
+      WriteParams params) {
+    try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
+      Data.exportSchema(allocator, schema, null, arrowSchema);
+      var dataset =  createWithFfiSchema(arrowSchema.memoryAddress(),
+          path, params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
+          params.getMaxBytesPerFile(), params.getMode());
+      dataset.allocator = allocator;
+      return dataset;
+    }
+  }
+
+  private static native Dataset createWithFfiSchema(long arrowSchemaMemoryAddress, String path,
+      Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile, Optional<String> mode);
+
+  /**
    * Write a dataset to the specified path.
    *
+   * @param allocator buffer allocator
    * @param stream arrow stream
    * @param path dataset uri
    * @param params write parameters
    * @return Dataset
    */
-  public static Dataset write(ArrowArrayStream stream, String path, WriteParams params) {
-    return writeWithFfiStream(stream.memoryAddress(), path,
+  public static Dataset write(BufferAllocator allocator, ArrowArrayStream stream,
+      String path, WriteParams params) {
+    var dataset = writeWithFfiStream(stream.memoryAddress(), path,
         params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
         params.getMaxBytesPerFile(), params.getMode());
+    dataset.allocator = allocator;
+    return dataset;
   }
 
   private static native Dataset writeWithFfiStream(long arrowStreamMemoryAddress, String path,
@@ -102,6 +141,20 @@ public class Dataset implements Closeable {
   }
 
   private native int[] getFragmentsIds();
+
+  /**
+   * Gets the schema of the dataset.
+   *
+   * @return the arrow schema
+   */
+  public Schema getSchema() {
+    try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+      importFfiSchema(ffiArrowSchema.memoryAddress());
+      return Data.importSchema(allocator, ffiArrowSchema, null);
+    }
+  }
+
+  private native void importFfiSchema(long arrowSchemaMemoryAddress);
 
   /**
    * Closes this dataset and releases any system resources associated with it. If the dataset is

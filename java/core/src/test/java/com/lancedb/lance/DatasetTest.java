@@ -23,12 +23,18 @@ import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.ArrowFileReader;
 import org.apache.arrow.vector.ipc.SeekableReadChannel;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -67,6 +73,7 @@ public class DatasetTest {
           () -> {
             dataset =
                 Dataset.write(
+                    allocator,
                     arrowStream,
                     datasetPath.toString(),
                     new WriteParams.Builder()
@@ -83,6 +90,24 @@ public class DatasetTest {
       assertEquals(1, fragments.size());
       assertEquals(0, fragments.get(0).getFragmentId());
       assertEquals(9, fragments.get(0).countRows());
+      assertEquals(reader.getVectorSchemaRoot().getSchema(), dataset.getSchema());
+    }
+  }
+
+  @Test
+  void testCreateEmptyDataset() {
+    Path datasetPath = tempDir.resolve("new_empty_dataset");
+    Schema schema = new Schema(Arrays.asList(
+        new Field("id", new FieldType(false, new ArrowType.Int(32, true), null), null),
+        new Field("data", new FieldType(false, new ArrowType.Utf8(), null), null)
+    ));
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset dataset = Dataset.create(allocator, datasetPath.toString(),
+            schema, new WriteParams.Builder().build())) {
+      assertEquals(0, dataset.countRows());
+      assertEquals(schema, dataset.getSchema());
+      var fragments = dataset.getFragments();
+      assertEquals(0, fragments.size());
     }
   }
 
