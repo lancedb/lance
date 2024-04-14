@@ -12,7 +12,9 @@ use lance_index::vector::{
 };
 use lance_linalg::{distance::MetricType, MatrixView};
 
-pub fn build_hnsw_model(
+use crate::utils;
+
+pub async fn build_hnsw_model(
     hnsw_params: HnswBuildParams,
     vector_array: Vec<Arc<dyn Array>>,
 ) -> Result<(HNSW, Arc<dyn Array>)> {
@@ -30,7 +32,7 @@ pub fn build_hnsw_model(
     // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
     let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
     let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params, vec_store);
-    let hnsw = hnsw_builder.build()?;
+    let hnsw = hnsw_builder.build(&utils::tokio::CPU_RUNTIME).await?;
 
     Ok((hnsw, fsl))
 }

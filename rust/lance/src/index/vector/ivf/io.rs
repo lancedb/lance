@@ -447,9 +447,7 @@ async fn build_hnsw_quantization_partition(
     }
 
     let build_with_aux = aux_writer.is_some();
-    let (hnsw, fsl) =
-        utils::tokio::spawn_cpu(move || build_hnsw_model((*hnsw_params).clone(), vector_batches))
-            .await?;
+    let (hnsw, fsl) = build_hnsw_model((*hnsw_params).clone(), vector_batches).await?;
 
     let length = hnsw.write(&mut writer).await?;
     std::mem::drop(hnsw);

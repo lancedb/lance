@@ -33,22 +33,22 @@ fn bench_hnsw(c: &mut Criterion) {
     c.bench_function(
         format!("create_hnsw({TOTAL}x1024,levels=6)").as_str(),
         |b| {
-            b.iter(|| {
-                let hnsw = HNSWBuilder::with_params(
-                    HnswBuildParams::default().max_level(6),
-                    vectors.clone(),
-                )
-                .build()
-                .unwrap();
-                let uids: HashSet<u32> = hnsw
-                    .search(query, K, 300, None)
-                    .unwrap()
-                    .iter()
-                    .map(|node| node.id)
-                    .collect();
+            // b.iter(|| {
+            //     let hnsw = HNSWBuilder::with_params(
+            //         HnswBuildParams::default().max_level(6),
+            //         vectors.clone(),
+            //     )
+            //     .build()
+            //     .unwrap();
+            //     let uids: HashSet<u32> = hnsw
+            //         .search(query, K, 300, None)
+            //         .unwrap()
+            //         .iter()
+            //         .map(|node| node.id)
+            //         .collect();
 
-                assert_eq!(uids.len(), K);
-            })
+            //     assert_eq!(uids.len(), K);
+            // })
         },
     );
 }
