@@ -207,7 +207,7 @@ message DataFile {
   // Otherwise there must be one entry for each field in `fields`.
   //
   // Some fields may not correspond to a top-level column in the file.  In these cases
-  // the offset will be top-level column of the ancestor containing the field.
+  // the offset will -1.
   //
   // For example, consider the schema:
   //
@@ -223,7 +223,7 @@ message DataFile {
   //     - padding: fp64 (8)
   //
   // One possible column offsets array could be:
-  // [0, 0, 0, 1, 3, 4, 5, 6, 7]
+  // [0, -1, -1, 1, 3, 4, 5, 6, 7]
   //
   // This reflects quite a few phenomenon:
   // - The packed struct is encoded into a single column and there is no top-level column
@@ -233,7 +233,7 @@ message DataFile {
   //   is not "FSL column"
   // - The borders field actually does have an "FSL column"
   //
-  // Hopefully it is clear that the column offsets may have duplicates and gaps.
+  // The column offsets table may not have duplicates (other than -1)
   repeated int32 column_offsets = 3;
   // The major file version used to create the file
   uint32 file_major_version = 4;
