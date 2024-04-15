@@ -21,8 +21,11 @@ pub struct DataFile {
     /// The ids of fields in this file.
     pub fields: Vec<i32>,
     /// The offsets of the fields listed in `fields`, empty in v1 files
+    ///
+    /// Note that -1 is a possibility and it indices that the field has
+    /// no top-level column in the file.
     #[serde(default)]
-    pub column_offsets: Vec<u32>,
+    pub column_indices: Vec<i32>,
     /// The major version of the file format used to write this file.
     #[serde(default)]
     pub file_major_version: u32,
@@ -35,14 +38,14 @@ impl DataFile {
     fn new(
         path: impl Into<String>,
         fields: Vec<i32>,
-        column_offsets: Vec<u32>,
+        column_indices: Vec<i32>,
         file_major_version: u32,
         file_minor_version: u32,
     ) -> Self {
         Self {
             path: path.into(),
             fields,
-            column_offsets,
+            column_indices,
             file_major_version,
             file_minor_version,
         }
@@ -73,10 +76,10 @@ impl DataFile {
                     location!(),
                 ));
             }
-        } else if self.fields.len() != self.column_offsets.len() {
+        } else if self.fields.len() != self.column_indices.len() {
             return Err(Error::corrupt_file(
                 base_path.child(self.path.clone()),
-                "contained an unequal number of fields / column_offsets",
+                "contained an unequal number of fields / column_indices",
                 location!(),
             ));
         }
@@ -89,7 +92,7 @@ impl From<&DataFile> for pb::DataFile {
         Self {
             path: df.path.clone(),
             fields: df.fields.clone(),
-            column_offsets: df.column_offsets.clone(),
+            column_indices: df.column_indices.clone(),
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
         }
@@ -101,7 +104,7 @@ impl From<&pb::DataFile> for DataFile {
         Self::new(
             &proto.path,
             proto.fields.clone(),
-            proto.column_offsets.clone(),
+            proto.column_indices.clone(),
             proto.file_major_version,
             proto.file_minor_version,
         )
@@ -348,7 +351,7 @@ mod tests {
             json!({
                 "id": 123,
                 "files":[
-                    {"path": "foobar.lance", "fields": [0], "column_offsets": [], "file_major_version": 0, "file_minor_version": 0}],
+                    {"path": "foobar.lance", "fields": [0], "column_indices": [], "file_major_version": 0, "file_minor_version": 0}],
                      "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                        "num_deleted_rows": 10},
                 "physical_rows": None::<usize>}),

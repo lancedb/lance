@@ -192,22 +192,22 @@ message DataFile {
   // This allows column offsets to be calculated from field IDs and the input schema.
   //
   // In Lance v2 the field IDs generally follow the same pattern but there is no
-  // way to calculate the column offset from the field ID.  This is because a given
+  // way to calculate the column index from the field ID.  This is because a given
   // field could be encoded in many different ways, some of which occupy a different
   // number of columns.  For example, a struct field could be encoded into N + 1 columns
-  // or it could be encoded into a single packed column.  To determine column offsets
-  // the column_offsets property should be used instead.
+  // or it could be encoded into a single packed column.  To determine column indices
+  // the column_indices property should be used instead.
   //
   // In Lance v1 these ids must be sorted and contiguous.
   repeated int32 fields = 2;
-  // The top-level offsets of the columns in the file.
+  // The top-level column indices for each field in the file.
   //
-  // If the data file is version 1 then the offsets will be empty
+  // If the data file is version 1 then this property will be empty
   //
   // Otherwise there must be one entry for each field in `fields`.
   //
   // Some fields may not correspond to a top-level column in the file.  In these cases
-  // the offset will -1.
+  // the index will -1.
   //
   // For example, consider the schema:
   //
@@ -222,7 +222,7 @@ message DataFile {
   //     - margin: fp64 (7)
   //     - padding: fp64 (8)
   //
-  // One possible column offsets array could be:
+  // One possible column indices array could be:
   // [0, -1, -1, 1, 3, 4, 5, 6, 7]
   //
   // This reflects quite a few phenomenon:
@@ -233,8 +233,8 @@ message DataFile {
   //   is not "FSL column"
   // - The borders field actually does have an "FSL column"
   //
-  // The column offsets table may not have duplicates (other than -1)
-  repeated int32 column_offsets = 3;
+  // The column indices table may not have duplicates (other than -1)
+  repeated int32 column_indices = 3;
   // The major file version used to create the file
   uint32 file_major_version = 4;
   // The minor file version used to create the file

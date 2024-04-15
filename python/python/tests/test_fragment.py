@@ -186,7 +186,7 @@ def test_dataset_progress(tmp_path: Path):
 
 
 def test_fragment_meta():
-    # Intentionally leaving off column_offsets / version fields to make sure
+    # Intentionally leaving off column_indices / version fields to make sure
     # we can handle backwards compatibility (though not clear we need to)
     data = {
         "id": 0,
@@ -206,8 +206,8 @@ def test_fragment_meta():
 
     assert repr(meta) == (
         'Fragment { id: 0, files: [DataFile { path: "0.lance", fields: [0], '
-        "column_offsets: [], file_major_version: 0, file_minor_version: 0 }, "
-        'DataFile { path: "1.lance", fields: [1], column_offsets: [], '
+        "column_indices: [], file_major_version: 0, file_minor_version: 0 }, "
+        'DataFile { path: "1.lance", fields: [1], column_indices: [], '
         "file_major_version: 0, file_minor_version: 0 }], deletion_file: None, "
         "physical_rows: Some(100) }"
     )
