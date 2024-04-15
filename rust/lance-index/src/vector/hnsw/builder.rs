@@ -157,8 +157,9 @@ impl HNSWBuilder {
             self.inner.params.ef_construction
         );
 
-        let mut tasks = Vec::with_capacity(num_cpus::get());
-        let chunk_size = (self.inner.vectors.len() - 1).div_ceil(num_cpus::get());
+        let parallel_limit = min(num_cpus::get(), 16);
+        let mut tasks = Vec::with_capacity(parallel_limit);
+        let chunk_size = (self.inner.vectors.len() - 1).div_ceil(parallel_limit);
         for chunk in &(1..self.inner.vectors.len()).chunks(chunk_size) {
             let chunk = chunk.collect_vec();
             let inner = self.inner.clone();
@@ -263,7 +264,8 @@ impl HNSWBuilderInner {
     fn insert(&self, node: u32) -> Result<()> {
         let target_level = self.nodes.read().unwrap()[node as usize]
             .level_neighbors
-            .len() as u16 - 1;
+            .len() as u16
+            - 1;
         let mut ep = OrderedNode::new(
             self.entry_point,
             self.vectors.distance_between(node, self.entry_point).into(),
@@ -335,7 +337,7 @@ impl HNSWBuilderInner {
     }
 
     fn connect(&self, u: u32, v: u32, dist: OrderedFloat, level: u16) {
-        let nodes = self.nodes.write().unwrap();
+        let nodes = self.nodes.read().unwrap();
         nodes[u as usize].add_neighbor(v, dist, level);
         nodes[v as usize].add_neighbor(u, dist, level);
     }
@@ -343,13 +345,12 @@ impl HNSWBuilderInner {
     fn prune(&self, id: u32, level: u16) {
         let node = &self.nodes.read().unwrap()[id as usize];
 
-        let neighbors = {
-            let level_neighbors = node.level_neighbors[level as usize].read().unwrap();
-            if level_neighbors.len() <= self.params.m_max {
-                return;
-            }
-            level_neighbors.iter().cloned().collect_vec()
-        };
+        let mut level_neighbors = node.level_neighbors[level as usize].write().unwrap();
+        if level_neighbors.len() <= self.params.m_max {
+            return;
+        }
+
+        let neighbors = level_neighbors.iter().cloned().collect_vec();
 
         let level_view = HnswLevelView::new(level, self);
         let new_neighbors = select_neighbors_heuristic(
@@ -361,7 +362,7 @@ impl HNSWBuilderInner {
         )
         .collect();
 
-        *node.level_neighbors[level as usize].write().unwrap() = new_neighbors;
+        *level_neighbors = new_neighbors;
     }
 }
 
