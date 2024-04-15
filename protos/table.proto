@@ -198,20 +198,43 @@ message DataFile {
   // or it could be encoded into a single packed column.  To determine column offsets
   // the column_offsets property should be used instead.
   //
-  // In Lance v2 a nested field may or may not have its field id recorded here.  In the
-  // "packed struct" example above a nested field would not have a field id recorded here.
-  // If a nested field is not listed here then it is not possible for that field to be
-  // projected / individually loaded and the entire parent field must be loaded instead (this
-  // is the downside of the packed struct)
-  //
   // In Lance v1 these ids must be sorted and contiguous.
   repeated int32 fields = 2;
-  // The offsets of the columns in the file.
+  // The top-level offsets of the columns in the file.
   //
   // If the data file is version 1 then the offsets will be empty
   //
   // Otherwise there must be one entry for each field in `fields`.
-  repeated uint32 column_offsets = 3;
+  //
+  // Some fields may not correspond to a top-level column in the file.  In these cases
+  // the offset will be top-level column of the ancestor containing the field.
+  //
+  // For example, consider the schema:
+  //
+  // - dimension: packed-struct (0):
+  //   - x: u32 (1)
+  //   - y: u32 (2)
+  // - path: string (3)
+  // - embedding: fsl<768> (4)
+  //   - fp64
+  // - borders: fsl<4> (5)
+  //   - simple-struct (6)
+  //     - margin: fp64 (7)
+  //     - padding: fp64 (8)
+  //
+  // One possible column offsets array could be:
+  // [0, 0, 0, 1, 3, 4, 5, 6, 7]
+  //
+  // This reflects quite a few phenomenon:
+  // - The packed struct is encoded into a single column and there is no top-level column
+  //   for the x or y fields
+  // - The string is encoded into two columns
+  // - The embedding is encoded into a single column (common for FSL of primitive) and there
+  //   is not "FSL column"
+  // - The borders field actually does have an "FSL column"
+  //
+  // Hopefully it is clear that the column offsets may have duplicates and gaps.
+  repeated int32 column_offsets = 3;
   // The major file version used to create the file
   uint32 file_major_version = 4;
   // The minor file version used to create the file
