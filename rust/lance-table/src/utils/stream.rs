@@ -193,9 +193,7 @@ fn apply_row_id_and_deletes(
     let num_rows = batch.num_rows() as u32;
 
     let row_ids = if should_fetch_row_id {
-        let ids_in_batch = config
-            .params
-            .to_offsets(batch_offset, num_rows, config.total_num_rows);
+        let ids_in_batch = config.params.to_offsets(batch_offset, num_rows);
         let row_ids: Vec<u64> = ids_in_batch
             .iter()
             .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))

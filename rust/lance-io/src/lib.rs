@@ -80,7 +80,13 @@ impl From<&Self> for ReadBatchParams {
 }
 
 impl ReadBatchParams {
-    pub fn to_offsets(&self, base_offset: u32, length: u32, total_num_rows: u32) -> Vec<u32> {
+    /// Convert a read range into a vector of row offsets
+    ///
+    /// Can take in a `base_offset` and `length` to allow paging through the range
+    ///
+    /// For example, if the range is `Range(10..20)` and `base_offset` is 5 and `length` is 3,
+    /// the output will be `15..18`
+    pub fn to_offsets(&self, base_offset: u32, length: u32) -> Vec<u32> {
         match self {
             Self::Indices(indices) => indices
                 .slice(base_offset as usize, length as usize)
@@ -92,13 +98,66 @@ impl ReadBatchParams {
                 (r.start as u32 + base_offset..r.start as u32 + base_offset + length).collect()
             }
             Self::RangeFull => (base_offset..base_offset + length).collect(),
-            Self::RangeTo(r) => {
-                let start = r.end as u32 - total_num_rows + base_offset;
-                (start..start + length).collect()
-            }
+            Self::RangeTo(_) => (base_offset..base_offset + length).collect(),
             Self::RangeFrom(r) => {
                 (r.start as u32 + base_offset..r.start as u32 + base_offset + length).collect()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::ops::{RangeFrom, RangeTo};
+
+    use arrow_array::UInt32Array;
+
+    use crate::ReadBatchParams;
+
+    #[test]
+    fn test_params_to_offsets() {
+        let check = |params: ReadBatchParams, base_offset, length, expected: Vec<u32>| {
+            let offsets = params.to_offsets(base_offset, length);
+            assert_eq!(offsets, expected);
+        };
+
+        check(ReadBatchParams::RangeFull, 0, 100, (0..100).collect());
+        check(ReadBatchParams::RangeFull, 50, 100, (50..150).collect());
+        check(
+            ReadBatchParams::RangeFrom(RangeFrom { start: 500 }),
+            0,
+            100,
+            (500..600).collect(),
+        );
+        check(
+            ReadBatchParams::RangeFrom(RangeFrom { start: 500 }),
+            100,
+            100,
+            (600..700).collect(),
+        );
+        check(
+            ReadBatchParams::RangeTo(RangeTo { end: 800 }),
+            0,
+            100,
+            (0..100).collect(),
+        );
+        check(
+            ReadBatchParams::RangeTo(RangeTo { end: 800 }),
+            200,
+            100,
+            (200..300).collect(),
+        );
+        check(
+            ReadBatchParams::Indices(UInt32Array::from(vec![1, 3, 5, 7, 9])),
+            0,
+            2,
+            vec![1, 3],
+        );
+        check(
+            ReadBatchParams::Indices(UInt32Array::from(vec![1, 3, 5, 7, 9])),
+            2,
+            2,
+            vec![5, 7],
+        );
     }
 }

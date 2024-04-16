@@ -1262,7 +1262,7 @@ impl FragmentReader {
                 .collect::<Vec<_>>()
         );
         if self.with_row_id && self.output_schema.fields.len() == 1 {
-            let mut offsets = params.to_offsets(0, total_num_rows, total_num_rows);
+            let mut offsets = params.to_offsets(0, total_num_rows);
             if let Some(deletion_vector) = self.deletion_vec.as_ref() {
                 // TODO: More efficient set subtraction
                 offsets.retain(|row_offset| !deletion_vector.contains(*row_offset));

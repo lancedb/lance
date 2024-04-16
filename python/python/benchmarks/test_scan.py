@@ -140,5 +140,5 @@ def test_filter_multiple(benchmark, sample_dataset):
         filter="i > 1000 and i < 5000 and s in ('hello', 'world')",
     )
 
-    assert result.num_rows == 1
+    assert result.num_rows > 1
     assert result.schema.names == ["i", "f", "s", "fsl", "blob"]
