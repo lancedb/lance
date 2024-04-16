@@ -374,6 +374,7 @@ impl FragmentMetadata {
     }
 
     fn __repr__(&self) -> String {
+        dbg!(&self.schema);
         format!("{:?}", self.inner)
     }
 
@@ -385,6 +386,7 @@ impl FragmentMetadata {
                     PyValueError::new_err(format!("Unable to unpickle FragmentMetadata: {}", e))
                 })?;
                 self.schema = Schema::from(&Fields(manifest.fields));
+                dbg!(&self.schema);
                 self.inner = LanceFragmentMetadata::from(&manifest.fragments[0]);
                 Ok(())
             }
