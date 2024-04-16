@@ -143,7 +143,7 @@ Now you train the model just like you would with any other dataset!
 
     # Define the optimizer, training loop and train the model!
     model = model.to(device)
-    model.eval()
+    model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     for epoch in range(nb_epochs):
