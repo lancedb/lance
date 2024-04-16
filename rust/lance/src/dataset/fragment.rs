@@ -1252,6 +1252,15 @@ impl FragmentReader {
         //
         // We could potentially delete the support for no-columns in the wrap function or
         // we can delete this path once we migrate away from any support of v1.
+        println!(
+            "new_read_impl with_row_id={} output_schema={:?}",
+            self.with_row_id,
+            self.output_schema
+                .fields
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>()
+        );
         if self.with_row_id && self.output_schema.fields.len() == 1 {
             let mut offsets = params.to_offsets(0, total_num_rows, total_num_rows);
             if let Some(deletion_vector) = self.deletion_vec.as_ref() {
@@ -1282,7 +1291,17 @@ impl FragmentReader {
         let read_streams = self
             .readers
             .iter()
-            .map(|(reader, schema)| read_fn(reader.as_ref(), schema))
+            .filter_map(|(reader, schema)| {
+                // Normally we filter out empty readers in the open_readers method
+                // However, we will keep the first empty reader to use for row id
+                // purposes on some legacy paths and so we need to filter that out
+                // here.
+                if schema.fields.is_empty() {
+                    None
+                } else {
+                    Some(read_fn(reader.as_ref(), schema))
+                }
+            })
             .collect::<Vec<_>>();
         // Merge the streams, this merges the generated batches
         let merged = lance_table::utils::stream::merge_streams(read_streams);
