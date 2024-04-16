@@ -318,12 +318,12 @@ impl WriterGenerator {
             let writer = self.object_store.create(&full_path).await?;
             Box::new(v2::writer::FileWriter::try_new(
                 writer,
-                data_file_path.to_string(),
+                data_file_path,
                 self.schema.clone(),
                 FileWriterOptions::default(),
             )?) as Box<dyn GenericWriter>
         } else {
-            let path = data_file_path.to_string();
+            let path = data_file_path;
             Box::new((
                 FileWriter::<ManifestDescribing>::try_new(
                     self.object_store.as_ref(),
