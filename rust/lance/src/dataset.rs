@@ -605,10 +605,12 @@ impl Dataset {
         self.append_impl(batches, params).await
     }
 
+    /// Get the base URI of the dataset.
     pub fn uri(&self) -> &Path {
         &self.base
     }
 
+    /// Get the full manifest of the dataset version.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -624,6 +626,10 @@ impl Dataset {
         .await
     }
 
+    /// Read the transaction file for this version of the dataset.
+    ///
+    /// If there was no transaction file written for this version of the dataset
+    /// then this will return None.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
         let path = match &self.manifest.transaction_file {
             Some(path) => self.base.child("_transactions").child(path.as_str()),

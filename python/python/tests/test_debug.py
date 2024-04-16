@@ -19,7 +19,6 @@ def test_print_schema(capfd, tmp_path: Path):
 
     print_schema(dataset)
     captured = capfd.readouterr()
-    # breakpoint()
     assert captured.out.startswith("Schema")
     assert (
         'Field {\n            name: "a",\n            id: 0,\n            parent_id:'
