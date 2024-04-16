@@ -319,6 +319,10 @@ impl FileFragment {
     /// Validate the fragment
     ///
     /// Verifies:
+    /// * All field ids in the fragment are distinct
+    /// * Within each data file, field ids are in increasing order
+    /// * All fields in the schema have a corresponding field in one of the data
+    ///  files
     /// * All data files exist and have the same length
     /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
@@ -326,16 +330,49 @@ impl FileFragment {
     /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
     pub async fn validate(&self) -> Result<()> {
         let mut seen_fields = HashSet::new();
-        for field_id in self.metadata.files.iter().flat_map(|f| f.fields.iter()) {
-            if !seen_fields.insert(field_id) {
+        for data_file in &self.metadata.files {
+            let last = -1;
+            for field_id in &data_file.fields {
+                if *field_id <= last {
+                    return Err(Error::corrupt_file(
+                        self.dataset
+                            .data_dir()
+                            .child(self.metadata.files[0].path.as_str()),
+                        format!(
+                            "Field id {} is not in increasing order in fragment {:#?}",
+                            field_id, self
+                        ),
+                        location!(),
+                    ));
+                }
+
+                if !seen_fields.insert(field_id) {
+                    return Err(Error::corrupt_file(
+                        self.dataset
+                            .data_dir()
+                            .child(self.metadata.files[0].path.as_str()),
+                        format!(
+                            "Field id {} is duplicated in fragment {:#?}",
+                            field_id, self
+                        ),
+                        location!(),
+                    ));
+                }
+            }
+        }
+
+        for field in self.schema().fields_pre_order() {
+            if !seen_fields.contains(&field.id) {
                 return Err(Error::corrupt_file(
                     self.dataset
                         .data_dir()
                         .child(self.metadata.files[0].path.as_str()),
                     format!(
-                        "Field id {} is duplicated in fragment {}",
-                        field_id,
-                        self.id()
+                        "Field {} is missing in fragment {}\nField: {:#?}\nFragment: {:#?}",
+                        field.id,
+                        self.id(),
+                        field,
+                        self.metadata()
                     ),
                     location!(),
                 ));
