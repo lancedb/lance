@@ -189,7 +189,7 @@ message DataFile {
   // nested fields (both struct and list).  Fixed size list fields have only a single
   // field id (these are not considered nested fields in Lance v1).
   //
-  // This allows column offsets to be calculated from field IDs and the input schema.
+  // This allows column indices to be calculated from field IDs and the input schema.
   //
   // In Lance v2 the field IDs generally follow the same pattern but there is no
   // way to calculate the column index from the field ID.  This is because a given
