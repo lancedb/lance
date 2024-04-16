@@ -19,6 +19,9 @@ use crate::Result;
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
+    /// Get integers from Java List<Integer> object.
+    fn get_integers(&mut self, obj: &JObject) -> Result<Vec<i32>>;
+
     /// Get strings from Java List<String> object.
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>>;
 
@@ -34,12 +37,27 @@ pub trait JNIEnvExt {
     /// Get Option<i64> from Java Optional<Long>.
     fn get_long_opt(&mut self, obj: &JObject) -> Result<Option<i64>>;
 
+    /// Get Option<u64> from Java Optional<Long>.
+    fn get_long_opt_u64(&mut self, obj: &JObject) -> Result<Option<u64>>;
+
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
     where
         F: FnOnce(&mut JNIEnv, &JObject) -> Result<T>;
 }
 
 impl JNIEnvExt for JNIEnv<'_> {
+    fn get_integers(&mut self, obj: &JObject) -> Result<Vec<i32>> {
+        let list = self.get_list(obj)?;
+        let mut iter = list.iter(self)?;
+        let mut results = Vec::with_capacity(list.size(self)? as usize);
+        while let Some(elem) = iter.next(self)? {
+            let int_obj = self.call_method(elem, "intValue", "()I", &[])?;
+            let int_value = int_obj.i()?;
+            results.push(int_value);
+        }
+        Ok(results)
+    }
+
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>> {
         let list = self.get_list(obj)?;
         let mut iter = list.iter(self)?;
@@ -87,6 +105,16 @@ impl JNIEnvExt for JNIEnv<'_> {
             let long_obj = env.call_method(java_long_obj, "longValue", "()J", &[])?;
             let long_value = long_obj.j()?;
             Ok(long_value)
+        })
+    }
+
+    fn get_long_opt_u64(&mut self, obj: &JObject) -> Result<Option<u64>> {
+        self.get_optional(obj, |env, inner_obj| {
+            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
+            let java_long_obj = java_obj_gen.l()?;
+            let long_obj = env.call_method(java_long_obj, "longValue", "()J", &[])?;
+            let long_value = long_obj.j()?;
+            Ok(long_value as u64)
         })
     }
 

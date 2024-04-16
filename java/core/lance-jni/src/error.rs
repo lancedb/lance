@@ -47,6 +47,8 @@ pub enum Error {
     Arrow { message: String, location: Location },
     #[snafu(display("Index error: {}, location", message))]
     Index { message: String, location: Location },
+    #[snafu(display("JSON error: {}, location: {}", message, location))]
+    JSON { message: String, location: Location },
     #[snafu(display("Dataset not found error: {}, location {}", path, location))]
     DatasetNotFound { path: String, location: Location },
     #[snafu(display("Dataset already exists error: {}, location {}", uri, location))]
@@ -66,6 +68,7 @@ impl Error {
             Self::Arrow { .. }
             | Self::DatasetNotFound { .. }
             | Self::DatasetAlreadyExists { .. }
+            | Self::JSON { .. }
             | Self::Other { .. }
             | Self::Jni { .. } => self.throw_as(env, JavaException::RuntimeException),
         }

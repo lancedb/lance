@@ -14,15 +14,30 @@
 
 package com.lancedb.lance;
 
-/** Metadata of a Fragment in the dataset. */
-public class FragmentMetadata {
-  private final int fragementId;
+import org.json.JSONObject;
 
-  public FragmentMetadata(int fragementId) {
-    this.fragementId = fragementId;
+/**
+ * Metadata of a Fragment in the dataset. 
+ * Matching to lance Fragment.
+ * */
+public class FragmentMetadata {
+  private final String jsonMetadata;
+  private final JSONObject metadata;
+
+  public FragmentMetadata(String jsonMetadata) {
+    this.jsonMetadata = jsonMetadata;
+    this.metadata = new JSONObject(jsonMetadata);
   }
 
-  public int getFragementId() {
-    return fragementId;
+  public int getId() {
+    return metadata.getInt("id");
+  }
+  
+  public long getPhysicalRows() {
+    return metadata.getLong("physical_rows");
+  }
+
+  public String getJsonMetadata() {
+    return jsonMetadata;
   }
 }

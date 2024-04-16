@@ -78,8 +78,8 @@ impl FragmentScanner {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray(
-    mut env: JNIEnv,
+pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'a>(
+    mut env: JNIEnv<'a>,
     _obj: JObject,
     dataset_uri: JString,
     arrow_array_addr: jlong,
@@ -89,7 +89,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray(
     max_rows_per_group: JObject, // Optional<Integer>
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
-) -> jint {
+) -> JString<'a> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
 
@@ -103,7 +103,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray(
                 location: location!(),
             }
         }),
-        -1
+        JString::default()
     );
 
     let array_data = ok_or_throw_with_return!(
@@ -114,15 +114,17 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray(
                 location: location!(),
             })
         },
-        -1
+        JString::default()
     );
 
     let record_batch = RecordBatch::from(StructArray::from(array_data));
     let batch_schema = record_batch.schema().clone();
     let reader = RecordBatchIterator::new(once(Ok(record_batch)), batch_schema);
 
-    let path_str: String = ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), -1);
-    let fragment_id_opts = ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), -1);
+    let path_str: String =
+        ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), JString::default());
+    let fragment_id_opts =
+        ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), JString::default());
 
     let write_params = ok_or_throw_with_return!(
         env,
@@ -133,30 +135,44 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray(
             &max_bytes_per_file,
             &mode
         ),
-        -1
+        JString::default()
     );
 
-    match RT.block_on(FileFragment::create(
+    // TODO(lu) improve the error handling and utils reuse
+    let fragment = match RT.block_on(FileFragment::create(
         &path_str,
         fragment_id_opts.unwrap_or(0) as usize,
         reader,
         Some(write_params),
     )) {
-        Ok(fragment) => fragment.id as jint,
+        Ok(fragment) => fragment,
         Err(e) => {
             Error::IO {
                 message: e.to_string(),
                 location: location!(),
             }
             .throw(&mut env);
-            -1
+            return JString::default();
         }
-    }
+    };
+    let json_string = match serde_json::to_string(&fragment) {
+        Ok(s) => s,
+        Err(err) => {
+            env.throw_new(
+                "java/lang/RuntimeException",
+                format!("Failed to convert JSON: {}", err),
+            )
+            .expect("Error throwing exception");
+            return JString::default();
+        }
+    };
+    env.new_string(json_string)
+        .expect("Failed to create json string")
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream(
-    mut env: JNIEnv,
+pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
+    mut env: JNIEnv<'a>,
     _obj: JObject,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
@@ -165,8 +181,9 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream(
     max_rows_per_group: JObject, // Optional<Integer>
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
-) -> jint {
-    let path_str: String = ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), -1);
+) -> JString<'a> {
+    let path_str: String =
+        ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), JString::default());
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = ok_or_throw_with_return!(
         env,
@@ -174,10 +191,11 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream(
             message: e.to_string(),
             location: location!(),
         }),
-        -1
+        JString::default()
     );
 
-    let fragment_id_opts = ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), -1);
+    let fragment_id_opts =
+        ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), JString::default());
 
     let write_params = ok_or_throw_with_return!(
         env,
@@ -188,29 +206,43 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream(
             &max_bytes_per_file,
             &mode
         ),
-        -1
+        JString::default()
     );
 
-    match RT.block_on(FileFragment::create(
+    let fragment = match RT.block_on(FileFragment::create(
         &path_str,
         fragment_id_opts.unwrap_or(0) as usize,
         reader,
         Some(write_params),
     )) {
-        Ok(fragment) => fragment.id as jint,
+        Ok(fragment) => fragment,
         Err(e) => {
             Error::IO {
                 message: e.to_string(),
                 location: location!(),
             }
             .throw(&mut env);
-            -1
+            return JString::default();
         }
-    }
+    };
+
+    let json_string = match serde_json::to_string(&fragment) {
+        Ok(s) => s,
+        Err(err) => {
+            env.throw_new(
+                "java/lang/RuntimeException",
+                format!("Failed to convert JSON: {}", err),
+            )
+            .expect("Error throwing exception");
+            return JString::default();
+        }
+    };
+    env.new_string(json_string)
+        .expect("Failed to create json string")
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative(
+pub extern "system" fn Java_com_lancedb_lance_DatasetFragment_countRowsNative(
     mut env: JNIEnv,
     _jfragment: JObject,
     jdataset: JObject,

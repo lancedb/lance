@@ -15,12 +15,8 @@
 package com.lancedb.lance;
 
 import io.questdb.jar.jni.JarJniLoader;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
-import java.nio.channels.Channels;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -28,10 +24,6 @@ import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowStreamReader;
-import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
@@ -120,6 +112,22 @@ public class Dataset implements Closeable {
   public static native Dataset openNative(String path);
 
   /**
+   * Opens a dataset from the specified path using the native library.
+   *
+   * @param path The file path of the dataset to open.
+   * @return A new instance of {@link Dataset} linked to the opened dataset.
+   */
+  public static Dataset commit(BufferAllocator allocator, String path,
+      FragmentOperation operation, Optional<Integer> readVersion) {
+    var dataset = operation.commit(allocator, path, readVersion);
+    dataset.allocator = allocator;
+    return dataset;
+  }
+
+  public static native Dataset commitAppend(String path, Optional<Integer> readVersion,
+      List<String> fragmentsMetadata);
+
+  /**
    * Count the number of rows in the dataset.
    *
    * @return num of rows.
@@ -129,18 +137,18 @@ public class Dataset implements Closeable {
   /**
    * Get all fragments in this dataset.
    *
-   * @return A list of {@link Fragment}.
+   * @return A list of {@link DatasetFragment}.
    */
-  public List<Fragment> getFragments() {
+  public List<DatasetFragment> getFragments() {
     // Set a pointer in Fragment to dataset, to make it is easier to issue IOs later.
     //
     // We do not need to close Fragments.
-    return Arrays.stream(this.getFragmentsIds())
-        .mapToObj(fid -> new Fragment(this, fid))
+    return this.getJsonFragments().stream().map(jsonFragment 
+        -> new DatasetFragment(this, new FragmentMetadata(jsonFragment)))
         .collect(Collectors.toList());
   }
 
-  private native int[] getFragmentsIds();
+  private native List<String> getJsonFragments();
 
   /**
    * Gets the schema of the dataset.

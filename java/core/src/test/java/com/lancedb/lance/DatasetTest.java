@@ -25,7 +25,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import org.apache.arrow.c.ArrowArrayStream;
-import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -88,7 +87,7 @@ public class DatasetTest {
 
       var fragments = dataset.getFragments();
       assertEquals(1, fragments.size());
-      assertEquals(0, fragments.get(0).getFragmentId());
+      assertEquals(0, fragments.get(0).getId());
       assertEquals(9, fragments.get(0).countRows());
       assertEquals(reader.getVectorSchemaRoot().getSchema(), dataset.getSchema());
     }

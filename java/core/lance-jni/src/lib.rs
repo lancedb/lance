@@ -19,9 +19,12 @@ use arrow::array::RecordBatchIterator;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::Schema;
+use ffi::JNIEnvExt;
 use jni::objects::{JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
+use lance::dataset::transaction::Operation;
+use lance::table::format::Fragment;
 use lazy_static::lazy_static;
 use snafu::{location, Location};
 use traits::IntoJava;
@@ -164,6 +167,44 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     let path_str: String = ok_or_throw!(env, path.extract(&mut env));
 
     let dataset = ok_or_throw!(env, BlockingDataset::open(&path_str));
+    dataset.into_java(&mut env)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_commitAppend<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    path: JString,
+    read_version_obj: JObject, // Optional<Long>
+    fragments_obj: JObject,    // List<String>, String is json serialized Fragment
+) -> JObject<'local> {
+    let json_fragments = ok_or_throw!(env, env.get_strings(&fragments_obj));
+    let mut fragments: Vec<Fragment> = Vec::new();
+    for json_fragment in json_fragments {
+        let fragment = ok_or_throw!(
+            env,
+            Fragment::from_json(&json_fragment).map_err(|err| Error::IO {
+                message: err.to_string(),
+                location: location!()
+            })
+        );
+        fragments.push(fragment);
+    }
+    let op = Operation::Append { fragments };
+    let path_str: String = ok_or_throw!(env, path.extract(&mut env));
+
+    let read_version = ok_or_throw!(env, env.get_long_opt_u64(&read_version_obj));
+    let dataset = match BlockingDataset::commit(&path_str, op, read_version) {
+        Ok(dataset) => dataset,
+        Err(err) => {
+            env.throw_new(
+                "java/lang/RuntimeException",
+                format!("Failed to commit: {}", err),
+            )
+            .expect("Error throwing exception");
+            return JObject::null();
+        }
+    };
     dataset.into_java(&mut env)
 }
 

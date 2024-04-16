@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::utils::create_json_fragment_list;
 use crate::{traits::IntoJava, Result, RT};
 use arrow::array::RecordBatchReader;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema;
 use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
+use lance::dataset::transaction::Operation;
 use lance::dataset::{Dataset, WriteParams};
-
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
 #[derive(Clone)]
@@ -39,6 +40,11 @@ impl BlockingDataset {
 
     pub fn open(uri: &str) -> Result<Self> {
         let inner = RT.block_on(Dataset::open(uri))?;
+        Ok(Self { inner })
+    }
+
+    pub fn commit(uri: &str, operation: Operation, read_version: Option<u64>) -> Result<Self> {
+        let inner = RT.block_on(Dataset::commit(uri, operation, read_version, None, None))?;
         Ok(Self { inner })
     }
 
@@ -100,7 +106,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsIds<'a>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_getJsonFragments<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
 ) -> JObject<'a> {
@@ -111,13 +117,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsIds<'a>(
         dataset.inner.get_fragments()
     };
 
-    let array_list = env
-        .new_int_array(fragments.len() as i32)
-        .expect("Failed to create int array");
-    let fragment_ids = fragments.iter().map(|f| f.id() as i32).collect::<Vec<_>>();
-    env.set_int_array_region(&array_list, 0, &fragment_ids)
-        .expect("Failed to set int array region");
-    array_list.into()
+    ok_or_throw!(env, create_json_fragment_list(&mut env, fragments))
 }
 
 #[no_mangle]
