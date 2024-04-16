@@ -5,7 +5,7 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
-from lance.debug import list_transactions, print_manifest, print_schema
+from lance.debug import list_transactions, print_fragment, print_manifest, print_schema
 
 
 def test_print_schema(capfd, tmp_path: Path):
@@ -22,15 +22,18 @@ def test_print_schema(capfd, tmp_path: Path):
     # breakpoint()
     assert captured.out.startswith("Schema")
     assert (
-        'Field { name: "a", id: 0, parent_id: -1, logical_type: LogicalType("int64")'
+        'Field {\n            name: "a",\n            id: 0,\n            parent_id:'
+        ' -1,\n            logical_type: LogicalType(\n                "int64"'
         in captured.out
     )
     assert (
-        'Field { name: "b", id: 1, parent_id: -1, logical_type: LogicalType("string")'
+        'Field {\n            name: "b",\n            id: 1,\n            parent_id:'
+        ' -1,\n            logical_type: LogicalType(\n                "string"'
         in captured.out
     )
     assert (
-        'Field { name: "c", id: 2, parent_id: -1, logical_type: LogicalType("bool")'
+        'Field {\n            name: "c",\n            id: 2,\n            parent_id:'
+        ' -1,\n            logical_type: LogicalType(\n                "bool"'
         in captured.out
     )
 
@@ -43,8 +46,26 @@ def test_print_manifest(capfd, tmp_path: Path):
     captured = capfd.readouterr()
     assert captured.out.startswith("Manifest {")
     assert "Schema {" in captured.out
-    assert 'writer_version: Some(WriterVersion { library: "lance"' in captured.out
-    assert "fragments: [Fragment { id: 0," in captured.out
+    assert (
+        'writer_version: Some(\n        WriterVersion {\n            library: "lance"'
+        in captured.out
+    )
+    assert "fragments: [\n        Fragment {" in captured.out
+
+
+def test_print_fragment(capfd, tmp_path: Path):
+    table = pa.table({"x": range(10)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.add_columns({"y": "x + 1", "z": "'hello'"})
+
+    fragment = dataset.get_fragments()[0].metadata
+
+    print_fragment(fragment)
+    captured = capfd.readouterr()
+
+    assert captured.out.startswith("PrettyPrintableFragment {")
+    assert "files: [" in captured.out
+    assert "schema: Schema {" in captured.out
 
 
 def test_list_transactions(tmp_path: Path):

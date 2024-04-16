@@ -3,10 +3,11 @@
 
 use std::sync::Arc;
 
-use lance::Error;
+use lance::{datatypes::Schema, Error};
+use lance_table::format::{DeletionFile, Fragment as LanceFragmentMetadata};
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-use crate::{Dataset, RT};
+use crate::{Dataset, FragmentMetadata, RT};
 
 /// Print the Lance schema of a dataset.
 ///
@@ -17,7 +18,7 @@ pub fn print_schema(dataset: &PyAny) -> PyResult<()> {
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.as_ref(py).borrow().ds;
     let schema = dataset_ref.schema();
-    println!("{:?}", schema);
+    println!("{:#?}", schema);
     Ok(())
 }
 
@@ -28,7 +29,63 @@ pub fn print_manifest(dataset: &PyAny) -> PyResult<()> {
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.as_ref(py).borrow().ds;
     let manifest = dataset_ref.manifest();
-    println!("{:?}", manifest);
+    println!("{:#?}", manifest);
+    Ok(())
+}
+
+// These are dead code because they just exist for the debug impl.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct PrettyPrintableFragment {
+    id: u64,
+    files: Vec<PrettyPrintableDataFile>,
+    deletion_file: Option<DeletionFile>,
+    physical_rows: Option<usize>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct PrettyPrintableDataFile {
+    path: String,
+    fields: Vec<i32>,
+    schema: Schema,
+}
+
+impl PrettyPrintableFragment {
+    fn new(fragment: &LanceFragmentMetadata, schema: &Schema) -> Self {
+        let files = fragment
+            .files
+            .iter()
+            .map(|file| {
+                let schema = schema.project_by_ids(&file.fields);
+                PrettyPrintableDataFile {
+                    path: file.path.clone(),
+                    fields: file.fields.clone(),
+                    schema,
+                }
+            })
+            .collect();
+
+        Self {
+            id: fragment.id,
+            files,
+            deletion_file: fragment.deletion_file.clone(),
+            physical_rows: fragment.physical_rows,
+        }
+    }
+}
+
+/// Debug print a LanceFragment.
+#[pyfunction]
+pub fn print_fragment(fragment: &PyAny) -> PyResult<()> {
+    let py = fragment.py();
+    let fragment = fragment
+        .getattr("_metadata")?
+        .extract::<Py<FragmentMetadata>>()?;
+    let schema = &fragment.as_ref(py).borrow().schema;
+    let meta = fragment.as_ref(py).borrow().inner.clone();
+    let pp_meta = PrettyPrintableFragment::new(&meta, schema);
+    println!("{:#?}", pp_meta);
     Ok(())
 }
 
@@ -55,7 +112,7 @@ pub fn list_transactions(
                 PyIOError::new_err(format!("Failed to read transaction file: {:?}", err))
             })?;
             if let Some(transaction) = transaction {
-                transactions.push(Some(format!("{:?}", transaction)));
+                transactions.push(Some(format!("{:#?}", transaction)));
             } else {
                 transactions.push(None);
             }

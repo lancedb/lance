@@ -8,6 +8,7 @@ Debug utilities for Lance.
 from .lance import (
     list_transactions as list_transactions,
 )
+from .lance import print_fragment as print_fragment
 from .lance import (
     print_manifest as print_manifest,
 )

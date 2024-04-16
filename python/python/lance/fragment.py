@@ -40,6 +40,12 @@ class FragmentMetadata:
         """
         self._metadata = _FragmentMetadata.from_json(metadata)
 
+    @classmethod
+    def from_metadata(cls, metadata: _FragmentMetadata):
+        instance = cls.__new__(cls)
+        instance._metadata = metadata
+        return instance
+
     def __repr__(self):
         return self._metadata.__repr__()
 
@@ -428,7 +434,7 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
-        return FragmentMetadata(self._fragment.metadata().json())
+        return FragmentMetadata.from_metadata(self._fragment.metadata())
 
 
 def write_fragments(

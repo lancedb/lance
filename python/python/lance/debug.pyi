@@ -4,11 +4,15 @@
 from typing import List
 
 from lance import LanceDataset
+from lance.fragment import FragmentMetadata
 
 def print_schema(dataset: LanceDataset) -> None:
     pass
 
 def print_manifest(dataset: LanceDataset) -> None:
+    pass
+
+def print_fragment(fragment: FragmentMetadata) -> None:
     pass
 
 def list_transactions(

@@ -328,7 +328,7 @@ impl DataFile {
 #[derive(Clone, Debug)]
 pub struct FragmentMetadata {
     pub(crate) inner: LanceFragmentMetadata,
-    schema: Schema,
+    pub(crate) schema: Schema,
 }
 
 impl FragmentMetadata {
