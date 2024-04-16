@@ -6,13 +6,13 @@ from typing import List
 from lance import LanceDataset
 from lance.fragment import FragmentMetadata
 
-def print_schema(dataset: LanceDataset) -> None:
+def format_schema(dataset: LanceDataset) -> str:
     pass
 
-def print_manifest(dataset: LanceDataset) -> None:
+def format_manifest(dataset: LanceDataset) -> str:
     pass
 
-def print_fragment(fragment: FragmentMetadata) -> None:
+def format_fragment(fragment: FragmentMetadata) -> str:
     pass
 
 def list_transactions(

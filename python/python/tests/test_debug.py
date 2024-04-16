@@ -5,10 +5,15 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
-from lance.debug import list_transactions, print_fragment, print_manifest, print_schema
+from lance.debug import (
+    format_fragment,
+    format_manifest,
+    format_schema,
+    list_transactions,
+)
 
 
-def test_print_schema(capfd, tmp_path: Path):
+def test_format_schema(tmp_path: Path):
     schema = pa.schema({
         "a": pa.int64(),
         "b": pa.string(),
@@ -17,54 +22,50 @@ def test_print_schema(capfd, tmp_path: Path):
     table = pa.Table.from_batches([], schema)
     dataset = lance.write_dataset(table, tmp_path)
 
-    print_schema(dataset)
-    captured = capfd.readouterr()
-    assert captured.out.startswith("Schema")
+    output = format_schema(dataset)
+    assert output.startswith("Schema")
     assert (
         'Field {\n            name: "a",\n            id: 0,\n            parent_id:'
         ' -1,\n            logical_type: LogicalType(\n                "int64"'
-        in captured.out
+        in output
     )
     assert (
         'Field {\n            name: "b",\n            id: 1,\n            parent_id:'
         ' -1,\n            logical_type: LogicalType(\n                "string"'
-        in captured.out
+        in output
     )
     assert (
         'Field {\n            name: "c",\n            id: 2,\n            parent_id:'
-        ' -1,\n            logical_type: LogicalType(\n                "bool"'
-        in captured.out
+        ' -1,\n            logical_type: LogicalType(\n                "bool"' in output
     )
 
 
-def test_print_manifest(capfd, tmp_path: Path):
+def test_format_manifest(tmp_path: Path):
     table = pa.table({"x": range(10)})
     dataset = lance.write_dataset(table, tmp_path)
 
-    print_manifest(dataset)
-    captured = capfd.readouterr()
-    assert captured.out.startswith("Manifest {")
-    assert "Schema {" in captured.out
+    output = format_manifest(dataset)
+    assert output.startswith("Manifest {")
+    assert "Schema {" in output
     assert (
         'writer_version: Some(\n        WriterVersion {\n            library: "lance"'
-        in captured.out
+        in output
     )
-    assert "fragments: [\n        Fragment {" in captured.out
+    assert "fragments: [\n        Fragment {" in output
 
 
-def test_print_fragment(capfd, tmp_path: Path):
+def test_format_fragment(tmp_path: Path):
     table = pa.table({"x": range(10)})
     dataset = lance.write_dataset(table, tmp_path)
     dataset.add_columns({"y": "x + 1", "z": "'hello'"})
 
     fragment = dataset.get_fragments()[0].metadata
 
-    print_fragment(fragment)
-    captured = capfd.readouterr()
+    output = format_fragment(fragment)
 
-    assert captured.out.startswith("PrettyPrintableFragment {")
-    assert "files: [" in captured.out
-    assert "schema: Schema {" in captured.out
+    assert output.startswith("PrettyPrintableFragment {")
+    assert "files: [" in output
+    assert "schema: Schema {" in output
 
 
 def test_list_transactions(tmp_path: Path):

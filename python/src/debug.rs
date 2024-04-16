@@ -9,28 +9,26 @@ use pyo3::{exceptions::PyIOError, prelude::*};
 
 use crate::{Dataset, FragmentMetadata, RT};
 
-/// Print the Lance schema of a dataset.
+/// Format the Lance schema of a dataset as a string.
 ///
 /// This can be used to view the field ids and types in the schema.
 #[pyfunction]
-pub fn print_schema(dataset: &PyAny) -> PyResult<()> {
+pub fn format_schema(dataset: &PyAny) -> PyResult<String> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.as_ref(py).borrow().ds;
     let schema = dataset_ref.schema();
-    println!("{:#?}", schema);
-    Ok(())
+    Ok(format!("{:#?}", schema))
 }
 
 /// Print the full Lance manifest of the dataset.
 #[pyfunction]
-pub fn print_manifest(dataset: &PyAny) -> PyResult<()> {
+pub fn format_manifest(dataset: &PyAny) -> PyResult<String> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.as_ref(py).borrow().ds;
     let manifest = dataset_ref.manifest();
-    println!("{:#?}", manifest);
-    Ok(())
+    Ok(format!("{:#?}", manifest))
 }
 
 // These are dead code because they just exist for the debug impl.
@@ -77,7 +75,7 @@ impl PrettyPrintableFragment {
 
 /// Debug print a LanceFragment.
 #[pyfunction]
-pub fn print_fragment(fragment: &PyAny) -> PyResult<()> {
+pub fn format_fragment(fragment: &PyAny) -> PyResult<String> {
     let py = fragment.py();
     let fragment = fragment
         .getattr("_metadata")?
@@ -85,8 +83,7 @@ pub fn print_fragment(fragment: &PyAny) -> PyResult<()> {
     let schema = &fragment.as_ref(py).borrow().schema;
     let meta = fragment.as_ref(py).borrow().inner.clone();
     let pp_meta = PrettyPrintableFragment::new(&meta, schema);
-    println!("{:#?}", pp_meta);
-    Ok(())
+    Ok(format!("{:#?}", pp_meta))
 }
 
 /// Return a string representation of each transaction in the dataset, in

@@ -139,9 +139,9 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(build_sq_storage))?;
     // Debug functions
-    m.add_wrapped(wrap_pyfunction!(debug::print_schema))?;
-    m.add_wrapped(wrap_pyfunction!(debug::print_manifest))?;
-    m.add_wrapped(wrap_pyfunction!(debug::print_fragment))?;
+    m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
+    m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
+    m.add_wrapped(wrap_pyfunction!(debug::format_fragment))?;
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
