@@ -1882,6 +1882,21 @@ impl Dataset {
                 )
                 .await?;
 
+            // Some data files may no longer contain any columns in the dataset (e.g. if every
+            // remaining column has been altered into a different data file) and so we remove them
+            let schema_field_ids = new_schema.field_ids().into_iter().collect::<Vec<_>>();
+            let fragments = fragments
+                .into_iter()
+                .map(|mut frag| {
+                    frag.files.retain(|f| {
+                        f.fields
+                            .iter()
+                            .any(|field| schema_field_ids.contains(field))
+                    });
+                    frag
+                })
+                .collect::<Vec<_>>();
+
             Transaction::new(
                 self.manifest.version,
                 Operation::Merge {
@@ -4866,9 +4881,9 @@ mod tests {
         let indices = dataset.load_indices().await?;
         assert_eq!(indices.len(), 0);
 
-        // Each fragment gains a file with the new columns
+        // Each fragment gains a file with the new columns, but then the original file is dropped
         dataset.fragments().iter().for_each(|f| {
-            assert_eq!(f.files.len(), 5);
+            assert_eq!(f.files.len(), 4);
         });
 
         let expected_data = RecordBatch::try_new(
