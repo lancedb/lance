@@ -366,7 +366,7 @@ impl FragmentMetadata {
         match op {
             CompareOp::Lt => Ok(self.inner.id < other.inner.id),
             CompareOp::Le => Ok(self.inner.id <= other.inner.id),
-            CompareOp::Eq => Ok(self.inner.id == other.inner.id && self.schema == other.schema),
+            CompareOp::Eq => Ok(self.inner == other.inner),
             CompareOp::Ne => self.__richcmp__(other, CompareOp::Eq).map(|v| !v),
             CompareOp::Gt => self.__richcmp__(other, CompareOp::Le).map(|v| !v),
             CompareOp::Ge => self.__richcmp__(other, CompareOp::Lt).map(|v| !v),
