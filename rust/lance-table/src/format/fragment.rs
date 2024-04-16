@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::BTreeSet;
-
+use lance_core::Error;
+use object_store::path::Path;
 use serde::{Deserialize, Serialize};
+use snafu::{location, Location};
 
 use crate::format::pb;
 
@@ -17,20 +18,72 @@ use lance_core::error::Result;
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
-    /// The Ids of fields in this file.
+    /// The ids of fields in this file.
     pub fields: Vec<i32>,
+    /// The offsets of the fields listed in `fields`, empty in v1 files
+    ///
+    /// Note that -1 is a possibility and it indices that the field has
+    /// no top-level column in the file.
+    #[serde(default)]
+    pub column_indices: Vec<i32>,
+    /// The major version of the file format used to write this file.
+    #[serde(default)]
+    pub file_major_version: u32,
+    /// The minor version of the file format used to write this file.
+    #[serde(default)]
+    pub file_minor_version: u32,
 }
 
 impl DataFile {
-    pub(crate) fn new(path: &str, schema: &Schema) -> Self {
+    fn new(
+        path: impl Into<String>,
+        fields: Vec<i32>,
+        column_indices: Vec<i32>,
+        file_major_version: u32,
+        file_minor_version: u32,
+    ) -> Self {
         Self {
-            path: path.to_string(),
-            fields: schema.field_ids(),
+            path: path.into(),
+            fields,
+            column_indices,
+            file_major_version,
+            file_minor_version,
         }
+    }
+
+    pub fn new_legacy_from_fields(path: impl Into<String>, fields: Vec<i32>) -> Self {
+        Self::new(path, fields, vec![], 0, 0)
+    }
+
+    pub(crate) fn new_legacy(path: impl Into<String>, schema: &Schema) -> Self {
+        Self::new(path, schema.field_ids(), vec![], 0, 0)
     }
 
     pub fn schema(&self, full_schema: &Schema) -> Schema {
         full_schema.project_by_ids(&self.fields)
+    }
+
+    pub fn is_legacy_file(&self) -> bool {
+        self.file_major_version == 0 && self.file_minor_version < 3
+    }
+
+    pub fn validate(&self, base_path: &Path) -> Result<()> {
+        if self.is_legacy_file() {
+            if !self.fields.windows(2).all(|w| w[0] < w[1]) {
+                return Err(Error::corrupt_file(
+                    base_path.child(self.path.clone()),
+                    "contained unsorted or duplicate field ids",
+                    location!(),
+                ));
+            }
+        } else if self.fields.len() != self.column_indices.len() {
+            return Err(Error::corrupt_file(
+                base_path.child(self.path.clone()),
+                "contained an unequal number of fields / column_indices",
+                location!(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -39,16 +92,22 @@ impl From<&DataFile> for pb::DataFile {
         Self {
             path: df.path.clone(),
             fields: df.fields.clone(),
+            column_indices: df.column_indices.clone(),
+            file_major_version: df.file_major_version,
+            file_minor_version: df.file_minor_version,
         }
     }
 }
 
 impl From<&pb::DataFile> for DataFile {
     fn from(proto: &pb::DataFile) -> Self {
-        Self {
-            path: proto.path.clone(),
-            fields: proto.fields.clone(),
-        }
+        Self::new(
+            &proto.path,
+            proto.fields.clone(),
+            proto.column_indices.clone(),
+            proto.file_major_version,
+            proto.file_minor_version,
+        )
     }
 }
 
@@ -155,25 +214,23 @@ impl Fragment {
     }
 
     /// Create a `Fragment` with one DataFile
-    pub fn with_file(id: u64, path: &str, schema: &Schema, physical_rows: Option<usize>) -> Self {
+    pub fn with_file_legacy(
+        id: u64,
+        path: &str,
+        schema: &Schema,
+        physical_rows: Option<usize>,
+    ) -> Self {
         Self {
             id,
-            files: vec![DataFile::new(path, schema)],
+            files: vec![DataFile::new_legacy(path, schema)],
             deletion_file: None,
             physical_rows,
         }
     }
 
     /// Add a new [`DataFile`] to this fragment.
-    pub fn add_file(&mut self, path: &str, schema: &Schema) {
-        self.files.push(DataFile::new(path, schema));
-    }
-
-    /// Get all field IDs from this fragment, sorted.
-    pub fn field_ids(&self) -> Vec<i32> {
-        BTreeSet::from_iter(self.files.iter().flat_map(|f| f.fields.clone()))
-            .into_iter()
-            .collect()
+    pub fn add_file_legacy(&mut self, path: &str, schema: &Schema) {
+        self.files.push(DataFile::new_legacy(path, schema));
     }
 }
 
@@ -240,16 +297,15 @@ mod tests {
             ArrowField::new("bool", DataType::Boolean, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let fragment = Fragment::with_file(123, path, &schema, Some(10));
+        let fragment = Fragment::with_file_legacy(123, path, &schema, Some(10));
 
         assert_eq!(123, fragment.id);
-        assert_eq!(fragment.field_ids(), [0, 1, 2, 3]);
         assert_eq!(
             fragment.files,
-            vec![DataFile {
-                path: path.to_string(),
-                fields: vec![0, 1, 2, 3]
-            }]
+            vec![DataFile::new_legacy_from_fields(
+                path.to_string(),
+                vec![0, 1, 2, 3],
+            )]
         )
     }
 
@@ -257,7 +313,7 @@ mod tests {
     fn test_roundtrip_fragment() {
         let mut fragment = Fragment::new(123);
         let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
-        fragment.add_file("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.add_file_legacy("foobar.lance", &Schema::try_from(&schema).unwrap());
         fragment.deletion_file = Some(DeletionFile {
             read_version: 123,
             id: 456,
@@ -279,7 +335,7 @@ mod tests {
     fn test_to_json() {
         let mut fragment = Fragment::new(123);
         let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
-        fragment.add_file("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.add_file_legacy("foobar.lance", &Schema::try_from(&schema).unwrap());
         fragment.deletion_file = Some(DeletionFile {
             read_version: 123,
             id: 456,
@@ -295,7 +351,7 @@ mod tests {
             json!({
                 "id": 123,
                 "files":[
-                    {"path": "foobar.lance", "fields": [0]}],
+                    {"path": "foobar.lance", "fields": [0], "column_indices": [], "file_major_version": 0, "file_minor_version": 0}],
                      "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                        "num_deleted_rows": 10},
                 "physical_rows": None::<usize>}),

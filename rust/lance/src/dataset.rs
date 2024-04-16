@@ -33,6 +33,7 @@ use lance_table::io::commit::{commit_handler_from_url, CommitError, CommitHandle
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
 use object_store::path::Path;
+use prost::Message;
 use snafu::{location, Location};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -604,6 +605,16 @@ impl Dataset {
         self.append_impl(batches, params).await
     }
 
+    /// Get the base URI of the dataset.
+    pub fn uri(&self) -> &Path {
+        &self.base
+    }
+
+    /// Get the full manifest of the dataset version.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
     pub async fn latest_manifest(&self) -> Result<Manifest> {
         read_manifest(
             &self.object_store,
@@ -613,6 +624,20 @@ impl Dataset {
                 .await?,
         )
         .await
+    }
+
+    /// Read the transaction file for this version of the dataset.
+    ///
+    /// If there was no transaction file written for this version of the dataset
+    /// then this will return None.
+    pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
+        let path = match &self.manifest.transaction_file {
+            Some(path) => self.base.child("_transactions").child(path.as_str()),
+            None => return Ok(None),
+        };
+        let data = self.object_store.inner.get(&path).await?.bytes().await?;
+        let transaction = lance_table::format::pb::Transaction::decode(data)?;
+        Transaction::try_from(&transaction).map(Some)
     }
 
     /// Restore the currently checked out version of the dataset as the latest version.
@@ -1856,6 +1881,21 @@ impl Dataset {
                     Some((new_col_schema, new_schema.clone())),
                 )
                 .await?;
+
+            // Some data files may no longer contain any columns in the dataset (e.g. if every
+            // remaining column has been altered into a different data file) and so we remove them
+            let schema_field_ids = new_schema.field_ids().into_iter().collect::<Vec<_>>();
+            let fragments = fragments
+                .into_iter()
+                .map(|mut frag| {
+                    frag.files.retain(|f| {
+                        f.fields
+                            .iter()
+                            .any(|field| schema_field_ids.contains(field))
+                    });
+                    frag
+                })
+                .collect::<Vec<_>>();
 
             Transaction::new(
                 self.manifest.version,
@@ -4841,9 +4881,9 @@ mod tests {
         let indices = dataset.load_indices().await?;
         assert_eq!(indices.len(), 0);
 
-        // Each fragment gains a file with the new columns
+        // Each fragment gains a file with the new columns, but then the original file is dropped
         dataset.fragments().iter().for_each(|f| {
-            assert_eq!(f.files.len(), 5);
+            assert_eq!(f.files.len(), 4);
         });
 
         let expected_data = RecordBatch::try_new(

@@ -111,7 +111,7 @@ impl Updater {
     /// Internal use only.
     async fn new_writer(&mut self, schema: Schema) -> Result<FileWriter<ManifestDescribing>> {
         let file_name = format!("{}.lance", Uuid::new_v4());
-        self.fragment.metadata.add_file(&file_name, &schema);
+        self.fragment.metadata.add_file_legacy(&file_name, &schema);
 
         let full_path = self.fragment.dataset().data_dir().child(file_name.as_str());
 

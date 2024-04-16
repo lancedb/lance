@@ -322,13 +322,23 @@ impl DataFile {
     fn field_ids(&self) -> Vec<i32> {
         self.inner.fields.clone()
     }
+
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.inner == other.inner),
+            CompareOp::Ne => Ok(self.inner != other.inner),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only == and != are supported for DataFile",
+            )),
+        }
+    }
 }
 
 #[pyclass(name = "_FragmentMetadata", module = "lance")]
 #[derive(Clone, Debug)]
 pub struct FragmentMetadata {
     pub(crate) inner: LanceFragmentMetadata,
-    schema: Schema,
+    pub(crate) schema: Schema,
 }
 
 impl FragmentMetadata {
@@ -366,7 +376,7 @@ impl FragmentMetadata {
         match op {
             CompareOp::Lt => Ok(self.inner.id < other.inner.id),
             CompareOp::Le => Ok(self.inner.id <= other.inner.id),
-            CompareOp::Eq => Ok(self.inner.id == other.inner.id && self.schema == other.schema),
+            CompareOp::Eq => Ok(self.inner == other.inner),
             CompareOp::Ne => self.__richcmp__(other, CompareOp::Eq).map(|v| !v),
             CompareOp::Gt => self.__richcmp__(other, CompareOp::Le).map(|v| !v),
             CompareOp::Ge => self.__richcmp__(other, CompareOp::Lt).map(|v| !v),

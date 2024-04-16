@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::empty;
+use std::sync::Arc;
+
+use arrow::array::RecordBatchIterator;
+use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow_schema::Schema;
 use jni::objects::{JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
@@ -64,6 +70,49 @@ lazy_static! {
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    arrow_schema_addr: jlong,
+    path: JString,
+    max_rows_per_file: JObject,  // Optional<Integer>
+    max_rows_per_group: JObject, // Optional<Integer>
+    max_bytes_per_file: JObject, // Optional<Long>
+    mode: JObject,               // Optional<String>
+) -> JObject<'local> {
+    let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
+    let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
+    let schema = ok_or_throw!(
+        env,
+        Schema::try_from(&c_schema).map_err(|e| Error::Arrow {
+            message: e.to_string(),
+            location: location!(),
+        })
+    );
+
+    let reader = RecordBatchIterator::new(empty(), Arc::new(schema));
+
+    let path_str: String = ok_or_throw!(env, path.extract(&mut env));
+
+    let write_params = ok_or_throw!(
+        env,
+        extract_write_params(
+            &mut env,
+            &max_rows_per_file,
+            &max_rows_per_group,
+            &max_bytes_per_file,
+            &mode
+        )
+    );
+
+    let dataset = ok_or_throw!(
+        env,
+        BlockingDataset::write(reader, &path_str, Some(write_params))
+    );
+    dataset.into_java(&mut env)
 }
 
 #[no_mangle]

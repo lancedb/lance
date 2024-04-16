@@ -431,6 +431,9 @@ impl FileReader {
     }
 }
 
+/// Adapts the FileReader to implement the same interface as the v2 reader
+pub struct FileReaderAdapter {}
+
 /// Stream desired full batches from the file.
 ///
 /// Parameters:

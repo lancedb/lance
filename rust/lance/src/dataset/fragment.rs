@@ -80,7 +80,7 @@ impl FileFragment {
 
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
-        let mut fragment = Fragment::with_file(id as u64, &filename, &schema, None);
+        let mut fragment = Fragment::with_file_legacy(id as u64, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let mut writer = FileWriter::<ManifestDescribing>::try_new(
             &object_store,
@@ -111,7 +111,8 @@ impl FileFragment {
         fragment_id: usize,
         physical_rows: Option<usize>,
     ) -> Result<Fragment> {
-        let fragment = Fragment::with_file(fragment_id as u64, filename, schema, physical_rows);
+        let fragment =
+            Fragment::with_file_legacy(fragment_id as u64, filename, schema, physical_rows);
         Ok(fragment)
     }
 
@@ -181,20 +182,20 @@ impl FileFragment {
         data_file.fields.first().copied().unwrap_or(0) as u32
     }
 
-    async fn open_readers(
+    async fn open_reader(
         &self,
-        projection: &Schema,
+        data_file: &DataFile,
+        projection: Option<&Schema>,
         with_row_id: bool,
-    ) -> Result<Vec<(FileReader, Schema)>> {
-        let full_schema = self.dataset.schema();
+    ) -> Result<Option<(FileReader, Schema)>> {
+        if data_file.is_legacy_file() {
+            let full_schema = self.dataset.schema();
 
-        let mut opened_files = vec![];
-        for (i, data_file) in self.metadata.files.iter().enumerate() {
             let data_file_schema = data_file.schema(full_schema);
+            let projection = projection.unwrap_or(full_schema);
             let schema_per_file = data_file_schema.intersection(projection)?;
-            let add_row_id = with_row_id && i == 0;
             let num_fields = data_file.fields.len() as u32;
-            if add_row_id || !schema_per_file.fields.is_empty() {
+            if with_row_id || !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
                 let mut reader = FileReader::try_new_with_fragment_id(
@@ -207,9 +208,30 @@ impl FileFragment {
                     Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
-                reader.with_row_id(add_row_id);
+                reader.with_row_id(with_row_id);
                 let initialized_schema = reader.schema().project_by_schema(&schema_per_file)?;
-                opened_files.push((reader, initialized_schema));
+                Ok(Some((reader, initialized_schema)))
+            } else {
+                Ok(None)
+            }
+        } else {
+            todo!()
+        }
+    }
+
+    async fn open_readers(
+        &self,
+        projection: &Schema,
+        with_row_id: bool,
+    ) -> Result<Vec<(FileReader, Schema)>> {
+        let mut opened_files = vec![];
+        for (i, data_file) in self.metadata.files.iter().enumerate() {
+            let with_row_id = with_row_id && i == 0;
+            if let Some((reader, schema)) = self
+                .open_reader(data_file, Some(projection), with_row_id)
+                .await?
+            {
+                opened_files.push((reader, schema));
             }
         }
 
@@ -300,18 +322,16 @@ impl FileFragment {
 
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
-        let path = self.dataset.data_dir().child(some_file.path.as_str());
-        let num_fields = some_file.fields.len() as u32;
-        let reader = FileReader::try_new_with_fragment_id(
-            &self.dataset.object_store,
-            &path,
-            self.schema().clone(),
-            self.id() as u32,
-            Self::get_field_id_offset(some_file),
-            num_fields,
-            Some(&self.dataset.session.file_metadata_cache),
-        )
-        .await?;
+        let (reader, _) = self
+            .open_reader(some_file, None, false)
+            .await?
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "The data file {} did not have any fields contained in the dataset schema",
+                    some_file.path
+                ),
+                location: location!(),
+            })?;
 
         Ok(reader.len())
     }
@@ -319,6 +339,10 @@ impl FileFragment {
     /// Validate the fragment
     ///
     /// Verifies:
+    /// * All field ids in the fragment are distinct
+    /// * Within each data file, field ids are in increasing order
+    /// * All fields in the schema have a corresponding field in one of the data
+    ///  files
     /// * All data files exist and have the same length
     /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
@@ -326,45 +350,72 @@ impl FileFragment {
     /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
     pub async fn validate(&self) -> Result<()> {
         let mut seen_fields = HashSet::new();
-        for field_id in self.metadata.files.iter().flat_map(|f| f.fields.iter()) {
-            if !seen_fields.insert(field_id) {
+        for data_file in &self.metadata.files {
+            let last = -1;
+            for field_id in &data_file.fields {
+                if *field_id <= last {
+                    return Err(Error::corrupt_file(
+                        self.dataset
+                            .data_dir()
+                            .child(self.metadata.files[0].path.as_str()),
+                        format!(
+                            "Field id {} is not in increasing order in fragment {:#?}",
+                            field_id, self
+                        ),
+                        location!(),
+                    ));
+                }
+
+                if !seen_fields.insert(field_id) {
+                    return Err(Error::corrupt_file(
+                        self.dataset
+                            .data_dir()
+                            .child(self.metadata.files[0].path.as_str()),
+                        format!(
+                            "Field id {} is duplicated in fragment {:#?}",
+                            field_id, self
+                        ),
+                        location!(),
+                    ));
+                }
+            }
+        }
+
+        for field in self.schema().fields_pre_order() {
+            if !seen_fields.contains(&field.id) {
                 return Err(Error::corrupt_file(
                     self.dataset
                         .data_dir()
                         .child(self.metadata.files[0].path.as_str()),
                     format!(
-                        "Field id {} is duplicated in fragment {}",
-                        field_id,
-                        self.id()
+                        "Field {} is missing in fragment {}\nField: {:#?}\nFragment: {:#?}",
+                        field.id,
+                        self.id(),
+                        field,
+                        self.metadata()
                     ),
                     location!(),
                 ));
             }
         }
 
-        let get_lengths = self
-            .metadata
-            .files
-            .iter()
-            .map(|data_file| {
-                let path = self.dataset.data_dir().child(data_file.path.as_str());
-                let field_id_offset = Self::get_field_id_offset(data_file);
-                let num_fields = data_file.fields.len() as u32;
-                (path, field_id_offset, num_fields)
-            })
-            .map(|(path, field_id_offset, num_fields)| async move {
-                let reader = FileReader::try_new_with_fragment_id(
-                    &self.dataset.object_store,
-                    &path,
-                    self.schema().clone(),
-                    self.id() as u32,
-                    field_id_offset,
-                    num_fields,
-                    Some(&self.dataset.session.file_metadata_cache),
-                )
-                .await?;
-                Result::Ok(reader.len())
-            });
+        for data_file in &self.metadata.files {
+            data_file.validate(&self.dataset.data_dir())?;
+        }
+
+        let get_lengths = self.metadata.files.iter().map(|data_file| async move {
+            let (reader, _) = self
+                .open_reader(data_file, None, false)
+                .await?
+                .ok_or_else(|| {
+                    Error::corrupt_file(
+                        self.dataset.data_dir().child(data_file.path.clone()),
+                        "did not have any fields in common with the dataset schema",
+                        location!(),
+                    )
+                })?;
+            Result::Ok(reader.len())
+        });
         let get_lengths = try_join_all(get_lengths);
 
         let deletion_vector = read_deletion_file(
