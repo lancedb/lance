@@ -64,10 +64,6 @@ impl Stream for MergeStream {
             let index = self.index;
             match self.streams[index].poll_next_unpin(cx) {
                 std::task::Poll::Ready(Some(batch_task)) => {
-                    println!(
-                        "MergeStream Polled Ready {},{}",
-                        self.index, batch_task.num_rows
-                    );
                     if self.index == 0 {
                         self.next_num_rows = batch_task.num_rows;
                     } else {
@@ -219,10 +215,6 @@ fn apply_row_id_and_deletes(
     // We should try to move this to later.
     let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
     let _enter = span.enter();
-    println!(
-        "Calculating mask from row_ids: {:?} and dv {:?} and batch offset={}",
-        row_ids, deletion_vector, batch_offset
-    );
     let deletion_mask =
         deletion_vector.and_then(|v| v.build_predicate(row_ids.as_ref().unwrap().iter()));
 
@@ -232,11 +224,6 @@ fn apply_row_id_and_deletes(
     } else {
         batch
     };
-
-    println!(
-        "Before deletion mask: {:?} make_deletions_null={}",
-        deletion_mask, config.make_deletions_null
-    );
 
     match (deletion_mask, config.make_deletions_null) {
         (None, _) => Ok(batch),
@@ -257,16 +244,11 @@ pub fn wrap_with_row_id_and_delete(
 ) -> ReadBatchFutStream {
     let config = Arc::new(config);
     let mut offset = 0;
-    println!(
-        "wrap_with_row_id_and_delete total_num_rows={}",
-        config.total_num_rows
-    );
     stream
         .map(move |batch_task| {
             let config = config.clone();
             let this_offset = offset;
             let num_rows = batch_task.num_rows;
-            println!("Processing task of {} rows", num_rows);
             offset += num_rows;
             let task = batch_task.task;
             async move {
