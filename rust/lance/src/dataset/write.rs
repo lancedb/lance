@@ -490,6 +490,8 @@ mod tests {
 
         let write_params = WriteParams {
             use_experimental_writer: true,
+            // This parameter should be ignored
+            max_rows_per_group: 1,
             ..Default::default()
         };
 
