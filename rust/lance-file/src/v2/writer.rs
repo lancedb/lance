@@ -236,7 +236,9 @@ impl FileWriter {
     /// This method will wait until all data has been flushed to the file.  Then it
     /// will write the file metadata and the footer.  It will not return until all
     /// data has been flushed and the file has been closed.
-    pub async fn finish(&mut self) -> Result<()> {
+    ///
+    /// Returns the total number of rows written
+    pub async fn finish(&mut self) -> Result<u64> {
         // 1. flush any remaining data and write out those pages
         let encoding_tasks = self
             .column_writers
@@ -252,7 +254,7 @@ impl FileWriter {
         // No data, so don't create a file
         if self.rows_written == 0 {
             self.writer.shutdown().await?;
-            return Ok(());
+            return Ok(0);
         }
 
         // 2. write the column metadatas
@@ -291,7 +293,15 @@ impl FileWriter {
 
         // 7. close the writer
         self.writer.shutdown().await?;
-        Ok(())
+        Ok(self.rows_written)
+    }
+
+    pub fn multipart_id(&self) -> &str {
+        &self.writer.multipart_id
+    }
+
+    pub async fn tell(&mut self) -> Result<u64> {
+        Ok(self.writer.tell().await? as u64)
     }
 }
 

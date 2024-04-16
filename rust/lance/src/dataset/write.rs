@@ -3,13 +3,15 @@
 
 use std::sync::Arc;
 
-use arrow_array::RecordBatchReader;
+use arrow_array::{RecordBatch, RecordBatchReader};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::chunk_stream;
 use lance_datafusion::utils::reader_to_stream;
-use lance_file::writer::FileWriter;
+use lance_file::v2;
+use lance_file::v2::writer::FileWriterOptions;
+use lance_file::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
@@ -145,10 +147,12 @@ pub async fn write_fragments_internal(
 ) -> Result<Vec<Fragment>> {
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
+    // TODO: When writing v2 we could consider skipping this chunking step.  However, leaving in
+    // for now as it doesn't hurt anything
     let mut buffered_reader = chunk_stream(data, params.max_rows_per_group);
 
     let writer_generator = WriterGenerator::new(object_store, base_dir, schema);
-    let mut writer: Option<FileWriter<ManifestDescribing>> = None;
+    let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
     while let Some(batch_chunk) = buffered_reader.next().await {
@@ -166,16 +170,16 @@ pub async fn write_fragments_internal(
 
         writer.as_mut().unwrap().write(&batch_chunk).await?;
         for batch in batch_chunk {
-            num_rows_in_current_file += batch.num_rows();
+            num_rows_in_current_file += batch.num_rows() as u32;
         }
 
-        if num_rows_in_current_file >= params.max_rows_per_file
-            || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file
+        if num_rows_in_current_file >= params.max_rows_per_file as u32
+            || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
         {
             let num_rows = writer.take().unwrap().finish().await?;
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             params.progress.complete(fragments.last().unwrap()).await?;
-            fragments.last_mut().unwrap().physical_rows = Some(num_rows);
+            fragments.last_mut().unwrap().physical_rows = Some(num_rows as usize);
             num_rows_in_current_file = 0;
         }
     }
@@ -183,10 +187,62 @@ pub async fn write_fragments_internal(
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
         let num_rows = writer.finish().await?;
-        fragments.last_mut().unwrap().physical_rows = Some(num_rows);
+        fragments.last_mut().unwrap().physical_rows = Some(num_rows as usize);
     }
 
     Ok(fragments)
+}
+
+#[async_trait::async_trait]
+trait GenericWriter: Send {
+    /// Get a unique id associated with the fragment being written
+    ///
+    /// This is used for progress reporting
+    fn multipart_id(&self) -> &str;
+    /// Write the given batches to the file
+    async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+    /// Get the current position in the file
+    ///
+    /// We use this to know when the file is too large and we need to start
+    /// a new file
+    async fn tell(&mut self) -> Result<u64>;
+    /// Finish writing the file (flush the remaining data and write footer)
+    async fn finish(&mut self) -> Result<u32>;
+}
+
+#[async_trait::async_trait]
+impl<M: ManifestProvider + Send + Sync> GenericWriter for FileWriter<M> {
+    fn multipart_id(&self) -> &str {
+        self.multipart_id()
+    }
+    async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        self.write(batches).await
+    }
+    async fn tell(&mut self) -> Result<u64> {
+        Ok(self.tell().await? as u64)
+    }
+    async fn finish(&mut self) -> Result<u32> {
+        Ok(self.finish().await? as u32)
+    }
+}
+
+#[async_trait::async_trait]
+impl GenericWriter for v2::writer::FileWriter {
+    fn multipart_id(&self) -> &str {
+        self.multipart_id()
+    }
+    async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        for batch in batches {
+            self.write_batch(batch).await?;
+        }
+        Ok(())
+    }
+    async fn tell(&mut self) -> Result<u64> {
+        Ok(self.tell().await? as u64)
+    }
+    async fn finish(&mut self) -> Result<u32> {
+        Ok(self.finish().await? as u32)
+    }
 }
 
 /// Creates new file writers for a given dataset.
@@ -205,7 +261,7 @@ impl WriterGenerator {
         }
     }
 
-    pub async fn new_writer(&self) -> Result<(FileWriter<ManifestDescribing>, Fragment)> {
+    pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
         let data_file_path = format!("{}.lance", Uuid::new_v4());
 
         // Use temporary ID 0; will assign ID later.
@@ -213,14 +269,27 @@ impl WriterGenerator {
         fragment.add_file_legacy(&data_file_path, &self.schema);
 
         let full_path = self.base_dir.child(DATA_DIR).child(data_file_path);
-        let writer = FileWriter::try_new(
-            self.object_store.as_ref(),
-            &full_path,
-            self.schema.clone(),
-            &Default::default(),
-        )
-        .await?;
 
+        let use_v2 = std::env::var("LANCE_EXPERIMENTAL_V2").is_ok();
+        let writer = if use_v2 {
+            let writer = self.object_store.create(&full_path).await?;
+            let arrow_schema = arrow_schema::Schema::from(&self.schema);
+            Box::new(v2::writer::FileWriter::try_new(
+                writer,
+                arrow_schema,
+                FileWriterOptions::default(),
+            )?) as Box<dyn GenericWriter>
+        } else {
+            Box::new(
+                FileWriter::<ManifestDescribing>::try_new(
+                    self.object_store.as_ref(),
+                    &full_path,
+                    self.schema.clone(),
+                    &Default::default(),
+                )
+                .await?,
+            )
+        };
         Ok((writer, fragment))
     }
 }
@@ -229,10 +298,11 @@ impl WriterGenerator {
 mod tests {
     use super::*;
 
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_array::Int32Array;
     use arrow_schema::{DataType, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
+    use lance_core::utils::testing::EnvVarGuard;
 
     #[tokio::test]
     async fn test_chunking_large_batches() {
@@ -357,5 +427,91 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fragments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_file_write_v2() {
+        let _v2_mode_guard = EnvVarGuard::new("LANCE_EXPERIMENTAL_V2", "1");
+        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+
+        // Write 1024 rows and show they are split into two files
+        // 512 * 4 bytes = 2KB
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter(0..1024))],
+        )
+        .unwrap();
+
+        let write_params = WriteParams::default();
+
+        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(std::iter::once(Ok(batch))),
+        ));
+
+        let schema = Schema::try_from(schema.as_ref()).unwrap();
+
+        let object_store = Arc::new(ObjectStore::memory());
+        let fragments = write_fragments_internal(
+            object_store,
+            &Path::from("test"),
+            &schema,
+            data_stream,
+            write_params,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fragments.len(), 1);
+        let fragment = &fragments[0];
+        assert_eq!(fragment.files.len(), 1);
+        assert_eq!(fragment.physical_rows, Some(1024));
+    }
+
+    #[tokio::test]
+    async fn test_write_v2() {
+        // Create a stream of 3 batches of 10 rows
+        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter(0..28))])
+                .unwrap();
+        let batches: Vec<RecordBatch> =
+            vec![batch.slice(0, 10), batch.slice(10, 10), batch.slice(20, 8)];
+        let stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)),
+        );
+
+        // Chunk into a stream of 3 row batches
+        let chunks: Vec<Vec<RecordBatch>> = chunk_stream(Box::pin(stream), 3)
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(chunks.len(), 10);
+        assert_eq!(chunks[0].len(), 1);
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let num_rows = chunk.iter().map(|batch| batch.num_rows()).sum::<usize>();
+            if i < chunks.len() - 1 {
+                assert_eq!(num_rows, 3);
+            } else {
+                // Last chunk is shorter
+                assert_eq!(num_rows, 1);
+            }
+        }
+
+        // The fourth chunk is split along the boundary between the original first
+        // two batches.
+        assert_eq!(chunks[3].len(), 2);
+        assert_eq!(chunks[3][0].num_rows(), 1);
+        assert_eq!(chunks[3][1].num_rows(), 2);
     }
 }
