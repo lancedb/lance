@@ -669,6 +669,36 @@ def test_merge_with_commit(tmp_path: Path):
     assert tbl == expected
 
 
+def test_merge_with_schema_holes(tmp_path: Path):
+    import lance.debug
+
+    # Create table with 3 cols
+    table = pa.table({"a": range(10)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.add_columns({"b": "a + 1"})
+    dataset.add_columns({"c": "a + 2"})
+    # Delete the middle column to create a hole in the field ids
+    dataset.drop_columns(["b"])
+
+    fragment = dataset.get_fragments()[0]
+    merged = fragment.add_columns(
+        lambda _: pa.RecordBatch.from_pydict({"d": range(10, 20)})
+    )
+    expected = pa.table({
+        "a": range(10),
+        "c": range(2, 12),
+        "d": range(10, 20),
+    })
+
+    merge = lance.LanceOperation.Merge([merged], expected.schema)
+    dataset = lance.LanceDataset.commit(tmp_path, merge, read_version=dataset.version)
+
+    dataset.validate()
+
+    tbl = dataset.to_table()
+    assert tbl == expected
+
+
 def test_merge_search(tmp_path: Path):
     left_table = pa.Table.from_pydict({"id": [1, 2, 3], "left": ["a", "b", "c"]})
     right_table = pa.Table.from_pydict({"id": [1, 2, 3], "right": ["A", "B", "C"]})

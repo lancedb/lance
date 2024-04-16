@@ -706,6 +706,8 @@ impl Dataset {
     ///
     /// This method can be used to commit this change to the dataset's manifest.  This method will
     /// not verify that the provided fragments exist and correct, that is the caller's responsibility.
+    /// Some validation can be performed using the function
+    /// [crate::dataset::transaction::validate_operation].
     ///
     /// If this commit is a change to an existing dataset then it will often need to be based on an
     /// existing version of the dataset.  For example, if this change is a `delete` operation then

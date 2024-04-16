@@ -27,6 +27,7 @@ use chrono::Duration;
 use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::transaction::validate_operation;
 use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -89,6 +90,7 @@ fn into_fragments(fragments: Vec<FragmentMetadata>) -> Vec<Fragment> {
 }
 
 fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
+    // Note: the field ids here are wrong.
     Schema::try_from(arrow_schema).map_err(|e| {
         PyValueError::new_err(format!(
             "Failed to convert Arrow schema to Lance schema: {}",
@@ -971,10 +973,15 @@ impl Dataset {
                 as Arc<dyn CommitHandler>
         });
         let ds = RT
-            .block_on(
-                commit_lock.map(|cl| cl.py()),
-                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler),
-            )?
+            .block_on(commit_lock.map(|cl| cl.py()), async move {
+                let dataset = DatasetBuilder::from_uri(dataset_uri)
+                    // .with_read_params(read_params)
+                    .load()
+                    .await?;
+                validate_operation(dataset.manifest(), &operation.0)?;
+                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler)
+                    .await
+            })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             ds: Arc::new(ds),
