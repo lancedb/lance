@@ -46,7 +46,6 @@ impl MergeStream {
             Ok(batch)
         }
         .boxed();
-        println!("Merge stream emit and reset {}", self.next_num_rows);
         let num_rows = self.next_num_rows;
         self.next_num_rows = 0;
         ReadBatchTask { task, num_rows }
