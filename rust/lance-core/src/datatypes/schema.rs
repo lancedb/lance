@@ -221,6 +221,12 @@ impl Schema {
         // Check for duplicate field ids
         let mut seen_ids = HashSet::new();
         for field in self.fields_pre_order() {
+            if field.id < 0 {
+                return Err(Error::Schema {
+                    message: format!("Field {} has a negative id {}", field.name, field.id),
+                    location: location!(),
+                });
+            }
             if !seen_ids.insert(field.id) {
                 return Err(Error::Schema {
                     message: format!("Duplicate field id {} in schema {:?}", field.id, self),

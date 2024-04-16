@@ -9,11 +9,12 @@ use futures::StreamExt;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::chunk_stream;
 use lance_datafusion::utils::reader_to_stream;
+use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_table::format::Fragment;
+use lance_table::format::{DataFile, Fragment};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -91,6 +92,12 @@ pub struct WriteParams {
     /// If a custom object store is provided (via store_params.object_store) then this
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
+
+    /// If set to true then the Lance v2 writer will be used instead of the Lance v1 writer
+    ///
+    /// Unless you are intentionally testing the v2 writer, you should leave this as false
+    /// as the v2 writer is still experimental and not fully implemented.
+    pub use_experimental_writer: bool,
 }
 
 impl Default for WriteParams {
@@ -105,6 +112,7 @@ impl Default for WriteParams {
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
+            use_experimental_writer: false,
         }
     }
 }
@@ -151,7 +159,12 @@ pub async fn write_fragments_internal(
     // for now as it doesn't hurt anything
     let mut buffered_reader = chunk_stream(data, params.max_rows_per_group);
 
-    let writer_generator = WriterGenerator::new(object_store, base_dir, schema);
+    let writer_generator = WriterGenerator::new(
+        object_store,
+        base_dir,
+        schema,
+        params.use_experimental_writer,
+    );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
@@ -176,18 +189,22 @@ pub async fn write_fragments_internal(
         if num_rows_in_current_file >= params.max_rows_per_file as u32
             || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
         {
-            let num_rows = writer.take().unwrap().finish().await?;
+            let (num_rows, data_file) = writer.take().unwrap().finish().await?;
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             params.progress.complete(fragments.last().unwrap()).await?;
-            fragments.last_mut().unwrap().physical_rows = Some(num_rows as usize);
+            let last_fragment = fragments.last_mut().unwrap();
+            last_fragment.physical_rows = Some(num_rows as usize);
+            last_fragment.files.push(data_file);
             num_rows_in_current_file = 0;
         }
     }
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
-        let num_rows = writer.finish().await?;
-        fragments.last_mut().unwrap().physical_rows = Some(num_rows as usize);
+        let (num_rows, data_file) = writer.finish().await?;
+        let last_fragment = fragments.last_mut().unwrap();
+        last_fragment.physical_rows = Some(num_rows as usize);
+        last_fragment.files.push(data_file);
     }
 
     Ok(fragments)
@@ -207,22 +224,25 @@ trait GenericWriter: Send {
     /// a new file
     async fn tell(&mut self) -> Result<u64>;
     /// Finish writing the file (flush the remaining data and write footer)
-    async fn finish(&mut self) -> Result<u32>;
+    async fn finish(&mut self) -> Result<(u32, DataFile)>;
 }
 
 #[async_trait::async_trait]
-impl<M: ManifestProvider + Send + Sync> GenericWriter for FileWriter<M> {
+impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String) {
     fn multipart_id(&self) -> &str {
-        self.multipart_id()
+        self.0.multipart_id()
     }
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        self.write(batches).await
+        self.0.write(batches).await
     }
     async fn tell(&mut self) -> Result<u64> {
-        Ok(self.tell().await? as u64)
+        Ok(self.0.tell().await? as u64)
     }
-    async fn finish(&mut self) -> Result<u32> {
-        Ok(self.finish().await? as u32)
+    async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        Ok((
+            self.0.finish().await? as u32,
+            DataFile::new_legacy(self.1.clone(), self.0.schema()),
+        ))
     }
 }
 
@@ -240,8 +260,26 @@ impl GenericWriter for v2::writer::FileWriter {
     async fn tell(&mut self) -> Result<u64> {
         Ok(self.tell().await? as u64)
     }
-    async fn finish(&mut self) -> Result<u32> {
-        Ok(self.finish().await? as u32)
+    async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        let field_ids = self
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(field_id, _)| *field_id)
+            .collect::<Vec<_>>();
+        let column_indices = self
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(_, column_index)| *column_index)
+            .collect::<Vec<_>>();
+        let data_file = DataFile::new(
+            self.path(),
+            field_ids,
+            column_indices,
+            MAJOR_VERSION as u32,
+            MINOR_VERSION_NEXT as u32,
+        );
+        let num_rows = self.finish().await? as u32;
+        Ok((num_rows, data_file))
     }
 }
 
@@ -250,14 +288,21 @@ struct WriterGenerator {
     object_store: Arc<ObjectStore>,
     base_dir: Path,
     schema: Schema,
+    use_v2: bool,
 }
 
 impl WriterGenerator {
-    pub fn new(object_store: Arc<ObjectStore>, base_dir: &Path, schema: &Schema) -> Self {
+    pub fn new(
+        object_store: Arc<ObjectStore>,
+        base_dir: &Path,
+        schema: &Schema,
+        use_v2: bool,
+    ) -> Self {
         Self {
             object_store,
             base_dir: base_dir.clone(),
             schema: schema.clone(),
+            use_v2,
         }
     }
 
@@ -265,22 +310,21 @@ impl WriterGenerator {
         let data_file_path = format!("{}.lance", Uuid::new_v4());
 
         // Use temporary ID 0; will assign ID later.
-        let mut fragment = Fragment::new(0);
-        fragment.add_file_legacy(&data_file_path, &self.schema);
+        let fragment = Fragment::new(0);
 
-        let full_path = self.base_dir.child(DATA_DIR).child(data_file_path);
+        let full_path = self.base_dir.child(DATA_DIR).child(data_file_path.clone());
 
-        let use_v2 = std::env::var("LANCE_EXPERIMENTAL_V2").is_ok();
-        let writer = if use_v2 {
+        let writer = if self.use_v2 {
             let writer = self.object_store.create(&full_path).await?;
-            let arrow_schema = arrow_schema::Schema::from(&self.schema);
             Box::new(v2::writer::FileWriter::try_new(
                 writer,
-                arrow_schema,
+                data_file_path.to_string(),
+                self.schema.clone(),
                 FileWriterOptions::default(),
             )?) as Box<dyn GenericWriter>
         } else {
-            Box::new(
+            let path = data_file_path.to_string();
+            Box::new((
                 FileWriter::<ManifestDescribing>::try_new(
                     self.object_store.as_ref(),
                     &full_path,
@@ -288,7 +332,8 @@ impl WriterGenerator {
                     &Default::default(),
                 )
                 .await?,
-            )
+                path,
+            ))
         };
         Ok((writer, fragment))
     }
@@ -302,7 +347,6 @@ mod tests {
     use arrow_schema::{DataType, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
-    use lance_core::utils::testing::EnvVarGuard;
 
     #[tokio::test]
     async fn test_chunking_large_batches() {
@@ -431,22 +475,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_write_v2() {
-        let _v2_mode_guard = EnvVarGuard::new("LANCE_EXPERIMENTAL_V2", "1");
         let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
             "a",
             DataType::Int32,
             false,
         )]));
 
-        // Write 1024 rows and show they are split into two files
-        // 512 * 4 bytes = 2KB
+        // Write 1024 rows
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter(0..1024))],
         )
         .unwrap();
 
-        let write_params = WriteParams::default();
+        let write_params = WriteParams {
+            use_experimental_writer: true,
+            ..Default::default()
+        };
 
         let data_stream = Box::pin(RecordBatchStreamAdapter::new(
             schema.clone(),
@@ -469,49 +514,6 @@ mod tests {
         let fragment = &fragments[0];
         assert_eq!(fragment.files.len(), 1);
         assert_eq!(fragment.physical_rows, Some(1024));
-    }
-
-    #[tokio::test]
-    async fn test_write_v2() {
-        // Create a stream of 3 batches of 10 rows
-        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
-            "a",
-            DataType::Int32,
-            false,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter(0..28))])
-                .unwrap();
-        let batches: Vec<RecordBatch> =
-            vec![batch.slice(0, 10), batch.slice(10, 10), batch.slice(20, 8)];
-        let stream = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)),
-        );
-
-        // Chunk into a stream of 3 row batches
-        let chunks: Vec<Vec<RecordBatch>> = chunk_stream(Box::pin(stream), 3)
-            .try_collect()
-            .await
-            .unwrap();
-
-        assert_eq!(chunks.len(), 10);
-        assert_eq!(chunks[0].len(), 1);
-
-        for (i, chunk) in chunks.iter().enumerate() {
-            let num_rows = chunk.iter().map(|batch| batch.num_rows()).sum::<usize>();
-            if i < chunks.len() - 1 {
-                assert_eq!(num_rows, 3);
-            } else {
-                // Last chunk is shorter
-                assert_eq!(num_rows, 1);
-            }
-        }
-
-        // The fourth chunk is split along the boundary between the original first
-        // two batches.
-        assert_eq!(chunks[3].len(), 2);
-        assert_eq!(chunks[3][0].num_rows(), 1);
-        assert_eq!(chunks[3][1].num_rows(), 2);
+        assert_eq!(fragment.files[0].file_minor_version, 3);
     }
 }
