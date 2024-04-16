@@ -154,8 +154,12 @@ def test_dataset_progress(tmp_path: Path):
 
     assert metadata["id"] == 0
     assert len(metadata["files"]) == 1
-
-    assert fragment == FragmentMetadata.from_json(json.dumps(metadata))
+    # Fragments aren't exactly equal, because the file was written before
+    # physical_rows was known.
+    assert (
+        fragment.data_files()
+        == FragmentMetadata.from_json(json.dumps(metadata)).data_files()
+    )
 
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=failing_write, args=(progress_uri, dataset_uri))
