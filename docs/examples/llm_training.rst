@@ -29,8 +29,8 @@ Let's setup our enviornment by doing all the necessary imports and defining a fe
     # Also define some hyperparameters
     lr = 3e-4
     nb_epochs = 10
-    block_size = 512
-    batch_size = 16
+    block_size = 1024
+    batch_size = 8
     device = 'cuda:0'
     dataset_path = 'wikitext_500K.lance'
 
@@ -74,9 +74,9 @@ Now let's define our custom dataset and sampler for loading the tokens.
             and return the tokens at those indices
             """
             window = np.arange(idx, idx + self.block_size)
-            sample = from_idxs(self.ds, window)
+            sample = from_indices(self.ds, window)
 
-            return {"input_ids": sample}
+            return {"input_ids": torch.tensor(sample), "labels": torch.tensor(sample)}
 
 When given a random index by the sampler, the dataset will load the next :meth:`block_size` number of tokens starting from current index.
 This would in-essence form a sample as the loaded tokens would be causal.
@@ -134,32 +134,41 @@ Now you train the model just like you would with any other dataset!
     dataset = LanceDataset(dataset_path, block_size)
     sampler = LanceSampler(dataset, block_size)
     dataloader = DataLoader(
-        dataset, 
-        shuffle=False, 
-        batch_size=batch_size, 
-        sampler=sampler, 
+        dataset,
+        shuffle=False,
+        batch_size=batch_size,
+        sampler=sampler,
         pin_memory=True
     )
 
-    # Define the optimizer, training loop and train the model
+    # Define the optimizer, training loop and train the model!
     model = model.to(device)
-    model.train()
+    model.eval()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     for epoch in range(nb_epochs):
         print(f"========= Epoch: {epoch+1} / {nb_epochs} =========")
         epoch_loss = []
-        for batch in dataloader:
+        prog_bar = tqdm(dataloader, total=len(dataloader))
+        for batch in prog_bar:
             optimizer.zero_grad(set_to_none=True)
-            batch['input_ids'] = batch['input_ids'].to(device)
+
+            # Put both input_ids and labels to the device
+            for k, v in batch.items():
+                batch[k] = v.to(device)
+
+            # Perform one forward pass and get the loss
             outputs = model(**batch)
             loss = outputs.loss
 
+            # Perform backward pass
             loss.backward()
             optimizer.step()
 
+            prog_bar.set_description(f"loss: {loss.item():.4f}")
+
             epoch_loss.append(loss.item())
-        
+
         # Calculate training perplexity for this epoch
         try:
             perplexity = np.exp(np.mean(epoch_loss))
@@ -169,7 +178,7 @@ Now you train the model just like you would with any other dataset!
         print(f"train_perplexity: {perplexity}")
 
 
-One tip: If your lance dataset is huge (like the wikitext_500K is), and you want to debug the model to look out for errors, you may want to wrap the dataloader in an :meth:`iter()` function and only run it for a few batches.
+One tip: If your lance dataset is huge (like the wikitext_500K is), and you want to debug the model to look out for errors, you may want to wrap the dataloader in an :meth:`iter()` function and only run it for a couple batches.
 
 And that's basically it! 
 
