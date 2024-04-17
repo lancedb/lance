@@ -1099,7 +1099,7 @@ impl Dataset {
             })?;
 
             let reader = fragment.open(projection.as_ref(), false).await?;
-            reader.read_range(range).await
+            reader.legacy_read_range_as_batch(range).await
         } else if row_id_meta.sorted {
             // Don't need to re-arrange data, just concatenate
 
@@ -2329,9 +2329,9 @@ mod tests {
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment.open(dataset.schema(), false).await.unwrap();
-            assert_eq!(reader.num_batches(), 10);
-            for i in 0..reader.num_batches() {
-                assert_eq!(reader.num_rows_in_batch(i), 10);
+            assert_eq!(reader.legacy_num_batches(), 10);
+            for i in 0..reader.legacy_num_batches() {
+                assert_eq!(reader.legacy_num_rows_in_batch(i), 10);
             }
         }
     }
