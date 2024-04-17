@@ -583,40 +583,41 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn test_build_hnsw() {
-    //     const DIM: usize = 32;
-    //     const TOTAL: usize = 2048;
-    //     const MAX_EDGES: usize = 32;
-    //     let data = generate_random_array(TOTAL * DIM);
-    //     let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
-    //     let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
-    //     let hnsw = HNSWBuilder::with_params(
-    //         HnswBuildParams::default()
-    //             .max_num_edges(MAX_EDGES)
-    //             .ef_construction(50),
-    //         store.clone(),
-    //     )
-    //     .build()
-    //     .unwrap();
-    //     assert!(hnsw.levels.len() > 1);
-    //     assert_eq!(hnsw.levels[0].len(), TOTAL);
+    #[tokio::test]
+    async fn test_build_hnsw() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        const MAX_EDGES: usize = 32;
+        let data = generate_random_array(TOTAL * DIM);
+        let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
+        let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
+        let hnsw = HNSWBuilder::with_params(
+            HnswBuildParams::default()
+                .max_num_edges(MAX_EDGES)
+                .ef_construction(50),
+            store.clone(),
+        )
+        .build()
+        .await
+        .unwrap();
+        assert!(hnsw.levels.len() > 1);
+        assert_eq!(hnsw.levels[0].len(), TOTAL);
 
-    //     hnsw.levels.windows(2).for_each(|w| {
-    //         let (prev, next) = (&w[0], &w[1]);
-    //         assert!(prev.len() >= next.len());
-    //     });
+        hnsw.levels.windows(2).for_each(|w| {
+            let (prev, next) = (&w[0], &w[1]);
+            assert!(prev.len() >= next.len());
+        });
 
-    //     hnsw.levels.iter().for_each(|layer| {
-    //         for &i in layer.id_to_node.keys() {
-    //             // If the node exist on this layer, check its out-degree.
-    //             if let Some(neighbors) = layer.neighbors(i) {
-    //                 let cnt = neighbors.count();
-    //                 assert!(cnt <= MAX_EDGES, "actual {}, max_edges: {}", cnt, MAX_EDGES);
-    //             }
-    //         }
-    //     });
-    // }
+        hnsw.levels.iter().for_each(|layer| {
+            for &i in layer.id_to_node.keys() {
+                // If the node exist on this layer, check its out-degree.
+                if let Some(neighbors) = layer.neighbors(i) {
+                    let cnt = neighbors.count();
+                    assert!(cnt <= MAX_EDGES, "actual {}, max_edges: {}", cnt, MAX_EDGES);
+                }
+            }
+        });
+    }
 
     fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
         let mut dists = vec![];
@@ -629,36 +630,37 @@ mod tests {
         dists.into_iter().map(|(_, i)| i).collect()
     }
 
-    // #[test]
-    // fn test_search() {
-    //     const DIM: usize = 32;
-    //     const TOTAL: usize = 10_000;
-    //     const MAX_EDGES: usize = 30;
-    //     const K: usize = 100;
+    #[tokio::test]
+    async fn test_search() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 10_000;
+        const MAX_EDGES: usize = 30;
+        const K: usize = 100;
 
-    //     let data = generate_random_array(TOTAL * DIM);
-    //     let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
-    //     let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
-    //     let q = mat.row(0).unwrap();
+        let data = generate_random_array(TOTAL * DIM);
+        let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
+        let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
+        let q = mat.row(0).unwrap();
 
-    //     let hnsw = HNSWBuilder::with_params(
-    //         HnswBuildParams::default()
-    //             .max_num_edges(MAX_EDGES)
-    //             .ef_construction(100)
-    //             .max_level(4),
-    //         vectors.clone(),
-    //     )
-    //     .build()
-    //     .unwrap();
+        let hnsw = HNSWBuilder::with_params(
+            HnswBuildParams::default()
+                .max_num_edges(MAX_EDGES)
+                .ef_construction(100)
+                .max_level(4),
+            vectors.clone(),
+        )
+        .build()
+        .await
+        .unwrap();
 
-    //     let results: HashSet<u32> = hnsw
-    //         .search(q, K, 128, None)
-    //         .unwrap()
-    //         .iter()
-    //         .map(|node| node.id)
-    //         .collect();
-    //     let gt = ground_truth(&mat, q, K);
-    //     let recall = results.intersection(&gt).count() as f32 / K as f32;
-    //     assert!(recall >= 0.9, "Recall: {}", recall);
-    // }
+        let results: HashSet<u32> = hnsw
+            .search(q, K, 128, None)
+            .unwrap()
+            .iter()
+            .map(|node| node.id)
+            .collect();
+        let gt = ground_truth(&mat, q, K);
+        let recall = results.intersection(&gt).count() as f32 / K as f32;
+        assert!(recall >= 0.9, "Recall: {}", recall);
+    }
 }

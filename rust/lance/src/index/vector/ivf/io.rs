@@ -15,6 +15,7 @@ use futures::stream::Peekable;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::Error;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
@@ -41,8 +42,8 @@ use tokio::sync::Semaphore;
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::PQIndex;
 use crate::index::vector::{hnsw::builder::build_hnsw_model, sq::build_sq_storage};
+use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
-use crate::{utils, Result};
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 lazy_static::lazy_static! {
@@ -481,10 +482,8 @@ async fn build_hnsw_quantization_partition(
             pq_store.batch().clone()
         }
         Quantizer::Scalar(sq) => {
-            let sq_storage = utils::tokio::spawn_cpu(move || {
-                build_sq_storage(metric_type, row_ids_array, fsl, sq)
-            })
-            .await?;
+            let sq_storage =
+                spawn_cpu(move || build_sq_storage(metric_type, row_ids_array, fsl, sq)).await?;
             sq_storage.batch().clone()
         }
     };

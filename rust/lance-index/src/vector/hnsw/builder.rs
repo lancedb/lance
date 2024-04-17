@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use itertools::Itertools;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::Result;
 use rand::{thread_rng, Rng};
 
@@ -148,7 +149,7 @@ impl HNSWBuilder {
     }
 
     /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
-    pub async fn build(&mut self, pool: &tokio::runtime::Runtime) -> Result<HNSW> {
+    pub async fn build(&mut self) -> Result<HNSW> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
             self.inner.vectors.metric_type(),
@@ -163,7 +164,7 @@ impl HNSWBuilder {
         for chunk in &(1..self.inner.vectors.len()).chunks(chunk_size) {
             let chunk = chunk.collect_vec();
             let inner = self.inner.clone();
-            tasks.push(pool.spawn_blocking(move || {
+            tasks.push(spawn_cpu(move || {
                 for node in chunk {
                     inner.insert(node as u32)?;
                 }
