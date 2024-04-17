@@ -112,14 +112,10 @@ impl FileFragment {
 
         reader.py().allow_threads(|| {
             RT.runtime.block_on(async move {
-                let schema = batches.schema().clone();
-
                 let metadata =
                     LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
                         .await
                         .map_err(|err| PyIOError::new_err(err.to_string()))?;
-                let schema = Schema::try_from(schema.as_ref())
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
                 Ok(FragmentMetadata::new(metadata))
             })

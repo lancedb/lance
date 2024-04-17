@@ -80,10 +80,7 @@ impl LanceSchema {
             })?;
             fields.push(Field::from(&field));
         }
-        let schema = Schema {
-            fields: fields,
-            metadata: metadata,
-        };
+        let schema = Schema { fields, metadata };
         Ok(Self(schema))
     }
 }
