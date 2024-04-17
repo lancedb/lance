@@ -131,13 +131,26 @@ pub async fn write_fragments(
     params: WriteParams,
 ) -> Result<Vec<Fragment>> {
     let (dataset, object_store, base) = if matches!(params.mode, WriteMode::Append) {
-        let dataset = DatasetBuilder::from_uri(dataset_uri)
+        match DatasetBuilder::from_uri(dataset_uri)
             .with_write_params(params.clone())
             .load()
-            .await?;
-        let store = dataset.object_store().clone();
-        let base = dataset.uri().clone();
-        (Some(dataset), store, base)
+            .await
+        {
+            Ok(dataset) => {
+                let store = dataset.object_store().clone();
+                let base = dataset.uri().clone();
+                (Some(dataset), store, base)
+            }
+            Err(Error::DatasetNotFound { .. }) => {
+                let (object_store, base) = ObjectStore::from_uri_and_params(
+                    dataset_uri,
+                    &params.store_params.clone().unwrap_or_default(),
+                )
+                .await?;
+                (None, object_store, base)
+            }
+            Err(err) => return Err(err),
+        }
     } else {
         let (object_store, base) = ObjectStore::from_uri_and_params(
             dataset_uri,
