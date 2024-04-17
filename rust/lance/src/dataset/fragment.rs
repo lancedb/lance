@@ -1343,7 +1343,7 @@ impl FragmentReader {
         batch_size: u32,
         read_fn: impl Fn(&dyn GenericFileReader, &Arc<Schema>) -> Result<ReadBatchTaskStream>,
     ) -> Result<ReadBatchFutStream> {
-        let total_num_rows = self.readers[0].0.len() as u32;
+        let total_num_rows = self.readers[0].0.len();
         // If just the row id there is no need to actually read any data
         // and we don't need to involve the readers at all.
         //
