@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -15,6 +16,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -28,6 +30,7 @@ from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner, ReaderLike
+    from .schema import LanceSchema
 
 
 class FragmentMetadata:
@@ -321,11 +324,11 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
         ).to_table()
 
-    def add_columns(
+    def merge_columns(
         self,
         value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
-    ) -> FragmentMetadata:
+    ) -> Tuple[FragmentMetadata, LanceSchema]:
         """Add columns to this Fragment.
 
         .. warning::
@@ -348,7 +351,8 @@ class LanceFragment(pa.dataset.Fragment):
 
         Returns
         -------
-            A new fragment with the added column(s).
+        Tuple[FragmentMetadata, LanceSchema]
+            A new fragment with the added column(s) and the final schema.
         """
         updater = self._fragment.updater(columns)
 
@@ -365,7 +369,48 @@ class LanceFragment(pa.dataset.Fragment):
 
             updater.update(new_value)
         metadata = updater.finish()
-        return FragmentMetadata(metadata.json())
+        schema = updater.schema()
+        return FragmentMetadata.from_metadata(metadata), schema
+
+    def add_columns(
+        self,
+        value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
+        columns: Optional[list[str]] = None,
+    ) -> FragmentMetadata:
+        """Add columns to this Fragment.
+
+        .. deprecated:: 0.10.14
+            Use :meth:`merge_columns` instead.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+
+        Parameters
+        ----------
+        value_func: Callable.
+            A function that takes a RecordBatch as input and returns a RecordBatch.
+        columns: Optional[list[str]].
+            If specified, only the columns in this list will be passed to the
+            value_func. Otherwise, all columns will be passed to the value_func.
+
+        See Also
+        --------
+        lance.dataset.LanceOperation.Merge :
+            The operation used to commit these changes to the dataset. See the
+            doc page for an example of using this API.
+
+        Returns
+        -------
+        FragmentMetadata
+            A new fragment with the added column(s).
+        """
+        warnings.warn(
+            "LanceFragment.add_columns is deprecated, use LanceFragment.merge_columns "
+            "instead",
+            DeprecationWarning,
+        )
+        return self.merge_columns(value_func, columns)[0]
 
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.
@@ -409,7 +454,7 @@ class LanceFragment(pa.dataset.Fragment):
         raw_fragment = self._fragment.delete(predicate)
         if raw_fragment is None:
             return None
-        return FragmentMetadata(raw_fragment.metadata().json())
+        return FragmentMetadata.from_metadata(raw_fragment.metadata())
 
     @property
     def schema(self) -> pa.Schema:
@@ -508,4 +553,4 @@ def write_fragments(
         max_bytes_per_file=max_bytes_per_file,
         progress=progress,
     )
-    return [FragmentMetadata(frag.json()) for frag in fragments]
+    return [FragmentMetadata.from_metadata(frag) for frag in fragments]

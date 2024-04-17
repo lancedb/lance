@@ -61,7 +61,7 @@ def test_format_fragment(tmp_path: Path):
 
     fragment = dataset.get_fragments()[0].metadata
 
-    output = format_fragment(fragment)
+    output = format_fragment(fragment, dataset)
 
     assert output.startswith("PrettyPrintableFragment {")
     assert "files: [" in output

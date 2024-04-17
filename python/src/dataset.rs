@@ -27,6 +27,7 @@ use chrono::Duration;
 use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::transaction::validate_operation;
 use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -63,6 +64,7 @@ use pyo3::{
 use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
+use crate::schema::LanceSchema;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -89,6 +91,7 @@ fn into_fragments(fragments: Vec<FragmentMetadata>) -> Vec<Fragment> {
 }
 
 fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
+    // Note: the field ids here are wrong.
     Schema::try_from(arrow_schema).map_err(|e| {
         PyValueError::new_err(format!(
             "Failed to convert Arrow schema to Lance schema: {}",
@@ -242,8 +245,8 @@ impl Operation {
     }
 
     #[staticmethod]
-    fn merge(fragments: Vec<FragmentMetadata>, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let schema = convert_schema(&schema.0)?;
+    fn merge(fragments: Vec<FragmentMetadata>, schema: LanceSchema) -> PyResult<Self> {
+        let schema = schema.0;
         let fragments = into_fragments(fragments);
         let op = LanceOperation::Merge { fragments, schema };
         Ok(Self(op))
@@ -320,6 +323,11 @@ impl Dataset {
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());
         arrow_schema.to_pyarrow(self_.py())
+    }
+
+    #[getter(lance_schema)]
+    fn lance_schema(self_: PyRef<'_, Self>) -> LanceSchema {
+        LanceSchema(self_.ds.schema().clone())
     }
 
     /// Get index statistics
@@ -971,10 +979,17 @@ impl Dataset {
                 as Arc<dyn CommitHandler>
         });
         let ds = RT
-            .block_on(
-                commit_lock.map(|cl| cl.py()),
-                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler),
-            )?
+            .block_on(commit_lock.map(|cl| cl.py()), async move {
+                let dataset = match DatasetBuilder::from_uri(dataset_uri).load().await {
+                    Ok(ds) => Some(ds),
+                    Err(lance::Error::DatasetNotFound { .. }) => None,
+                    Err(err) => return Err(err),
+                };
+                let manifest = dataset.as_ref().map(|ds| ds.manifest());
+                validate_operation(manifest, &operation.0)?;
+                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler)
+                    .await
+            })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             ds: Arc::new(ds),
