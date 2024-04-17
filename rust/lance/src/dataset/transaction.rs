@@ -981,14 +981,15 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
 /// It is not required that the schema contains all fields in the fragment.
 /// There may be masked fields.
 fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+    // TODO: add additional validation. Consider consolidating with various
+    // validate() methods in the codebase.
     for fragment in fragments {
         for field in schema.fields_pre_order() {
-            if fragment
+            if !fragment
                 .files
                 .iter()
                 .flat_map(|f| f.fields.iter())
-                .find(|&f_id| f_id == &field.id)
-                .is_none()
+                .any(|f_id| f_id == &field.id)
             {
                 return Err(Error::invalid_input(
                     format!(

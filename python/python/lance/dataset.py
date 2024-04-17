@@ -1852,9 +1852,9 @@ class LanceOperation:
         ...     return pa.record_batch([doubled], ["a_doubled"])
         >>> fragments = []
         >>> for fragment in dataset.get_fragments():
-        ...     new_fragment = fragment.add_columns(double_a, columns=['a'])
+        ...     new_fragment, new_schema = fragment.merge_columns(double_a,
+        ...                                                       columns=['a'])
         ...     fragments.append(new_fragment)
-        >>> new_schema = table.schema.append(pa.field("a_doubled", pa.int64()))
         >>> operation = lance.LanceOperation.Merge(fragments, new_schema)
         >>> dataset = lance.LanceDataset.commit("example", operation,
         ...                                     read_version=dataset.version)
@@ -1867,7 +1867,7 @@ class LanceOperation:
         """
 
         fragments: Iterable[FragmentMetadata]
-        schema: LanceSchema
+        schema: LanceSchema | pa.Schema
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.fragments)

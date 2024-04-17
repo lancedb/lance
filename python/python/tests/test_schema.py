@@ -6,6 +6,7 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
+from lance.schema import LanceSchema
 
 
 def test_lance_schema(tmp_path: Path):
@@ -19,3 +20,6 @@ def test_lance_schema(tmp_path: Path):
     dumped = pickle.dumps(schema)
     loaded = pickle.loads(dumped)
     assert schema == loaded
+
+    assert schema.to_pyarrow() == data.schema
+    assert LanceSchema.from_pyarrow(data.schema) == schema
