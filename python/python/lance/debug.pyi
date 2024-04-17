@@ -12,7 +12,7 @@ def format_schema(dataset: LanceDataset) -> str:
 def format_manifest(dataset: LanceDataset) -> str:
     pass
 
-def format_fragment(fragment: FragmentMetadata) -> str:
+def format_fragment(fragment: FragmentMetadata, dataset: LanceDataset) -> str:
     pass
 
 def list_transactions(

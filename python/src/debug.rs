@@ -75,12 +75,16 @@ impl PrettyPrintableFragment {
 
 /// Debug print a LanceFragment.
 #[pyfunction]
-pub fn format_fragment(fragment: &PyAny) -> PyResult<String> {
+pub fn format_fragment(fragment: &PyAny, dataset: &PyAny) -> PyResult<String> {
     let py = fragment.py();
     let fragment = fragment
         .getattr("_metadata")?
         .extract::<Py<FragmentMetadata>>()?;
-    let schema = &fragment.as_ref(py).borrow().schema;
+
+    let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
+    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let schema = dataset_ref.schema();
+
     let meta = fragment.as_ref(py).borrow().inner.clone();
     let pp_meta = PrettyPrintableFragment::new(&meta, schema);
     Ok(format!("{:#?}", pp_meta))
