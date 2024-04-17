@@ -5,7 +5,7 @@ use arrow_array::ArrayRef;
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
-use lance_core::datatypes::{Field as LanceField, Schema as LanceSchema};
+use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
 use crate::{
@@ -160,7 +160,7 @@ pub struct BatchEncoder {
 
 impl BatchEncoder {
     pub(crate) fn get_encoder_for_field(
-        field: &LanceField,
+        field: &Field,
         cache_bytes_per_column: u64,
         col_idx: &mut u32,
         field_col_mapping: &mut Vec<(i32, i32)>,
@@ -249,7 +249,7 @@ impl BatchEncoder {
         }
     }
 
-    pub fn try_new(schema: &LanceSchema, cache_bytes_per_column: u64) -> Result<Self> {
+    pub fn try_new(schema: &Schema, cache_bytes_per_column: u64) -> Result<Self> {
         let mut col_idx = 0;
         let mut field_col_mapping = Vec::new();
         let field_encoders = schema

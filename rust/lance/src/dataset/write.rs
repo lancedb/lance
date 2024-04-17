@@ -258,7 +258,7 @@ impl GenericWriter for v2::writer::FileWriter {
         Ok(())
     }
     async fn tell(&mut self) -> Result<u64> {
-        Ok(self.tell().await? as u64)
+        Ok(self.tell().await?)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
         let field_ids = self
