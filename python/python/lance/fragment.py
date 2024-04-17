@@ -15,6 +15,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -28,6 +29,7 @@ from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner, ReaderLike
+    from .schema import LanceSchema
 
 
 class FragmentMetadata:
@@ -325,7 +327,7 @@ class LanceFragment(pa.dataset.Fragment):
         self,
         value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
-    ) -> FragmentMetadata:
+    ) -> Tuple[FragmentMetadata, LanceSchema]:
         """Add columns to this Fragment.
 
         .. warning::
@@ -365,7 +367,10 @@ class LanceFragment(pa.dataset.Fragment):
 
             updater.update(new_value)
         metadata = updater.finish()
-        return FragmentMetadata(metadata.json())
+        schema = updater.schema()
+        # There's some craziness here. It technically has a schema, but isn't
+        # preserved when pickled. Should we keep it? or separate it.
+        return FragmentMetadata.from_metadata(metadata), schema
 
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.

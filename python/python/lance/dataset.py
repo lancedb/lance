@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 
     from .commit import CommitLock
     from .progress import FragmentWriteProgress
+    from .schema import LanceSchema
 
     ReaderLike = Union[
         pd.Timestamp,
@@ -327,6 +328,13 @@ class LanceDataset(pa.dataset.Dataset):
         The pyarrow Schema for this dataset
         """
         return self._ds.schema
+
+    @property
+    def lance_schema(self) -> "LanceSchema":
+        """
+        The LanceSchema for this dataset
+        """
+        return self._ds.lance_schema
 
     def to_table(
         self,

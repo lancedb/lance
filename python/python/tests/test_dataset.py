@@ -523,12 +523,11 @@ def test_add_columns(tmp_path: Path):
         c_array = pa.compute.multiply(batch.column(0), 2)
         return pa.RecordBatch.from_arrays([c_array], names=["c"])
 
-    fragment_metadata = fragment.add_columns(adder, columns=["a"])
-    schema = dataset.schema.append(pa.field("c", pa.int64()))
+    fragment_metadata, schema = fragment.add_columns(adder, columns=["a"])
 
-    operation = lance.LanceOperation.Overwrite(schema, [fragment_metadata])
+    operation = lance.LanceOperation.Overwrite(schema.to_pyarrow(), [fragment_metadata])
     dataset = lance.LanceDataset.commit(base_dir, operation)
-    assert dataset.schema == schema
+    assert dataset.schema == schema.to_pyarrow()
 
     tbl = dataset.to_table()
     assert tbl == pa.Table.from_pydict({
@@ -656,16 +655,15 @@ def test_merge_with_commit(tmp_path: Path):
     lance.write_dataset(table, base_dir)
 
     fragment = lance.dataset(base_dir).get_fragments()[0]
-    merged = fragment.add_columns(
+    merged, schema = fragment.add_columns(
         lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
     )
 
-    expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
-
-    merge = lance.LanceOperation.Merge([merged], expected.schema)
+    merge = lance.LanceOperation.Merge([merged], schema)
     dataset = lance.LanceDataset.commit(base_dir, merge, read_version=1)
 
     tbl = dataset.to_table()
+    expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
     assert tbl == expected
 
 
@@ -681,21 +679,21 @@ def test_merge_with_schema_holes(tmp_path: Path):
     dataset.drop_columns(["b"])
 
     fragment = dataset.get_fragments()[0]
-    merged = fragment.add_columns(
+    merged, schema = fragment.add_columns(
         lambda _: pa.RecordBatch.from_pydict({"d": range(10, 20)})
     )
-    expected = pa.table({
-        "a": range(10),
-        "c": range(2, 12),
-        "d": range(10, 20),
-    })
 
-    merge = lance.LanceOperation.Merge([merged], expected.schema)
+    merge = lance.LanceOperation.Merge([merged], schema)
     dataset = lance.LanceDataset.commit(tmp_path, merge, read_version=dataset.version)
 
     dataset.validate()
 
     tbl = dataset.to_table()
+    expected = pa.table({
+        "a": range(10),
+        "c": range(2, 12),
+        "d": range(10, 20),
+    })
     assert tbl == expected
 
 

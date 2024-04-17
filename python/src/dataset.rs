@@ -64,6 +64,7 @@ use pyo3::{
 use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
+use crate::schema::LanceSchema;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -244,8 +245,8 @@ impl Operation {
     }
 
     #[staticmethod]
-    fn merge(fragments: Vec<FragmentMetadata>, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let schema = convert_schema(&schema.0)?;
+    fn merge(fragments: Vec<FragmentMetadata>, schema: LanceSchema) -> PyResult<Self> {
+        let schema = schema.0;
         let fragments = into_fragments(fragments);
         let op = LanceOperation::Merge { fragments, schema };
         Ok(Self(op))
@@ -322,6 +323,11 @@ impl Dataset {
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());
         arrow_schema.to_pyarrow(self_.py())
+    }
+
+    #[getter(lance_schema)]
+    fn lance_schema(self_: PyRef<'_, Self>) -> LanceSchema {
+        LanceSchema(self_.ds.schema().clone())
     }
 
     /// Get index statistics
