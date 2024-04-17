@@ -45,6 +45,11 @@ impl PageTable {
     /// The page table is stored as an array. The on-disk size is determined based
     /// on the `min_field_id`, `max_field_id`, and `num_batches` parameters. If
     /// these are incorrect, the page table will not be read correctly.
+    ///
+    /// The full sequence of field ids `min_field_id..=max_field_id` will be loaded.
+    /// Non-existent pages will be represented as (0, 0) in the page table. Pages
+    /// can be non-existent because they are not present in the file, or because
+    /// they are struct fields which have no data pages.
     pub async fn load<'a>(
         reader: &dyn Reader,
         position: usize,
@@ -96,7 +101,8 @@ impl PageTable {
     /// be serialized to the page table per the format spec.
     ///
     /// Any (field_id, batch_id) combinations that are not present in the page table
-    /// will be written as (0, 0) to indicate an empty page.
+    /// will be written as (0, 0) to indicate an empty page. This includes any
+    /// holes in the field ids as well as struct fields which have no data pages.
     pub async fn write(&self, writer: &mut dyn Writer, min_field_id: i32) -> Result<usize> {
         if self.pages.is_empty() {
             return Err(Error::InvalidInput {
