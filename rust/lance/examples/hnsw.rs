@@ -82,35 +82,36 @@ async fn main() {
     let k = 10;
     let gt = ground_truth(&mat, q, k);
 
-    // for ef_construction in [15, 30, 50] {
-    //     let now = std::time::Instant::now();
-    //     let hnsw = HNSWBuilder::with_params(
-    //         HnswBuildParams::default()
-    //             .max_level(args.max_level)
-    //             .num_edges(15)
-    //             .max_num_edges(args.max_edges)
-    //             .ef_construction(ef_construction),
-    //         vector_store.clone(),
-    //     )
-    //     .build()
-    //     .unwrap();
-    //     let construct_time = now.elapsed().as_secs_f32();
-    //     let now = std::time::Instant::now();
-    //     let results: HashSet<u32> = hnsw
-    //         .search(q, k, args.ef, None)
-    //         .unwrap()
-    //         .iter()
-    //         .map(|node| node.id)
-    //         .collect();
-    //     let search_time = now.elapsed().as_micros();
-    //     println!(
-    //         "level={}, ef_construct={}, ef={} recall={}: construct={:.3}s search={:.3} us",
-    //         args.max_level,
-    //         ef_construction,
-    //         args.ef,
-    //         results.intersection(&gt).count() as f32 / k as f32,
-    //         construct_time,
-    //         search_time
-    //     );
-    // }
+    for ef_construction in [15, 30, 50] {
+        let now = std::time::Instant::now();
+        let hnsw = HNSWBuilder::with_params(
+            HnswBuildParams::default()
+                .max_level(args.max_level)
+                .num_edges(15)
+                .max_num_edges(args.max_edges)
+                .ef_construction(ef_construction),
+            vector_store.clone(),
+        )
+        .build()
+        .await
+        .unwrap();
+        let construct_time = now.elapsed().as_secs_f32();
+        let now = std::time::Instant::now();
+        let results: HashSet<u32> = hnsw
+            .search(q, k, args.ef, None)
+            .unwrap()
+            .iter()
+            .map(|node| node.id)
+            .collect();
+        let search_time = now.elapsed().as_micros();
+        println!(
+            "level={}, ef_construct={}, ef={} recall={}: construct={:.3}s search={:.3} us",
+            args.max_level,
+            ef_construction,
+            args.ef,
+            results.intersection(&gt).count() as f32 / k as f32,
+            construct_time,
+            search_time
+        );
+    }
 }
