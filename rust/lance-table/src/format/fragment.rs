@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::Error;
+use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
@@ -35,7 +36,7 @@ pub struct DataFile {
 }
 
 impl DataFile {
-    fn new(
+    pub fn new(
         path: impl Into<String>,
         fields: Vec<i32>,
         column_indices: Vec<i32>,
@@ -55,7 +56,7 @@ impl DataFile {
         Self::new(path, fields, vec![], 0, 0)
     }
 
-    pub(crate) fn new_legacy(path: impl Into<String>, schema: &Schema) -> Self {
+    pub fn new_legacy(path: impl Into<String>, schema: &Schema) -> Self {
         Self::new(path, schema.field_ids(), vec![], 0, 0)
     }
 
@@ -226,6 +227,21 @@ impl Fragment {
             deletion_file: None,
             physical_rows,
         }
+    }
+
+    pub fn add_file(
+        &mut self,
+        path: impl Into<String>,
+        field_ids: Vec<i32>,
+        column_indices: Vec<i32>,
+    ) {
+        self.files.push(DataFile::new(
+            path,
+            field_ids,
+            column_indices,
+            MAJOR_VERSION as u32,
+            MINOR_VERSION_NEXT as u32,
+        ));
     }
 
     /// Add a new [`DataFile`] to this fragment.

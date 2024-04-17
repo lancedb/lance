@@ -3,8 +3,9 @@
 
 use arrow_array::ArrayRef;
 use arrow_buffer::Buffer;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::DataType;
 use futures::future::BoxFuture;
+use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
 use crate::{
@@ -154,6 +155,7 @@ pub trait FieldEncoder: Send {
 
 pub struct BatchEncoder {
     pub field_encoders: Vec<Box<dyn FieldEncoder>>,
+    pub field_id_to_column_index: Vec<(i32, i32)>,
 }
 
 impl BatchEncoder {
@@ -161,6 +163,7 @@ impl BatchEncoder {
         field: &Field,
         cache_bytes_per_column: u64,
         col_idx: &mut u32,
+        field_col_mapping: &mut Vec<(i32, i32)>,
     ) -> Result<Box<dyn FieldEncoder>> {
         match field.data_type() {
             DataType::Boolean
@@ -189,30 +192,43 @@ impl BatchEncoder {
             | DataType::FixedSizeList(_, _) => {
                 let my_col_idx = *col_idx;
                 *col_idx += 1;
+                field_col_mapping.push((field.id, my_col_idx as i32));
                 Ok(Box::new(PrimitiveFieldEncoder::try_new(
                     cache_bytes_per_column,
-                    field.data_type(),
+                    &field.data_type(),
                     my_col_idx,
                 )?))
             }
-            DataType::List(inner_type) => {
+            DataType::List(_) => {
                 let my_col_idx = *col_idx;
+                field_col_mapping.push((field.id, my_col_idx as i32));
                 *col_idx += 1;
-                let inner_encoding =
-                    Self::get_encoder_for_field(inner_type, cache_bytes_per_column, col_idx)?;
+                let inner_encoding = Self::get_encoder_for_field(
+                    &field.children[0],
+                    cache_bytes_per_column,
+                    col_idx,
+                    field_col_mapping,
+                )?;
                 Ok(Box::new(ListFieldEncoder::new(
                     inner_encoding,
                     cache_bytes_per_column,
                     my_col_idx,
                 )))
             }
-            DataType::Struct(fields) => {
+            DataType::Struct(_) => {
                 let header_col_idx = *col_idx;
+                field_col_mapping.push((field.id, header_col_idx as i32));
                 *col_idx += 1;
-                let children_encoders = fields
+                let children_encoders = field
+                    .children
                     .iter()
                     .map(|field| {
-                        Self::get_encoder_for_field(field, cache_bytes_per_column, col_idx)
+                        Self::get_encoder_for_field(
+                            field,
+                            cache_bytes_per_column,
+                            col_idx,
+                            field_col_mapping,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Box::new(StructFieldEncoder::new(
@@ -222,6 +238,7 @@ impl BatchEncoder {
             }
             DataType::Utf8 | DataType::Binary => {
                 let my_col_idx = *col_idx;
+                field_col_mapping.push((field.id, my_col_idx as i32));
                 *col_idx += 2;
                 Ok(Box::new(BinaryFieldEncoder::new(
                     cache_bytes_per_column,
@@ -234,12 +251,23 @@ impl BatchEncoder {
 
     pub fn try_new(schema: &Schema, cache_bytes_per_column: u64) -> Result<Self> {
         let mut col_idx = 0;
+        let mut field_col_mapping = Vec::new();
         let field_encoders = schema
             .fields
             .iter()
-            .map(|field| Self::get_encoder_for_field(field, cache_bytes_per_column, &mut col_idx))
+            .map(|field| {
+                Self::get_encoder_for_field(
+                    field,
+                    cache_bytes_per_column,
+                    &mut col_idx,
+                    &mut field_col_mapping,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { field_encoders })
+        Ok(Self {
+            field_encoders,
+            field_id_to_column_index: field_col_mapping,
+        })
     }
 
     pub fn num_columns(&self) -> u32 {

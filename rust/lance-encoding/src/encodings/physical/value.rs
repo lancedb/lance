@@ -183,11 +183,11 @@ impl ArrayEncoder for ValueEncoder {
 #[cfg(test)]
 pub(crate) mod tests {
 
-    use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
+    use arrow_schema::{DataType, Field, TimeUnit};
 
     use crate::testing::check_round_trip_encoding;
 
-    pub const PRIMITIVE_TYPES: &[DataType] = &[
+    const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Date32,
         DataType::Date64,
         DataType::Int8,
@@ -207,7 +207,9 @@ pub(crate) mod tests {
         DataType::Time32(TimeUnit::Second),
         DataType::Time64(TimeUnit::Nanosecond),
         DataType::Duration(TimeUnit::Second),
-        DataType::Interval(IntervalUnit::DayTime),
+        // The Interval type is supported by the reader but the writer works with Lance schema
+        // at the moment and Lance schema can't parse interval
+        // DataType::Interval(IntervalUnit::DayTime),
     ];
 
     #[test_log::test(tokio::test)]

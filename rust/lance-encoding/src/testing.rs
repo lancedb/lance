@@ -86,7 +86,15 @@ async fn test_decode(
 
 pub async fn check_round_trip_encoding(field: Field) {
     let mut col_idx = 0;
-    let encoder = BatchEncoder::get_encoder_for_field(&field, 4096, &mut col_idx).unwrap();
+    let mut field_id_to_col_index = Vec::new();
+    let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    let encoder = BatchEncoder::get_encoder_for_field(
+        &lance_field,
+        4096,
+        &mut col_idx,
+        &mut field_id_to_col_index,
+    )
+    .unwrap();
     check_round_trip_field_encoding(encoder, field).await
 }
 

@@ -171,9 +171,11 @@ impl LanceFileWriter {
     async fn open(uri_or_path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
         let object_writer = object_store.create(&path).await.infer_error()?;
+        let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
         let inner = FileWriter::try_new(
             object_writer,
-            schema.0.clone(),
+            path.to_string(),
+            lance_schema,
             FileWriterOptions::default(),
         )
         .infer_error()?;
@@ -196,7 +198,7 @@ impl LanceFileWriter {
             .infer_error()
     }
 
-    pub fn finish(&mut self) -> PyResult<()> {
+    pub fn finish(&mut self) -> PyResult<u64> {
         RT.runtime.block_on(self.inner.finish()).infer_error()
     }
 }
