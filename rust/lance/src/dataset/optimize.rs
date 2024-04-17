@@ -799,6 +799,7 @@ async fn rewrite_files(
         ..Default::default()
     };
     let mut new_fragments = write_fragments_internal(
+        Some(dataset.as_ref()),
         dataset.object_store.clone(),
         &dataset.base,
         dataset.schema(),

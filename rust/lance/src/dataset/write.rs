@@ -22,6 +22,9 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
+use crate::Dataset;
+
+use super::builder::DatasetBuilder;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::DATA_DIR;
 
@@ -127,13 +130,33 @@ pub async fn write_fragments(
     data: impl RecordBatchReader + Send + 'static,
     params: WriteParams,
 ) -> Result<Vec<Fragment>> {
-    let (object_store, base) = ObjectStore::from_uri_and_params(
-        dataset_uri,
-        &params.store_params.clone().unwrap_or_default(),
-    )
-    .await?;
+    let (dataset, object_store, base) = if matches!(params.mode, WriteMode::Append) {
+        let dataset = DatasetBuilder::from_uri(dataset_uri)
+            .with_write_params(params.clone())
+            .load()
+            .await?;
+        let store = dataset.object_store().clone();
+        let base = dataset.uri().clone();
+        (Some(dataset), store, base)
+    } else {
+        let (object_store, base) = ObjectStore::from_uri_and_params(
+            dataset_uri,
+            &params.store_params.clone().unwrap_or_default(),
+        )
+        .await?;
+        (None, object_store, base)
+    };
+
     let (stream, schema) = reader_to_stream(Box::new(data)).await?;
-    write_fragments_internal(Arc::new(object_store), &base, &schema, stream, params).await
+    write_fragments_internal(
+        dataset.as_ref(),
+        Arc::new(object_store),
+        &base,
+        &schema,
+        stream,
+        params,
+    )
+    .await
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -147,6 +170,7 @@ pub async fn write_fragments(
 /// DataFusion type.
 #[instrument(level = "debug", skip_all)]
 pub async fn write_fragments_internal(
+    dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
@@ -155,6 +179,23 @@ pub async fn write_fragments_internal(
 ) -> Result<Vec<Fragment>> {
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
+
+    let schema = if let Some(dataset) = dataset {
+        if matches!(params.mode, WriteMode::Append) {
+            // Append mode, so we need to check compatibility
+            schema.check_compatible(dataset.schema(), &Default::default())?;
+            // Use the schema from the dataset, because it has the correct
+            // field ids.
+            dataset.schema()
+        } else {
+            schema
+        }
+    } else {
+        schema
+    };
+    dbg!(&params.mode);
+    dbg!(schema);
+
     // TODO: When writing v2 we could consider skipping this chunking step.  However, leaving in
     // for now as it doesn't hurt anything
     let mut buffered_reader = chunk_stream(data, params.max_rows_per_group);

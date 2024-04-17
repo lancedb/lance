@@ -30,10 +30,11 @@ use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
 use uuid::Uuid;
 
+use super::builder::DatasetBuilder;
 use super::hash_joiner::HashJoiner;
 use super::scanner::Scanner;
 use super::updater::Updater;
-use super::WriteParams;
+use super::{WriteMode, WriteParams};
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 
@@ -70,6 +71,28 @@ impl FileFragment {
 
         let reader = Box::new(reader);
         let (stream, schema) = reader_to_stream(reader).await?;
+
+        let schema = if matches!(params.mode, WriteMode::Append) {
+            // TODO: we need to pass down params somehow.
+            match DatasetBuilder::from_uri(dataset_uri).load().await {
+                Ok(dataset) => {
+                    schema.check_compatible(dataset.schema(), &Default::default())?;
+                    // Use the schema from the dataset, because it has the correct
+                    // field ids.
+                    dataset.schema().clone()
+                }
+                Err(Error::DatasetNotFound { .. }) => {
+                    // If the dataset does not exist, we can use the schema from
+                    // the reader.
+                    schema
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        } else {
+            schema
+        };
 
         if schema.fields.is_empty() {
             return Err(Error::invalid_input(

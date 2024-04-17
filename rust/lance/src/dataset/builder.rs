@@ -9,7 +9,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use url::Url;
 
-use super::{ReadParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::{
     error::{Error, Result},
     session::Session,
@@ -150,6 +150,18 @@ impl DatasetBuilder {
             self.commit_handler = Some(commit_handler);
         }
 
+        self
+    }
+
+    /// Set options based on [WriteParams].
+    pub fn with_write_params(mut self, write_params: WriteParams) -> Self {
+        if let Some(options) = write_params.store_params {
+            self.options = options;
+        }
+
+        if let Some(commit_handler) = write_params.commit_handler {
+            self.commit_handler = Some(commit_handler);
+        }
         self
     }
 
