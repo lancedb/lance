@@ -431,10 +431,6 @@ pub fn write_fragments(
 ) -> PyResult<Vec<FragmentMetadata>> {
     let batches = convert_reader(reader)?;
 
-    let schema = batches.schema();
-    let schema =
-        Schema::try_from(schema.as_ref()).map_err(|err| PyValueError::new_err(err.to_string()))?;
-
     let params = kwargs
         .and_then(|params| get_write_params(params).ok().flatten())
         .unwrap_or_default();

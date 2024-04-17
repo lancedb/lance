@@ -523,7 +523,7 @@ def test_add_columns(tmp_path: Path):
         c_array = pa.compute.multiply(batch.column(0), 2)
         return pa.RecordBatch.from_arrays([c_array], names=["c"])
 
-    fragment_metadata, schema = fragment.add_columns(adder, columns=["a"])
+    fragment_metadata, schema = fragment.merge_columns(adder, columns=["a"])
 
     operation = lance.LanceOperation.Overwrite(schema.to_pyarrow(), [fragment_metadata])
     dataset = lance.LanceDataset.commit(base_dir, operation)
@@ -655,15 +655,22 @@ def test_merge_with_commit(tmp_path: Path):
     lance.write_dataset(table, base_dir)
 
     fragment = lance.dataset(base_dir).get_fragments()[0]
-    merged, schema = fragment.add_columns(
-        lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
-    )
+    # add_columns is deprecated, but we can make sure it still work
+    # for now.
+    with pytest.deprecated_call():
+        merged = fragment.add_columns(
+            lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
+        )
 
-    merge = lance.LanceOperation.Merge([merged], schema)
-    dataset = lance.LanceDataset.commit(base_dir, merge, read_version=1)
+    expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
+
+    # PyArrow schema is deprecated, but should still work for now.
+    with pytest.deprecated_call():
+        merge = lance.LanceOperation.Merge([merged], expected.schema)
+        dataset = lance.LanceDataset.commit(base_dir, merge, read_version=1)
 
     tbl = dataset.to_table()
-    expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
+
     assert tbl == expected
 
 
@@ -679,7 +686,7 @@ def test_merge_with_schema_holes(tmp_path: Path):
     dataset.drop_columns(["b"])
 
     fragment = dataset.get_fragments()[0]
-    merged, schema = fragment.add_columns(
+    merged, schema = fragment.merge_columns(
         lambda _: pa.RecordBatch.from_pydict({"d": range(10, 20)})
     )
 

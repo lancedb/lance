@@ -39,8 +39,20 @@ impl LanceSchema {
         }
     }
 
+    /// Convert the schema to a PyArrow schema.
     pub fn to_pyarrow(&self) -> PyArrowType<ArrowSchema> {
         PyArrowType(ArrowSchema::from(&self.0))
+    }
+
+    /// Create a Lance schema from a PyArrow schema.
+    ///
+    /// This will assign field ids in depth-first order. Be aware this may not
+    /// match the correct schema for a particular table.
+    #[staticmethod]
+    pub fn from_pyarrow(schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
+        let schema = Schema::try_from(&schema.0)
+            .map_err(|err| PyValueError::new_err(format!("Failed to convert schema: {}", err)))?;
+        Ok(Self(schema))
     }
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
