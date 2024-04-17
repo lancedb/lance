@@ -23,7 +23,7 @@ use lance_file::v2::{
     reader::{BufferDescriptor, CachedFileMetadata, FileReader},
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_io::scheduler::StoreScheduler;
+use lance_io::{scheduler::StoreScheduler, ReadBatchParams};
 use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
@@ -273,6 +273,24 @@ impl RecordBatchReader for LanceReaderAdapter {
     }
 }
 
+impl LanceFileReader {
+    fn read_stream(
+        &mut self,
+        params: ReadBatchParams,
+        batch_size: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        // read_stream is a synchronous method but it launches tasks and needs to be
+        // run in the context of a tokio runtime
+        let stream = RT
+            .runtime
+            .block_on(std::future::ready(
+                self.inner.read_stream(params, batch_size),
+            ))
+            .infer_error()?;
+        Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
+    }
+}
+
 #[pymethods]
 impl LanceFileReader {
     #[new]
@@ -284,11 +302,7 @@ impl LanceFileReader {
         &mut self,
         batch_size: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        let stream = RT.runtime.block_on(
-            self.inner
-                .read_stream(lance_io::ReadBatchParams::RangeFull, batch_size),
-        );
-        Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
+        self.read_stream(lance_io::ReadBatchParams::RangeFull, batch_size)
     }
 
     pub fn read_range(
@@ -297,11 +311,10 @@ impl LanceFileReader {
         num_rows: u64,
         batch_size: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        let stream = RT.runtime.block_on(self.inner.read_stream(
+        self.read_stream(
             lance_io::ReadBatchParams::Range((offset as usize)..(offset + num_rows) as usize),
             batch_size,
-        ));
-        Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
+        )
     }
 
     pub fn metadata(&mut self, py: Python) -> LanceFileMetadata {

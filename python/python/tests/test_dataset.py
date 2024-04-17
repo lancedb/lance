@@ -1578,3 +1578,15 @@ def test_migrate_manifest(tmp_path: Path):
     ds = lance.write_dataset(table, tmp_path)
     # We shouldn't need a migration for a brand new dataset.
     assert not manifest_needs_migration(ds)
+
+
+def test_v2_dataset(tmp_path: Path):
+    table = pa.table({"a": range(100), "b": range(100)})
+    # max_rows_per_group is ignored by the v2 writer so we specify here to confirm
+    # we are in fact using v2 files
+    dataset = lance.write_dataset(
+        table, tmp_path, use_experimental_writer=True, max_rows_per_group=10
+    )
+    batches = list(dataset.to_batches())
+    assert len(batches) == 1
+    assert pa.Table.from_batches(batches) == table

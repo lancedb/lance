@@ -7,9 +7,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
-use futures::{stream::BoxStream, StreamExt};
+use futures::{stream::BoxStream, Future, Stream, StreamExt};
 use lance_encoding::{
-    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, PageInfo},
+    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, PageInfo, ReadBatchTask},
     EncodingsIo,
 };
 use prost::Message;
@@ -22,7 +22,7 @@ use lance_io::{
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
     ReadBatchParams,
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::sync::mpsc;
 
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
@@ -35,12 +35,14 @@ use super::io::LanceEncodingsIo;
 // use these later we should make them lazily loaded and then cached once loaded.
 //
 // We store their position / length for debugging purposes
+#[derive(Debug)]
 pub struct BufferDescriptor {
     pub position: u64,
     pub size: u64,
 }
 
 // TODO: Caching
+#[derive(Debug)]
 pub struct CachedFileMetadata {
     /// The schema of the file
     pub file_schema: Schema,
@@ -59,6 +61,7 @@ pub struct CachedFileMetadata {
     pub minor_version: u16,
 }
 
+#[derive(Debug)]
 pub struct FileReader {
     scheduler: Arc<LanceEncodingsIo>,
     file_schema: Schema,
@@ -402,62 +405,76 @@ impl FileReader {
         })
     }
 
-    async fn read_range(
+    fn read_range(
         &self,
         range: Range<u64>,
         batch_size: u32,
-    ) -> BoxStream<'static, JoinHandle<Result<RecordBatch>>> {
+    ) -> BoxStream<'static, ReadBatchTask<impl Future<Output = Result<RecordBatch>>>> {
         let mut decode_scheduler =
             DecodeBatchScheduler::new(&self.file_schema, &self.column_infos, &vec![]);
 
         let (tx, rx) = mpsc::unbounded_channel();
 
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
-        // FIXME: spawn this, change this method to sync
-        decode_scheduler
-            .schedule_range(range, tx, &scheduler)
-            .await
-            .unwrap();
+        tokio::task::spawn(
+            async move { decode_scheduler.schedule_range(range, tx, &scheduler).await },
+        );
 
         BatchDecodeStream::new(rx, batch_size, self.num_rows).into_stream()
     }
 
-    // TODO: change output to sendable record batch stream
-
-    pub async fn read_stream(
+    pub fn read_tasks(
         &self,
         params: ReadBatchParams,
         batch_size: u32,
-    ) -> Pin<Box<dyn RecordBatchStream>> {
-        let futures_stream = match params {
+    ) -> Result<
+        Pin<
+            Box<dyn Stream<Item = ReadBatchTask<impl Future<Output = Result<RecordBatch>>>> + Send>,
+        >,
+    > {
+        let verify_bound = |params: &ReadBatchParams, bound: usize| {
+            if bound > std::u32::MAX as usize {
+                Err(Error::invalid_input(
+                    format!(
+                        "cannot read {:?} from file with {} rows",
+                        params, self.num_rows
+                    ),
+                    location!(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let tasks_stream = match &params {
             ReadBatchParams::Indices(_) => todo!(),
             ReadBatchParams::Range(range) => {
-                // TODO: Make err
-                assert!((range.end as u64) < self.num_rows);
+                verify_bound(&params, range.end)?;
                 self.read_range(range.start as u64..range.end as u64, batch_size)
-                    .await
             }
             ReadBatchParams::RangeFrom(range) => {
+                verify_bound(&params, range.start)?;
                 self.read_range(range.start as u64..self.num_rows, batch_size)
-                    .await
             }
             ReadBatchParams::RangeTo(range) => {
-                // TODO: Make err
-                assert!((range.end as u64) < self.num_rows);
-                self.read_range(0..range.end as u64, batch_size).await
+                verify_bound(&params, range.end)?;
+                self.read_range(0..range.end as u64, batch_size)
             }
-            ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size).await,
+            ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size),
         };
-        let batch_stream = futures_stream
-            .buffered(16)
-            // JoinHandle returns Result<Result<...>> where the outer Result means the thread
-            // task panic'd so we propagate that panic here.
-            .map(|res_res| res_res.unwrap())
-            .boxed();
-        Box::pin(RecordBatchStreamAdapter::new(
+        Ok(tasks_stream)
+    }
+
+    pub fn read_stream(
+        &self,
+        params: ReadBatchParams,
+        batch_size: u32,
+    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
+        let tasks_stream = self.read_tasks(params, batch_size)?;
+        let batch_stream = tasks_stream.map(|task| task.task).buffered(16).boxed();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::new(self.file_schema.clone()),
             batch_stream,
-        ))
+        )))
     }
 }
 
@@ -560,7 +577,7 @@ mod tests {
 
             let mut batch_stream = file_reader
                 .read_stream(lance_io::ReadBatchParams::RangeFull, read_size)
-                .await;
+                .unwrap();
 
             let mut total_remaining = 1000 * 100;
             let mut expected_iter = data.iter();
