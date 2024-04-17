@@ -655,7 +655,7 @@ def test_merge_with_commit(tmp_path: Path):
     lance.write_dataset(table, base_dir)
 
     fragment = lance.dataset(base_dir).get_fragments()[0]
-    # add_columns is deprecated, but we can make sure it still work
+    # add_columns is deprecated, but we can make sure it still works
     # for now.
     with pytest.deprecated_call():
         merged = fragment.add_columns(
@@ -675,8 +675,6 @@ def test_merge_with_commit(tmp_path: Path):
 
 
 def test_merge_with_schema_holes(tmp_path: Path):
-    import lance.debug
-
     # Create table with 3 cols
     table = pa.table({"a": range(10)})
     dataset = lance.write_dataset(table, tmp_path)

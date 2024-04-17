@@ -938,8 +938,10 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
 /// Validate the operation is valid for the given manifest.
 pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) -> Result<()> {
     let manifest = match (manifest, operation) {
-        (None, Operation::Overwrite { .. }) => {
-            // TODO: validate overwrite
+        (None, Operation::Overwrite { fragments, schema }) => {
+            // Validate here because we are going to return early.
+            schema_fragments_valid(schema, fragments)?;
+
             return Ok(());
         }
         (Some(manifest), _) => manifest,

@@ -16,8 +16,13 @@ use pyo3::{
 
 /// A Lance Schema.
 ///
-/// This is valid for a particular dataset. It contains the field ids for each
-/// column in the dataset.
+/// Unlike a PyArrow schema, a Lance schema assigns every field an integer id.
+/// This is used to track fields across versions. This assignment of fields to
+/// ids is initially done in depth-first order, but as a schema evolves the
+/// assignment may change.
+///
+/// The assignment of field ids is particular to each dataset, so these schemas
+/// cannot be used interchangeably between datasets.
 #[pyclass(name = "LanceSchema", module = "lance.schema")]
 #[derive(Clone)]
 pub struct LanceSchema(pub Schema);
@@ -56,38 +61,38 @@ impl LanceSchema {
     }
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
-        // Each field is a protobuf message
+        // We don't have a single message for the schema, just protobuf message
+        // for a field. So, the state will be:
+        // (metadata_json, field_protos...)
+
         let mut states = Vec::new();
+        let metadata_str = serde_json::to_string(&self.0.metadata)
+            .map_err(|e| PyErr::new::<PyValueError, _>(format!("{}", e)))?
+            .into_py(py);
+        states.push(metadata_str);
 
         let fields = Fields::from(&self.0);
         for field in fields.0.iter() {
-            states.push(field.encode_to_vec());
+            states.push(field.encode_to_vec().into_py(py));
         }
-        // The metadata is its own JSON object
-        let metadata_str = serde_json::to_string(&self.0.metadata)
-            .map_err(|e| PyErr::new::<PyValueError, _>(format!("{}", e)))?;
-        states.push(metadata_str.as_bytes().to_vec());
 
         let state = PyTuple::new(py, states).extract()?;
-        let from_json = PyModule::import(py, "lance.schema")?
+        let from_protos = PyModule::import(py, "lance.schema")?
             .getattr("LanceSchema")?
             .getattr("_from_protos")?
             .extract()?;
-        Ok((from_json, state))
+        Ok((from_protos, state))
     }
 
     #[staticmethod]
-    #[pyo3(signature = (*args))]
-    pub fn _from_protos(mut args: Vec<Vec<u8>>) -> PyResult<Self> {
-        let metadata = args
-            .pop()
-            .ok_or_else(|| PyValueError::new_err("Must have at least two arguments"))?;
-        let metadata = serde_json::from_slice(&metadata)
+    #[pyo3(signature = (metadata_json, *field_protos))]
+    pub fn _from_protos(metadata_json: String, field_protos: Vec<Vec<u8>>) -> PyResult<Self> {
+        let metadata = serde_json::from_str(&metadata_json)
             .map_err(|err| PyValueError::new_err(format!("Failed to parse metadata: {}", err)))?;
 
         let mut fields = Vec::new();
-        for arg in args {
-            let field = pb::Field::decode(arg.as_slice()).map_err(|e| {
+        for proto in field_protos {
+            let field = pb::Field::decode(proto.as_slice()).map_err(|e| {
                 PyValueError::new_err(format!("Failed to parse field proto: {}", e))
             })?;
             fields.push(Field::from(&field));
