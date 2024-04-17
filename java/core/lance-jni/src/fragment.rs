@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
+use arrow::array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StructArray};
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::{DataType, Schema};
@@ -95,25 +95,12 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'a>(
 
     let c_array = unsafe { FFI_ArrowArray::from_raw(c_array_ptr) };
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-    let data_type = ok_or_throw_with_return!(
-        env,
-        DataType::try_from(&c_schema).map_err(|e| {
-            Error::Arrow {
-                message: e.to_string(),
-                location: location!(),
-            }
-        }),
-        JString::default()
-    );
+    let data_type =
+        ok_or_throw_with_return!(env, DataType::try_from(&c_schema), JString::default());
 
     let array_data = ok_or_throw_with_return!(
         env,
-        unsafe {
-            from_ffi_and_data_type(c_array, data_type).map_err(|e| Error::Arrow {
-                message: e.to_string(),
-                location: location!(),
-            })
-        },
+        unsafe { from_ffi_and_data_type(c_array, data_type) },
         JString::default()
     );
 
@@ -121,53 +108,20 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'a>(
     let batch_schema = record_batch.schema().clone();
     let reader = RecordBatchIterator::new(once(Ok(record_batch)), batch_schema);
 
-    let path_str: String =
-        ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), JString::default());
-    let fragment_id_opts =
-        ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), JString::default());
-
-    let write_params = ok_or_throw_with_return!(
+    ok_or_throw_with_return!(
         env,
-        extract_write_params(
+        create_fragment(
             &mut env,
-            &max_rows_per_file,
-            &max_rows_per_group,
-            &max_bytes_per_file,
-            &mode
+            dataset_uri,
+            fragment_id,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode,
+            reader
         ),
         JString::default()
-    );
-
-    // TODO(lu) improve the error handling and utils reuse
-    let fragment = match RT.block_on(FileFragment::create(
-        &path_str,
-        fragment_id_opts.unwrap_or(0) as usize,
-        reader,
-        Some(write_params),
-    )) {
-        Ok(fragment) => fragment,
-        Err(e) => {
-            Error::IO {
-                message: e.to_string(),
-                location: location!(),
-            }
-            .throw(&mut env);
-            return JString::default();
-        }
-    };
-    let json_string = match serde_json::to_string(&fragment) {
-        Ok(s) => s,
-        Err(err) => {
-            env.throw_new(
-                "java/lang/RuntimeException",
-                format!("Failed to convert JSON: {}", err),
-            )
-            .expect("Error throwing exception");
-            return JString::default();
-        }
-    };
-    env.new_string(json_string)
-        .expect("Failed to create json string")
+    )
 }
 
 #[no_mangle]
@@ -182,8 +136,6 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
 ) -> JString<'a> {
-    let path_str: String =
-        ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), JString::default());
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = ok_or_throw_with_return!(
         env,
@@ -194,51 +146,52 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
         JString::default()
     );
 
-    let fragment_id_opts =
-        ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), JString::default());
-
-    let write_params = ok_or_throw_with_return!(
+    ok_or_throw_with_return!(
         env,
-        extract_write_params(
+        create_fragment(
             &mut env,
-            &max_rows_per_file,
-            &max_rows_per_group,
-            &max_bytes_per_file,
-            &mode
+            dataset_uri,
+            fragment_id,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode,
+            reader
         ),
         JString::default()
-    );
+    )
+}
 
-    let fragment = match RT.block_on(FileFragment::create(
+#[allow(clippy::too_many_arguments)]
+fn create_fragment<'a>(
+    env: &mut JNIEnv<'a>,
+    dataset_uri: JString,
+    fragment_id: JObject,        // Optional<Integer>
+    max_rows_per_file: JObject,  // Optional<Integer>
+    max_rows_per_group: JObject, // Optional<Integer>
+    max_bytes_per_file: JObject, // Optional<Long>
+    mode: JObject,               // Optional<String>
+    reader: impl RecordBatchReader + Send + 'static,
+) -> Result<JString<'a>> {
+    let path_str = dataset_uri.extract(env)?;
+
+    let fragment_id_opts = env.get_int_opt(&fragment_id)?;
+
+    let write_params = extract_write_params(
+        env,
+        &max_rows_per_file,
+        &max_rows_per_group,
+        &max_bytes_per_file,
+        &mode,
+    )?;
+    let fragment = RT.block_on(FileFragment::create(
         &path_str,
         fragment_id_opts.unwrap_or(0) as usize,
         reader,
         Some(write_params),
-    )) {
-        Ok(fragment) => fragment,
-        Err(e) => {
-            Error::IO {
-                message: e.to_string(),
-                location: location!(),
-            }
-            .throw(&mut env);
-            return JString::default();
-        }
-    };
-
-    let json_string = match serde_json::to_string(&fragment) {
-        Ok(s) => s,
-        Err(err) => {
-            env.throw_new(
-                "java/lang/RuntimeException",
-                format!("Failed to convert JSON: {}", err),
-            )
-            .expect("Error throwing exception");
-            return JString::default();
-        }
-    };
-    env.new_string(json_string)
-        .expect("Failed to create json string")
+    ))?;
+    let json_string = serde_json::to_string(&fragment)?;
+    Ok(env.new_string(json_string)?)
 }
 
 #[no_mangle]
@@ -248,19 +201,16 @@ pub extern "system" fn Java_com_lancedb_lance_DatasetFragment_countRowsNative(
     jdataset: JObject,
     fragment_id: jlong,
 ) -> jint {
-    let res = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-                .expect("Dataset handle not set");
-        fragment_count_rows(&dataset, fragment_id)
-    };
-    match res {
-        Ok(r) => r,
-        Err(e) => {
-            e.throw(&mut env);
-            -1
-        }
-    }
+    ok_or_throw_with_return!(
+        env,
+        {
+            let dataset =
+                unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                    .expect("Dataset handle not set");
+            fragment_count_rows(&dataset, fragment_id)
+        },
+        -1
+    )
 }
 
 #[no_mangle]
@@ -271,13 +221,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
     fragment_id: jint,
     columns: JObject, // Optional<String[]>
 ) -> jlong {
-    let columns = match env.get_strings_opt(&columns) {
-        Ok(c) => c,
-        Err(e) => {
-            env.throw(e.to_string()).expect("Failed to throw exception");
-            return -1;
-        }
-    };
+    let columns = ok_or_throw_with_return!(env, env.get_strings_opt(&columns), -1);
 
     let res = {
         let dataset =
@@ -307,13 +251,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_openStream(
     batch_size: jlong,
     stream_addr: jlong,
 ) {
-    let columns = match env.get_strings_opt(&columns) {
-        Ok(c) => c,
-        Err(e) => {
-            env.throw(e.to_string()).expect("Failed to throw exception");
-            return;
-        }
-    };
+    let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
     let dataset = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
@@ -327,21 +265,12 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_openStream(
     };
     let mut scanner: Scanner = fragment.scan();
     if let Some(cols) = columns {
-        if let Err(e) = scanner.project(&cols) {
-            env.throw(format!("Setting scanner projection: {}", e))
-                .expect("Throw exception failed");
-            return;
-        }
+        ok_or_throw_without_return!(env, scanner.project(&cols));
     };
     scanner.batch_size(batch_size as usize);
 
-    let stream = match RT.block_on(async { scanner.try_into_stream().await }) {
-        Ok(s) => s,
-        Err(e) => {
-            env.throw(e.to_string()).expect("Throw exception failed");
-            return;
-        }
-    };
+    let stream =
+        ok_or_throw_without_return!(env, RT.block_on(async { scanner.try_into_stream().await }));
     let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone()).unwrap();
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
 }

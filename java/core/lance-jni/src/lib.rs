@@ -15,7 +15,7 @@
 use std::iter::empty;
 use std::sync::Arc;
 
-use arrow::array::RecordBatchIterator;
+use arrow::array::{RecordBatchIterator, RecordBatchReader};
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::Schema;
@@ -37,8 +37,20 @@ macro_rules! ok_or_throw {
         match $result {
             Ok(value) => value,
             Err(err) => {
-                err.throw(&mut $env);
+                Error::from(err).throw(&mut $env);
                 return JObject::null();
+            }
+        }
+    };
+}
+
+macro_rules! ok_or_throw_without_return {
+    ($env:expr, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(err) => {
+                Error::from(err).throw(&mut $env);
+                return;
             }
         }
     };
@@ -50,7 +62,7 @@ macro_rules! ok_or_throw_with_return {
         match $result {
             Ok(value) => value,
             Err(err) => {
-                err.throw(&mut $env);
+                Error::from(err).throw(&mut $env);
                 return $ret;
             }
         }
@@ -97,25 +109,18 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     );
 
     let reader = RecordBatchIterator::new(empty(), Arc::new(schema));
-
-    let path_str: String = ok_or_throw!(env, path.extract(&mut env));
-
-    let write_params = ok_or_throw!(
+    ok_or_throw!(
         env,
-        extract_write_params(
+        create_dataset(
             &mut env,
-            &max_rows_per_file,
-            &max_rows_per_group,
-            &max_bytes_per_file,
-            &mode
+            path,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode,
+            reader
         )
-    );
-
-    let dataset = ok_or_throw!(
-        env,
-        BlockingDataset::write(reader, &path_str, Some(write_params))
-    );
-    dataset.into_java(&mut env)
+    )
 }
 
 #[no_mangle]
@@ -129,19 +134,6 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
 ) -> JObject<'local> {
-    let path_str: String = ok_or_throw!(env, path.extract(&mut env));
-
-    let write_params = ok_or_throw!(
-        env,
-        extract_write_params(
-            &mut env,
-            &max_rows_per_file,
-            &max_rows_per_group,
-            &max_bytes_per_file,
-            &mode
-        )
-    );
-
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = ok_or_throw!(
         env,
@@ -151,11 +143,41 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
         })
     );
 
-    let dataset = ok_or_throw!(
+    ok_or_throw!(
         env,
-        BlockingDataset::write(reader, &path_str, Some(write_params))
-    );
-    dataset.into_java(&mut env)
+        create_dataset(
+            &mut env,
+            path,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode,
+            reader
+        )
+    )
+}
+
+fn create_dataset<'local>(
+    env: &mut JNIEnv<'local>,
+    path: JString,
+    max_rows_per_file: JObject,
+    max_rows_per_group: JObject,
+    max_bytes_per_file: JObject,
+    mode: JObject,
+    reader: impl RecordBatchReader + Send + 'static,
+) -> Result<JObject<'local>> {
+    let path_str = path.extract(env)?;
+
+    let write_params = extract_write_params(
+        env,
+        &max_rows_per_file,
+        &max_rows_per_group,
+        &max_bytes_per_file,
+        &mode,
+    )?;
+
+    let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
+    Ok(dataset.into_java(env))
 }
 
 #[no_mangle]
@@ -194,17 +216,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_commitAppend<'local>(
     let path_str: String = ok_or_throw!(env, path.extract(&mut env));
 
     let read_version = ok_or_throw!(env, env.get_long_opt_u64(&read_version_obj));
-    let dataset = match BlockingDataset::commit(&path_str, op, read_version) {
-        Ok(dataset) => dataset,
-        Err(err) => {
-            env.throw_new(
-                "java/lang/RuntimeException",
-                format!("Failed to commit: {}", err),
-            )
-            .expect("Error throwing exception");
-            return JObject::null();
-        }
-    };
+    let dataset = ok_or_throw!(env, BlockingDataset::commit(&path_str, op, read_version));
     dataset.into_java(&mut env)
 }
 

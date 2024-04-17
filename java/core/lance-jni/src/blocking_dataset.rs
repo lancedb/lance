@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::utils::create_json_fragment_list;
-use crate::{traits::IntoJava, Result, RT};
+use crate::{traits::IntoJava, Error, Result, RT};
 use arrow::array::RecordBatchReader;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema;
 use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
+use lance::dataset::fragment::FileFragment;
 use lance::dataset::transaction::Operation;
 use lance::dataset::{Dataset, WriteParams};
+use snafu::{location, Location};
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
 #[derive(Clone)]
@@ -133,20 +134,34 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
         Schema::from(dataset.inner.schema())
     };
     let out_c_schema = arrow_schema_addr as *mut FFI_ArrowSchema;
-    let c_schema = match FFI_ArrowSchema::try_from(&schema) {
-        Ok(schema) => schema,
-        Err(err) => {
-            env.throw_new(
-                "java/lang/RuntimeException",
-                format!("Failed to convert Arrow schema: {}", err),
-            )
-            .expect("Error throwing exception");
-            return;
-        }
-    };
+    let c_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&schema));
 
     unsafe {
         std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
         std::mem::forget(c_schema);
     };
+}
+
+fn create_json_fragment_list<'a>(
+    env: &mut JNIEnv<'a>,
+    fragments: Vec<FileFragment>,
+) -> Result<JObject<'a>> {
+    let array_list_class = env.find_class("java/util/ArrayList")?;
+
+    let array_list = env.new_object(array_list_class, "()V", &[])?;
+
+    for fragment in fragments {
+        let json_string = serde_json::to_string(fragment.metadata()).map_err(|e| Error::JSON {
+            message: e.to_string(),
+            location: location!(),
+        })?;
+        let jstring = env.new_string(json_string)?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[(&jstring).into()],
+        )?;
+    }
+    Ok(array_list)
 }

@@ -14,8 +14,10 @@
 
 use std::str::Utf8Error;
 
+use arrow_schema::ArrowError;
 use jni::errors::Error as JniError;
-use snafu::{Location, Snafu};
+use serde_json::Error as JsonError;
+use snafu::{location, Location, Snafu};
 
 /// Java Exception types
 pub enum JavaException {
@@ -95,6 +97,24 @@ impl From<Utf8Error> for Error {
     fn from(source: Utf8Error) -> Self {
         Self::InvalidArgument {
             message: source.to_string(),
+        }
+    }
+}
+
+impl From<ArrowError> for Error {
+    fn from(source: ArrowError) -> Self {
+        Self::Arrow {
+            message: source.to_string(),
+            location: location!(),
+        }
+    }
+}
+
+impl From<JsonError> for Error {
+    fn from(source: JsonError) -> Self {
+        Self::JSON {
+            message: source.to_string(),
+            location: location!(),
         }
     }
 }

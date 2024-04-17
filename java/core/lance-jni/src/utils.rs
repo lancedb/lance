@@ -14,12 +14,10 @@
 
 use jni::objects::JObject;
 use jni::JNIEnv;
-use lance::dataset::fragment::FileFragment;
 use lance::dataset::{WriteMode, WriteParams};
-use snafu::{location, Location};
 
 use crate::ffi::JNIEnvExt;
-use crate::{Error, Result};
+use crate::Result;
 
 pub fn extract_write_params(
     env: &mut JNIEnv,
@@ -43,28 +41,4 @@ pub fn extract_write_params(
         write_params.mode = WriteMode::try_from(mode_val.as_str())?;
     }
     Ok(write_params)
-}
-
-pub fn create_json_fragment_list<'a>(
-    env: &mut JNIEnv<'a>,
-    fragments: Vec<FileFragment>,
-) -> Result<JObject<'a>> {
-    let array_list_class = env.find_class("java/util/ArrayList")?;
-
-    let array_list = env.new_object(array_list_class, "()V", &[])?;
-
-    for fragment in fragments {
-        let json_string = serde_json::to_string(fragment.metadata()).map_err(|e| Error::JSON {
-            message: e.to_string(),
-            location: location!(),
-        })?;
-        let jstring = env.new_string(json_string)?;
-        env.call_method(
-            &array_list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[(&jstring).into()],
-        )?;
-    }
-    Ok(array_list)
 }
