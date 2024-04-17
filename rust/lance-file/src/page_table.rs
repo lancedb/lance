@@ -105,11 +105,12 @@ impl PageTable {
             });
         }
 
+        let observed_min = *self.pages.keys().min().unwrap();
         if min_field_id > *self.pages.keys().min().unwrap() {
             return Err(Error::invalid_input(
                 format!(
                     "field_id_offset {} is greater than the minimum field_id {}",
-                    min_field_id, min_field_id
+                    min_field_id, observed_min
                 ),
                 location!(),
             ));
@@ -245,5 +246,46 @@ mod tests {
         }
 
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_error_handling() {
+        let mut page_table = PageTable::default();
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let path = test_dir.path().join("test");
+
+        // Returns an error if the page table is empty
+        let mut writer = tokio::fs::File::create(&path).await.unwrap();
+        let res = page_table.write(&mut writer, 1).await;
+        assert!(res.is_err());
+        assert!(
+            matches!(res.unwrap_err(), Error::InvalidInput { source, .. } if source.to_string().contains("empty page table"))
+        );
+
+        let page_info = PageInfo::new(1, 2);
+        page_table.set(0, 0, page_info.clone());
+
+        // Returns an error if passing a min_field_id higher than the lowest field_id
+        let mut writer = tokio::fs::File::create(&path).await.unwrap();
+        let res = page_table.write(&mut writer, 1).await;
+        assert!(res.is_err());
+        assert!(
+            matches!(res.unwrap_err(), Error::InvalidInput { source, .. } 
+                if source.to_string().contains("field_id_offset 1 is greater than the minimum field_id 0"))
+        );
+
+        let mut writer = tokio::fs::File::create(&path).await.unwrap();
+        let res = page_table.write(&mut writer, 0).await.unwrap();
+
+        let reader = LocalObjectReader::open_local_path(&path, 1024)
+            .await
+            .unwrap();
+
+        // Returns an error if max_field_id is less than min_field_id
+        let res = PageTable::load(reader.as_ref(), res, 1, 0, 1).await;
+        assert!(res.is_err());
+        assert!(matches!(res.unwrap_err(), Error::Internal { message, .. }
+                if message.contains("max_field_id 0 is less than min_field_id 1")));
     }
 }
