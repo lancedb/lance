@@ -172,13 +172,11 @@ pub trait Graph {
 pub(super) fn beam_search(
     graph: &dyn Graph,
     start: &[OrderedNode],
-    query: &[f32],
     k: usize,
-    dist_calc: Option<Arc<dyn DistCalculator>>,
+    dist_calc: Arc<dyn DistCalculator>,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
 ) -> Result<Vec<OrderedNode>> {
     let mut visited: HashSet<_> = start.iter().map(|node| node.id).collect();
-    let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
     let mut candidates = start
         .iter()
         .cloned()
@@ -257,12 +255,10 @@ pub(super) fn beam_search(
 pub(super) fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
-    query: &[f32],
-    dist_calc: Option<Arc<dyn DistCalculator>>,
+    dist_calc: Arc<dyn DistCalculator>,
 ) -> Result<OrderedNode> {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
-    let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
     loop {
         let neighbors: Vec<_> = graph
             .neighbors(current)

@@ -358,17 +358,10 @@ impl HNSW {
         let num_layers = self.levels.len();
 
         for level in self.levels.iter().rev().take(num_layers - 1) {
-            ep = greedy_search(level, ep, query, Some(dist_calc.clone()))?;
+            ep = greedy_search(level, ep, dist_calc.clone())?;
         }
 
-        let candidates = beam_search(
-            &self.levels[0],
-            &[ep],
-            query,
-            ef,
-            Some(dist_calc),
-            bitset.as_ref(),
-        )?;
+        let candidates = beam_search(&self.levels[0], &[ep], ef, dist_calc, bitset.as_ref())?;
         Ok(select_neighbors(&candidates, k).cloned().collect())
     }
 
