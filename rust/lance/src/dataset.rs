@@ -4911,4 +4911,18 @@ mod tests {
 
         Ok(())
     }
+
+    // Bug: https://github.com/lancedb/lancedb/issues/1223
+    #[tokio::test]
+    async fn test_open_nonexisting_dataset() {
+        let test_dir = tempdir().unwrap();
+        let base_dir = test_dir.path();
+        let dataset_dir = base_dir.join("non_existing");
+        let dataset_uri = dataset_dir.to_str().unwrap();
+
+        let res = Dataset::open(dataset_uri).await;
+        assert!(res.is_err());
+
+        assert!(!dataset_dir.exists());
+    }
 }

@@ -25,6 +25,7 @@ use object_store::{
 };
 use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredentialProvider};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+use path_absolutize::*;
 use shellexpand::tilde;
 use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
@@ -373,11 +374,10 @@ impl ObjectStore {
         let expanded = tilde(str_path).to_string();
         let expanded_path = StdPath::new(&expanded);
 
-        if !expanded_path.try_exists()? {
-            std::fs::create_dir_all(expanded_path)?;
-        }
-
-        let expanded_path = expanded_path.canonicalize()?;
+        let expanded_path = expanded_path.absolutize().map_err(|e| Error::IO {
+            message: format!("Failed to resolve absolute path: {}", e),
+            location: location!(),
+        })?;
 
         Ok((
             Self {
@@ -386,13 +386,14 @@ impl ObjectStore {
                 base_path: Path::from_absolute_path(&expanded_path)?,
                 block_size: 4 * 1024, // 4KB block size
             },
-            Path::from_filesystem_path(&expanded_path)?,
+            Path::from_absolute_path(&expanded_path)?,
         ))
     }
 
     async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
         configure_store(url.as_str(), params).await
     }
+
     /// Local object store.
     pub fn local() -> Self {
         Self {
