@@ -193,8 +193,14 @@ fn apply_row_id_and_deletes(
     let num_rows = batch.num_rows() as u32;
 
     let row_ids = if should_fetch_row_id {
-        let ids_in_batch = config.params.to_offsets(batch_offset, num_rows);
+        let ids_in_batch = config
+            .params
+            .slice(batch_offset as usize, num_rows as usize)
+            .unwrap()
+            .to_offsets()
+            .unwrap();
         let row_ids: Vec<u64> = ids_in_batch
+            .values()
             .iter()
             .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))
             .collect();
@@ -388,7 +394,7 @@ mod tests {
         .await;
         check_row_id(
             ReadBatchParams::RangeTo(std::ops::RangeTo { end: 1000 }),
-            900..1000,
+            0..100,
         )
         .await;
     }

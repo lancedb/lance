@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
+use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array, UInt64Array};
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
@@ -1262,12 +1262,23 @@ impl FragmentReader {
                 .collect::<Vec<_>>()
         );
         if self.with_row_id && self.output_schema.fields.len() == 1 {
-            let mut offsets = params.to_offsets(0, total_num_rows);
+            let mut offsets = params
+                .slice(0, total_num_rows as usize)
+                .unwrap()
+                .to_offsets()
+                .unwrap();
             if let Some(deletion_vector) = self.deletion_vec.as_ref() {
                 // TODO: More efficient set subtraction
-                offsets.retain(|row_offset| !deletion_vector.contains(*row_offset));
+                offsets = UInt32Array::from_iter_values(
+                    offsets
+                        .values()
+                        .iter()
+                        .copied()
+                        .filter(|row_offset| !deletion_vector.contains(*row_offset)),
+                );
             }
             let row_ids: Vec<u64> = offsets
+                .values()
                 .iter()
                 .map(|row_id| {
                     u64::from(RowAddress::new_from_parts(self.fragment_id as u32, *row_id))
