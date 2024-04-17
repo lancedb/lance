@@ -30,6 +30,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::MetricType;
+use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -434,12 +435,19 @@ async fn build_hnsw_quantization_partition(
     std::mem::drop(row_ids_array);
 
     let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
-    let vectors = dataset
+    let mut vectors = dataset
         .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
         .await?
         .column_by_name(column.as_ref())
         .expect("row id column not found")
         .clone();
+
+    let mut metric_type = metric_type;
+    if metric_type == MetricType::Cosine {
+        // Normalize vectors for cosine similarity
+        vectors = normalize_arrow(&vectors)?;
+        metric_type = MetricType::L2;
+    }
 
     let fsl = vectors.clone();
     let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), fsl, writer);
