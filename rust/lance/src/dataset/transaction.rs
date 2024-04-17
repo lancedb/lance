@@ -936,7 +936,24 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
 }
 
 /// Validate the operation is valid for the given manifest.
-pub fn validate_operation(manifest: &Manifest, operation: &Operation) -> Result<()> {
+pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) -> Result<()> {
+    let manifest = match (manifest, operation) {
+        (None, Operation::Overwrite { .. }) => {
+            // TODO: validate overwrite
+            return Ok(());
+        }
+        (Some(manifest), _) => manifest,
+        (None, _) => {
+            return Err(Error::invalid_input(
+                format!(
+                    "Cannot apply operation {} to non-existent dataset",
+                    operation.name()
+                ),
+                location!(),
+            ));
+        }
+    };
+
     match operation {
         Operation::Append { fragments } => {
             // Fragments must contain all fields in the schema
