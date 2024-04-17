@@ -32,9 +32,6 @@ pub struct HnswBuildParams {
     /// size of the dynamic list for the candidates
     pub ef_construction: usize,
 
-    /// whether extend candidates while selecting neighbors
-    pub extend_candidates: bool,
-
     /// log base used for assigning random level
     pub log_base: f32,
 
@@ -49,7 +46,6 @@ impl Default for HnswBuildParams {
             m: 20,
             m_max: 40,
             ef_construction: 100,
-            extend_candidates: false,
             log_base: 10.0,
             use_select_heuristic: true,
         }
@@ -84,16 +80,6 @@ impl HnswBuildParams {
     /// The default value is `100`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
-        self
-    }
-
-    /// Whether to expend to search candidate neighbors during heuristic search.
-    ///
-    /// The default value is `false`.
-    ///
-    /// See `extendCandidates` parameter in the paper (Algorithm 4)
-    pub fn extend_candidates(mut self, flag: bool) -> Self {
-        self.extend_candidates = flag;
         self
     }
 
@@ -237,14 +223,7 @@ impl HNSWBuilder {
         )?;
 
         let neighbors = if self.params.use_select_heuristic {
-            select_neighbors_heuristic(
-                &cur_level,
-                query,
-                &candidates,
-                self.params.m,
-                self.params.extend_candidates,
-            )
-            .collect()
+            select_neighbors_heuristic(&cur_level, &candidates, self.params.m).collect()
         } else {
             select_neighbors(&candidates, self.params.m)
                 .cloned()
@@ -268,14 +247,8 @@ impl HNSWBuilder {
         let level_view = HnswLevelView::new(level, self);
         let neighbors: Vec<OrderedNode> = level_neighbors.iter().cloned().collect();
 
-        let new_neighbors = select_neighbors_heuristic(
-            &level_view,
-            self.vectors.vector(node),
-            &neighbors,
-            self.params.m_max,
-            self.params.extend_candidates,
-        )
-        .collect();
+        let new_neighbors =
+            select_neighbors_heuristic(&level_view, &neighbors, self.params.m_max).collect();
 
         self.nodes[node as usize].level_neighbors[level as usize] = new_neighbors;
     }
