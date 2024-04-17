@@ -193,8 +193,6 @@ pub async fn write_fragments_internal(
     } else {
         schema
     };
-    dbg!(&params.mode);
-    dbg!(schema);
 
     // TODO: When writing v2 we could consider skipping this chunking step.  However, leaving in
     // for now as it doesn't hurt anything
@@ -203,7 +201,7 @@ pub async fn write_fragments_internal(
     let writer_generator = WriterGenerator::new(
         object_store,
         base_dir,
-        schema,
+        dbg!(schema),
         params.use_experimental_writer,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
@@ -503,6 +501,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let fragments = write_fragments_internal(
+            None,
             object_store,
             &Path::from("test"),
             &schema,
@@ -545,6 +544,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let fragments = write_fragments_internal(
+            None,
             object_store,
             &Path::from("test"),
             &schema,

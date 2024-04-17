@@ -89,8 +89,11 @@ impl PageTable {
             });
         }
 
+        dbg!(self);
+
         let pos = writer.tell().await?;
-        let num_columns = self.pages.keys().max().unwrap() + 1 - field_id_offset;
+        let num_field_ids = self.pages.keys().max().unwrap() + 1 - field_id_offset;
+        dbg!(num_field_ids);
         let num_batches = self
             .pages
             .values()
@@ -99,8 +102,8 @@ impl PageTable {
             .unwrap()
             + 1;
 
-        let mut builder = Int64Builder::with_capacity((num_columns * num_batches) as usize);
-        for col in 0..num_columns {
+        let mut builder = Int64Builder::with_capacity((num_field_ids * num_batches) as usize);
+        for col in 0..num_field_ids {
             for batch in 0..num_batches {
                 let field_id = col + field_id_offset;
                 if let Some(page_info) = self.get(field_id, batch) {
@@ -138,6 +141,7 @@ impl PageTable {
 mod tests {
 
     use super::*;
+    use pretty_assertions::assert_eq;
 
     use lance_io::local::LocalObjectReader;
 
@@ -156,13 +160,14 @@ mod tests {
         let mut page_table = PageTable::default();
         let page_info = PageInfo::new(1, 2);
 
-        // Add fields 10..13, 4 batches with some missing
+        // Add fields 10..14, 4 batches with some missing
         page_table.set(10, 2, page_info.clone());
         page_table.set(11, 1, page_info.clone());
-        page_table.set(12, 0, page_info.clone());
-        page_table.set(12, 1, page_info.clone());
-        page_table.set(12, 2, page_info.clone());
-        page_table.set(12, 3, page_info.clone());
+        // A hole at 12
+        page_table.set(13, 0, page_info.clone());
+        page_table.set(13, 1, page_info.clone());
+        page_table.set(13, 2, page_info.clone());
+        page_table.set(13, 3, page_info.clone());
 
         let test_dir = tempfile::tempdir().unwrap();
         let path = test_dir.path().join("test");
@@ -195,16 +200,25 @@ mod tests {
         // Output should have filled in the empty pages.
         let mut expected = actual.clone();
         let default_page_info = PageInfo::new(0, 0);
-        expected.set(9, 0, default_page_info.clone());
-        expected.set(9, 1, default_page_info.clone());
-        expected.set(9, 2, default_page_info.clone());
-        expected.set(9, 3, default_page_info.clone());
-        expected.set(10, 0, default_page_info.clone());
-        expected.set(10, 1, default_page_info.clone());
-        expected.set(10, 3, default_page_info.clone());
-        expected.set(11, 0, default_page_info.clone());
-        expected.set(11, 2, default_page_info.clone());
-        expected.set(11, 3, default_page_info);
+        let expected_default_pages = [
+            (9, 0),
+            (9, 1),
+            (9, 2),
+            (9, 3),
+            (10, 0),
+            (10, 1),
+            (10, 3),
+            (11, 0),
+            (11, 2),
+            (11, 3),
+            (12, 0),
+            (12, 1),
+            (12, 2),
+            (12, 3),
+        ];
+        for (field_id, batch) in expected_default_pages.iter() {
+            expected.set(*field_id, *batch, default_page_info.clone());
+        }
 
         assert_eq!(expected, actual);
     }

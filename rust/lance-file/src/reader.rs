@@ -682,6 +682,7 @@ async fn _read_fixed_stride_array(
     page_table: &PageTable,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
+    dbg!(reader.fragment_id, &reader.schema, page_table);
     let page_info = get_page_info(page_table, field, batch_id)?;
     read_fixed_stride_array(
         reader.object_reader.as_ref(),
