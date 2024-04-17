@@ -167,7 +167,7 @@ class LanceFragment(pa.dataset.Fragment):
             starting to write and finishing writing.
         mode: str, default "append"
             The write mode. If "append" is specified, the data will be checked
-            against the existing datasets schema. Otherwise, the schema will
+            against the existing dataset's schema. Otherwise, the schema will
             get newly assigned field ids.
 
         See Also
@@ -473,7 +473,7 @@ def write_fragments(
         from the data.
     mode : str, default "append"
         The write mode. If "append" is specified, the data will be checked
-        against the existing datasets schema. Otherwise, the schema will get
+        against the existing dataset's schema. Otherwise, the schema will get
         newly assigned field ids.
     max_rows_per_file : int, default 1024 * 1024
         The maximum number of rows per data file.
