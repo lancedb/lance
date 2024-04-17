@@ -210,7 +210,7 @@ impl HNSWBuilder {
             self.level_count[level as usize] += 1;
 
             let (candidates, neighbors) =
-                self.search_level(&ep, self.vectors.vector(node), level, dist_calc.clone())?;
+                self.search_level(&ep, query, level, dist_calc.clone())?;
             for neighbor in neighbors {
                 self.connect(node, neighbor.id, neighbor.dist, level);
                 self.prune(neighbor.id, level);
