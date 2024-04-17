@@ -353,7 +353,7 @@ impl HNSW {
             self.levels[0].storage().dist_calculator(query).into();
         let mut ep = OrderedNode::new(
             self.entry_point,
-            dist_calc.distance(&[self.entry_point])[0].into(),
+            dist_calc.distance(self.entry_point).into(),
         );
         let num_layers = self.levels.len();
 
@@ -492,7 +492,7 @@ pub(crate) fn select_neighbors_heuristic(
             if let Some(neighbors) = graph.neighbors(node.id) {
                 neighbors.for_each(|n| {
                     if !visited.contains(&n) {
-                        let d: OrderedFloat = dist_calc.distance(&[n])[0].into();
+                        let d: OrderedFloat = dist_calc.distance(n).into();
                         w.push(OrderedNode::new(n, d));
                     }
                     visited.insert(n);

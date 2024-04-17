@@ -218,7 +218,7 @@ pub(super) fn beam_search(
                 .peek()
                 .map(|node| node.dist)
                 .unwrap_or(OrderedFloat(f32::INFINITY));
-            let dist = dist_calc.distance(&[neighbor])[0].into();
+            let dist = dist_calc.distance(neighbor).into();
             if dist <= furthest || results.len() < k {
                 if bitset
                     .map(|bitset| bitset.contains(neighbor))
@@ -271,13 +271,15 @@ pub(super) fn greedy_search(
                 location: location!(),
             })?
             .collect();
-        let distances = dist_calc.distance(&neighbors);
+        let distances = neighbors
+            .iter()
+            .map(|neighbor| dist_calc.distance(*neighbor));
 
         let mut next = None;
-        for (neighbor, dist) in neighbors.into_iter().zip(distances) {
+        for (neighbor, dist) in neighbors.iter().zip(distances) {
             if dist < closest_dist {
                 closest_dist = dist;
-                next = Some(neighbor);
+                next = Some(*neighbor);
             }
         }
 
