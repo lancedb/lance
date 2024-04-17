@@ -36,28 +36,44 @@ pub struct PageTable {
 impl PageTable {
     /// Load [PageTable] from disk.
     ///
-    /// The field_ids that are loaded are `field_id_offset` to `field_id_offset + num_columns`.
-    /// `field_id_offset` should be the smallest field_id in the schema. `num_columns` should
-    /// be the total unique number of field ids, including struct fields despite the fact
-    /// they have no data pages.
+    /// Parameters:
+    ///  * `position`: The start position in the file where the page table is stored.
+    ///  * `min_field_id`: The smallest field_id that is present in the schema.
+    ///  * `max_field_id`: The largest field_id that is present in the schema.
+    ///  * `num_batches`: The number of batches in the file.
+    ///
+    /// The page table is stored as an array. The on-disk size is determined based
+    /// on the `min_field_id`, `max_field_id`, and `num_batches` parameters. If
+    /// these are incorrect, the page table will not be read correctly.
     pub async fn load<'a>(
         reader: &dyn Reader,
         position: usize,
-        num_columns: i32,
+        min_field_id: i32,
+        max_field_id: i32,
         num_batches: i32,
-        field_id_offset: i32,
     ) -> Result<Self> {
-        let length = num_columns * num_batches * 2;
-        let decoder = PlainDecoder::new(reader, &DataType::Int64, position, length as usize)?;
+        if max_field_id < min_field_id {
+            return Err(Error::Internal {
+                message: format!(
+                    "max_field_id {} is less than min_field_id {}",
+                    max_field_id, min_field_id
+                ),
+                location: location!(),
+            });
+        }
+
+        let field_ids = min_field_id..=max_field_id;
+        let num_columns = field_ids.clone().count();
+        let length = num_columns * num_batches as usize * 2;
+        let decoder = PlainDecoder::new(reader, &DataType::Int64, position, length)?;
         let raw_arr = decoder.decode().await?;
         let arr = raw_arr.as_any().downcast_ref::<Int64Array>().unwrap();
 
         let mut pages = BTreeMap::default();
-        for col in 0..num_columns {
-            let field_id = col + field_id_offset;
+        for (field_pos, field_id) in field_ids.enumerate() {
             pages.insert(field_id, BTreeMap::default());
             for batch in 0..num_batches {
-                let idx = col * num_batches + batch;
+                let idx = field_pos as i32 * num_batches + batch;
                 let batch_position = &arr.value((idx * 2) as usize);
                 let batch_length = &arr.value((idx * 2 + 1) as usize);
                 pages.get_mut(&field_id).unwrap().insert(
@@ -75,13 +91,13 @@ impl PageTable {
 
     /// Write [PageTable] to disk.
     ///
-    /// `field_id_offset` is the smallest field_id that is present in the schema.
+    /// `min_field_id` is the smallest field_id that is present in the schema.
     /// This might be a struct field, which has no data pages, but it still must
     /// be serialized to the page table per the format spec.
     ///
     /// Any (field_id, batch_id) combinations that are not present in the page table
     /// will be written as (0, 0) to indicate an empty page.
-    pub async fn write(&self, writer: &mut dyn Writer, field_id_offset: i32) -> Result<usize> {
+    pub async fn write(&self, writer: &mut dyn Writer, min_field_id: i32) -> Result<usize> {
         if self.pages.is_empty() {
             return Err(Error::InvalidInput {
                 source: "empty page table".into(),
@@ -89,11 +105,19 @@ impl PageTable {
             });
         }
 
-        dbg!(self);
+        if min_field_id > *self.pages.keys().min().unwrap() {
+            return Err(Error::invalid_input(
+                format!(
+                    "field_id_offset {} is greater than the minimum field_id {}",
+                    min_field_id, min_field_id
+                ),
+                location!(),
+            ));
+        }
+        let max_field_id = *self.pages.keys().max().unwrap();
+        let field_ids = min_field_id..=max_field_id;
 
         let pos = writer.tell().await?;
-        let num_field_ids = self.pages.keys().max().unwrap() + 1 - field_id_offset;
-        dbg!(num_field_ids);
         let num_batches = self
             .pages
             .values()
@@ -102,10 +126,10 @@ impl PageTable {
             .unwrap()
             + 1;
 
-        let mut builder = Int64Builder::with_capacity((num_field_ids * num_batches) as usize);
-        for col in 0..num_field_ids {
+        let mut builder =
+            Int64Builder::with_capacity(field_ids.clone().count() * num_batches as usize);
+        for field_id in field_ids {
             for batch in 0..num_batches {
-                let field_id = col + field_id_offset;
                 if let Some(page_info) = self.get(field_id, batch) {
                     builder.append_value(page_info.position as i64);
                     builder.append_value(page_info.length as i64);
@@ -190,9 +214,9 @@ mod tests {
         let actual = PageTable::load(
             reader.as_ref(),
             pos,
-            3,                 // There are three columns
-            4,                 // 4 batches
             starting_field_id, // First field id is 10, but we want to start at 9
+            13,                // Last field id is 13
+            4,                 // 4 batches
         )
         .await
         .unwrap();

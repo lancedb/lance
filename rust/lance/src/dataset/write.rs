@@ -201,7 +201,7 @@ pub async fn write_fragments_internal(
     let writer_generator = WriterGenerator::new(
         object_store,
         base_dir,
-        dbg!(schema),
+        schema,
         params.use_experimental_writer,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
