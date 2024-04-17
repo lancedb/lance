@@ -974,11 +974,13 @@ impl Dataset {
         });
         let ds = RT
             .block_on(commit_lock.map(|cl| cl.py()), async move {
-                let dataset = DatasetBuilder::from_uri(dataset_uri)
-                    // .with_read_params(read_params)
-                    .load()
-                    .await?;
-                validate_operation(dataset.manifest(), &operation.0)?;
+                let dataset = match DatasetBuilder::from_uri(dataset_uri).load().await {
+                    Ok(ds) => Some(ds),
+                    Err(lance::Error::DatasetNotFound { .. }) => None,
+                    Err(err) => return Err(err),
+                };
+                let manifest = dataset.as_ref().map(|ds| ds.manifest());
+                validate_operation(manifest, &operation.0)?;
                 LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler)
                     .await
             })?

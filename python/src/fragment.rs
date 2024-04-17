@@ -22,19 +22,12 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
-use lance_file::datatypes::Fields;
-use lance_file::format::pb::Field as LanceField;
 use lance_io::object_store::ObjectStore;
-use lance_table::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
+use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
-use prost::Message;
 use pyo3::prelude::*;
-use pyo3::{
-    exceptions::*,
-    pyclass::CompareOp,
-    types::{PyBytes, PyDict},
-};
+use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
@@ -98,7 +91,7 @@ impl FileFragment {
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
         })??;
-        Ok(FragmentMetadata::new(metadata, schema))
+        Ok(FragmentMetadata::new(metadata))
     }
 
     #[staticmethod]
@@ -128,7 +121,7 @@ impl FileFragment {
                 let schema = Schema::try_from(schema.as_ref())
                     .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-                Ok(FragmentMetadata::new(metadata, schema))
+                Ok(FragmentMetadata::new(metadata))
             })
         })
     }
@@ -138,10 +131,7 @@ impl FileFragment {
     }
 
     fn metadata(&self) -> FragmentMetadata {
-        FragmentMetadata::new(
-            self.fragment.metadata().clone(),
-            self.fragment.dataset().schema().clone(),
-        )
+        FragmentMetadata::new(self.fragment.metadata().clone())
     }
 
     fn count_rows(&self, _filter: Option<String>) -> PyResult<usize> {
@@ -338,15 +328,11 @@ impl DataFile {
 #[derive(Clone, Debug)]
 pub struct FragmentMetadata {
     pub(crate) inner: LanceFragmentMetadata,
-    pub(crate) schema: Schema,
 }
 
 impl FragmentMetadata {
-    pub(crate) fn new(inner: LanceFragmentMetadata, full_schema: Schema) -> Self {
-        Self {
-            inner,
-            schema: full_schema,
-        }
+    pub(crate) fn new(inner: LanceFragmentMetadata) -> Self {
+        Self { inner }
     }
 }
 
@@ -356,7 +342,6 @@ impl FragmentMetadata {
     fn init() -> Self {
         Self {
             inner: LanceFragmentMetadata::new(0),
-            schema: Schema::from(&Fields(Vec::<LanceField>::new())),
         }
     }
 
@@ -366,10 +351,7 @@ impl FragmentMetadata {
             PyValueError::new_err(format!("Invalid metadata json payload: {json}: {}", err))
         })?;
 
-        Ok(Self {
-            inner: metadata,
-            schema: Schema::from(&Fields(Vec::<LanceField>::new())),
-        })
+        Ok(Self { inner: metadata })
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
@@ -385,36 +367,6 @@ impl FragmentMetadata {
 
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
-    }
-
-    pub fn __setstate__(&mut self, py: Python, state: PyObject) -> PyResult<()> {
-        match state.extract::<&PyBytes>(py) {
-            Ok(bytes) => {
-                let bytes = bytes.as_bytes();
-                let manifest = pb::Manifest::decode(bytes).map_err(|e| {
-                    PyValueError::new_err(format!("Unable to unpickle FragmentMetadata: {}", e))
-                })?;
-                self.schema = Schema::from(&Fields(manifest.fields));
-                self.inner = LanceFragmentMetadata::from(&manifest.fragments[0]);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    pub fn __getstate__(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let container = pb::Manifest {
-            fields: Fields::from(&self_.schema).0,
-            fragments: vec![pb::DataFragment::from(&self_.inner)],
-            ..Default::default()
-        };
-
-        Ok(PyBytes::new(self_.py(), container.encode_to_vec().as_slice()).to_object(self_.py()))
-    }
-
-    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let arrow_schema: ArrowSchema = (&self_.schema).into();
-        arrow_schema.to_pyarrow(self_.py())
     }
 
     fn json(self_: PyRef<'_, Self>) -> PyResult<String> {
@@ -499,7 +451,7 @@ pub fn write_fragments(
 
     fragments
         .into_iter()
-        .map(|f| Ok(FragmentMetadata::new(f, schema.clone())))
+        .map(|f| Ok(FragmentMetadata::new(f)))
         .collect()
 }
 
