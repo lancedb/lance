@@ -6,7 +6,7 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -36,9 +36,7 @@ use self::builder::HNSW_METADATA_KEY;
 use super::graph::memory::InMemoryVectorStorage;
 use super::graph::OrderedNode;
 use super::graph::{
-    greedy_search,
-    storage::{DistCalculator, VectorStorage},
-    Graph, OrderedFloat, NEIGHBORS_COL, NEIGHBORS_FIELD,
+    greedy_search, storage::VectorStorage, Graph, OrderedFloat, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use super::ivf::storage::IvfData;
 use crate::vector::graph::beam_search;
@@ -354,24 +352,22 @@ impl HNSW {
         ef: usize,
         bitset: Option<RoaringBitmap>,
     ) -> Result<Vec<OrderedNode>> {
-        let dist_calc: Arc<dyn DistCalculator> =
-            self.levels[0].storage().dist_calculator(query).into();
+        let dist_calc = self.levels[0].storage().dist_calculator(query);
         let mut ep = OrderedNode::new(
             self.entry_point,
-            dist_calc.distance(&[self.entry_point])[0].into(),
+            dist_calc.distance(self.entry_point).into(),
         );
         let num_layers = self.levels.len();
 
         for level in self.levels.iter().rev().take(num_layers - 1) {
-            ep = greedy_search(level, ep, query, Some(dist_calc.clone()))?;
+            ep = greedy_search(level, ep, dist_calc.as_ref())?;
         }
 
         let candidates = beam_search(
             &self.levels[0],
-            &[ep],
-            query,
+            &ep,
             ef,
-            Some(dist_calc),
+            dist_calc.as_ref(),
             bitset.as_ref(),
         )?;
         Ok(select_neighbors(&candidates, k).cloned().collect())
@@ -479,44 +475,23 @@ fn select_neighbors(
 /// NOTE: the result is not ordered
 pub(crate) fn select_neighbors_heuristic(
     graph: &dyn Graph,
-    query: &[f32],
     candidates: &[OrderedNode],
     k: usize,
-    extend_candidates: bool,
 ) -> impl Iterator<Item = OrderedNode> {
     if candidates.len() <= k {
         return candidates.iter().cloned().collect_vec().into_iter();
     }
-    let mut w = candidates.to_vec();
-
-    if extend_candidates {
-        let dist_calc = graph.storage().dist_calculator(query);
-        let mut visited = HashSet::with_capacity(w.len() * k);
-        visited.extend(candidates.iter().map(|node| node.id));
-        candidates.iter().sorted().rev().for_each(|node| {
-            if let Some(neighbors) = graph.neighbors(node.id) {
-                neighbors.for_each(|n| {
-                    if !visited.contains(&n) {
-                        let d: OrderedFloat = dist_calc.distance(&[n])[0].into();
-                        w.push(OrderedNode::new(n, d));
-                    }
-                    visited.insert(n);
-                });
-            }
-        });
-    }
-
-    w.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
+    let mut candidates = candidates.to_vec();
+    candidates.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
-    let mut discarded = Vec::with_capacity(k);
     let storage = graph.storage();
     let storage = storage
         .as_any()
         .downcast_ref::<InMemoryVectorStorage>()
         .unwrap();
-    while !w.is_empty() && results.len() < k {
-        let u = w.pop().unwrap();
+    while !candidates.is_empty() && results.len() < k {
+        let u = candidates.pop().unwrap();
 
         if results.is_empty()
             || results
@@ -524,13 +499,7 @@ pub(crate) fn select_neighbors_heuristic(
                 .all(|v| u.dist < OrderedFloat(storage.distance_between(u.id, v.id)))
         {
             results.push(u);
-        } else if discarded.len() < k - results.len() {
-            discarded.push(u);
         }
-    }
-
-    while results.len() < k && !discarded.is_empty() {
-        results.push(discarded.pop().unwrap());
     }
 
     results.into_iter()
@@ -538,6 +507,8 @@ pub(crate) fn select_neighbors_heuristic(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     use arrow_array::types::Float32Type;

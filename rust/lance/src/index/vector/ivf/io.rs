@@ -7,7 +7,6 @@ use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
 use arrow::compute::concat;
-use arrow::datatypes::Float32Type;
 use arrow_array::{
     cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
@@ -23,15 +22,16 @@ use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
-use lance_index::vector::pq::storage::ProductQuantizationStorage;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{Quantization as _, Quantizer};
+use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::MetricType;
-use lance_linalg::kernels::normalize_fsl;
+use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -40,7 +40,7 @@ use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
-use crate::index::vector::pq::PQIndex;
+use crate::index::vector::pq::{build_pq_storage, PQIndex};
 use crate::index::vector::{hnsw::builder::build_hnsw_model, sq::build_sq_storage};
 use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
@@ -425,78 +425,100 @@ async fn build_hnsw_quantization_partition(
     column: Arc<String>,
     metric_type: MetricType,
     hnsw_params: Arc<HnswBuildParams>,
-    mut writer: FileWriter<ManifestDescribing>,
-    mut aux_writer: Option<FileWriter<ManifestDescribing>>,
+    writer: FileWriter<ManifestDescribing>,
+    aux_writer: Option<FileWriter<ManifestDescribing>>,
     quantizer: Quantizer,
     row_ids_array: Vec<Arc<dyn Array>>,
     code_array: Vec<Arc<dyn Array>>,
 ) -> Result<usize> {
-    let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
-    let mut vector_batches = Vec::with_capacity(row_ids_array.len());
-    for row_ids in row_ids_array.iter() {
-        let mut array = dataset
-            .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
-            .await?
-            .column_by_name(column.as_ref())
-            .expect("row id column not found")
-            .clone();
+    let row_ids_arrs = row_ids_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+    let row_ids = concat(&row_ids_arrs)?;
+    std::mem::drop(row_ids_array);
 
-        if metric_type == MetricType::Cosine {
-            array = Arc::new(normalize_fsl(array.as_fixed_size_list())?);
-        }
-        vector_batches.push(array);
+    let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
+    let mut vectors = dataset
+        .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
+        .await?
+        .column_by_name(column.as_ref())
+        .expect("row id column not found")
+        .clone();
+
+    let mut metric_type = metric_type;
+    if metric_type == MetricType::Cosine {
+        // Normalize vectors for cosine similarity
+        vectors = normalize_arrow(&vectors)?;
+        metric_type = MetricType::L2;
     }
 
-    let build_with_aux = aux_writer.is_some();
-    let (hnsw, fsl) = build_hnsw_model((*hnsw_params).clone(), vector_batches).await?;
+    let fsl = vectors.clone();
+    let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), fsl, writer);
 
-    let length = hnsw.write(&mut writer).await?;
-    std::mem::drop(hnsw);
+    let build_store = match quantizer {
+        Quantizer::Product(pq) => tokio::spawn(build_and_write_pq_storage(
+            metric_type,
+            row_ids,
+            code_array,
+            pq,
+            aux_writer.unwrap(),
+        )),
 
-    let quantization_storage_batch = match quantizer {
-        Quantizer::Product(pq) => {
-            let pq_arrs = code_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            let pq_column = concat(&pq_arrs)?;
-            std::mem::drop(code_array);
-
-            let row_ids_arrs = row_ids_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            let row_ids_column = concat(&row_ids_arrs)?;
-            std::mem::drop(row_ids_array);
-
-            let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
-                (ROW_ID, row_ids_column, true),
-                (pq.column(), pq_column, false),
-            ])?;
-            let pq_store = ProductQuantizationStorage::new(
-                pq.codebook_as_fsl()
-                    .values()
-                    .as_primitive::<Float32Type>()
-                    .clone()
-                    .into(),
-                pq_batch.clone(),
-                pq.num_bits(),
-                pq.num_sub_vectors(),
-                pq.dimension(),
-                metric_type,
-            )?;
-            pq_store.batch().clone()
-        }
-        Quantizer::Scalar(sq) => {
-            let sq_storage =
-                spawn_cpu(move || build_sq_storage(metric_type, row_ids_array, fsl, sq)).await?;
-            sq_storage.batch().clone()
-        }
+        Quantizer::Scalar(sq) => tokio::spawn(build_and_write_sq_storage(
+            metric_type,
+            row_ids,
+            vectors,
+            sq,
+            aux_writer.unwrap(),
+        )),
     };
 
-    if build_with_aux {
-        let aux_writer = aux_writer.as_mut().unwrap();
-        aux_writer
-            .write_record_batch(quantization_storage_batch)
-            .await?;
-        aux_writer.finish().await?;
-    }
+    let (length, _) = futures::join!(build_hnsw, build_store);
+    length
+}
 
-    Ok(length)
+async fn build_and_write_hnsw(
+    hnsw_params: HnswBuildParams,
+    vectors: Arc<dyn Array>,
+    mut writer: FileWriter<ManifestDescribing>,
+) -> Result<usize> {
+    let hnsw = build_hnsw_model(hnsw_params, vectors).await?;
+    let length = hnsw.write(&mut writer).await?;
+    Result::Ok(length)
+}
+
+async fn build_and_write_pq_storage(
+    metric_type: MetricType,
+    row_ids: Arc<dyn Array>,
+    code_array: Vec<Arc<dyn Array>>,
+    pq: Arc<dyn ProductQuantizer>,
+    mut writer: FileWriter<ManifestDescribing>,
+) -> Result<()> {
+    let storage = spawn_cpu(move || {
+        let storage = build_pq_storage(metric_type, row_ids, code_array, pq)?;
+        Ok(storage)
+    })
+    .await?;
+
+    writer.write_record_batch(storage.batch().clone()).await?;
+    writer.finish().await?;
+    Ok(())
+}
+
+async fn build_and_write_sq_storage(
+    metric_type: MetricType,
+    row_ids: Arc<dyn Array>,
+    vectors: Arc<dyn Array>,
+    sq: ScalarQuantizer,
+    mut writer: FileWriter<ManifestDescribing>,
+) -> Result<()> {
+    let storage = spawn_cpu(move || {
+        let storage = build_sq_storage(metric_type, row_ids, vectors, sq)?;
+        Ok(storage)
+    })
+    .await?;
+
+    writer.write_record_batch(storage.batch().clone()).await?;
+    writer.finish().await?;
+    Ok(())
 }
 
 #[cfg(test)]

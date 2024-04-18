@@ -58,6 +58,7 @@ pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod reader;
 pub(crate) mod scanner;
+pub(crate) mod schema;
 pub(crate) mod tracing;
 pub(crate) mod updater;
 pub(crate) mod utils;
@@ -127,6 +128,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<TraceGuard>()?;
+    m.add_class::<schema::LanceSchema>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;

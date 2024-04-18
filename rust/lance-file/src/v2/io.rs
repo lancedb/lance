@@ -5,6 +5,7 @@ use futures::{future::BoxFuture, FutureExt};
 use lance_encoding::EncodingsIo;
 use lance_io::scheduler::FileScheduler;
 
+#[derive(Debug)]
 pub struct LanceEncodingsIo(pub FileScheduler);
 
 impl EncodingsIo for LanceEncodingsIo {

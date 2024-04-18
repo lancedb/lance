@@ -473,9 +473,15 @@ impl Dataset {
         }
 
         let object_store = Arc::new(object_store);
-        let fragments =
-            write_fragments_internal(object_store.clone(), &base, &schema, stream, params.clone())
-                .await?;
+        let fragments = write_fragments_internal(
+            dataset.as_ref(),
+            object_store.clone(),
+            &base,
+            &schema,
+            stream,
+            params.clone(),
+        )
+        .await?;
 
         let operation = match params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
@@ -565,6 +571,7 @@ impl Dataset {
         )?;
 
         let fragments = write_fragments_internal(
+            Some(self),
             self.object_store.clone(),
             &self.base,
             &schema,
@@ -706,6 +713,8 @@ impl Dataset {
     ///
     /// This method can be used to commit this change to the dataset's manifest.  This method will
     /// not verify that the provided fragments exist and correct, that is the caller's responsibility.
+    /// Some validation can be performed using the function
+    /// [crate::dataset::transaction::validate_operation].
     ///
     /// If this commit is a change to an existing dataset then it will often need to be based on an
     /// existing version of the dataset.  For example, if this change is a `delete` operation then
@@ -1099,7 +1108,7 @@ impl Dataset {
             })?;
 
             let reader = fragment.open(projection.as_ref(), false).await?;
-            reader.read_range(range).await
+            reader.legacy_read_range_as_batch(range).await
         } else if row_id_meta.sorted {
             // Don't need to re-arrange data, just concatenate
 
@@ -2329,9 +2338,9 @@ mod tests {
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment.open(dataset.schema(), false).await.unwrap();
-            assert_eq!(reader.num_batches(), 10);
-            for i in 0..reader.num_batches() {
-                assert_eq!(reader.num_rows_in_batch(i), 10);
+            assert_eq!(reader.legacy_num_batches(), 10);
+            for i in 0..reader.legacy_num_batches() {
+                assert_eq!(reader.legacy_num_rows_in_batch(i), 10);
             }
         }
     }

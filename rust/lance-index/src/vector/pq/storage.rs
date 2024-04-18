@@ -460,17 +460,13 @@ impl PQDistCalculator {
 }
 
 impl DistCalculator for PQDistCalculator {
-    fn distance(&self, ids: &[u32]) -> Vec<f32> {
-        ids.iter()
-            .map(|&id| {
-                let pq_code = self.get_pq_code(id);
-                pq_code
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
-                    .sum()
-            })
-            .collect()
+    fn distance(&self, id: u32) -> f32 {
+        let pq_code = self.get_pq_code(id);
+        pq_code
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
+            .sum()
     }
 }
 

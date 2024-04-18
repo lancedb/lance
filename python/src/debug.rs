@@ -46,7 +46,10 @@ struct PrettyPrintableFragment {
 struct PrettyPrintableDataFile {
     path: String,
     fields: Vec<i32>,
+    column_indices: Vec<i32>,
     schema: Schema,
+    major_version: u32,
+    minor_version: u32,
 }
 
 impl PrettyPrintableFragment {
@@ -59,7 +62,10 @@ impl PrettyPrintableFragment {
                 PrettyPrintableDataFile {
                     path: file.path.clone(),
                     fields: file.fields.clone(),
+                    column_indices: file.column_indices.clone(),
                     schema,
+                    major_version: file.file_major_version,
+                    minor_version: file.file_minor_version,
                 }
             })
             .collect();
@@ -75,12 +81,16 @@ impl PrettyPrintableFragment {
 
 /// Debug print a LanceFragment.
 #[pyfunction]
-pub fn format_fragment(fragment: &PyAny) -> PyResult<String> {
+pub fn format_fragment(fragment: &PyAny, dataset: &PyAny) -> PyResult<String> {
     let py = fragment.py();
     let fragment = fragment
         .getattr("_metadata")?
         .extract::<Py<FragmentMetadata>>()?;
-    let schema = &fragment.as_ref(py).borrow().schema;
+
+    let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
+    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let schema = dataset_ref.schema();
+
     let meta = fragment.as_ref(py).borrow().inner.clone();
     let pp_meta = PrettyPrintableFragment::new(&meta, schema);
     Ok(format!("{:#?}", pp_meta))

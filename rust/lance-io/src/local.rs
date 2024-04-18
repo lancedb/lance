@@ -47,6 +47,7 @@ pub fn remove_dir_all(path: &Path) -> Result<()> {
 }
 
 /// [ObjectReader] for local file system.
+#[derive(Debug)]
 pub struct LocalObjectReader {
     /// File handler.
     file: Arc<File>,
