@@ -154,14 +154,9 @@ impl HNSWBuilder {
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
-        // This is different to the paper.
-        // We use log10 instead of log(e), so each layer has about 1/10 of its bottom layer.
-        let m = self.vectors.len();
+        let ml = self.params.m as f32;
         min(
-            (m as f32).log(self.params.log_base).ceil() as u16
-                - (rng.gen::<f32>() * m as f32)
-                    .log(self.params.log_base)
-                    .ceil() as u16,
+            (-rng.gen::<f32>().ln() * ml) as u16,
             self.params.max_level - 1,
         )
     }
