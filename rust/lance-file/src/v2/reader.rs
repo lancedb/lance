@@ -433,7 +433,7 @@ impl FileReader {
         >,
     > {
         let verify_bound = |params: &ReadBatchParams, bound: usize| {
-            if bound > std::u32::MAX as usize {
+            if bound > u32::MAX as usize {
                 Err(Error::invalid_input(
                     format!(
                         "cannot read {:?} from file with {} rows",

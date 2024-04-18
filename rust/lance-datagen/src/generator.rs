@@ -174,7 +174,7 @@ impl ArrayGenerator for NullGenerator {
             let mut null_count = 0;
             // Sampling the RNG once per bit is kind of slow so we do this to sample once
             // per byte.  We only get 8 bits of RNG resolution but that should be good enough.
-            let threshold = (self.null_probability * std::u8::MAX as f64) as u8;
+            let threshold = (self.null_probability * u8::MAX as f64) as u8;
             let bytes = (0..num_validity_bytes)
                 .map(|byte_idx| {
                     let mut sample = rng.gen::<u64>();
