@@ -172,13 +172,11 @@ pub trait Graph {
 pub(super) fn beam_search(
     graph: &dyn Graph,
     start: &[OrderedNode],
-    query: &[f32],
     k: usize,
-    dist_calc: Option<Arc<dyn DistCalculator>>,
+    dist_calc: &dyn DistCalculator,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
 ) -> Result<Vec<OrderedNode>> {
     let mut visited: HashSet<_> = start.iter().map(|node| node.id).collect();
-    let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
     let mut candidates = start
         .iter()
         .cloned()
@@ -218,7 +216,7 @@ pub(super) fn beam_search(
                 .peek()
                 .map(|node| node.dist)
                 .unwrap_or(OrderedFloat(f32::INFINITY));
-            let dist = dist_calc.distance(&[neighbor])[0].into();
+            let dist = dist_calc.distance(neighbor).into();
             if dist <= furthest || results.len() < k {
                 if bitset
                     .map(|bitset| bitset.contains(neighbor))
@@ -257,12 +255,10 @@ pub(super) fn beam_search(
 pub(super) fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
-    query: &[f32],
-    dist_calc: Option<Arc<dyn DistCalculator>>,
+    dist_calc: &dyn DistCalculator,
 ) -> Result<OrderedNode> {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
-    let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
     loop {
         let neighbors: Vec<_> = graph
             .neighbors(current)
@@ -271,13 +267,15 @@ pub(super) fn greedy_search(
                 location: location!(),
             })?
             .collect();
-        let distances = dist_calc.distance(&neighbors);
+        let distances = neighbors
+            .iter()
+            .map(|neighbor| dist_calc.distance(*neighbor));
 
         let mut next = None;
-        for (neighbor, dist) in neighbors.into_iter().zip(distances) {
+        for (neighbor, dist) in neighbors.iter().zip(distances) {
             if dist < closest_dist {
                 closest_dist = dist;
-                next = Some(neighbor);
+                next = Some(*neighbor);
             }
         }
 

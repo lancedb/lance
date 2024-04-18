@@ -12,6 +12,7 @@ use rand::{thread_rng, Rng};
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, select_neighbors_heuristic, HNSW};
 use crate::vector::graph::builder::GraphBuilderNode;
+use crate::vector::graph::storage::DistCalculator;
 use crate::vector::graph::{greedy_search, storage::VectorStorage};
 use crate::vector::graph::{Graph, OrderedFloat, OrderedNode};
 
@@ -183,18 +184,17 @@ impl HNSWBuilder {
         //    ep = Select-Neighbors(W, 1)
         //  }
         // ```
+        let dist_calc = self.vectors.dist_calculator(self.vectors.vector(node));
         for level in (target_level + 1..self.params.max_level).rev() {
-            let query = self.vectors.vector(node);
             let cur_level = HnswLevelView::new(level, self);
-            ep = greedy_search(&cur_level, ep, query, None)?;
+            ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
         }
 
         let mut ep = vec![ep];
         for level in (0..=target_level).rev() {
             self.level_count[level as usize] += 1;
 
-            let (candidates, neighbors) =
-                self.search_level(&ep, self.vectors.vector(node), level)?;
+            let (candidates, neighbors) = self.search_level(&ep, level, dist_calc.as_ref())?;
             for neighbor in neighbors {
                 self.connect(node, neighbor.id, neighbor.dist, level);
                 self.prune(neighbor.id, level);
@@ -209,18 +209,11 @@ impl HNSWBuilder {
     fn search_level(
         &self,
         ep: &[OrderedNode],
-        query: &[f32],
         level: u16,
+        dist_calc: &dyn DistCalculator,
     ) -> Result<(Vec<OrderedNode>, Vec<OrderedNode>)> {
         let cur_level = HnswLevelView::new(level, self);
-        let candidates = beam_search(
-            &cur_level,
-            ep,
-            query,
-            self.params.ef_construction,
-            None,
-            None,
-        )?;
+        let candidates = beam_search(&cur_level, ep, self.params.ef_construction, dist_calc, None)?;
 
         let neighbors = if self.params.use_select_heuristic {
             select_neighbors_heuristic(&cur_level, &candidates, self.params.m).collect()
