@@ -498,6 +498,7 @@ def write_fragments(
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
     progress: Optional[FragmentWriteProgress] = None,
+    use_experimental_writer=False,
 ) -> List[FragmentMetadata]:
     """
     Write data into one or more fragments.
@@ -534,6 +535,9 @@ def write_fragments(
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
+    use_experimental_writer : optional, bool
+        Use the Lance v2 writer to write Lance v2 files.  This is not recommended
+        at this time as there are several known limitations in the v2 writer.
 
     Returns
     -------
@@ -564,5 +568,6 @@ def write_fragments(
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,
         progress=progress,
+        use_experimental_writer=use_experimental_writer,
     )
     return [FragmentMetadata.from_metadata(frag) for frag in fragments]
