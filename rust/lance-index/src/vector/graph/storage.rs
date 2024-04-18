@@ -3,6 +3,7 @@
 
 use std::any::Any;
 
+use arrow_array::ArrayRef;
 use lance_linalg::distance::MetricType;
 
 pub trait DistCalculator {
@@ -35,5 +36,5 @@ pub trait VectorStorage: Send + Sync {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator>;
+    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator>;
 }

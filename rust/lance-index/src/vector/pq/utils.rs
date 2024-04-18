@@ -25,7 +25,7 @@ pub(super) fn divide_to_subvectors<T: ArrowFloatType>(
     for i in 0..m {
         let mut builder = Vec::with_capacity(capacity);
         for j in 0..data.num_rows() {
-            let row = data.row(j).unwrap();
+            let row = data.row_ref(j).unwrap();
             let start = i * sub_vector_length;
             builder.extend_from_slice(&row[start..start + sub_vector_length]);
         }

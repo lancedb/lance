@@ -7,6 +7,7 @@
 
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
+use arrow_array::ArrayRef;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
@@ -410,13 +411,13 @@ impl VectorStorage for ProductQuantizationStorage {
         self.metric_type
     }
 
-    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator> {
+    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator> {
         Box::new(PQDistCalculator::new(
             self.codebook.values(),
             self.num_bits,
             self.num_sub_vectors,
             self.pq_code.clone(),
-            query,
+            query.as_primitive::<Float32Type>().values(),
             self.metric_type(),
         ))
     }
