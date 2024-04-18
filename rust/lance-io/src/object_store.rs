@@ -4,7 +4,7 @@
 //! Extend [object_store::ObjectStore] functionalities
 
 use std::collections::HashMap;
-use std::path::{Path as StdPath, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -368,17 +368,25 @@ impl ObjectStore {
 
     pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
-        let expanded_path = StdPath::new(&expanded);
 
-        let abs_path = path_abs::PathAbs::new(expanded_path).unwrap();
+        let mut expanded_path = path_abs::PathAbs::new(expanded)
+            .unwrap()
+            .as_path()
+            .to_path_buf();
+        // path_abs::PathAbs::new(".") returns an empty string.
+        if let Some(s) = expanded_path.as_path().to_str() {
+            if s.is_empty() {
+                expanded_path = std::env::current_dir()?.to_path_buf();
+            }
+        }
         Ok((
             Self {
                 inner: Arc::new(LocalFileSystem::new()).traced(),
                 scheme: String::from("file"),
-                base_path: Path::from_absolute_path(abs_path.as_path())?,
+                base_path: Path::from_absolute_path(expanded_path.as_path())?,
                 block_size: 4 * 1024, // 4KB block size
             },
-            Path::from_absolute_path(abs_path.as_path())?,
+            Path::from_absolute_path(expanded_path.as_path())?,
         ))
     }
 
@@ -863,6 +871,7 @@ mod tests {
     use parquet::data_type::AsBytes;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
+    use std::path as StdPath;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Write test content to file.
