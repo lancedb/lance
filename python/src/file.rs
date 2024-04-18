@@ -239,7 +239,7 @@ async fn object_store_from_uri_or_path(uri_or_path: String) -> PyResult<(ObjectS
 
 #[pyclass]
 pub struct LanceFileReader {
-    inner: Box<FileReader>,
+    inner: Arc<FileReader>,
 }
 
 impl LanceFileReader {
@@ -251,7 +251,7 @@ impl LanceFileReader {
             .await
             .infer_error()?;
         Ok(Self {
-            inner: Box::new(inner),
+            inner: Arc::new(inner),
         })
     }
 }
@@ -281,12 +281,9 @@ impl LanceFileReader {
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         // read_stream is a synchronous method but it launches tasks and needs to be
         // run in the context of a tokio runtime
-        let stream = RT
-            .runtime
-            .block_on(std::future::ready(
-                self.inner.read_stream(params, batch_size),
-            ))
-            .infer_error()?;
+        let inner = self.inner.clone();
+        let _guard = RT.runtime.enter();
+        let stream = inner.read_stream(params, batch_size).infer_error()?;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
     }
 }

@@ -27,6 +27,7 @@ import pytest
 from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
+from lance.debug import format_fragment
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
@@ -1582,11 +1583,9 @@ def test_migrate_manifest(tmp_path: Path):
 
 def test_v2_dataset(tmp_path: Path):
     table = pa.table({"a": range(100), "b": range(100)})
-    # max_rows_per_group is ignored by the v2 writer so we specify here to confirm
-    # we are in fact using v2 files
-    dataset = lance.write_dataset(
-        table, tmp_path, use_experimental_writer=True, max_rows_per_group=10
-    )
+    dataset = lance.write_dataset(table, tmp_path, use_experimental_writer=True)
     batches = list(dataset.to_batches())
     assert len(batches) == 1
     assert pa.Table.from_batches(batches) == table
+    fragment = list(dataset.get_fragments())[0]
+    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)

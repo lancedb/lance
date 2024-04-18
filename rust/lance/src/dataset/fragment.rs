@@ -1353,15 +1353,6 @@ impl FragmentReader {
         //
         // We could potentially delete the support for no-columns in the wrap function or
         // we can delete this path once we migrate away from any support of v1.
-        println!(
-            "new_read_impl with_row_id={} output_schema={:?}",
-            self.with_row_id,
-            self.output_schema
-                .fields
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>()
-        );
         if self.with_row_id && self.output_schema.fields.len() == 1 {
             let mut offsets = params
                 .slice(0, total_num_rows as usize)
