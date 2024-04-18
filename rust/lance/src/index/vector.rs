@@ -424,14 +424,14 @@ pub(crate) async fn open_vector_index_v2(
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-    let aux_path = dataset
-        .indices_dir()
-        .child(uuid)
-        .child(INDEX_AUXILIARY_FILE_NAME);
-    let aux_reader = dataset.object_store().open(&aux_path).await?;
-
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
+            let aux_path = dataset
+                .indices_dir()
+                .child(uuid)
+                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_reader = dataset.object_store().open(&aux_path).await?;
+
             let ivf_data = IvfData::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizerImpl<Float32Type>>::try_new(
@@ -455,6 +455,12 @@ pub(crate) async fn open_vector_index_v2(
         }
 
         "IVF_HNSW_SQ" => {
+            let aux_path = dataset
+                .indices_dir()
+                .child(uuid)
+                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_reader = dataset.object_store().open(&aux_path).await?;
+
             let ivf_data = IvfData::load(&reader).await?;
             let options = HNSWIndexOptions {
                 use_residual: false,
@@ -479,11 +485,16 @@ pub(crate) async fn open_vector_index_v2(
             )?)
         }
 
-        _ => {
-            return Err(Error::Index {
-                message: format!("Unsupported index type: {}", index_metadata.index_type),
-                location: location!(),
-            })
+        index_type => {
+            if let Some(ext) = dataset.session.vector_index_extensions.get(index_type) {
+                ext.load_index(dataset.clone(), column, uuid, reader)
+                    .await?
+            } else {
+                return Err(Error::Index {
+                    message: format!("Unsupported index type: {}", index_metadata.index_type),
+                    location: location!(),
+                });
+            }
         }
     };
 
