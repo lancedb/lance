@@ -360,7 +360,7 @@ impl HNSW {
 
         let candidates = beam_search(
             &self.levels[0],
-            &[ep],
+            &ep,
             ef,
             dist_calc.as_ref(),
             bitset.as_ref(),
@@ -476,18 +476,17 @@ pub(crate) fn select_neighbors_heuristic(
     if candidates.len() <= k {
         return candidates.iter().cloned().collect_vec().into_iter();
     }
-    let mut w = candidates.to_vec();
-    w.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
+    let mut candidates = candidates.to_vec();
+    candidates.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
-    let mut discarded = Vec::with_capacity(k);
     let storage = graph.storage();
     let storage = storage
         .as_any()
         .downcast_ref::<InMemoryVectorStorage>()
         .unwrap();
-    while !w.is_empty() && results.len() < k {
-        let u = w.pop().unwrap();
+    while !candidates.is_empty() && results.len() < k {
+        let u = candidates.pop().unwrap();
 
         if results.is_empty()
             || results
@@ -495,13 +494,7 @@ pub(crate) fn select_neighbors_heuristic(
                 .all(|v| u.dist < OrderedFloat(storage.distance_between(u.id, v.id)))
         {
             results.push(u);
-        } else if discarded.len() < k - results.len() {
-            discarded.push(u);
         }
-    }
-
-    while results.len() < k && !discarded.is_empty() {
-        results.push(discarded.pop().unwrap());
     }
 
     results.into_iter()

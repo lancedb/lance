@@ -154,14 +154,9 @@ impl HNSWBuilder {
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
-        // This is different to the paper.
-        // We use log10 instead of log(e), so each layer has about 1/10 of its bottom layer.
-        let m = self.vectors.len();
+        let ml = self.params.m as f32;
         min(
-            (m as f32).log(self.params.log_base).ceil() as u16
-                - (rng.gen::<f32>() * m as f32)
-                    .log(self.params.log_base)
-                    .ceil() as u16,
+            (-rng.gen::<f32>().ln() * ml) as u16,
             self.params.max_level - 1,
         )
     }
@@ -190,7 +185,6 @@ impl HNSWBuilder {
             ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
         }
 
-        let mut ep = vec![ep];
         for level in (0..=target_level).rev() {
             self.level_count[level as usize] += 1;
 
@@ -200,7 +194,7 @@ impl HNSWBuilder {
                 self.prune(neighbor.id, level);
             }
 
-            ep[0] = candidates[0].clone();
+            ep = candidates[0].clone();
         }
 
         Ok(())
@@ -208,7 +202,7 @@ impl HNSWBuilder {
 
     fn search_level(
         &self,
-        ep: &[OrderedNode],
+        ep: &OrderedNode,
         level: u16,
         dist_calc: &dyn DistCalculator,
     ) -> Result<(Vec<OrderedNode>, Vec<OrderedNode>)> {
