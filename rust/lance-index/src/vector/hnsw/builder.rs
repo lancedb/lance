@@ -194,8 +194,7 @@ impl HNSWBuilder {
         for level in (0..=target_level).rev() {
             self.level_count[level as usize] += 1;
 
-            let (candidates, neighbors) =
-                self.search_level(&ep, self.vectors.vector(node), level, dist_calc.as_ref())?;
+            let (candidates, neighbors) = self.search_level(&ep, level, dist_calc.as_ref())?;
             for neighbor in neighbors {
                 self.connect(node, neighbor.id, neighbor.dist, level);
                 self.prune(neighbor.id, level);
