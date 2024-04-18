@@ -473,9 +473,15 @@ impl Dataset {
         }
 
         let object_store = Arc::new(object_store);
-        let fragments =
-            write_fragments_internal(object_store.clone(), &base, &schema, stream, params.clone())
-                .await?;
+        let fragments = write_fragments_internal(
+            dataset.as_ref(),
+            object_store.clone(),
+            &base,
+            &schema,
+            stream,
+            params.clone(),
+        )
+        .await?;
 
         let operation = match params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
@@ -565,6 +571,7 @@ impl Dataset {
         )?;
 
         let fragments = write_fragments_internal(
+            Some(self),
             self.object_store.clone(),
             &self.base,
             &schema,

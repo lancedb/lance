@@ -57,7 +57,9 @@ impl DataFile {
     }
 
     pub fn new_legacy(path: impl Into<String>, schema: &Schema) -> Self {
-        Self::new(path, schema.field_ids(), vec![], 0, 0)
+        let mut field_ids = schema.field_ids();
+        field_ids.sort();
+        Self::new(path, field_ids, vec![], 0, 0)
     }
 
     pub fn schema(&self, full_schema: &Schema) -> Schema {

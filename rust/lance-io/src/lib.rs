@@ -103,7 +103,7 @@ impl ReadBatchParams {
     ///
     /// You cannot slice beyond the bounds of the selection and an attempt to do so will
     /// return an error.
-    pub fn slice(&self, start: usize, length: usize) -> Result<ReadBatchParams> {
+    pub fn slice(&self, start: usize, length: usize) -> Result<Self> {
         let out_of_bounds = |size: usize| {
             Err(Error::InvalidInput {
                 source: format!(

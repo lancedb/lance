@@ -113,6 +113,7 @@ async fn run_io_loop(tasks: mpsc::UnboundedReceiver<IoTask>, io_capacity: u32) {
 /// parallel I/O that can be run.
 ///
 /// TODO: This will also add coalescing
+#[derive(Debug)]
 pub struct StoreScheduler {
     object_store: Arc<ObjectStore>,
     io_submitter: mpsc::UnboundedSender<IoTask>,
@@ -204,7 +205,7 @@ impl StoreScheduler {
 }
 
 /// A throttled file reader
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FileScheduler {
     reader: Arc<dyn Reader>,
     root: Arc<StoreScheduler>,

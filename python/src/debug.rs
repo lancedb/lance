@@ -46,7 +46,10 @@ struct PrettyPrintableFragment {
 struct PrettyPrintableDataFile {
     path: String,
     fields: Vec<i32>,
+    column_indices: Vec<i32>,
     schema: Schema,
+    major_version: u32,
+    minor_version: u32,
 }
 
 impl PrettyPrintableFragment {
@@ -59,7 +62,10 @@ impl PrettyPrintableFragment {
                 PrettyPrintableDataFile {
                     path: file.path.clone(),
                     fields: file.fields.clone(),
+                    column_indices: file.column_indices.clone(),
                     schema,
+                    major_version: file.file_major_version,
+                    minor_version: file.file_minor_version,
                 }
             })
             .collect();

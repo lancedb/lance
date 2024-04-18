@@ -83,7 +83,7 @@ impl LanceStream {
             .collect::<Vec<_>>();
 
         let inner_stream = if scan_in_order {
-            stream::iter(file_fragments)
+            let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
                         file_fragment,
@@ -92,8 +92,16 @@ impl LanceStream {
                         with_make_deletions_null,
                     ))
                 })
-                .try_buffered(fragment_readahead)
-                .map_ok(move |reader| reader.read_all(read_size as u32).map(Ok))
+                .try_buffered(fragment_readahead);
+            let tasks = readers.and_then(move |reader| {
+                std::future::ready(
+                    reader
+                        .read_all(read_size as u32)
+                        .map(|task_stream| task_stream.map(Ok))
+                        .map_err(DataFusionError::from),
+                )
+            });
+            tasks
                 // We must be waiting to finish a file before moving onto thenext. That's an issue.
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
@@ -101,7 +109,7 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            stream::iter(file_fragments)
+            let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
                         file_fragment,
@@ -110,10 +118,18 @@ impl LanceStream {
                         with_make_deletions_null,
                     ))
                 })
-                .try_buffered(fragment_readahead)
-                .map_ok(move |reader| reader.read_all(read_size as u32).map(Ok))
-                // When we flatten the streams (one stream per fragment), we allow
-                // `fragment_readahead` stream to be read concurrently.
+                .try_buffered(fragment_readahead);
+            let tasks = readers.and_then(move |reader| {
+                std::future::ready(
+                    reader
+                        .read_all(read_size as u32)
+                        .map(|task_stream| task_stream.map(Ok))
+                        .map_err(DataFusionError::from),
+                )
+            });
+            // When we flatten the streams (one stream per fragment), we allow
+            // `fragment_readahead` stream to be read concurrently.
+            tasks
                 .try_flatten_unordered(fragment_readahead)
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffer_unordered(batch_readahead)

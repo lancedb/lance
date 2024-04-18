@@ -3,12 +3,11 @@
 
 use arrow_array::RecordBatch;
 
-use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
-use lance_encoding::encoder::{BatchEncoder, EncodedPage, FieldEncoder};
+use lance_encoding::encoder::{BatchEncoder, EncodeTask, EncodedPage, FieldEncoder};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
 use prost::Message;
@@ -127,7 +126,7 @@ impl FileWriter {
 
     async fn write_pages(
         &mut self,
-        mut encoding_tasks: FuturesUnordered<BoxFuture<'static, Result<EncodedPage>>>,
+        mut encoding_tasks: FuturesUnordered<EncodeTask>,
     ) -> Result<()> {
         // As soon as an encoding task is done we write it.  There is no parallelism
         // needed here because "writing" is really just submitting the buffer to the

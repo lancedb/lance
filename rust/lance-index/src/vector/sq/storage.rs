@@ -243,13 +243,9 @@ impl SQDistCalculator {
 }
 
 impl DistCalculator for SQDistCalculator {
-    fn distance(&self, ids: &[u32]) -> Vec<f32> {
-        ids.iter()
-            .map(|&id| {
-                let sq_code = get_sq_code(&self.sq_codes, id);
-                l2_distance_uint_scalar(sq_code, &self.query_sq_code)
-            })
-            .collect()
+    fn distance(&self, id: u32) -> f32 {
+        let sq_code = get_sq_code(&self.sq_codes, id);
+        l2_distance_uint_scalar(sq_code, &self.query_sq_code)
     }
 }
 

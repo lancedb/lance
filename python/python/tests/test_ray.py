@@ -30,6 +30,9 @@ def test_ray_sink(tmp_path: Path):
     ds = lance.dataset(tmp_path)
     ds.count_rows() == 10
     assert ds.schema.names == schema.names
+    # The schema is platform-dependent, because numpy uses int32 on Windows.
+    # So we observe the schema that is written and use that.
+    schema = ds.schema
 
     tbl = ds.to_table()
     assert sorted(tbl["id"].to_pylist()) == list(range(10))

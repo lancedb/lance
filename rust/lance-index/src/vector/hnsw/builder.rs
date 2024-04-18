@@ -12,6 +12,7 @@ use rand::{thread_rng, Rng};
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, select_neighbors_heuristic, HNSW};
 use crate::vector::graph::builder::GraphBuilderNode;
+use crate::vector::graph::storage::DistCalculator;
 use crate::vector::graph::{greedy_search, storage::VectorStorage};
 use crate::vector::graph::{Graph, OrderedFloat, OrderedNode};
 
@@ -32,9 +33,6 @@ pub struct HnswBuildParams {
     /// size of the dynamic list for the candidates
     pub ef_construction: usize,
 
-    /// whether extend candidates while selecting neighbors
-    pub extend_candidates: bool,
-
     /// log base used for assigning random level
     pub log_base: f32,
 
@@ -49,7 +47,6 @@ impl Default for HnswBuildParams {
             m: 20,
             m_max: 40,
             ef_construction: 100,
-            extend_candidates: false,
             log_base: 10.0,
             use_select_heuristic: true,
         }
@@ -84,16 +81,6 @@ impl HnswBuildParams {
     /// The default value is `100`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
-        self
-    }
-
-    /// Whether to expend to search candidate neighbors during heuristic search.
-    ///
-    /// The default value is `false`.
-    ///
-    /// See `extendCandidates` parameter in the paper (Algorithm 4)
-    pub fn extend_candidates(mut self, flag: bool) -> Self {
-        self.extend_candidates = flag;
         self
     }
 
@@ -167,14 +154,9 @@ impl HNSWBuilder {
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
-        // This is different to the paper.
-        // We use log10 instead of log(e), so each layer has about 1/10 of its bottom layer.
-        let m = self.vectors.len();
+        let ml = self.params.m as f32;
         min(
-            (m as f32).log(self.params.log_base).ceil() as u16
-                - (rng.gen::<f32>() * m as f32)
-                    .log(self.params.log_base)
-                    .ceil() as u16,
+            (-rng.gen::<f32>().ln() * ml) as u16,
             self.params.max_level - 1,
         )
     }
@@ -197,24 +179,22 @@ impl HNSWBuilder {
         //    ep = Select-Neighbors(W, 1)
         //  }
         // ```
+        let dist_calc = self.vectors.dist_calculator(self.vectors.vector(node));
         for level in (target_level + 1..self.params.max_level).rev() {
-            let query = self.vectors.vector(node);
             let cur_level = HnswLevelView::new(level, self);
-            ep = greedy_search(&cur_level, ep, query, None)?;
+            ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
         }
 
-        let mut ep = vec![ep];
         for level in (0..=target_level).rev() {
             self.level_count[level as usize] += 1;
 
-            let (candidates, neighbors) =
-                self.search_level(&ep, self.vectors.vector(node), level)?;
+            let (candidates, neighbors) = self.search_level(&ep, level, dist_calc.as_ref())?;
             for neighbor in neighbors {
                 self.connect(node, neighbor.id, neighbor.dist, level);
                 self.prune(neighbor.id, level);
             }
 
-            ep[0] = candidates[0].clone();
+            ep = candidates[0].clone();
         }
 
         Ok(())
@@ -222,29 +202,15 @@ impl HNSWBuilder {
 
     fn search_level(
         &self,
-        ep: &[OrderedNode],
-        query: &[f32],
+        ep: &OrderedNode,
         level: u16,
+        dist_calc: &dyn DistCalculator,
     ) -> Result<(Vec<OrderedNode>, Vec<OrderedNode>)> {
         let cur_level = HnswLevelView::new(level, self);
-        let candidates = beam_search(
-            &cur_level,
-            ep,
-            query,
-            self.params.ef_construction,
-            None,
-            None,
-        )?;
+        let candidates = beam_search(&cur_level, ep, self.params.ef_construction, dist_calc, None)?;
 
         let neighbors = if self.params.use_select_heuristic {
-            select_neighbors_heuristic(
-                &cur_level,
-                query,
-                &candidates,
-                self.params.m,
-                self.params.extend_candidates,
-            )
-            .collect()
+            select_neighbors_heuristic(&cur_level, &candidates, self.params.m).collect()
         } else {
             select_neighbors(&candidates, self.params.m)
                 .cloned()
@@ -268,14 +234,8 @@ impl HNSWBuilder {
         let level_view = HnswLevelView::new(level, self);
         let neighbors: Vec<OrderedNode> = level_neighbors.iter().cloned().collect();
 
-        let new_neighbors = select_neighbors_heuristic(
-            &level_view,
-            self.vectors.vector(node),
-            &neighbors,
-            self.params.m_max,
-            self.params.extend_candidates,
-        )
-        .collect();
+        let new_neighbors =
+            select_neighbors_heuristic(&level_view, &neighbors, self.params.m_max).collect();
 
         self.nodes[node as usize].level_neighbors[level as usize] = new_neighbors;
     }
