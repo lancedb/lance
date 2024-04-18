@@ -8,6 +8,9 @@ pub mod sql;
 pub(crate) mod temporal;
 #[cfg(feature = "tfrecord")]
 pub mod tfrecord;
+pub(crate) mod tokio;
+#[cfg(test)]
+pub(crate) mod test;
 
 // Re-export
 pub use lance_linalg::kmeans;
