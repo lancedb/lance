@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{traits::IntoJava, Result, RT};
 use arrow::array::RecordBatchReader;
-
+use arrow::ffi::FFI_ArrowSchema;
+use arrow_schema::Schema;
+use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::{Dataset, WriteParams};
-
-use crate::{traits::IntoJava, Result, RT};
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
@@ -117,4 +118,35 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsIds<'a>(
     env.set_int_array_region(&array_list, 0, &fragment_ids)
         .expect("Failed to set int array region");
     array_list.into()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
+    mut env: JNIEnv,
+    jdataset: JObject,
+    arrow_schema_addr: jlong,
+) {
+    let schema = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Failed to get native dataset handle");
+        Schema::from(dataset.inner.schema())
+    };
+    let out_c_schema = arrow_schema_addr as *mut FFI_ArrowSchema;
+    let c_schema = match FFI_ArrowSchema::try_from(&schema) {
+        Ok(schema) => schema,
+        Err(err) => {
+            env.throw_new(
+                "java/lang/RuntimeException",
+                format!("Failed to convert Arrow schema: {}", err),
+            )
+            .expect("Error throwing exception");
+            return;
+        }
+    };
+
+    unsafe {
+        std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
+        std::mem::forget(c_schema);
+    };
 }

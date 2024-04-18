@@ -260,7 +260,9 @@ impl FragmentScanner {
         }
 
         // We only need the statistics for the predicate projection.
-        let stats = reader.read_page_stats(Some(&predicate_projection)).await?;
+        let stats = reader
+            .legacy_read_page_stats(Some(&predicate_projection))
+            .await?;
 
         Ok(Self {
             fragment,
@@ -326,7 +328,7 @@ impl FragmentScanner {
                     projection_reader.with_row_id();
                 }
                 let batch = projection_reader
-                    .read_batch_projected(batch_id, .., &self.projection)
+                    .legacy_read_batch_projected(batch_id, .., &self.projection)
                     .await?;
                 let batch = self.final_projection(batch)?;
                 Ok(Some(batch))
@@ -357,7 +359,7 @@ impl FragmentScanner {
                 reader.with_row_id();
 
                 let batch = reader
-                    .read_batch_projected(batch_id, .., &predicate_projection)
+                    .legacy_read_batch_projected(batch_id, .., &predicate_projection)
                     .await?;
 
                 // 2. Evaluate predicate
@@ -430,7 +432,7 @@ impl FragmentScanner {
                     let remaining_projection = self.projection.project_by_ids(&remaining_fields);
                     Some(
                         self.reader
-                            .read_batch_projected(
+                            .legacy_read_batch_projected(
                                 batch_id,
                                 selection.clone(),
                                 &remaining_projection,
@@ -603,11 +605,11 @@ impl FragmentScanner {
     }
 
     fn simplified_predicates(&self) -> Result<Vec<Expr>> {
-        let num_batches = self.reader.num_batches();
+        let num_batches = self.reader.legacy_num_batches();
 
         if let Some(stats) = &self.stats {
             let batch_sizes: Vec<usize> = (0..num_batches)
-                .map(|batch_id| self.reader.num_rows_in_batch(batch_id))
+                .map(|batch_id| self.reader.legacy_num_rows_in_batch(batch_id))
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);

@@ -6,7 +6,7 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -470,33 +470,13 @@ fn select_neighbors(
 /// NOTE: the result is not ordered
 pub(crate) fn select_neighbors_heuristic(
     graph: &dyn Graph,
-    query: &[f32],
     candidates: &[OrderedNode],
     k: usize,
-    extend_candidates: bool,
 ) -> impl Iterator<Item = OrderedNode> {
     if candidates.len() <= k {
         return candidates.iter().cloned().collect_vec().into_iter();
     }
     let mut w = candidates.to_vec();
-
-    if extend_candidates {
-        let dist_calc = graph.storage().dist_calculator(query);
-        let mut visited = HashSet::with_capacity(w.len() * k);
-        visited.extend(candidates.iter().map(|node| node.id));
-        candidates.iter().sorted().rev().for_each(|node| {
-            if let Some(neighbors) = graph.neighbors(node.id) {
-                neighbors.for_each(|n| {
-                    if !visited.contains(&n) {
-                        let d: OrderedFloat = dist_calc.distance(n).into();
-                        w.push(OrderedNode::new(n, d));
-                    }
-                    visited.insert(n);
-                });
-            }
-        });
-    }
-
     w.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
@@ -529,6 +509,8 @@ pub(crate) fn select_neighbors_heuristic(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     use arrow_array::types::Float32Type;

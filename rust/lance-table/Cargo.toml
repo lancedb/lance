@@ -14,8 +14,10 @@ rust-version.workspace = true
 [dependencies]
 lance-arrow.workspace = true
 lance-core.workspace = true
+lance-datagen.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true
+arrow.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-ipc.workspace = true

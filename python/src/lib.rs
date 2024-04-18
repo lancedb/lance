@@ -51,12 +51,14 @@ pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
+pub(crate) mod debug;
 pub(crate) mod error;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod reader;
 pub(crate) mod scanner;
+pub(crate) mod schema;
 pub(crate) mod tracing;
 pub(crate) mod updater;
 pub(crate) mod utils;
@@ -126,6 +128,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<TraceGuard>()?;
+    m.add_class::<schema::LanceSchema>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
@@ -137,6 +140,11 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(build_sq_storage))?;
+    // Debug functions
+    m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
+    m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
+    m.add_wrapped(wrap_pyfunction!(debug::format_fragment))?;
+    m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
     Ok(())

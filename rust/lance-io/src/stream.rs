@@ -5,11 +5,20 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
-use futures::Stream;
+use arrow_schema::{ArrowError, SchemaRef};
+use futures::stream::BoxStream;
+use futures::{Stream, StreamExt};
 use pin_project::pin_project;
 
 use lance_core::Result;
+
+pub type BatchStream = BoxStream<'static, Result<RecordBatch>>;
+
+pub fn arrow_stream_to_lance_stream(
+    arrow_stream: BoxStream<'static, std::result::Result<RecordBatch, ArrowError>>,
+) -> BatchStream {
+    arrow_stream.map(|r| r.map_err(Into::into)).boxed()
+}
 
 /// RecordBatch Stream trait.
 pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> + Send {

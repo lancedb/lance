@@ -91,10 +91,10 @@ impl Updater {
 
     /// Returns the next [`RecordBatch`] as input for updater.
     pub async fn next(&mut self) -> Result<Option<&RecordBatch>> {
-        if self.batch_id >= self.reader.num_batches() {
+        if self.batch_id >= self.reader.legacy_num_batches() {
             return Ok(None);
         }
-        let batch = self.reader.read_batch(self.batch_id, ..).await?;
+        let batch = self.reader.legacy_read_batch(self.batch_id, ..).await?;
         self.batch_id += 1;
 
         self.last_input = Some(batch);
@@ -111,7 +111,7 @@ impl Updater {
     /// Internal use only.
     async fn new_writer(&mut self, schema: Schema) -> Result<FileWriter<ManifestDescribing>> {
         let file_name = format!("{}.lance", Uuid::new_v4());
-        self.fragment.metadata.add_file(&file_name, &schema);
+        self.fragment.metadata.add_file_legacy(&file_name, &schema);
 
         let full_path = self.fragment.dataset().data_dir().child(file_name.as_str());
 
@@ -169,7 +169,7 @@ impl Updater {
         let writer = self.writer.as_mut().unwrap();
         // Because of deleted rows, the number of row ids in the batch might not
         // match the length.
-        let row_id_stride = self.reader.num_rows_in_batch(self.batch_id - 1) as u32; // Subtract since we incremented in next()
+        let row_id_stride = self.reader.legacy_num_rows_in_batch(self.batch_id - 1) as u32; // Subtract since we incremented in next()
         let batch = add_blanks(
             batch,
             self.start_row_id..(self.start_row_id + row_id_stride),
