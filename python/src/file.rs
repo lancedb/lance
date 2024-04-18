@@ -14,7 +14,7 @@
 
 use std::{pin::Pin, sync::Arc};
 
-use arrow::{array::AsArray, datatypes::Float64Type, pyarrow::PyArrowType};
+use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
