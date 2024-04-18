@@ -58,7 +58,7 @@ impl VectorStorage for InMemoryVectorStorage {
     fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator> {
         Box::new(InMemoryDistanceCal {
             vectors: self.vectors.clone(),
-            query: query.to_vec(),
+            query: query.as_ptr(),
             metric_type: self.metric_type,
         })
     }
@@ -66,14 +66,17 @@ impl VectorStorage for InMemoryVectorStorage {
 
 struct InMemoryDistanceCal {
     vectors: Arc<MatrixView<Float32Type>>,
-    query: Vec<f32>,
+    query: *const f32,
     metric_type: MetricType,
 }
 
-impl DistCalculator for InMemoryDistanceCal {
+impl<'a> DistCalculator for InMemoryDistanceCal {
     #[inline]
     fn distance(&self, id: u32) -> f32 {
         let vector = self.vectors.row(id as usize).unwrap();
-        self.metric_type.func()(&self.query, vector)
+        self.metric_type.func()(
+            unsafe { std::slice::from_raw_parts(self.query, vector.len()) },
+            vector,
+        )
     }
 }
