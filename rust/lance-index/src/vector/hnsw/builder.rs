@@ -36,11 +36,11 @@ pub struct HnswBuildParams {
     /// size of the dynamic list for the candidates
     pub ef_construction: usize,
 
-    /// log base used for assigning random level
-    pub log_base: f32,
-
     /// whether select neighbors heuristic
     pub use_select_heuristic: bool,
+
+    /// the max number of threads to use for building the graph
+    pub parallel_limit: Option<usize>,
 }
 
 impl Default for HnswBuildParams {
@@ -50,8 +50,8 @@ impl Default for HnswBuildParams {
             m: 20,
             m_max: 40,
             ef_construction: 100,
-            log_base: 10.0,
             use_select_heuristic: true,
+            parallel_limit: None,
         }
     }
 }
@@ -92,6 +92,12 @@ impl HnswBuildParams {
     /// See algorithm 4 in HNSW paper.
     pub fn use_select_heuristic(mut self, flag: bool) -> Self {
         self.use_select_heuristic = flag;
+        self
+    }
+
+    /// The max number of threads to use for building the graph.
+    pub fn parallel_limit(mut self, limit: usize) -> Self {
+        self.parallel_limit = Some(limit);
         self
     }
 }
@@ -145,7 +151,11 @@ impl HNSWBuilder {
             self.inner.params.ef_construction
         );
 
-        let parallel_limit = min(num_cpus::get(), 16);
+        let parallel_limit = self
+            .inner
+            .params
+            .parallel_limit
+            .unwrap_or_else(num_cpus::get);
         let mut tasks = Vec::with_capacity(parallel_limit);
         let chunk_size = (self.inner.vectors.len() - 1).div_ceil(parallel_limit);
         for chunk in &(1..self.inner.vectors.len()).chunks(chunk_size) {

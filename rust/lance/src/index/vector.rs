@@ -115,6 +115,11 @@ impl VectorIndexParams {
         hnsw: HnswBuildParams,
         pq: PQBuildParams,
     ) -> Self {
+        let hnsw = match &hnsw.parallel_limit {
+            Some(_) => hnsw,
+            None => hnsw.parallel_limit(num_cpus::get().div_ceil(ivf.num_partitions)),
+        };
+
         let stages = vec![
             StageParams::Ivf(ivf),
             StageParams::Hnsw(hnsw),
@@ -134,6 +139,11 @@ impl VectorIndexParams {
         hnsw: HnswBuildParams,
         sq: SQBuildParams,
     ) -> Self {
+        let hnsw = match &hnsw.parallel_limit {
+            Some(_) => hnsw,
+            None => hnsw.parallel_limit(num_cpus::get().div_ceil(ivf.num_partitions)),
+        };
+
         let stages = vec![
             StageParams::Ivf(ivf),
             StageParams::Hnsw(hnsw),
