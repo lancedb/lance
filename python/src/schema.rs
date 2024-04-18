@@ -3,8 +3,8 @@
 
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
-use lance::datatypes::{Field, Schema};
-use lance_file::datatypes::Fields;
+use lance::datatypes::Schema;
+use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::format::pb;
 use prost::Message;
 use pyo3::{
@@ -64,15 +64,15 @@ impl LanceSchema {
         // We don't have a single message for the schema, just protobuf message
         // for a field. So, the state will be:
         // (metadata_json, field_protos...)
+        let fields_with_meta = FieldsWithMeta::from(&self.0);
 
         let mut states = Vec::new();
-        let metadata_str = serde_json::to_string(&self.0.metadata)
+        let metadata_str = serde_json::to_string(&fields_with_meta.metadata)
             .map_err(|e| PyErr::new::<PyValueError, _>(format!("{}", e)))?
             .into_py(py);
         states.push(metadata_str);
 
-        let fields = Fields::from(&self.0);
-        for field in fields.0.iter() {
+        for field in fields_with_meta.fields.0.iter() {
             states.push(field.encode_to_vec().into_py(py));
         }
 
@@ -95,9 +95,13 @@ impl LanceSchema {
             let field = pb::Field::decode(proto.as_slice()).map_err(|e| {
                 PyValueError::new_err(format!("Failed to parse field proto: {}", e))
             })?;
-            fields.push(Field::from(&field));
+            fields.push(field);
         }
-        let schema = Schema { fields, metadata };
+        let fields_with_meta = FieldsWithMeta {
+            fields: Fields(fields),
+            metadata,
+        };
+        let schema = Schema::from(fields_with_meta);
         Ok(Self(schema))
     }
 }
