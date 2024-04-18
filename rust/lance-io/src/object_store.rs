@@ -871,7 +871,7 @@ mod tests {
     use parquet::data_type::AsBytes;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
-    use std::path as StdPath;
+    use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Write test content to file.
