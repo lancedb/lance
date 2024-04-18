@@ -17,22 +17,18 @@ use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
-use object_store::azure::AzureConfigKey;
-use object_store::gcp::GoogleConfigKey;
 use object_store::{
-    aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory, CredentialProvider,
-    Error as ObjectStoreError, Result as ObjectStoreResult,
+    aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
+    memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
 };
 use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredentialProvider};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
-use path_absolutize::*;
 use shellexpand::tilde;
 use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
 use super::local::LocalObjectReader;
-
 mod tracing;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
@@ -374,19 +370,15 @@ impl ObjectStore {
         let expanded = tilde(str_path).to_string();
         let expanded_path = StdPath::new(&expanded);
 
-        let expanded_path = expanded_path.absolutize().map_err(|e| Error::IO {
-            message: format!("Failed to resolve absolute path: {}", e),
-            location: location!(),
-        })?;
-
+        let abs_path = path_abs::PathAbs::new(expanded_path).unwrap();
         Ok((
             Self {
                 inner: Arc::new(LocalFileSystem::new()).traced(),
                 scheme: String::from("file"),
-                base_path: Path::from_absolute_path(&expanded_path)?,
+                base_path: Path::from_absolute_path(abs_path.as_path())?,
                 block_size: 4 * 1024, // 4KB block size
             },
-            Path::from_absolute_path(&expanded_path)?,
+            Path::from_absolute_path(abs_path.as_path())?,
         ))
     }
 
