@@ -17,25 +17,25 @@ use lance_core::{
 };
 use lance_io::ReadBatchParams;
 
-type BatchFut = BoxFuture<'static, Result<RecordBatch>>;
+pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
 /// A task, emitted by a file reader, that will produce a batch (of the
 /// given size)
-pub struct BatchTask {
-    task: BatchFut,
-    num_rows: u32,
+pub struct ReadBatchTask {
+    pub task: ReadBatchFut,
+    pub num_rows: u32,
 }
-type BatchTaskStream = BoxStream<'static, BatchTask>;
-type BatchFutStream = BoxStream<'static, BatchFut>;
+pub type ReadBatchTaskStream = BoxStream<'static, ReadBatchTask>;
+pub type ReadBatchFutStream = BoxStream<'static, ReadBatchFut>;
 
 struct MergeStream {
-    streams: Vec<BatchTaskStream>,
-    next_batch: FuturesOrdered<BatchFut>,
+    streams: Vec<ReadBatchTaskStream>,
+    next_batch: FuturesOrdered<ReadBatchFut>,
     next_num_rows: u32,
     index: usize,
 }
 
 impl MergeStream {
-    fn emit(&mut self) -> BatchTask {
+    fn emit(&mut self) -> ReadBatchTask {
         let mut iter = std::mem::take(&mut self.next_batch);
         let task = async move {
             let mut batch = iter.next().await.unwrap()?;
@@ -46,16 +46,14 @@ impl MergeStream {
             Ok(batch)
         }
         .boxed();
+        let num_rows = self.next_num_rows;
         self.next_num_rows = 0;
-        BatchTask {
-            task,
-            num_rows: self.next_num_rows,
-        }
+        ReadBatchTask { task, num_rows }
     }
 }
 
 impl Stream for MergeStream {
-    type Item = BatchTask;
+    type Item = ReadBatchTask;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -101,7 +99,7 @@ impl Stream for MergeStream {
 ///
 /// This will panic if any of the input streams return a batch with a different
 /// number of rows than the first stream.
-pub fn merge_streams(streams: Vec<BatchTaskStream>) -> BatchTaskStream {
+pub fn merge_streams(streams: Vec<ReadBatchTaskStream>) -> ReadBatchTaskStream {
     MergeStream {
         streams,
         next_batch: FuturesOrdered::new(),
@@ -165,7 +163,7 @@ pub struct RowIdAndDeletesConfig {
     /// Whether to include the row id column in the final batch
     pub with_row_id: bool,
     /// An optional deletion vector to apply to the batch
-    pub deletion_vector: Option<DeletionVector>,
+    pub deletion_vector: Option<Arc<DeletionVector>>,
     /// Whether to make deleted rows null instead of filtering them out
     pub make_deletions_null: bool,
     /// The total number of rows that will be loaded
@@ -182,8 +180,10 @@ fn apply_row_id_and_deletes(
 ) -> Result<RecordBatch> {
     let mut deletion_vector = config.deletion_vector.as_ref();
     // Convert Some(NoDeletions) into None to simplify logic below
-    if matches!(deletion_vector, Some(DeletionVector::NoDeletions)) {
-        deletion_vector = None;
+    if let Some(deletion_vector_inner) = deletion_vector {
+        if matches!(deletion_vector_inner.as_ref(), DeletionVector::NoDeletions) {
+            deletion_vector = None;
+        }
     }
     let has_deletions = deletion_vector.is_some();
     debug_assert!(batch.num_columns() > 0 || config.with_row_id || has_deletions);
@@ -193,26 +193,14 @@ fn apply_row_id_and_deletes(
     let num_rows = batch.num_rows() as u32;
 
     let row_ids = if should_fetch_row_id {
-        let ids_in_batch: Vec<u32> = match &config.params {
-            ReadBatchParams::Indices(indices) => indices
-                .slice(batch_offset as usize, num_rows as usize)
-                .values()
-                .iter()
-                .copied()
-                .collect(),
-            ReadBatchParams::Range(r) => {
-                (r.start as u32 + batch_offset..r.start as u32 + batch_offset + num_rows).collect()
-            }
-            ReadBatchParams::RangeFull => (batch_offset..batch_offset + num_rows).collect(),
-            ReadBatchParams::RangeTo(r) => {
-                let start = r.end as u32 - config.total_num_rows + batch_offset;
-                (start..start + num_rows).collect()
-            }
-            ReadBatchParams::RangeFrom(r) => {
-                (r.start as u32 + batch_offset..r.start as u32 + batch_offset + num_rows).collect()
-            }
-        };
+        let ids_in_batch = config
+            .params
+            .slice(batch_offset as usize, num_rows as usize)
+            .unwrap()
+            .to_offsets()
+            .unwrap();
         let row_ids: Vec<u64> = ids_in_batch
+            .values()
             .iter()
             .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))
             .collect();
@@ -253,10 +241,10 @@ fn apply_row_id_and_deletes(
 /// This converts from BatchTaskStream to BatchFutStream because, if we are applying a
 /// deletion vector, it is impossible to know how many output rows we will have.
 pub fn wrap_with_row_id_and_delete(
-    stream: BatchTaskStream,
+    stream: ReadBatchTaskStream,
     fragment_id: u32,
     config: RowIdAndDeletesConfig,
-) -> BatchFutStream {
+) -> ReadBatchFutStream {
     let config = Arc::new(config);
     let mut offset = 0;
     stream
@@ -277,6 +265,8 @@ pub fn wrap_with_row_id_and_delete(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::{types::Int32Type, RecordBatch, UInt32Array};
     use arrow_schema::ArrowError;
@@ -289,15 +279,15 @@ mod tests {
     use lance_io::{stream::arrow_stream_to_lance_stream, ReadBatchParams};
     use roaring::RoaringBitmap;
 
-    use crate::utils::stream::BatchTask;
+    use crate::utils::stream::ReadBatchTask;
 
     use super::RowIdAndDeletesConfig;
 
     fn batch_task_stream(
         datagen_stream: BoxStream<'static, std::result::Result<RecordBatch, ArrowError>>,
-    ) -> super::BatchTaskStream {
+    ) -> super::ReadBatchTaskStream {
         arrow_stream_to_lance_stream(datagen_stream)
-            .map(|batch| BatchTask {
+            .map(|batch| ReadBatchTask {
                 num_rows: batch.as_ref().unwrap().num_rows() as u32,
                 task: std::future::ready(batch).boxed(),
             })
@@ -404,17 +394,19 @@ mod tests {
         .await;
         check_row_id(
             ReadBatchParams::RangeTo(std::ops::RangeTo { end: 1000 }),
-            900..1000,
+            0..100,
         )
         .await;
     }
 
     #[tokio::test]
     async fn test_deletes() {
-        let no_deletes: Option<DeletionVector> = None;
-        let no_deletes_2 = Some(DeletionVector::NoDeletions);
-        let delete_some_bitmap = Some(DeletionVector::Bitmap(RoaringBitmap::from_iter(0..35)));
-        let delete_some_set = Some(DeletionVector::Set((0..35).collect()));
+        let no_deletes: Option<Arc<DeletionVector>> = None;
+        let no_deletes_2 = Some(Arc::new(DeletionVector::NoDeletions));
+        let delete_some_bitmap = Some(Arc::new(DeletionVector::Bitmap(RoaringBitmap::from_iter(
+            0..35,
+        ))));
+        let delete_some_set = Some(Arc::new(DeletionVector::Set((0..35).collect())));
 
         for deletion_vector in [
             no_deletes,
@@ -425,90 +417,100 @@ mod tests {
             for has_columns in [false, true] {
                 for with_row_id in [false, true] {
                     for make_deletions_null in [false, true] {
-                        let has_deletions =
-                            !matches!(deletion_vector, None | Some(DeletionVector::NoDeletions));
-                        if !has_columns && !has_deletions && !with_row_id {
-                            // This is an invalid case and should be prevented upstream,
-                            // no meaningful work is being done!
-                            continue;
-                        }
-                        if make_deletions_null && !with_row_id {
-                            // This is an invalid case and should be prevented upstream
-                            // we cannot make the row_id column null if it isn't present
-                            continue;
-                        }
-
-                        let mut datagen = lance_datagen::gen();
-                        if has_columns {
-                            datagen = datagen.col(
-                                Some("x".to_string()),
-                                lance_datagen::array::rand::<Int32Type>(),
-                            );
-                        }
-                        // 100 rows across 10 batches of 10 rows
-                        let data = batch_task_stream(
-                            datagen.into_reader_stream(RowCount::from(10), BatchCount::from(10)),
-                        );
-
-                        let config = RowIdAndDeletesConfig {
-                            params: ReadBatchParams::RangeFull,
-                            with_row_id,
-                            deletion_vector: deletion_vector.clone(),
-                            make_deletions_null,
-                            total_num_rows: 100,
-                        };
-                        let stream = super::wrap_with_row_id_and_delete(data, 0, config);
-                        let batches = stream
-                            .buffered(1)
-                            .filter_map(|batch| {
-                                std::future::ready(
-                                    batch
-                                        .map(|batch| {
-                                            if batch.num_rows() == 0 {
-                                                None
-                                            } else {
-                                                Some(batch)
-                                            }
-                                        })
-                                        .transpose(),
-                                )
-                            })
-                            .try_collect::<Vec<_>>()
-                            .await
-                            .unwrap();
-
-                        let total_num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
-                        let total_num_nulls = if make_deletions_null {
-                            batches
-                                .iter()
-                                .map(|b| b[ROW_ID].null_count())
-                                .sum::<usize>()
-                        } else {
-                            0
-                        };
-                        let total_actually_deleted = total_num_nulls + (100 - total_num_rows);
-
-                        let expected_deletions = match &deletion_vector {
-                            None | Some(DeletionVector::NoDeletions) => 0,
-                            Some(DeletionVector::Bitmap(b)) => b.len() as usize,
-                            Some(DeletionVector::Set(s)) => s.len(),
-                        };
-                        assert_eq!(total_actually_deleted, expected_deletions);
-                        if expected_deletions > 0 && with_row_id {
-                            if make_deletions_null {
-                                assert_eq!(
-                                    batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
-                                    30
-                                );
+                        for frag_id in [0, 1] {
+                            let has_deletions = if let Some(dv) = &deletion_vector {
+                                !matches!(dv.as_ref(), DeletionVector::NoDeletions)
                             } else {
-                                assert_eq!(
-                                    batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
-                                    35
+                                false
+                            };
+                            if !has_columns && !has_deletions && !with_row_id {
+                                // This is an invalid case and should be prevented upstream,
+                                // no meaningful work is being done!
+                                continue;
+                            }
+                            if make_deletions_null && !with_row_id {
+                                // This is an invalid case and should be prevented upstream
+                                // we cannot make the row_id column null if it isn't present
+                                continue;
+                            }
+
+                            let mut datagen = lance_datagen::gen();
+                            if has_columns {
+                                datagen = datagen.col(
+                                    Some("x".to_string()),
+                                    lance_datagen::array::rand::<Int32Type>(),
                                 );
                             }
-                        }
-                        if !with_row_id {
-                            assert!(batches[0].column_by_name(ROW_ID).is_none());
+                            // 100 rows across 10 batches of 10 rows
+                            let data = batch_task_stream(
+                                datagen
+                                    .into_reader_stream(RowCount::from(10), BatchCount::from(10)),
+                            );
+
+                            let config = RowIdAndDeletesConfig {
+                                params: ReadBatchParams::RangeFull,
+                                with_row_id,
+                                deletion_vector: deletion_vector.clone(),
+                                make_deletions_null,
+                                total_num_rows: 100,
+                            };
+                            let stream = super::wrap_with_row_id_and_delete(data, frag_id, config);
+                            let batches = stream
+                                .buffered(1)
+                                .filter_map(|batch| {
+                                    std::future::ready(
+                                        batch
+                                            .map(|batch| {
+                                                if batch.num_rows() == 0 {
+                                                    None
+                                                } else {
+                                                    Some(batch)
+                                                }
+                                            })
+                                            .transpose(),
+                                    )
+                                })
+                                .try_collect::<Vec<_>>()
+                                .await
+                                .unwrap();
+
+                            let total_num_rows =
+                                batches.iter().map(|b| b.num_rows()).sum::<usize>();
+                            let total_num_nulls = if make_deletions_null {
+                                batches
+                                    .iter()
+                                    .map(|b| b[ROW_ID].null_count())
+                                    .sum::<usize>()
+                            } else {
+                                0
+                            };
+                            let total_actually_deleted = total_num_nulls + (100 - total_num_rows);
+
+                            let expected_deletions = match &deletion_vector {
+                                None => 0,
+                                Some(deletion_vector) => match deletion_vector.as_ref() {
+                                    DeletionVector::NoDeletions => 0,
+                                    DeletionVector::Bitmap(b) => b.len() as usize,
+                                    DeletionVector::Set(s) => s.len(),
+                                },
+                            };
+                            assert_eq!(total_actually_deleted, expected_deletions);
+                            if expected_deletions > 0 && with_row_id {
+                                if make_deletions_null {
+                                    assert_eq!(
+                                        batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
+                                        u64::from(RowAddress::new_from_parts(frag_id, 30))
+                                    );
+                                } else {
+                                    assert_eq!(
+                                        batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
+                                        u64::from(RowAddress::new_from_parts(frag_id, 35))
+                                    );
+                                }
+                            }
+                            if !with_row_id {
+                                assert!(batches[0].column_by_name(ROW_ID).is_none());
+                            }
                         }
                     }
                 }

@@ -453,7 +453,7 @@ impl SelfDescribingFileReader for FileReader {
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
         populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         let schema = manifest.schema;
-        let num_fields = schema.max_field_id().unwrap_or_default() + 1;
+        let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_from_reader(
             reader.path(),
             reader.clone(),
@@ -461,7 +461,7 @@ impl SelfDescribingFileReader for FileReader {
             schema,
             0,
             0,
-            num_fields as u32,
+            max_field_id,
             cache,
         )
         .await
@@ -512,9 +512,9 @@ mod tests {
         )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let fragments = vec![
-            Fragment::with_file(0, "path1", &schema, Some(10)),
-            Fragment::with_file(1, "path2", &schema, Some(15)),
-            Fragment::with_file(2, "path3", &schema, Some(20)),
+            Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
+            Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
+            Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
         ];
         let manifest = Manifest::new(schema, Arc::new(fragments));
 
@@ -561,24 +561,15 @@ mod tests {
         let fragments = vec![
             Fragment {
                 id: 0,
-                files: vec![DataFile {
-                    path: "path1".to_string(),
-                    fields: vec![0, 1, 2],
-                }],
+                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
                 deletion_file: None,
                 physical_rows: None,
             },
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile {
-                        path: "path2".to_string(),
-                        fields: vec![0, 1, 43],
-                    },
-                    DataFile {
-                        path: "path3".to_string(),
-                        fields: vec![2],
-                    },
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43]),
+                    DataFile::new_legacy_from_fields("path3", vec![2]),
                 ],
                 deletion_file: None,
                 physical_rows: None,

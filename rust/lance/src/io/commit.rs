@@ -852,14 +852,8 @@ mod tests {
             Fragment {
                 id: 0,
                 files: vec![
-                    DataFile {
-                        path: "path1".to_string(),
-                        fields: vec![0, 1, 2],
-                    },
-                    DataFile {
-                        path: "unused".to_string(),
-                        fields: vec![9],
-                    },
+                    DataFile::new_legacy_from_fields("path1", vec![0, 1, 2]),
+                    DataFile::new_legacy_from_fields("unused", vec![9]),
                 ],
                 deletion_file: None,
                 physical_rows: None,
@@ -867,14 +861,8 @@ mod tests {
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile {
-                        path: "path2".to_string(),
-                        fields: vec![0, 1, 2],
-                    },
-                    DataFile {
-                        path: "path3".to_string(),
-                        fields: vec![2],
-                    },
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
+                    DataFile::new_legacy_from_fields("path3", vec![2]),
                 ],
                 deletion_file: None,
                 physical_rows: None,
@@ -900,24 +888,15 @@ mod tests {
         let expected_fragments = vec![
             Fragment {
                 id: 0,
-                files: vec![DataFile {
-                    path: "path1".to_string(),
-                    fields: vec![0, 1, 10],
-                }],
+                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 10])],
                 deletion_file: None,
                 physical_rows: None,
             },
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile {
-                        path: "path2".to_string(),
-                        fields: vec![0, 1, 2],
-                    },
-                    DataFile {
-                        path: "path3".to_string(),
-                        fields: vec![10],
-                    },
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
+                    DataFile::new_legacy_from_fields("path3", vec![10]),
                 ],
                 deletion_file: None,
                 physical_rows: None,

@@ -104,6 +104,35 @@ def test_write_fragments(tmp_path: Path):
     assert progress.complete_called == 2
 
 
+def test_write_fragments_schema_holes(tmp_path: Path):
+    # Create table with 3 cols
+    data = pa.table({"a": range(3)})
+    dataset = write_dataset(data, tmp_path)
+    dataset.add_columns({"b": "a + 1"})
+    dataset.add_columns({"c": "a + 2"})
+    # Delete the middle column to create a hole in the field ids
+    dataset.drop_columns(["b"])
+
+    def get_field_ids(fragment):
+        return [id for f in fragment.data_files() for id in f.field_ids()]
+
+    field_ids = get_field_ids(dataset.get_fragments()[0])
+
+    data = pa.table({"a": range(3, 6), "c": range(5, 8)})
+    fragment = LanceFragment.create(tmp_path, data)
+    assert get_field_ids(fragment) == field_ids
+
+    data = pa.table({"a": range(6, 9), "c": range(8, 11)})
+    fragments = write_fragments(data, tmp_path)
+    assert len(fragments) == 1
+    assert get_field_ids(fragments[0]) == field_ids
+
+    operation = LanceOperation.Append([fragment, *fragments])
+    dataset = LanceDataset.commit(tmp_path, operation, read_version=dataset.version)
+
+    assert dataset.to_table().equals(pa.table({"a": range(9), "c": range(2, 11)}))
+
+
 def test_write_fragment_with_progress(tmp_path: Path):
     df = pd.DataFrame({"a": [10 * 10]})
     progress = ProgressForTest()
@@ -154,8 +183,12 @@ def test_dataset_progress(tmp_path: Path):
 
     assert metadata["id"] == 0
     assert len(metadata["files"]) == 1
-
-    assert fragment == FragmentMetadata.from_json(json.dumps(metadata))
+    # Fragments aren't exactly equal, because the file was written before
+    # physical_rows was known.
+    assert (
+        fragment.data_files()
+        == FragmentMetadata.from_json(json.dumps(metadata)).data_files()
+    )
 
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=failing_write, args=(progress_uri, dataset_uri))
@@ -186,6 +219,8 @@ def test_dataset_progress(tmp_path: Path):
 
 
 def test_fragment_meta():
+    # Intentionally leaving off column_indices / version fields to make sure
+    # we can handle backwards compatibility (though not clear we need to)
     data = {
         "id": 0,
         "files": [
@@ -203,7 +238,9 @@ def test_fragment_meta():
     assert meta.data_files()[1].path() == "1.lance"
 
     assert repr(meta) == (
-        'Fragment { id: 0, files: [DataFile { path: "0.lance", fields: [0] },'
-        ' DataFile { path: "1.lance", fields: [1] }], deletion_file: None,'
-        " physical_rows: Some(100) }"
+        'Fragment { id: 0, files: [DataFile { path: "0.lance", fields: [0], '
+        "column_indices: [], file_major_version: 0, file_minor_version: 0 }, "
+        'DataFile { path: "1.lance", fields: [1], column_indices: [], '
+        "file_major_version: 0, file_minor_version: 0 }], deletion_file: None, "
+        "physical_rows: Some(100) }"
     )

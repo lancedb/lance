@@ -531,9 +531,13 @@ mod tests {
 
         let writer = obj_store.create(&tmp_path).await.unwrap();
 
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
+
         let mut file_writer = FileWriter::try_new(
             writer,
-            (*reader.schema()).clone(),
+            tmp_path.to_string(),
+            lance_schema,
             FileWriterOptions::default(),
         )
         .unwrap();

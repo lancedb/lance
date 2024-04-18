@@ -52,6 +52,7 @@ from .lance import (
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .optimize import Compaction
+from .schema import LanceSchema
 from .util import td_to_micros
 
 if TYPE_CHECKING:
@@ -327,6 +328,13 @@ class LanceDataset(pa.dataset.Dataset):
         The pyarrow Schema for this dataset
         """
         return self._ds.schema
+
+    @property
+    def lance_schema(self) -> "LanceSchema":
+        """
+        The LanceSchema for this dataset
+        """
+        return self._ds.lance_schema
 
     def to_table(
         self,
@@ -1812,8 +1820,9 @@ class LanceOperation:
         ----------
         fragments: iterable of FragmentMetadata
             The fragments that make up the new dataset.
-        schema: pyarrow.Schema
-            The schema of the new dataset.
+        schema: LanceSchema or pyarrow.Schema
+            The schema of the new dataset. Passing a LanceSchema is preferred,
+            and passing a pyarrow.Schema is deprecated.
 
         Warning
         -------
@@ -1843,9 +1852,9 @@ class LanceOperation:
         ...     return pa.record_batch([doubled], ["a_doubled"])
         >>> fragments = []
         >>> for fragment in dataset.get_fragments():
-        ...     new_fragment = fragment.add_columns(double_a, columns=['a'])
+        ...     new_fragment, new_schema = fragment.merge_columns(double_a,
+        ...                                                       columns=['a'])
         ...     fragments.append(new_fragment)
-        >>> new_schema = table.schema.append(pa.field("a_doubled", pa.int64()))
         >>> operation = lance.LanceOperation.Merge(fragments, new_schema)
         >>> dataset = lance.LanceDataset.commit("example", operation,
         ...                                     read_version=dataset.version)
@@ -1858,13 +1867,20 @@ class LanceOperation:
         """
 
         fragments: Iterable[FragmentMetadata]
-        schema: pa.Schema
+        schema: LanceSchema | pa.Schema
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.fragments)
 
         def _to_inner(self):
             raw_fragments = [f._metadata for f in self.fragments]
+            if isinstance(self.schema, pa.Schema):
+                warnings.warn(
+                    "Passing a pyarrow.Schema to Merge is deprecated. "
+                    "Please use a LanceSchema instead.",
+                    DeprecationWarning,
+                )
+                self.schema = LanceSchema.from_pyarrow(self.schema)
             return _Operation.merge(raw_fragments, self.schema)
 
     @dataclass
