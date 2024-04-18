@@ -210,7 +210,6 @@ impl HNSWBuilder {
     fn search_level(
         &self,
         ep: &[OrderedNode],
-        query: &[f32],
         level: u16,
         dist_calc: &dyn DistCalculator,
     ) -> Result<(Vec<OrderedNode>, Vec<OrderedNode>)> {
