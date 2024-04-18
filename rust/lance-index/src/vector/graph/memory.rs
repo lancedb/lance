@@ -71,6 +71,7 @@ struct InMemoryDistanceCal {
 }
 
 impl DistCalculator for InMemoryDistanceCal {
+    #[inline]
     fn distance(&self, id: u32) -> f32 {
         let vector = self.vectors.row(id as usize).unwrap();
         self.metric_type.func()(&self.query, vector)
