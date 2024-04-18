@@ -121,6 +121,9 @@ pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray>;
 }
 
+/// A task to create a page of data
+pub type EncodeTask = BoxFuture<'static, Result<EncodedPage>>;
+
 /// Top level encoding trait to code any Arrow array type into one or more pages.
 ///
 /// The field encoder implements buffering and encoding of a single input column
@@ -143,12 +146,9 @@ pub trait FieldEncoder: Send {
     /// than a single disk page.
     ///
     /// It could also return an empty Vec if there is not enough data yet to encode any pages.
-    fn maybe_encode(
-        &mut self,
-        array: ArrayRef,
-    ) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>>;
+    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
-    fn flush(&mut self) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>>;
+    fn flush(&mut self) -> Result<Vec<EncodeTask>>;
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
 }

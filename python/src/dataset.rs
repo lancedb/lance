@@ -1146,6 +1146,9 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(maybe_nbytes) = options.get_item("max_bytes_per_file")? {
             p.max_bytes_per_file = usize::extract(maybe_nbytes)?;
         }
+        if let Some(use_experimental_writer) = options.get_item("use_experimental_writer")? {
+            p.use_experimental_writer = use_experimental_writer.extract()?;
+        }
         if let Some(progress) = options.get_item("progress")? {
             if !progress.is_none() {
                 p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
