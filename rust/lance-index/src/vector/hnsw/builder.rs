@@ -190,7 +190,6 @@ impl HNSWBuilder {
             ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
         }
 
-        let mut ep = vec![ep];
         for level in (0..=target_level).rev() {
             self.level_count[level as usize] += 1;
 
@@ -200,7 +199,7 @@ impl HNSWBuilder {
                 self.prune(neighbor.id, level);
             }
 
-            ep[0] = candidates[0].clone();
+            ep = candidates[0].clone();
         }
 
         Ok(())
@@ -208,7 +207,7 @@ impl HNSWBuilder {
 
     fn search_level(
         &self,
-        ep: &[OrderedNode],
+        ep: &OrderedNode,
         level: u16,
         dist_calc: &dyn DistCalculator,
     ) -> Result<(Vec<OrderedNode>, Vec<OrderedNode>)> {
