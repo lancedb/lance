@@ -72,7 +72,6 @@ tempfile.workspace = true
 tracing.workspace = true
 lazy_static = { workspace = true }
 async_cell = "0.2.2"
-path-absolutize = "3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
