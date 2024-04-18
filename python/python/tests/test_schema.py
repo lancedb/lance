@@ -10,7 +10,12 @@ from lance.schema import LanceSchema
 
 
 def test_lance_schema(tmp_path: Path):
-    data = pa.table({"x": range(2)})
+    # Include nested fields to test the reconstruction of the schema
+    data = pa.table({
+        "x": range(2),
+        "s": [{"a": 1, "b": "hello"}, {"a": 2, "b": "world"}],
+        "y": [[1.0, 2.0], [3.0, 4.0]],
+    })
     dataset = lance.write_dataset(data, tmp_path)
 
     schema = dataset.lance_schema
