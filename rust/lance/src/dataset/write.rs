@@ -22,6 +22,9 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
+use crate::Dataset;
+
+use super::builder::DatasetBuilder;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::DATA_DIR;
 
@@ -127,13 +130,46 @@ pub async fn write_fragments(
     data: impl RecordBatchReader + Send + 'static,
     params: WriteParams,
 ) -> Result<Vec<Fragment>> {
-    let (object_store, base) = ObjectStore::from_uri_and_params(
-        dataset_uri,
-        &params.store_params.clone().unwrap_or_default(),
-    )
-    .await?;
+    let (dataset, object_store, base) = if matches!(params.mode, WriteMode::Append) {
+        match DatasetBuilder::from_uri(dataset_uri)
+            .with_write_params(params.clone())
+            .load()
+            .await
+        {
+            Ok(dataset) => {
+                let store = dataset.object_store().clone();
+                let base = dataset.uri().clone();
+                (Some(dataset), store, base)
+            }
+            Err(Error::DatasetNotFound { .. }) => {
+                let (object_store, base) = ObjectStore::from_uri_and_params(
+                    dataset_uri,
+                    &params.store_params.clone().unwrap_or_default(),
+                )
+                .await?;
+                (None, object_store, base)
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        let (object_store, base) = ObjectStore::from_uri_and_params(
+            dataset_uri,
+            &params.store_params.clone().unwrap_or_default(),
+        )
+        .await?;
+        (None, object_store, base)
+    };
+
     let (stream, schema) = reader_to_stream(Box::new(data)).await?;
-    write_fragments_internal(Arc::new(object_store), &base, &schema, stream, params).await
+    write_fragments_internal(
+        dataset.as_ref(),
+        Arc::new(object_store),
+        &base,
+        &schema,
+        stream,
+        params,
+    )
+    .await
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -147,6 +183,7 @@ pub async fn write_fragments(
 /// DataFusion type.
 #[instrument(level = "debug", skip_all)]
 pub async fn write_fragments_internal(
+    dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
@@ -155,6 +192,21 @@ pub async fn write_fragments_internal(
 ) -> Result<Vec<Fragment>> {
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
+
+    let schema = if let Some(dataset) = dataset {
+        if matches!(params.mode, WriteMode::Append) {
+            // Append mode, so we need to check compatibility
+            schema.check_compatible(dataset.schema(), &Default::default())?;
+            // Use the schema from the dataset, because it has the correct
+            // field ids.
+            dataset.schema()
+        } else {
+            schema
+        }
+    } else {
+        schema
+    };
+
     // TODO: When writing v2 we could consider skipping this chunking step.  However, leaving in
     // for now as it doesn't hurt anything
     let mut buffered_reader = chunk_stream(data, params.max_rows_per_group);
@@ -343,10 +395,12 @@ impl WriterGenerator {
 mod tests {
     use super::*;
 
-    use arrow_array::Int32Array;
-    use arrow_schema::{DataType, Schema as ArrowSchema};
+    use arrow_array::{Int32Array, StructArray};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
+    use lance_file::reader::FileReader;
+    use lance_io::traits::Reader;
 
     #[tokio::test]
     async fn test_chunking_large_batches() {
@@ -462,6 +516,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let fragments = write_fragments_internal(
+            None,
             object_store,
             &Path::from("test"),
             &schema,
@@ -504,6 +559,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let fragments = write_fragments_internal(
+            None,
             object_store,
             &Path::from("test"),
             &schema,
@@ -517,5 +573,88 @@ mod tests {
         assert_eq!(fragment.files.len(), 1);
         assert_eq!(fragment.physical_rows, Some(1024));
         assert_eq!(fragment.files[0].file_minor_version, 3);
+    }
+
+    #[tokio::test]
+    async fn test_file_v1_schema_order() {
+        // Create a schema where fields ids are not in order and contain holes.
+        // Also first field id is a struct.
+        let struct_fields = Fields::from(vec![ArrowField::new("b", DataType::Int32, false)]);
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("d", DataType::Int32, false),
+            ArrowField::new("a", DataType::Struct(struct_fields.clone()), false),
+        ]);
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        // Make schema:
+        // 0: a
+        // 1: a.b
+        // (hole at 2)
+        // 3: d
+        schema.mut_field_by_id(0).unwrap().id = 3;
+        schema.mut_field_by_id(1).unwrap().id = 0;
+        schema.mut_field_by_id(2).unwrap().id = 1;
+
+        let field_ids = schema.fields_pre_order().map(|f| f.id).collect::<Vec<_>>();
+        assert_eq!(field_ids, vec![3, 0, 1]);
+
+        let data = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![Arc::new(Int32Array::from(vec![3, 4]))],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            use_experimental_writer: false,
+            ..Default::default()
+        };
+        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(arrow_schema),
+            futures::stream::iter(std::iter::once(Ok(data.clone()))),
+        ));
+
+        let object_store = Arc::new(ObjectStore::memory());
+        let base_path = Path::from("test");
+        let fragments = write_fragments_internal(
+            None,
+            object_store.clone(),
+            &base_path,
+            &schema,
+            data_stream,
+            write_params,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fragments.len(), 1);
+        let fragment = &fragments[0];
+        assert_eq!(fragment.files.len(), 1);
+        assert_eq!(fragment.files[0].fields, vec![0, 1, 3]);
+
+        let path = base_path
+            .child(DATA_DIR)
+            .child(fragment.files[0].path.as_str());
+        let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
+        let reader = FileReader::try_new_from_reader(
+            &path,
+            file_reader,
+            None,
+            schema.clone(),
+            0,
+            0,
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.num_batches(), 1);
+        let batch = reader.read_batch(0, .., &schema, None).await.unwrap();
+        assert_eq!(batch, data);
     }
 }

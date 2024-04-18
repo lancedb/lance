@@ -232,6 +232,7 @@ impl UpdateJob {
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let new_fragments = write_fragments_internal(
+            Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema(),

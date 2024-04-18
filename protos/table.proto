@@ -198,7 +198,7 @@ message DataFile {
   // or it could be encoded into a single packed column.  To determine column indices
   // the column_indices property should be used instead.
   //
-  // In Lance v1 these ids must be sorted and contiguous.
+  // In Lance v1 these ids must be sorted but might not always be contiguous.
   repeated int32 fields = 2;
   // The top-level column indices for each field in the file.
   //

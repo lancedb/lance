@@ -453,7 +453,7 @@ impl SelfDescribingFileReader for FileReader {
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
         populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         let schema = manifest.schema;
-        let num_fields = schema.max_field_id().unwrap_or_default() + 1;
+        let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_from_reader(
             reader.path(),
             reader.clone(),
@@ -461,7 +461,7 @@ impl SelfDescribingFileReader for FileReader {
             schema,
             0,
             0,
-            num_fields as u32,
+            max_field_id,
             cache,
         )
         .await

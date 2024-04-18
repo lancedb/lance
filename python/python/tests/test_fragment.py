@@ -104,6 +104,35 @@ def test_write_fragments(tmp_path: Path):
     assert progress.complete_called == 2
 
 
+def test_write_fragments_schema_holes(tmp_path: Path):
+    # Create table with 3 cols
+    data = pa.table({"a": range(3)})
+    dataset = write_dataset(data, tmp_path)
+    dataset.add_columns({"b": "a + 1"})
+    dataset.add_columns({"c": "a + 2"})
+    # Delete the middle column to create a hole in the field ids
+    dataset.drop_columns(["b"])
+
+    def get_field_ids(fragment):
+        return [id for f in fragment.data_files() for id in f.field_ids()]
+
+    field_ids = get_field_ids(dataset.get_fragments()[0])
+
+    data = pa.table({"a": range(3, 6), "c": range(5, 8)})
+    fragment = LanceFragment.create(tmp_path, data)
+    assert get_field_ids(fragment) == field_ids
+
+    data = pa.table({"a": range(6, 9), "c": range(8, 11)})
+    fragments = write_fragments(data, tmp_path)
+    assert len(fragments) == 1
+    assert get_field_ids(fragments[0]) == field_ids
+
+    operation = LanceOperation.Append([fragment, *fragments])
+    dataset = LanceDataset.commit(tmp_path, operation, read_version=dataset.version)
+
+    assert dataset.to_table().equals(pa.table({"a": range(9), "c": range(2, 11)}))
+
+
 def test_write_fragment_with_progress(tmp_path: Path):
     df = pd.DataFrame({"a": [10 * 10]})
     progress = ProgressForTest()

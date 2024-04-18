@@ -141,6 +141,7 @@ class LanceFragment(pa.dataset.Fragment):
         schema: Optional[pa.Schema] = None,
         max_rows_per_group: int = 1024,
         progress: Optional[FragmentWriteProgress] = None,
+        mode: str = "append",
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -167,6 +168,10 @@ class LanceFragment(pa.dataset.Fragment):
             *Experimental API*. Progress tracking for writing the fragment. Pass
             a custom class that defines hooks to be called when each fragment is
             starting to write and finishing writing.
+        mode: str, default "append"
+            The write mode. If "append" is specified, the data will be checked
+            against the existing dataset's schema. Otherwise, pass "create" or
+            "overwrite" to assign new field ids to the schema.
 
         See Also
         --------
@@ -204,6 +209,7 @@ class LanceFragment(pa.dataset.Fragment):
             reader,
             max_rows_per_group=max_rows_per_group,
             progress=progress,
+            mode=mode,
         )
         return FragmentMetadata(inner_meta.json())
 
@@ -487,6 +493,7 @@ def write_fragments(
     dataset_uri: Union[str, Path],
     schema: Optional[pa.Schema] = None,
     *,
+    mode: str = "append",
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
@@ -509,6 +516,10 @@ def write_fragments(
     schema : pa.Schema, optional
         The schema of the data. If not specified, the schema will be inferred
         from the data.
+    mode : str, default "append"
+        The write mode. If "append" is specified, the data will be checked
+        against the existing dataset's schema. Otherwise, pass "create" or
+        "overwrite" to assign new field ids to the schema.
     max_rows_per_file : int, default 1024 * 1024
         The maximum number of rows per data file.
     max_rows_per_group : int, default 1024
@@ -548,6 +559,7 @@ def write_fragments(
     fragments = _write_fragments(
         dataset_uri,
         reader,
+        mode=mode,
         max_rows_per_file=max_rows_per_file,
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,

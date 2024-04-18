@@ -36,10 +36,11 @@ use lance_table::utils::stream::{
 use snafu::{location, Location};
 use uuid::Uuid;
 
+use super::builder::DatasetBuilder;
 use super::hash_joiner::HashJoiner;
 use super::scanner::Scanner;
 use super::updater::Updater;
-use super::WriteParams;
+use super::{WriteMode, WriteParams};
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 
@@ -226,6 +227,28 @@ impl FileFragment {
         let reader = Box::new(reader);
         let (stream, schema) = reader_to_stream(reader).await?;
 
+        let schema = if matches!(params.mode, WriteMode::Append) {
+            // TODO: we need to pass down params somehow.
+            match DatasetBuilder::from_uri(dataset_uri).load().await {
+                Ok(dataset) => {
+                    schema.check_compatible(dataset.schema(), &Default::default())?;
+                    // Use the schema from the dataset, because it has the correct
+                    // field ids.
+                    dataset.schema().clone()
+                }
+                Err(Error::DatasetNotFound { .. }) => {
+                    // If the dataset does not exist, we can use the schema from
+                    // the reader.
+                    schema
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        } else {
+            schema
+        };
+
         if schema.fields.is_empty() {
             return Err(Error::invalid_input(
                 "Cannot write with an empty schema.",
@@ -349,7 +372,7 @@ impl FileFragment {
             let data_file_schema = data_file.schema(full_schema);
             let projection = projection.unwrap_or(full_schema);
             let schema_per_file = data_file_schema.intersection(projection)?;
-            let num_fields = data_file.fields.len() as u32;
+            let max_field_id = data_file.fields.iter().max().unwrap();
             if with_row_id || !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
@@ -358,8 +381,8 @@ impl FileFragment {
                     &path,
                     self.schema().clone(),
                     self.id() as u32,
-                    field_id_offset,
-                    num_fields,
+                    field_id_offset as i32,
+                    *max_field_id,
                     Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
