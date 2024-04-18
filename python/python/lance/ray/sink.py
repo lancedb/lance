@@ -239,10 +239,12 @@ class LanceFragmentWriter:
             max_rows_per_file=self.max_rows_per_file,
             max_rows_per_group=self.max_rows_per_group,
         )
-        return pa.Table.from_pydict({
-            "fragment": [pickle.dumps(fragment) for fragment, _ in fragments],
-            "schema": [pickle.dumps(schema) for _, schema in fragments],
-        })
+        return pa.Table.from_pydict(
+            {
+                "fragment": [pickle.dumps(fragment) for fragment, _ in fragments],
+                "schema": [pickle.dumps(schema) for _, schema in fragments],
+            }
+        )
 
 
 class LanceCommitter(_BaseLanceDatasink):
