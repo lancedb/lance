@@ -152,14 +152,16 @@ class LanceFileWriter:
         else:
             self._writer.write_batch(batch)
 
-    def close(self) -> None:
+    def close(self) -> int:
         """
         Write the file metadata and close the file
+
+        Returns the number of rows written to the file
         """
         if self.closed:
             return
         self.closed = True
-        self._writer.finish()
+        return self._writer.finish()
 
     def __enter__(self) -> "LanceFileWriter":
         return self

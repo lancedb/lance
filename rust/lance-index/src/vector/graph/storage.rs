@@ -6,7 +6,7 @@ use std::any::Any;
 use lance_linalg::distance::MetricType;
 
 pub trait DistCalculator {
-    fn distance(&self, ids: &[u32]) -> Vec<f32>;
+    fn distance(&self, id: u32) -> f32;
 }
 
 /// Vector Storage is the abstraction to store the vectors.

@@ -196,6 +196,7 @@
 //!  * The "batch overhead" is very small in Lance compared to other formats because it has no
 //!    relation to the way the data is stored.
 
+use std::future::Future;
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -204,11 +205,10 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::BytesMut;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use log::trace;
 use snafu::{location, Location};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use lance_core::{Error, Result};
 
@@ -237,6 +237,7 @@ pub struct PageInfo {
 /// Metadata describing a column in a file
 ///
 /// This is typically created by reading the metadata section of a Lance file
+#[derive(Debug)]
 pub struct ColumnInfo {
     /// The metadata for each page in the column
     pub page_infos: Vec<Arc<PageInfo>>,
@@ -538,6 +539,11 @@ impl DecodeBatchScheduler {
     }
 }
 
+pub struct ReadBatchTask<Fut: Future<Output = Result<RecordBatch>>> {
+    pub task: Fut,
+    pub num_rows: u32,
+}
+
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct BatchDecodeStream {
     scheduled: mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
@@ -601,16 +607,26 @@ impl BatchDecodeStream {
         Ok(RecordBatch::from(struct_arr.as_struct()))
     }
 
-    pub fn into_stream(self) -> BoxStream<'static, JoinHandle<Result<RecordBatch>>> {
+    pub fn into_stream(
+        self,
+    ) -> BoxStream<'static, ReadBatchTask<impl Future<Output = Result<RecordBatch>>>> {
         let stream = futures::stream::unfold(self, |mut slf| async move {
             let next_task = slf.next_batch_task().await;
             let next_task = next_task.transpose().map(|next_task| {
-                tokio::spawn(async move {
+                let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
+                let task = tokio::spawn(async move {
                     let next_task = next_task?;
                     Self::task_to_batch(next_task)
-                })
+                });
+                (task, num_rows)
             });
-            next_task.map(|next_task| (next_task, slf))
+            next_task.map(|(task, num_rows)| {
+                let next_task = ReadBatchTask {
+                    task: task.map(|join_wrapper| join_wrapper.unwrap()),
+                    num_rows,
+                };
+                (next_task, slf)
+            })
         });
         stream.boxed()
     }

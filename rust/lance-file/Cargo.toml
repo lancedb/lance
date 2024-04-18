@@ -42,6 +42,7 @@ tracing.workspace = true
 rand.workspace = true
 tempfile.workspace = true
 proptest.workspace = true
+pretty_assertions.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

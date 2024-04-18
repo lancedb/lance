@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use arrow::compute::concat;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{
     cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, UInt32Array,
@@ -142,7 +143,7 @@ impl KMeans {
 #[pyclass(name = "_Hnsw")]
 pub struct Hnsw {
     hnsw: lance_index::vector::hnsw::HNSW,
-    fsl: Arc<dyn Array>,
+    vectors: Arc<dyn Array>,
 }
 
 #[pymethods]
@@ -179,10 +180,13 @@ impl Hnsw {
             }
             data.push(Arc::new(FixedSizeListArray::from(vectors)));
         }
+        let array_refs = data.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let vectors = concat(&array_refs).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        std::mem::drop(data);
 
-        let (hnsw, fsl) =
-            build_hnsw_model(params, data).map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(Self { hnsw, fsl })
+        let hnsw = build_hnsw_model(params, vectors.clone())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(Self { hnsw, vectors })
     }
 
     #[pyo3(signature = (file_path))]
@@ -207,7 +211,7 @@ impl Hnsw {
     }
 
     fn vectors(&self, py: Python) -> PyResult<PyObject> {
-        self.fsl.to_data().to_pyarrow(py)
+        self.vectors.to_data().to_pyarrow(py)
     }
 }
 
@@ -227,6 +231,9 @@ pub fn build_sq_storage(
         }
         row_ids_arr.push(Arc::new(UInt64Array::from(row_ids)));
     }
+    let row_ids_refs = row_ids_arr.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+    let row_ids = concat(&row_ids_refs).map_err(|e| PyIOError::new_err(e.to_string()))?;
+    std::mem::drop(row_ids_arr);
 
     let vectors = Arc::new(FixedSizeListArray::from(ArrayData::from_pyarrow(vectors)?));
 
@@ -238,7 +245,7 @@ pub fn build_sq_storage(
         MetricType::L2,
         lower_bound..upper_bound,
     );
-    let storage = sq::build_sq_storage(MetricType::L2, row_ids_arr, vectors, quantizer)
+    let storage = sq::build_sq_storage(MetricType::L2, row_ids, vectors, quantizer)
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
     storage.batch().clone().to_pyarrow(py)
 }
