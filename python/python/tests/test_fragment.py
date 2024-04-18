@@ -86,9 +86,11 @@ def test_scan_fragment_with_dynamic_projection(tmp_path: Path):
 
 def test_write_fragments(tmp_path: Path):
     # This will be split across two files if we set the max_bytes_per_file to 1024
-    tab = pa.table({
-        "a": pa.array(range(1024)),
-    })
+    tab = pa.table(
+        {
+            "a": pa.array(range(1024)),
+        }
+    )
     progress = ProgressForTest()
     fragments = write_fragments(
         tab,

@@ -58,8 +58,8 @@ jobs:
         pip install torch --index-url https://download.pytorch.org/whl/cpu
     - name: Lint Python
       run: |
-        ruff format --preview --check python
-        ruff check --preview python
+        ruff format --check python
+        ruff check python
     - name: Install dependencies
       run: |
         sudo apt update

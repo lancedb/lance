@@ -221,10 +221,12 @@ def compute_partitions(
         with_row_id=True,
         columns=[column],
     )
-    output_schema = pa.schema([
-        pa.field("row_id", pa.uint64()),
-        pa.field("partition", pa.uint32()),
-    ])
+    output_schema = pa.schema(
+        [
+            pa.field("row_id", pa.uint64()),
+            pa.field("partition", pa.uint32()),
+        ]
+    )
 
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():

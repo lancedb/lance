@@ -189,10 +189,12 @@ def test_sample_batches(tmp_path: Path):
 
 def test_sample_batches_with_filter(tmp_path: Path):
     NUM_ROWS = 10000
-    tbl = pa.Table.from_pydict({
-        "id": range(NUM_ROWS),
-        "filterme": [i % 2 for i in range(NUM_ROWS)],
-    })
+    tbl = pa.Table.from_pydict(
+        {
+            "id": range(NUM_ROWS),
+            "filterme": [i % 2 for i in range(NUM_ROWS)],
+        }
+    )
 
     lance.write_dataset(tbl, tmp_path, max_rows_per_file=2000)
 
