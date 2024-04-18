@@ -8,7 +8,7 @@ use tokio::runtime::{Builder, Runtime};
 use tracing::Span;
 
 lazy_static::lazy_static! {
-    static ref CPU_RUNTIME: Runtime = Builder::new_multi_thread()
+    pub static ref CPU_RUNTIME: Runtime = Builder::new_multi_thread()
         .thread_name("lance-cpu")
         .max_blocking_threads(num_cpus::get())
         .build()
