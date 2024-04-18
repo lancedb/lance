@@ -173,7 +173,7 @@ pub(super) fn beam_search(
     graph: &dyn Graph,
     start: &[OrderedNode],
     k: usize,
-    dist_calc: Arc<dyn DistCalculator>,
+    dist_calc: &dyn DistCalculator,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
 ) -> Result<Vec<OrderedNode>> {
     let mut visited: HashSet<_> = start.iter().map(|node| node.id).collect();
@@ -255,7 +255,7 @@ pub(super) fn beam_search(
 pub(super) fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
-    dist_calc: Arc<dyn DistCalculator>,
+    dist_calc: &dyn DistCalculator,
 ) -> Result<OrderedNode> {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;

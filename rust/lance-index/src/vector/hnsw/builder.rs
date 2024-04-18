@@ -198,13 +198,10 @@ impl HNSWBuilder {
         //    ep = Select-Neighbors(W, 1)
         //  }
         // ```
-        let dist_calc: Arc<dyn DistCalculator> = self
-            .vectors
-            .dist_calculator(self.vectors.vector(node))
-            .into();
+        let dist_calc = self.vectors.dist_calculator(self.vectors.vector(node));
         for level in (target_level + 1..self.params.max_level).rev() {
             let cur_level = HnswLevelView::new(level, self);
-            ep = greedy_search(&cur_level, ep, dist_calc.clone())?;
+            ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
         }
 
         let mut ep = vec![ep];
@@ -212,7 +209,7 @@ impl HNSWBuilder {
             self.level_count[level as usize] += 1;
 
             let (candidates, neighbors) =
-                self.search_level(&ep, self.vectors.vector(node), level, dist_calc.clone())?;
+                self.search_level(&ep, self.vectors.vector(node), level, dist_calc.as_ref())?;
             for neighbor in neighbors {
                 self.connect(node, neighbor.id, neighbor.dist, level);
                 self.prune(neighbor.id, level);
@@ -229,7 +226,7 @@ impl HNSWBuilder {
         ep: &[OrderedNode],
         query: &[f32],
         level: u16,
-        dist_calc: Arc<dyn DistCalculator>,
+        dist_calc: &dyn DistCalculator,
     ) -> Result<(Vec<OrderedNode>, Vec<OrderedNode>)> {
         let cur_level = HnswLevelView::new(level, self);
         let candidates = beam_search(&cur_level, ep, self.params.ef_construction, dist_calc, None)?;

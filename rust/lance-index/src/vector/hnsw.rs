@@ -36,9 +36,7 @@ use self::builder::HNSW_METADATA_KEY;
 use super::graph::memory::InMemoryVectorStorage;
 use super::graph::OrderedNode;
 use super::graph::{
-    greedy_search,
-    storage::{DistCalculator, VectorStorage},
-    Graph, OrderedFloat, NEIGHBORS_COL, NEIGHBORS_FIELD,
+    greedy_search, storage::VectorStorage, Graph, OrderedFloat, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use super::ivf::storage::IvfData;
 use crate::vector::graph::beam_search;
@@ -349,8 +347,7 @@ impl HNSW {
         ef: usize,
         bitset: Option<RoaringBitmap>,
     ) -> Result<Vec<OrderedNode>> {
-        let dist_calc: Arc<dyn DistCalculator> =
-            self.levels[0].storage().dist_calculator(query).into();
+        let dist_calc = self.levels[0].storage().dist_calculator(query);
         let mut ep = OrderedNode::new(
             self.entry_point,
             dist_calc.distance(self.entry_point).into(),
@@ -358,10 +355,16 @@ impl HNSW {
         let num_layers = self.levels.len();
 
         for level in self.levels.iter().rev().take(num_layers - 1) {
-            ep = greedy_search(level, ep, dist_calc.clone())?;
+            ep = greedy_search(level, ep, dist_calc.as_ref())?;
         }
 
-        let candidates = beam_search(&self.levels[0], &[ep], ef, dist_calc, bitset.as_ref())?;
+        let candidates = beam_search(
+            &self.levels[0],
+            &[ep],
+            ef,
+            dist_calc.as_ref(),
+            bitset.as_ref(),
+        )?;
         Ok(select_neighbors(&candidates, k).cloned().collect())
     }
 
