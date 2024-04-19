@@ -62,7 +62,7 @@ tests = [
     "h5py<3.11",
     "tqdm",
 ]
-dev = ["ruff==0.2.2"]
+dev = ["ruff==0.4.1"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
 ray = ["ray[data]; python_version<'3.12'"]
