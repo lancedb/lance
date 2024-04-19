@@ -30,7 +30,7 @@ public class Fragment {
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
          ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
-      return new FragmentMetadata(createWithFfiArray(datasetUri, arrowArray.memoryAddress(),
+      return FragmentMetadata.fromJson(createWithFfiArray(datasetUri, arrowArray.memoryAddress(),
           arrowSchema.memoryAddress(), fragmentId, params.getMaxRowsPerFile(),
           params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode()));
     }
@@ -39,16 +39,27 @@ public class Fragment {
   /** Create a fragment from the given data. */
   public static FragmentMetadata create(String datasetUri, ArrowArrayStream stream,
       Optional<Integer> fragmentId, WriteParams params) {
-    return new FragmentMetadata(createWithFfiStream(datasetUri, stream.memoryAddress(), fragmentId,
+    return FragmentMetadata.fromJson(createWithFfiStream(datasetUri,
+        stream.memoryAddress(), fragmentId,
         params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
         params.getMaxBytesPerFile(), params.getMode()));
   }
 
+  /**
+   * Create a fragment from the given arrow array and schema.
+   *
+   * @return the json serialized fragment metadata
+   */
   private static native String createWithFfiArray(String datasetUri,
       long arrowArrayMemoryAddress, long arrowSchemaMemoryAddress, Optional<Integer> fragmentId,
       Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile, Optional<String> mode);
 
+  /**
+   * Create a fragment from the given arrow stream.
+   *
+   * @return the json serialized fragment metadata
+   */
   private static native String createWithFfiStream(String datasetUri, long arrowStreamMemoryAddress,
       Optional<Integer> fragmentId, Optional<Integer> maxRowsPerFile,
       Optional<Integer> maxRowsPerGroup, Optional<Long> maxBytesPerFile,

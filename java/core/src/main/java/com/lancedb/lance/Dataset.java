@@ -144,7 +144,7 @@ public class Dataset implements Closeable {
     //
     // We do not need to close Fragments.
     return this.getJsonFragments().stream().map(jsonFragment 
-        -> new DatasetFragment(this, new FragmentMetadata(jsonFragment)))
+        -> new DatasetFragment(this, FragmentMetadata.fromJson(jsonFragment)))
         .collect(Collectors.toList());
   }
 

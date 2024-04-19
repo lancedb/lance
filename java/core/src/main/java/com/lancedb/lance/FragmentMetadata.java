@@ -21,23 +21,44 @@ import org.json.JSONObject;
  * Matching to lance Fragment.
  * */
 public class FragmentMetadata {
+  private static final String ID_KEY = "id";
+  private static final String PHYSICAL_ROWS_KEY = "physical_rows";
   private final String jsonMetadata;
-  private final JSONObject metadata;
+  private final int id;
+  private final long physicalRows;
 
-  public FragmentMetadata(String jsonMetadata) {
+  private FragmentMetadata(String jsonMetadata, int id, long physicalRows) {
     this.jsonMetadata = jsonMetadata;
-    this.metadata = new JSONObject(jsonMetadata);
+    this.id = id;
+    this.physicalRows = physicalRows;
   }
 
   public int getId() {
-    return metadata.getInt("id");
+    return id;
   }
   
   public long getPhysicalRows() {
-    return metadata.getLong("physical_rows");
+    return physicalRows;
   }
 
   public String getJsonMetadata() {
     return jsonMetadata;
+  }
+
+  /**
+   * Creates the fragment metadata from json serialized string.
+   *
+   * @param jsonMetadata json metadata
+   * @return created fragment metadata
+   */
+  public static FragmentMetadata fromJson(String jsonMetadata) {
+    JSONObject metadata = new JSONObject(jsonMetadata);
+    if (!metadata.has(ID_KEY) || !metadata.has(PHYSICAL_ROWS_KEY)) {
+      throw new IllegalArgumentException(
+          String.format("Fragment metadata must have {} and {} but is {}",
+          ID_KEY, PHYSICAL_ROWS_KEY, jsonMetadata));
+    }
+    return new FragmentMetadata(jsonMetadata, metadata.getInt(ID_KEY),
+        metadata.getLong(PHYSICAL_ROWS_KEY));
   }
 }

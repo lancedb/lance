@@ -215,7 +215,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_commitAppend<'local>(
     let op = Operation::Append { fragments };
     let path_str: String = ok_or_throw!(env, path.extract(&mut env));
 
-    let read_version = ok_or_throw!(env, env.get_long_opt_u64(&read_version_obj));
+    let read_version = ok_or_throw!(env, env.get_u64_opt(&read_version_obj));
     let dataset = ok_or_throw!(env, BlockingDataset::commit(&path_str, op, read_version));
     dataset.into_java(&mut env)
 }

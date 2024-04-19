@@ -38,7 +38,7 @@ pub trait JNIEnvExt {
     fn get_long_opt(&mut self, obj: &JObject) -> Result<Option<i64>>;
 
     /// Get Option<u64> from Java Optional<Long>.
-    fn get_long_opt_u64(&mut self, obj: &JObject) -> Result<Option<u64>>;
+    fn get_u64_opt(&mut self, obj: &JObject) -> Result<Option<u64>>;
 
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
     where
@@ -108,7 +108,7 @@ impl JNIEnvExt for JNIEnv<'_> {
         })
     }
 
-    fn get_long_opt_u64(&mut self, obj: &JObject) -> Result<Option<u64>> {
+    fn get_u64_opt(&mut self, obj: &JObject) -> Result<Option<u64>> {
         self.get_optional(obj, |env, inner_obj| {
             let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
             let java_long_obj = java_obj_gen.l()?;
