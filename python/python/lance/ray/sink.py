@@ -53,6 +53,7 @@ def _write_fragment(
     schema: Optional[pa.Schema] = None,
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,  # Only useful for v1 writer.
+    use_experimental_writer: bool = False,
 ) -> Tuple[FragmentMetadata, pa.Schema]:
     from ..dependencies import _PANDAS_AVAILABLE
     from ..dependencies import pandas as pd
@@ -73,7 +74,6 @@ def _write_fragment(
             tbl = _pd_to_arrow(block, schema)
             yield from tbl.to_batches()
 
-    # TODO: use format v2.
     reader = pa.RecordBatchReader.from_batches(schema, record_batch_converter())
     fragments = write_fragments(
         reader,
@@ -81,6 +81,7 @@ def _write_fragment(
         schema=schema,
         max_rows_per_file=max_rows_per_file,
         max_rows_per_group=max_rows_per_group,
+        use_experimental_writer=use_experimental_writer,
     )
     return [(fragment, schema) for fragment in fragments]
 
@@ -152,7 +153,9 @@ class LanceDatasink(_BaseLanceDatasink):
         Choices are 'append', 'create', 'overwrite'.
     max_rows_per_file : int, optional
         The maximum number of rows per file. Default is 1024 * 1024.
-
+    use_experimental_writer : bool, optional
+        Set true to use v2 writer. Default is False now. Will be removed once
+        v2 writer become the default.
     """
 
     NAME = "Lance"
@@ -163,12 +166,14 @@ class LanceDatasink(_BaseLanceDatasink):
         schema: Optional[pa.Schema] = None,
         mode: Literal["create", "append", "overwrite"] = "create",
         max_rows_per_file: int = 1024 * 1024,
+        use_experimental_writer: bool = True,
         *args,
         **kwargs,
     ):
         super().__init__(uri, schema=schema, mode=mode, *args, **kwargs)
 
         self.max_rows_per_file = max_rows_per_file
+        self.use_experimental_writer = use_experimental_writer
         # if mode is append, read_version is read from existing dataset.
         self.read_version: int | None = None
 
@@ -193,6 +198,7 @@ class LanceDatasink(_BaseLanceDatasink):
             self.uri,
             schema=self.schema,
             max_rows_per_file=self.max_rows_per_file,
+            use_experimental_writer=self.use_experimental_writer,
         )
         return [
             (pickle.dumps(fragment), pickle.dumps(schema))
@@ -217,6 +223,7 @@ class LanceFragmentWriter:
         schema: Optional[pa.Schema] = None,
         max_rows_per_group: int = 1024,  # Only useful for v1 writer.
         max_rows_per_file: int = 1024 * 1024,
+        use_experimental_writer: bool = True,
     ):
         self.uri = uri
         self.schema = schema
@@ -224,6 +231,7 @@ class LanceFragmentWriter:
 
         self.max_rows_per_group = max_rows_per_group
         self.max_rows_per_file = max_rows_per_file
+        self.use_experimental_writer = use_experimental_writer
 
     def __call__(self, batch: Union[pa.Table, "pd.DataFrame"]) -> Dict[str, Any]:
         """Write a Batch to the Lance fragment."""
