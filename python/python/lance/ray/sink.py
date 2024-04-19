@@ -155,7 +155,7 @@ class LanceDatasink(_BaseLanceDatasink):
         The maximum number of rows per file. Default is 1024 * 1024.
     use_experimental_writer : bool, optional
         Set true to use v2 writer. Default is False now. Will be removed once
-        v2 writer
+        v2 writer become the default.
     """
 
     NAME = "Lance"
