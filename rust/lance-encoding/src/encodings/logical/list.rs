@@ -473,9 +473,8 @@ impl ArrayEncoder for ListOffsetsEncoder {
             );
         }
         println!("Stitched offsets {:?}", offsets);
-        return self
-            .inner
-            .encode(&[Arc::new(Int32Array::from(offsets))], buffer_index);
+        self.inner
+            .encode(&[Arc::new(Int32Array::from(offsets))], buffer_index)
     }
 }
 
