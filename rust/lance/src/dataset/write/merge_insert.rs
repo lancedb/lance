@@ -326,8 +326,8 @@ impl MergeInsertJob {
         self,
         source: Box<dyn RecordBatchReader + Send>,
     ) -> Result<Arc<Dataset>> {
-        let (source, _) = reader_to_stream(source).await?;
-        self.execute(source).await
+        let stream = reader_to_stream(source);
+        self.execute(stream).await
     }
 
     fn check_compatible_schema(&self, schema: &Schema) -> Result<()> {
@@ -851,12 +851,8 @@ mod tests {
         job.dataset = Arc::new(dataset);
 
         let schema = new_data.schema();
-        let (new_stream, _) = reader_to_stream(Box::new(RecordBatchIterator::new(
-            [Ok(new_data)],
-            schema.clone(),
-        )))
-        .await
-        .unwrap();
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
 
         let merged_dataset = job.execute(new_stream).await.unwrap();
 

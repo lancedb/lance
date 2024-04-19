@@ -22,7 +22,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, SchemaCompareOptions};
-use lance_datafusion::utils::reader_to_stream;
+use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::ObjectWriter;
@@ -404,7 +404,8 @@ impl Dataset {
             Err(e) => return Err(e),
         };
 
-        let (stream, schema) = reader_to_stream(batches).await?;
+        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let stream = reader_to_stream(batches);
 
         // Running checks for the different write modes
         // create + dataset already exists = error
@@ -559,7 +560,8 @@ impl Dataset {
             });
         }
 
-        let (stream, schema) = reader_to_stream(batches).await?;
+        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let stream = reader_to_stream(batches);
 
         // Return Error if append and input schema differ
         self.manifest.schema.check_compatible(

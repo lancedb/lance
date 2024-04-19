@@ -8,7 +8,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::chunk_stream;
-use lance_datafusion::utils::reader_to_stream;
+use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
@@ -160,7 +160,8 @@ pub async fn write_fragments(
         (None, object_store, base)
     };
 
-    let (stream, schema) = reader_to_stream(Box::new(data)).await?;
+    let (data, schema) = peek_reader_schema(Box::new(data)).await?;
+    let stream = reader_to_stream(data);
     write_fragments_internal(
         dataset.as_ref(),
         Arc::new(object_store),
