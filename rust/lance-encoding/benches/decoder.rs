@@ -49,13 +49,13 @@ const PRIMITIVE_TYPES_FOR_FSL: &[DataType] = &[
 ];
 
 fn bench_decode(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
     for data_type in PRIMITIVE_TYPES {
         let data = lance_datagen::gen()
             .col(None, lance_datagen::array::rand_type(&DataType::Int32))
             .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024))
             .unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let input_bytes = data.get_array_memory_size();
         group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
         let encoded = rt.block_on(encode_batch(&data, 1024 * 1024)).unwrap();
@@ -71,6 +71,7 @@ fn bench_decode(c: &mut Criterion) {
     }
 }
 fn bench_decode_fsl(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive_fsl");
     for data_type in PRIMITIVE_TYPES_FOR_FSL {
         let data = lance_datagen::gen()
@@ -83,7 +84,6 @@ fn bench_decode_fsl(c: &mut Criterion) {
             )
             .into_batch_rows(lance_datagen::RowCount::from(1024))
             .unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let input_bytes = data.get_array_memory_size();
         group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
         let encoded = rt.block_on(encode_batch(&data, 1024 * 1024)).unwrap();
