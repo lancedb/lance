@@ -498,7 +498,7 @@ def write_fragments(
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
     progress: Optional[FragmentWriteProgress] = None,
-    use_experimental_writer=False,
+    use_experimental_writer: bool = False,
 ) -> List[FragmentMetadata]:
     """
     Write data into one or more fragments.
