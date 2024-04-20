@@ -40,9 +40,11 @@ class LanceFileWriter:
 
 class LanceFileReader:
     def __init__(self, path: str, schema: pa.Schema): ...
-    def read_all(self, batch_size: int) -> pa.RecordBatchReader: ...
+    def read_all(
+        self, batch_size: int, batch_readahead: int
+    ) -> pa.RecordBatchReader: ...
     def read_range(
-        self, start: int, num_rows: int, batch_size: int
+        self, start: int, num_rows: int, batch_size: int, batch_readahead: int
     ) -> pa.RecordBatchReader: ...
 
 class LanceBufferDescriptor:
