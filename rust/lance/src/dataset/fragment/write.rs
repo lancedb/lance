@@ -100,7 +100,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             writer.write(&batch).await?;
         }
 
-        if writer.len() == 0 {
+        if writer.is_empty() {
             return Err(Error::invalid_input("Input data was empty.", location!()));
         }
 
@@ -143,9 +143,7 @@ impl<'a> FragmentCreateBuilder<'a> {
                 // the reader.
                 Ok(None)
             }
-            Err(e) => {
-                return Err(e);
-            }
+            Err(e) => Err(e),
         }
     }
 
