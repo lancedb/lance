@@ -31,7 +31,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::MetricType;
-use lance_linalg::kernels::normalize_arrow;
+use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -446,7 +446,8 @@ async fn build_hnsw_quantization_partition(
     let mut metric_type = metric_type;
     if metric_type == MetricType::Cosine {
         // Normalize vectors for cosine similarity
-        vectors = normalize_arrow(&vectors)?;
+        vectors =
+            Arc::new(spawn_cpu(move || Ok(normalize_fsl(vectors.as_fixed_size_list())?)).await?);
         metric_type = MetricType::L2;
     }
 

@@ -2320,7 +2320,7 @@ mod tests {
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::L2,
+            MetricType::Cosine,
             ivf_params,
             hnsw_params,
             sq_params,
