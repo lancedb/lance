@@ -2207,6 +2207,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_create_ivf_pq_with_invalid_num_sub_vectors() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float32Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(256),
+            PQBuildParams::new(6, 8),
+        );
+        assert!(dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .is_err());
+    }
+
     fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
         let mut dists = vec![];
         for i in 0..mat.num_rows() {

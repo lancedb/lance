@@ -97,7 +97,7 @@ impl PQBuildParams {
 
         const REDOS: usize = 1;
 
-        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
+        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors)?;
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
