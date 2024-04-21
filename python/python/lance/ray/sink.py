@@ -20,14 +20,14 @@ from typing import (
 import pyarrow as pa
 
 import lance
-from lance.fragment import FragmentMetadata, write_fragments
+from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, FragmentMetadata, write_fragments
 
 from ..dependencies import ray
 
 if TYPE_CHECKING:
     import pandas as pd
 
-__all__ = ["LanceDatasink", "LanceFragmentWriter", "LanceCommitter"]
+__all__ = ["LanceDatasink", "LanceFragmentWriter", "LanceCommitter", "write_lance"]
 
 
 def _pd_to_arrow(
@@ -52,6 +52,7 @@ def _write_fragment(
     *,
     schema: Optional[pa.Schema] = None,
     max_rows_per_file: int = 1024 * 1024,
+    max_bytes_per_file: Optional[int] = None,
     max_rows_per_group: int = 1024,  # Only useful for v1 writer.
     use_experimental_writer: bool = False,
 ) -> Tuple[FragmentMetadata, pa.Schema]:
@@ -74,6 +75,10 @@ def _write_fragment(
             tbl = _pd_to_arrow(block, schema)
             yield from tbl.to_batches()
 
+    max_bytes_per_file = (
+        DEFAULT_MAX_BYTES_PER_FILE if max_bytes_per_file is None else max_bytes_per_file
+    )
+
     reader = pa.RecordBatchReader.from_batches(schema, record_batch_converter())
     fragments = write_fragments(
         reader,
@@ -81,6 +86,7 @@ def _write_fragment(
         schema=schema,
         max_rows_per_file=max_rows_per_file,
         max_rows_per_group=max_rows_per_group,
+        max_bytes_per_file=max_bytes_per_file,
         use_experimental_writer=use_experimental_writer,
     )
     return [(fragment, schema) for fragment in fragments]
@@ -213,6 +219,21 @@ class LanceFragmentWriter:
     in distributed fashion.
 
     Parameters
+    ----------
+    uri : str
+        The base URI of the dataset.
+    transform : Callable[[pa.Table], Union[pa.Table, Generator]], optional
+        A callable to transform the input batch. Default is identity.
+    schema : pyarrow.Schema, optional
+        The schema of the dataset.
+    max_rows_per_file : int, optional
+        The maximum number of rows per file. Default is 1024 * 1024.
+    max_bytes_per_file : int, optional
+        The maximum number of bytes per file. Default is None.
+    max_rows_per_group : int, optional
+        The maximum number of rows per group. Default is 1024.
+        Only useful for v1 writer.
+
     """
 
     def __init__(
@@ -221,8 +242,9 @@ class LanceFragmentWriter:
         *,
         transform: Callable[[pa.Table], Union[pa.Table, Generator]] = lambda x: x,
         schema: Optional[pa.Schema] = None,
-        max_rows_per_group: int = 1024,  # Only useful for v1 writer.
         max_rows_per_file: int = 1024 * 1024,
+        max_bytes_per_file: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,  # Only useful for v1 writer.
         use_experimental_writer: bool = True,
     ):
         self.uri = uri
@@ -231,6 +253,7 @@ class LanceFragmentWriter:
 
         self.max_rows_per_group = max_rows_per_group
         self.max_rows_per_file = max_rows_per_file
+        self.max_bytes_per_file = max_bytes_per_file
         self.use_experimental_writer = use_experimental_writer
 
     def __call__(self, batch: Union[pa.Table, "pd.DataFrame"]) -> Dict[str, Any]:
@@ -282,3 +305,43 @@ class LanceCommitter(_BaseLanceDatasink):
             ):
                 v.append((fragment, schema))
         return v
+
+
+def write_lance(
+    data: ray.data.Dataset,
+    output_uri: str,
+    *,
+    schema: Optional[pa.Schema] = None,
+    transform: Optional[
+        Callable[[pa.Table], Union[pa.Table, Generator[pa.Table]]]
+    ] = None,
+    max_rows_per_file: int = 1024 * 1024,
+    max_bytes_per_file: Optional[int] = None,
+) -> None:
+    """Write Ray dataset at scale.
+
+    This method wraps the `LanceFragmentWriter` and `LanceCommitter` to write
+    large-than-memory ray data to lance files.
+
+    Parameters
+    ----------
+    data : ray.data.Dataset
+        The dataset to write.
+    output_uri : str
+        The output dataset URI.
+    transform : Callable[[pa.Table], Union[pa.Table, Generator]], optional
+        A callable to transform the input batch. Default is identity function.
+    schema : pyarrow.Schema, optional
+        If provided, the schema of the dataset. Otherwise, it will be inferred.
+    max_rows_per_file: int, optional
+        The maximum number of rows per file. Default is 1024 * 1024.
+    """
+    data.map_batches(
+        LanceFragmentWriter(
+            output_uri,
+            transform=transform,
+            max_rows_per_file=max_rows_per_file,
+            max_bytes_per_file=max_bytes_per_file,
+        ),
+        batch_size=max_rows_per_file,  # each video split into 10-50 clips
+    ).write_datasink(LanceCommitter(output_uri, schema=schema))
