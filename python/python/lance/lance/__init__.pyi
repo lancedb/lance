@@ -32,6 +32,14 @@ class CompactionMetrics:
     fragments_added: int
     files_removed: int
     files_added: int
+    
+    def __repr__(self):
+        return f"""
+        Fragments Removed: {self.fragments_removed}
+        Fragments Added: {self.fragments_added}
+        Files Removed: {self.files_removed}
+        Files Added: {self.files_added}
+    """
 
 class LanceFileWriter:
     def __init__(self, path: str, schema: pa.Schema): ...
