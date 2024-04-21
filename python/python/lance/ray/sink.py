@@ -22,7 +22,7 @@ import pyarrow as pa
 import lance
 from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, FragmentMetadata, write_fragments
 
-from ..dependencies import ray
+from ..dependencies import ray, _RAY_AVAILABLE
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -313,7 +313,7 @@ def write_lance(
     *,
     schema: Optional[pa.Schema] = None,
     transform: Optional[
-        Callable[[pa.Table], Union[pa.Table, Generator[pa.Table]]]
+        Callable[[pa.Table], Union[pa.Table, Generator[None, pa.Table, None]]]
     ] = None,
     max_rows_per_file: int = 1024 * 1024,
     max_bytes_per_file: Optional[int] = None,
@@ -347,3 +347,7 @@ def write_lance(
         ),
         batch_size=max_rows_per_file,  # each video split into 10-50 clips
     ).write_datasink(LanceCommitter(output_uri, schema=schema))
+
+
+if _RAY_AVAILABLE:
+    ray.data.Dataset.write_lance = write_lance
