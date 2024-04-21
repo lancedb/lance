@@ -335,6 +335,8 @@ def write_lance(
         If provided, the schema of the dataset. Otherwise, it will be inferred.
     max_rows_per_file: int, optional
         The maximum number of rows per file. Default is 1024 * 1024.
+    max_bytes_per_file: int, optional
+        The maximum number of bytes per file. Default is None.
     """
     data.map_batches(
         LanceFragmentWriter(
