@@ -22,7 +22,7 @@ import pyarrow as pa
 import lance
 from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, FragmentMetadata, write_fragments
 
-from ..dependencies import ray, _RAY_AVAILABLE
+from ..dependencies import _RAY_AVAILABLE, ray
 
 if TYPE_CHECKING:
     import pandas as pd
