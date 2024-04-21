@@ -34,6 +34,10 @@
             <artifactId>arrow-dataset</artifactId>
         </dependency>
         <dependency>
+            <groupId>org.json</groupId>
+            <artifactId>json</artifactId>
+        </dependency>
+        <dependency>
             <groupId>org.questdb</groupId>
             <artifactId>jar-jni</artifactId>
         </dependency>
@@ -58,7 +62,7 @@
                         </goals>
                         <configuration>
                             <path>lance-jni</path>
-<!--                            <release>true</release>-->
+                            <!--<release>true</release>-->
                             <copyTo>src/main/resources/nativelib</copyTo>
                             <copyWithPlatformDir>true</copyWithPlatformDir>
                         </configuration>
