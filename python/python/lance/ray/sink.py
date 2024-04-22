@@ -343,11 +343,12 @@ def write_lance(
     data.map_batches(
         LanceFragmentWriter(
             output_uri,
+            schema=schema,
             transform=transform,
             max_rows_per_file=max_rows_per_file,
             max_bytes_per_file=max_bytes_per_file,
         ),
-        batch_size=max_rows_per_file,  # each video split into 10-50 clips
+        batch_size=max_rows_per_file,
     ).write_datasink(LanceCommitter(output_uri, schema=schema))
 
 
