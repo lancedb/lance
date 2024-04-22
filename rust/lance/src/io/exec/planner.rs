@@ -11,11 +11,17 @@ use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
-use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::DFSchema;
+use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
+use datafusion::execution::config::SessionConfig;
+use datafusion::execution::context::SessionState;
+use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
-    ColumnarValue, GetFieldAccess, GetIndexedField, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    AggregateUDF, ColumnarValue, GetFieldAccess, GetIndexedField, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
@@ -32,6 +38,7 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
+use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_index::scalar::expression::{
@@ -39,7 +46,7 @@ use lance_index::scalar::expression::{
 };
 use snafu::{location, Location};
 
-use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
+use crate::datafusion::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt};
 use crate::utils::sql::parse_sql_expr;
 use crate::{
     datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
@@ -167,9 +174,22 @@ impl ScalarUDFImpl for CastListF16Udf {
 }
 
 // Adapter that instructs datafusion how lance expects expressions to be interpreted
-#[derive(Default)]
 struct LanceContextProvider {
     options: datafusion::config::ConfigOptions,
+    state: SessionState,
+}
+
+impl Default for LanceContextProvider {
+    fn default() -> Self {
+        let config = SessionConfig::new();
+        let runtime_config = RuntimeConfig::new();
+        let runtime = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
+        let state = SessionState::new_with_config_rt(config, runtime);
+        Self {
+            options: ConfigOptions::default(),
+            state,
+        }
+    }
 }
 
 impl ContextProvider for LanceContextProvider {
@@ -183,23 +203,21 @@ impl ContextProvider for LanceContextProvider {
         )))
     }
 
+    fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
+        self.state.aggregate_functions().get(name).cloned()
+    }
+
+    fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
+        self.state.window_functions().get(name).cloned()
+    }
+
     fn get_function_meta(&self, f: &str) -> Option<Arc<ScalarUDF>> {
         match f {
             // TODO: cast should go thru CAST syntax instead of UDF
             // Going thru UDF makes it hard for the optimizer to find no-ops
             "_cast_list_f16" => Some(Arc::new(ScalarUDF::new_from_impl(CastListF16Udf::new()))),
-            _ => None,
+            _ => self.state.scalar_functions().get(f).cloned(),
         }
-    }
-
-    fn get_aggregate_meta(&self, _: &str) -> Option<Arc<datafusion::logical_expr::AggregateUDF>> {
-        // UDFs not supported yet
-        None
-    }
-
-    fn get_window_meta(&self, _: &str) -> Option<Arc<datafusion::logical_expr::WindowUDF>> {
-        // UDFs not supported yet
-        None
     }
 
     fn get_variable_type(&self, _: &[String]) -> Option<ArrowDataType> {
@@ -209,6 +227,18 @@ impl ContextProvider for LanceContextProvider {
 
     fn options(&self) -> &datafusion::config::ConfigOptions {
         &self.options
+    }
+
+    fn udfs_names(&self) -> Vec<String> {
+        self.state.scalar_functions().keys().cloned().collect()
+    }
+
+    fn udafs_names(&self) -> Vec<String> {
+        self.state.aggregate_functions().keys().cloned().collect()
+    }
+
+    fn udwfs_names(&self) -> Vec<String> {
+        self.state.window_functions().keys().cloned().collect()
     }
 }
 
@@ -224,7 +254,15 @@ impl Planner {
     fn column(idents: &[Ident]) -> Expr {
         let mut column = col(&idents[0].value);
         for ident in &idents[1..] {
-            column = column.field(&ident.value);
+            column = Expr::ScalarFunction(ScalarFunction {
+                args: vec![
+                    column,
+                    Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone()))),
+                ],
+                func_def: datafusion::logical_expr::ScalarFunctionDefinition::UDF(Arc::new(
+                    ScalarUDF::new_from_impl(GetFieldFunc::default()),
+                )),
+            });
         }
         column
     }
@@ -717,9 +755,9 @@ struct ColumnCapturingVisitor {
 }
 
 impl TreeNodeVisitor for ColumnCapturingVisitor {
-    type N = Expr;
+    type Node = Expr;
 
-    fn pre_visit(&mut self, node: &Self::N) -> DFResult<VisitRecursion> {
+    fn f_down(&mut self, node: &Self::Node) -> DFResult<TreeNodeRecursion> {
         match node {
             Expr::Column(Column { name, .. }) => {
                 let mut path = name.clone();
@@ -729,6 +767,17 @@ impl TreeNodeVisitor for ColumnCapturingVisitor {
                 }
                 self.columns.insert(path);
                 self.current_path.clear();
+            }
+            Expr::ScalarFunction(udf) => {
+                if udf.name() == GetFieldFunc::default().name() {
+                    if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
+                        self.current_path.push_front(name.to_string())
+                    } else {
+                        self.current_path.clear();
+                    }
+                } else {
+                    self.current_path.clear();
+                }
             }
             Expr::GetIndexedField(GetIndexedField {
                 expr: _,
@@ -741,12 +790,14 @@ impl TreeNodeVisitor for ColumnCapturingVisitor {
             }
         }
 
-        Ok(VisitRecursion::Continue)
+        Ok(TreeNodeRecursion::Continue)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::datafusion::logical_expr::ExprExt;
+
     use super::*;
 
     use arrow_array::{
@@ -755,7 +806,7 @@ mod tests {
         TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Fields, Schema};
-    use datafusion::logical_expr::{lit, Cast};
+    use datafusion::logical_expr::{lit, Cast, ScalarFunctionDefinition};
 
     #[test]
     fn test_parse_filter_simple() {
@@ -776,7 +827,7 @@ mod tests {
 
         let expected = col("i")
             .gt(lit(3_i32))
-            .and(col("st").field("x").lt_eq(lit(5.0_f32)))
+            .and(col("st").field_newstyle("x").lt_eq(lit(5.0_f32)))
             .and(
                 col("s")
                     .eq(lit("str-4"))
@@ -875,33 +926,43 @@ mod tests {
         assert_column_eq(&planner, "s0", &expected);
         assert_column_eq(&planner, "`s0`", &expected);
 
-        let expected = Expr::GetIndexedField(GetIndexedField {
-            expr: Box::new(Expr::Column(Column {
-                relation: None,
-                name: "st".to_string(),
-            })),
-            field: GetFieldAccess::NamedStructField {
-                name: ScalarValue::from("s1"),
-            },
+        let expected = Expr::ScalarFunction(ScalarFunction {
+            func_def: ScalarFunctionDefinition::UDF(Arc::new(ScalarUDF::new_from_impl(
+                GetFieldFunc::default(),
+            ))),
+            args: vec![
+                Expr::Column(Column {
+                    relation: None,
+                    name: "st".to_string(),
+                }),
+                Expr::Literal(ScalarValue::Utf8(Some("s1".to_string()))),
+            ],
         });
         assert_column_eq(&planner, "st.s1", &expected);
         assert_column_eq(&planner, "`st`.`s1`", &expected);
         assert_column_eq(&planner, "st.`s1`", &expected);
 
-        let expected = Expr::GetIndexedField(GetIndexedField {
-            expr: Box::new(Expr::GetIndexedField(GetIndexedField {
-                expr: Box::new(Expr::Column(Column {
-                    relation: None,
-                    name: "st".to_string(),
-                })),
-                field: GetFieldAccess::NamedStructField {
-                    name: ScalarValue::from("st"),
-                },
-            })),
-            field: GetFieldAccess::NamedStructField {
-                name: ScalarValue::from("s2"),
-            },
+        let expected = Expr::ScalarFunction(ScalarFunction {
+            func_def: ScalarFunctionDefinition::UDF(Arc::new(ScalarUDF::new_from_impl(
+                GetFieldFunc::default(),
+            ))),
+            args: vec![
+                Expr::ScalarFunction(ScalarFunction {
+                    func_def: ScalarFunctionDefinition::UDF(Arc::new(ScalarUDF::new_from_impl(
+                        GetFieldFunc::default(),
+                    ))),
+                    args: vec![
+                        Expr::Column(Column {
+                            relation: None,
+                            name: "st".to_string(),
+                        }),
+                        Expr::Literal(ScalarValue::Utf8(Some("st".to_string()))),
+                    ],
+                }),
+                Expr::Literal(ScalarValue::Utf8(Some("s2".to_string()))),
+            ],
         });
+
         assert_column_eq(&planner, "st.st.s2", &expected);
         assert_column_eq(&planner, "`st`.`st`.`s2`", &expected);
         assert_column_eq(&planner, "st.st.`s2`", &expected);

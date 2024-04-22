@@ -12,10 +12,10 @@ name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "50.0.0", features = ["pyarrow"] }
-arrow-array = "50.0"
-arrow-data = "50.0"
-arrow-schema = "50.0"
+arrow = { version = "51.0.0", features = ["pyarrow"] }
+arrow-array = "51.0"
+arrow-data = "51.0"
+arrow-schema = "51.0"
 object_store = "0.9.0"
 async-trait = "0.1"
 chrono = "0.4.31"
