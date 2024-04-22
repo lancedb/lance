@@ -796,7 +796,8 @@ impl TreeNodeVisitor for ColumnCapturingVisitor {
 
 #[cfg(test)]
 mod tests {
-    use crate::datafusion::logical_expr::ExprExt;
+
+    use crate::datafusion::logical_expr::tests::ExprExt;
 
     use super::*;
 

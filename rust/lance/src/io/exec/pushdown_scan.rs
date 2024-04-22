@@ -665,7 +665,7 @@ mod test {
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use tempfile::tempdir;
 
-    use crate::{datafusion::logical_expr::ExprExt, dataset::WriteParams};
+    use crate::{datafusion::logical_expr::tests::ExprExt, dataset::WriteParams};
 
     use super::*;
 
