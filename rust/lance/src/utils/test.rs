@@ -15,6 +15,11 @@ use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 use crate::Dataset;
 
+/// A dataset generator that can generate random layouts. This is used to test
+/// dataset operations are robust to different layouts.
+///
+/// "Layout" includes: How the fields are split across files within the same
+/// fragment, the order of the field ids, and the order of fields across files.
 pub struct TestDatasetGenerator {
     seed: Option<u64>,
     data: Vec<RecordBatch>,
@@ -29,6 +34,9 @@ impl TestDatasetGenerator {
         Self { data, seed: None }
     }
 
+    /// Set the seed for the random number generator.
+    ///
+    /// If not set, a random seed will be generated on each call to [`Self::make_hostile`].
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -36,11 +44,14 @@ impl TestDatasetGenerator {
 
     /// Make a new dataset that has a "hostile" layout.
     ///
+    /// For this to be effective, there should be at least two top-level columns.
+    ///
     /// By "hostile", we mean that:
     /// 1. Top-level columns are randomly split into different files. If there
-    ///    are multiple fragments, they do not have the same arrangement of
-    ///    fields in data files.
-    /// 2. The field ids are not in sorted order, and have holes.
+    ///    are multiple fragments, they do not all have the same arrangement of
+    ///    fields in data files. There is an exception for single-column data,
+    ///    which will always be in a single file.
+    /// 2. The field ids are not in sorted order, and have at least one hole.
     /// 3. The order of fields across the data files is random, and not
     ///    consistent across fragments.
     ///
@@ -66,8 +77,10 @@ impl TestDatasetGenerator {
                 let fields = field_structure(&fragment);
                 let first_fields = fragments.first().map(field_structure);
                 if let Some(first_fields) = first_fields {
-                    if fields == first_fields {
+                    if fields == first_fields && schema.fields.len() > 1 {
                         // The layout is the same as the first fragment, try again
+                        // If there's only one field, then we can't expect a different
+                        // layout, so there's an exception for that.
                         continue;
                     }
                 }
@@ -247,7 +260,7 @@ mod tests {
         let generator = TestDatasetGenerator::new(data);
         let schema = generator.make_schema(&mut rand::thread_rng());
 
-        let roundtripped_schema = ArrowSchema::try_from(&schema).unwrap();
+        let roundtripped_schema = ArrowSchema::from(&schema);
         assert_eq!(&roundtripped_schema, arrow_schema.as_ref());
 
         let field_ids = schema.fields_pre_order().map(|f| f.id).collect::<Vec<_>>();
@@ -333,6 +346,7 @@ mod tests {
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
             ArrowField::new("c", DataType::Float64, false),
         ]));
         let data = vec![
@@ -340,6 +354,7 @@ mod tests {
                 schema.clone(),
                 vec![
                     Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(Int32Array::from(vec![10, 20, 30])),
                     Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
                 ],
             )
@@ -348,6 +363,7 @@ mod tests {
                 schema.clone(),
                 vec![
                     Arc::new(Int32Array::from(vec![4, 5, 6])),
+                    Arc::new(Int32Array::from(vec![40, 50, 60])),
                     Arc::new(Float64Array::from(vec![4.4, 5.5, 6.6])),
                 ],
             )
@@ -369,17 +385,28 @@ mod tests {
         let field_structure_2 = get_field_structure(&dataset2);
         assert_eq!(field_structure_1, field_structure_2);
 
-        // Now make it random
-        for i in 1..20 {
+        // Make sure we handle different numbers of columns
+        for num_cols in 1..4 {
+            let projection = (0..num_cols).collect::<Vec<_>>();
+            let data = data
+                .iter()
+                .map(|rb| rb.project(&projection).unwrap())
+                .collect::<Vec<RecordBatch>>();
+
             let generator = TestDatasetGenerator::new(data.clone());
-            let path = tmp_dir.path().join(format!("test_ds{}", i));
-            let dataset = generator.make_hostile(path.to_str().unwrap()).await;
+            // Sample a few
+            for i in 1..20 {
+                let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));
+                let dataset = generator.make_hostile(path.to_str().unwrap()).await;
 
-            let field_structure = get_field_structure(&dataset);
+                let field_structure = get_field_structure(&dataset);
 
-            // The two fragments should have different layout.
-            assert_eq!(field_structure.len(), 2);
-            assert_ne!(field_structure[0], field_structure[1]);
+                // The two fragments should have different layout.
+                assert_eq!(field_structure.len(), 2);
+                if num_cols > 1 {
+                    assert_ne!(field_structure[0], field_structure[1]);
+                }
+            }
         }
     }
 }

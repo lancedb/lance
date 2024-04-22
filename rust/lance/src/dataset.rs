@@ -2083,6 +2083,7 @@ mod tests {
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::TestDatasetGenerator;
 
     use arrow_array::types::Int64Type;
     use arrow_array::{
@@ -3500,32 +3501,33 @@ mod tests {
     #[tokio::test]
     async fn test_delete() {
         fn sequence_data(range: Range<u32>) -> RecordBatch {
-            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-                "i",
-                DataType::UInt32,
-                false,
-            )]));
-            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
-                .unwrap()
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("i", DataType::UInt32, false),
+                Field::new("x", DataType::UInt32, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt32Array::from_iter_values(range.clone())),
+                    Arc::new(UInt32Array::from_iter_values(range.map(|v| v * 2))),
+                ],
+            )
+            .unwrap()
         }
         // Write a dataset
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "i",
-            DataType::UInt32,
-            false,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::UInt32, false),
+            Field::new("x", DataType::UInt32, false),
+        ]));
         let data = sequence_data(0..100);
-        let batches = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
-        let write_params = WriteParams {
-            max_rows_per_file: 50, // Split over two files.
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
-            .await
-            .unwrap();
+        // Split over two files.
+        let batches = vec![data.slice(0, 50), data.slice(50, 50)];
+        let mut dataset = TestDatasetGenerator::new(batches)
+            .make_hostile(test_uri)
+            .await;
 
         // Delete nothing
         dataset.delete("i < 0").await.unwrap();
