@@ -62,7 +62,7 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
             Expr::ScalarFunction(udf) => {
                 if udf.name() == GetFieldFunc::default().name() {
                     let name = get_as_string_scalar_opt(&udf.args[1])?;
-                    field_path.push(&name);
+                    field_path.push(name);
                     current_expr = &udf.args[0];
                 } else {
                     return None;
