@@ -78,6 +78,8 @@ public class FragmentTest {
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(fragmentMeta));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1))) {
+        assertEquals(2, dataset.version());
+        assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
         var fragment = dataset.getFragments().get(0);
         assertEquals(fragmentId, fragment.getId());

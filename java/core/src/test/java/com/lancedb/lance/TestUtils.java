@@ -66,6 +66,8 @@ public class TestUtils {
         assertEquals(schema, dataset.getSchema());
         var fragments = dataset.getFragments();
         assertEquals(0, fragments.size());
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
       }
     }
 
@@ -127,14 +129,18 @@ public class TestUtils {
           assertEquals(ROW_COUNT, dataset.countRows());
           schema = reader.getVectorSchemaRoot().getSchema();
           validateFragments(dataset);
+          assertEquals(1, dataset.version());
+          assertEquals(1, dataset.latestVersion());
         }
       }
     }
 
     public void openDatasetAndValidate() throws IOException {
-      try (Dataset datasetRead = Dataset.open(datasetPath, allocator)) {
-        assertEquals(ROW_COUNT, datasetRead.countRows());
-        validateFragments(datasetRead);
+      try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
+        assertEquals(ROW_COUNT, dataset.countRows());
+        validateFragments(dataset);
       }
     }
 

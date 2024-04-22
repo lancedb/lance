@@ -221,6 +221,34 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_commitAppend<'local>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_version(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jlong {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, "nativeDatasetHandle") };
+    match dataset_guard {
+        Ok(dataset) => dataset.inner.version().version as jlong,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_latestVersion(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jlong {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, "nativeDatasetHandle") };
+    match dataset_guard {
+        Ok(dataset) => dataset
+            .latest_version()
+            .expect("Failed to get the latest version.") as jlong,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_countRows(
     mut env: JNIEnv,
     java_dataset: JObject,

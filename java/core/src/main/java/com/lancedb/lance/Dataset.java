@@ -128,6 +128,16 @@ public class Dataset implements Closeable {
       List<String> fragmentsMetadata);
 
   /**
+   * @return the currently checked out version of the dataset
+   */
+  public native long version();
+
+  /**
+   * @return the latest version of the dataset
+   */
+  public native long latestVersion();
+
+  /**
    * Count the number of rows in the dataset.
    *
    * @return num of rows.

@@ -49,6 +49,10 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
+    pub fn latest_version(&self) -> Result<u64> {
+        Ok(RT.block_on(self.inner.latest_version_id())?)
+    }
+
     pub fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         Ok(RT.block_on(self.inner.count_rows(filter))?)
     }
