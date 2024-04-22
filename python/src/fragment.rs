@@ -391,9 +391,42 @@ impl FragmentMetadata {
         )
     }
 
+    /// Get the physical rows statistic.
+    ///
+    /// This represents the original number of rows in the fragment
+    /// before any deletions.
+    ///
+    /// If this is None, it is unavailable.
     #[getter]
-    fn id(&self) -> PyResult<u64> {
-        Ok(self.inner.id)
+    fn physical_rows(&self) -> Option<usize> {
+        self.inner.physical_rows
+    }
+
+    /// Get the number of tombstoned rows in the fragment.
+    ///
+    /// If this is None, this statistic is unavailable. It does not necessarily
+    /// mean there are no deletions.
+    #[getter]
+    fn num_deletions(&self) -> Option<usize> {
+        self.inner
+            .deletion_file
+            .as_ref()
+            .and_then(|d| d.num_deleted_rows)
+    }
+
+    /// Get the number of rows in the fragment.
+    ///
+    /// This is equivalent to physical_rows minus num_deletions.
+    ///
+    /// If this is None, this statistic is unavailable.
+    #[getter]
+    fn num_rows(&self) -> Option<usize> {
+        self.inner.num_rows()
+    }
+
+    #[getter]
+    fn id(&self) -> u64 {
+        self.inner.id
     }
 }
 
