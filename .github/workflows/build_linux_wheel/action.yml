@@ -17,7 +17,7 @@ inputs:
   manylinux:
     description: "The manylinux version to build for"
     required: false
-    default: "2_28"
+    default: "2_17"
 runs:
   using: "composite"
   steps:
