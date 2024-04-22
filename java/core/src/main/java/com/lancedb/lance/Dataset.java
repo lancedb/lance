@@ -128,12 +128,12 @@ public class Dataset implements Closeable {
       List<String> fragmentsMetadata);
 
   /**
-   * @return the currently checked out version of the dataset
+   * Gets the currently checked out version of the dataset.
    */
   public native long version();
 
   /**
-   * @return the latest version of the dataset
+   * Gets the latest version of the dataset.
    */
   public native long latestVersion();
 
