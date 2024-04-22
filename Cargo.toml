@@ -85,16 +85,16 @@ chrono = { version = "0.4.25", default-features = false, features = [
     "now",
 ] }
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
-datafusion = { version = "37.0.0", default-features = false, features = [
+datafusion = { version = "37.1", default-features = false, features = [
     "array_expressions",
     "regex_expressions",
 ] }
-datafusion-common = "37.0"
-datafusion-functions = { version = "37.0", features = ["regex_expressions"] }
-datafusion-sql = "37.0"
-datafusion-expr = "37.0"
-datafusion-execution = "37.0"
-datafusion-physical-expr = { version = "37.0", features = [
+datafusion-common = "37.1"
+datafusion-functions = { version = "37.1", features = ["regex_expressions"] }
+datafusion-sql = "37.1"
+datafusion-expr = "37.1"
+datafusion-execution = "37.1"
+datafusion-physical-expr = { version = "37.1", features = [
     "regex_expressions",
 ] }
 either = "1.0"
