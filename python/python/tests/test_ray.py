@@ -89,7 +89,7 @@ def test_ray_write_lance(tmp_path: Path):
     (
         ray.data.range(10)
         .map(lambda x: {"id": x["id"], "str": f"str-{x['id']}"})
-        .write_lance(tmp_path)
+        .write_lance(tmp_path, schema=schema)
     )
 
     ds = lance.dataset(tmp_path)
