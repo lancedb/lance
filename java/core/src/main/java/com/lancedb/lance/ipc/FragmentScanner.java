@@ -53,8 +53,7 @@ public class FragmentScanner implements Scanner {
 
   @Override
   public ArrowReader scanBatches() {
-    try {
-      ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator);
+    try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
       openStream(
               dataset, fragmentId, options.getColumns(), options.getBatchSize(), s.memoryAddress());
       return Data.importArrayStream(allocator, s);
@@ -74,8 +73,9 @@ public class FragmentScanner implements Scanner {
   @Override
   public Schema schema() {
     long address = getSchema(dataset, fragmentId, options.getColumns());
-    var schema = ArrowSchema.wrap(address);
-    return Data.importSchema(allocator, schema, null);
+    try (ArrowSchema schema = ArrowSchema.wrap(address)) {
+      return Data.importSchema(allocator, schema, null);
+    }
   }
 
   @Override
