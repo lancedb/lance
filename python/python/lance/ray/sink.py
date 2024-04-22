@@ -223,13 +223,13 @@ class LanceFragmentWriter:
     uri : str
         The base URI of the dataset.
     transform : Callable[[pa.Table], Union[pa.Table, Generator]], optional
-        A callable to transform the input batch. Default is identity.
+        A callable to transform the input batch. Default is None.
     schema : pyarrow.Schema, optional
         The schema of the dataset.
     max_rows_per_file : int, optional
         The maximum number of rows per file. Default is 1024 * 1024.
     max_bytes_per_file : int, optional
-        The maximum number of bytes per file. Default is None.
+        The maximum number of bytes per file. Default is 90GB.
     max_rows_per_group : int, optional
         The maximum number of rows per group. Default is 1024.
         Only useful for v1 writer.
@@ -242,7 +242,7 @@ class LanceFragmentWriter:
         self,
         uri: str,
         *,
-        transform: Callable[[pa.Table], Union[pa.Table, Generator]] = None,
+        transform: Optional[Callable[[pa.Table], Union[pa.Table, Generator]]] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_file: int = 1024 * 1024,
         max_bytes_per_file: Optional[int] = None,
@@ -338,7 +338,7 @@ def write_lance(
     max_rows_per_file: int, optional
         The maximum number of rows per file. Default is 1024 * 1024.
     max_bytes_per_file: int, optional
-        The maximum number of bytes per file. Default is None.
+        The maximum number of bytes per file. Default is 90GB.
     """
     data.map_batches(
         LanceFragmentWriter(
