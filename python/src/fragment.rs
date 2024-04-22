@@ -16,7 +16,6 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::ipc::gen;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
@@ -427,7 +426,7 @@ impl FragmentMetadata {
 
     #[getter]
     fn id(&self) -> u64 {
-        Ok(self.inner.id)
+        self.inner.id
     }
 }
 
