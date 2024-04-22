@@ -22,7 +22,7 @@ import pyarrow as pa
 import lance
 from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, FragmentMetadata, write_fragments
 
-from ..dependencies import _RAY_AVAILABLE, ray
+from ..dependencies import ray
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -233,6 +233,8 @@ class LanceFragmentWriter:
     max_rows_per_group : int, optional
         The maximum number of rows per group. Default is 1024.
         Only useful for v1 writer.
+    use_experimental_writer : bool, optional
+        Set true to use v2 writer. Default is True.
 
     """
 
@@ -240,7 +242,7 @@ class LanceFragmentWriter:
         self,
         uri: str,
         *,
-        transform: Callable[[pa.Table], Union[pa.Table, Generator]] = lambda x: x,
+        transform: Callable[[pa.Table], Union[pa.Table, Generator]] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_file: int = 1024 * 1024,
         max_bytes_per_file: Optional[int] = None,
@@ -249,7 +251,7 @@ class LanceFragmentWriter:
     ):
         self.uri = uri
         self.schema = schema
-        self.transform = transform
+        self.transform = transform if transform is not None else lambda x: x
 
         self.max_rows_per_group = max_rows_per_group
         self.max_rows_per_file = max_rows_per_file
@@ -349,5 +351,22 @@ def write_lance(
     ).write_datasink(LanceCommitter(output_uri, schema=schema))
 
 
-if _RAY_AVAILABLE:
+def _register_hooks():
+    """Register lance hook to Ray for better integration.
+
+    You can use `ray.data.Dataset.write_lance` to write Ray dataset to lance.
+    Example:
+
+    ```python
+    import ray
+    import lance
+    from lance.ray.sink import _register_hooks
+
+    _register_hooks()
+
+    ray.data.range(10)
+        .map(lambda x: {"id": x["id"], "str": f"str-{x['id']}"})
+        .write_lance("~/data.lance")
+    ```
+    """
     ray.data.Dataset.write_lance = write_lance
