@@ -152,7 +152,7 @@ impl HNSWBuilder {
             self.inner.params.ef_construction
         );
 
-        if self.inner.vectors.len() == 0 {
+        if self.inner.vectors.len() <= 1 {
             return Ok(HNSW::from_builder(
                 self,
                 self.inner.entry_point,
