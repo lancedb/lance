@@ -431,6 +431,7 @@ impl MergeInsertJob {
                 vec![(Arc::new(target_key), Arc::new(source_key))],
                 None,
                 &JoinType::Full,
+                None,
                 PartitionMode::CollectLeft,
                 true,
             )

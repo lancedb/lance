@@ -494,6 +494,8 @@ impl Ord for OrderableScalarValue {
             (Dictionary(_k1, _v1), Dictionary(_k2, _v2)) => todo!(),
             (Dictionary(_, v1), Null) => Self(*v1.clone()).cmp(&Self(ScalarValue::Null)),
             (Dictionary(_, _), _) => panic!("Attempt to compare Dictionary with non-Dictionary"),
+            // What would a btree of unions even look like?  May not be possible.
+            (Union(_, _, _), _) => todo!("Support for union scalars"),
             (Null, Null) => Ordering::Equal,
             (Null, _) => todo!(),
         }
