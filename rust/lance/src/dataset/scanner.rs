@@ -702,6 +702,7 @@ impl Scanner {
             &[],
             &plan.schema(),
             "",
+            false,
         )?;
         let plan_schema = plan.schema().clone();
         let count_plan = Arc::new(AggregateExec::try_new(
