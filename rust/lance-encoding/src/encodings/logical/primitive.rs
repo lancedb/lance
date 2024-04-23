@@ -20,7 +20,7 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
-use log::trace;
+use log::{debug, trace};
 use snafu::{location, Location};
 
 use lance_core::{Error, Result};
@@ -493,8 +493,17 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         self.current_bytes += array.get_array_memory_size() as u64;
         self.buffered_arrays.push(array);
         if self.current_bytes > self.cache_bytes {
+            debug!(
+                "Flushing column {} page of size {} bytes (unencoded)",
+                self.column_index, self.current_bytes
+            );
             Ok(vec![self.do_flush()])
         } else {
+            trace!(
+                "Accumulating data for column {}.  Now at {} bytes",
+                self.column_index,
+                self.current_bytes
+            );
             Ok(vec![])
         }
     }
