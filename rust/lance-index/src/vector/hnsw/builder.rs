@@ -12,7 +12,7 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_core::Result;
 use rand::{thread_rng, Rng};
 
-use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
+use super::super::graph::beam_search;
 use super::{select_neighbors, select_neighbors_heuristic, HNSW};
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::storage::DistCalculator;
@@ -115,7 +115,7 @@ pub struct HNSWBuilder {
 
 impl HNSWBuilder {
     /// Create a new [`HNSWBuilder`] with in memory vector storage.
-    pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
+    pub fn new(vectors: Arc<dyn VectorStorage>) -> Self {
         Self::with_params(HnswBuildParams::default(), vectors)
     }
 
@@ -131,12 +131,12 @@ impl HNSWBuilder {
         self.inner.nodes()
     }
 
-    pub fn storage(&self) -> Arc<InMemoryVectorStorage> {
+    pub fn storage(&self) -> Arc<dyn VectorStorage> {
         self.inner.storage()
     }
 
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
-    pub fn with_params(params: HnswBuildParams, vectors: Arc<InMemoryVectorStorage>) -> Self {
+    pub fn with_params(params: HnswBuildParams, vectors: Arc<dyn VectorStorage>) -> Self {
         let inner = Arc::new(HNSWBuilderInner::with_params(params, vectors));
         Self { inner }
     }
@@ -184,7 +184,7 @@ struct HNSWBuilderInner {
     params: HnswBuildParams,
 
     /// Vector storage for the graph.
-    vectors: Arc<InMemoryVectorStorage>,
+    vectors: Arc<dyn VectorStorage>,
 
     nodes: Arc<RwLock<Vec<GraphBuilderNode>>>,
     level_count: Vec<AtomicUsize>,
@@ -205,12 +205,12 @@ impl HNSWBuilderInner {
         self.nodes.clone()
     }
 
-    pub fn storage(&self) -> Arc<InMemoryVectorStorage> {
+    pub fn storage(&self) -> Arc<dyn VectorStorage> {
         self.vectors.clone()
     }
 
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
-    pub fn with_params(params: HnswBuildParams, vectors: Arc<InMemoryVectorStorage>) -> Self {
+    pub fn with_params(params: HnswBuildParams, vectors: Arc<dyn VectorStorage>) -> Self {
         let len = vectors.len();
         let max_level = params.max_level;
 
@@ -272,7 +272,7 @@ impl HNSWBuilderInner {
         //    ep = Select-Neighbors(W, 1)
         //  }
         // ```
-        let dist_calc = self.vectors.dist_calculator(self.vectors.vector(node));
+        let dist_calc = self.vectors.dist_calculator_from_id(node);
         for level in (target_level + 1..self.params.max_level).rev() {
             let cur_level = HnswLevelView::new(level, self);
             ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;

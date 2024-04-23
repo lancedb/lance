@@ -29,13 +29,6 @@ impl InMemoryVectorStorage {
     pub fn vector(&self, id: u32) -> &[f32] {
         self.vectors.row(id as usize).unwrap()
     }
-
-    /// Distance between two vectors.
-    pub fn distance_between(&self, a: u32, b: u32) -> f32 {
-        let vector1 = self.vectors.row(a as usize).unwrap();
-        let vector2 = self.vectors.row(b as usize).unwrap();
-        self.metric_type.func()(vector1, vector2)
-    }
 }
 
 impl VectorStorage for InMemoryVectorStorage {
@@ -61,6 +54,21 @@ impl VectorStorage for InMemoryVectorStorage {
             query: query.to_vec(),
             metric_type: self.metric_type,
         })
+    }
+
+    fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator> {
+        Box::new(InMemoryDistanceCal {
+            vectors: self.vectors.clone(),
+            query: self.vectors.row(id as usize).unwrap().to_vec(),
+            metric_type: self.metric_type,
+        })
+    }
+
+    /// Distance between two vectors.
+    fn distance_between(&self, a: u32, b: u32) -> f32 {
+        let vector1 = self.vectors.row(a as usize).unwrap();
+        let vector2 = self.vectors.row(b as usize).unwrap();
+        self.metric_type.func()(vector1, vector2)
     }
 }
 
