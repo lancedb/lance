@@ -246,7 +246,7 @@ impl HNSWBuilderInner {
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
-        let ml = self.params.m as f32;
+        let ml = 1.0 / (self.params.m as f32).ln();
         min(
             (-rng.gen::<f32>().ln() * ml) as u16,
             self.params.max_level - 1,
