@@ -129,8 +129,7 @@ class LanceFileWriter:
         path: str,
         schema: pa.Schema,
         *,
-        data_cache_bytes: int,
-        keep_original_array: bool,
+        data_cache_bytes: int = None,
         **kwargs,
     ):
         """
