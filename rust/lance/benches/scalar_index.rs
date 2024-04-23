@@ -48,7 +48,7 @@ impl BtreeTrainingSource for BenchmarkDataSource {
         self: Box<Self>,
         _chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
-        Ok(reader_to_stream(Box::new(Self::test_data())).await?.0)
+        Ok(reader_to_stream(Box::new(Self::test_data())))
     }
 }
 
