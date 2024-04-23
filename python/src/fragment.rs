@@ -465,7 +465,8 @@ pub fn write_fragments(
     let batches = convert_reader(reader)?;
 
     let params = kwargs
-        .and_then(|params| get_write_params(params).ok().flatten())
+        .and_then(|params| get_write_params(params).transpose())
+        .transpose()?
         .unwrap_or_default();
 
     let fragments = RT
