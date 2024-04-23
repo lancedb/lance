@@ -280,6 +280,21 @@ impl KMeanMembership {
     }
 }
 
+pub struct KMeanMultipleMembership {
+    dimension: usize,
+
+    /// Cluster Id and distance for each vector.
+    ///
+    /// If it is None, means the assignment is not valid, i.e., input vectors might
+    /// be all `NaN`.
+    pub assignments: Vec<Option<Vec<(u32, f32)>>>,
+
+    /// Number of centroids.
+    k: usize,
+
+    metric_type: MetricType,
+}
+
 impl<T: ArrowFloatType> KMeans<T>
 where
     T: L2 + Dot + Normalize,
@@ -508,6 +523,60 @@ where
         }
     }
 
+    pub async fn compute_multiple_memberships(
+        &self,
+        data: Arc<T::ArrayType>,
+        max_replica: usize,
+    ) -> KMeanMultipleMembership {
+        let dimension = self.dimension;
+        let n = data.len() / self.dimension;
+        let metric_type = self.metric_type;
+        const CHUNK_SIZE: usize = 1024;
+
+        let assignments = stream::iter((0..n).step_by(CHUNK_SIZE))
+            // make tiles of input data to split between threads.
+            .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
+            .map(|(start_idx, (data, centroids))| async move {
+                let data = tokio::task::spawn_blocking(move || {
+                    let last_idx = min(start_idx + CHUNK_SIZE, n);
+
+                    let centroids_array = centroids.as_slice();
+                    let values = &data.as_slice()[start_idx * dimension..last_idx * dimension];
+
+                    match metric_type {
+                        MetricType::L2 => {
+                            return compute_multiple_partitions_l2(centroids_array, values, dimension,max_replica)
+                        }
+                        // MetricType::Dot => values
+                        //     .chunks_exact(dimension)
+                        //     .map(|vector| {
+                        //         let centroid_stream = centroids_array.chunks_exact(dimension);
+                        //         argmin_value(centroid_stream.map(|cent| dot_distance(vector, cent)))
+                        //     })
+                        //     .collect::<Vec<_>>(),
+                        _ => {
+                            panic!("KMeans: should not use cosine distance to train kmeans, use L2 instead.");
+                        }
+                    }
+                })
+                .await
+                .map_err(|e| {
+                    ArrowError::ComputeError(format!("KMeans: failed to compute membership: {}", e))
+                })?;
+                Ok::<Vec<_>, Error>(data)
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        KMeanMultipleMembership {
+            dimension,
+            assignments: assignments.iter().flatten().cloned().collect(),
+            k: self.k,
+            metric_type: self.metric_type,
+        }
+    }
+
     pub fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
         if query.len() != self.dimension {
             return Err(Error::InvalidArgumentError(format!(
@@ -633,6 +702,41 @@ where
             .map(|(p, d)| p.map(|p| (p, d)))
     });
     Box::new(stream)
+}
+
+fn compute_multiple_partitions_l2<'a, T: FloatToArrayType>(
+    centroids: &'a [T],
+    data: &'a [T],
+    dim: usize,
+    max_replica: usize,
+) -> Vec<Option<Vec<(u32, f32)>>>
+where
+    T::ArrowType: L2,
+{
+    const REPLICATE_FACTOR: f32 = 0.04;
+    data.chunks(dim)
+        .map(|row| {
+            let mut dists = l2_distance_batch(row, centroids, dim)
+                .enumerate()
+                .map(|(i, d)| (i as u32, d))
+                .collect::<Vec<_>>();
+            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let min_dist = dists[0].1;
+            if min_dist.is_nan() {
+                return None;
+            }
+            let mut keep_length = 1;
+            while keep_length < max_replica
+                && keep_length < dists.len()
+                && dists[keep_length].1 < min_dist * (1.0 + REPLICATE_FACTOR)
+            {
+                keep_length += 1;
+            }
+
+            dists.truncate(keep_length);
+            Some(dists)
+        })
+        .collect()
 }
 
 /// Compute partition ID of each vector in the KMeans.
