@@ -144,12 +144,22 @@ impl HNSWBuilder {
     /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
     pub async fn build(&mut self) -> Result<HNSW> {
         log::info!(
-            "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
+            "Building HNSW graph: num={}, metric_type={}, max_levels={}, m_max={}, ef_construction={}",
+            self.inner.vectors.len(),
             self.inner.vectors.metric_type(),
             self.inner.params.max_level,
             self.inner.params.m_max,
             self.inner.params.ef_construction
         );
+
+        if self.inner.vectors.len() == 0 {
+            return Ok(HNSW::from_builder(
+                self,
+                self.inner.entry_point,
+                self.inner.vectors.metric_type(),
+                self.inner.params.use_select_heuristic,
+            ));
+        }
 
         let parallel_limit = self
             .inner
