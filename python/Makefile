@@ -17,16 +17,16 @@ format: format-python
 .PHONY: format
 
 format-python:
-	ruff format --preview python
-	ruff --preview --fix python
+	ruff format python
+	ruff --fix python
 .PHONY: format-python
 
 lint: lint-python lint-rust
 .PHONY: lint
 
 lint-python:
-	ruff format --preview --check python
-	ruff --preview python
+	ruff format --check python
+	ruff python
 .PHONY: lint-python
 
 lint-rust:

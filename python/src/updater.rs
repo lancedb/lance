@@ -18,7 +18,7 @@ use pyo3::{exceptions::*, prelude::*};
 
 use lance::dataset::updater::Updater as LanceUpdater;
 
-use crate::{fragment::FragmentMetadata, RT};
+use crate::{fragment::FragmentMetadata, schema::LanceSchema, RT};
 
 #[pyclass(name = "_Updater", module = "_lib")]
 pub struct Updater {
@@ -62,9 +62,10 @@ impl Updater {
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         })??;
 
-        Ok(FragmentMetadata::new(
-            fragment,
-            self.inner.schema().unwrap().clone(),
-        ))
+        Ok(FragmentMetadata::new(fragment))
+    }
+
+    fn schema(&self) -> Option<LanceSchema> {
+        self.inner.schema().map(|s| LanceSchema(s.clone()))
     }
 }

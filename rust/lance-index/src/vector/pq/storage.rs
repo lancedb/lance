@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Product Quantization storage
 //!
@@ -405,6 +394,10 @@ impl QuantizerStorage for ProductQuantizationStorage {
 }
 
 impl VectorStorage for ProductQuantizationStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn len(&self) -> usize {
         self.batch.num_rows()
     }
@@ -426,6 +419,14 @@ impl VectorStorage for ProductQuantizationStorage {
             query,
             self.metric_type(),
         ))
+    }
+
+    fn dist_calculator_from_id(&self, _: u32) -> Box<dyn DistCalculator> {
+        todo!("distance_between not implemented for PQ storage")
+    }
+
+    fn distance_between(&self, _: u32, _: u32) -> f32 {
+        todo!("distance_between not implemented for PQ storage")
     }
 }
 
@@ -467,17 +468,13 @@ impl PQDistCalculator {
 }
 
 impl DistCalculator for PQDistCalculator {
-    fn distance(&self, ids: &[u32]) -> Vec<f32> {
-        ids.iter()
-            .map(|&id| {
-                let pq_code = self.get_pq_code(id);
-                pq_code
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
-                    .sum()
-            })
-            .collect()
+    fn distance(&self, id: u32) -> f32 {
+        let pq_code = self.get_pq_code(id);
+        pq_code
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
+            .sum()
     }
 }
 

@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Transaction definitions for updating datasets
 //!
@@ -944,6 +933,77 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
                 .collect(),
         }
     }
+}
+
+/// Validate the operation is valid for the given manifest.
+pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) -> Result<()> {
+    let manifest = match (manifest, operation) {
+        (None, Operation::Overwrite { fragments, schema }) => {
+            // Validate here because we are going to return early.
+            schema_fragments_valid(schema, fragments)?;
+
+            return Ok(());
+        }
+        (Some(manifest), _) => manifest,
+        (None, _) => {
+            return Err(Error::invalid_input(
+                format!(
+                    "Cannot apply operation {} to non-existent dataset",
+                    operation.name()
+                ),
+                location!(),
+            ));
+        }
+    };
+
+    match operation {
+        Operation::Append { fragments } => {
+            // Fragments must contain all fields in the schema
+            schema_fragments_valid(&manifest.schema, fragments)
+        }
+        Operation::Project { schema } => {
+            schema_fragments_valid(schema, manifest.fragments.as_ref())
+        }
+        Operation::Merge { fragments, schema } | Operation::Overwrite { fragments, schema } => {
+            schema_fragments_valid(schema, fragments)
+        }
+        Operation::Update {
+            updated_fragments,
+            new_fragments,
+            ..
+        } => {
+            schema_fragments_valid(&manifest.schema, updated_fragments)?;
+            schema_fragments_valid(&manifest.schema, new_fragments)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Check that each fragment contains all fields in the schema.
+/// It is not required that the schema contains all fields in the fragment.
+/// There may be masked fields.
+fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+    // TODO: add additional validation. Consider consolidating with various
+    // validate() methods in the codebase.
+    for fragment in fragments {
+        for field in schema.fields_pre_order() {
+            if !fragment
+                .files
+                .iter()
+                .flat_map(|f| f.fields.iter())
+                .any(|f_id| f_id == &field.id)
+            {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Fragment {} does not contain field {:?}",
+                        fragment.id, field
+                    ),
+                    location!(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

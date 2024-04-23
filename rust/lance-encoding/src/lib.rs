@@ -1,21 +1,10 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Range;
 
 use bytes::Bytes;
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, FutureExt};
 
 use lance_core::Result;
 
@@ -43,4 +32,29 @@ pub trait EncodingsIo: Send + Sync {
     ///
     /// * `ranges` - the byte ranges to request
     fn submit_request(&self, range: Vec<Range<u64>>) -> BoxFuture<'static, Result<Vec<Bytes>>>;
+}
+
+/// An implementation of EncodingsIo that serves data from an in-memory buffer
+pub struct BufferScheduler {
+    data: Bytes,
+}
+
+impl BufferScheduler {
+    pub fn new(data: Bytes) -> Self {
+        Self { data }
+    }
+
+    fn satisfy_request(&self, req: Range<u64>) -> Bytes {
+        self.data.slice(req.start as usize..req.end as usize)
+    }
+}
+
+impl EncodingsIo for BufferScheduler {
+    fn submit_request(&self, ranges: Vec<Range<u64>>) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+        std::future::ready(Ok(ranges
+            .into_iter()
+            .map(|range| self.satisfy_request(range))
+            .collect::<Vec<_>>()))
+        .boxed()
+    }
 }

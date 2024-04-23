@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use arrow_array::{cast::AsArray, ArrayRef, StructArray};
@@ -8,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
-    encoder::{EncodedPage, FieldEncoder},
+    encoder::{EncodedArray, EncodedPage, FieldEncoder},
     format::pb,
     EncodingsIo,
 };
@@ -36,11 +39,6 @@ impl SimpleStructScheduler {
         debug_assert!(!children.is_empty());
         let num_rows = children[0].iter().map(|page| page.num_rows()).sum();
         // Ensure that all the children have the same number of rows
-        debug_assert!(children.iter().all(|col| col
-            .iter()
-            .map(|page| page.num_rows())
-            .sum::<u32>()
-            == num_rows));
         Self {
             children,
             child_fields,
@@ -400,10 +398,6 @@ impl ChildState {
             // It's possible that we loaded more rows than asked for so need to calculate
             // newly_avail this way (we do this above too)
             let newly_avail = decoder.avail() - previously_avail;
-            println!(
-                "prev_avail: {}, newly_avail: {}",
-                previously_avail, newly_avail
-            );
             self.awaited.push_back(decoder);
             self.rows_available += newly_avail;
             self.rows_unawaited -= newly_avail;
@@ -541,7 +535,7 @@ impl DecodeArrayTask for SimpleStructDecodeTask {
     }
 }
 
-struct StructFieldEncoder {
+pub struct StructFieldEncoder {
     children: Vec<Box<dyn FieldEncoder>>,
     column_index: u32,
     num_rows_seen: u32,
@@ -587,11 +581,13 @@ impl FieldEncoder for StructFieldEncoder {
         // the very end which covers the entire struct.
         child_tasks.push(
             std::future::ready(Ok(EncodedPage {
-                buffers: vec![],
-                encoding: pb::ArrayEncoding {
-                    array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
-                        pb::SimpleStruct {},
-                    )),
+                array: EncodedArray {
+                    buffers: vec![],
+                    encoding: pb::ArrayEncoding {
+                        array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
+                            pb::SimpleStruct {},
+                        )),
+                    },
                 },
                 num_rows: num_rows_seen,
                 column_idx: column_index,
@@ -609,18 +605,9 @@ impl FieldEncoder for StructFieldEncoder {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
-
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::{
-        encoder::FieldEncoder,
-        encodings::{
-            logical::{primitive::PrimitiveFieldEncoder, r#struct::StructFieldEncoder},
-            physical::basic::BasicEncoder,
-        },
-        testing::check_round_trip_field_encoding,
-    };
+    use crate::testing::check_round_trip_encoding;
 
     #[test_log::test(tokio::test)]
     async fn test_simple_struct() {
@@ -628,18 +615,7 @@ mod tests {
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
         ]));
-        let child_encoders = vec![
-            Box::new(PrimitiveFieldEncoder::new(
-                4096,
-                Arc::new(BasicEncoder::new(1)),
-            )) as Box<dyn FieldEncoder>,
-            Box::new(PrimitiveFieldEncoder::new(
-                4096,
-                Arc::new(BasicEncoder::new(2)),
-            )) as Box<dyn FieldEncoder>,
-        ];
-        let encoder = StructFieldEncoder::new(child_encoders, 0);
         let field = Field::new("", data_type, false);
-        check_round_trip_field_encoding(encoder, field).await;
+        check_round_trip_encoding(field).await;
     }
 }

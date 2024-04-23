@@ -35,6 +35,10 @@ use dataset::optimize::{
 };
 use dataset::MergeInsertBuilder;
 use env_logger::Env;
+use file::{
+    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
+    LanceFileWriter, LancePageMetadata,
+};
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
@@ -47,10 +51,14 @@ pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
+pub(crate) mod debug;
+pub(crate) mod error;
 pub(crate) mod executor;
+pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod reader;
 pub(crate) mod scanner;
+pub(crate) mod schema;
 pub(crate) mod tracing;
 pub(crate) mod updater;
 pub(crate) mod utils;
@@ -58,6 +66,8 @@ pub(crate) mod utils;
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::{cleanup_partial_writes, write_fragments};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
+use crate::utils::build_sq_storage;
+use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
 pub use dataset::{Dataset, Operation};
@@ -101,16 +111,24 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<FileFragment>()?;
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<MergeInsertBuilder>()?;
+    m.add_class::<LanceFileReader>()?;
+    m.add_class::<LanceFileWriter>()?;
+    m.add_class::<LanceFileMetadata>()?;
+    m.add_class::<LanceColumnMetadata>()?;
+    m.add_class::<LancePageMetadata>()?;
+    m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
     m.add_class::<KMeans>()?;
+    m.add_class::<Hnsw>()?;
     m.add_class::<PyCompactionTask>()?;
     m.add_class::<PyCompaction>()?;
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<TraceGuard>()?;
+    m.add_class::<schema::LanceSchema>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
@@ -121,6 +139,12 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
+    m.add_wrapped(wrap_pyfunction!(build_sq_storage))?;
+    // Debug functions
+    m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
+    m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
+    m.add_wrapped(wrap_pyfunction!(debug::format_fragment))?;
+    m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
     Ok(())

@@ -6,19 +6,19 @@ authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
 repository = "https://github.com/eto-ai/lance"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 keywords = [
     "data-format",
     "data-science",
     "machine-learning",
     "arrow",
-    "data-analytics"
+    "data-analytics",
 ]
 categories = [
     "database-implementations",
     "data-structures",
     "development-tools",
-    "science"
+    "science",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -29,7 +29,6 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -56,20 +55,25 @@ tests = [
     "polars[pyarrow,pandas]",
     "pytest",
     "tensorflow",
+    # Remove when https://github.com/h5py/h5py/issues/2408 is resolved
+    # We don't need h5py but it is transitive from tensorflow and 3.11
+    # is missing wheels for arm so we need to prevent that version.
+    "h5py<3.11",
     "tqdm",
 ]
-dev = ["ruff==0.2.2"]
+dev = ["ruff==0.4.1"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
+ray = ["ray[data]; python_version<'3.12'"]
 
 [tool.ruff]
-lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "CPY001", "B019"]
+lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 
 [tool.ruff.lint.per-file-ignores]
-"*.pyi" = ["E302"]
+"*.pyi" = ["E301", "E302"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 check_untyped_defs = true
 warn_redundant_casts = true
 warn_unused_ignores = true

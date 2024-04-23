@@ -7,3 +7,4 @@ Integrations
     Huggingface <./huggingface>
     Tensorflow <./tensorflow>
     PyTorch <./pytorch>
+    Ray <./ray>

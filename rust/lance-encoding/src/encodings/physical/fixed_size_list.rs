@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use arrow_array::{cast::AsArray, ArrayRef};
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
@@ -5,7 +8,7 @@ use log::trace;
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
-    encoder::{ArrayEncoder, EncodedPage},
+    encoder::{ArrayEncoder, EncodedArray},
     format::pb,
     EncodingsIo,
 };
@@ -67,11 +70,17 @@ pub struct FixedListDecoder {
 }
 
 impl PhysicalPageDecoder for FixedListDecoder {
-    fn update_capacity(&self, rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]) {
+    fn update_capacity(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        buffers: &mut [(u64, bool)],
+        all_null: &mut bool,
+    ) {
         let rows_to_skip = rows_to_skip * self.dimension;
         let num_rows = num_rows * self.dimension;
         self.items_decoder
-            .update_capacity(rows_to_skip, num_rows, buffers);
+            .update_capacity(rows_to_skip, num_rows, buffers, all_null);
     }
 
     fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [bytes::BytesMut]) {
@@ -79,6 +88,10 @@ impl PhysicalPageDecoder for FixedListDecoder {
         let num_rows = num_rows * self.dimension;
         self.items_decoder
             .decode_into(rows_to_skip, num_rows, dest_buffers);
+    }
+
+    fn num_buffers(&self) -> u32 {
+        self.items_decoder.num_buffers()
     }
 }
 
@@ -98,15 +111,14 @@ impl FslEncoder {
 }
 
 impl ArrayEncoder for FslEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedPage> {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let inner_arrays = arrays
             .iter()
             .map(|arr| arr.as_fixed_size_list().values().clone())
             .collect::<Vec<_>>();
-        let items_page = self.items_encoder.encode(&inner_arrays)?;
-        Ok(EncodedPage {
+        let items_page = self.items_encoder.encode(&inner_arrays, buffer_index)?;
+        Ok(EncodedArray {
             buffers: items_page.buffers,
-            num_rows: items_page.num_rows / self.dimension,
             encoding: pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::FixedSizeList(Box::new(
                     pb::FixedSizeList {
@@ -115,7 +127,6 @@ impl ArrayEncoder for FslEncoder {
                     },
                 ))),
             },
-            column_idx: items_page.column_idx,
         })
     }
 }
@@ -126,22 +137,40 @@ mod tests {
 
     use arrow_schema::{DataType, Field};
 
-    use crate::encodings::physical::basic::BasicEncoder;
-    use crate::encodings::physical::fixed_size_list::FslEncoder;
-    use crate::encodings::physical::value::tests::PRIMITIVE_TYPES;
-    use crate::testing::check_round_trip_array_encoding;
+    use crate::testing::check_round_trip_encoding;
+
+    // The commented out types are supported by the encoder/decoder but Lance
+    // schema doesn't yet parse them in the context of a fixed size list.
+    const PRIMITIVE_TYPES: &[DataType] = &[
+        // DataType::Date32,
+        // DataType::Date64,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+        DataType::Float16,
+        DataType::Float32,
+        DataType::Float64,
+        // DataType::Decimal128(10, 10),
+        // DataType::Decimal256(10, 10),
+        // DataType::Timestamp(TimeUnit::Nanosecond, None),
+        // DataType::Time32(TimeUnit::Second),
+        // DataType::Time64(TimeUnit::Nanosecond),
+        // DataType::Duration(TimeUnit::Second),
+        // DataType::Interval(IntervalUnit::DayTime),
+    ];
 
     #[test_log::test(tokio::test)]
     async fn test_value_fsl_primitive() {
         for data_type in PRIMITIVE_TYPES {
-            let encoder = FslEncoder::new(Box::new(BasicEncoder::new(0)), 16);
             let inner_field = Field::new("item", data_type.clone(), true);
-            let field = Field::new(
-                "",
-                DataType::FixedSizeList(Arc::new(inner_field), 16),
-                false,
-            );
-            check_round_trip_array_encoding(encoder, field).await;
+            let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
+            let field = Field::new("", data_type, false);
+            check_round_trip_encoding(field).await;
         }
     }
 }

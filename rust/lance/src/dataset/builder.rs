@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -20,7 +9,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use url::Url;
 
-use super::{ReadParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::{
     error::{Error, Result},
     session::Session,
@@ -161,6 +150,18 @@ impl DatasetBuilder {
             self.commit_handler = Some(commit_handler);
         }
 
+        self
+    }
+
+    /// Set options based on [WriteParams].
+    pub fn with_write_params(mut self, write_params: WriteParams) -> Self {
+        if let Some(options) = write_params.store_params {
+            self.options = options;
+        }
+
+        if let Some(commit_handler) = write_params.commit_handler {
+            self.commit_handler = Some(commit_handler);
+        }
         self
     }
 

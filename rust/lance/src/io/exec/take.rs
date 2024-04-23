@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,10 +7,13 @@ use std::task::{Context, Poll};
 
 use arrow_array::{cast::as_primitive_array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream,
 };
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
 use tokio::sync::mpsc::{self, Receiver};
@@ -188,6 +180,8 @@ pub struct TakeExec {
     output_schema: Schema,
 
     batch_readahead: usize,
+
+    properties: PlanProperties,
 }
 
 impl DisplayAs for TakeExec {
@@ -230,12 +224,19 @@ impl TakeExec {
 
         let remaining_schema = extra_schema.exclude(&input_schema)?;
 
+        let output_arrow = Arc::new(ArrowSchema::from(&output_schema));
+        let properties = input
+            .properties()
+            .clone()
+            .with_eq_properties(EquivalenceProperties::new(output_arrow));
+
         Ok(Self {
             dataset,
             extra_schema: Arc::new(remaining_schema),
             input,
             output_schema,
             batch_readahead,
+            properties,
         })
     }
 }
@@ -247,14 +248,6 @@ impl ExecutionPlan for TakeExec {
 
     fn schema(&self) -> SchemaRef {
         ArrowSchema::from(&self.output_schema).into()
-    }
-
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -302,7 +295,14 @@ impl ExecutionPlan for TakeExec {
     }
 
     fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {
-        self.input.statistics()
+        Ok(Statistics {
+            num_rows: self.input.statistics()?.num_rows,
+            ..Statistics::new_unknown(self.schema().as_ref())
+        })
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 }
 

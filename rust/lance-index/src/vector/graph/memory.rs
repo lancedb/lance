@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! In-memory graph representations.
 
@@ -40,16 +29,13 @@ impl InMemoryVectorStorage {
     pub fn vector(&self, id: u32) -> &[f32] {
         self.vectors.row(id as usize).unwrap()
     }
-
-    /// Distance between two vectors.
-    pub fn distance_between(&self, a: u32, b: u32) -> f32 {
-        let vector1 = self.vectors.row(a as usize).unwrap();
-        let vector2 = self.vectors.row(b as usize).unwrap();
-        self.metric_type.func()(vector1, vector2)
-    }
 }
 
 impl VectorStorage for InMemoryVectorStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn len(&self) -> usize {
         self.vectors.num_rows()
     }
@@ -69,6 +55,21 @@ impl VectorStorage for InMemoryVectorStorage {
             metric_type: self.metric_type,
         })
     }
+
+    fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator> {
+        Box::new(InMemoryDistanceCal {
+            vectors: self.vectors.clone(),
+            query: self.vectors.row(id as usize).unwrap().to_vec(),
+            metric_type: self.metric_type,
+        })
+    }
+
+    /// Distance between two vectors.
+    fn distance_between(&self, a: u32, b: u32) -> f32 {
+        let vector1 = self.vectors.row(a as usize).unwrap();
+        let vector2 = self.vectors.row(b as usize).unwrap();
+        self.metric_type.func()(vector1, vector2)
+    }
 }
 
 struct InMemoryDistanceCal {
@@ -78,12 +79,9 @@ struct InMemoryDistanceCal {
 }
 
 impl DistCalculator for InMemoryDistanceCal {
-    fn distance(&self, ids: &[u32]) -> Vec<f32> {
-        ids.iter()
-            .map(|id| {
-                let vector = self.vectors.row(*id as usize).unwrap();
-                self.metric_type.func()(&self.query, vector)
-            })
-            .collect()
+    #[inline]
+    fn distance(&self, id: u32) -> f32 {
+        let vector = self.vectors.row(id as usize).unwrap();
+        self.metric_type.func()(&self.query, vector)
     }
 }

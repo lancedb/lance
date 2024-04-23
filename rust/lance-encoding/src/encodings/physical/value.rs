@@ -1,15 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use arrow_array::ArrayRef;
+use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
+use lance_arrow::DataTypeExt;
 use log::trace;
+use snafu::{location, Location};
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
-    encoder::{BufferEncoder, EncodedBuffer},
+    encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
+    format::pb,
     EncodingsIo,
 };
 
-use lance_core::Result;
+use lance_core::{Error, Result};
+
+use super::buffers::{BitmapBufferEncoder, FlatBufferEncoder};
 
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
@@ -74,7 +83,13 @@ struct ValuePageDecoder {
 }
 
 impl PhysicalPageDecoder for ValuePageDecoder {
-    fn update_capacity(&self, _rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]) {
+    fn update_capacity(
+        &self,
+        _rows_to_skip: u32,
+        num_rows: u32,
+        buffers: &mut [(u64, bool)],
+        _all_null: &mut bool,
+    ) {
         buffers[0].0 = self.bytes_per_value * num_rows as u64;
         buffers[0].1 = true;
     }
@@ -101,20 +116,65 @@ impl PhysicalPageDecoder for ValuePageDecoder {
             }
         }
     }
+
+    fn num_buffers(&self) -> u32 {
+        1
+    }
 }
 
-#[derive(Debug, Default)]
-pub struct ValueEncoder {}
+#[derive(Debug)]
+pub struct ValueEncoder {
+    buffer_encoder: Box<dyn BufferEncoder>,
+}
 
-impl BufferEncoder for ValueEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
-        let parts = arrays
-            .iter()
-            .map(|arr| arr.to_data().buffers()[0].clone())
-            .collect::<Vec<_>>();
-        Ok(EncodedBuffer {
-            is_data: true,
-            parts,
+impl ValueEncoder {
+    pub fn try_new(data_type: &DataType) -> Result<Self> {
+        if data_type.is_primitive() {
+            Ok(Self {
+                buffer_encoder: Box::<FlatBufferEncoder>::default(),
+            })
+        } else if *data_type == DataType::Boolean {
+            Ok(Self {
+                buffer_encoder: Box::<BitmapBufferEncoder>::default(),
+            })
+        } else {
+            Err(Error::invalid_input(
+                format!("Cannot use value encoded to encode {}", data_type),
+                location!(),
+            ))
+        }
+    }
+}
+
+impl ArrayEncoder for ValueEncoder {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
+        let index = *buffer_index;
+        *buffer_index += 1;
+
+        let encoded_buffer = self.buffer_encoder.encode(arrays)?;
+        let array_bufs = vec![EncodedArrayBuffer {
+            parts: encoded_buffer.parts,
+            index,
+        }];
+
+        let data_type = arrays[0].data_type();
+        let bits_per_value = match data_type {
+            DataType::Boolean => 1,
+            _ => 8 * data_type.byte_width() as u64,
+        };
+        let flat_encoding = pb::ArrayEncoding {
+            array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
+                bits_per_value,
+                buffer: Some(pb::Buffer {
+                    buffer_index: index,
+                    buffer_type: pb::buffer::BufferType::Page as i32,
+                }),
+            })),
+        };
+
+        Ok(EncodedArray {
+            buffers: array_bufs,
+            encoding: flat_encoding,
         })
     }
 }
@@ -123,12 +183,11 @@ impl BufferEncoder for ValueEncoder {
 #[cfg(test)]
 pub(crate) mod tests {
 
-    use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
+    use arrow_schema::{DataType, Field, TimeUnit};
 
-    use crate::encodings::physical::basic::BasicEncoder;
-    use crate::testing::check_round_trip_array_encoding;
+    use crate::testing::check_round_trip_encoding;
 
-    pub const PRIMITIVE_TYPES: &[DataType] = &[
+    const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Date32,
         DataType::Date64,
         DataType::Int8,
@@ -148,16 +207,16 @@ pub(crate) mod tests {
         DataType::Time32(TimeUnit::Second),
         DataType::Time64(TimeUnit::Nanosecond),
         DataType::Duration(TimeUnit::Second),
-        DataType::Interval(IntervalUnit::DayTime),
+        // The Interval type is supported by the reader but the writer works with Lance schema
+        // at the moment and Lance schema can't parse interval
+        // DataType::Interval(IntervalUnit::DayTime),
     ];
 
     #[test_log::test(tokio::test)]
     async fn test_value_primitive() {
         for data_type in PRIMITIVE_TYPES {
-            let encoder = BasicEncoder::new(0);
             let field = Field::new("", data_type.clone(), false);
-
-            check_round_trip_array_encoding(encoder, field).await;
+            check_round_trip_encoding(field).await;
         }
     }
 }

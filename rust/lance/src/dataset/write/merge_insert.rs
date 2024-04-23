@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! The merge insert operation merges a batch of new data into an existing batch of old data.  This can be
 //! used to implement a bulk update-or-insert (upsert) or find-or-create operation.  It can also be used to
@@ -442,6 +431,7 @@ impl MergeInsertJob {
                 vec![(Arc::new(target_key), Arc::new(source_key))],
                 None,
                 &JoinType::Full,
+                None,
                 PartitionMode::CollectLeft,
                 true,
             )
@@ -514,6 +504,7 @@ impl MergeInsertJob {
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let new_fragments = write_fragments_internal(
+            None,
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema(),

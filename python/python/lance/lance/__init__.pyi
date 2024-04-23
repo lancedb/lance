@@ -32,3 +32,38 @@ class CompactionMetrics:
     fragments_added: int
     files_removed: int
     files_added: int
+
+class LanceFileWriter:
+    def __init__(self, path: str, schema: pa.Schema): ...
+    def write_batch(self, batch: pa.RecordBatch) -> None: ...
+    def finish(self) -> int: ...
+
+class LanceFileReader:
+    def __init__(self, path: str, schema: pa.Schema): ...
+    def read_all(
+        self, batch_size: int, batch_readahead: int
+    ) -> pa.RecordBatchReader: ...
+    def read_range(
+        self, start: int, num_rows: int, batch_size: int, batch_readahead: int
+    ) -> pa.RecordBatchReader: ...
+
+class LanceBufferDescriptor:
+    position: int
+    size: int
+
+class LancePageMetadata:
+    buffers: List[LanceBufferDescriptor]
+    encoding: str
+
+class LanceColumnMetadata:
+    column_buffers: List[LanceBufferDescriptor]
+    pages: List[LancePageMetadata]
+
+class LanceFileMetadata:
+    schema: pa.Schema
+    num_rows: int
+    num_data_bytes: int
+    num_column_metadata_bytes: int
+    num_global_buffer_bytes: int
+    global_buffers: List[LanceBufferDescriptor]
+    columns: List[LanceColumnMetadata]

@@ -1,16 +1,5 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import lance
 import lance.arrow
@@ -182,10 +171,12 @@ def _create_dataset(uri, num_batches=1):
 
 
 def test_schema_to_json():
-    schema = pa.schema([
-        pa.field("embedding", pa.list_(pa.float32(), 32), False),
-        pa.field("id", pa.int64(), True),
-    ])
+    schema = pa.schema(
+        [
+            pa.field("embedding", pa.list_(pa.float32(), 32), False),
+            pa.field("id", pa.int64(), True),
+        ]
+    )
     json_schema = lance.schema_to_json(schema)
     assert json_schema == {
         "fields": [
@@ -222,15 +213,19 @@ def sample_data_all_types():
     storage = pa.FixedSizeListArray.from_arrays(inner, 6)
     tensor_array = pa.ExtensionArray.from_storage(tensor_type, storage)
 
-    return pa.table({
-        # TODO: add remaining types
-        "str": pa.array([str(i) for i in range(nrows)]),
-        "float16": pa.array(
-            [np.float16(1.0 + i / 10) for i in range(nrows)], pa.float16()
-        ),
-        "bfloat16": lance.arrow.bfloat16_array([1.0 + i / 10 for i in range(nrows)]),
-        "tensor": tensor_array,
-    })
+    return pa.table(
+        {
+            # TODO: add remaining types
+            "str": pa.array([str(i) for i in range(nrows)]),
+            "float16": pa.array(
+                [np.float16(1.0 + i / 10) for i in range(nrows)], pa.float16()
+            ),
+            "bfloat16": lance.arrow.bfloat16_array(
+                [1.0 + i / 10 for i in range(nrows)]
+            ),
+            "tensor": tensor_array,
+        }
+    )
 
 
 def test_roundtrip_types(tmp_path, sample_data_all_types):

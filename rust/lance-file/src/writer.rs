@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 mod statistics;
 
@@ -1264,5 +1253,51 @@ mod tests {
 
         let batch = read_file_as_one_batch(&store, &path, schema).await;
         assert_eq!(batch.column_by_name("i").unwrap().as_ref(), &array);
+    }
+
+    #[tokio::test]
+    async fn test_write_schema_with_holes() {
+        let store = ObjectStore::memory();
+        let path = Path::from("test");
+
+        let mut field0 = Field::try_from(&ArrowField::new("a", DataType::Int32, true)).unwrap();
+        field0.set_id(-1, &mut 0);
+        assert_eq!(field0.id, 0);
+        let mut field2 = Field::try_from(&ArrowField::new("b", DataType::Int32, true)).unwrap();
+        field2.set_id(-1, &mut 2);
+        assert_eq!(field2.id, 2);
+        // There is a hole at field id 1.
+        let schema = Schema {
+            fields: vec![field0, field2],
+            metadata: Default::default(),
+        };
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let data = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(10..20)),
+            ],
+        )
+        .unwrap();
+
+        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+            &store,
+            &path,
+            schema.clone(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        file_writer.write(&[data]).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let page_table = file_writer.page_table;
+        assert!(page_table.get(0, 0).is_some());
+        assert!(page_table.get(2, 0).is_some());
     }
 }

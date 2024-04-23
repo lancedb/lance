@@ -1,19 +1,15 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lance_core::Result;
-use lance_index::vector::sq::{builder::SQBuildParams, ScalarQuantizer};
+use std::sync::Arc;
+
+use arrow::datatypes::Float32Type;
+use arrow_array::{Array, RecordBatch};
+use lance_core::{Result, ROW_ID};
+use lance_index::vector::{
+    quantizer::Quantization,
+    sq::{builder::SQBuildParams, storage::ScalarQuantizationStorage, ScalarQuantizer},
+};
 use lance_linalg::{distance::MetricType, kernels::normalize_fsl};
 
 use crate::{index::vector::utils::maybe_sample_training_data, Dataset};
@@ -57,4 +53,22 @@ pub(super) async fn build_sq_model(
         start.elapsed().as_secs_f32()
     );
     Ok(sq)
+}
+
+pub fn build_sq_storage(
+    metric_type: MetricType,
+    row_ids: Arc<dyn Array>,
+    vectors: Arc<dyn Array>,
+    sq: ScalarQuantizer,
+) -> Result<ScalarQuantizationStorage> {
+    let code_column = sq.transform::<Float32Type>(vectors.as_ref())?;
+    std::mem::drop(vectors);
+
+    let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
+        (ROW_ID, row_ids, true),
+        (sq.column(), code_column, false),
+    ])?;
+    let store = ScalarQuantizationStorage::new(sq.num_bits(), metric_type, sq.bounds(), pq_batch)?;
+
+    Ok(store)
 }

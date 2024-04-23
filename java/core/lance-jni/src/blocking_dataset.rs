@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{traits::IntoJava, Error, Result, RT};
 use arrow::array::RecordBatchReader;
-
+use arrow::ffi::FFI_ArrowSchema;
+use arrow_schema::Schema;
+use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
+use lance::dataset::fragment::FileFragment;
+use lance::dataset::transaction::Operation;
 use lance::dataset::{Dataset, WriteParams};
-
-use crate::{traits::IntoJava, Result, RT};
-
+use snafu::{location, Location};
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
 #[derive(Clone)]
@@ -38,6 +41,11 @@ impl BlockingDataset {
 
     pub fn open(uri: &str) -> Result<Self> {
         let inner = RT.block_on(Dataset::open(uri))?;
+        Ok(Self { inner })
+    }
+
+    pub fn commit(uri: &str, operation: Operation, read_version: Option<u64>) -> Result<Self> {
+        let inner = RT.block_on(Dataset::commit(uri, operation, read_version, None, None))?;
         Ok(Self { inner })
     }
 
@@ -99,7 +107,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsIds<'a>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_getJsonFragments<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
 ) -> JObject<'a> {
@@ -110,11 +118,50 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsIds<'a>(
         dataset.inner.get_fragments()
     };
 
-    let array_list = env
-        .new_int_array(fragments.len() as i32)
-        .expect("Failed to create int array");
-    let fragment_ids = fragments.iter().map(|f| f.id() as i32).collect::<Vec<_>>();
-    env.set_int_array_region(&array_list, 0, &fragment_ids)
-        .expect("Failed to set int array region");
-    array_list.into()
+    ok_or_throw!(env, create_json_fragment_list(&mut env, fragments))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
+    mut env: JNIEnv,
+    jdataset: JObject,
+    arrow_schema_addr: jlong,
+) {
+    let schema = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Failed to get native dataset handle");
+        Schema::from(dataset.inner.schema())
+    };
+    let out_c_schema = arrow_schema_addr as *mut FFI_ArrowSchema;
+    let c_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&schema));
+
+    unsafe {
+        std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
+        std::mem::forget(c_schema);
+    };
+}
+
+fn create_json_fragment_list<'a>(
+    env: &mut JNIEnv<'a>,
+    fragments: Vec<FileFragment>,
+) -> Result<JObject<'a>> {
+    let array_list_class = env.find_class("java/util/ArrayList")?;
+
+    let array_list = env.new_object(array_list_class, "()V", &[])?;
+
+    for fragment in fragments {
+        let json_string = serde_json::to_string(fragment.metadata()).map_err(|e| Error::JSON {
+            message: e.to_string(),
+            location: location!(),
+        })?;
+        let jstring = env.new_string(json_string)?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[(&jstring).into()],
+        )?;
+    }
+    Ok(array_list)
 }

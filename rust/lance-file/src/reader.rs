@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance Data File Reader
 
@@ -116,8 +105,8 @@ impl FileReader {
         path: &Path,
         schema: Schema,
         fragment_id: u32,
-        field_id_offset: u32,
-        num_fields: u32,
+        field_id_offset: i32,
+        max_field_id: i32,
         session: Option<&FileMetadataCache>,
     ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
@@ -131,7 +120,7 @@ impl FileReader {
             schema,
             fragment_id,
             field_id_offset,
-            num_fields,
+            max_field_id,
             session,
         )
         .await
@@ -144,8 +133,8 @@ impl FileReader {
         metadata: Option<Arc<Metadata>>,
         schema: Schema,
         fragment_id: u32,
-        field_id_offset: u32,
-        num_fields: u32,
+        field_id_offset: i32,
+        max_field_id: i32,
         session: Option<&FileMetadataCache>,
     ) -> Result<Self> {
         let metadata = match metadata {
@@ -158,9 +147,9 @@ impl FileReader {
                 PageTable::load(
                     object_reader.as_ref(),
                     metadata.page_table_position,
-                    num_fields as i32,
+                    field_id_offset,
+                    max_field_id,
                     metadata.num_batches() as i32,
-                    field_id_offset as i32,
                 )
                 .await
             })
@@ -226,9 +215,9 @@ impl FileReader {
                     PageTable::load(
                         reader,
                         stats_meta.page_table_position,
-                        stats_meta.leaf_field_ids.len() as i32,
+                        /*min_field_id=*/ 0,
+                        /*max_field_id=*/ *stats_meta.leaf_field_ids.iter().max().unwrap(),
                         /*num_batches=*/ 1,
-                        /*field_id_offset=*/ 0,
                     )
                     .await?,
                 ))
@@ -259,9 +248,8 @@ impl FileReader {
     /// Open one Lance data file for read.
     pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
         // If just reading a lance data file we assume the schema is the schema of the data file
-        let num_fields = schema.max_field_id().unwrap_or_default() + 1;
-        Self::try_new_with_fragment_id(object_store, path, schema, 0, 0, num_fields as u32, None)
-            .await
+        let max_field_id = schema.max_field_id().unwrap_or_default();
+        Self::try_new_with_fragment_id(object_store, path, schema, 0, 0, max_field_id, None).await
     }
 
     /// Instruct the FileReader to return meta row id column.
@@ -486,7 +474,7 @@ pub fn batches_stream(
 ///
 /// `schema` may only be empty if `with_row_id` is also true. This function
 /// panics otherwise.
-async fn read_batch(
+pub async fn read_batch(
     reader: &FileReader,
     params: &ReadBatchParams,
     schema: &Schema,
@@ -1829,14 +1817,13 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let field_id = partial_schema.fields.first().unwrap().id;
-        let num_fields = 1;
         let reader = FileReader::try_new_with_fragment_id(
             &store,
             &path,
             schema.clone(),
             0,
-            field_id as u32,
-            num_fields,
+            /*min_field_id=*/ field_id,
+            /*max_field_id=*/ field_id,
             None,
         )
         .await

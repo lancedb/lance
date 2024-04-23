@@ -1,21 +1,11 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import json
 import multiprocessing
 from pathlib import Path
 
+import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
@@ -27,6 +17,7 @@ from lance import (
     LanceOperation,
     write_dataset,
 )
+from lance.debug import format_fragment
 from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
@@ -97,9 +88,11 @@ def test_scan_fragment_with_dynamic_projection(tmp_path: Path):
 
 def test_write_fragments(tmp_path: Path):
     # This will be split across two files if we set the max_bytes_per_file to 1024
-    tab = pa.table({
-        "a": pa.array(range(1024)),
-    })
+    tab = pa.table(
+        {
+            "a": pa.array(range(1024)),
+        }
+    )
     progress = ProgressForTest()
     fragments = write_fragments(
         tab,
@@ -113,6 +106,35 @@ def test_write_fragments(tmp_path: Path):
     # progress hook was called for each fragment
     assert progress.begin_called == 2
     assert progress.complete_called == 2
+
+
+def test_write_fragments_schema_holes(tmp_path: Path):
+    # Create table with 3 cols
+    data = pa.table({"a": range(3)})
+    dataset = write_dataset(data, tmp_path)
+    dataset.add_columns({"b": "a + 1"})
+    dataset.add_columns({"c": "a + 2"})
+    # Delete the middle column to create a hole in the field ids
+    dataset.drop_columns(["b"])
+
+    def get_field_ids(fragment):
+        return [id for f in fragment.data_files() for id in f.field_ids()]
+
+    field_ids = get_field_ids(dataset.get_fragments()[0])
+
+    data = pa.table({"a": range(3, 6), "c": range(5, 8)})
+    fragment = LanceFragment.create(tmp_path, data)
+    assert get_field_ids(fragment) == field_ids
+
+    data = pa.table({"a": range(6, 9), "c": range(8, 11)})
+    fragments = write_fragments(data, tmp_path)
+    assert len(fragments) == 1
+    assert get_field_ids(fragments[0]) == field_ids
+
+    operation = LanceOperation.Append([fragment, *fragments])
+    dataset = LanceDataset.commit(tmp_path, operation, read_version=dataset.version)
+
+    assert dataset.to_table().equals(pa.table({"a": range(9), "c": range(2, 11)}))
 
 
 def test_write_fragment_with_progress(tmp_path: Path):
@@ -165,8 +187,12 @@ def test_dataset_progress(tmp_path: Path):
 
     assert metadata["id"] == 0
     assert len(metadata["files"]) == 1
-
-    assert fragment == FragmentMetadata.from_json(json.dumps(metadata))
+    # Fragments aren't exactly equal, because the file was written before
+    # physical_rows was known.
+    assert (
+        fragment.data_files()
+        == FragmentMetadata.from_json(json.dumps(metadata)).data_files()
+    )
 
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=failing_write, args=(progress_uri, dataset_uri))
@@ -197,6 +223,8 @@ def test_dataset_progress(tmp_path: Path):
 
 
 def test_fragment_meta():
+    # Intentionally leaving off column_indices / version fields to make sure
+    # we can handle backwards compatibility (though not clear we need to)
     data = {
         "id": 0,
         "files": [
@@ -214,7 +242,27 @@ def test_fragment_meta():
     assert meta.data_files()[1].path() == "1.lance"
 
     assert repr(meta) == (
-        'Fragment { id: 0, files: [DataFile { path: "0.lance", fields: [0] },'
-        ' DataFile { path: "1.lance", fields: [1] }], deletion_file: None,'
-        " physical_rows: Some(100) }"
+        'Fragment { id: 0, files: [DataFile { path: "0.lance", fields: [0], '
+        "column_indices: [], file_major_version: 0, file_minor_version: 0 }, "
+        'DataFile { path: "1.lance", fields: [1], column_indices: [], '
+        "file_major_version: 0, file_minor_version: 0 }], deletion_file: None, "
+        "physical_rows: Some(100) }"
     )
+
+
+def test_fragment_v2(tmp_path):
+    dataset_uri = tmp_path / "dataset"
+    tab = pa.table(
+        {
+            "a": pa.array(range(1024)),
+        }
+    )
+    lance.write_dataset([], dataset_uri, schema=tab.schema)
+    fragments = write_fragments(
+        tab,
+        tmp_path,
+        use_experimental_writer=True,
+    )
+    assert len(fragments) == 1
+    ds = lance.dataset(dataset_uri)
+    assert "minor_version: 3" in format_fragment(fragments[0], ds)

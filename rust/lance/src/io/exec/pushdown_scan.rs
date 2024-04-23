@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
@@ -20,12 +9,13 @@ use arrow_array::types::{Int64Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Int64Array, PrimitiveArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
+use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::col;
 use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::physical_plan::ColumnarValue;
+use datafusion::physical_plan::{ColumnarValue, ExecutionMode, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     physical_plan::{
@@ -34,6 +24,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID_FIELD;
@@ -93,6 +84,8 @@ pub struct LancePushdownScanExec {
     predicate_projection: Arc<Schema>,
     predicate: Expr,
     config: ScanConfig,
+    output_schema: Arc<ArrowSchema>,
+    properties: PlanProperties,
 }
 
 impl LancePushdownScanExec {
@@ -120,6 +113,22 @@ impl LancePushdownScanExec {
             ));
         }
 
+        let output_schema: ArrowSchema = projection.as_ref().into();
+        let output_schema = if config.with_row_id {
+            let mut fields: Vec<Arc<Field>> = Vec::with_capacity(output_schema.fields.len() + 1);
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
+            fields.extend(output_schema.fields.iter().cloned());
+            Arc::new(ArrowSchema::new(fields))
+        } else {
+            Arc::new(output_schema)
+        };
+
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(output_schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        );
+
         Ok(Self {
             dataset,
             fragments,
@@ -127,6 +136,8 @@ impl LancePushdownScanExec {
             predicate,
             predicate_projection,
             config,
+            output_schema,
+            properties,
         })
     }
 }
@@ -137,23 +148,7 @@ impl ExecutionPlan for LancePushdownScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        let schema: ArrowSchema = self.projection.as_ref().into();
-        if self.config.with_row_id {
-            let mut fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields.len() + 1);
-            fields.push(Arc::new(ROW_ID_FIELD.clone()));
-            fields.extend(schema.fields.iter().cloned());
-            Arc::new(ArrowSchema::new(fields))
-        } else {
-            Arc::new(schema)
-        }
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+        self.output_schema.clone()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -168,7 +163,7 @@ impl ExecutionPlan for LancePushdownScanExec {
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        todo!()
+        Ok(Statistics::new_unknown(self.output_schema.as_ref()))
     }
 
     fn execute(
@@ -213,6 +208,10 @@ impl ExecutionPlan for LancePushdownScanExec {
             self.schema(),
             batch_stream,
         )))
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 }
 
@@ -271,7 +270,9 @@ impl FragmentScanner {
         }
 
         // We only need the statistics for the predicate projection.
-        let stats = reader.read_page_stats(Some(&predicate_projection)).await?;
+        let stats = reader
+            .legacy_read_page_stats(Some(&predicate_projection))
+            .await?;
 
         Ok(Self {
             fragment,
@@ -337,7 +338,7 @@ impl FragmentScanner {
                     projection_reader.with_row_id();
                 }
                 let batch = projection_reader
-                    .read_batch_projected(batch_id, .., &self.projection)
+                    .legacy_read_batch_projected(batch_id, .., &self.projection)
                     .await?;
                 let batch = self.final_projection(batch)?;
                 Ok(Some(batch))
@@ -368,7 +369,7 @@ impl FragmentScanner {
                 reader.with_row_id();
 
                 let batch = reader
-                    .read_batch_projected(batch_id, .., &predicate_projection)
+                    .legacy_read_batch_projected(batch_id, .., &predicate_projection)
                     .await?;
 
                 // 2. Evaluate predicate
@@ -441,7 +442,7 @@ impl FragmentScanner {
                     let remaining_projection = self.projection.project_by_ids(&remaining_fields);
                     Some(
                         self.reader
-                            .read_batch_projected(
+                            .legacy_read_batch_projected(
                                 batch_id,
                                 selection.clone(),
                                 &remaining_projection,
@@ -614,11 +615,11 @@ impl FragmentScanner {
     }
 
     fn simplified_predicates(&self) -> Result<Vec<Expr>> {
-        let num_batches = self.reader.num_batches();
+        let num_batches = self.reader.legacy_num_batches();
 
         if let Some(stats) = &self.stats {
             let batch_sizes: Vec<usize> = (0..num_batches)
-                .map(|batch_id| self.reader.num_rows_in_batch(batch_id))
+                .map(|batch_id| self.reader.legacy_num_rows_in_batch(batch_id))
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
@@ -664,7 +665,7 @@ mod test {
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use tempfile::tempdir;
 
-    use crate::dataset::WriteParams;
+    use crate::{datafusion::logical_expr::tests::ExprExt, dataset::WriteParams};
 
     use super::*;
 
@@ -809,9 +810,9 @@ mod test {
         let projection = Arc::new(dataset.schema().clone().project_by_ids(&[2, 4]));
 
         let predicate = col("x")
-            .field("a")
+            .field_newstyle("a")
             .lt(lit(8))
-            .and(col("y").field("b").gt(lit(3)));
+            .and(col("y").field_newstyle("b").gt(lit(3)));
 
         let exec = LancePushdownScanExec::try_new(
             dataset.clone(),
@@ -1047,7 +1048,7 @@ mod test {
         let dataset = Arc::new(test_dataset().await);
 
         let predicate = col("struct")
-            .field("int")
+            .field_newstyle("int")
             .gt(lit(4))
             .and(col(Column::from_name("str")).is_not_null());
 

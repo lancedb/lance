@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use arrow_array::RecordBatchReader;
 use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
 use datafusion_common::DataFusionError;

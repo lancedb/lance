@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Benchmark of HNSW graph.
 //!
@@ -36,6 +25,8 @@ fn bench_hnsw(c: &mut Criterion) {
     const SEED: [u8; 32] = [42; 32];
     const K: usize = 10;
 
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
     let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
     let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
@@ -44,18 +35,19 @@ fn bench_hnsw(c: &mut Criterion) {
     c.bench_function(
         format!("create_hnsw({TOTAL}x1024,levels=6)").as_str(),
         |b| {
-            b.iter(|| {
+            b.to_async(&rt).iter(|| async {
                 let hnsw = HNSWBuilder::with_params(
                     HnswBuildParams::default().max_level(6),
                     vectors.clone(),
                 )
                 .build()
+                .await
                 .unwrap();
                 let uids: HashSet<u32> = hnsw
                     .search(query, K, 300, None)
                     .unwrap()
                     .iter()
-                    .map(|(i, _)| *i)
+                    .map(|node| node.id)
                     .collect();
 
                 assert_eq!(uids.len(), K);

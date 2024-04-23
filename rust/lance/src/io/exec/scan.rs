@@ -1,19 +1,7 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::any::Any;
-use std::cmp::min;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -23,16 +11,16 @@ use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
+use datafusion_physical_expr::EquivalenceProperties;
+use futures::stream;
 use futures::stream::Stream;
-use futures::{stream, Future};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::ROW_ID_FIELD;
 use lance_table::format::Fragment;
-use tracing::Instrument;
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
 use crate::dataset::Dataset;
@@ -50,41 +38,6 @@ async fn open_file(
         reader.with_make_deletions_null();
     };
     Ok(reader)
-}
-
-/// Convert a [`FragmentReader`] into a [`Stream`] of [`RecordBatch`].
-fn scan_batches(
-    reader: FragmentReader,
-    read_size: usize,
-) -> impl Stream<Item = Result<impl Future<Output = Result<RecordBatch>> + Send>> {
-    // To make sure the reader lives long enough, we put it in an Arc.
-    let reader = Arc::new(reader);
-    let reader2 = reader.clone();
-
-    let read_params_iter = (0..reader.num_batches()).flat_map(move |batch_id| {
-        let rows_in_batch = reader.num_rows_in_batch(batch_id);
-        (0..rows_in_batch)
-            .step_by(read_size)
-            .map(move |start| (batch_id, start..min(start + read_size, rows_in_batch)))
-    });
-    let batch_stream = stream::iter(read_params_iter).map(move |(batch_id, range)| {
-        let reader = reader2.clone();
-        // The Ok here is only here because try_flatten_unordered wants both the
-        // outer *and* inner stream to be TryStream.
-        let task = tokio::task::spawn(
-            async move {
-                reader
-                    .read_batch(batch_id, range)
-                    .await
-                    .map_err(DataFusionError::from)
-            }
-            .in_current_span(),
-        );
-
-        Ok(async move { task.await.unwrap() })
-    });
-
-    Box::pin(batch_stream)
 }
 
 /// Dataset Scan Node.
@@ -131,7 +84,7 @@ impl LanceStream {
             .collect::<Vec<_>>();
 
         let inner_stream = if scan_in_order {
-            stream::iter(file_fragments)
+            let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
                         file_fragment,
@@ -140,8 +93,16 @@ impl LanceStream {
                         with_make_deletions_null,
                     ))
                 })
-                .try_buffered(fragment_readahead)
-                .map_ok(move |reader| scan_batches(reader, read_size))
+                .try_buffered(fragment_readahead);
+            let tasks = readers.and_then(move |reader| {
+                std::future::ready(
+                    reader
+                        .read_all(read_size as u32)
+                        .map(|task_stream| task_stream.map(Ok))
+                        .map_err(DataFusionError::from),
+                )
+            });
+            tasks
                 // We must be waiting to finish a file before moving onto thenext. That's an issue.
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
@@ -149,7 +110,7 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            stream::iter(file_fragments)
+            let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
                         file_fragment,
@@ -158,16 +119,28 @@ impl LanceStream {
                         with_make_deletions_null,
                     ))
                 })
-                .try_buffered(fragment_readahead)
-                .map_ok(move |reader| scan_batches(reader, read_size))
-                // When we flatten the streams (one stream per fragment), we allow
-                // `fragment_readahead` stream to be read concurrently.
+                .try_buffered(fragment_readahead);
+            let tasks = readers.and_then(move |reader| {
+                std::future::ready(
+                    reader
+                        .read_all(read_size as u32)
+                        .map(|task_stream| task_stream.map(Ok))
+                        .map_err(DataFusionError::from),
+                )
+            });
+            // When we flatten the streams (one stream per fragment), we allow
+            // `fragment_readahead` stream to be read concurrently.
+            tasks
                 .try_flatten_unordered(fragment_readahead)
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffer_unordered(batch_readahead)
                 .stream_in_current_span()
                 .boxed()
         };
+
+        let inner_stream = inner_stream
+            .map(|batch| batch.map_err(DataFusionError::from))
+            .boxed();
 
         Ok(Self {
             inner_stream,
@@ -219,6 +192,8 @@ pub struct LanceScanExec {
     with_row_id: bool,
     with_make_deletions_null: bool,
     ordered_output: bool,
+    output_schema: Arc<ArrowSchema>,
+    properties: PlanProperties,
 }
 
 impl DisplayAs for LanceScanExec {
@@ -258,6 +233,19 @@ impl LanceScanExec {
         with_make_deletions_null: bool,
         ordered_ouput: bool,
     ) -> Self {
+        let output_schema: ArrowSchema = projection.as_ref().into();
+        let output_schema = if with_row_id {
+            let mut fields: Vec<Arc<Field>> = output_schema.fields.to_vec();
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
+            Arc::new(ArrowSchema::new(fields))
+        } else {
+            Arc::new(output_schema)
+        };
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(output_schema.clone()),
+            Partitioning::RoundRobinBatch(1),
+            datafusion::physical_plan::ExecutionMode::Bounded,
+        );
         Self {
             dataset,
             fragments,
@@ -268,6 +256,8 @@ impl LanceScanExec {
             with_row_id,
             with_make_deletions_null,
             ordered_output: ordered_ouput,
+            output_schema,
+            properties,
         }
     }
 }
@@ -278,22 +268,7 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        let schema: ArrowSchema = self.projection.as_ref().into();
-        if self.with_row_id {
-            let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
-            fields.push(Arc::new(ROW_ID_FIELD.clone()));
-            Arc::new(ArrowSchema::new(fields))
-        } else {
-            Arc::new(schema)
-        }
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+        self.output_schema.clone()
     }
 
     /// Scan is the leaf node, so returns an empty vector.
@@ -353,5 +328,9 @@ impl ExecutionPlan for LanceScanExec {
             num_rows,
             ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
         })
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 }

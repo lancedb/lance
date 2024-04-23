@@ -1,37 +1,30 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Builder of Hnsw Graph.
 
 use std::cmp::min;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
+use itertools::Itertools;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::Result;
-use log::{info, log_enabled, Level::Info};
 use rand::{thread_rng, Rng};
 
-use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
+use super::super::graph::beam_search;
 use super::{select_neighbors, select_neighbors_heuristic, HNSW};
-use crate::vector::graph::{builder::GraphBuilder, greedy_search, storage::VectorStorage};
-use crate::vector::hnsw::HnswLevel;
+use crate::vector::graph::builder::GraphBuilderNode;
+use crate::vector::graph::storage::DistCalculator;
+use crate::vector::graph::{greedy_search, storage::VectorStorage};
+use crate::vector::graph::{Graph, OrderedFloat, OrderedNode};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
 /// Parameters of building HNSW index
 #[derive(Debug, Clone)]
 pub struct HnswBuildParams {
-    /// max level of
+    /// max level ofm
     pub max_level: u16,
 
     /// number of connections to establish while inserting new element
@@ -43,14 +36,11 @@ pub struct HnswBuildParams {
     /// size of the dynamic list for the candidates
     pub ef_construction: usize,
 
-    /// whether extend candidates while selecting neighbors
-    pub extend_candidates: bool,
-
-    /// log base used for assigning random level
-    pub log_base: f32,
-
     /// whether select neighbors heuristic
     pub use_select_heuristic: bool,
+
+    /// the max number of threads to use for building the graph
+    pub parallel_limit: Option<usize>,
 }
 
 impl Default for HnswBuildParams {
@@ -58,11 +48,10 @@ impl Default for HnswBuildParams {
         Self {
             max_level: 7,
             m: 20,
-            m_max: 30,
+            m_max: 40,
             ef_construction: 100,
-            extend_candidates: false,
-            log_base: 10.0,
             use_select_heuristic: true,
+            parallel_limit: None,
         }
     }
 }
@@ -98,21 +87,17 @@ impl HnswBuildParams {
         self
     }
 
-    /// Whether to expend to search candidate neighbors during heuristic search.
-    ///
-    /// The default value is `false`.
-    ///
-    /// See `extendCandidates` parameter in the paper (Algorithm 4)
-    pub fn extend_candidates(mut self, flag: bool) -> Self {
-        self.extend_candidates = flag;
-        self
-    }
-
     /// Use select heuristic when searching for the nearest neighbors.
     ///
     /// See algorithm 4 in HNSW paper.
     pub fn use_select_heuristic(mut self, flag: bool) -> Self {
         self.use_select_heuristic = flag;
+        self
+    }
+
+    /// The max number of threads to use for building the graph.
+    pub fn parallel_limit(mut self, limit: usize) -> Self {
+        self.parallel_limit = Some(limit);
         self
     }
 }
@@ -124,37 +109,136 @@ impl HnswBuildParams {
 /// During the build, the graph is built layer by layer.
 ///
 /// Each node in the graph has a global ID which is the index on the base layer.
-#[derive(Clone)]
 pub struct HNSWBuilder {
-    params: HnswBuildParams,
-
-    /// Vector storage for the graph.
-    vectors: Arc<InMemoryVectorStorage>,
-
-    levels: Vec<GraphBuilder>,
-
-    entry_point: u32,
+    inner: Arc<HNSWBuilderInner>,
 }
 
 impl HNSWBuilder {
     /// Create a new [`HNSWBuilder`] with in memory vector storage.
-    pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
-        Self {
-            params: HnswBuildParams::default(),
-            vectors,
-            levels: vec![],
-            entry_point: 0,
-        }
+    pub fn new(vectors: Arc<dyn VectorStorage>) -> Self {
+        Self::with_params(HnswBuildParams::default(), vectors)
+    }
+
+    pub fn num_levels(&self) -> usize {
+        self.inner.num_levels()
+    }
+
+    pub fn num_nodes(&self, level: usize) -> usize {
+        self.inner.num_nodes(level)
+    }
+
+    pub fn nodes(&self) -> Arc<RwLock<Vec<GraphBuilderNode>>> {
+        self.inner.nodes()
+    }
+
+    pub fn storage(&self) -> Arc<dyn VectorStorage> {
+        self.inner.storage()
     }
 
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
-    pub fn with_params(params: HnswBuildParams, vectors: Arc<InMemoryVectorStorage>) -> Self {
-        Self {
+    pub fn with_params(params: HnswBuildParams, vectors: Arc<dyn VectorStorage>) -> Self {
+        let inner = Arc::new(HNSWBuilderInner::with_params(params, vectors));
+        Self { inner }
+    }
+
+    /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
+    pub async fn build(&mut self) -> Result<HNSW> {
+        log::info!(
+            "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
+            self.inner.vectors.metric_type(),
+            self.inner.params.max_level,
+            self.inner.params.m_max,
+            self.inner.params.ef_construction
+        );
+
+        let parallel_limit = self
+            .inner
+            .params
+            .parallel_limit
+            .unwrap_or_else(num_cpus::get);
+        let mut tasks = Vec::with_capacity(parallel_limit);
+        let chunk_size = (self.inner.vectors.len() - 1).div_ceil(parallel_limit);
+        for chunk in &(1..self.inner.vectors.len()).chunks(chunk_size) {
+            let chunk = chunk.collect_vec();
+            let inner = self.inner.clone();
+            tasks.push(spawn_cpu(move || {
+                for node in chunk {
+                    inner.insert(node as u32)?;
+                }
+                Result::Ok(())
+            }));
+        }
+
+        futures::future::try_join_all(tasks).await?;
+
+        Ok(HNSW::from_builder(
+            self,
+            self.inner.entry_point,
+            self.inner.vectors.metric_type(),
+            self.inner.params.use_select_heuristic,
+        ))
+    }
+}
+
+struct HNSWBuilderInner {
+    params: HnswBuildParams,
+
+    /// Vector storage for the graph.
+    vectors: Arc<dyn VectorStorage>,
+
+    nodes: Arc<RwLock<Vec<GraphBuilderNode>>>,
+    level_count: Vec<AtomicUsize>,
+
+    entry_point: u32,
+}
+
+impl HNSWBuilderInner {
+    pub fn num_levels(&self) -> usize {
+        self.params.max_level as usize
+    }
+
+    pub fn num_nodes(&self, level: usize) -> usize {
+        self.level_count[level].load(Ordering::Relaxed)
+    }
+
+    pub fn nodes(&self) -> Arc<RwLock<Vec<GraphBuilderNode>>> {
+        self.nodes.clone()
+    }
+
+    pub fn storage(&self) -> Arc<dyn VectorStorage> {
+        self.vectors.clone()
+    }
+
+    /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
+    pub fn with_params(params: HnswBuildParams, vectors: Arc<dyn VectorStorage>) -> Self {
+        let len = vectors.len();
+        let max_level = params.max_level;
+
+        let mut level_count = Vec::with_capacity(max_level as usize);
+        for _ in 0..max_level {
+            level_count.push(AtomicUsize::new(0));
+        }
+
+        let builder = Self {
             params,
             vectors,
-            levels: vec![],
+            nodes: Arc::new(RwLock::new(Vec::with_capacity(len))),
+            level_count,
             entry_point: 0,
+        };
+
+        {
+            let mut nodes = builder.nodes.write().unwrap();
+            nodes.push(GraphBuilderNode::new(0, max_level as usize));
+            for i in 1..len {
+                nodes.push(GraphBuilderNode::new(
+                    i as u32,
+                    builder.random_level() as usize + 1,
+                ));
+            }
         }
+
+        builder
     }
 
     /// New node's level
@@ -162,30 +246,23 @@ impl HNSWBuilder {
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
-        // This is different to the paper.
-        // We use log10 instead of log(e), so each layer has about 1/10 of its bottom layer.
-        let m = self.vectors.len();
+        let ml = 1.0 / (self.params.m as f32).ln();
         min(
-            (m as f32).log(self.params.log_base).ceil() as u16
-                - (rng.gen::<f32>() * self.vectors.len() as f32)
-                    .log(self.params.log_base)
-                    .ceil() as u16,
-            self.params.max_level,
+            (-rng.gen::<f32>().ln() * ml) as u16,
+            self.params.max_level - 1,
         )
     }
 
     /// Insert one node.
-    fn insert(&mut self, node: u32) -> Result<()> {
-        let vector = self.vectors.vector(node);
-        let level = self.random_level();
-
-        let levels_to_search = if self.levels.len() > level as usize {
-            self.levels.len() - level as usize - 1
-        } else {
-            0
-        };
-        let mut ep = self.entry_point;
-        let query = self.vectors.vector(self.entry_point);
+    fn insert(&self, node: u32) -> Result<()> {
+        let target_level = self.nodes.read().unwrap()[node as usize]
+            .level_neighbors
+            .len() as u16
+            - 1;
+        let mut ep = OrderedNode::new(
+            self.entry_point,
+            self.vectors.distance_between(node, self.entry_point).into(),
+        );
 
         //
         // Search for entry point in paper.
@@ -195,91 +272,115 @@ impl HNSWBuilder {
         //    ep = Select-Neighbors(W, 1)
         //  }
         // ```
-        for cur_level in self.levels.iter().rev().take(levels_to_search) {
-            ep = greedy_search(cur_level, ep, vector, None)?.1;
+        let dist_calc = self.vectors.dist_calculator_from_id(node);
+        for level in (target_level + 1..self.params.max_level).rev() {
+            let cur_level = HnswLevelView::new(level, self);
+            ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
         }
 
-        let mut ep = vec![ep];
-        for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
-            cur_level.insert(node);
-            let candidates = beam_search(
-                cur_level,
-                &ep,
-                vector,
-                self.params.ef_construction,
-                None,
-                None,
-            )?;
-            let neighbors: Vec<_> = if self.params.use_select_heuristic {
-                select_neighbors_heuristic(
-                    cur_level,
-                    query,
-                    &candidates,
-                    self.params.m,
-                    self.params.extend_candidates,
-                )
-                .collect()
-            } else {
-                select_neighbors(&candidates, self.params.m).collect()
-            };
+        for level in (0..=target_level).rev() {
+            self.level_count[level as usize].fetch_add(1, Ordering::Relaxed);
 
-            for (distance, nb) in neighbors.iter() {
-                cur_level.connect(node, *nb, Some(*distance))?;
+            let (candidates, neighbors) = self.search_level(&ep, level, dist_calc.as_ref())?;
+            for neighbor in neighbors {
+                self.connect(node, neighbor.id, neighbor.dist, level);
+                self.prune(neighbor.id, level);
             }
-            for (_, nb) in neighbors {
-                cur_level.prune(nb, self.params.m_max)?;
-            }
-            cur_level.prune(node, self.params.m_max)?;
-            ep = candidates.iter().map(|(_, node)| *node).collect();
-        }
 
-        if level > self.levels.len() as u16 {
-            self.entry_point = node;
+            ep = candidates[0].clone();
         }
 
         Ok(())
     }
 
-    /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
-    pub fn build(&mut self) -> Result<HNSW> {
-        self.build_with(self.vectors.clone())
+    fn search_level(
+        &self,
+        ep: &OrderedNode,
+        level: u16,
+        dist_calc: &dyn DistCalculator,
+    ) -> Result<(Vec<OrderedNode>, Vec<OrderedNode>)> {
+        let cur_level = HnswLevelView::new(level, self);
+        let candidates = beam_search(&cur_level, ep, self.params.ef_construction, dist_calc, None)?;
+
+        let neighbors = if self.params.use_select_heuristic {
+            select_neighbors_heuristic(&cur_level, &candidates, self.params.m).collect()
+        } else {
+            select_neighbors(&candidates, self.params.m)
+                .cloned()
+                .collect()
+        };
+
+        Ok((candidates, neighbors))
     }
 
-    /// Build the graph, with the provided [VectorStorage] as backing storage for HNSW graph.
-    pub fn build_with(&mut self, storage: Arc<dyn VectorStorage>) -> Result<HNSW> {
-        log::info!(
-            "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
-            self.vectors.metric_type(),
-            self.params.max_level,
-            self.params.m_max,
-            self.params.ef_construction
-        );
-        for _ in 0..self.params.max_level {
-            let mut level = GraphBuilder::new(self.vectors.clone());
-            level.insert(0);
-            self.levels.push(level);
+    fn connect(&self, u: u32, v: u32, dist: OrderedFloat, level: u16) {
+        let nodes = self.nodes.read().unwrap();
+        nodes[u as usize].add_neighbor(v, dist, level);
+        nodes[v as usize].add_neighbor(u, dist, level);
+    }
+
+    fn prune(&self, id: u32, level: u16) {
+        let node = &self.nodes.read().unwrap()[id as usize];
+
+        let mut level_neighbors = node.level_neighbors[level as usize].write().unwrap();
+        if level_neighbors.len() <= self.params.m_max {
+            return;
         }
 
-        for i in 1..self.vectors.len() {
-            self.insert(i as u32)?;
-        }
+        let neighbors = level_neighbors.iter().cloned().collect_vec();
 
-        if log_enabled!(Info) {
-            for (i, level) in self.levels.iter().enumerate() {
-                info!("HNSW level {}: {:#?}", i, level.stats());
-            }
-        }
+        let level_view = HnswLevelView::new(level, self);
+        let new_neighbors =
+            select_neighbors_heuristic(&level_view, &neighbors, self.params.m_max).collect();
 
-        let graphs = self
-            .levels
-            .iter()
-            .map(|l| HnswLevel::from_builder(l, storage.clone()))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(HNSW::from_builder(
-            graphs,
-            self.entry_point,
-            self.vectors.metric_type(),
-            self.params.use_select_heuristic,
-        ))
+        *level_neighbors = new_neighbors;
+    }
+}
+
+// View of a level in HNSW graph.
+// This is used to iterate over neighbors in a specific level.
+pub(crate) struct HnswLevelView<'a> {
+    level: u16,
+    builder: &'a HNSWBuilderInner,
+}
+
+impl<'a> HnswLevelView<'a> {
+    fn new(level: u16, builder: &'a HNSWBuilderInner) -> Self {
+        Self { level, builder }
+    }
+}
+
+impl<'a> Graph for HnswLevelView<'a> {
+    fn len(&self) -> usize {
+        self.builder.level_count[self.level as usize].load(Ordering::Relaxed)
+    }
+
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
+        let node = &self.builder.nodes.read().unwrap()[key as usize];
+
+        Some(
+            node.level_neighbors
+                .get(self.level as usize)
+                .map(|neighbors| {
+                    let iter: Box<dyn Iterator<Item = u32>> = Box::new(
+                        neighbors
+                            .read()
+                            .unwrap()
+                            .clone()
+                            .into_sorted_vec()
+                            .into_iter()
+                            .map(|n| n.id),
+                    );
+                    iter
+                })
+                .unwrap_or_else(|| {
+                    let iter: Box<dyn Iterator<Item = u32>> = Box::new(std::iter::empty());
+                    iter
+                }),
+        )
+    }
+
+    fn storage(&self) -> Arc<dyn VectorStorage> {
+        self.builder.vectors.clone()
     }
 }

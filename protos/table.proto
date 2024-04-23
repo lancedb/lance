@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 syntax = "proto3";
 
@@ -190,13 +179,69 @@ message DataFile {
   string path = 1;
   // The ids of the fields/columns in this file.
   //
-  // IDs are assigned based on position in the file, offset by the max existing
-  // field id in the table (if any already). So when a fragment is first created
-  // with one file of N columns, the field ids will be 1, 2, ..., N. If a second,
-  // fragment is created with M columns, the field ids will be N+1, N+2, ..., N+M.
+  // In Lance v1 IDs are assigned based on position in the file, offset by the max
+  // existing field id in the table (if any already). So when a fragment is first
+  // created with one file of N columns, the field ids will be 1, 2, ..., N. If a
+  // second, fragment is created with M columns, the field ids will be N+1, N+2,
+  // ..., N+M.
   //
-  // These ids must be sorted and contiguous.
+  // In Lance v1 there is one field for each field in the input schema, this includes
+  // nested fields (both struct and list).  Fixed size list fields have only a single
+  // field id (these are not considered nested fields in Lance v1).
+  //
+  // This allows column indices to be calculated from field IDs and the input schema.
+  //
+  // In Lance v2 the field IDs generally follow the same pattern but there is no
+  // way to calculate the column index from the field ID.  This is because a given
+  // field could be encoded in many different ways, some of which occupy a different
+  // number of columns.  For example, a struct field could be encoded into N + 1 columns
+  // or it could be encoded into a single packed column.  To determine column indices
+  // the column_indices property should be used instead.
+  //
+  // In Lance v1 these ids must be sorted but might not always be contiguous.
   repeated int32 fields = 2;
+  // The top-level column indices for each field in the file.
+  //
+  // If the data file is version 1 then this property will be empty
+  //
+  // Otherwise there must be one entry for each field in `fields`.
+  //
+  // Some fields may not correspond to a top-level column in the file.  In these cases
+  // the index will -1.
+  //
+  // For example, consider the schema:
+  //
+  // - dimension: packed-struct (0):
+  //   - x: u32 (1)
+  //   - y: u32 (2)
+  // - path: string (3)
+  // - embedding: fsl<768> (4)
+  //   - fp64
+  // - borders: fsl<4> (5)
+  //   - simple-struct (6)
+  //     - margin: fp64 (7)
+  //     - padding: fp64 (8)
+  //
+  // One possible column indices array could be:
+  // [0, -1, -1, 1, 3, 4, 5, 6, 7]
+  //
+  // This reflects quite a few phenomenon:
+  // - The packed struct is encoded into a single column and there is no top-level column
+  //   for the x or y fields
+  // - The string is encoded into two columns
+  // - The embedding is encoded into a single column (common for FSL of primitive) and there
+  //   is not "FSL column"
+  // - The borders field actually does have an "FSL column"
+  //
+  // The column indices table may not have duplicates (other than -1)
+  repeated int32 column_indices = 3;
+  // The major file version used to create the file
+  uint32 file_major_version = 4;
+  // The minor file version used to create the file
+  //
+  // If both `file_major_version` and `file_minor_version` are set to 0,
+  // then this is a version 0.1 or version 0.2 file.
+  uint32 file_minor_version = 5;
 } // DataFile
 
 // Deletion File

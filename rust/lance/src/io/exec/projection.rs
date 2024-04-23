@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Projection
 //!
@@ -21,10 +10,13 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream,
 };
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -127,6 +119,7 @@ impl RecordBatchStream for ProjectionStream {
 pub struct ProjectionExec {
     input: Arc<dyn ExecutionPlan>,
     project: Arc<Schema>,
+    properties: PlanProperties,
 }
 
 impl DisplayAs for ProjectionExec {
@@ -148,7 +141,18 @@ impl DisplayAs for ProjectionExec {
 
 impl ProjectionExec {
     pub fn try_new(input: Arc<dyn ExecutionPlan>, project: Arc<Schema>) -> Result<Self> {
-        Ok(Self { input, project })
+        let arrow_schema = ArrowSchema::from(project.as_ref());
+        // TODO: we reset the EquivalenceProperties here but we could probably just project
+        // them, that way ordering is maintained (or just use DF project?)
+        let properties = input
+            .properties()
+            .clone()
+            .with_eq_properties(EquivalenceProperties::new(Arc::new(arrow_schema)));
+        Ok(Self {
+            input,
+            project,
+            properties,
+        })
     }
 }
 
@@ -160,14 +164,6 @@ impl ExecutionPlan for ProjectionExec {
     fn schema(&self) -> SchemaRef {
         let arrow_schema = ArrowSchema::from(self.project.as_ref());
         arrow_schema.into()
-    }
-
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -194,6 +190,14 @@ impl ExecutionPlan for ProjectionExec {
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        self.input.statistics()
+        let num_rows = self.input.statistics()?.num_rows;
+        Ok(Statistics {
+            num_rows,
+            ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
+        })
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 }

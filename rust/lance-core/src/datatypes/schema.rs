@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Schema
 
@@ -232,6 +221,12 @@ impl Schema {
         // Check for duplicate field ids
         let mut seen_ids = HashSet::new();
         for field in self.fields_pre_order() {
+            if field.id < 0 {
+                return Err(Error::Schema {
+                    message: format!("Field {} has a negative id {}", field.name, field.id),
+                    location: location!(),
+                });
+            }
             if !seen_ids.insert(field.id) {
                 return Err(Error::Schema {
                     message: format!("Duplicate field id {} in schema {:?}", field.id, self),
@@ -348,6 +343,10 @@ impl Schema {
                 message: "Vector column not in schema".to_string(),
                 location: location!(),
             })
+    }
+
+    pub fn top_level_field_ids(&self) -> Vec<i32> {
+        self.fields.iter().map(|f| f.id).collect()
     }
 
     // Recursively collect all the field IDs, in pre-order traversal order.

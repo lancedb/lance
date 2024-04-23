@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance Dataset
 //!
@@ -44,6 +33,7 @@ use lance_table::io::commit::{commit_handler_from_url, CommitError, CommitHandle
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
 use object_store::path::Path;
+use prost::Message;
 use snafu::{location, Location};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -483,9 +473,15 @@ impl Dataset {
         }
 
         let object_store = Arc::new(object_store);
-        let fragments =
-            write_fragments_internal(object_store.clone(), &base, &schema, stream, params.clone())
-                .await?;
+        let fragments = write_fragments_internal(
+            dataset.as_ref(),
+            object_store.clone(),
+            &base,
+            &schema,
+            stream,
+            params.clone(),
+        )
+        .await?;
 
         let operation = match params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
@@ -575,6 +571,7 @@ impl Dataset {
         )?;
 
         let fragments = write_fragments_internal(
+            Some(self),
             self.object_store.clone(),
             &self.base,
             &schema,
@@ -615,6 +612,16 @@ impl Dataset {
         self.append_impl(batches, params).await
     }
 
+    /// Get the base URI of the dataset.
+    pub fn uri(&self) -> &Path {
+        &self.base
+    }
+
+    /// Get the full manifest of the dataset version.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
     pub async fn latest_manifest(&self) -> Result<Manifest> {
         read_manifest(
             &self.object_store,
@@ -624,6 +631,20 @@ impl Dataset {
                 .await?,
         )
         .await
+    }
+
+    /// Read the transaction file for this version of the dataset.
+    ///
+    /// If there was no transaction file written for this version of the dataset
+    /// then this will return None.
+    pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
+        let path = match &self.manifest.transaction_file {
+            Some(path) => self.base.child("_transactions").child(path.as_str()),
+            None => return Ok(None),
+        };
+        let data = self.object_store.inner.get(&path).await?.bytes().await?;
+        let transaction = lance_table::format::pb::Transaction::decode(data)?;
+        Transaction::try_from(&transaction).map(Some)
     }
 
     /// Restore the currently checked out version of the dataset as the latest version.
@@ -692,6 +713,8 @@ impl Dataset {
     ///
     /// This method can be used to commit this change to the dataset's manifest.  This method will
     /// not verify that the provided fragments exist and correct, that is the caller's responsibility.
+    /// Some validation can be performed using the function
+    /// [crate::dataset::transaction::validate_operation].
     ///
     /// If this commit is a change to an existing dataset then it will often need to be based on an
     /// existing version of the dataset.  For example, if this change is a `delete` operation then
@@ -1085,7 +1108,7 @@ impl Dataset {
             })?;
 
             let reader = fragment.open(projection.as_ref(), false).await?;
-            reader.read_range(range).await
+            reader.legacy_read_range_as_batch(range).await
         } else if row_id_meta.sorted {
             // Don't need to re-arrange data, just concatenate
 
@@ -1868,6 +1891,21 @@ impl Dataset {
                 )
                 .await?;
 
+            // Some data files may no longer contain any columns in the dataset (e.g. if every
+            // remaining column has been altered into a different data file) and so we remove them
+            let schema_field_ids = new_schema.field_ids().into_iter().collect::<Vec<_>>();
+            let fragments = fragments
+                .into_iter()
+                .map(|mut frag| {
+                    frag.files.retain(|f| {
+                        f.fields
+                            .iter()
+                            .any(|field| schema_field_ids.contains(field))
+                    });
+                    frag
+                })
+                .collect::<Vec<_>>();
+
             Transaction::new(
                 self.manifest.version,
                 Operation::Merge {
@@ -2300,9 +2338,9 @@ mod tests {
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment.open(dataset.schema(), false).await.unwrap();
-            assert_eq!(reader.num_batches(), 10);
-            for i in 0..reader.num_batches() {
-                assert_eq!(reader.num_rows_in_batch(i), 10);
+            assert_eq!(reader.legacy_num_batches(), 10);
+            for i in 0..reader.legacy_num_batches() {
+                assert_eq!(reader.legacy_num_rows_in_batch(i), 10);
             }
         }
     }
@@ -4852,9 +4890,9 @@ mod tests {
         let indices = dataset.load_indices().await?;
         assert_eq!(indices.len(), 0);
 
-        // Each fragment gains a file with the new columns
+        // Each fragment gains a file with the new columns, but then the original file is dropped
         dataset.fragments().iter().for_each(|f| {
-            assert_eq!(f.files.len(), 5);
+            assert_eq!(f.files.len(), 4);
         });
 
         let expected_data = RecordBatch::try_new(
@@ -4881,5 +4919,19 @@ mod tests {
         assert_eq!(actual_data, expected_data);
 
         Ok(())
+    }
+
+    // Bug: https://github.com/lancedb/lancedb/issues/1223
+    #[tokio::test]
+    async fn test_open_nonexisting_dataset() {
+        let test_dir = tempdir().unwrap();
+        let base_dir = test_dir.path();
+        let dataset_dir = base_dir.join("non_existing");
+        let dataset_uri = dataset_dir.to_str().unwrap();
+
+        let res = Dataset::open(dataset_uri).await;
+        assert!(res.is_err());
+
+        assert!(!dataset_dir.exists());
     }
 }

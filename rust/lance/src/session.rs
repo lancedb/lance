@@ -1,21 +1,19 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use lance_core::cache::FileMetadataCache;
+use lance_core::{Error, Result};
+use snafu::{location, Location};
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::index::cache::IndexCache;
+
+use self::index_extension::VectorIndexExtension;
+
+pub mod index_extension;
 
 /// A user session tracks the runtime state.
 #[derive(Clone)]
@@ -25,6 +23,8 @@ pub struct Session {
 
     /// Cache for file metadata
     pub(crate) file_metadata_cache: FileMetadataCache,
+
+    pub(crate) vector_index_extensions: HashMap<String, Arc<dyn VectorIndexExtension>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -43,7 +43,24 @@ impl Session {
         Self {
             index_cache: IndexCache::new(index_cache_size),
             file_metadata_cache: FileMetadataCache::new(metadata_cache_size),
+            vector_index_extensions: HashMap::new(),
         }
+    }
+
+    pub fn register_vector_index_extension(
+        &mut self,
+        name: String,
+        extension: Arc<dyn VectorIndexExtension>,
+    ) -> Result<()> {
+        if self.vector_index_extensions.contains_key(&name) {
+            return Err(Error::invalid_input(
+                format!("{name} is already registered"),
+                location!(),
+            ));
+        }
+        self.vector_index_extensions.insert(name, extension);
+
+        Ok(())
     }
 }
 
@@ -52,6 +69,7 @@ impl Default for Session {
         Self {
             index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
             file_metadata_cache: FileMetadataCache::new(DEFAULT_METADATA_CACHE_SIZE),
+            vector_index_extensions: HashMap::new(),
         }
     }
 }

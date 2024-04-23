@@ -1,20 +1,10 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
+use arrow::compute::concat;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
@@ -24,13 +14,17 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
+use lance_core::utils::tokio::spawn_cpu;
+use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
+use lance_index::vector::pq::storage::ProductQuantizationStorage;
+use lance_index::vector::quantizer::Quantization;
 use lance_index::{
     vector::{pq::ProductQuantizer, Query, DIST_COL},
     Index, IndexType,
 };
 use lance_io::{traits::Reader, utils::read_fixed_stride_array};
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::{DistanceType, MetricType};
 use log::info;
 use roaring::RoaringBitmap;
 use serde_json::json;
@@ -45,7 +39,7 @@ use super::ivf::Ivf;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
-use crate::{arrow::*, utils::tokio::spawn_cpu, Dataset};
+use crate::{arrow::*, Dataset};
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -385,6 +379,35 @@ pub(super) async fn build_pq_model(
     Ok(pq)
 }
 
+pub(crate) fn build_pq_storage(
+    distance_type: DistanceType,
+    row_ids: Arc<dyn Array>,
+    code_array: Vec<Arc<dyn Array>>,
+    pq: Arc<dyn ProductQuantizer>,
+) -> Result<ProductQuantizationStorage> {
+    let pq_arrs = code_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+    let pq_column = concat(&pq_arrs)?;
+    std::mem::drop(code_array);
+
+    let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
+        (ROW_ID, row_ids, true),
+        (pq.column(), pq_column, false),
+    ])?;
+    let pq_store = ProductQuantizationStorage::new(
+        pq.codebook_as_fsl()
+            .values()
+            .as_primitive::<Float32Type>()
+            .clone()
+            .into(),
+        pq_batch.clone(),
+        pq.num_bits(),
+        pq.num_sub_vectors(),
+        pq.dimension(),
+        distance_type,
+    )?;
+
+    Ok(pq_store)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

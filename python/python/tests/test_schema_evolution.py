@@ -1,16 +1,5 @@
-#  Copyright (c) 2024. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import os
 import uuid
@@ -28,20 +17,24 @@ def test_drop_columns(tmp_path: Path):
     dims = 32
     nrows = 512
     values = pc.random(nrows * dims).cast("float32")
-    table = pa.table({
-        "a": pa.FixedSizeListArray.from_arrays(values, dims),
-        "b": range(nrows),
-        "c": range(nrows),
-    })
+    table = pa.table(
+        {
+            "a": pa.FixedSizeListArray.from_arrays(values, dims),
+            "b": range(nrows),
+            "c": range(nrows),
+        }
+    )
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_index("a", "IVF_PQ", num_partitions=2, num_sub_vectors=1)
 
     # Drop a column, index is kept
     dataset.drop_columns(["b"])
-    assert dataset.schema == pa.schema({
-        "a": pa.list_(pa.float32(), dims),
-        "c": pa.int64(),
-    })
+    assert dataset.schema == pa.schema(
+        {
+            "a": pa.list_(pa.float32(), dims),
+            "c": pa.int64(),
+        }
+    )
     assert len(dataset.list_indices()) == 1
 
     # Drop vector column, index is dropped
@@ -95,10 +88,12 @@ def test_add_columns_udf(tmp_path):
 
 
 def test_add_columns_udf_caching(tmp_path):
-    tab = pa.table({
-        "a": range(100),
-        "b": range(100),
-    })
+    tab = pa.table(
+        {
+            "a": range(100),
+            "b": range(100),
+        }
+    )
     dataset = lance.write_dataset(tab, tmp_path, max_rows_per_file=20)
 
     @lance.batch_udf(checkpoint_file=tmp_path / "cache.sqlite")
@@ -143,16 +138,20 @@ def test_add_many_columns(tmp_path: Path):
 
 def test_query_after_merge(tmp_path):
     # https://github.com/lancedb/lance/issues/1905
-    tab = pa.table({
-        "id": range(100),
-        "vec": pa.FixedShapeTensorArray.from_numpy_ndarray(
-            np.random.rand(100, 128).astype("float32")
-        ),
-    })
-    tab2 = pa.table({
-        "id": range(100),
-        "data": range(100, 200),
-    })
+    tab = pa.table(
+        {
+            "id": range(100),
+            "vec": pa.FixedShapeTensorArray.from_numpy_ndarray(
+                np.random.rand(100, 128).astype("float32")
+            ),
+        }
+    )
+    tab2 = pa.table(
+        {
+            "id": range(100),
+            "data": range(100, 200),
+        }
+    )
     dataset = lance.write_dataset(tab, tmp_path)
 
     dataset.merge(tab2, left_on="id")
@@ -163,10 +162,12 @@ def test_query_after_merge(tmp_path):
 
 
 def test_alter_columns(tmp_path: Path):
-    schema = pa.schema([
-        pa.field("a", pa.int64(), nullable=False),
-        pa.field("b", pa.string(), nullable=False),
-    ])
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64(), nullable=False),
+            pa.field("b", pa.string(), nullable=False),
+        ]
+    )
     tab = pa.table(
         {"a": pa.array([1, 2, 1024]), "b": pa.array(["a", "b", "c"])}, schema=schema
     )
@@ -178,10 +179,12 @@ def test_alter_columns(tmp_path: Path):
         {"path": "b", "name": "y"},
     )
 
-    expected_schema = pa.schema([
-        pa.field("x", pa.int64()),
-        pa.field("y", pa.string(), nullable=False),
-    ])
+    expected_schema = pa.schema(
+        [
+            pa.field("x", pa.int64()),
+            pa.field("y", pa.string(), nullable=False),
+        ]
+    )
     assert dataset.schema == expected_schema
 
     expected_tab = pa.table(
@@ -194,10 +197,12 @@ def test_alter_columns(tmp_path: Path):
         {"path": "x", "data_type": pa.int32()},
         {"path": "y", "data_type": pa.large_string()},
     )
-    expected_schema = pa.schema([
-        pa.field("x", pa.int32()),
-        pa.field("y", pa.large_string(), nullable=False),
-    ])
+    expected_schema = pa.schema(
+        [
+            pa.field("x", pa.int32()),
+            pa.field("y", pa.large_string(), nullable=False),
+        ]
+    )
     assert dataset.schema == expected_schema
 
     expected_tab = pa.table(

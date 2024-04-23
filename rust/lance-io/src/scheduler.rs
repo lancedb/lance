@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use bytes::Bytes;
 use futures::channel::oneshot;
@@ -124,6 +113,7 @@ async fn run_io_loop(tasks: mpsc::UnboundedReceiver<IoTask>, io_capacity: u32) {
 /// parallel I/O that can be run.
 ///
 /// TODO: This will also add coalescing
+#[derive(Debug)]
 pub struct StoreScheduler {
     object_store: Arc<ObjectStore>,
     io_submitter: mpsc::UnboundedSender<IoTask>,
@@ -215,7 +205,7 @@ impl StoreScheduler {
 }
 
 /// A throttled file reader
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FileScheduler {
     reader: Arc<dyn Reader>,
     root: Arc<StoreScheduler>,

@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::sync::{Arc, Mutex};
 
 use arrow_array::RecordBatch;
@@ -142,14 +131,6 @@ impl ExecutionPlan for ReplayExec {
         self.input.schema()
     }
 
-    fn output_partitioning(&self) -> datafusion_physical_expr::Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion_physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![self.input.clone()]
     }
@@ -187,6 +168,10 @@ impl ExecutionPlan for ReplayExec {
                 stream: to_return,
             }))
         }
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        self.input.properties()
     }
 }
 

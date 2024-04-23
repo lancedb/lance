@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Generic Graph implementation.
 //!
@@ -63,7 +52,7 @@ impl<I> From<I> for GraphNode<I> {
 /// A wrapper for f32 to make it ordered, so that we can put it into
 /// a BTree or Heap
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) struct OrderedFloat(pub f32);
+pub struct OrderedFloat(pub f32);
 
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -92,9 +81,15 @@ impl From<OrderedFloat> for f32 {
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
-pub(crate) struct OrderedNode {
+pub struct OrderedNode {
     pub id: u32,
     pub dist: OrderedFloat,
+}
+
+impl OrderedNode {
+    pub fn new(id: u32, dist: OrderedFloat) -> Self {
+        Self { id, dist }
+    }
 }
 
 impl PartialOrd for OrderedNode {
@@ -161,8 +156,8 @@ pub trait Graph {
 /// ----------
 /// graph : Graph
 ///  The graph to search.
-/// start : I
-///  The index starting point.
+/// start : &[OrderedNode]
+///  The starting point.
 /// query : &[f32]
 ///  The query vector.
 /// k : usize
@@ -176,42 +171,34 @@ pub trait Graph {
 ///
 pub(super) fn beam_search(
     graph: &dyn Graph,
-    start: &[u32],
-    query: &[f32],
+    ep: &OrderedNode,
     k: usize,
-    dist_calc: Option<Arc<dyn DistCalculator>>,
+    dist_calc: &dyn DistCalculator,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
-) -> Result<BinaryHeap<(OrderedFloat, u32)>> {
-    let mut visited: HashSet<_> = start.iter().copied().collect();
-    let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
-    let mut candidates: BinaryHeap<Reverse<(OrderedFloat, u32)>> = dist_calc
-        .distance(start)
-        .iter()
-        .zip(start)
-        .map(|(&dist, id)| Reverse((dist.into(), *id)))
-        .collect();
-    let mut results: BinaryHeap<(OrderedFloat, u32)> = candidates
-        .clone()
-        .into_iter()
-        .filter(|node| {
-            bitset
-                .map(|bitset| bitset.contains(node.0 .1))
-                .unwrap_or(true)
-        })
-        .map(|v| v.0)
-        .collect();
+) -> Result<Vec<OrderedNode>> {
+    let mut visited: HashSet<_> = HashSet::with_capacity(k);
+    let mut candidates = BinaryHeap::with_capacity(k);
+    visited.insert(ep.id);
+    candidates.push(Reverse(ep.clone()));
+
+    let mut results = BinaryHeap::with_capacity(k);
+    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true) {
+        results.push(ep.clone());
+    }
 
     while !candidates.is_empty() {
-        let (dist, current) = candidates.pop().expect("candidates is empty").0;
+        let current = candidates.pop().expect("candidates is empty").0;
         let furthest = results
             .peek()
-            .map(|kv| kv.0)
+            .map(|node| node.dist)
             .unwrap_or(OrderedFloat(f32::INFINITY));
-        if dist > furthest {
+
+        // TODO: add an option to ignore the second condition for better performance.
+        if current.dist > furthest && results.len() == k {
             break;
         }
-        let neighbors = graph.neighbors(current).ok_or_else(|| Error::Index {
-            message: format!("Node {} does not exist in the graph", current),
+        let neighbors = graph.neighbors(current.id).ok_or_else(|| Error::Index {
+            message: format!("Node {} does not exist in the graph", current.id),
             location: location!(),
         })?;
 
@@ -222,24 +209,27 @@ pub(super) fn beam_search(
             visited.insert(neighbor);
             let furthest = results
                 .peek()
-                .map(|kv| kv.0)
+                .map(|node| node.dist)
                 .unwrap_or(OrderedFloat(f32::INFINITY));
-            let dist = dist_calc.distance(&[neighbor])[0].into();
+            let dist = dist_calc.distance(neighbor).into();
             if dist <= furthest || results.len() < k {
                 if bitset
                     .map(|bitset| bitset.contains(neighbor))
                     .unwrap_or(true)
                 {
-                    results.push((dist, neighbor));
-                    if results.len() > k {
+                    if results.len() < k {
+                        results.push((dist, neighbor).into());
+                    } else if results.len() == k && dist < results.peek().unwrap().dist {
                         results.pop();
+                        results.push((dist, neighbor).into());
                     }
                 }
-                candidates.push(Reverse((dist, neighbor)));
+                candidates.push(Reverse((dist, neighbor).into()));
             }
         }
     }
-    Ok(results)
+
+    Ok(results.into_sorted_vec())
 }
 
 /// Greedy search over a graph
@@ -261,13 +251,11 @@ pub(super) fn beam_search(
 ///
 pub(super) fn greedy_search(
     graph: &dyn Graph,
-    start: u32,
-    query: &[f32],
-    dist_calc: Option<Arc<dyn DistCalculator>>,
-) -> Result<(OrderedFloat, u32)> {
-    let mut current = start;
-    let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
-    let mut closest_dist = dist_calc.distance(&[start])[0];
+    start: OrderedNode,
+    dist_calc: &dyn DistCalculator,
+) -> Result<OrderedNode> {
+    let mut current = start.id;
+    let mut closest_dist = start.dist.0;
     loop {
         let neighbors: Vec<_> = graph
             .neighbors(current)
@@ -276,13 +264,15 @@ pub(super) fn greedy_search(
                 location: location!(),
             })?
             .collect();
-        let distances = dist_calc.distance(&neighbors);
+        let distances = neighbors
+            .iter()
+            .map(|neighbor| dist_calc.distance(*neighbor));
 
         let mut next = None;
-        for (neighbor, dist) in neighbors.into_iter().zip(distances) {
+        for (neighbor, dist) in neighbors.iter().zip(distances) {
             if dist < closest_dist {
                 closest_dist = dist;
-                next = Some(neighbor);
+                next = Some(*neighbor);
             }
         }
 
@@ -293,7 +283,7 @@ pub(super) fn greedy_search(
         }
     }
 
-    Ok((OrderedFloat(closest_dist), current))
+    Ok(OrderedNode::new(current, closest_dist.into()))
 }
 
 #[cfg(test)]

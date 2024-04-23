@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Trait for commit implementations.
 //!
@@ -206,39 +195,43 @@ async fn migrate_manifest(
 /// See test dataset v0.10.5/corrupt_schema
 fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     // We can short-circuit if there is only one file per fragment or no fragments.
-    if manifest
-        .fragments
-        .first()
-        .map(|f| f.files.len() <= 1)
-        .unwrap_or(true)
-    {
+    if manifest.fragments.iter().all(|f| f.files.len() <= 1) {
         return Ok(());
     }
 
-    let mut field_id_seed = manifest.max_field_id() + 1;
+    // First, see which, if any fields have duplicate ids, within any fragment.
+    let mut fields_with_duplicate_ids = HashSet::new();
     let mut seen_fields = HashSet::new();
-    let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
-    let field_ids = if let Some(fragment) = manifest.fragments.first() {
-        fragment.files.iter().flat_map(|file| file.fields.iter())
-    } else {
-        return Ok(());
-    };
-    for field_id in field_ids {
-        if !seen_fields.insert(field_id) {
-            old_field_id_mapping.insert(*field_id, field_id_seed);
-            field_id_seed += 1;
+    for fragment in manifest.fragments.iter() {
+        for file in fragment.files.iter() {
+            for field_id in file.fields.iter() {
+                if !seen_fields.insert(*field_id) {
+                    fields_with_duplicate_ids.insert(*field_id);
+                }
+            }
         }
+        seen_fields.clear();
+    }
+    if fields_with_duplicate_ids.is_empty() {
+        return Ok(());
     }
 
-    if old_field_id_mapping.is_empty() {
-        return Ok(());
+    // Now, we need to remap the field ids to be unique.
+    let mut field_id_seed = manifest.max_field_id() + 1;
+    let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
+    let mut fields_with_duplicate_ids = fields_with_duplicate_ids.into_iter().collect::<Vec<_>>();
+    fields_with_duplicate_ids.sort_unstable();
+    for field_id in fields_with_duplicate_ids {
+        old_field_id_mapping.insert(field_id, field_id_seed);
+        field_id_seed += 1;
     }
 
     let mut fragments = manifest.fragments.as_ref().clone();
 
     // Apply mapping to fragment files list
-    for fragment in fragments.iter_mut().rev() {
-        let mut seen_fields = HashSet::new();
+    // We iterate over files in reverse order so that we only map the last field id
+    seen_fields.clear();
+    for fragment in fragments.iter_mut() {
         for field_id in fragment
             .files
             .iter_mut()
@@ -251,6 +244,7 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
                 }
             }
         }
+        seen_fields.clear();
     }
 
     // Apply mapping to the schema
@@ -505,11 +499,13 @@ mod tests {
     use std::sync::Mutex;
 
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::datatypes::{Field, Schema};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
+    use lance_table::format::DataFile;
     use lance_table::io::commit::{
         CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
     };
@@ -522,7 +518,7 @@ mod tests {
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "x",
             DataType::Int64,
             false,
@@ -681,18 +677,18 @@ mod tests {
 
         let dimension = 16;
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(
+            ArrowField::new(
                 "vector1",
                 DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
                     dimension,
                 ),
                 false,
             ),
-            Field::new(
+            ArrowField::new(
                 "vector2",
                 DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
                     dimension,
                 ),
                 false,
@@ -772,7 +768,7 @@ mod tests {
             let test_dir = tempfile::tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
-            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "i",
                 DataType::Int32,
                 false,
@@ -835,5 +831,77 @@ mod tests {
 
             dataset.validate().await.unwrap()
         }
+    }
+
+    #[test]
+    fn test_fix_schema() {
+        // Manifest has a fragment with no fields in use
+        // Manifest has a duplicate field id in one fragment but not others.
+        let mut field0 =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+        let mut field2 =
+            Field::try_from(ArrowField::new("b", arrow_schema::DataType::Int64, false)).unwrap();
+        field2.set_id(-1, &mut 2);
+
+        let schema = Schema {
+            fields: vec![field0.clone(), field2.clone()],
+            metadata: Default::default(),
+        };
+        let fragments = vec![
+            Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("path1", vec![0, 1, 2]),
+                    DataFile::new_legacy_from_fields("unused", vec![9]),
+                ],
+                deletion_file: None,
+                physical_rows: None,
+            },
+            Fragment {
+                id: 1,
+                files: vec![
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
+                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                ],
+                deletion_file: None,
+                physical_rows: None,
+            },
+        ];
+
+        let mut manifest = Manifest::new(schema, Arc::new(fragments));
+
+        fix_schema(&mut manifest).unwrap();
+
+        // Because of the duplicate field id, the field id of field2 should have been changed to 10
+        field2.id = 10;
+        let expected_schema = Schema {
+            fields: vec![field0, field2],
+            metadata: Default::default(),
+        };
+        assert_eq!(manifest.schema, expected_schema);
+
+        // The fragment with just field 9 should have been removed, since it's
+        // not used in the current schema.
+        // The field 2 should have been changed to 10, except in the first
+        // file of the second fragment.
+        let expected_fragments = vec![
+            Fragment {
+                id: 0,
+                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 10])],
+                deletion_file: None,
+                physical_rows: None,
+            },
+            Fragment {
+                id: 1,
+                files: vec![
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
+                    DataFile::new_legacy_from_fields("path3", vec![10]),
+                ],
+                deletion_file: None,
+                physical_rows: None,
+            },
+        ];
+        assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
     }
 }

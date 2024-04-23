@@ -1,12 +1,15 @@
-use std::{io::Cursor, ops::Range, sync::Arc};
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use std::{io::Cursor, ops::Range, pin::Pin, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
-use futures::{stream::BoxStream, StreamExt};
+use futures::{stream::BoxStream, Future, Stream, StreamExt};
 use lance_encoding::{
-    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, PageInfo},
+    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, PageInfo, ReadBatchTask},
     EncodingsIo,
 };
 use prost::Message;
@@ -14,8 +17,12 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 use lance_encoding::format::pb as pbenc;
-use lance_io::{scheduler::FileScheduler, ReadBatchParams};
-use tokio::{sync::mpsc, task::JoinHandle};
+use lance_io::{
+    scheduler::FileScheduler,
+    stream::{RecordBatchStream, RecordBatchStreamAdapter},
+    ReadBatchParams,
+};
+use tokio::sync::mpsc;
 
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
@@ -24,7 +31,18 @@ use crate::{
 
 use super::io::LanceEncodingsIo;
 
+// For now, we don't use global buffers for anything other than schema.  If we
+// use these later we should make them lazily loaded and then cached once loaded.
+//
+// We store their position / length for debugging purposes
+#[derive(Debug)]
+pub struct BufferDescriptor {
+    pub position: u64,
+    pub size: u64,
+}
+
 // TODO: Caching
+#[derive(Debug)]
 pub struct CachedFileMetadata {
     /// The schema of the file
     pub file_schema: Schema,
@@ -32,13 +50,24 @@ pub struct CachedFileMetadata {
     pub column_metadatas: Vec<pbfile::ColumnMetadata>,
     /// The number of rows in the file
     pub num_rows: u64,
+    pub file_buffers: Vec<BufferDescriptor>,
+    /// The number of bytes contained in the data page section of the file
+    pub num_data_bytes: u64,
+    /// The number of bytes contained in the column metadata section of the file
+    pub num_column_metadata_bytes: u64,
+    /// The number of bytes contained in the global buffer section of the file
+    pub num_global_buffer_bytes: u64,
+    pub major_version: u16,
+    pub minor_version: u16,
 }
 
+#[derive(Debug)]
 pub struct FileReader {
     scheduler: Arc<LanceEncodingsIo>,
     file_schema: Schema,
     column_infos: Vec<ColumnInfo>,
     num_rows: u64,
+    metadata: Arc<CachedFileMetadata>,
 }
 
 struct Footer {
@@ -51,11 +80,17 @@ struct Footer {
     global_buff_offsets_start: u64,
     num_global_buffers: u32,
     num_columns: u32,
+    major_version: u16,
+    minor_version: u16,
 }
 
 const FOOTER_LEN: usize = 48;
 
 impl FileReader {
+    pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
+        &self.metadata
+    }
+
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
         let file_size = scheduler.reader().size().await? as u64;
         let begin = if file_size < scheduler.reader().block_size() as u64 {
@@ -118,6 +153,8 @@ impl FileReader {
             global_buff_offsets_start,
             num_global_buffers,
             num_columns,
+            major_version,
+            minor_version,
         })
     }
 
@@ -216,55 +253,65 @@ impl FileReader {
         // Next, read the metadata for the columns
         let column_metadatas = Self::read_all_column_metadata(scheduler, &footer).await?;
 
-        Ok(CachedFileMetadata {
-            file_schema: Schema::from(&schema),
-            column_metadatas,
-            num_rows,
-        })
-    }
+        let footer_start = file_len - FOOTER_LEN as u64;
+        let num_data_bytes = footer.column_meta_start;
+        let num_column_metadata_bytes = footer.global_buff_start - footer.column_meta_start;
+        let num_global_buffer_bytes = footer_start - footer.global_buff_start;
 
-    pub async fn print_all_metadata(scheduler: &FileScheduler) -> Result<()> {
-        // 1. read and print the footer
-        let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
-        let footer = Self::decode_footer(&tail_bytes)?;
-
-        println!("# Footer");
-        println!();
-        println!(
-            "File version           : {}.{}",
-            MAJOR_VERSION, MINOR_VERSION_NEXT
-        );
-        println!("Data bytes             : {}", footer.column_meta_start);
-        println!(
-            "Col. meta size (padded): {}",
-            footer.column_meta_offsets_start - footer.column_meta_start
-        );
-        println!(
-            "Glo. buff size (padded): {}",
-            footer.global_buff_offsets_start - footer.global_buff_start
-        );
-
-        let all_metadata_bytes =
-            Self::get_all_meta_bytes(tail_bytes, file_len, scheduler, &footer).await?;
-        let meta_offset = footer.column_meta_start;
-
-        // 2. print the global buffers
         let global_bufs_table_nbytes = footer.num_global_buffers as usize * 16;
         let global_bufs_table_start = (footer.global_buff_offsets_start - meta_offset) as usize;
         let global_bufs_table_end = global_bufs_table_start + global_bufs_table_nbytes;
         let global_bufs_table =
             all_metadata_bytes.slice(global_bufs_table_start..global_bufs_table_end);
         let mut global_bufs_cursor = Cursor::new(&global_bufs_table);
-        println!("Global buffers:");
+
+        let mut global_buffers = Vec::with_capacity(footer.num_global_buffers as usize);
         for _ in 0..footer.num_global_buffers {
             let buf_pos = global_bufs_cursor.read_u64::<LittleEndian>()? - meta_offset;
             let buf_size = global_bufs_cursor.read_u64::<LittleEndian>()?;
-            println!(" * {}..{}", buf_pos, buf_pos + buf_size);
+            global_buffers.push(BufferDescriptor {
+                position: buf_pos,
+                size: buf_size,
+            });
         }
 
-        let col_meta = Self::read_all_column_metadata(scheduler, &footer).await?;
+        Ok(CachedFileMetadata {
+            file_schema: Schema::from(&schema),
+            column_metadatas,
+            num_rows,
+            num_data_bytes,
+            num_column_metadata_bytes,
+            num_global_buffer_bytes,
+            file_buffers: global_buffers,
+            major_version: footer.major_version,
+            minor_version: footer.minor_version,
+        })
+    }
+
+    pub async fn print_all_metadata(metadata: &CachedFileMetadata) -> Result<()> {
+        // 1. read and print the footer
+        println!("# Footer");
+        println!();
+        println!(
+            "File version           : {}.{}",
+            MAJOR_VERSION, MINOR_VERSION_NEXT
+        );
+        println!("Data bytes             : {}", metadata.num_data_bytes);
+        println!("Col. meta bytes: {}", metadata.num_column_metadata_bytes);
+        println!("Glo. data bytes: {}", metadata.num_global_buffer_bytes);
+
+        // 2. print the global buffers
+        println!("Global buffers:");
+        for file_buffer in &metadata.file_buffers {
+            println!(
+                " * {}..{}",
+                file_buffer.position,
+                file_buffer.position + file_buffer.size
+            );
+        }
+
         println!("Columns:");
-        for (idx, col) in col_meta.iter().enumerate() {
+        for (idx, col) in metadata.column_metadatas.iter().enumerate() {
             println!(" * Column {}", idx);
             println!();
             println!("   Buffers:");
@@ -354,61 +401,123 @@ impl FileReader {
             column_infos,
             file_schema: file_metadata.file_schema.clone(),
             num_rows,
+            metadata: file_metadata,
         })
     }
 
-    async fn read_range(
+    fn read_range(
         &self,
         range: Range<u64>,
         batch_size: u32,
-    ) -> BoxStream<'static, JoinHandle<Result<RecordBatch>>> {
+    ) -> BoxStream<'static, ReadBatchTask<impl Future<Output = Result<RecordBatch>>>> {
         let mut decode_scheduler =
             DecodeBatchScheduler::new(&self.file_schema, &self.column_infos, &vec![]);
 
         let (tx, rx) = mpsc::unbounded_channel();
 
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
-        // FIXME: spawn this, change this method to sync
-        decode_scheduler
-            .schedule_range(range, tx, &scheduler)
-            .await
-            .unwrap();
+        tokio::task::spawn(
+            async move { decode_scheduler.schedule_range(range, tx, &scheduler).await },
+        );
 
         BatchDecodeStream::new(rx, batch_size, self.num_rows).into_stream()
     }
 
-    // TODO: change output to sendable record batch stream
-
-    pub async fn read_stream(
+    pub fn read_tasks(
         &self,
         params: ReadBatchParams,
         batch_size: u32,
-    ) -> BoxStream<'static, Result<RecordBatch>> {
-        let futures_stream = match params {
+    ) -> Result<
+        Pin<
+            Box<dyn Stream<Item = ReadBatchTask<impl Future<Output = Result<RecordBatch>>>> + Send>,
+        >,
+    > {
+        let verify_bound = |params: &ReadBatchParams, bound: usize| {
+            if bound > u32::MAX as usize {
+                Err(Error::invalid_input(
+                    format!(
+                        "cannot read {:?} from file with {} rows",
+                        params, self.num_rows
+                    ),
+                    location!(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let tasks_stream = match &params {
             ReadBatchParams::Indices(_) => todo!(),
             ReadBatchParams::Range(range) => {
-                // TODO: Make err
-                assert!((range.end as u64) < self.num_rows);
+                verify_bound(&params, range.end)?;
                 self.read_range(range.start as u64..range.end as u64, batch_size)
-                    .await
             }
             ReadBatchParams::RangeFrom(range) => {
+                verify_bound(&params, range.start)?;
                 self.read_range(range.start as u64..self.num_rows, batch_size)
-                    .await
             }
             ReadBatchParams::RangeTo(range) => {
-                // TODO: Make err
-                assert!((range.end as u64) < self.num_rows);
-                self.read_range(0..range.end as u64, batch_size).await
+                verify_bound(&params, range.end)?;
+                self.read_range(0..range.end as u64, batch_size)
             }
-            ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size).await,
+            ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size),
         };
-        futures_stream
-            .buffered(16)
-            // JoinHandle returns Result<Result<...>> where the outer Result means the thread
-            // task panic'd so we propagate that panic here.
-            .map(|res_res| res_res.unwrap())
-            .boxed()
+        Ok(tasks_stream)
+    }
+
+    pub fn read_stream(
+        &self,
+        params: ReadBatchParams,
+        batch_size: u32,
+        batch_readahead: u32,
+    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
+        let tasks_stream = self.read_tasks(params, batch_size)?;
+        let batch_stream = tasks_stream
+            .map(|task| task.task)
+            .buffered(batch_readahead as usize)
+            .boxed();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(self.file_schema.clone()),
+            batch_stream,
+        )))
+    }
+}
+
+/// Inspects a page and returns a String describing the page's encoding
+pub fn describe_encoding(page: &pbfile::column_metadata::Page) -> String {
+    if let Some(encoding) = &page.encoding {
+        if let Some(style) = &encoding.style {
+            match style {
+                pbfile::encoding::Style::Deferred(deferred) => {
+                    format!(
+                        "DeferredEncoding(pos={},size={})",
+                        deferred.buffer_location, deferred.buffer_length
+                    )
+                }
+                pbfile::encoding::Style::Direct(direct) => {
+                    if let Some(encoding) = &direct.encoding {
+                        if encoding.type_url == "/lance.encodings.ArrayEncoding" {
+                            let encoding = encoding.to_msg::<pbenc::ArrayEncoding>();
+                            match encoding {
+                                Ok(encoding) => {
+                                    format!("{:#?}", encoding)
+                                }
+                                Err(err) => {
+                                    format!("Unsupported(decode_err={})", err)
+                                }
+                            }
+                        } else {
+                            format!("Unrecognized(type_url={})", encoding.type_url)
+                        }
+                    } else {
+                        "MISSING DIRECT VALUE".to_string()
+                    }
+                }
+            }
+        } else {
+            "MISSING STYLE".to_string()
+        }
+    } else {
+        "MISSING".to_string()
     }
 }
 
@@ -443,9 +552,13 @@ mod tests {
 
         let writer = obj_store.create(&tmp_path).await.unwrap();
 
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
+
         let mut file_writer = FileWriter::try_new(
             writer,
-            (*reader.schema()).clone(),
+            tmp_path.to_string(),
+            lance_schema,
             FileWriterOptions::default(),
         )
         .unwrap();
@@ -460,11 +573,6 @@ mod tests {
         }
         file_writer.finish().await.unwrap();
 
-        let file_scheduler = scheduler.open_file(&tmp_path).await.unwrap();
-        FileReader::print_all_metadata(&file_scheduler)
-            .await
-            .unwrap();
-
         for read_size in [32, 1024, 1024 * 1024] {
             let file_scheduler = scheduler.open_file(&tmp_path).await.unwrap();
             let file_reader = FileReader::try_open(file_scheduler, (*schema).clone())
@@ -472,8 +580,8 @@ mod tests {
                 .unwrap();
 
             let mut batch_stream = file_reader
-                .read_stream(lance_io::ReadBatchParams::RangeFull, read_size)
-                .await;
+                .read_stream(lance_io::ReadBatchParams::RangeFull, read_size, 16)
+                .unwrap();
 
             let mut total_remaining = 1000 * 100;
             let mut expected_iter = data.iter();

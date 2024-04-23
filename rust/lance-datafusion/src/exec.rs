@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Utilities for working with datafusion execution plans
 
@@ -28,25 +17,30 @@ use datafusion::{
         TaskContext,
     },
     physical_plan::{
-        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan,
+        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
         SendableRecordBatchStream,
     },
 };
-use datafusion_common::DataFusionError;
-use datafusion_physical_expr::Partitioning;
+use datafusion_common::{DataFusionError, Statistics};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
 use lance_arrow::SchemaExt;
 use lance_core::Result;
+use log::{info, warn};
 
 /// An source execution node created from an existing stream
 ///
 /// It can only be used once, and will return the stream.  After that the node
 /// is exhuasted.
+///
+/// Note: the stream should be finite, otherwise we will report datafusion properties
+/// incorrectly.
 pub struct OneShotExec {
     stream: Mutex<Option<SendableRecordBatchStream>>,
     // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
     // can still function after exhuasted
     schema: Arc<ArrowSchema>,
+    properties: PlanProperties,
 }
 
 impl OneShotExec {
@@ -55,7 +49,12 @@ impl OneShotExec {
         let schema = stream.schema().clone();
         Self {
             stream: Mutex::new(Some(stream)),
-            schema,
+            schema: schema.clone(),
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::RoundRobinBatch(1),
+                datafusion::physical_plan::ExecutionMode::Bounded,
+            ),
         }
     }
 }
@@ -106,14 +105,6 @@ impl ExecutionPlan for OneShotExec {
         self.schema.clone()
     }
 
-    fn output_partitioning(&self) -> datafusion_physical_expr::Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion_physical_expr::PhysicalSortExpr]> {
-        None
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -145,22 +136,47 @@ impl ExecutionPlan for OneShotExec {
     }
 
     fn statistics(&self) -> datafusion_common::Result<datafusion_common::Statistics> {
-        todo!()
+        Ok(Statistics::new_unknown(&self.schema))
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.properties
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
-    pub mem_pool_size: u64,
+    pub mem_pool_size: Option<u64>,
 }
 
-impl Default for LanceExecutionOptions {
-    fn default() -> Self {
-        Self {
-            use_spilling: false,
-            mem_pool_size: 1024 * 1024 * 100,
+const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
+
+impl LanceExecutionOptions {
+    pub fn mem_pool_size(&self) -> u64 {
+        self.mem_pool_size.unwrap_or_else(|| {
+            std::env::var("LANCE_MEM_POOL_SIZE")
+                .map(|s| match s.parse::<u64>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("Failed to parse LANCE_MEM_POOL_SIZE: {}, using default", e);
+                        DEFAULT_LANCE_MEM_POOL_SIZE
+                    }
+                })
+                .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE)
+        })
+    }
+
+    pub fn use_spilling(&self) -> bool {
+        if !self.use_spilling {
+            return false;
         }
+        std::env::var("LANCE_BYPASS_SPILLING")
+            .map(|_| {
+                info!("Bypassing spilling because LANCE_BYPASS_SPILLING is set");
+                false
+            })
+            .unwrap_or(true)
     }
 }
 
@@ -173,16 +189,17 @@ pub fn execute_plan(
 ) -> Result<SendableRecordBatchStream> {
     let session_config = SessionConfig::new();
     let mut runtime_config = RuntimeConfig::new();
-    if options.use_spilling {
+    if options.use_spilling() {
         runtime_config.disk_manager = DiskManagerConfig::NewOs;
-        runtime_config.memory_pool =
-            Some(Arc::new(FairSpillPool::new(options.mem_pool_size as usize)));
+        runtime_config.memory_pool = Some(Arc::new(FairSpillPool::new(
+            options.mem_pool_size() as usize
+        )));
     }
     let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
     let session_state = SessionState::new_with_config_rt(session_config, runtime_env);
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
-    assert_eq!(plan.output_partitioning().partition_count(), 1);
+    assert_eq!(plan.properties().partitioning.partition_count(), 1);
     Ok(plan.execute(0, session_state.task_ctx())?)
 }
 

@@ -1,16 +1,7 @@
-#  Copyright 2023 Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import os
 import random
 import string
 from datetime import date, datetime, timedelta
@@ -95,12 +86,14 @@ def test_temporal_index(tmp_path):
     # Timestamps
     now = datetime.now()
     today = date.today()
-    table = pa.Table.from_pydict({
-        "ts": [now - timedelta(days=i) for i in range(100)],
-        "date": [today - timedelta(days=i) for i in range(100)],
-        "time": pa.array([i for i in range(100)], type=pa.time32("s")),
-        "id": [i for i in range(100)],
-    })
+    table = pa.Table.from_pydict(
+        {
+            "ts": [now - timedelta(days=i) for i in range(100)],
+            "date": [today - timedelta(days=i) for i in range(100)],
+            "time": pa.array([i for i in range(100)], type=pa.time32("s")),
+            "id": [i for i in range(100)],
+        }
+    )
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("ts", index_type="BTREE")
     dataset.create_scalar_index("date", index_type="BTREE")
@@ -173,3 +166,28 @@ def test_indexed_vector_scan_postfilter(
     )
 
     assert scanner.to_table().num_rows == 0
+
+
+# We currently allow the memory pool default size to be configured with an
+# environment variable.  This test ensures that the environment variable
+# is respected.
+def test_lance_mem_pool_env_var(tmp_path):
+    strings = pa.array([f"string-{i}" * 10 for i in range(100 * 1024)])
+    table = pa.Table.from_arrays([strings], ["str"])
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Should succeed
+    dataset.create_scalar_index("str", index_type="BTREE")
+
+    try:
+        # Should fail if we intentionally use a very small memory pool
+        os.environ["LANCE_MEM_POOL_SIZE"] = "1024"
+        with pytest.raises(Exception):
+            dataset.create_scalar_index("str", index_type="BTREE", replace=True)
+
+        # Should succeed again since bypassing spilling takes precedence
+        os.environ["LANCE_BYPASS_SPILLING"] = "1"
+        dataset.create_scalar_index("str", index_type="BTREE", replace=True)
+    finally:
+        del os.environ["LANCE_MEM_POOL_SIZE"]
+        del os.environ["LANCE_BYPASS_SPILLING"]

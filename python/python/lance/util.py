@@ -1,28 +1,17 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union
 
 import pyarrow as pa
 
 from .dependencies import _check_for_numpy, _check_for_pandas
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
-from .lance import _KMeans
+from .lance import _build_sq_storage, _Hnsw, _KMeans
 
 if TYPE_CHECKING:
     ts_types = Union[datetime, pd.Timestamp, str]
@@ -228,3 +217,36 @@ def validate_vector_index(
         raise ValueError(
             f"Vector index failed sanity check, only {passes}/{total} passed"
         )
+
+
+class HNSW:
+    _hnsw = None
+
+    def __init__(self, hnsw) -> None:
+        self._hnsw = hnsw
+
+    @staticmethod
+    def build(
+        vectors_array: Iterator[pa.Array],
+        max_level=7,
+        m=20,
+        m_max=40,
+        ef_construction=100,
+        use_select_heuristic=True,
+    ) -> HNSW:
+        hnsw = _Hnsw.build(
+            vectors_array, max_level, m, m_max, ef_construction, use_select_heuristic
+        )
+        return HNSW(hnsw)
+
+    def to_lance_file(self, file_path):
+        self._hnsw.to_lance_file(file_path)
+
+    def vectors(self) -> pa.Array:
+        return self._hnsw.vectors()
+
+
+def build_sq_storage(
+    row_ids_array: Iterator[pa.Array], vectors_array: pa.Array, dim, bounds: tuple
+) -> pa.RecordBatch:
+    return _build_sq_storage(row_ids_array, vectors_array, dim, bounds)

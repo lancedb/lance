@@ -17,15 +17,17 @@ use std::str;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::{ToPyArrow, *};
+use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use chrono::Duration;
 
+use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::transaction::validate_operation;
 use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -62,6 +64,7 @@ use pyo3::{
 use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
+use crate::schema::LanceSchema;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -88,6 +91,7 @@ fn into_fragments(fragments: Vec<FragmentMetadata>) -> Vec<Fragment> {
 }
 
 fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
+    // Note: the field ids here are wrong.
     Schema::try_from(arrow_schema).map_err(|e| {
         PyValueError::new_err(format!(
             "Failed to convert Arrow schema to Lance schema: {}",
@@ -241,8 +245,8 @@ impl Operation {
     }
 
     #[staticmethod]
-    fn merge(fragments: Vec<FragmentMetadata>, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let schema = convert_schema(&schema.0)?;
+    fn merge(fragments: Vec<FragmentMetadata>, schema: LanceSchema) -> PyResult<Self> {
+        let schema = schema.0;
         let fragments = into_fragments(fragments);
         let op = LanceOperation::Merge { fragments, schema };
         Ok(Self(op))
@@ -319,6 +323,11 @@ impl Dataset {
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());
         arrow_schema.to_pyarrow(self_.py())
+    }
+
+    #[getter(lance_schema)]
+    fn lance_schema(self_: PyRef<'_, Self>) -> LanceSchema {
+        LanceSchema(self_.ds.schema().clone())
     }
 
     /// Get index statistics
@@ -901,7 +910,11 @@ impl Dataset {
         let params: Box<dyn IndexParams> = if index_type == "BTREE" {
             Box::<ScalarIndexParams>::default()
         } else {
-            prepare_vector_index_params(&index_type, kwargs)?
+            let column_type = match self.ds.schema().field(columns[0]) {
+                Some(f) => f.data_type().clone(),
+                None => return Err(PyValueError::new_err("Column not found in dataset schema.")),
+            };
+            prepare_vector_index_params(&index_type, &column_type, kwargs)?
         };
 
         let replace = replace.unwrap_or(true);
@@ -966,10 +979,17 @@ impl Dataset {
                 as Arc<dyn CommitHandler>
         });
         let ds = RT
-            .block_on(
-                commit_lock.map(|cl| cl.py()),
-                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler),
-            )?
+            .block_on(commit_lock.map(|cl| cl.py()), async move {
+                let dataset = match DatasetBuilder::from_uri(dataset_uri).load().await {
+                    Ok(ds) => Some(ds),
+                    Err(lance::Error::DatasetNotFound { .. }) => None,
+                    Err(err) => return Err(err),
+                };
+                let manifest = dataset.as_ref().map(|ds| ds.manifest());
+                validate_operation(manifest, &operation.0)?;
+                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler)
+                    .await
+            })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             ds: Arc::new(ds),
@@ -1126,6 +1146,9 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(maybe_nbytes) = options.get_item("max_bytes_per_file")? {
             p.max_bytes_per_file = usize::extract(maybe_nbytes)?;
         }
+        if let Some(use_experimental_writer) = options.get_item("use_experimental_writer")? {
+            p.use_experimental_writer = use_experimental_writer.extract()?;
+        }
         if let Some(progress) = options.get_item("progress")? {
             if !progress.is_none() {
                 p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
@@ -1151,6 +1174,7 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
 
 fn prepare_vector_index_params(
     index_type: &str,
+    column_type: &DataType,
     kwargs: Option<&PyDict>,
 ) -> PyResult<Box<dyn IndexParams>> {
     let mut m_type = MetricType::L2;
@@ -1186,7 +1210,22 @@ fn prepare_vector_index_params(
                     "Expected '_ivf_centroids' as the first column name.",
                 ));
             }
-            let centroids = as_fixed_size_list_array(batch.column(0));
+
+            // It's important that the centroids are the same data type
+            // as the vectors that will be indexed.
+            let mut centroids: Arc<dyn Array> = batch.column(0).clone();
+            if centroids.data_type() != column_type {
+                centroids = lance_arrow::cast::cast_with_options(
+                    centroids.as_ref(),
+                    column_type,
+                    &Default::default(),
+                )
+                .map_err(|e| {
+                    PyValueError::new_err(format!("Failed to cast centroids to column type: {}", e))
+                })?;
+            }
+            let centroids = as_fixed_size_list_array(centroids.as_ref());
+
             ivf_params.centroids = Some(Arc::new(centroids.clone()))
         };
 

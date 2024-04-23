@@ -13,23 +13,13 @@
  */
 package com.lancedb.lance;
 
-import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-import com.lancedb.lance.WriteParams.WriteMode;
 import java.io.IOException;
 import java.net.URISyntaxException;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import org.apache.arrow.c.ArrowArrayStream;
-import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.ipc.ArrowFileReader;
-import org.apache.arrow.vector.ipc.SeekableReadChannel;
-import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -52,37 +42,21 @@ public class DatasetTest {
   }
 
   @Test
-  void testWriteStreamAndOpenPath() throws URISyntaxException, IOException {
-    Path path = Paths.get(DatasetTest.class.getResource("/random_access.arrow").toURI());
-    try (BufferAllocator allocator = new RootAllocator();
-        ArrowFileReader reader =
-            new ArrowFileReader(
-                new SeekableReadChannel(
-                    new ByteArrayReadableSeekableByteChannel(Files.readAllBytes(path))),
-                allocator);
-        ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
-      Data.exportArrayStream(allocator, reader, arrowStream);
-      Path datasetPath = tempDir.resolve("new_dataset");
-      assertDoesNotThrow(
-          () -> {
-            dataset =
-                Dataset.write(
-                    arrowStream,
-                    datasetPath.toString(),
-                    new WriteParams.Builder()
-                        .withMaxRowsPerFile(10)
-                        .withMaxRowsPerGroup(20)
-                        .withMode(WriteMode.CREATE)
-                        .build());
-            assertEquals(9, dataset.countRows());
-            Dataset datasetRead = Dataset.open(datasetPath.toString(), allocator);
-            assertEquals(9, datasetRead.countRows());
-          });
+  void testWriteStreamAndOpenPath() throws IOException, URISyntaxException {
+    String datasetPath = tempDir.resolve("write_stream").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+       TestUtils.RandomAccessDataset testDataset = new TestUtils.RandomAccessDataset(allocator, datasetPath);
+       testDataset.createDatasetAndValidate();
+       testDataset.openDatasetAndValidate();
+    }
+  }
 
-      var fragments = dataset.getFragments();
-      assertEquals(1, fragments.size());
-      assertEquals(0, fragments.get(0).getFragmentId());
-      assertEquals(9, fragments.get(0).countRows());
+  @Test
+  void testCreateEmptyDataset() {
+    String datasetPath = tempDir.resolve("new_empty_dataset").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset();
     }
   }
 
