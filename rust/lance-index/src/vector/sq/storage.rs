@@ -223,8 +223,6 @@ impl VectorStorage for ScalarQuantizationStorage {
 
 struct SQDistCalculator {
     query_sq_code: Vec<u8>,
-
-    // flatten sq codes
     sq_codes: Arc<FixedSizeListArray>,
 }
 

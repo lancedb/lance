@@ -451,8 +451,7 @@ async fn build_hnsw_quantization_partition(
         metric_type = MetricType::L2;
     }
 
-    let fsl = vectors.clone();
-    let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), fsl, writer);
+    let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), vectors.clone(), writer);
 
     let build_store = match quantizer {
         Quantizer::Product(pq) => tokio::spawn(build_and_write_pq_storage(
