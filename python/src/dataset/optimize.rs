@@ -91,6 +91,16 @@ pub struct PyCompactionMetrics {
     pub files_added: usize,
 }
 
+#[pymethods]
+impl PyCompactionMetrics {
+    fn __repr__(&self) -> PyResult<String> {
+        Ok(format!(
+            "CompactionMetrics(fragments_removed={}, fragments_added={}, files_removed={}, files_added={})",
+            self.fragments_removed, self.fragments_added, self.files_removed, self.files_added
+        ))
+    }
+}
+
 impl From<CompactionMetrics> for PyCompactionMetrics {
     fn from(metrics: CompactionMetrics) -> Self {
         Self {

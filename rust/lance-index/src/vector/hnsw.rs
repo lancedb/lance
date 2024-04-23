@@ -294,12 +294,17 @@ impl HNSW {
             levels.push((vector_id_builder, neighbours_builder));
         }
 
-        for node in builder.nodes() {
+        for node in builder.nodes().read().unwrap().iter() {
             for (level, neighbors) in node.level_neighbors.iter().enumerate() {
                 let (vector_id_builder, neighbours_builder) = &mut levels[level];
                 vector_id_builder.append_value(node.id);
-                neighbours_builder
-                    .append_value(neighbors.iter().map(|neighbors| Some(neighbors.id)));
+                neighbours_builder.append_value(
+                    neighbors
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .map(|neighbors| Some(neighbors.id)),
+                );
             }
         }
 
@@ -549,8 +554,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_hnsw() {
+    #[tokio::test]
+    async fn test_build_hnsw() {
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
         const MAX_EDGES: usize = 32;
@@ -564,6 +569,7 @@ mod tests {
             store.clone(),
         )
         .build()
+        .await
         .unwrap();
         assert!(hnsw.levels.len() > 1);
         assert_eq!(hnsw.levels[0].len(), TOTAL);
@@ -595,8 +601,8 @@ mod tests {
         dists.into_iter().map(|(_, i)| i).collect()
     }
 
-    #[test]
-    fn test_search() {
+    #[tokio::test]
+    async fn test_search() {
         const DIM: usize = 32;
         const TOTAL: usize = 10_000;
         const MAX_EDGES: usize = 30;
@@ -615,6 +621,7 @@ mod tests {
             vectors.clone(),
         )
         .build()
+        .await
         .unwrap();
 
         let results: HashSet<u32> = hnsw

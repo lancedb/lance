@@ -14,8 +14,10 @@
 
 use std::str::Utf8Error;
 
+use arrow_schema::ArrowError;
 use jni::errors::Error as JniError;
-use snafu::{Location, Snafu};
+use serde_json::Error as JsonError;
+use snafu::{location, Location, Snafu};
 
 /// Java Exception types
 pub enum JavaException {
@@ -47,6 +49,8 @@ pub enum Error {
     Arrow { message: String, location: Location },
     #[snafu(display("Index error: {}, location", message))]
     Index { message: String, location: Location },
+    #[snafu(display("JSON error: {}, location: {}", message, location))]
+    JSON { message: String, location: Location },
     #[snafu(display("Dataset not found error: {}, location {}", path, location))]
     DatasetNotFound { path: String, location: Location },
     #[snafu(display("Dataset already exists error: {}, location {}", uri, location))]
@@ -66,6 +70,7 @@ impl Error {
             Self::Arrow { .. }
             | Self::DatasetNotFound { .. }
             | Self::DatasetAlreadyExists { .. }
+            | Self::JSON { .. }
             | Self::Other { .. }
             | Self::Jni { .. } => self.throw_as(env, JavaException::RuntimeException),
         }
@@ -92,6 +97,24 @@ impl From<Utf8Error> for Error {
     fn from(source: Utf8Error) -> Self {
         Self::InvalidArgument {
             message: source.to_string(),
+        }
+    }
+}
+
+impl From<ArrowError> for Error {
+    fn from(source: ArrowError) -> Self {
+        Self::Arrow {
+            message: source.to_string(),
+            location: location!(),
+        }
+    }
+}
+
+impl From<JsonError> for Error {
+    fn from(source: JsonError) -> Self {
+        Self::JSON {
+            message: source.to_string(),
+            location: location!(),
         }
     }
 }

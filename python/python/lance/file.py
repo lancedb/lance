@@ -70,7 +70,7 @@ class LanceFileReader:
         """
         self._reader = _LanceFileReader(path, schema)
 
-    def read_all(self, *, batch_size: int = 1024) -> ReaderResults:
+    def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
         """
         Reads the entire file
 
@@ -83,10 +83,10 @@ class LanceFileReader:
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
         """
-        return ReaderResults(self._reader.read_all(batch_size))
+        return ReaderResults(self._reader.read_all(batch_size, batch_readahead))
 
     def read_range(
-        self, start: int, num_rows: int, *, batch_size: int = 1024
+        self, start: int, num_rows: int, *, batch_size: int = 1024, batch_readahead=16
     ) -> ReaderResults:
         """
         Read a range of rows from the file
@@ -104,7 +104,9 @@ class LanceFileReader:
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
         """
-        return ReaderResults(self._reader.read_range(start, num_rows, batch_size))
+        return ReaderResults(
+            self._reader.read_range(start, num_rows, batch_size, batch_readahead)
+        )
 
     def metadata(self) -> LanceFileMetadata:
         """

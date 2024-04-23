@@ -5,6 +5,7 @@ import json
 import multiprocessing
 from pathlib import Path
 
+import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
@@ -16,6 +17,7 @@ from lance import (
     LanceOperation,
     write_dataset,
 )
+from lance.debug import format_fragment
 from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
@@ -86,9 +88,11 @@ def test_scan_fragment_with_dynamic_projection(tmp_path: Path):
 
 def test_write_fragments(tmp_path: Path):
     # This will be split across two files if we set the max_bytes_per_file to 1024
-    tab = pa.table({
-        "a": pa.array(range(1024)),
-    })
+    tab = pa.table(
+        {
+            "a": pa.array(range(1024)),
+        }
+    )
     progress = ProgressForTest()
     fragments = write_fragments(
         tab,
@@ -244,3 +248,21 @@ def test_fragment_meta():
         "file_major_version: 0, file_minor_version: 0 }], deletion_file: None, "
         "physical_rows: Some(100) }"
     )
+
+
+def test_fragment_v2(tmp_path):
+    dataset_uri = tmp_path / "dataset"
+    tab = pa.table(
+        {
+            "a": pa.array(range(1024)),
+        }
+    )
+    lance.write_dataset([], dataset_uri, schema=tab.schema)
+    fragments = write_fragments(
+        tab,
+        tmp_path,
+        use_experimental_writer=True,
+    )
+    assert len(fragments) == 1
+    ds = lance.dataset(dataset_uri)
+    assert "minor_version: 3" in format_fragment(fragments[0], ds)

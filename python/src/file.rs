@@ -278,12 +278,15 @@ impl LanceFileReader {
         &mut self,
         params: ReadBatchParams,
         batch_size: u32,
+        batch_readahead: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         // read_stream is a synchronous method but it launches tasks and needs to be
         // run in the context of a tokio runtime
         let inner = self.inner.clone();
         let _guard = RT.runtime.enter();
-        let stream = inner.read_stream(params, batch_size).infer_error()?;
+        let stream = inner
+            .read_stream(params, batch_size, batch_readahead)
+            .infer_error()?;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
     }
 }
@@ -298,8 +301,13 @@ impl LanceFileReader {
     pub fn read_all(
         &mut self,
         batch_size: u32,
+        batch_readahead: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        self.read_stream(lance_io::ReadBatchParams::RangeFull, batch_size)
+        self.read_stream(
+            lance_io::ReadBatchParams::RangeFull,
+            batch_size,
+            batch_readahead,
+        )
     }
 
     pub fn read_range(
@@ -307,10 +315,12 @@ impl LanceFileReader {
         offset: u64,
         num_rows: u64,
         batch_size: u32,
+        batch_readahead: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         self.read_stream(
             lance_io::ReadBatchParams::Range((offset as usize)..(offset + num_rows) as usize),
             batch_size,
+            batch_readahead,
         )
     }
 

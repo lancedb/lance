@@ -184,7 +184,9 @@ impl Hnsw {
         let vectors = concat(&array_refs).map_err(|e| PyIOError::new_err(e.to_string()))?;
         std::mem::drop(data);
 
-        let hnsw = build_hnsw_model(params, vectors.clone())
+        let hnsw = RT
+            .runtime
+            .block_on(build_hnsw_model(params, vectors.clone()))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self { hnsw, vectors })
     }

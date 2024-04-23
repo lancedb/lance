@@ -93,6 +93,7 @@ async fn main() {
             vector_store.clone(),
         )
         .build()
+        .await
         .unwrap();
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();

@@ -14,11 +14,13 @@ from lance.debug import (
 
 
 def test_format_schema(tmp_path: Path):
-    schema = pa.schema({
-        "a": pa.int64(),
-        "b": pa.string(),
-        "c": pa.bool_(),
-    })
+    schema = pa.schema(
+        {
+            "a": pa.int64(),
+            "b": pa.string(),
+            "c": pa.bool_(),
+        }
+    )
     table = pa.Table.from_batches([], schema)
     dataset = lance.write_dataset(table, tmp_path)
 

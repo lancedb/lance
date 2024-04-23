@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+use std::sync::Arc;
 
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
+use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
 use crate::{
+    decoder::{ColumnInfo, PageInfo},
     encodings::logical::{
         binary::BinaryFieldEncoder, list::ListFieldEncoder, primitive::PrimitiveFieldEncoder,
         r#struct::StructFieldEncoder,
@@ -276,4 +279,60 @@ impl BatchEncoder {
             .map(|field_encoder| field_encoder.num_columns())
             .sum::<u32>()
     }
+}
+
+/// An encoded batch of data and a page table describing it
+///
+/// This is returned by [`crate::encoder::encode_batch`]
+pub struct EncodedBatch {
+    pub data: Bytes,
+    pub page_table: Vec<ColumnInfo>,
+    pub schema: Arc<arrow_schema::Schema>,
+    pub num_rows: u64,
+}
+
+/// Helper method to encode a batch of data into memory
+///
+/// This is primarily for testing and benchmarking but could be useful in other
+/// niche situations like IPC.
+pub async fn encode_batch(
+    batch: &RecordBatch,
+    cache_bytes_per_column: u64,
+) -> Result<EncodedBatch> {
+    let mut data_buffer = BytesMut::new();
+    let lance_schema = Schema::try_from(batch.schema().as_ref())?;
+    let batch_encoder = BatchEncoder::try_new(&lance_schema, cache_bytes_per_column)?;
+    let mut page_table = Vec::new();
+    for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
+        let mut tasks = encoder.maybe_encode(arr.clone())?;
+        tasks.extend(encoder.flush()?);
+        let mut pages = Vec::new();
+        for task in tasks {
+            let encoded_page = task.await?;
+            let mut buffers = encoded_page.array.buffers;
+            buffers.sort_by_key(|b| b.index);
+            let mut buffer_offsets = Vec::new();
+            for buffer in buffers {
+                buffer_offsets.push(data_buffer.len() as u64);
+                for part in buffer.parts {
+                    data_buffer.extend_from_slice(&part);
+                }
+            }
+            pages.push(Arc::new(PageInfo {
+                buffer_offsets: Arc::new(buffer_offsets),
+                encoding: encoded_page.array.encoding,
+                num_rows: encoded_page.num_rows,
+            }))
+        }
+        page_table.push(ColumnInfo {
+            buffer_offsets: vec![],
+            page_infos: pages,
+        })
+    }
+    Ok(EncodedBatch {
+        data: data_buffer.freeze(),
+        page_table,
+        schema: batch.schema(),
+        num_rows: batch.num_rows() as u64,
+    })
 }

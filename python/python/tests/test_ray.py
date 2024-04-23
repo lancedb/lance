@@ -14,7 +14,11 @@ from lance.ray.sink import (  # noqa: E402
     LanceCommitter,
     LanceDatasink,
     LanceFragmentWriter,
+    _register_hooks,
 )
+
+# Use this hook until we have offical DataSink in Ray.
+_register_hooks()
 
 ray.init()
 
@@ -77,3 +81,21 @@ def test_ray_committer(tmp_path: Path):
     assert sorted(tbl["id"].to_pylist()) == list(range(10))
     assert set(tbl["str"].to_pylist()) == set([f"str-{i}" for i in range(10)])
     assert len(ds.get_fragments()) == 2
+
+
+def test_ray_write_lance(tmp_path: Path):
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
+
+    (
+        ray.data.range(10)
+        .map(lambda x: {"id": x["id"], "str": f"str-{x['id']}"})
+        .write_lance(tmp_path, schema=schema)
+    )
+
+    ds = lance.dataset(tmp_path)
+    ds.count_rows() == 10
+    assert ds.schema == schema
+
+    tbl = ds.to_table()
+    assert sorted(tbl["id"].to_pylist()) == list(range(10))
+    assert set(tbl["str"].to_pylist()) == set([f"str-{i}" for i in range(10)])
