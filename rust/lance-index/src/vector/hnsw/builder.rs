@@ -320,18 +320,22 @@ impl HNSWBuilderInner {
     }
 
     fn prune(&self, id: u32, level: u16) {
+        let m_max = match level {
+            0 => self.params.m_max,
+            _ => self.params.m,
+        };
+
         let node = &self.nodes.read().unwrap()[id as usize];
 
         let mut level_neighbors = node.level_neighbors[level as usize].write().unwrap();
-        if level_neighbors.len() <= self.params.m_max {
+        if level_neighbors.len() <= m_max {
             return;
         }
 
         let neighbors = level_neighbors.iter().cloned().collect_vec();
 
         let level_view = HnswLevelView::new(level, self);
-        let new_neighbors =
-            select_neighbors_heuristic(&level_view, &neighbors, self.params.m_max).collect();
+        let new_neighbors = select_neighbors_heuristic(&level_view, &neighbors, m_max).collect();
 
         *level_neighbors = new_neighbors;
     }
