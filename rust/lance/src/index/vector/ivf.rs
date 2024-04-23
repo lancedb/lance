@@ -2233,10 +2233,15 @@ mod tests {
             IvfBuildParams::new(256),
             PQBuildParams::new(6, 8),
         );
-        assert!(dataset
+        let res = dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .is_err());
+            .await;
+        assert!(
+            matches!(res, Err(Error::InvalidInput { source, .. }  
+            if source.to_string().contains("num_sub_vectors must divide vector dimension"))),
+            "{:?}",
+            &res
+        );
     }
 
     fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
