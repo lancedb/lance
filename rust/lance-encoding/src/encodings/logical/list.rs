@@ -487,6 +487,7 @@ impl ListFieldEncoder {
     pub fn new(
         items_encoder: Box<dyn FieldEncoder>,
         cache_bytes_per_columns: u64,
+        keep_original_array: bool,
         column_index: u32,
     ) -> Self {
         let inner_encoder =
@@ -497,6 +498,7 @@ impl ListFieldEncoder {
         Self {
             offsets_encoder: PrimitiveFieldEncoder::new_with_encoder(
                 cache_bytes_per_columns,
+                keep_original_array,
                 column_index,
                 offsets_encoder,
             ),

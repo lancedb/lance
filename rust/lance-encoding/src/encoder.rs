@@ -165,6 +165,7 @@ impl BatchEncoder {
     pub(crate) fn get_encoder_for_field(
         field: &Field,
         cache_bytes_per_column: u64,
+        keep_original_array: bool,
         col_idx: &mut u32,
         field_col_mapping: &mut Vec<(i32, i32)>,
     ) -> Result<Box<dyn FieldEncoder>> {
@@ -198,6 +199,7 @@ impl BatchEncoder {
                 field_col_mapping.push((field.id, my_col_idx as i32));
                 Ok(Box::new(PrimitiveFieldEncoder::try_new(
                     cache_bytes_per_column,
+                    keep_original_array,
                     &field.data_type(),
                     my_col_idx,
                 )?))
@@ -209,12 +211,14 @@ impl BatchEncoder {
                 let inner_encoding = Self::get_encoder_for_field(
                     &field.children[0],
                     cache_bytes_per_column,
+                    keep_original_array,
                     col_idx,
                     field_col_mapping,
                 )?;
                 Ok(Box::new(ListFieldEncoder::new(
                     inner_encoding,
                     cache_bytes_per_column,
+                    keep_original_array,
                     my_col_idx,
                 )))
             }
@@ -229,6 +233,7 @@ impl BatchEncoder {
                         Self::get_encoder_for_field(
                             field,
                             cache_bytes_per_column,
+                            keep_original_array,
                             col_idx,
                             field_col_mapping,
                         )
@@ -245,6 +250,7 @@ impl BatchEncoder {
                 *col_idx += 2;
                 Ok(Box::new(BinaryFieldEncoder::new(
                     cache_bytes_per_column,
+                    keep_original_array,
                     my_col_idx,
                 )))
             }
@@ -252,7 +258,11 @@ impl BatchEncoder {
         }
     }
 
-    pub fn try_new(schema: &Schema, cache_bytes_per_column: u64) -> Result<Self> {
+    pub fn try_new(
+        schema: &Schema,
+        cache_bytes_per_column: u64,
+        keep_original_array: bool,
+    ) -> Result<Self> {
         let mut col_idx = 0;
         let mut field_col_mapping = Vec::new();
         let field_encoders = schema
@@ -262,6 +272,7 @@ impl BatchEncoder {
                 Self::get_encoder_for_field(
                     field,
                     cache_bytes_per_column,
+                    keep_original_array,
                     &mut col_idx,
                     &mut field_col_mapping,
                 )
@@ -301,7 +312,11 @@ pub async fn encode_batch(
 ) -> Result<EncodedBatch> {
     let mut data_buffer = BytesMut::new();
     let lance_schema = Schema::try_from(batch.schema().as_ref())?;
-    let batch_encoder = BatchEncoder::try_new(&lance_schema, cache_bytes_per_column)?;
+    // At this point, this is just a test utility, and there is no point in copying allocations
+    // This could become configurable in the future if needed.
+    let keep_original_array = true;
+    let batch_encoder =
+        BatchEncoder::try_new(&lance_schema, cache_bytes_per_column, keep_original_array)?;
     let mut page_table = Vec::new();
     for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
         let mut tasks = encoder.maybe_encode(arr.clone())?;

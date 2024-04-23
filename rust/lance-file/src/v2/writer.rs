@@ -41,6 +41,24 @@ pub struct FileWriterOptions {
     /// The default will use 8MiB per column which should be reasonable for most cases.
     // TODO: Do we need to be able to set this on a per-column basis?
     pub data_cache_bytes: Option<u64>,
+    /// The file writer buffers columns until enough data has arrived to flush a page
+    /// to disk.
+    ///
+    /// Some columns with small data types may not flush very often.  These arrays can
+    /// stick around for a long time.  These arrays might also be keeping larger data
+    /// structures alive.  By default, the writer will make a deep copy of this array
+    /// to avoid any potential memory leaks.  However, this can be disabled for a
+    /// (probably minor) performance boost if you are sure that arrays are not keeping
+    /// any sibling structures alive (this typically means the array was allocated in
+    /// the same language / runtime as the writer)
+    ///
+    /// Do not enable this if your data is arriving from the C data interface.
+    /// Data typically arrives one "batch" at a time (encoded in the C data interface
+    /// as a struct array).  Each array in that batch keeps the entire batch alive.
+    /// This means a small boolean array (which we will buffer in memory for quite a
+    /// while) might keep a much larger record batch around in memory (even though most
+    /// of that batch's data has been written to disk)
+    pub keep_original_array: Option<bool>,
 }
 
 pub struct FileWriter {
@@ -70,7 +88,9 @@ impl FileWriter {
 
         schema.validate()?;
 
-        let encoder = BatchEncoder::try_new(&schema, cache_bytes_per_column)?;
+        let keep_original_array = options.keep_original_array.unwrap_or(false);
+
+        let encoder = BatchEncoder::try_new(&schema, cache_bytes_per_column, keep_original_array)?;
         let num_columns = encoder.num_columns();
 
         let column_writers = encoder.field_encoders;

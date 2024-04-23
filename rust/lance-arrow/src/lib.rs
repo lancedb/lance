@@ -17,6 +17,7 @@ use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, 
 use arrow_select::take::take;
 use rand::prelude::*;
 
+pub mod deepcopy;
 pub mod schema;
 pub use schema::*;
 pub mod bfloat16;
