@@ -97,7 +97,7 @@ impl<T: ArrowFloatType> Transformer for ResidualTransform<T> {
             .chunks_exact(dim as usize)
             .zip(part_ids.as_primitive::<UInt32Type>().values().iter())
             .for_each(|(vector, &part_id)| {
-                let centroid = self.centroids.row(part_id as usize).unwrap();
+                let centroid = self.centroids.row_ref(part_id as usize).unwrap();
                 // TODO: SIMD
                 residual_arr.extend(
                     vector
