@@ -1006,8 +1006,9 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>) -> Result<RecordBatch> {
     let page_numbers = UInt32Array::from_iter_values(stats.iter().map(|stat| stat.page_number));
 
     let schema = Arc::new(Schema::new(vec![
-        Field::new("min", mins.data_type().clone(), false),
-        Field::new("max", maxs.data_type().clone(), false),
+        // min and max can be null if the entire batch is null values
+        Field::new("min", mins.data_type().clone(), true),
+        Field::new("max", maxs.data_type().clone(), true),
         Field::new("null_count", null_counts.data_type().clone(), false),
         Field::new("page_idx", page_numbers.data_type().clone(), false),
     ]));

@@ -160,7 +160,7 @@ mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
@@ -627,5 +627,47 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn btree_entire_null_page() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let batch = gen()
+            .col(
+                Some("values".to_string()),
+                array::rand_utf8(ByteCount::from(0)).with_nulls(&[true]),
+            )
+            .col(
+                Some("row_ids".to_string()),
+                array::cycle::<UInt64Type>(vec![0, 1]),
+            )
+            .into_batch_rows(RowCount::from(4096));
+        assert_eq!(batch.as_ref().unwrap()["values"].null_count(), 4096);
+        let batches = vec![batch];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Utf8, true),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+        let data = RecordBatchIterator::new(batches, schema);
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Utf8);
+
+        let data = Box::new(MockTrainingSource::new(data).await);
+        train_btree_index(data, &sub_index_trainer, index_store.as_ref())
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(index_store).await.unwrap();
+
+        let row_ids = index
+            .search(&ScalarQuery::Equals(ScalarValue::Utf8(Some(
+                "foo".to_string(),
+            ))))
+            .await
+            .unwrap();
+        assert!(row_ids.is_empty());
+
+        let row_ids = index.search(&ScalarQuery::IsNull()).await.unwrap();
+        assert_eq!(row_ids.len(), 4096);
     }
 }
