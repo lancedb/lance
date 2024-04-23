@@ -41,8 +41,8 @@ impl JavaException {
 pub enum Error {
     #[snafu(display("JNI error: {}", message))]
     Jni { message: String },
-    #[snafu(display("Invalid argument: {}", message))]
-    InvalidArgument { message: String },
+    #[snafu(display("Invalid argument: {}, location: {}", message, location))]
+    InvalidArgument { message: String, location: Location },
     #[snafu(display("IO error: {}, location: {}", message, location))]
     IO { message: String, location: Location },
     #[snafu(display("Arrow error: {}", message))]
@@ -55,7 +55,7 @@ pub enum Error {
     DatasetNotFound { path: String, location: Location },
     #[snafu(display("Dataset already exists error: {}, location {}", uri, location))]
     DatasetAlreadyExists { uri: String, location: Location },
-    #[snafu(display("Unknown error"))]
+    #[snafu(display("Unknown error: {}", message))]
     Other { message: String },
 }
 
@@ -97,6 +97,7 @@ impl From<Utf8Error> for Error {
     fn from(source: Utf8Error) -> Self {
         Self::InvalidArgument {
             message: source.to_string(),
+            location: location!(),
         }
     }
 }
@@ -133,6 +134,10 @@ impl From<lance::Error> for Error {
             lance::Error::IO { message, location } => Self::IO { message, location },
             lance::Error::Arrow { message, location } => Self::Arrow { message, location },
             lance::Error::Index { message, location } => Self::Index { message, location },
+            lance::Error::InvalidInput { source, location } => Self::InvalidArgument {
+                message: source.to_string(),
+                location,
+            },
             _ => Self::Other {
                 message: source.to_string(),
             },

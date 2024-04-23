@@ -112,9 +112,13 @@ public class Dataset implements Closeable {
   public static native Dataset openNative(String path);
 
   /**
-   * Opens a dataset from the specified path using the native library.
+   * Create a new version of dataset.
    *
+   * @param allocator the buffer allocator
    * @param path The file path of the dataset to open.
+   * @param operation The operation to apply to the dataset.
+   * @param readVersion The version of the dataset that was used as the base for the changes.
+   *     This is not needed for overwrite or restore operations.
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
   public static Dataset commit(BufferAllocator allocator, String path,
