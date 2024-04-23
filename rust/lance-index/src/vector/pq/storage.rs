@@ -421,6 +421,14 @@ impl VectorStorage for ProductQuantizationStorage {
             self.metric_type(),
         ))
     }
+
+    fn dist_calculator_from_id(&self, _: u32) -> Box<dyn DistCalculator> {
+        todo!("distance_between not implemented for PQ storage")
+    }
+
+    fn distance_between(&self, _: u32, _: u32) -> f32 {
+        todo!("distance_between not implemented for PQ storage")
+    }
 }
 
 /// Distance calculator backed by PQ code.

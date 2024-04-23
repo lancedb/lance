@@ -295,12 +295,17 @@ impl HNSW {
             levels.push((vector_id_builder, neighbours_builder));
         }
 
-        for node in builder.nodes() {
+        for node in builder.nodes().read().unwrap().iter() {
             for (level, neighbors) in node.level_neighbors.iter().enumerate() {
                 let (vector_id_builder, neighbours_builder) = &mut levels[level];
                 vector_id_builder.append_value(node.id);
-                neighbours_builder
-                    .append_value(neighbors.iter().map(|neighbors| Some(neighbors.id)));
+                neighbours_builder.append_value(
+                    neighbors
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .map(|neighbors| Some(neighbors.id)),
+                );
             }
         }
 
@@ -361,7 +366,7 @@ impl HNSW {
 
         let candidates = beam_search(
             &self.levels[0],
-            &[ep],
+            &ep,
             ef,
             dist_calc.as_ref(),
             bitset.as_ref(),
@@ -477,18 +482,17 @@ pub(crate) fn select_neighbors_heuristic(
     if candidates.len() <= k {
         return candidates.iter().cloned().collect_vec().into_iter();
     }
-    let mut w = candidates.to_vec();
-    w.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
+    let mut candidates = candidates.to_vec();
+    candidates.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
-    let mut discarded = Vec::with_capacity(k);
     let storage = graph.storage();
     let storage = storage
         .as_any()
         .downcast_ref::<InMemoryVectorStorage>()
         .unwrap();
-    while !w.is_empty() && results.len() < k {
-        let u = w.pop().unwrap();
+    while !candidates.is_empty() && results.len() < k {
+        let u = candidates.pop().unwrap();
 
         if results.is_empty()
             || results
@@ -496,13 +500,7 @@ pub(crate) fn select_neighbors_heuristic(
                 .all(|v| u.dist < OrderedFloat(storage.distance_between(u.id, v.id)))
         {
             results.push(u);
-        } else if discarded.len() < k - results.len() {
-            discarded.push(u);
         }
-    }
-
-    while results.len() < k && !discarded.is_empty() {
-        results.push(discarded.pop().unwrap());
     }
 
     results.into_iter()
@@ -557,8 +555,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_hnsw() {
+    #[tokio::test]
+    async fn test_build_hnsw() {
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
         const MAX_EDGES: usize = 32;
@@ -572,6 +570,7 @@ mod tests {
             store.clone(),
         )
         .build()
+        .await
         .unwrap();
         assert!(hnsw.levels.len() > 1);
         assert_eq!(hnsw.levels[0].len(), TOTAL);
@@ -603,8 +602,8 @@ mod tests {
         dists.into_iter().map(|(_, i)| i).collect()
     }
 
-    #[test]
-    fn test_search() {
+    #[tokio::test]
+    async fn test_search() {
         const DIM: usize = 32;
         const TOTAL: usize = 10_000;
         const MAX_EDGES: usize = 30;
@@ -623,6 +622,7 @@ mod tests {
             vectors.clone(),
         )
         .build()
+        .await
         .unwrap();
 
         let results: HashSet<u32> = hnsw

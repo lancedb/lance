@@ -46,28 +46,32 @@ def test_scan_integer(tmp_path: Path, benchmark, array_factory):
 @pytest.fixture(scope="module")
 def sample_dataset(tmpdir_factory):
     tmp_path = Path(tmpdir_factory.mktemp("data"))
-    table = pa.table({
-        "i": pa.array(range(NUM_ROWS), type=pa.int32()),
-        "f": pc.random(NUM_ROWS).cast(pa.float32()),
-        "s": pa.array(
-            [random.choice(["hello", "world", "today"]) for _ in range(NUM_ROWS)],
-            type=pa.string(),
-        ),
-        "fsl": pa.FixedSizeListArray.from_arrays(
-            pc.random(NUM_ROWS * 128).cast(pa.float32()), 128
-        ),
-        "blob": pa.array(
-            [
-                random.choice([
-                    random.randbytes(100 * 1024),
-                    random.randbytes(100 * 1024),
-                    random.randbytes(100 * 1024),
-                ])
-                for _ in range(NUM_ROWS)
-            ],
-            type=pa.binary(),
-        ),
-    })
+    table = pa.table(
+        {
+            "i": pa.array(range(NUM_ROWS), type=pa.int32()),
+            "f": pc.random(NUM_ROWS).cast(pa.float32()),
+            "s": pa.array(
+                [random.choice(["hello", "world", "today"]) for _ in range(NUM_ROWS)],
+                type=pa.string(),
+            ),
+            "fsl": pa.FixedSizeListArray.from_arrays(
+                pc.random(NUM_ROWS * 128).cast(pa.float32()), 128
+            ),
+            "blob": pa.array(
+                [
+                    random.choice(
+                        [
+                            random.randbytes(100 * 1024),
+                            random.randbytes(100 * 1024),
+                            random.randbytes(100 * 1024),
+                        ]
+                    )
+                    for _ in range(NUM_ROWS)
+                ],
+                type=pa.binary(),
+            ),
+        }
+    )
 
     return lance.write_dataset(table, tmp_path)
 

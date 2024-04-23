@@ -171,27 +171,20 @@ pub trait Graph {
 ///
 pub(super) fn beam_search(
     graph: &dyn Graph,
-    start: &[OrderedNode],
+    ep: &OrderedNode,
     k: usize,
     dist_calc: &dyn DistCalculator,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
 ) -> Result<Vec<OrderedNode>> {
-    let mut visited: HashSet<_> = start.iter().map(|node| node.id).collect();
-    let mut candidates = start
-        .iter()
-        .cloned()
-        .map(Reverse)
-        .collect::<BinaryHeap<_>>();
-    let mut results = candidates
-        .clone()
-        .into_iter()
-        .filter(|node| {
-            bitset
-                .map(|bitset| bitset.contains(node.0.id))
-                .unwrap_or(true)
-        })
-        .map(|v| v.0)
-        .collect::<BinaryHeap<_>>();
+    let mut visited: HashSet<_> = HashSet::with_capacity(k);
+    let mut candidates = BinaryHeap::with_capacity(k);
+    visited.insert(ep.id);
+    candidates.push(Reverse(ep.clone()));
+
+    let mut results = BinaryHeap::with_capacity(k);
+    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true) {
+        results.push(ep.clone());
+    }
 
     while !candidates.is_empty() {
         let current = candidates.pop().expect("candidates is empty").0;
@@ -199,7 +192,9 @@ pub(super) fn beam_search(
             .peek()
             .map(|node| node.dist)
             .unwrap_or(OrderedFloat(f32::INFINITY));
-        if current.dist > furthest {
+
+        // TODO: add an option to ignore the second condition for better performance.
+        if current.dist > furthest && results.len() == k {
             break;
         }
         let neighbors = graph.neighbors(current.id).ok_or_else(|| Error::Index {
@@ -222,9 +217,11 @@ pub(super) fn beam_search(
                     .map(|bitset| bitset.contains(neighbor))
                     .unwrap_or(true)
                 {
-                    results.push((dist, neighbor).into());
-                    if results.len() > k {
+                    if results.len() < k {
+                        results.push((dist, neighbor).into());
+                    } else if results.len() == k && dist < results.peek().unwrap().dist {
                         results.pop();
+                        results.push((dist, neighbor).into());
                     }
                 }
                 candidates.push(Reverse((dist, neighbor).into()));

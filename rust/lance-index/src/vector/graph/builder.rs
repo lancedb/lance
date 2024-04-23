@@ -2,30 +2,37 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::BinaryHeap;
+use std::sync::RwLock;
 
 use super::OrderedFloat;
 use super::OrderedNode;
 
 /// GraphNode during build.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GraphBuilderNode {
     /// Node ID
     pub(crate) id: u32,
 
     /// neighbors of each level of the node.
-    pub(crate) level_neighbors: Vec<BinaryHeap<OrderedNode>>,
+    pub(crate) level_neighbors: Vec<RwLock<BinaryHeap<OrderedNode>>>,
 }
 
 impl GraphBuilderNode {
     pub(crate) fn new(id: u32, max_level: usize) -> Self {
+        let level_neighbors = (0..max_level)
+            .map(|_| RwLock::new(BinaryHeap::new()))
+            .collect();
         Self {
             id,
-            level_neighbors: vec![BinaryHeap::new(); max_level],
+            level_neighbors,
         }
     }
 
-    pub(crate) fn add_neighbor(&mut self, v: u32, dist: OrderedFloat, level: u16) {
-        self.level_neighbors[level as usize].push(OrderedNode { dist, id: v });
+    pub(crate) fn add_neighbor(&self, v: u32, dist: OrderedFloat, level: u16) {
+        self.level_neighbors[level as usize]
+            .write()
+            .unwrap()
+            .push(OrderedNode { dist, id: v });
     }
 }
 

@@ -86,12 +86,14 @@ def test_temporal_index(tmp_path):
     # Timestamps
     now = datetime.now()
     today = date.today()
-    table = pa.Table.from_pydict({
-        "ts": [now - timedelta(days=i) for i in range(100)],
-        "date": [today - timedelta(days=i) for i in range(100)],
-        "time": pa.array([i for i in range(100)], type=pa.time32("s")),
-        "id": [i for i in range(100)],
-    })
+    table = pa.Table.from_pydict(
+        {
+            "ts": [now - timedelta(days=i) for i in range(100)],
+            "date": [today - timedelta(days=i) for i in range(100)],
+            "time": pa.array([i for i in range(100)], type=pa.time32("s")),
+            "id": [i for i in range(100)],
+        }
+    )
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("ts", index_type="BTREE")
     dataset.create_scalar_index("date", index_type="BTREE")

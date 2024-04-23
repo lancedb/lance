@@ -14,15 +14,51 @@
 
 package com.lancedb.lance;
 
-/** Metadata of a Fragment in the dataset. */
-public class FragmentMetadata {
-  private final int fragementId;
+import org.json.JSONObject;
 
-  public FragmentMetadata(int fragementId) {
-    this.fragementId = fragementId;
+/**
+ * Metadata of a Fragment in the dataset. 
+ * Matching to lance Fragment.
+ * */
+public class FragmentMetadata {
+  private static final String ID_KEY = "id";
+  private static final String PHYSICAL_ROWS_KEY = "physical_rows";
+  private final String jsonMetadata;
+  private final int id;
+  private final long physicalRows;
+
+  private FragmentMetadata(String jsonMetadata, int id, long physicalRows) {
+    this.jsonMetadata = jsonMetadata;
+    this.id = id;
+    this.physicalRows = physicalRows;
   }
 
-  public int getFragementId() {
-    return fragementId;
+  public int getId() {
+    return id;
+  }
+  
+  public long getPhysicalRows() {
+    return physicalRows;
+  }
+
+  public String getJsonMetadata() {
+    return jsonMetadata;
+  }
+
+  /**
+   * Creates the fragment metadata from json serialized string.
+   *
+   * @param jsonMetadata json metadata
+   * @return created fragment metadata
+   */
+  public static FragmentMetadata fromJson(String jsonMetadata) {
+    JSONObject metadata = new JSONObject(jsonMetadata);
+    if (!metadata.has(ID_KEY) || !metadata.has(PHYSICAL_ROWS_KEY)) {
+      throw new IllegalArgumentException(
+          String.format("Fragment metadata must have {} and {} but is {}",
+          ID_KEY, PHYSICAL_ROWS_KEY, jsonMetadata));
+    }
+    return new FragmentMetadata(jsonMetadata, metadata.getInt(ID_KEY),
+        metadata.getLong(PHYSICAL_ROWS_KEY));
   }
 }

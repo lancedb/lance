@@ -14,6 +14,7 @@ use futures::stream::Peekable;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::Error;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
@@ -41,8 +42,8 @@ use tokio::sync::Semaphore;
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
 use crate::index::vector::{hnsw::builder::build_hnsw_model, sq::build_sq_storage};
+use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
-use crate::{utils, Result};
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 lazy_static::lazy_static! {
@@ -479,7 +480,7 @@ async fn build_and_write_hnsw(
     vectors: Arc<dyn Array>,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
-    let hnsw = utils::tokio::spawn_cpu(move || build_hnsw_model(hnsw_params, vectors)).await?;
+    let hnsw = build_hnsw_model(hnsw_params, vectors).await?;
     let length = hnsw.write(&mut writer).await?;
     Result::Ok(length)
 }
@@ -491,7 +492,7 @@ async fn build_and_write_pq_storage(
     pq: Arc<dyn ProductQuantizer>,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<()> {
-    let storage = utils::tokio::spawn_cpu(move || {
+    let storage = spawn_cpu(move || {
         let storage = build_pq_storage(metric_type, row_ids, code_array, pq)?;
         Ok(storage)
     })
@@ -509,7 +510,7 @@ async fn build_and_write_sq_storage(
     sq: ScalarQuantizer,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<()> {
-    let storage = utils::tokio::spawn_cpu(move || {
+    let storage = spawn_cpu(move || {
         let storage = build_sq_storage(metric_type, row_ids, vectors, sq)?;
         Ok(storage)
     })

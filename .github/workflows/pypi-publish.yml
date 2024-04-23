@@ -10,7 +10,7 @@ jobs:
     name: Python Linux 3.${{ matrix.python-minor-version }} ${{ matrix.config.platform }} manylinux${{ matrix.config.manylinux }}
     strategy:
       matrix:
-        python-minor-version: [ "8" ]
+        python-minor-version: [ "9" ]
         config:
           - platform: x86_64
             manylinux: "2_17"
@@ -21,7 +21,7 @@ jobs:
           - platform: aarch64
             manylinux: "2_24"
             extra_args: ""
-          # We don't build fp16 kernels for aarch64, because it uses 
+          # We don't build fp16 kernels for aarch64, because it uses
           # cross compilation image, which doesn't have a new enough compiler.
     runs-on: "ubuntu-22.04"
     steps:
@@ -48,7 +48,7 @@ jobs:
     runs-on: ${{ matrix.config.runner }}
     strategy:
       matrix:
-        python-minor-version: ["8"]
+        python-minor-version: ["9"]
         config:
           - target: x86_64-apple-darwin
             runner: macos-13
@@ -80,7 +80,7 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        python-minor-version: ["8"]
+        python-minor-version: ["9"]
     steps:
       - uses: actions/checkout@v4
         with:

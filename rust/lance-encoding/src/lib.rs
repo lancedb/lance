@@ -4,7 +4,7 @@
 use std::ops::Range;
 
 use bytes::Bytes;
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, FutureExt};
 
 use lance_core::Result;
 
@@ -32,4 +32,29 @@ pub trait EncodingsIo: Send + Sync {
     ///
     /// * `ranges` - the byte ranges to request
     fn submit_request(&self, range: Vec<Range<u64>>) -> BoxFuture<'static, Result<Vec<Bytes>>>;
+}
+
+/// An implementation of EncodingsIo that serves data from an in-memory buffer
+pub struct BufferScheduler {
+    data: Bytes,
+}
+
+impl BufferScheduler {
+    pub fn new(data: Bytes) -> Self {
+        Self { data }
+    }
+
+    fn satisfy_request(&self, req: Range<u64>) -> Bytes {
+        self.data.slice(req.start as usize..req.end as usize)
+    }
+}
+
+impl EncodingsIo for BufferScheduler {
+    fn submit_request(&self, ranges: Vec<Range<u64>>) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+        std::future::ready(Ok(ranges
+            .into_iter()
+            .map(|range| self.satisfy_request(range))
+            .collect::<Vec<_>>()))
+        .boxed()
+    }
 }

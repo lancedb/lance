@@ -219,6 +219,20 @@ impl VectorStorage for ScalarQuantizationStorage {
             self.bounds.clone(),
         ))
     }
+
+    fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator> {
+        Box::new(SQDistCalculator {
+            query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
+            sq_codes: self.sq_codes.clone(),
+        })
+    }
+
+    fn distance_between(&self, a: u32, b: u32) -> f32 {
+        l2_distance_uint_scalar(
+            get_sq_code(&self.sq_codes, a),
+            get_sq_code(&self.sq_codes, b),
+        )
+    }
 }
 
 struct SQDistCalculator {

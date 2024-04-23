@@ -11,9 +11,10 @@ use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream;
 use futures::stream::Stream;
 use futures::{StreamExt, TryStreamExt};
@@ -83,7 +84,7 @@ impl LanceStream {
             .collect::<Vec<_>>();
 
         let inner_stream = if scan_in_order {
-            stream::iter(file_fragments)
+            let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
                         file_fragment,
@@ -92,8 +93,16 @@ impl LanceStream {
                         with_make_deletions_null,
                     ))
                 })
-                .try_buffered(fragment_readahead)
-                .map_ok(move |reader| reader.read_all(read_size as u32).map(Ok))
+                .try_buffered(fragment_readahead);
+            let tasks = readers.and_then(move |reader| {
+                std::future::ready(
+                    reader
+                        .read_all(read_size as u32)
+                        .map(|task_stream| task_stream.map(Ok))
+                        .map_err(DataFusionError::from),
+                )
+            });
+            tasks
                 // We must be waiting to finish a file before moving onto thenext. That's an issue.
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
@@ -101,7 +110,7 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            stream::iter(file_fragments)
+            let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
                         file_fragment,
@@ -110,10 +119,18 @@ impl LanceStream {
                         with_make_deletions_null,
                     ))
                 })
-                .try_buffered(fragment_readahead)
-                .map_ok(move |reader| reader.read_all(read_size as u32).map(Ok))
-                // When we flatten the streams (one stream per fragment), we allow
-                // `fragment_readahead` stream to be read concurrently.
+                .try_buffered(fragment_readahead);
+            let tasks = readers.and_then(move |reader| {
+                std::future::ready(
+                    reader
+                        .read_all(read_size as u32)
+                        .map(|task_stream| task_stream.map(Ok))
+                        .map_err(DataFusionError::from),
+                )
+            });
+            // When we flatten the streams (one stream per fragment), we allow
+            // `fragment_readahead` stream to be read concurrently.
+            tasks
                 .try_flatten_unordered(fragment_readahead)
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffer_unordered(batch_readahead)
@@ -175,6 +192,8 @@ pub struct LanceScanExec {
     with_row_id: bool,
     with_make_deletions_null: bool,
     ordered_output: bool,
+    output_schema: Arc<ArrowSchema>,
+    properties: PlanProperties,
 }
 
 impl DisplayAs for LanceScanExec {
@@ -214,6 +233,19 @@ impl LanceScanExec {
         with_make_deletions_null: bool,
         ordered_ouput: bool,
     ) -> Self {
+        let output_schema: ArrowSchema = projection.as_ref().into();
+        let output_schema = if with_row_id {
+            let mut fields: Vec<Arc<Field>> = output_schema.fields.to_vec();
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
+            Arc::new(ArrowSchema::new(fields))
+        } else {
+            Arc::new(output_schema)
+        };
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(output_schema.clone()),
+            Partitioning::RoundRobinBatch(1),
+            datafusion::physical_plan::ExecutionMode::Bounded,
+        );
         Self {
             dataset,
             fragments,
@@ -224,6 +256,8 @@ impl LanceScanExec {
             with_row_id,
             with_make_deletions_null,
             ordered_output: ordered_ouput,
+            output_schema,
+            properties,
         }
     }
 }
@@ -234,22 +268,7 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        let schema: ArrowSchema = self.projection.as_ref().into();
-        if self.with_row_id {
-            let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
-            fields.push(Arc::new(ROW_ID_FIELD.clone()));
-            Arc::new(ArrowSchema::new(fields))
-        } else {
-            Arc::new(schema)
-        }
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+        self.output_schema.clone()
     }
 
     /// Scan is the leaf node, so returns an empty vector.
@@ -309,5 +328,9 @@ impl ExecutionPlan for LanceScanExec {
             num_rows,
             ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
         })
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 }

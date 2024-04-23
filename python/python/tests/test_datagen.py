@@ -20,10 +20,12 @@ def test_import_error():
 def test_rand_batches():
     import lance._datagen as datagen
 
-    schema = pa.schema([
-        pa.field("int", pa.int64()),
-        pa.field("vector", pa.list_(pa.float32(), 128)),
-    ])
+    schema = pa.schema(
+        [
+            pa.field("int", pa.int64()),
+            pa.field("vector", pa.list_(pa.float32(), 128)),
+        ]
+    )
 
     batches = datagen.rand_batches(schema, batch_size_bytes=16 * 1024, num_batches=10)
 

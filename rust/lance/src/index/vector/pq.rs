@@ -14,6 +14,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
 use lance_index::vector::pq::storage::ProductQuantizationStorage;
@@ -38,7 +39,7 @@ use super::ivf::Ivf;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
-use crate::{arrow::*, utils::tokio::spawn_cpu, Dataset};
+use crate::{arrow::*, Dataset};
 use crate::{Error, Result};
 
 /// Product Quantization Index.

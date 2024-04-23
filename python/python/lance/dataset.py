@@ -1203,10 +1203,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         index_type = index_type.upper()
         if index_type != "BTREE":
-            raise NotImplementedError((
-                'Only "BTREE" is supported for ',
-                f"index_type.  Received {index_type}",
-            ))
+            raise NotImplementedError(
+                (
+                    'Only "BTREE" is supported for ',
+                    f"index_type.  Received {index_type}",
+                )
+            )
 
         self._ds.create_index([column], index_type, name, replace)
 
@@ -2349,6 +2351,7 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
+    use_experimental_writer: bool = False,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2388,6 +2391,9 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
+    use_experimental_writer : optional, bool
+        Use the Lance v2 writer to write Lance v2 files.  This is not recommended
+        at this time as there are several known limitations in the v2 writer.
     """
     if _check_for_hugging_face(data_obj):
         # Huggingface datasets
@@ -2409,6 +2415,7 @@ def write_dataset(
         "max_bytes_per_file": max_bytes_per_file,
         "progress": progress,
         "storage_options": storage_options,
+        "use_experimental_writer": use_experimental_writer,
     }
 
     if commit_lock:

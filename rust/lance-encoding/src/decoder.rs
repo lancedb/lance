@@ -196,6 +196,7 @@
 //!  * The "batch overhead" is very small in Lance compared to other formats because it has no
 //!    relation to the way the data is stored.
 
+use std::future::Future;
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -204,14 +205,15 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::BytesMut;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use log::trace;
 use snafu::{location, Location};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::{Error, Result};
+use tracing::instrument;
 
+use crate::encoder::EncodedBatch;
 use crate::encodings::logical::binary::BinaryPageScheduler;
 use crate::encodings::logical::fixed_size_list::FslPageScheduler;
 use crate::encodings::logical::list::ListPageScheduler;
@@ -219,7 +221,7 @@ use crate::encodings::logical::primitive::PrimitivePageScheduler;
 use crate::encodings::logical::r#struct::SimpleStructScheduler;
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
-use crate::EncodingsIo;
+use crate::{BufferScheduler, EncodingsIo};
 
 /// Metadata describing a page in a file
 ///
@@ -237,6 +239,7 @@ pub struct PageInfo {
 /// Metadata describing a column in a file
 ///
 /// This is typically created by reading the metadata section of a Lance file
+#[derive(Debug)]
 pub struct ColumnInfo {
     /// The metadata for each page in the column
     pub page_infos: Vec<Arc<PageInfo>>,
@@ -490,6 +493,7 @@ impl DecodeBatchScheduler {
     /// * `range` - The range of rows to load
     /// * `sink` - A channel to send the decode tasks
     /// * `scheduler` An I/O scheduler to issue I/O requests
+    #[instrument(skip_all)]
     pub async fn schedule_range(
         &mut self,
         range: Range<u64>,
@@ -538,6 +542,11 @@ impl DecodeBatchScheduler {
     }
 }
 
+pub struct ReadBatchTask<Fut: Future<Output = Result<RecordBatch>>> {
+    pub task: Fut,
+    pub num_rows: u32,
+}
+
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct BatchDecodeStream {
     scheduled: mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
@@ -570,6 +579,7 @@ impl BatchDecodeStream {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
         trace!("Draining batch task");
         if self.rows_remaining == 0 {
@@ -596,21 +606,32 @@ impl BatchDecodeStream {
         Ok(Some(next_task))
     }
 
+    #[instrument(level = "debug", skip_all)]
     fn task_to_batch(task: NextDecodeTask) -> Result<RecordBatch> {
         let struct_arr = task.task.decode()?;
         Ok(RecordBatch::from(struct_arr.as_struct()))
     }
 
-    pub fn into_stream(self) -> BoxStream<'static, JoinHandle<Result<RecordBatch>>> {
+    pub fn into_stream(
+        self,
+    ) -> BoxStream<'static, ReadBatchTask<impl Future<Output = Result<RecordBatch>>>> {
         let stream = futures::stream::unfold(self, |mut slf| async move {
             let next_task = slf.next_batch_task().await;
             let next_task = next_task.transpose().map(|next_task| {
-                tokio::spawn(async move {
+                let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
+                let task = tokio::spawn(async move {
                     let next_task = next_task?;
                     Self::task_to_batch(next_task)
-                })
+                });
+                (task, num_rows)
             });
-            next_task.map(|next_task| (next_task, slf))
+            next_task.map(|(task, num_rows)| {
+                let next_task = ReadBatchTask {
+                    task: task.map(|join_wrapper| join_wrapper.unwrap()),
+                    num_rows,
+                };
+                (next_task, slf)
+            })
         });
         stream.boxed()
     }
@@ -658,7 +679,7 @@ pub trait PhysicalPageDecoder: Send + Sync {
     /// Decodes the data into the requested buffers.
     ///
     /// You can assume that the capacity will have already been configured on the `BytesMut`
-    /// according to the capacity calculated in [`Self::update_capacity`]
+    /// according to the capacity calculated in [`PhysicalPageDecoder::update_capacity`]
     ///
     /// # Arguments
     ///
@@ -777,4 +798,17 @@ pub trait LogicalPageDecoder: Send {
     fn unawaited(&self) -> u32;
     /// The number of rows that have been "waited" but not yet decoded
     fn avail(&self) -> u32;
+}
+
+/// Decodes a batch of data from an in-memory structure created by [`crate::encoder::encode_batch`]
+pub async fn decode_batch(batch: &EncodedBatch) -> Result<RecordBatch> {
+    let mut decode_scheduler =
+        DecodeBatchScheduler::new(batch.schema.as_ref(), &batch.page_table, &vec![]);
+    let (tx, rx) = unbounded_channel();
+    let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
+    decode_scheduler
+        .schedule_range(0..batch.num_rows, tx, &io_scheduler)
+        .await?;
+    let stream = BatchDecodeStream::new(rx, batch.num_rows as u32, batch.num_rows);
+    stream.into_stream().next().await.unwrap().task.await
 }

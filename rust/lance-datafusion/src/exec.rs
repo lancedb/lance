@@ -17,12 +17,12 @@ use datafusion::{
         TaskContext,
     },
     physical_plan::{
-        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan,
+        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
         SendableRecordBatchStream,
     },
 };
-use datafusion_common::DataFusionError;
-use datafusion_physical_expr::Partitioning;
+use datafusion_common::{DataFusionError, Statistics};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
 use lance_arrow::SchemaExt;
 use lance_core::Result;
@@ -32,11 +32,15 @@ use log::{info, warn};
 ///
 /// It can only be used once, and will return the stream.  After that the node
 /// is exhuasted.
+///
+/// Note: the stream should be finite, otherwise we will report datafusion properties
+/// incorrectly.
 pub struct OneShotExec {
     stream: Mutex<Option<SendableRecordBatchStream>>,
     // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
     // can still function after exhuasted
     schema: Arc<ArrowSchema>,
+    properties: PlanProperties,
 }
 
 impl OneShotExec {
@@ -45,7 +49,12 @@ impl OneShotExec {
         let schema = stream.schema().clone();
         Self {
             stream: Mutex::new(Some(stream)),
-            schema,
+            schema: schema.clone(),
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::RoundRobinBatch(1),
+                datafusion::physical_plan::ExecutionMode::Bounded,
+            ),
         }
     }
 }
@@ -96,14 +105,6 @@ impl ExecutionPlan for OneShotExec {
         self.schema.clone()
     }
 
-    fn output_partitioning(&self) -> datafusion_physical_expr::Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion_physical_expr::PhysicalSortExpr]> {
-        None
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -135,7 +136,11 @@ impl ExecutionPlan for OneShotExec {
     }
 
     fn statistics(&self) -> datafusion_common::Result<datafusion_common::Statistics> {
-        todo!()
+        Ok(Statistics::new_unknown(&self.schema))
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.properties
     }
 }
 
@@ -194,7 +199,7 @@ pub fn execute_plan(
     let session_state = SessionState::new_with_config_rt(session_config, runtime_env);
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
-    assert_eq!(plan.output_partitioning().partition_count(), 1);
+    assert_eq!(plan.properties().partitioning.partition_count(), 1);
     Ok(plan.execute(0, session_state.task_ctx())?)
 }
 
