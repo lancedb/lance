@@ -5,7 +5,6 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, TimeUnit};
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance_encoding::encoder::encode_batch;
-use pprof::criterion::{Output, PProfProfiler};
 
 const PRIMITIVE_TYPES: &[DataType] = &[
     DataType::Date32,
@@ -103,7 +102,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+        .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
     targets = bench_decode, bench_decode_fsl);
 
 // Non-linux version does not support pprof.
