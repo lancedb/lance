@@ -88,11 +88,15 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_index::optimize::{
+    IndexHandling, NewDataHandling, OptimizeOptions as OptimizeIndexOptions,
+};
 use lance_index::DatasetIndexExt;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::index::optimize_indices;
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Dataset;
 use crate::Result;
@@ -243,6 +247,7 @@ pub async fn compact_files(
     dataset: &mut Dataset,
     mut options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>,
+    optimize_index_opts: Option<OptimizeIndexOptions>,
 ) -> Result<CompactionMetrics> {
     options.validate();
 
@@ -261,7 +266,8 @@ pub async fn compact_files(
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
-    let metrics = commit_compaction(dataset, completed_tasks, remap_options).await?;
+    let metrics =
+        commit_compaction(dataset, completed_tasks, remap_options, optimize_index_opts).await?;
 
     Ok(metrics)
 }
@@ -849,6 +855,7 @@ pub async fn commit_compaction(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,
     options: Arc<dyn IndexRemapperOptions>,
+    mut optimize_index_opts: Option<OptimizeIndexOptions>,
 ) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
@@ -878,22 +885,70 @@ pub async fn commit_compaction(
     let remapped_indices = index_remapper
         .remap_indices(row_id_map, &affected_ids)
         .await?;
-    let rewritten_indices = remapped_indices
+    let mut rewritten_indices = remapped_indices
         .iter()
         .map(|rewritten| RewrittenIndex {
             old_id: rewritten.original,
             new_id: rewritten.new,
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    // Optimize indices here
+    let (removed_indices, new_indices) = if let Some(optimize_index_opts) = &mut optimize_index_opts
+    {
+        // If specific fragments are requested, we need to map them to the
+        // new fragment ids
+        if let NewDataHandling::Fragments(frag_ids) = &mut optimize_index_opts.new_data_handling {
+            for group in &rewrite_groups {
+                frag_ids.retain(|id| !group.old_fragments.iter().any(|frag| frag.id as u32 == *id));
+                for frag in &group.new_fragments {
+                    frag_ids.push(frag.id as u32);
+                }
+            }
+        }
+
+        // If specific indexes were requested, we need to map them to the
+        // remapped ones.
+        if let IndexHandling::MergeIndices(index_ids) = &mut optimize_index_opts.index_handling {
+            for index_id in index_ids {
+                if let Some(rewritten) = remapped_indices.iter().find(|r| &r.original == index_id) {
+                    *index_id = rewritten.new;
+                }
+            }
+        }
+
+        let mut existing_indices = dataset.load_indices().await?.as_ref().clone();
+        for &RewrittenIndex { old_id, new_id } in &rewritten_indices {
+            let old_index = existing_indices
+                .iter()
+                .position(|index| index.uuid == old_id)
+                .expect("Index not found");
+            existing_indices[old_index].uuid = new_id;
+        }
+
+        let (removed_indices, new_indices) =
+            optimize_indices(dataset, &existing_indices, &optimize_index_opts).await?;
+
+        // TODO: Clean up any tmp indices created by re-mapping.
+        rewritten_indices.retain(|r| !removed_indices.iter().any(|i| i.uuid == r.new_id));
+
+        (removed_indices, new_indices)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::Rewrite {
             groups: rewrite_groups,
             rewritten_indices,
+            removed_indices,
+            new_indices,
         },
         None,
     );
+
+    dbg!(&transaction);
 
     let manifest = commit_transaction(
         dataset,
@@ -1126,7 +1181,7 @@ mod tests {
             .unwrap();
         assert_eq!(plan.tasks().len(), 0);
 
-        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None, None)
             .await
             .unwrap();
 
@@ -1337,7 +1392,7 @@ mod tests {
         let mock_remapper = MockIndexRemapper::in_any_order(&[remap_a, remap_b]);
 
         // Run compaction
-        let metrics = compact_files(&mut dataset, options, Some(Arc::new(mock_remapper)))
+        let metrics = compact_files(&mut dataset, options, Some(Arc::new(mock_remapper)), None)
             .await
             .unwrap();
 
@@ -1413,9 +1468,14 @@ mod tests {
         assert_eq!(plan.tasks().len(), 1);
         assert_eq!(plan.tasks()[0].fragments.len(), 2);
 
-        let metrics = compact_files(&mut dataset, plan.options, Some(Arc::new(expected_remap)))
-            .await
-            .unwrap();
+        let metrics = compact_files(
+            &mut dataset,
+            plan.options,
+            Some(Arc::new(expected_remap)),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(metrics.files_removed, 4); // 2 fragments with 2 data files
         assert_eq!(metrics.files_added, 1); // 1 fragment with 1 data file
@@ -1477,7 +1537,9 @@ mod tests {
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 1);
 
-        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        let metrics = compact_files(&mut dataset, options, None, None)
+            .await
+            .unwrap();
         assert_eq!(metrics.fragments_removed, 1);
         assert_eq!(metrics.files_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
@@ -1539,6 +1601,7 @@ mod tests {
             &mut dataset,
             vec![results.pop().unwrap()],
             Arc::new(IgnoreRemap::default()),
+            None,
         )
         .await
         .unwrap();
@@ -1547,9 +1610,14 @@ mod tests {
         assert_eq!(dataset.manifest.version, 5);
 
         // Can commit the remaining tasks
-        commit_compaction(&mut dataset, results, Arc::new(IgnoreRemap::default()))
-            .await
-            .unwrap();
+        commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(IgnoreRemap::default()),
+            None,
+        )
+        .await
+        .unwrap();
         // The reserve fragments call already happened for this task
         // and so we just see the bump from the commit_compaction
         assert_eq!(dataset.manifest.version, 6);
@@ -1604,5 +1672,16 @@ mod tests {
             .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into())
             .collect::<Vec<u64>>();
         assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn test_validate_optimize_options() {
+        todo!()
+    }
+
+    #[tokio::test]
+    async fn test_compact_and_optimize() {
+        // Compact and optimize indices
+        todo!()
     }
 }

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// How to handle new unindexed data
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NewDataHandling {
     /// Do not index new data
     Ignore,
@@ -16,7 +17,7 @@ pub enum NewDataHandling {
 }
 
 /// How to merge indices.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IndexHandling {
     /// Put all new data into it's own delta index.
     ///
@@ -57,8 +58,8 @@ pub enum IndexHandling {
 /// OptimizeOptions {
 ///    new_data_handling: NewDataHandling::Ignore,
 ///    index_handling: IndexHandling::MergeAll,
-/// };
-#[derive(Debug, Clone, PartialEq)]
+/// }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimizeOptions {
     /// How to handle new unindexed data.
     pub new_data_handling: NewDataHandling,

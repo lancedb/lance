@@ -462,9 +462,54 @@ impl PyCompaction {
     /// CompactionMetrics
     ///     The metrics from the compaction operation.
     #[staticmethod]
-    pub fn execute(dataset: PyObject, options: PyObject) -> PyResult<PyCompactionMetrics> {
+    pub fn execute(dataset: PyObject, options: PyObject, merge_indices: Option<&PyAny>,
+        index_new_data: Option<&PyAny>,) -> PyResult<PyCompactionMetrics> {
         let dataset_ref = unwrap_dataset(dataset)?;
         let dataset = Python::with_gil(|py| dataset_ref.borrow(py).clone());
+
+        let index_opts = if let Some((merge_indices, index_new_data)) = merge_indices.zip(index_new_data) {
+            let mut index_opts: OptimizeOptions = Default::default();
+        if let Ok(merge_indices_bool) = merge_indices.extract::<bool>() {
+            if merge_indices_bool {
+                index_opts.index_handling = IndexHandling::MergeAll;
+            } else {
+                index_opts.index_handling = IndexHandling::NewDelta;
+            }
+        } else if let Ok(merge_indices_int) = merge_indices.extract::<usize>() {
+            index_opts.index_handling = IndexHandling::MergeLatestN(merge_indices_int as usize);
+        } else if let Ok(merge_indices_ids) = merge_indices.extract::<Vec<String>>() {
+            let index_ids = merge_indices_ids
+                .iter()
+                .map(|id_str| {
+                    Uuid::parse_str(id_str).map_err(|err| PyValueError::new_err(err.to_string()))
+                })
+                .collect::<PyResult<Vec<Uuid>>>()?;
+            index_opts.index_handling = IndexHandling::MergeIndices(index_ids);
+        } else {
+            return Err(PyValueError::new_err(
+                "merge_indices must be a boolean value, integer, or list of str.",
+            ));
+        }
+
+        if let Ok(index_new_data_bool) = index_new_data.extract::<bool>() {
+            if index_new_data_bool {
+                index_opts.new_data_handling = NewDataHandling::IndexAll;
+            } else {
+                index_opts.new_data_handling = NewDataHandling::Ignore;
+            }
+        } else if let Ok(index_new_data_ids) = index_new_data.extract::<Vec<u32>>() {
+            index_opts.new_data_handling = NewDataHandling::Fragments(index_new_data_ids);
+        } else {
+            return Err(PyValueError::new_err(
+                "index_new_data must be a boolean value.",
+            ));
+        }
+        Some(index_opts)
+        } else {
+            None
+        };
+        
+
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
         let opts = Python::with_gil(|py| {
@@ -472,7 +517,7 @@ impl PyCompaction {
             parse_compaction_options(options)
         })?;
         let mut new_ds = dataset.ds.as_ref().clone();
-        let fut = compact_files(&mut new_ds, opts, None);
+        let fut = compact_files(&mut new_ds, opts, None, index_opts);
         let metrics = RT.block_on(None, async move {
             fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
         })??;
@@ -530,6 +575,14 @@ impl PyCompaction {
     ///     new version once committed.
     /// rewrites : List[RewriteResult]
     ///     The results of the compaction tasks to include in the commit.
+    /// merge_indices : Union[bool, int, List[str]]
+    ///    How to handle merging indices. If a boolean, it will merge all
+    ///    indices. If an integer, it will merge the latest N indices. If a
+    ///    list of strings, it will merge the indices with those IDs.
+    /// index_new_data : Union[bool, List[int]]
+    ///    How to handle indexing new data. If a True, it will index all new
+    ///    data. If a list of integers, it will index the new data with those
+    ///    fragment IDs. If False, it will not index any new data.
     ///
     /// Returns
     /// -------
@@ -538,15 +591,56 @@ impl PyCompaction {
     pub fn commit(
         dataset: PyObject,
         rewrites: Vec<PyRewriteResult>,
+        merge_indices: &PyAny,
+        index_new_data: &PyAny,
     ) -> PyResult<PyCompactionMetrics> {
         let dataset_ref = unwrap_dataset(dataset)?;
         let dataset = Python::with_gil(|py| dataset_ref.borrow(py).clone());
         let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
+
+        let mut index_opts: OptimizeOptions = Default::default();
+        if let Ok(merge_indices_bool) = merge_indices.extract::<bool>() {
+            if merge_indices_bool {
+                index_opts.index_handling = IndexHandling::MergeAll;
+            } else {
+                index_opts.index_handling = IndexHandling::NewDelta;
+            }
+        } else if let Ok(merge_indices_int) = merge_indices.extract::<usize>() {
+            index_opts.index_handling = IndexHandling::MergeLatestN(merge_indices_int as usize);
+        } else if let Ok(merge_indices_ids) = merge_indices.extract::<Vec<String>>() {
+            let index_ids = merge_indices_ids
+                .iter()
+                .map(|id_str| {
+                    Uuid::parse_str(id_str).map_err(|err| PyValueError::new_err(err.to_string()))
+                })
+                .collect::<PyResult<Vec<Uuid>>>()?;
+            index_opts.index_handling = IndexHandling::MergeIndices(index_ids);
+        } else {
+            return Err(PyValueError::new_err(
+                "merge_indices must be a boolean value, integer, or list of str.",
+            ));
+        }
+
+        if let Ok(index_new_data_bool) = index_new_data.extract::<bool>() {
+            if index_new_data_bool {
+                index_opts.new_data_handling = NewDataHandling::IndexAll;
+            } else {
+                index_opts.new_data_handling = NewDataHandling::Ignore;
+            }
+        } else if let Ok(index_new_data_ids) = index_new_data.extract::<Vec<u32>>() {
+            index_opts.new_data_handling = NewDataHandling::Fragments(index_new_data_ids);
+        } else {
+            return Err(PyValueError::new_err(
+                "index_new_data must be a boolean value.",
+            ));
+        }
+
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = commit_compaction(
             &mut new_ds,
             rewrites,
             Arc::new(DatasetIndexRemapperOptions::default()),
+            Some(index_opts),
         );
         let metrics = RT
             .block_on(None, fut)?

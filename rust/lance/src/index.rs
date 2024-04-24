@@ -318,46 +318,10 @@ impl DatasetIndexExt for Dataset {
 
     #[instrument(skip_all)]
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
-        let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
 
-        let name_to_indices = indices
-            .iter()
-            .map(|idx| (idx.name.clone(), idx))
-            .into_group_map();
-
-        let mut new_indices = vec![];
-        let mut removed_indices = vec![];
-        for deltas in name_to_indices.values() {
-            let Some((new_id, removed, mut new_frag_ids)) =
-                merge_indices(dataset.as_ref(), deltas.as_slice(), options).await?
-            else {
-                continue;
-            };
-            for removed_idx in removed.iter() {
-                new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
-            }
-
-            let last_idx = deltas.last().expect("Delta indices should not be empty");
-            let new_idx = IndexMetadata {
-                uuid: new_id,
-                name: last_idx.name.clone(), // Keep the same name
-                fields: last_idx.fields.clone(),
-                dataset_version: self.manifest.version,
-                fragment_bitmap: Some(new_frag_ids),
-            };
-            removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
-            // To keep the existing deltas, we need to add them to the new list.
-            if deltas.len() > removed.len() {
-                new_indices.extend(
-                    deltas
-                        .iter()
-                        .filter(|idx| !removed.iter().any(|&r| r.uuid == idx.uuid))
-                        .map(|&idx| idx.clone()),
-                );
-            }
-            new_indices.push(new_idx);
-        }
+        let (removed_indices, new_indices) =
+            optimize_indices(self, indices.as_slice(), options).await?;
 
         if new_indices.is_empty() {
             return Ok(());
@@ -444,6 +408,52 @@ impl DatasetIndexExt for Dataset {
             location: location!(),
         })
     }
+}
+
+pub(crate) async fn optimize_indices(
+    dataset: &Dataset,
+    indices: &[IndexMetadata],
+    options: &OptimizeOptions,
+) -> Result<(Vec<IndexMetadata>, Vec<IndexMetadata>)> {
+    let name_to_indices = indices
+        .iter()
+        .map(|idx| (idx.name.clone(), idx))
+        .into_group_map();
+
+    let mut new_indices = vec![];
+    let mut removed_indices = vec![];
+    for deltas in name_to_indices.values() {
+        let Some((new_id, removed, mut new_frag_ids)) =
+            merge_indices(dataset, deltas.as_slice(), options).await?
+        else {
+            continue;
+        };
+        for removed_idx in removed.iter() {
+            new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
+        }
+
+        let last_idx = deltas.last().expect("Delta indices should not be empty");
+        let new_idx = IndexMetadata {
+            uuid: new_id,
+            name: last_idx.name.clone(), // Keep the same name
+            fields: last_idx.fields.clone(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(new_frag_ids),
+        };
+        removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
+        // To keep the existing deltas, we need to add them to the new list.
+        if deltas.len() > removed.len() {
+            new_indices.extend(
+                deltas
+                    .iter()
+                    .filter(|idx| !removed.iter().any(|&r| r.uuid == idx.uuid))
+                    .map(|&idx| idx.clone()),
+            );
+        }
+        new_indices.push(new_idx);
+    }
+
+    Ok((removed_indices, new_indices))
 }
 
 /// A trait for internal dataset utilities

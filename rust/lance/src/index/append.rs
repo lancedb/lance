@@ -32,7 +32,7 @@ pub async fn merge_indices<'a>(
 ) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, RoaringBitmap)>> {
     if old_indices.is_empty() {
         return Err(Error::Index {
-            message: "Append index: no prevoius index found".to_string(),
+            message: "Append index: no previous index found".to_string(),
             location: location!(),
         });
     };

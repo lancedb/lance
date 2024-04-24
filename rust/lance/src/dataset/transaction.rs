@@ -111,6 +111,10 @@ pub enum Operation {
         groups: Vec<RewriteGroup>,
         /// Indices that have been updated with the new row addresses
         rewritten_indices: Vec<RewrittenIndex>,
+        /// Indices that have been removed
+        removed_indices: Vec<Index>,
+        /// Indices that have been added
+        new_indices: Vec<Index>,
     },
     /// Merge a new column in
     Merge {
@@ -447,6 +451,8 @@ impl Transaction {
             Operation::Rewrite {
                 ref groups,
                 ref rewritten_indices,
+                ref removed_indices,
+                ref new_indices,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -457,6 +463,15 @@ impl Transaction {
                     current_version,
                 )?;
                 Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                final_indices.retain(|existing_index| {
+                    !new_indices
+                        .iter()
+                        .any(|new_index| new_index.name == existing_index.name)
+                        && !removed_indices
+                            .iter()
+                            .any(|old_index| old_index.uuid == existing_index.uuid)
+                });
+                final_indices.extend(new_indices.clone());
             }
             Operation::CreateIndex {
                 new_indices,
@@ -702,6 +717,8 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 new_fragments,
                 groups,
                 rewritten_indices,
+                removed_indices,
+                new_indices,
             })) => {
                 let groups = if !groups.is_empty() {
                     groups
@@ -719,9 +736,21 @@ impl TryFrom<&pb::Transaction> for Transaction {
                     .map(RewrittenIndex::try_from)
                     .collect::<Result<_>>()?;
 
+                let new_indices = new_indices
+                    .iter()
+                    .map(Index::try_from)
+                    .collect::<Result<_>>()?;
+
+                let removed_indices = removed_indices
+                    .iter()
+                    .map(Index::try_from)
+                    .collect::<Result<_>>()?;
+
                 Operation::Rewrite {
                     groups,
                     rewritten_indices,
+                    new_indices,
+                    removed_indices,
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -853,6 +882,8 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
+                removed_indices,
+                new_indices,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 groups: groups
                     .iter()
@@ -862,6 +893,8 @@ impl From<&Transaction> for pb::Transaction {
                     .iter()
                     .map(|rewritten| rewritten.into())
                     .collect(),
+                removed_indices: removed_indices.iter().map(IndexMetadata::from).collect(),
+                new_indices: new_indices.iter().map(IndexMetadata::from).collect(),
                 ..Default::default()
             }),
             Operation::CreateIndex {
@@ -1050,6 +1083,8 @@ mod tests {
                     new_fragments: vec![fragment1.clone()],
                 }],
                 rewritten_indices: vec![],
+                removed_indices: vec![],
+                new_indices: vec![],
             },
             Operation::ReserveFragments { num_fragments: 3 },
             Operation::Update {
@@ -1115,6 +1150,8 @@ mod tests {
                         new_fragments: vec![fragment0.clone()],
                     }],
                     rewritten_indices: Vec::new(),
+                    removed_indices: Vec::new(),
+                    new_indices: Vec::new(),
                 },
                 [false, true, false, true, true, false, false, true],
             ),
@@ -1126,6 +1163,8 @@ mod tests {
                         new_fragments: vec![fragment0.clone()],
                     }],
                     rewritten_indices: Vec::new(),
+                    removed_indices: Vec::new(),
+                    new_indices: Vec::new(),
                 },
                 [false, true, true, true, true, true, false, true],
             ),

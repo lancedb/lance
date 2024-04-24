@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import json
 import pickle
 import random
 import re
@@ -9,6 +10,7 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from lance.lance import Compaction
 from lance.optimize import RewriteResult
 from lance.vector import vec_to_table
@@ -236,3 +238,79 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert metrics.fragments_added == 1
     # Compaction occurs in two transactions so it increments the version by 2.
     assert dataset.version == 3
+
+
+def test_compact_and_optimize(tmp_path: Path):
+    def data(id_start, id_end):
+        num_rows = id_end - id_start
+        dim = 128
+        vector_values = pc.random(num_rows * dim).cast(pa.float32())
+        vectors = pa.FixedSizeListArray.from_arrays(vector_values, dim)
+        return pa.table({"id": range(id_start, id_end), "vec": vectors})
+
+    # Create a dataset
+    dataset = lance.write_dataset(data(0, 2000), tmp_path)
+
+    # Add a vector and scalar index
+    dataset.create_index(
+        "vec",
+        index_type="IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=8,
+        name="vec_index",
+    )
+    dataset.create_scalar_index("id", index_type="BTREE", name="id_index")
+
+    # Append new data
+    dataset = lance.write_dataset(data(100, 200), tmp_path, mode="append")
+
+    # Add index segments
+    dataset.optimize.optimize_indices(merge_indices=False, index_new_data=True)
+
+    # Append new data
+    # dataset = lance.write_dataset(data(200, 300), tmp_path, mode="append")
+    # assert len(dataset.get_fragments()) == 3
+
+    # Compact and optimize -> Should have 1 fragment with 1 vector index and 1 scalar index
+    # Right now, plan_compaction won't compact fragments with different indices.
+    # So we manually create a compaction task.
+    task_data = dict(
+        task=dict(
+            fragments=[
+                candidate.metadata.to_json() for candidate in dataset.get_fragments()
+            ]
+        ),
+        read_version=dataset.version,
+        options=dict(
+            target_rows_per_fragment=10 * 1024 * 1024,
+            max_rows_per_group=1024,
+            materialize_deletions=True,
+            materialize_deletions_threshold=0,
+            num_threads=1,
+        ),
+    )
+    task = lance.lance.CompactionTask.from_json(json.dumps(task_data))
+    result = task.execute(dataset)
+    lance.optimize.Compaction.commit(
+        dataset, [result], merge_indices=True, index_new_data=True
+    )
+    assert len(dataset.get_fragments()) == 1
+
+    vector_index_stats = dataset.stats.index_stats("vec_index")
+    assert vector_index_stats["num_indexed_fragments"] == 1
+    assert vector_index_stats["num_unindexed_fragments"] == 0
+    assert len(vector_index_stats["indices"]) == 1
+
+    scalar_index_stats = dataset.stats.index_stats("id_index")
+    assert scalar_index_stats["num_indexed_fragments"] == 1
+    assert scalar_index_stats["num_unindexed_fragments"] == 0
+    assert len(scalar_index_stats["indices"]) == 1
+
+    # Make sure we can query the dataset
+    q = {"column": "vec", "q": np.random.rand(128).astype(np.float32), "k": 5}
+    results = dataset.to_table(nearest=q)
+    assert results.num_rows == 5
+
+
+def test_compact_and_optimize_targetted(tmp_path: Path):
+    pass

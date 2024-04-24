@@ -2231,6 +2231,8 @@ class DatasetOptimizer:
         materialize_deletions: bool = True,
         materialize_deletions_threshold: float = 0.1,
         num_threads: Optional[int] = None,
+        merge_indices: bool | int | List[str] | None = None,
+        index_new_data: bool | List[int] | None = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -2280,7 +2282,7 @@ class DatasetOptimizer:
             materialize_deletions_threshold=materialize_deletions_threshold,
             num_threads=num_threads,
         )
-        return Compaction.execute(self._dataset, opts)
+        return Compaction.execute(self._dataset, opts, merge_indices, index_new_data)
 
     def optimize_indices(
         self,
