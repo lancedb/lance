@@ -179,7 +179,7 @@ impl Debug for HNSW {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HnswMetadata {
     entry_point: u32,
     level_offsets: Vec<usize>,
@@ -197,7 +197,7 @@ impl HNSW {
 
     /// The number of nodes in the level 0 of the graph.
     pub fn len(&self) -> usize {
-        self.levels[0].len()
+        self.levels.first().map_or(0, |level| level.len())
     }
 
     pub fn storage(&self) -> &dyn VectorStorage {
@@ -264,6 +264,10 @@ impl HNSW {
         vector_storage: Arc<dyn VectorStorage>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
+        if range.is_empty() {
+            return Ok(Self::empty());
+        }
+
         let levels = futures::stream::iter(0..metadata.level_offsets.len() - 1)
             .map(|i| {
                 let start = range.start + metadata.level_offsets[i];

@@ -317,6 +317,11 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         )
         .await?;
 
+        if row_id_array.is_empty() {
+            tasks.push(tokio::spawn(async { Ok(0) }));
+            continue;
+        }
+
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_writer = FileWriter::<ManifestDescribing>::try_new(
             &object_store,
@@ -368,13 +373,20 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let mut aux_ivf = IvfData::empty();
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     for (part_id, task) in tasks.into_iter().enumerate() {
+        let offset = writer.tell().await?;
         let length = task.await??;
+
+        if length == 0 {
+            ivf.add_partition(offset, 0);
+            aux_ivf.add_partition(0);
+            hnsw_metadata.push(HnswMetadata::default());
+            continue;
+        }
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
             FileReader::try_new_self_described(&object_store, part_file, None).await?;
 
-        let offset = writer.tell().await?;
         let batches = futures::stream::iter(0..part_reader.num_batches())
             .map(|batch_id| {
                 part_reader.read_batch(

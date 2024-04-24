@@ -9,10 +9,8 @@ use std::{
 };
 
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
-
-use arrow_schema::DataType;
 use async_trait::async_trait;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_index::{
     vector::{
@@ -20,7 +18,7 @@ use lance_index::{
         hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization},
-        Query, DIST_COL,
+        Query,
     },
     Index, IndexType,
 };
@@ -36,6 +34,7 @@ use tracing::instrument;
 use super::opq::train_opq;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
+use crate::RESULT_SCHEMA;
 
 pub mod builder;
 
@@ -136,6 +135,11 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
 impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+        let schema = RESULT_SCHEMA.clone();
+
+        if self.hnsw.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
         let row_ids = self.hnsw.storage().row_ids();
         let bitmap = if pre_filter.is_empty() {
             None
@@ -170,10 +174,6 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             results.iter().map(|x| x.dist.0),
         ));
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, true),
-        ]));
         Ok(RecordBatch::try_new(
             schema,
             vec![distances, Arc::new(row_ids)],
