@@ -77,28 +77,33 @@ message Nullable {
 message List {
     // An array containing the offsets into an items array.
     //
-    // This array will have (num_rows + 1), will have a data
-    // type of uint64, and will never have nulls.
+    // This array will have num_rows items and will never
+    // have nulls.
     //
-    // offsets[0] will always be 0.
-    //
-    // If the incoming list at index i is not null then offsets[i+1]
-    // will contain offsets[i] + len(list)
+    // If the list at index i is not null then offsets[i] will
+    // contain `base + len(list)` where `base` is defined as:
+    //   i == 0: 0
+    //   i >  0: (offsets[i-1] % first_invalid_offset)
     //
     // If the incoming list at index i is null then offsets[i+1] will
-    // contain offsets[i] + num_items
+    // contain `base + len(list) + first_invalid_offset` where `base`
+    // is defined the same as above.
     //
-    // The length of the list at index i can then be found from
-    // the calculation (offsets[i+1] - offsets[i]) % num_items.  If
-    // the length is 0 the list is:
-    //   * offsets[i+1] == offsets[i] -> empty list
-    //   * offsets[i+1] == num_items + offsets[i+1] -> null list
+    // When reading a list at index i only only needs the offsets at
+    // index i and index i-1 (if i > 0).
     //
-    // The offsets array is always a uint64 array (even if the arrow type it
-    // maps to is using int32 or int64 offsets).  However, this array is an
+    // If the offset at index i is greater than first_invalid_offset
+    //   then the list at index i is null.
+    // Otherwise the length of the list is `offsets[i] - base` where
+    // base is defined the same as above.
+    //
+    // The data type of the offsets array is flexible and does not need
+    // to match the data type of the destination array.  However, this array is an
     // unsigned integer array with range [0, 2 * num_items] and so it should
     // be bit packed accordingly.
     ArrayEncoding offsets = 1;
+    // All valid offsets will be less than this value.
+    uint64 first_invalid_offset = 2;
 }
 
 // An array encoding for fixed-size list fields

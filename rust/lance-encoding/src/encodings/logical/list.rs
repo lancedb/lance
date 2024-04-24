@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use arrow_array::{
     cast::AsArray,
     new_empty_array,
-    types::{Int32Type, Int64Type},
-    ArrayRef, Int32Array, Int64Array, LargeListArray, ListArray, UInt32Array,
+    types::{Int32Type, Int64Type, UInt64Type},
+    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeListArray, ListArray, UInt64Array,
 };
-use arrow_buffer::OffsetBuffer;
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 use futures::{future::BoxFuture, FutureExt};
-use log::trace;
+use log::{info, trace};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use lance_core::Result;
@@ -24,7 +24,7 @@ use crate::{
     EncodingsIo,
 };
 
-use super::primitive::PrimitiveFieldEncoder;
+use super::primitive::{AccumulationQueue, PrimitiveFieldEncoder};
 
 /// A page scheduler for list fields that encodes offsets in one field and items in another
 ///
@@ -61,6 +61,7 @@ pub struct ListPageScheduler {
     items_schedulers: Arc<Vec<Box<dyn LogicalPageScheduler>>>,
     items_type: DataType,
     offset_type: DataType,
+    last_valid_offset: u64,
 }
 
 impl ListPageScheduler {
@@ -71,6 +72,7 @@ impl ListPageScheduler {
         items_type: DataType,
         // Should be int32 or int64
         offset_type: DataType,
+        last_valid_offset: u64,
     ) -> Self {
         match &offset_type {
             DataType::Int32 | DataType::Int64 => {}
@@ -81,7 +83,109 @@ impl ListPageScheduler {
             items_schedulers: Arc::new(items_schedulers),
             items_type,
             offset_type,
+            last_valid_offset,
         }
+    }
+
+    fn decode_offsets(
+        offsets: &dyn Array,
+        offset_ranges: &[Range<u32>],
+        last_valid_offset: u64,
+    ) -> (VecDeque<Range<u64>>, Vec<u64>, BooleanBuffer) {
+        let numeric_offsets = offsets.as_primitive::<UInt64Type>();
+        // Given ranges [1..3, 5..6] where each list has 10 items we get offsets [[10, 20, 30], [50, 60]]
+        // and we need to normalize to [0, 10, 20, 30]
+        let total_num_lists = offset_ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u32>();
+        let mut normalized_offsets = Vec::with_capacity(total_num_lists as usize);
+        let mut validity_buffer = BooleanBufferBuilder::new(total_num_lists as usize);
+        normalized_offsets.push(0);
+        let mut last_normalized_offset = 0;
+        let offsets_values = numeric_offsets.values();
+
+        let mut item_ranges = VecDeque::new();
+        let mut offsets_offset: u32 = 0;
+        // Only the first range is allowed to start with 0
+        debug_assert!(offset_ranges.iter().skip(1).all(|r| r.start > 0));
+        for range in offset_ranges {
+            let num_lists = range.end - range.start;
+
+            let (items_range, offsets_to_norm_start, num_offsets_to_norm) = if range.start == 0 {
+                let items_start = 0;
+                let mut items_end = offsets_values[(offsets_offset + num_lists - 1) as usize];
+                if items_end > last_valid_offset {
+                    items_end -= last_valid_offset;
+                }
+                let items_range = items_start..items_end;
+                normalized_offsets.push(offsets_values[0]);
+                last_normalized_offset = offsets_values[0];
+                let offsets_to_norm_start = 0 as usize;
+                let num_offsets_to_norm = num_lists as usize;
+                (items_range, offsets_to_norm_start, num_offsets_to_norm)
+            } else {
+                let mut items_start = offsets_values[offsets_offset as usize];
+                if items_start > last_valid_offset {
+                    items_start -= last_valid_offset;
+                }
+                let mut items_end = offsets_values[(offsets_offset + num_lists) as usize];
+                if items_end > last_valid_offset {
+                    items_end -= last_valid_offset;
+                }
+                let items_range = items_start..items_end;
+                (items_range, offsets_offset as usize, num_lists as usize + 1)
+            };
+
+            // TODO: Maybe consider writing whether there are nulls or not as part of the
+            // page description.  Then we can skip all validity work (and all these if branches
+            // comparing with last_valid_offset) when there are no nulls.
+
+            // We calculate validity from all elements but the first (or all elements
+            // if this is the special zero-start case)
+            let validity_start = if range.start == 0 {
+                0
+            } else {
+                offsets_to_norm_start + 1
+            };
+            for off in offsets_values
+                .slice(validity_start, num_lists as usize)
+                .iter()
+            {
+                validity_buffer.append(*off <= last_valid_offset);
+            }
+
+            normalized_offsets.extend(
+                offsets_values
+                    .slice(offsets_to_norm_start, num_offsets_to_norm)
+                    .windows(2)
+                    .map(|w| {
+                        let start = if w[0] > last_valid_offset {
+                            w[0] - last_valid_offset
+                        } else {
+                            w[0]
+                        };
+                        let end = if w[1] > last_valid_offset {
+                            w[1] - last_valid_offset
+                        } else {
+                            w[1]
+                        };
+                        let length = end - start;
+                        last_normalized_offset += length;
+                        last_normalized_offset
+                    }),
+            );
+            trace!(
+                "List offsets range of {:?} maps to item range {:?}",
+                range,
+                items_range
+            );
+            offsets_offset += num_offsets_to_norm as u32;
+            item_ranges.push_back(items_range);
+        }
+
+        let validity = validity_buffer.finish();
+        (item_ranges, normalized_offsets, validity)
     }
 }
 
@@ -92,17 +196,31 @@ impl LogicalPageScheduler for ListPageScheduler {
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
     ) -> Result<()> {
+        // TODO: Shortcut here if the request covers the entire range (can be determined by
+        // the first_invalid_offset).  If this is the case we don't need any indirect I/O.  We
+        // know we need the entirety of the list items.
         let num_rows = ranges.iter().map(|range| range.end - range.start).sum();
         // TODO: Should coalesce here (e.g. if receiving take(&[0, 1, 2]))
         // otherwise we are double-dipping on the offsets scheduling
         let offsets_ranges = ranges
             .iter()
-            .map(|range| range.start..(range.end + 1))
+            .map(|range| {
+                if range.start == 0 {
+                    // If the start is 0 then we don't need to read an extra value because we know
+                    // we are starting from 0
+                    0..range.end
+                } else {
+                    // If the start is not 0 we need to read one more offset so we know the length
+                    // of the first item
+                    (range.start - 1)..range.end
+                }
+            })
             .collect::<Vec<_>>();
         let num_offsets = offsets_ranges
             .iter()
             .map(|range| range.end - range.start)
             .sum();
+        let last_valid_offset = self.last_valid_offset;
         trace!("Scheduling list offsets ranges: {:?}", offsets_ranges);
         // Create a channel for the internal schedule / decode loop that is unique
         // to this page.
@@ -126,41 +244,9 @@ impl LogicalPageScheduler for ListPageScheduler {
             scheduled_offsets.wait(num_rows, &mut dummy_rx).await?;
             let decode_task = scheduled_offsets.drain(num_offsets)?;
             let offsets = decode_task.task.decode()?;
-            let numeric_offsets = offsets.as_primitive::<Int32Type>();
-            // Given ranges [1..3, 5..6] where each list has 10 items we get offsets [[10, 20, 30], [50, 60]]
-            // and we need to normalize to [0, 10, 20, 30]
-            let mut normalized_offsets =
-                Vec::with_capacity(numeric_offsets.len() - ranges.len() + 1);
-            normalized_offsets.push(0);
-            let mut last_normalized_offset = 0;
-            let offsets_values = numeric_offsets.values();
 
-            let mut item_ranges = VecDeque::new();
-            let mut offsets_offset: u32 = 0;
-            for range in ranges {
-                let num_lists = range.end - range.start;
-                let items_start = offsets_values[offsets_offset as usize] as u32;
-                let items_end = offsets_values[(offsets_offset + num_lists) as usize] as u32;
-                normalized_offsets.extend(
-                    offsets_values
-                        .slice(offsets_offset as usize, (num_lists + 1) as usize)
-                        .windows(2)
-                        .map(|w| {
-                            let length = w[1] - w[0];
-                            last_normalized_offset += length as u32;
-                            last_normalized_offset
-                        }),
-                );
-                trace!(
-                    "List offsets range of {:?} maps to item range {:?}..{:?}",
-                    range,
-                    items_start,
-                    items_end
-                );
-                offsets_offset += num_lists + 1;
-                item_ranges.push_back(items_start..items_end);
-            }
-
+            let (mut item_ranges, offsets, validity) =
+                Self::decode_offsets(offsets.as_ref(), &ranges, last_valid_offset);
             let (tx, mut rx) = mpsc::unbounded_channel();
 
             trace!(
@@ -169,7 +255,7 @@ impl LogicalPageScheduler for ListPageScheduler {
                 items_schedulers.len()
             );
             let mut item_schedulers = VecDeque::from_iter(items_schedulers.iter());
-            let mut row_offset = 0;
+            let mut row_offset = 0_u64;
             let mut next_scheduler = item_schedulers.pop_front().unwrap();
             let mut next_range = item_ranges.pop_front().unwrap();
             let mut next_item_ranges = Vec::new();
@@ -186,17 +272,19 @@ impl LogicalPageScheduler for ListPageScheduler {
             // page 3: 0..1000
             // page 4: nothing
             loop {
-                let current_scheduler_end = row_offset + next_scheduler.num_rows();
+                let current_scheduler_end = row_offset + next_scheduler.num_rows() as u64;
                 if next_range.start > current_scheduler_end {
                     // All requested items are past this page, continue
-                    row_offset += next_scheduler.num_rows();
+                    row_offset += next_scheduler.num_rows() as u64;
                     if !next_item_ranges.is_empty() {
                         next_scheduler.schedule_ranges(&next_item_ranges, &scheduler, &tx)?;
+                        next_item_ranges.clear();
                     }
                     next_scheduler = item_schedulers.pop_front().unwrap();
                 } else if next_range.end <= current_scheduler_end {
                     // Range entirely contained in current scheduler
-                    let page_range = (next_range.start - row_offset)..(next_range.end - row_offset);
+                    let page_range = (next_range.start - row_offset) as u32
+                        ..(next_range.end - row_offset) as u32;
                     next_item_ranges.push(page_range);
                     if let Some(item_range) = item_ranges.pop_front() {
                         next_range = item_range;
@@ -206,12 +294,14 @@ impl LogicalPageScheduler for ListPageScheduler {
                     }
                 } else {
                     // Range partially contained in current scheduler
-                    let page_range = (next_range.start - row_offset)..next_scheduler.num_rows();
+                    let page_range =
+                        (next_range.start - row_offset) as u32..next_scheduler.num_rows();
                     next_range = current_scheduler_end..next_range.end;
                     next_item_ranges.push(page_range);
-                    row_offset += next_scheduler.num_rows();
+                    row_offset += next_scheduler.num_rows() as u64;
                     if !next_item_ranges.is_empty() {
                         next_scheduler.schedule_ranges(&next_item_ranges, &scheduler, &tx)?;
+                        next_item_ranges.clear();
                     }
                     next_scheduler = item_schedulers.pop_front().unwrap();
                 }
@@ -227,12 +317,14 @@ impl LogicalPageScheduler for ListPageScheduler {
             }
 
             Ok(IndirectlyLoaded {
-                offsets: normalized_offsets,
+                offsets,
+                validity,
                 item_decoders,
             })
         });
         sink.send(Box::new(ListPageDecoder {
             offsets: Vec::new(),
+            validity: BooleanBuffer::new(Buffer::from_vec(Vec::<u8>::default()), 0, 0),
             item_decoders: VecDeque::new(),
             num_rows,
             rows_drained: 0,
@@ -244,9 +336,8 @@ impl LogicalPageScheduler for ListPageScheduler {
         Ok(())
     }
 
-    // A list page's length is one less than the length of the offsets
     fn num_rows(&self) -> u32 {
-        self.offsets_scheduler.num_rows() - 1
+        self.offsets_scheduler.num_rows()
     }
 
     fn schedule_take(
@@ -279,9 +370,9 @@ impl LogicalPageScheduler for ListPageScheduler {
 /// TODO: Test the case where a single list page has multiple items pages
 struct ListPageDecoder {
     unloaded: Option<JoinHandle<Result<IndirectlyLoaded>>>,
-    // offsets will have already been decoded as part of the indirect I/O
-    // and so we store ArrayRef and not Box<dyn LogicalPageDecoder>
-    offsets: Vec<u32>,
+    // offsets and validity will have already been decoded as part of the indirect I/O
+    offsets: Vec<u64>,
+    validity: BooleanBuffer,
     // Items will not yet be decoded, we at least try and do that part
     // on the decode thread
     item_decoders: VecDeque<Box<dyn LogicalPageDecoder>>,
@@ -292,7 +383,8 @@ struct ListPageDecoder {
 }
 
 struct ListDecodeTask {
-    offsets: Vec<u32>,
+    offsets: Vec<u64>,
+    validity: BooleanBuffer,
     items: Vec<Box<dyn DecodeArrayTask>>,
     items_type: DataType,
     offset_type: DataType,
@@ -318,9 +410,21 @@ impl DecodeArrayTask for ListDecodeTask {
         // us from the input schema
         let item_field = Arc::new(Field::new("item", self.items_type.clone(), true));
 
-        // The offsets are already decoded but they need to be shifted back to 0
-        // TODO: Can these branches be simplified?
-        let offsets = UInt32Array::from(self.offsets);
+        // The offsets are already decoded but they need to be shifted back to 0 and cast
+        // to the appropriate type
+        // TODO: This shift is not strictly required since a list array's offsets don't have
+        // to start at zero but doing the shift makes testing easier.
+        //
+        // Also note, we are implicitly relying on the fact that null spots are filled in
+        // a certain way to do this shift (e.g. even if the first value is null it will still
+        // contain an appropriate starting point for the lengths)
+        let offsets = UInt64Array::from(self.offsets);
+        let validity = NullBuffer::new(self.validity);
+        let validity = if validity.null_count() == 0 {
+            None
+        } else {
+            Some(validity)
+        };
         match &self.offset_type {
             DataType::Int32 => {
                 let offsets = arrow_cast::cast(&offsets, &DataType::Int32)?;
@@ -331,7 +435,7 @@ impl DecodeArrayTask for ListDecodeTask {
                 let offsets = OffsetBuffer::new(offsets_i32.values().clone());
 
                 Ok(Arc::new(ListArray::try_new(
-                    item_field, offsets, items, None,
+                    item_field, offsets, items, validity,
                 )?))
             }
             DataType::Int64 => {
@@ -343,7 +447,7 @@ impl DecodeArrayTask for ListDecodeTask {
                 let offsets = OffsetBuffer::new(offsets_i64.values().clone());
 
                 Ok(Arc::new(LargeListArray::try_new(
-                    item_field, offsets, items, None,
+                    item_field, offsets, items, validity,
                 )?))
             }
             _ => panic!("ListDecodeTask with data type that is not i32 or i64"),
@@ -366,6 +470,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             if self.unloaded.is_some() {
                 let indirectly_loaded = self.unloaded.take().unwrap().await.unwrap()?;
                 self.offsets = indirectly_loaded.offsets;
+                self.validity = indirectly_loaded.validity;
                 self.item_decoders.extend(indirectly_loaded.item_decoders);
             }
             Ok(())
@@ -382,9 +487,30 @@ impl LogicalPageDecoder for ListPageDecoder {
 
     fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
         // We already have the offsets but need to drain the item pages
+        let mut actual_num_rows = num_rows;
+        let item_start = self.offsets[self.rows_drained as usize];
+        if self.offset_type != DataType::Int64 {
+            // We might not be able to drain `num_rows` because that request might contain more than 2^31 items
+            // so we need to figure out how many rows we can actually drain.
+            while actual_num_rows > 0 {
+                let num_items =
+                    self.offsets[(self.rows_drained + actual_num_rows) as usize] - item_start;
+                if num_items <= i32::MAX as u64 {
+                    break;
+                }
+                // TODO: This could be slow.  Maybe faster to start from zero?
+                actual_num_rows -= 1;
+            }
+        }
+        if actual_num_rows < num_rows {
+            info!("Only decoding {} rows instead of {} because total data size would exceed 2^31 items", actual_num_rows, num_rows);
+        }
         let offsets = self.offsets
-            [self.rows_drained as usize..(self.rows_drained + num_rows + 1) as usize]
+            [self.rows_drained as usize..(self.rows_drained + actual_num_rows + 1) as usize]
             .to_vec();
+        let validity = self
+            .validity
+            .slice(self.rows_drained as usize, actual_num_rows as usize);
         let start = offsets[0];
         let end = offsets[offsets.len() - 1];
         let mut num_items_to_drain = end - start;
@@ -393,8 +519,8 @@ impl LogicalPageDecoder for ListPageDecoder {
         while num_items_to_drain > 0 {
             let next_item_page = self.item_decoders.front_mut().unwrap();
             let avail = next_item_page.avail();
-            let to_take = num_items_to_drain.min(avail);
-            num_items_to_drain -= to_take;
+            let to_take = num_items_to_drain.min(avail as u64) as u32;
+            num_items_to_drain -= to_take as u64;
             let next_task = next_item_page.drain(to_take)?;
 
             if !next_task.has_more {
@@ -409,6 +535,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             num_rows,
             task: Box::new(ListDecodeTask {
                 offsets,
+                validity,
                 items: item_decodes,
                 items_type: self.items_type.clone(),
                 offset_type: self.offset_type.clone(),
@@ -425,7 +552,8 @@ impl LogicalPageDecoder for ListPageDecoder {
 }
 
 struct IndirectlyLoaded {
-    offsets: Vec<u32>,
+    offsets: Vec<u64>,
+    validity: BooleanBuffer,
     item_decoders: Vec<Box<dyn LogicalPageDecoder>>,
 }
 
@@ -436,48 +564,269 @@ struct IndirectlyLoaded {
 ///
 /// We will have offset arrays [0, 2, 3] and [0, 3].  We don't want to encode [0, 2, 3, 0, 3].  What
 /// we want is [0, 2, 3, 6]
+///
+/// This encoder also handles validity by converting a null value into an oversized offset
+///
+/// Some times we may accumulate many offsets (enough to form a page) and still fit in u32.  For example,
+/// if each list has 10 items then we will accumulate 8MiB (as an example buffer size) of offset info and
+/// only span about ~80MiB of offset range.  So we can easily use u32.
+///
+/// Other times we may span beyond the u64 range with only a few items.  For example, if each list has
+/// 1Mi items then we will go beyond 4GiB with only 4Ki items which will probably easily fit within
+/// our accumulation buffer.
+///
+/// As a result, we sometimes create u32 pages and we sometimes create u64 pages.  This could be simplified
+/// in the future once we support bit packing.  Then we can always use bit packed u64 pages.
 #[derive(Debug)]
 struct ListOffsetsEncoder {
-    inner: Box<dyn ArrayEncoder>,
+    // An accumulation queue, we insert both offset arrays and validity arrays into this queue
+    accumulation_queue: AccumulationQueue,
+    // The inner encoder of offset values
+    inner_encoder: Arc<dyn ArrayEncoder>,
+    column_index: u32,
 }
 
-impl ArrayEncoder for ListOffsetsEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        if arrays.len() < 2 {
-            // Nothing to patch, don't incur a copy
-            return self.inner.encode(arrays, buffer_index);
+impl ListOffsetsEncoder {
+    fn new(cache_bytes: u64, keep_original_array: bool, column_index: u32) -> Self {
+        Self {
+            accumulation_queue: AccumulationQueue::new(
+                cache_bytes,
+                column_index,
+                keep_original_array,
+            ),
+            inner_encoder: PrimitiveFieldEncoder::array_encoder_from_data_type(&DataType::UInt64)
+                .unwrap()
+                .into(),
+            column_index,
         }
-        let num_offsets =
-            arrays.iter().map(|array| array.len()).sum::<usize>() - (arrays.len() - 1);
-        let mut offsets = Vec::with_capacity(num_offsets);
-        offsets.extend_from_slice(arrays[0].as_primitive::<Int32Type>().values());
-        for array in &arrays[1..] {
-            let last_prev_offset = *offsets.last().unwrap();
-            let values = array.as_primitive::<Int32Type>().values();
-            if values.len() == 0 {
-                continue;
+    }
+
+    /// Given a list array, return the offsets as a standalone ArrayRef (either an Int32Array or Int64Array)
+    fn extract_offsets(list_arr: &dyn Array) -> ArrayRef {
+        match list_arr.data_type() {
+            DataType::List(_) => {
+                let offsets = list_arr.as_list::<i32>().offsets().clone();
+                Arc::new(Int32Array::new(offsets.into_inner(), None))
             }
-            // The first offset doesn't have to be 0 (this happens when lists are sliced)
-            //
-            // So if the previous offsets are [0, 3, 5] and the current offsets are
-            // [10, 11, 12] then we want to add 5 - 10 to all of the current offsets
-            // (skipping the first) to get [6, 7] and then append them to the previous
-            // offsets to get [0, 3, 5, 6, 7]
-            let first_curr_offset = values[0];
-            offsets.extend(
-                values
-                    .iter()
-                    .skip(1)
-                    .map(|&v| v + last_prev_offset - first_curr_offset),
+            DataType::LargeList(_) => {
+                let offsets = list_arr.as_list::<i64>().offsets().clone();
+                Arc::new(Int64Array::new(offsets.into_inner(), None))
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Converts the validity of a list array into a boolean array.  If there is no validity information
+    /// then this is an empty boolean array.
+    fn extract_validity(list_arr: &dyn Array) -> ArrayRef {
+        if let Some(validity) = list_arr.nulls() {
+            Arc::new(BooleanArray::new(validity.inner().clone(), None))
+        } else {
+            // We convert None validity into an empty array because the accumulation queue can't
+            // handle Option<ArrayRef>
+            new_empty_array(&DataType::Boolean)
+        }
+    }
+
+    fn make_encode_task(&self, arrays: Vec<ArrayRef>) -> EncodeTask {
+        let inner_encoder = self.inner_encoder.clone();
+        let column_idx = self.column_index;
+        // At this point we should have 2*N arrays where the 0, 2, ... arrays are integer offsets
+        // and the 1, 3, ... arrays are boolean
+        let offset_arrays = arrays.iter().step_by(2).cloned().collect::<Vec<_>>();
+        let validity_arrays = arrays.into_iter().skip(1).step_by(2).collect::<Vec<_>>();
+
+        tokio::task::spawn(async move {
+            let num_rows =
+                offset_arrays.iter().map(|arr| arr.len()).sum::<usize>() - offset_arrays.len();
+            let num_rows = num_rows as u32;
+            let mut buffer_index = 0;
+            let array = Self::do_encode(
+                offset_arrays,
+                validity_arrays,
+                &mut buffer_index,
+                num_rows,
+                inner_encoder,
+            )?;
+            Ok(EncodedPage {
+                array,
+                num_rows,
+                column_idx,
+            })
+        })
+        .map(|res_res| res_res.unwrap())
+        .boxed()
+    }
+
+    fn maybe_encode_offsets_and_validity(&mut self, list_arr: &dyn Array) -> Option<EncodeTask> {
+        let offsets = Self::extract_offsets(list_arr);
+        let validity = Self::extract_validity(list_arr);
+        // Either inserting the offsets OR inserting the validity could cause the
+        // accumulation queue to fill up
+        if let Some(mut arrays) = self.accumulation_queue.insert(offsets) {
+            arrays.push(validity);
+            Some(self.make_encode_task(arrays))
+        } else if let Some(arrays) = self.accumulation_queue.insert(validity) {
+            Some(self.make_encode_task(arrays))
+        } else {
+            None
+        }
+    }
+
+    fn flush(&mut self) -> Option<EncodeTask> {
+        if let Some(arrays) = self.accumulation_queue.flush() {
+            Some(self.make_encode_task(arrays))
+        } else {
+            None
+        }
+    }
+
+    // Get's the total number of items covered by an array of offsets (keeping in
+    // mind that the first offset may not be zero)
+    fn get_offset_span(array: &dyn Array) -> u64 {
+        match array.data_type() {
+            DataType::Int32 => {
+                let arr_i32 = array.as_primitive::<Int32Type>();
+                (arr_i32.value(arr_i32.len() - 1) - arr_i32.value(0)) as u64
+            }
+            DataType::Int64 => {
+                let arr_i64 = array.as_primitive::<Int64Type>();
+                (arr_i64.value(arr_i64.len() - 1) - arr_i64.value(0)) as u64
+            }
+            _ => panic!(),
+        }
+    }
+
+    fn extend_offsets_vec_u64(
+        dest: &mut Vec<u64>,
+        offsets: &dyn Array,
+        validity: Option<&BooleanArray>,
+        base: u64,
+        end: u64,
+    ) {
+        match offsets.data_type() {
+            DataType::Int32 => {
+                let offsets_i32 = offsets.as_primitive::<Int32Type>();
+                let start = offsets_i32.value(0) as u64;
+                if let Some(validity) = validity {
+                    dest.extend(
+                        offsets_i32
+                            .values()
+                            .iter()
+                            .skip(1)
+                            .zip(validity.values().iter())
+                            .map(|(&off, valid)| {
+                                let end = if valid { 0 } else { end };
+                                off as u64 - start + base + end
+                            }),
+                    );
+                } else {
+                    dest.extend(
+                        offsets_i32
+                            .values()
+                            .iter()
+                            .skip(1)
+                            .map(|&v| v as u64 - start + base),
+                    );
+                }
+            }
+            DataType::Int64 => {
+                let offsets_i64 = offsets.as_primitive::<Int32Type>();
+                let start = offsets_i64.value(0) as u64;
+                if let Some(validity) = validity {
+                    dest.extend(
+                        offsets_i64
+                            .values()
+                            .iter()
+                            .skip(1)
+                            .zip(validity.values().iter())
+                            .map(|(&off, valid)| {
+                                let end = if valid { 0 } else { end };
+                                off as u64 - start + base + end
+                            }),
+                    )
+                } else {
+                    dest.extend(
+                        offsets_i64
+                            .values()
+                            .iter()
+                            .skip(1)
+                            .map(|&v| v as u64 - start + base),
+                    );
+                }
+            }
+            _ => panic!("Invalid list offsets data type {:?}", offsets.data_type()),
+        }
+    }
+
+    fn do_encode_u64(
+        offset_arrays: Vec<ArrayRef>,
+        validity: Vec<Option<&BooleanArray>>,
+        num_offsets: u32,
+        total_span: u64,
+        buffer_index: &mut u32,
+        inner_encoder: Arc<dyn ArrayEncoder>,
+    ) -> Result<EncodedArray> {
+        let mut offsets = Vec::with_capacity(num_offsets as usize);
+        for (offsets_arr, validity_arr) in offset_arrays.iter().zip(validity) {
+            let last_prev_offset = offsets.last().copied().unwrap_or(0);
+            Self::extend_offsets_vec_u64(
+                &mut offsets,
+                &offsets_arr,
+                validity_arr,
+                last_prev_offset,
+                total_span,
             );
         }
-        self.inner
-            .encode(&[Arc::new(Int32Array::from(offsets))], buffer_index)
+        inner_encoder.encode(&[Arc::new(UInt64Array::from(offsets))], buffer_index)
+    }
+
+    fn do_encode(
+        offset_arrays: Vec<ArrayRef>,
+        validity_arrays: Vec<ArrayRef>,
+        buffer_index: &mut u32,
+        num_offsets: u32,
+        inner_encoder: Arc<dyn ArrayEncoder>,
+    ) -> Result<EncodedArray> {
+        let validity_arrays = validity_arrays
+            .iter()
+            .map(|v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.as_boolean())
+                }
+            })
+            .collect::<Vec<_>>();
+        debug_assert_eq!(offset_arrays.len(), validity_arrays.len());
+        let total_span = offset_arrays
+            .iter()
+            .map(|arr| Self::get_offset_span(arr.as_ref()))
+            .sum::<u64>();
+        let encoded_offsets = Self::do_encode_u64(
+            offset_arrays,
+            validity_arrays,
+            num_offsets,
+            total_span,
+            buffer_index,
+            inner_encoder,
+        )?;
+        Ok(EncodedArray {
+            buffers: encoded_offsets.buffers,
+            encoding: pb::ArrayEncoding {
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::List(Box::new(
+                    pb::List {
+                        offsets: Some(Box::new(encoded_offsets.encoding)),
+                        first_invalid_offset: total_span,
+                    },
+                ))),
+            },
+        })
     }
 }
 
 pub struct ListFieldEncoder {
-    offsets_encoder: PrimitiveFieldEncoder,
+    offsets_encoder: ListOffsetsEncoder,
     items_encoder: Box<dyn FieldEncoder>,
 }
 
@@ -488,17 +837,11 @@ impl ListFieldEncoder {
         keep_original_array: bool,
         column_index: u32,
     ) -> Self {
-        let inner_encoder =
-            PrimitiveFieldEncoder::array_encoder_from_data_type(&DataType::Int32).unwrap();
-        let offsets_encoder = Arc::new(ListOffsetsEncoder {
-            inner: inner_encoder,
-        });
         Self {
-            offsets_encoder: PrimitiveFieldEncoder::new_with_encoder(
+            offsets_encoder: ListOffsetsEncoder::new(
                 cache_bytes_per_columns,
                 keep_original_array,
                 column_index,
-                offsets_encoder,
             ),
             items_encoder,
         }
@@ -513,60 +856,48 @@ impl ListFieldEncoder {
         all_tasks.extend(item_tasks);
         Ok(all_tasks)
     }
-
-    fn wrap_offsets_encode_tasks(tasks: Result<Vec<EncodeTask>>) -> Result<Vec<EncodeTask>> {
-        tasks.map(|tasks| {
-            tasks
-                .into_iter()
-                .map(|page_task| {
-                    async move {
-                        let page = page_task.await?;
-                        let array = EncodedArray {
-                            buffers: page.array.buffers,
-                            encoding: pb::ArrayEncoding {
-                                array_encoding: Some(pb::array_encoding::ArrayEncoding::List(
-                                    Box::new(pb::List {
-                                        offsets: Some(Box::new(page.array.encoding)),
-                                    }),
-                                )),
-                            },
-                        };
-                        Ok(EncodedPage { array, ..page })
-                    }
-                    .boxed()
-                })
-                .collect::<Vec<_>>()
-        })
-    }
 }
 
 impl FieldEncoder for ListFieldEncoder {
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
+        // The list may have an offset / shorter length which means the underlying
+        // values array could be longer than what we need to encode
         let items = match array.data_type() {
-            DataType::List(_) => array.as_list::<i32>().values().clone(),
-            DataType::LargeList(_) => array.as_list::<i64>().values().clone(),
-            _ => panic!(),
-        };
-        let offsets = match array.data_type() {
             DataType::List(_) => {
-                let offsets = array.as_list::<i32>().offsets().clone();
-                Arc::new(Int32Array::new(offsets.into_inner(), None)) as ArrayRef
+                let list_arr = array.as_list::<i32>();
+                let items_start = list_arr.value_offsets()[list_arr.offset()] as usize;
+                let items_end =
+                    list_arr.value_offsets()[list_arr.offset() + list_arr.len()] as usize;
+                list_arr
+                    .values()
+                    .slice(items_start, items_end - items_start)
             }
             DataType::LargeList(_) => {
-                let offsets = array.as_list::<i64>().offsets().clone();
-                Arc::new(Int64Array::new(offsets.into_inner(), None)) as ArrayRef
+                let list_arr = array.as_list::<i64>();
+                let items_start = list_arr.value_offsets()[list_arr.offset()] as usize;
+                let items_end =
+                    list_arr.value_offsets()[list_arr.offset() + list_arr.len()] as usize;
+                list_arr
+                    .values()
+                    .slice(items_start, items_end - items_start)
             }
             _ => panic!(),
         };
-        let offsets_tasks = self.offsets_encoder.maybe_encode(offsets);
-        let offsets_tasks = Self::wrap_offsets_encode_tasks(offsets_tasks);
+        let offsets_tasks = self
+            .offsets_encoder
+            .maybe_encode_offsets_and_validity(array.as_ref())
+            .map(|task| Ok(vec![task]))
+            .unwrap_or_else(|| Ok(Vec::default()));
         let item_tasks = self.items_encoder.maybe_encode(items);
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
     fn flush(&mut self) -> Result<Vec<EncodeTask>> {
-        let offsets_tasks = self.offsets_encoder.flush();
-        let offsets_tasks = Self::wrap_offsets_encode_tasks(offsets_tasks);
+        let offsets_tasks = self
+            .offsets_encoder
+            .flush()
+            .map(|task| Ok(vec![task]))
+            .unwrap_or_else(|| Ok(Vec::default()));
         let item_tasks = self.items_encoder.flush();
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
@@ -588,11 +919,32 @@ mod tests {
         check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
     };
 
+    fn make_list_type(inner_type: DataType) -> DataType {
+        DataType::List(Arc::new(Field::new("item", inner_type, true)))
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_list() {
-        let data_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
-        let field = Field::new("", data_type, false);
+        let field = Field::new("", make_list_type(DataType::Int32), true);
         check_round_trip_encoding_random(field).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_list_simple() {
+        let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_value([Some(1), Some(2), Some(3)]);
+        list_builder.append_value([Some(4), Some(5)]);
+        list_builder.append_null();
+        list_builder.append_value([Some(6), Some(7), Some(8)]);
+        let list_array = list_builder.finish();
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(1..3)
+            .with_indices(vec![1, 3]);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
     }
 
     #[test_log::test(tokio::test)]
