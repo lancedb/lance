@@ -19,17 +19,17 @@ pub fn deep_copy_array_data(data: &ArrayData) -> ArrayData {
     let data_type = data.data_type().clone();
     let len = data.len();
     let null_count = data.null_count();
-    let null_bit_buffer = data.nulls().map(|nulls| deep_copy_nulls(nulls));
+    let null_bit_buffer = data.nulls().map(deep_copy_nulls);
     let offset = data.offset();
     let buffers = data
         .buffers()
         .iter()
-        .map(|buf| deep_copy_buffer(buf))
+        .map(deep_copy_buffer)
         .collect::<Vec<_>>();
     let child_data = data
         .child_data()
         .iter()
-        .map(|child| deep_copy_array_data(child))
+        .map(deep_copy_array_data)
         .collect::<Vec<_>>();
     unsafe {
         ArrayData::new_unchecked(
@@ -56,5 +56,5 @@ pub fn deep_copy_batch(batch: &RecordBatch) -> crate::Result<RecordBatch> {
         .iter()
         .map(|array| deep_copy_array(array))
         .collect::<Vec<_>>();
-    Ok(RecordBatch::try_new(batch.schema().clone(), arrays)?)
+    RecordBatch::try_new(batch.schema().clone(), arrays)
 }
