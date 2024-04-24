@@ -2255,7 +2255,7 @@ mod tests {
         query: &[f32],
         k: usize,
         distance_type: DistanceType,
-    ) -> HashSet<u32> {
+    ) -> Vec<(f32, u32)> {
         let mut dists = vec![];
         for i in 0..mat.num_rows() {
             let dist = distance_type.func()(query, mat.row_ref(i).unwrap());

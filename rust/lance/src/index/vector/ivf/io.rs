@@ -392,6 +392,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         hnsw_metadata.push(serde_json::from_str(
             part_reader.schema().metadata[HNSW_METADATA_KEY].as_str(),
         )?);
+        std::mem::drop(part_reader);
+        object_store.delete(part_file).await?;
 
         if let Some(aux_writer) = auxiliary_writer.as_mut() {
             let aux_part_reader =
@@ -409,6 +411,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                 .buffered(num_cpus::get())
                 .try_collect::<Vec<_>>()
                 .await?;
+            std::mem::drop(aux_part_reader);
+            object_store.delete(aux_part_file).await?;
 
             let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             aux_writer.write(&batches).await?;
