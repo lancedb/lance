@@ -5,12 +5,38 @@ use std::sync::Arc;
 
 use lance_core::Result;
 use lance_file::reader::FileReader;
+use lance_index::{IndexParams, IndexType};
 
 use crate::{index::vector::VectorIndex, Dataset};
 
+pub trait IndexExtension: Send + Sync {
+    fn index_type(&self) -> IndexType;
+
+    // TODO: this shouldn't exist, as upcasting should be well defined
+    // fix after https://github.com/rust-lang/rust/issues/65991
+    fn to_generic(self: Arc<Self>) -> Arc<dyn IndexExtension>;
+
+    fn to_scalar(self: Arc<Self>) -> Option<Arc<dyn ScalarIndexExtension>>;
+
+    fn to_vector(self: Arc<Self>) -> Option<Arc<dyn VectorIndexExtension>>;
+}
+
+pub trait ScalarIndexExtension: IndexExtension {
+    // TODO: implement this trait and wire it in
+}
+
 #[async_trait::async_trait]
-pub trait VectorIndexExtension: Send + Sync {
-    /// TODO: add create_index and optimize_index methods
+pub trait VectorIndexExtension: IndexExtension {
+    async fn create_index(
+        &self,
+        // Can't use Arc<Dataset> here
+        // because we need &mut Dataset to call `create_index`
+        // if we wrap into an Arc, the mutable reference is lost
+        dataset: &Dataset,
+        column: &str,
+        uuid: &str,
+        params: &dyn IndexParams,
+    ) -> Result<()>;
 
     /// Load a vector index from a file.
     async fn load_index(
@@ -25,19 +51,18 @@ pub trait VectorIndexExtension: Send + Sync {
 #[cfg(test)]
 mod test {
     use crate::{
-        dataset::{
-            builder::DatasetBuilder,
-            scanner::test_dataset::TestVectorDataset,
-            transaction::{Operation, Transaction},
-        },
+        dataset::{builder::DatasetBuilder, scanner::test_dataset::TestVectorDataset},
         index::{DatasetIndexInternalExt, PreFilter},
-        io::commit::commit_transaction,
         session::Session,
     };
 
     use super::*;
 
-    use std::{any::Any, collections::HashMap, sync::Arc};
+    use std::{
+        any::Any,
+        collections::HashMap,
+        sync::{atomic::AtomicBool, Arc},
+    };
 
     use arrow_array::RecordBatch;
     use arrow_schema::Schema;
@@ -52,7 +77,6 @@ mod test {
     use lance_table::io::manifest::ManifestDescribing;
     use roaring::RoaringBitmap;
     use serde_json::json;
-    use uuid::Uuid;
 
     #[derive(Debug)]
     struct MockIndex;
@@ -116,10 +140,82 @@ mod test {
         }
     }
 
-    struct MockIndexExtension {}
+    struct MockIndexExtension {
+        create_index_called: AtomicBool,
+        load_index_called: AtomicBool,
+    }
+
+    impl MockIndexExtension {
+        fn new() -> Self {
+            Self {
+                create_index_called: AtomicBool::new(false),
+                load_index_called: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl IndexExtension for MockIndexExtension {
+        fn index_type(&self) -> IndexType {
+            IndexType::Vector
+        }
+
+        fn to_generic(self: Arc<Self>) -> Arc<dyn IndexExtension> {
+            self
+        }
+
+        fn to_scalar(self: Arc<Self>) -> Option<Arc<dyn ScalarIndexExtension>> {
+            None
+        }
+
+        fn to_vector(self: Arc<Self>) -> Option<Arc<dyn VectorIndexExtension>> {
+            Some(self)
+        }
+    }
 
     #[async_trait::async_trait]
     impl VectorIndexExtension for MockIndexExtension {
+        async fn create_index(
+            &self,
+            dataset: &Dataset,
+            _column: &str,
+            uuid: &str,
+            _params: &dyn IndexParams,
+        ) -> Result<()> {
+            let store = dataset.object_store.clone();
+            let path = dataset
+                .indices_dir()
+                .child(uuid.to_string())
+                .child(INDEX_FILE_NAME);
+
+            let writer = store.create(&path).await.unwrap();
+
+            let arrow_schema = Arc::new(Schema::new(vec![VECTOR_ID_FIELD.clone()]));
+            let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref()).unwrap();
+            let mut writer: FileWriter<ManifestDescribing> =
+                FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())
+                    .unwrap();
+            writer.add_metadata(
+                INDEX_METADATA_SCHEMA_KEY,
+                json!(IndexMetadata {
+                    index_type: "TEST".to_string(),
+                    distance_type: "cosine".to_string(),
+                })
+                .to_string()
+                .as_str(),
+            );
+
+            writer
+                .write(&[RecordBatch::new_empty(arrow_schema)])
+                .await
+                .unwrap();
+            writer.finish().await.unwrap();
+
+            self.create_index_called
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            Ok(())
+        }
+
         async fn load_index(
             &self,
             _dataset: Arc<Dataset>,
@@ -127,125 +223,104 @@ mod test {
             _uuid: &str,
             _reader: FileReader,
         ) -> Result<Arc<dyn VectorIndex>> {
+            self.load_index_called
+                .store(true, std::sync::atomic::Ordering::Release);
+
             Ok(Arc::new(MockIndex))
         }
     }
 
-    async fn make_empty_index(
-        dataset: &mut Dataset,
-        index_type: &str,
-        index_uuid: &Uuid,
-        column: &str,
-    ) {
-        // write an index
-        let store = dataset.object_store.clone();
-        let path = dataset
-            .indices_dir()
-            .child(index_uuid.to_string())
-            .child(INDEX_FILE_NAME);
-        let writer = store.create(&path).await.unwrap();
+    struct MockIndexParams;
 
-        let arrow_schema = Arc::new(Schema::new(vec![VECTOR_ID_FIELD.clone()]));
-        let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut writer: FileWriter<ManifestDescribing> =
-            FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default()).unwrap();
-        writer.add_metadata(
-            INDEX_METADATA_SCHEMA_KEY,
-            json!(IndexMetadata {
-                index_type: index_type.to_string(),
-                distance_type: "cosine".to_string(),
-            })
-            .to_string()
-            .as_str(),
-        );
+    impl IndexParams for MockIndexParams {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
 
-        writer
-            .write(&[RecordBatch::new_empty(arrow_schema)])
-            .await
-            .unwrap();
-        writer.finish().await.unwrap();
+        fn index_type(&self) -> IndexType {
+            IndexType::Vector
+        }
 
-        // check in the metadat to point at the index
-
-        let field = dataset.schema().field(column).unwrap();
-
-        let new_idx = lance_table::format::Index {
-            uuid: *index_uuid,
-            name: "test".to_string(),
-            fields: vec![field.id],
-            dataset_version: dataset.manifest.version,
-            fragment_bitmap: Some(
-                dataset
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            ),
-        };
-
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices: vec![],
-            },
-            None,
-        );
-
-        let new_manifest = commit_transaction(
-            dataset,
-            dataset.object_store(),
-            dataset.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-        )
-        .await
-        .unwrap();
-
-        dataset.manifest = Arc::new(new_manifest);
+        fn index_name(&self) -> &str {
+            "TEST"
+        }
     }
 
     #[tokio::test]
-    async fn test_vector_index_extension() {
+    async fn test_vector_index_extension_roundtrip() {
         // make dataset and index that is not supported natively
-        let mut test_ds = TestVectorDataset::new().await.unwrap();
-
+        let test_ds = TestVectorDataset::new().await.unwrap();
         let idx = test_ds.dataset.load_indices().await.unwrap();
         assert_eq!(idx.len(), 0);
 
-        let index_uuid = Uuid::new_v4();
+        let idx_ext = Arc::new(MockIndexExtension::new());
+        // make a new index with the extension
+        let mut session = Session::default();
+        session
+            .register_index_extension("TEST".into(), idx_ext.clone())
+            .unwrap();
 
-        make_empty_index(&mut test_ds.dataset, "TEST", &index_uuid, "vec").await;
+        // neither has been called
+        assert!(!idx_ext
+            .create_index_called
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(!idx_ext
+            .load_index_called
+            .load(std::sync::atomic::Ordering::Acquire));
 
-        let idx = test_ds.dataset.load_indices().await.unwrap();
+        let mut ds_with_extension =
+            DatasetBuilder::from_uri(test_ds.tmp_dir.path().to_str().unwrap())
+                .with_session(Arc::new(session))
+                .load()
+                .await
+                .unwrap();
+
+        // create index
+        ds_with_extension
+            .create_index(&["vec"], IndexType::Vector, None, &MockIndexParams, false)
+            .await
+            .unwrap();
+
+        // create index should have been called
+        assert!(idx_ext
+            .create_index_called
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(!idx_ext
+            .load_index_called
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // check that the index was created
+        let ds_without_extension =
+            DatasetBuilder::from_uri(test_ds.tmp_dir.path().to_str().unwrap())
+                .load()
+                .await
+                .unwrap();
+        let idx = ds_without_extension.load_indices().await.unwrap();
         assert_eq!(idx.len(), 1);
+        // get the index uuid
+        let index_uuid = idx.first().unwrap().uuid.to_string();
 
         // trying to open the index should fail as there is no extension loader
-        assert!(test_ds
-            .dataset
-            .open_vector_index("vec", &index_uuid.to_string())
+        assert!(ds_without_extension
+            .open_vector_index("vec", &index_uuid)
             .await
             .unwrap_err()
             .to_string()
             .contains("Unsupported index type: TEST"));
 
-        // make a session with extension loader
-        let mut session = Session::default();
-        session
-            .register_vector_index_extension("TEST".into(), Arc::new(MockIndexExtension {}))
-            .unwrap();
-
-        let ds_with_extension = DatasetBuilder::from_uri(test_ds.tmp_dir.path().to_str().unwrap())
-            .with_session(Arc::new(session))
-            .load()
-            .await
-            .unwrap();
-
+        // trying to open the index should succeed with the extension loader
         let vector_index = ds_with_extension
-            .open_vector_index("vec", &index_uuid.to_string())
+            .open_vector_index("vec", &index_uuid)
             .await
             .unwrap();
+
+        // load index should have been called
+        assert!(idx_ext
+            .create_index_called
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(idx_ext
+            .load_index_called
+            .load(std::sync::atomic::Ordering::Acquire));
 
         // should be able to downcast to the mock index
         let _downcasted = vector_index.as_any().downcast_ref::<MockIndex>().unwrap();
