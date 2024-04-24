@@ -526,6 +526,7 @@ where
     pub async fn compute_multiple_memberships(
         &self,
         data: Arc<T::ArrayType>,
+        replicate_factor: f32,
         max_replica: usize,
     ) -> KMeanMultipleMembership {
         let dimension = self.dimension;
@@ -545,7 +546,7 @@ where
 
                     match metric_type {
                         MetricType::L2 => {
-                            return compute_multiple_partitions_l2(centroids_array, values, dimension,max_replica)
+                            return compute_multiple_partitions_l2(centroids_array, values, dimension,replicate_factor, max_replica)
                         }
                         // MetricType::Dot => values
                         //     .chunks_exact(dimension)
@@ -708,12 +709,12 @@ fn compute_multiple_partitions_l2<'a, T: FloatToArrayType>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
+    replicate_factor: f32,
     max_replica: usize,
 ) -> Vec<Option<Vec<(u32, f32)>>>
 where
     T::ArrowType: L2,
 {
-    const REPLICATE_FACTOR: f32 = 0.04;
     data.chunks(dim)
         .map(|row| {
             let mut dists = l2_distance_batch(row, centroids, dim)
@@ -728,7 +729,7 @@ where
             let mut keep_length = 1;
             while keep_length < max_replica
                 && keep_length < dists.len()
-                && dists[keep_length].1 < min_dist * (1.0 + REPLICATE_FACTOR)
+                && dists[keep_length].1 < min_dist * replicate_factor
             {
                 keep_length += 1;
             }
@@ -757,6 +758,33 @@ where
         .cluster_id_and_distances
         .iter()
         .map(|cluster_and_dist| cluster_and_dist.map(|(cluster, _)| cluster))
+        .collect()
+}
+
+/// Compute partition IDs of each vector in the KMeans.
+pub async fn compute_multiple_partitions<T: ArrowFloatType>(
+    centroids: Arc<T::ArrayType>,
+    vectors: Arc<T::ArrayType>,
+    dimension: usize,
+    metric_type: MetricType,
+    replicate_factor: f32,
+    max_replica: usize,
+) -> Vec<Option<Vec<u32>>>
+where
+    <T::Native as FloatToArrayType>::ArrowType: Dot + L2 + Normalize,
+{
+    let kmeans: KMeans<T> = KMeans::with_centroids(centroids, dimension, metric_type);
+    let membership = kmeans
+        .compute_multiple_memberships(vectors, replicate_factor, max_replica)
+        .await;
+    membership
+        .assignments
+        .iter()
+        .map(|assignment| {
+            assignment
+                .as_ref()
+                .map(|a| a.iter().map(|(c, _)| *c).collect())
+        })
         .collect()
 }
 

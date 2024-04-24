@@ -102,7 +102,7 @@ pub(super) async fn build_hnsw_partitions(
     quantizer: Quantizer,
     metric_type: MetricType,
     hnsw_params: &HnswBuildParams,
-    part_range: Range<u32>,
+    part_range: Option<Range<u32>>,
     precomputed_partitons: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
@@ -137,7 +137,7 @@ pub(super) async fn build_hnsw_partitions(
         metric_type,
         column,
         quantizer.clone(),
-        Some(part_range),
+        part_range,
     )?;
 
     let stream = shuffle_dataset(

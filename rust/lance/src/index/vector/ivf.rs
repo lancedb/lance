@@ -1350,7 +1350,6 @@ async fn write_ivf_hnsw_file(
     );
 
     let start = std::time::Instant::now();
-    let num_partitions = ivf.num_partitions() as u32;
 
     let (hnsw_metadata, aux_ivf) = builder::build_hnsw_partitions(
         dataset,
@@ -1362,7 +1361,7 @@ async fn write_ivf_hnsw_file(
         quantizer,
         distance_type,
         hnsw_params,
-        0..num_partitions,
+        None,
         precomputed_partitons,
         shuffle_partition_batches,
         shuffle_partition_concurrency,
