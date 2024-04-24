@@ -2533,14 +2533,37 @@ mod tests {
             .map(|v| v.unwrap() as u32)
             .collect::<HashSet<_>>();
 
-        let gt = ground_truth(&mat, query.values(), k);
-        let recall = results.intersection(&gt).count() as f32 / k as f32;
+        let row_ids = results[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap() as u32)
+            .collect::<Vec<_>>();
+        let dists = results[0]
+            .column_by_name("_distance")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+
+        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
+        let gt = ground_truth(&mat, query.values(), k, DistanceType::L2);
+
+        let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
+        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+
+        let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
             recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
-            results.iter().sorted().collect_vec(),
-            gt.iter().sorted().collect_vec()
+            results,
+            gt,
         );
     }
 
