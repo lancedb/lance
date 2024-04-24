@@ -124,13 +124,14 @@ fn bench_uint_distance(c: &mut Criterion) {
     let target = repeat_with(|| rng.gen::<u8>())
         .take(TOTAL * DIMENSION)
         .collect::<Vec<_>>();
+    let bounds = vec![1.0..2.0; DIMENSION];
 
     c.bench_function("L2(uint8, scalar)", |b| {
         b.iter(|| {
             black_box(
                 target
                     .chunks_exact(DIMENSION)
-                    .map(|tgt| l2_distance_uint_scalar(&key, tgt))
+                    .map(|tgt| l2_distance_uint_scalar(&key, tgt, &bounds))
                     .collect::<Vec<_>>(),
             );
         });

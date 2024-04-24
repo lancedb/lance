@@ -31,7 +31,7 @@ pub const SQ_METADATA_KEY: &str = "lance:sq";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScalarQuantizationMetadata {
     pub num_bits: u16,
-    pub bounds: Range<f64>,
+    pub bounds: Vec<Range<f64>>,
 }
 
 #[async_trait]
@@ -61,7 +61,7 @@ pub struct ScalarQuantizationStorage {
 
     // Metadata
     num_bits: u16,
-    bounds: Range<f64>,
+    bounds: Vec<Range<f64>>,
 
     // Row IDs and SQ codes
     batch: RecordBatch,
@@ -75,7 +75,7 @@ impl ScalarQuantizationStorage {
     pub fn new(
         num_bits: u16,
         metric_type: MetricType,
-        bounds: Range<f64>,
+        bounds: Vec<Range<f64>>,
         batch: RecordBatch,
     ) -> Result<Self> {
         let row_ids = Arc::new(
@@ -119,8 +119,8 @@ impl ScalarQuantizationStorage {
         self.metric_type
     }
 
-    pub fn bounds(&self) -> Range<f64> {
-        self.bounds.clone()
+    pub fn bounds(&self) -> &[Range<f64>] {
+        &self.bounds
     }
 
     pub fn batch(&self) -> &RecordBatch {
@@ -223,6 +223,7 @@ impl VectorStorage for ScalarQuantizationStorage {
     fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator> {
         Box::new(SQDistCalculator {
             query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
+            bounds: self.bounds.clone(),
             sq_codes: self.sq_codes.clone(),
         })
     }
@@ -237,15 +238,17 @@ impl VectorStorage for ScalarQuantizationStorage {
 
 struct SQDistCalculator {
     query_sq_code: Vec<u8>,
+    bounds: Vec<Range<f64>>,
     sq_codes: Arc<FixedSizeListArray>,
 }
 
 impl SQDistCalculator {
-    fn new(query: ArrayRef, sq_codes: Arc<FixedSizeListArray>, bounds: Range<f64>) -> Self {
+    fn new(query: ArrayRef, sq_codes: Arc<FixedSizeListArray>, bounds: Vec<Range<f64>>) -> Self {
         let query_sq_code =
-            scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), bounds);
+            scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), &bounds);
         Self {
             query_sq_code,
+            bounds,
             sq_codes,
         }
     }
@@ -254,7 +257,7 @@ impl SQDistCalculator {
 impl DistCalculator for SQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let sq_code = get_sq_code(&self.sq_codes, id);
-        l2_distance_uint_scalar(sq_code, &self.query_sq_code)
+        l2_distance_uint_scalar(sq_code, &self.query_sq_code, &self.bounds)
     }
 }
 

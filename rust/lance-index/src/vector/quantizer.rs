@@ -147,7 +147,7 @@ impl Quantization for ScalarQuantizer {
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
         Ok(serde_json::to_value(ScalarQuantizationMetadata {
             num_bits: self.num_bits(),
-            bounds: self.bounds(),
+            bounds: self.bounds().to_vec(),
         })?)
     }
 }
