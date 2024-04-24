@@ -2523,16 +2523,6 @@ mod tests {
         assert_eq!(1, results.len());
         assert_eq!(k, results[0].num_rows());
 
-        let results = results[0]
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .iter()
-            .map(|v| v.unwrap() as u32)
-            .collect::<HashSet<_>>();
-
         let row_ids = results[0]
             .column_by_name(ROW_ID)
             .unwrap()
