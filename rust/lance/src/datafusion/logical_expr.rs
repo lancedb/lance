@@ -241,13 +241,13 @@ pub mod tests {
 
     impl ExprExt for Expr {
         fn field_newstyle(&self, name: &str) -> Expr {
-            Expr::ScalarFunction(ScalarFunction {
+            Self::ScalarFunction(ScalarFunction {
                 func_def: ScalarFunctionDefinition::UDF(Arc::new(ScalarUDF::new_from_impl(
                     GetFieldFunc::default(),
                 ))),
                 args: vec![
                     self.clone(),
-                    Expr::Literal(ScalarValue::Utf8(Some(name.to_string()))),
+                    Self::Literal(ScalarValue::Utf8(Some(name.to_string()))),
                 ],
             })
         }

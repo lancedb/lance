@@ -2471,10 +2471,11 @@ mod tests {
         let ivf_params =
             IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
 
+        let distance_type = MetricType::L2;
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::L2,
+            distance_type,
             ivf_params,
             hnsw_params,
             sq_params,
@@ -2533,14 +2534,15 @@ mod tests {
             .map(|v| v.unwrap() as u32)
             .collect::<HashSet<_>>();
 
-        let gt = ground_truth(&mat, query.values(), k);
-        let recall = results.intersection(&gt).count() as f32 / k as f32;
+        let gt = ground_truth(&mat, query.values(), k, distance_type);
+        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+        let recall = results.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
             recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results.iter().sorted().collect_vec(),
-            gt.iter().sorted().collect_vec()
+            gt_set.iter().sorted().collect_vec()
         );
     }
 
