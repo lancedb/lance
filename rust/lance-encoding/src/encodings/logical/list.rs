@@ -447,7 +447,6 @@ impl ArrayEncoder for ListOffsetsEncoder {
             // Nothing to patch, don't incur a copy
             return self.inner.encode(arrays, buffer_index);
         }
-        println!("Stitching offsets {:?}", arrays);
         let num_offsets =
             arrays.iter().map(|array| array.len()).sum::<usize>() - (arrays.len() - 1);
         let mut offsets = Vec::with_capacity(num_offsets);
@@ -472,7 +471,6 @@ impl ArrayEncoder for ListOffsetsEncoder {
                     .map(|&v| v + last_prev_offset - first_curr_offset),
             );
         }
-        println!("Stitched offsets {:?}", offsets);
         self.inner
             .encode(&[Arc::new(Int32Array::from(offsets))], buffer_index)
     }
