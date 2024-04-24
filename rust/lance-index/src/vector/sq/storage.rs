@@ -232,6 +232,7 @@ impl VectorStorage for ScalarQuantizationStorage {
         l2_distance_uint_scalar(
             get_sq_code(&self.sq_codes, a),
             get_sq_code(&self.sq_codes, b),
+            &self.bounds,
         )
     }
 }
