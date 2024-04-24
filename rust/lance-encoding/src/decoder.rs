@@ -418,6 +418,7 @@ impl DecodeBatchScheduler {
                         Box::new(ListPageScheduler::new(
                             offsets_page,
                             vec![items_page],
+                            items_field.data_type().clone(),
                             DataType::Int32,
                         )) as Box<dyn LogicalPageScheduler>
                     })

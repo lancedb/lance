@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
-    encoder::{EncodedArray, EncodedPage, FieldEncoder},
+    encoder::{EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
     format::pb,
     EncodingsIo,
 };
@@ -553,10 +553,7 @@ impl StructFieldEncoder {
 }
 
 impl FieldEncoder for StructFieldEncoder {
-    fn maybe_encode(
-        &mut self,
-        array: ArrayRef,
-    ) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         self.num_rows_seen += array.len() as u32;
         let struct_array = array.as_struct();
         let child_tasks = self
@@ -568,7 +565,7 @@ impl FieldEncoder for StructFieldEncoder {
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
     }
 
-    fn flush(&mut self) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
         let child_tasks = self
             .children
             .iter_mut()
@@ -607,7 +604,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::testing::check_round_trip_encoding;
+    use crate::testing::check_round_trip_encoding_random;
 
     #[test_log::test(tokio::test)]
     async fn test_simple_struct() {
@@ -616,6 +613,6 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
         let field = Field::new("", data_type, false);
-        check_round_trip_encoding(field).await;
+        check_round_trip_encoding_random(field).await;
     }
 }
