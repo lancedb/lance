@@ -8,10 +8,8 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{cast::AsArray, types::Float32Type, Float32Array, RecordBatch, UInt64Array};
-
+use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use async_trait::async_trait;
-use lance_arrow::*;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_index::{
@@ -169,12 +167,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             });
         }
 
-        let results = self.hnsw.search(
-            query.key.as_primitive::<Float32Type>().as_slice(),
-            k,
-            ef,
-            bitmap,
-        )?;
+        let results = self.hnsw.search(query.key.clone(), k, ef, bitmap)?;
 
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.id as usize]));
         let distances = Arc::new(Float32Array::from_iter_values(

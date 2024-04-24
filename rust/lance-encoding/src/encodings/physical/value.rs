@@ -185,7 +185,7 @@ pub(crate) mod tests {
 
     use arrow_schema::{DataType, Field, TimeUnit};
 
-    use crate::testing::check_round_trip_encoding;
+    use crate::testing::check_round_trip_encoding_random;
 
     const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Date32,
@@ -216,7 +216,7 @@ pub(crate) mod tests {
     async fn test_value_primitive() {
         for data_type in PRIMITIVE_TYPES {
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding(field).await;
+            check_round_trip_encoding_random(field).await;
         }
     }
 }

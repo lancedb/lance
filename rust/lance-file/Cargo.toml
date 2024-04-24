@@ -28,6 +28,7 @@ bytes.workspace = true
 datafusion-common.workspace = true
 futures.workspace = true
 lance-datagen.workspace = true
+log.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true
 object_store.workspace = true

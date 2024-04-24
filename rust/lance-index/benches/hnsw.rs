@@ -44,7 +44,7 @@ fn bench_hnsw(c: &mut Criterion) {
                 .await
                 .unwrap();
                 let uids: HashSet<u32> = hnsw
-                    .search(query, K, 300, None)
+                    .search(query.clone(), K, 300, None)
                     .unwrap()
                     .iter()
                     .map(|node| node.id)

@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::datatypes::UInt32Type;
+use arrow_array::ArrayRef;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
@@ -351,7 +352,7 @@ impl HNSW {
     /// A list of `(id_in_graph, distance)` pairs. Or Error if the search failed.
     pub fn search(
         &self,
-        query: &[f32],
+        query: ArrayRef,
         k: usize,
         ef: usize,
         bitset: Option<RoaringBitmap>,
@@ -597,7 +598,7 @@ mod tests {
     fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
         let mut dists = vec![];
         for i in 0..mat.num_rows() {
-            let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
+            let dist = lance_linalg::distance::l2_distance(query, mat.row_ref(i).unwrap());
             dists.push((dist, i as u32));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -629,12 +630,12 @@ mod tests {
         .unwrap();
 
         let results: HashSet<u32> = hnsw
-            .search(q, K, 128, None)
+            .search(q.clone(), K, 128, None)
             .unwrap()
             .iter()
             .map(|node| node.id)
             .collect();
-        let gt = ground_truth(&mat, q, K);
+        let gt = ground_truth(&mat, q.as_primitive::<Float32Type>().values(), K);
         let recall = results.intersection(&gt).count() as f32 / K as f32;
         assert!(recall >= 0.9, "Recall: {}", recall);
     }

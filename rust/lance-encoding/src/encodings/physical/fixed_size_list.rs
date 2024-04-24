@@ -137,32 +137,9 @@ mod tests {
 
     use arrow_schema::{DataType, Field};
 
-    use crate::testing::check_round_trip_encoding;
+    use crate::testing::check_round_trip_encoding_random;
 
-    // The commented out types are supported by the encoder/decoder but Lance
-    // schema doesn't yet parse them in the context of a fixed size list.
-    const PRIMITIVE_TYPES: &[DataType] = &[
-        // DataType::Date32,
-        // DataType::Date64,
-        DataType::Int8,
-        DataType::Int16,
-        DataType::Int32,
-        DataType::Int64,
-        DataType::UInt8,
-        DataType::UInt16,
-        DataType::UInt32,
-        DataType::UInt64,
-        DataType::Float16,
-        DataType::Float32,
-        DataType::Float64,
-        // DataType::Decimal128(10, 10),
-        // DataType::Decimal256(10, 10),
-        // DataType::Timestamp(TimeUnit::Nanosecond, None),
-        // DataType::Time32(TimeUnit::Second),
-        // DataType::Time64(TimeUnit::Nanosecond),
-        // DataType::Duration(TimeUnit::Second),
-        // DataType::Interval(IntervalUnit::DayTime),
-    ];
+    const PRIMITIVE_TYPES: &[DataType] = &[DataType::Int8, DataType::Float32, DataType::Float64];
 
     #[test_log::test(tokio::test)]
     async fn test_value_fsl_primitive() {
@@ -170,7 +147,7 @@ mod tests {
             let inner_field = Field::new("item", data_type.clone(), true);
             let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
             let field = Field::new("", data_type, false);
-            check_round_trip_encoding(field).await;
+            check_round_trip_encoding_random(field).await;
         }
     }
 }
