@@ -208,7 +208,7 @@ pub fn generate_random_array(n: usize) -> Float32Array {
 /// Create a random float32 array where each element is uniformly distributed a
 /// given range.
 pub fn generate_random_array_with_range(n: usize, range: Range<f32>) -> Float32Array {
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::from_seed([13; 32]);
     let distribution = Uniform::new(range.start, range.end);
     Float32Array::from_iter_values(repeat_with(|| distribution.sample(&mut rng)).take(n))
 }
