@@ -271,6 +271,7 @@ class LanceFragmentWriter:
             schema=self.schema,
             max_rows_per_file=self.max_rows_per_file,
             max_rows_per_group=self.max_rows_per_group,
+            use_experimental_writer=self.use_experimental_writer,
         )
         return pa.Table.from_pydict(
             {

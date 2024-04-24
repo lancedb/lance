@@ -49,7 +49,7 @@ impl Default for HnswBuildParams {
             max_level: 7,
             m: 20,
             m_max: 40,
-            ef_construction: 100,
+            ef_construction: 150,
             use_select_heuristic: true,
             parallel_limit: None,
         }
@@ -144,12 +144,22 @@ impl HNSWBuilder {
     /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
     pub async fn build(&mut self) -> Result<HNSW> {
         log::info!(
-            "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
+            "Building HNSW graph: num={}, metric_type={}, max_levels={}, m_max={}, ef_construction={}",
+            self.inner.vectors.len(),
             self.inner.vectors.metric_type(),
             self.inner.params.max_level,
             self.inner.params.m_max,
             self.inner.params.ef_construction
         );
+
+        if self.inner.vectors.len() <= 1 {
+            return Ok(HNSW::from_builder(
+                self,
+                self.inner.entry_point,
+                self.inner.vectors.metric_type(),
+                self.inner.params.use_select_heuristic,
+            ));
+        }
 
         let parallel_limit = self
             .inner
@@ -320,18 +330,22 @@ impl HNSWBuilderInner {
     }
 
     fn prune(&self, id: u32, level: u16) {
+        let m_max = match level {
+            0 => self.params.m_max,
+            _ => self.params.m,
+        };
+
         let node = &self.nodes.read().unwrap()[id as usize];
 
         let mut level_neighbors = node.level_neighbors[level as usize].write().unwrap();
-        if level_neighbors.len() <= self.params.m_max {
+        if level_neighbors.len() <= m_max {
             return;
         }
 
         let neighbors = level_neighbors.iter().cloned().collect_vec();
 
         let level_view = HnswLevelView::new(level, self);
-        let new_neighbors =
-            select_neighbors_heuristic(&level_view, &neighbors, self.params.m_max).collect();
+        let new_neighbors = select_neighbors_heuristic(&level_view, &neighbors, m_max).collect();
 
         *level_neighbors = new_neighbors;
     }

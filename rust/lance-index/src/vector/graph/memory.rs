@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use super::storage::{DistCalculator, VectorStorage};
+use arrow::array::AsArray;
 use arrow_array::types::Float32Type;
+use arrow_array::ArrayRef;
 use lance_linalg::{distance::MetricType, MatrixView};
 
 /// All data are stored in memory
@@ -26,7 +28,7 @@ impl InMemoryVectorStorage {
         }
     }
 
-    pub fn vector(&self, id: u32) -> &[f32] {
+    pub fn vector(&self, id: u32) -> ArrayRef {
         self.vectors.row(id as usize).unwrap()
     }
 }
@@ -48,10 +50,10 @@ impl VectorStorage for InMemoryVectorStorage {
         self.metric_type
     }
 
-    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator> {
+    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator> {
         Box::new(InMemoryDistanceCal {
             vectors: self.vectors.clone(),
-            query: query.to_vec(),
+            query,
             metric_type: self.metric_type,
         })
     }
@@ -59,29 +61,29 @@ impl VectorStorage for InMemoryVectorStorage {
     fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator> {
         Box::new(InMemoryDistanceCal {
             vectors: self.vectors.clone(),
-            query: self.vectors.row(id as usize).unwrap().to_vec(),
+            query: self.vectors.row(id as usize).unwrap(),
             metric_type: self.metric_type,
         })
     }
 
     /// Distance between two vectors.
     fn distance_between(&self, a: u32, b: u32) -> f32 {
-        let vector1 = self.vectors.row(a as usize).unwrap();
-        let vector2 = self.vectors.row(b as usize).unwrap();
+        let vector1 = self.vectors.row_ref(a as usize).unwrap();
+        let vector2 = self.vectors.row_ref(b as usize).unwrap();
         self.metric_type.func()(vector1, vector2)
     }
 }
 
 struct InMemoryDistanceCal {
     vectors: Arc<MatrixView<Float32Type>>,
-    query: Vec<f32>,
+    query: ArrayRef,
     metric_type: MetricType,
 }
 
 impl DistCalculator for InMemoryDistanceCal {
     #[inline]
     fn distance(&self, id: u32) -> f32 {
-        let vector = self.vectors.row(id as usize).unwrap();
-        self.metric_type.func()(&self.query, vector)
+        let vector = self.vectors.row_ref(id as usize).unwrap();
+        self.metric_type.func()(self.query.as_primitive::<Float32Type>().values(), vector)
     }
 }

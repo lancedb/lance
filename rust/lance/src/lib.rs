@@ -68,7 +68,11 @@
 //!
 //! ```
 //!
+use std::sync::Arc;
+
+use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
+use lance_core::ROW_ID_FIELD;
 pub use lance_core::{datatypes, error};
 pub use lance_core::{Error, Result};
 
@@ -82,6 +86,7 @@ pub mod table;
 pub mod utils;
 
 pub use dataset::Dataset;
+use lance_index::vector::DIST_COL;
 
 /// Creates and loads a [`Dataset`] from the given path.
 /// Infers the storage backend to use from the scheme in the given table path.
@@ -89,4 +94,14 @@ pub use dataset::Dataset;
 /// For more advanced configurations use [`DatasetBuilder`].
 pub async fn open_dataset<T: AsRef<str>>(table_uri: T) -> Result<Dataset> {
     DatasetBuilder::from_uri(table_uri.as_ref()).load().await
+}
+
+lazy_static::lazy_static! {
+    pub static ref DIST_FIELD : arrow_schema::Field = arrow_schema::Field::new(DIST_COL, DataType::Float32, true);
+    /// Row ID field. This is nullable because its validity bitmap is sometimes used
+    /// as a selection vector.
+    pub static ref RESULT_SCHEMA: Arc<arrow_schema::Schema> = Arc::new(arrow_schema::Schema::new(vec![
+        DIST_FIELD.clone(),
+        ROW_ID_FIELD.clone(),
+    ]));
 }

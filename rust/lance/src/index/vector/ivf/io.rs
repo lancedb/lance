@@ -31,7 +31,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::MetricType;
-use lance_linalg::kernels::normalize_arrow;
+use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -317,6 +317,11 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         )
         .await?;
 
+        if row_id_array.is_empty() {
+            tasks.push(tokio::spawn(async { Ok(0) }));
+            continue;
+        }
+
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_writer = FileWriter::<ManifestDescribing>::try_new(
             &object_store,
@@ -368,13 +373,20 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let mut aux_ivf = IvfData::empty();
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     for (part_id, task) in tasks.into_iter().enumerate() {
+        let offset = writer.tell().await?;
         let length = task.await??;
+
+        if length == 0 {
+            ivf.add_partition(offset, 0);
+            aux_ivf.add_partition(0);
+            hnsw_metadata.push(HnswMetadata::default());
+            continue;
+        }
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
             FileReader::try_new_self_described(&object_store, part_file, None).await?;
 
-        let offset = writer.tell().await?;
         let batches = futures::stream::iter(0..part_reader.num_batches())
             .map(|batch_id| {
                 part_reader.read_batch(
@@ -392,6 +404,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         hnsw_metadata.push(serde_json::from_str(
             part_reader.schema().metadata[HNSW_METADATA_KEY].as_str(),
         )?);
+        std::mem::drop(part_reader);
+        object_store.delete(part_file).await?;
 
         if let Some(aux_writer) = auxiliary_writer.as_mut() {
             let aux_part_reader =
@@ -409,6 +423,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                 .buffered(num_cpus::get())
                 .try_collect::<Vec<_>>()
                 .await?;
+            std::mem::drop(aux_part_reader);
+            object_store.delete(aux_part_file).await?;
 
             let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             aux_writer.write(&batches).await?;
@@ -446,12 +462,12 @@ async fn build_hnsw_quantization_partition(
     let mut metric_type = metric_type;
     if metric_type == MetricType::Cosine {
         // Normalize vectors for cosine similarity
-        vectors = normalize_arrow(&vectors)?;
+        vectors =
+            Arc::new(spawn_cpu(move || Ok(normalize_fsl(vectors.as_fixed_size_list())?)).await?);
         metric_type = MetricType::L2;
     }
 
-    let fsl = vectors.clone();
-    let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), fsl, writer);
+    let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), vectors.clone(), writer);
 
     let build_store = match quantizer {
         Quantizer::Product(pq) => tokio::spawn(build_and_write_pq_storage(

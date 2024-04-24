@@ -145,6 +145,8 @@ class LanceFragment(pa.dataset.Fragment):
         max_rows_per_group: int = 1024,
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
+        *,
+        use_experimental_writer=False,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -213,6 +215,7 @@ class LanceFragment(pa.dataset.Fragment):
             max_rows_per_group=max_rows_per_group,
             progress=progress,
             mode=mode,
+            use_experimental_writer=use_experimental_writer,
         )
         return FragmentMetadata(inner_meta.json())
 

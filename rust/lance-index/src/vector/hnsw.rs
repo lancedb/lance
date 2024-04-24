@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::datatypes::UInt32Type;
+use arrow_array::ArrayRef;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
@@ -178,7 +179,7 @@ impl Debug for HNSW {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HnswMetadata {
     entry_point: u32,
     level_offsets: Vec<usize>,
@@ -196,7 +197,7 @@ impl HNSW {
 
     /// The number of nodes in the level 0 of the graph.
     pub fn len(&self) -> usize {
-        self.levels[0].len()
+        self.levels.first().map_or(0, |level| level.len())
     }
 
     pub fn storage(&self) -> &dyn VectorStorage {
@@ -263,6 +264,10 @@ impl HNSW {
         vector_storage: Arc<dyn VectorStorage>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
+        if range.is_empty() {
+            return Ok(Self::empty());
+        }
+
         let levels = futures::stream::iter(0..metadata.level_offsets.len() - 1)
             .map(|i| {
                 let start = range.start + metadata.level_offsets[i];
@@ -347,7 +352,7 @@ impl HNSW {
     /// A list of `(id_in_graph, distance)` pairs. Or Error if the search failed.
     pub fn search(
         &self,
-        query: &[f32],
+        query: ArrayRef,
         k: usize,
         ef: usize,
         bitset: Option<RoaringBitmap>,
@@ -593,7 +598,7 @@ mod tests {
     fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
         let mut dists = vec![];
         for i in 0..mat.num_rows() {
-            let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
+            let dist = lance_linalg::distance::l2_distance(query, mat.row_ref(i).unwrap());
             dists.push((dist, i as u32));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -625,12 +630,12 @@ mod tests {
         .unwrap();
 
         let results: HashSet<u32> = hnsw
-            .search(q, K, 128, None)
+            .search(q.clone(), K, 128, None)
             .unwrap()
             .iter()
             .map(|node| node.id)
             .collect();
-        let gt = ground_truth(&mat, q, K);
+        let gt = ground_truth(&mat, q.as_primitive::<Float32Type>().values(), K);
         let recall = results.intersection(&gt).count() as f32 / K as f32;
         assert!(recall >= 0.9, "Recall: {}", recall);
     }

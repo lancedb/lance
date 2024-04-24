@@ -330,6 +330,9 @@ impl FileReader {
         projection: &Schema,
         deletion_vector: Option<&DeletionVector>,
     ) -> Result<RecordBatch> {
+        if range.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
+        }
         let range_in_batches = self.metadata.range_to_batches(range)?;
         let batches = stream::iter(range_in_batches)
             .map(|(batch_id, range)| async move {
