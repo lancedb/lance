@@ -170,7 +170,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
 
         let hnsw = self.hnsw.clone();
         let key = query.key.clone();
-        let results = spawn_cpu(move || Ok(hnsw.search(key, k, ef, bitmap)?)).await?;
+        let results = spawn_cpu(move || hnsw.search(key, k, ef, bitmap)).await?;
 
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.id as usize]));
         let distances = Arc::new(Float32Array::from_iter_values(
