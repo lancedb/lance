@@ -4,7 +4,7 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow::{array::AsArray, datatypes::Float32Type};
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
 use async_trait::async_trait;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
@@ -212,12 +212,26 @@ impl VectorStorage for ScalarQuantizationStorage {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator> {
+    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator> {
         Box::new(SQDistCalculator::new(
             query,
             self.sq_codes.clone(),
             self.bounds.clone(),
         ))
+    }
+
+    fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator> {
+        Box::new(SQDistCalculator {
+            query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
+            sq_codes: self.sq_codes.clone(),
+        })
+    }
+
+    fn distance_between(&self, a: u32, b: u32) -> f32 {
+        l2_distance_uint_scalar(
+            get_sq_code(&self.sq_codes, a),
+            get_sq_code(&self.sq_codes, b),
+        )
     }
 }
 
@@ -227,12 +241,9 @@ struct SQDistCalculator {
 }
 
 impl SQDistCalculator {
-    fn new(query: &[f32], sq_codes: Arc<FixedSizeListArray>, bounds: Range<f64>) -> Self {
-        // TODO: support f16/f64
-        let query_sq_code = scale_to_u8::<Float32Type>(query, bounds)
-            .into_iter()
-            .collect::<Vec<_>>();
-
+    fn new(query: ArrayRef, sq_codes: Arc<FixedSizeListArray>, bounds: Range<f64>) -> Self {
+        let query_sq_code =
+            scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), bounds);
         Self {
             query_sq_code,
             sq_codes,

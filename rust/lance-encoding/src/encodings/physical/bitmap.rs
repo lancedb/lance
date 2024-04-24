@@ -154,14 +154,14 @@ mod tests {
 
     use crate::decoder::PhysicalPageDecoder;
     use crate::encodings::physical::bitmap::BitmapData;
-    use crate::testing::check_round_trip_encoding;
+    use crate::testing::check_round_trip_encoding_random;
 
     use super::BitmapDecoder;
 
     #[test_log::test(tokio::test)]
     async fn test_bitmap_boolean() {
         let field = Field::new("", DataType::Boolean, false);
-        check_round_trip_encoding(field).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test]

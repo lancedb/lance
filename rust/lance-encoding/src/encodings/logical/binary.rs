@@ -18,7 +18,7 @@ use log::trace;
 
 use crate::{
     decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
-    encoder::{EncodedPage, FieldEncoder},
+    encoder::{EncodeTask, FieldEncoder},
 };
 
 use super::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder};
@@ -210,15 +210,12 @@ impl BinaryFieldEncoder {
 }
 
 impl FieldEncoder for BinaryFieldEncoder {
-    fn maybe_encode(
-        &mut self,
-        array: ArrayRef,
-    ) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         let list_array = Self::to_list_array(array);
         self.varbin_encoder.maybe_encode(Arc::new(list_array))
     }
 
-    fn flush(&mut self) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
         self.varbin_encoder.flush()
     }
 
@@ -231,17 +228,17 @@ impl FieldEncoder for BinaryFieldEncoder {
 mod tests {
     use arrow_schema::{DataType, Field};
 
-    use crate::testing::check_round_trip_encoding;
+    use crate::testing::check_round_trip_encoding_random;
 
     #[test_log::test(tokio::test)]
     async fn test_utf8() {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding(field).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding(field).await;
+        check_round_trip_encoding_random(field).await;
     }
 }

@@ -33,6 +33,9 @@ if TYPE_CHECKING:
     from .schema import LanceSchema
 
 
+DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
+
+
 class FragmentMetadata:
     """Metadata of a Fragment in the dataset."""
 
@@ -142,6 +145,8 @@ class LanceFragment(pa.dataset.Fragment):
         max_rows_per_group: int = 1024,
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
+        *,
+        use_experimental_writer=False,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -210,6 +215,7 @@ class LanceFragment(pa.dataset.Fragment):
             max_rows_per_group=max_rows_per_group,
             progress=progress,
             mode=mode,
+            use_experimental_writer=use_experimental_writer,
         )
         return FragmentMetadata(inner_meta.json())
 
@@ -496,7 +502,7 @@ def write_fragments(
     mode: str = "append",
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
-    max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
+    max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
     use_experimental_writer: bool = False,
 ) -> List[FragmentMetadata]:

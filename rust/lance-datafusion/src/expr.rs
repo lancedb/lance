@@ -508,7 +508,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
                 match relation {
                     TableReference::Bare { table } => {
                         if table == "dummy" {
-                            Ok(Transformed::Yes(Expr::Column(Column {
+                            Ok(Transformed::yes(Expr::Column(Column {
                                 relation: None,
                                 name: column.name,
                             })))
@@ -524,12 +524,12 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
                             _ => Err(DataFusionError::Substrait("Unexpected partially or fully qualified table reference encountered when parsing filter".into()))
                 }
             } else {
-                Ok(Transformed::No(Expr::Column(column)))
+                Ok(Transformed::no(Expr::Column(column)))
             }
         }
-        _ => Ok(Transformed::No(node)),
+        _ => Ok(Transformed::no(node)),
     })?;
-    Ok(expr)
+    Ok(expr.data)
 }
 
 #[cfg(test)]

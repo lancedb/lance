@@ -2215,7 +2215,7 @@ mod tests {
     ) -> Vec<(f32, u32)> {
         let mut dists = vec![];
         for i in 0..mat.num_rows() {
-            let dist = distance_type.func()(query, mat.row(i).unwrap());
+            let dist = distance_type.func()(query, mat.row_ref(i).unwrap());
             dists.push((dist, i as u32));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());

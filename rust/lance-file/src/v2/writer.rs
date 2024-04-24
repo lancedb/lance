@@ -10,6 +10,7 @@ use lance_core::{Error, Result};
 use lance_encoding::encoder::{BatchEncoder, EncodeTask, EncodedPage, FieldEncoder};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
+use log::debug;
 use prost::Message;
 use prost_types::Any;
 use snafu::{location, Location};
@@ -148,6 +149,10 @@ impl FileWriter {
     /// Note: the future returned by this method may complete before the data has been fully
     /// flushed to the file (some data may be in the data cache or the I/O cache)
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        debug!(
+            "write_batch called with {} bytes of data",
+            batch.get_array_memory_size()
+        );
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
