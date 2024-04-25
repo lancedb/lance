@@ -56,3 +56,6 @@ prost-build.workspace = true
 [[bench]]
 name = "scheduler"
 harness = false
+
+[features]
+gcs-test = []

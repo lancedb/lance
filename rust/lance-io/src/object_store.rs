@@ -719,7 +719,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
 
         "gs" => {
             storage_options.with_env_gcs();
-            let mut builder = GoogleCloudStorageBuilder::new();
+            let mut builder = GoogleCloudStorageBuilder::new().with_url(url.as_ref());
             for (key, value) in storage_options.as_gcs_options() {
                 builder = builder.with_config(key, value);
             }
