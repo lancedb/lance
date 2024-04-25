@@ -29,7 +29,7 @@ public abstract class FragmentOperation {
   }
 
   public abstract Dataset commit(BufferAllocator allocator, String path,
-      Optional<Integer> readVersion);
+      Optional<Long> readVersion);
 
   /** Fragment append operation. */
   public static class Append extends FragmentOperation {
@@ -41,7 +41,7 @@ public abstract class FragmentOperation {
     }
 
     @Override
-    public Dataset commit(BufferAllocator allocator, String path, Optional<Integer> readVersion) {
+    public Dataset commit(BufferAllocator allocator, String path, Optional<Long> readVersion) {
       return Dataset.commitAppend(path, readVersion,
           fragments.stream().map(FragmentMetadata::getJsonMetadata).collect(Collectors.toList()));
     }

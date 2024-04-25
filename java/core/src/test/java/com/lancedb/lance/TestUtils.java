@@ -76,7 +76,6 @@ public class TestUtils {
       FragmentMetadata fragmentMeta;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
         root.allocateNew();
-        // Fill data
         VarCharVector nameVector = (VarCharVector) root.getVector("name");
         IntVector ageVector = (IntVector) root.getVector("age");
         for (int i = 0; i < rowCount; i++) {
@@ -95,7 +94,7 @@ public class TestUtils {
       return fragmentMeta;
     }
 
-    public Dataset write(int version, int rowCount) {
+    public Dataset write(long version, int rowCount) {
       FragmentMetadata metadata = createNewFragment(rowCount, rowCount);
       FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(metadata));
       return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));

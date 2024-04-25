@@ -24,6 +24,7 @@ import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
@@ -122,13 +123,13 @@ public class Dataset implements Closeable {
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
   public static Dataset commit(BufferAllocator allocator, String path,
-      FragmentOperation operation, Optional<Integer> readVersion) {
+      FragmentOperation operation, Optional<Long> readVersion) {
     var dataset = operation.commit(allocator, path, readVersion);
     dataset.allocator = allocator;
     return dataset;
   }
 
-  public static native Dataset commitAppend(String path, Optional<Integer> readVersion,
+  public static native Dataset commitAppend(String path, Optional<Long> readVersion,
       List<String> fragmentsMetadata);
 
   /**
