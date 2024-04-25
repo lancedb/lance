@@ -411,6 +411,7 @@ impl FileFragment {
             deletion_vec,
             opened_files,
             ArrowSchema::from(projection),
+            self.count_rows().await?,
         )?;
 
         if with_row_id {
@@ -1093,6 +1094,9 @@ pub struct FragmentReader {
     /// If true, deleted rows will be set to null, which is fast
     /// If false, deleted rows will be removed from the batch, requiring a copy
     make_deletions_null: bool,
+
+    // total number of rows in the fragment
+    num_rows: usize,
 }
 
 // Custom clone impl needed because it is not easy to clone Box<dyn GenericFileReader>
@@ -1112,6 +1116,7 @@ impl Clone for FragmentReader {
             fragment_id: self.fragment_id,
             with_row_id: self.with_row_id,
             make_deletions_null: self.make_deletions_null,
+            num_rows: self.num_rows,
         }
     }
 }
@@ -1143,6 +1148,7 @@ impl FragmentReader {
         deletion_vec: Option<Arc<DeletionVector>>,
         readers: Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>,
         output_schema: ArrowSchema,
+        num_rows: usize,
     ) -> Result<Self> {
         if readers.is_empty() {
             return Err(Error::IO {
@@ -1178,6 +1184,7 @@ impl FragmentReader {
             fragment_id,
             with_row_id: false,
             make_deletions_null: false,
+            num_rows,
         })
     }
 
@@ -1463,6 +1470,15 @@ impl FragmentReader {
     //
     // TODO: Move away from this by changing callers to support consuming a stream
     pub async fn legacy_read_range_as_batch(&self, range: Range<usize>) -> Result<RecordBatch> {
+        if range.start >= self.num_rows || range.end > self.num_rows {
+            return Err(Error::invalid_input(
+                format!(
+                    "range {:?} is out of bounds for fragment {} with {} rows",
+                    range, self.fragment_id, self.num_rows
+                ),
+                location!(),
+            ));
+        }
         let batches = self
             .read_range(
                 range.start as u32..range.end as u32,
