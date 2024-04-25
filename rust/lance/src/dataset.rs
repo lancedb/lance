@@ -2101,6 +2101,7 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
+    use tests::scanner::test_dataset::TestVectorDataset;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -2868,6 +2869,23 @@ mod tests {
             .unwrap(),
             values
         );
+    }
+
+    // panics with (it shouldn't)
+    // ---- handler_tests::test::test_server_takes_errors stdout ----
+    // thread 'handler_tests::test::test_server_takes_errors' panicked at /Users/robmeng/workspace/sophon2/src/lance/rust/lance-file/src/format/metadata.rs:118:25:
+    // attempt to add with overflow
+    #[tokio::test]
+    #[ignore]
+    async fn test_take_rows_out_of_bound() {
+        // a dataset with 1 fragment and 400 rows
+        let test_ds = TestVectorDataset::new().await.unwrap();
+        let ds = test_ds.dataset;
+
+        // take the last row of first fragment
+        // garunteed out of bound with default max_rows_per_file
+        let indices = &[(1 << 32) - 1];
+        let _values = ds.take_rows(indices, ds.schema()).await.unwrap_err();
     }
 
     #[tokio::test]
