@@ -11,6 +11,7 @@ use itertools::Itertools;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::Result;
 use rand::{thread_rng, Rng};
+use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
 use super::{select_neighbors, select_neighbors_heuristic, HNSW};
@@ -22,7 +23,7 @@ use crate::vector::graph::{Graph, OrderedFloat, OrderedNode};
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
 /// Parameters of building HNSW index
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswBuildParams {
     /// max level ofm
     pub max_level: u16,
@@ -157,7 +158,7 @@ impl HNSWBuilder {
                 self,
                 self.inner.entry_point,
                 self.inner.vectors.metric_type(),
-                self.inner.params.use_select_heuristic,
+                self.inner.params.clone(),
             ));
         }
 
@@ -185,7 +186,7 @@ impl HNSWBuilder {
             self,
             self.inner.entry_point,
             self.inner.vectors.metric_type(),
-            self.inner.params.use_select_heuristic,
+            self.inner.params.clone(),
         ))
     }
 }

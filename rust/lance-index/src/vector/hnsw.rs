@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
 
-use self::builder::HNSW_METADATA_KEY;
+use self::builder::{HnswBuildParams, HNSW_METADATA_KEY};
 
 use super::graph::memory::InMemoryVectorStorage;
 use super::graph::OrderedNode;
@@ -160,12 +160,8 @@ impl Graph for HnswLevel {
 pub struct HNSW {
     levels: Vec<HnswLevel>,
     distance_type: MetricType,
-    /// Entry point of the graph.
     entry_point: u32,
-
-    #[allow(dead_code)]
-    /// Whether to use the heuristic to select neighbors (Algorithm 4 or 3 in the paper).
-    use_select_heuristic: bool,
+    params: HnswBuildParams,
 }
 
 impl Debug for HNSW {
@@ -181,8 +177,9 @@ impl Debug for HNSW {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HnswMetadata {
-    entry_point: u32,
-    level_offsets: Vec<usize>,
+    pub entry_point: u32,
+    pub params: HnswBuildParams,
+    pub level_offsets: Vec<usize>,
 }
 
 impl HNSW {
@@ -191,7 +188,7 @@ impl HNSW {
             levels: vec![],
             distance_type: MetricType::L2,
             entry_point: 0,
-            use_select_heuristic: true,
+            params: HnswBuildParams::default(),
         }
     }
 
@@ -281,7 +278,7 @@ impl HNSW {
             levels,
             distance_type: metric_type,
             entry_point: metadata.entry_point,
-            use_select_heuristic: true,
+            params: metadata.params,
         })
     }
 
@@ -289,7 +286,7 @@ impl HNSW {
         builder: &HNSWBuilder,
         entry_point: u32,
         metric_type: MetricType,
-        use_select_heuristic: bool,
+        params: HnswBuildParams,
     ) -> Self {
         let mut levels = Vec::with_capacity(builder.num_levels());
         for level in 0..builder.num_levels() {
@@ -330,7 +327,7 @@ impl HNSW {
             levels,
             distance_type: metric_type,
             entry_point,
-            use_select_heuristic,
+            params,
         }
     }
 
@@ -390,6 +387,7 @@ impl HNSW {
 
         HnswMetadata {
             entry_point: self.entry_point,
+            params: self.params.clone(),
             level_offsets,
         }
     }
@@ -519,7 +517,6 @@ mod tests {
     use arrow_array::types::Float32Type;
     use lance_linalg::matrix::MatrixView;
     use lance_testing::datagen::generate_random_array;
-    use tests::builder::HnswBuildParams;
 
     #[test]
     fn test_select_neighbors() {

@@ -12,9 +12,10 @@ use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use async_trait::async_trait;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
+use lance_index::vector::quantizer::Quantizer;
 use lance_index::{
     vector::{
-        graph::NEIGHBORS_FIELD,
+        graph::{VectorStorage, NEIGHBORS_FIELD},
         hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization},
@@ -84,6 +85,14 @@ impl<Q: Quantization> HNSWIndex<Q> {
             partition_metadata,
             options,
         })
+    }
+
+    pub fn quantizer(&self) -> &Quantizer {
+        self.partition_storage.quantizer()
+    }
+
+    pub fn metadata(&self) -> HnswMetadata {
+        self.partition_metadata.as_ref().unwrap()[0].clone()
     }
 
     fn get_partition_metadata(&self, partition_id: usize) -> Result<HnswMetadata> {
@@ -254,6 +263,10 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),
         }))
+    }
+
+    fn storage(&self) -> &dyn VectorStorage {
+        self.hnsw.storage()
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

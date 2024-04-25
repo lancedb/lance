@@ -606,6 +606,9 @@ mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
+    use lance_index::vector::{
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
@@ -802,6 +805,105 @@ mod tests {
             .await
             .unwrap();
         let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 1024);
+        assert_eq!(stats["num_indexed_fragments"], 2);
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+        assert_eq!(stats["num_indices"], 2);
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 2,
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 1024);
+        assert_eq!(stats["num_indexed_fragments"], 2);
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+        assert_eq!(stats["num_indices"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_ivf_hnsw_sq_delta_indices() {
+        let test_dir = tempdir().unwrap();
+        let dimensions = 16;
+        let column_name = "vec";
+        let field = Field::new(
+            column_name,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+
+        let float_arr = generate_random_array(512 * dimensions as usize);
+
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![record_batch.clone()].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let ivf_params = IvfBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let sq_params = SQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::L2,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+        dataset
+            .create_index(
+                &[column_name],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+        dataset.append(reader, None).await.unwrap();
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 512);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0, // Just create index for delta
+            })
+            .await
+            .unwrap();
 
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();

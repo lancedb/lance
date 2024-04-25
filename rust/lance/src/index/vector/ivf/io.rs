@@ -7,6 +7,7 @@ use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
 use arrow::compute::concat;
+use arrow_array::UInt64Array;
 use arrow_array::{
     cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
@@ -250,7 +251,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     ivf: &mut Ivf,
     quantizer: Quantizer,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
-    _existing_indices: Option<&[&IVFIndex]>,
+    existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<(Vec<HnswMetadata>, IvfData)> {
     let dataset = Arc::new(dataset.clone());
     let column = Arc::new(column.to_owned());
@@ -303,6 +304,17 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         // We don't transform vectors to SQ codes while shuffling,
         // so we won't merge SQ codes from the stream.
+
+        if let Some(&previous_indices) = existing_indices.as_ref() {
+            for &idx in previous_indices.iter() {
+                let sub_index = idx.load_partition(part_id, true).await?;
+                let row_ids = Arc::new(UInt64Array::from_iter_values(
+                    sub_index.storage().row_ids().iter().cloned(),
+                ));
+                row_id_array.push(row_ids);
+            }
+        }
+
         let code_column = match &quantizer {
             Quantizer::Product(pq) => Some(pq.column()),
             Quantizer::Scalar(_) => None,

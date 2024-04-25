@@ -30,6 +30,7 @@ pub const SQ_METADATA_KEY: &str = "lance:sq";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScalarQuantizationMetadata {
+    pub dim: usize,
     pub num_bits: u16,
     pub bounds: Range<f64>,
 }
