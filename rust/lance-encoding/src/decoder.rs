@@ -295,7 +295,7 @@ impl DecodeBatchScheduler {
         }
     }
 
-    fn create_primitive_scheduler<'a>(
+    fn create_primitive_scheduler(
         data_type: &DataType,
         column: &ColumnInfo,
         buffers: FileBuffers,

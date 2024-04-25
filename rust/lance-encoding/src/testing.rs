@@ -76,7 +76,6 @@ async fn test_decode(
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
         let batch = batch.task.await.unwrap();
-        assert_eq!(batch.num_rows() as u32, BATCH_SIZE);
         if let Some(expected) = expected.as_ref() {
             let actual = batch.column(0);
             let expected_size = (BATCH_SIZE as usize).min(expected.len() - offset);

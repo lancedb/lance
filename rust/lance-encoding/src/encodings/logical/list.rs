@@ -137,7 +137,7 @@ impl ListPageScheduler {
                 let first_offset_idx = 0_usize;
                 let num_offsets = num_lists as usize;
                 let items_start = 0;
-                let mut items_end = offsets_values[num_offsets as usize - 1];
+                let mut items_end = offsets_values[num_offsets - 1];
                 // Repair any null value
                 if items_end > last_valid_offset {
                     items_end = items_end - last_valid_offset - 1;
