@@ -17,6 +17,7 @@ use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::{
     aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
     memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
@@ -29,7 +30,9 @@ use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
 use super::local::LocalObjectReader;
+mod gcs_wrapper;
 mod tracing;
+use self::gcs_wrapper::PatchedGoogleCloudStorage;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -716,7 +719,14 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
 
         "gs" => {
             storage_options.with_env_gcs();
-            let (store, _) = parse_url_opts(&url, storage_options.as_gcs_options())?;
+            let mut builder = GoogleCloudStorageBuilder::new();
+            for (key, value) in storage_options.as_gcs_options() {
+                builder = builder.with_config(key, value);
+            }
+            let store = builder.build()?;
+            // Temporary fix for having larger object sizes. Replace when
+            // object_store 0.10.0 is available.
+            let store = PatchedGoogleCloudStorage(Arc::new(store));
             let store = Arc::new(store);
             Ok(ObjectStore {
                 inner: store,
