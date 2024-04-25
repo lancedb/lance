@@ -1129,40 +1129,57 @@ pub fn get_commit_handler(options: &PyDict) -> Option<Arc<dyn CommitHandler>> {
     }
 }
 
+// Gets a value from the dictionary and attempts to extract it to
+// the desired type.  If the value is None then it treats it as if
+// it were never present in the dictionary.  If the value is not
+// None it will try and parse it and parsing failures will be
+// returned (e.g. a parsing failure is not considered `None`)
+fn get_dict_opt<'a, D: FromPyObject<'a>>(dict: &'a PyDict, key: &str) -> PyResult<Option<D>> {
+    let value = dict.get_item(key)?;
+    value
+        .and_then(|v| {
+            if v.is_none() {
+                None
+            } else {
+                Some(v.extract::<D>())
+            }
+        })
+        .transpose()
+}
+
 pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {
         let mut p = WriteParams::default();
-        if let Some(mode) = options.get_item("mode")? {
-            p.mode = parse_write_mode(mode.extract::<String>()?.as_str())?;
+        if let Some(mode) = get_dict_opt::<String>(options, "mode")? {
+            p.mode = parse_write_mode(mode.as_str())?;
         };
-        if let Some(maybe_nrows) = options.get_item("max_rows_per_file")? {
-            p.max_rows_per_file = usize::extract(maybe_nrows)?;
+        if let Some(maybe_nrows) = get_dict_opt::<usize>(options, "max_rows_per_file")? {
+            p.max_rows_per_file = maybe_nrows;
         }
-        if let Some(maybe_nrows) = options.get_item("max_rows_per_group")? {
-            p.max_rows_per_group = usize::extract(maybe_nrows)?;
+        if let Some(maybe_nrows) = get_dict_opt::<usize>(options, "max_rows_per_group")? {
+            p.max_rows_per_group = maybe_nrows;
         }
-        if let Some(maybe_nbytes) = options.get_item("max_bytes_per_file")? {
-            p.max_bytes_per_file = usize::extract(maybe_nbytes)?;
+        if let Some(maybe_nbytes) = get_dict_opt::<usize>(options, "max_bytes_per_file")? {
+            p.max_bytes_per_file = maybe_nbytes;
         }
-        if let Some(use_experimental_writer) = options.get_item("use_experimental_writer")? {
-            p.use_experimental_writer = use_experimental_writer.extract()?;
+        if let Some(use_experimental_writer) =
+            get_dict_opt::<bool>(options, "use_experimental_writer")?
+        {
+            p.use_experimental_writer = use_experimental_writer;
         }
-        if let Some(progress) = options.get_item("progress")? {
-            if !progress.is_none() {
-                p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
-            }
+        if let Some(progress) = get_dict_opt::<PyObject>(options, "progress")? {
+            p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
         }
 
-        if let Some(storage_options) = options.get_item("storage_options")? {
-            let storage_options = storage_options.extract::<Option<HashMap<String, String>>>()?;
-            if let Some(storage_options) = storage_options {
-                p.store_params = Some(ObjectStoreParams {
-                    storage_options: Some(storage_options),
-                    ..Default::default()
-                });
-            }
+        if let Some(storage_options) =
+            get_dict_opt::<HashMap<String, String>>(options, "storage_options")?
+        {
+            p.store_params = Some(ObjectStoreParams {
+                storage_options: Some(storage_options),
+                ..Default::default()
+            });
         }
 
         p.commit_handler = get_commit_handler(options);

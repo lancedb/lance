@@ -20,7 +20,8 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
-use log::trace;
+use lance_arrow::deepcopy::deep_copy_array;
+use log::{debug, trace};
 use snafu::{location, Location};
 
 use lance_core::{Error, Result};
@@ -31,7 +32,7 @@ use crate::{
         DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo,
         PhysicalPageDecoder, PhysicalPageScheduler,
     },
-    encoder::{ArrayEncoder, EncodedPage, FieldEncoder},
+    encoder::{ArrayEncoder, EncodeTask, EncodedPage, FieldEncoder},
     encodings::physical::{
         basic::BasicEncoder, decoder_from_array_encoding, fixed_size_list::FslEncoder,
         value::ValueEncoder, ColumnBuffers, PageBuffers,
@@ -430,6 +431,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
 
 pub struct PrimitiveFieldEncoder {
     cache_bytes: u64,
+    keep_original_array: bool,
     buffered_arrays: Vec<ArrayRef>,
     current_bytes: u64,
     encoder: Arc<dyn ArrayEncoder>,
@@ -437,7 +439,7 @@ pub struct PrimitiveFieldEncoder {
 }
 
 impl PrimitiveFieldEncoder {
-    fn array_encoder_from_data_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
+    pub fn array_encoder_from_data_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
@@ -451,18 +453,40 @@ impl PrimitiveFieldEncoder {
         }
     }
 
-    pub fn try_new(cache_bytes: u64, data_type: &DataType, column_index: u32) -> Result<Self> {
+    pub fn try_new(
+        cache_bytes: u64,
+        keep_original_array: bool,
+        data_type: &DataType,
+        column_index: u32,
+    ) -> Result<Self> {
         Ok(Self {
             cache_bytes,
+            keep_original_array,
             column_index,
-            buffered_arrays: Vec::with_capacity(8),
+            buffered_arrays: Vec::new(),
             current_bytes: 0,
             encoder: Arc::from(Self::array_encoder_from_data_type(data_type)?),
         })
     }
 
+    pub fn new_with_encoder(
+        cache_bytes: u64,
+        keep_original_array: bool,
+        column_index: u32,
+        encoder: Arc<dyn ArrayEncoder>,
+    ) -> Self {
+        Self {
+            cache_bytes,
+            keep_original_array,
+            column_index,
+            buffered_arrays: Vec::new(),
+            current_bytes: 0,
+            encoder,
+        }
+    }
+
     // Creates an encode task, consuming all buffered data
-    fn do_flush(&mut self) -> BoxFuture<'static, Result<EncodedPage>> {
+    fn do_flush(&mut self) -> EncodeTask {
         let mut arrays = Vec::new();
         std::mem::swap(&mut arrays, &mut self.buffered_arrays);
         self.current_bytes = 0;
@@ -486,21 +510,33 @@ impl PrimitiveFieldEncoder {
 
 impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
-    fn maybe_encode(
-        &mut self,
-        array: ArrayRef,
-    ) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         self.current_bytes += array.get_array_memory_size() as u64;
-        self.buffered_arrays.push(array);
         if self.current_bytes > self.cache_bytes {
+            // Push into buffered_arrays without copy since we are about to flush anyways
+            self.buffered_arrays.push(array);
+            debug!(
+                "Flushing column {} page of size {} bytes (unencoded)",
+                self.column_index, self.current_bytes
+            );
             Ok(vec![self.do_flush()])
         } else {
+            if self.keep_original_array {
+                self.buffered_arrays.push(array);
+            } else {
+                self.buffered_arrays.push(deep_copy_array(array.as_ref()))
+            }
+            trace!(
+                "Accumulating data for column {}.  Now at {} bytes",
+                self.column_index,
+                self.current_bytes
+            );
             Ok(vec![])
         }
     }
 
     // If there is any data left in the buffer then create an encode task from it
-    fn flush(&mut self) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
         if self.current_bytes > 0 {
             Ok(vec![self.do_flush()])
         } else {

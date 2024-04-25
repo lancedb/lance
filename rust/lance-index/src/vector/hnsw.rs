@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::datatypes::UInt32Type;
+use arrow_array::ArrayRef;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
@@ -31,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
 
-use self::builder::HNSW_METADATA_KEY;
+use self::builder::{HnswBuildParams, HNSW_METADATA_KEY};
 
 use super::graph::memory::InMemoryVectorStorage;
 use super::graph::OrderedNode;
@@ -159,12 +160,8 @@ impl Graph for HnswLevel {
 pub struct HNSW {
     levels: Vec<HnswLevel>,
     distance_type: MetricType,
-    /// Entry point of the graph.
     entry_point: u32,
-
-    #[allow(dead_code)]
-    /// Whether to use the heuristic to select neighbors (Algorithm 4 or 3 in the paper).
-    use_select_heuristic: bool,
+    params: HnswBuildParams,
 }
 
 impl Debug for HNSW {
@@ -178,10 +175,11 @@ impl Debug for HNSW {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HnswMetadata {
-    entry_point: u32,
-    level_offsets: Vec<usize>,
+    pub entry_point: u32,
+    pub params: HnswBuildParams,
+    pub level_offsets: Vec<usize>,
 }
 
 impl HNSW {
@@ -190,13 +188,13 @@ impl HNSW {
             levels: vec![],
             distance_type: MetricType::L2,
             entry_point: 0,
-            use_select_heuristic: true,
+            params: HnswBuildParams::default(),
         }
     }
 
     /// The number of nodes in the level 0 of the graph.
     pub fn len(&self) -> usize {
-        self.levels[0].len()
+        self.levels.first().map_or(0, |level| level.len())
     }
 
     pub fn storage(&self) -> &dyn VectorStorage {
@@ -263,6 +261,10 @@ impl HNSW {
         vector_storage: Arc<dyn VectorStorage>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
+        if range.is_empty() {
+            return Ok(Self::empty());
+        }
+
         let levels = futures::stream::iter(0..metadata.level_offsets.len() - 1)
             .map(|i| {
                 let start = range.start + metadata.level_offsets[i];
@@ -276,7 +278,7 @@ impl HNSW {
             levels,
             distance_type: metric_type,
             entry_point: metadata.entry_point,
-            use_select_heuristic: true,
+            params: metadata.params,
         })
     }
 
@@ -284,7 +286,7 @@ impl HNSW {
         builder: &HNSWBuilder,
         entry_point: u32,
         metric_type: MetricType,
-        use_select_heuristic: bool,
+        params: HnswBuildParams,
     ) -> Self {
         let mut levels = Vec::with_capacity(builder.num_levels());
         for level in 0..builder.num_levels() {
@@ -325,7 +327,7 @@ impl HNSW {
             levels,
             distance_type: metric_type,
             entry_point,
-            use_select_heuristic,
+            params,
         }
     }
 
@@ -347,7 +349,7 @@ impl HNSW {
     /// A list of `(id_in_graph, distance)` pairs. Or Error if the search failed.
     pub fn search(
         &self,
-        query: &[f32],
+        query: ArrayRef,
         k: usize,
         ef: usize,
         bitset: Option<RoaringBitmap>,
@@ -385,6 +387,7 @@ impl HNSW {
 
         HnswMetadata {
             entry_point: self.entry_point,
+            params: self.params.clone(),
             level_offsets,
         }
     }
@@ -514,7 +517,6 @@ mod tests {
     use arrow_array::types::Float32Type;
     use lance_linalg::matrix::MatrixView;
     use lance_testing::datagen::generate_random_array;
-    use tests::builder::HnswBuildParams;
 
     #[test]
     fn test_select_neighbors() {
@@ -593,7 +595,7 @@ mod tests {
     fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
         let mut dists = vec![];
         for i in 0..mat.num_rows() {
-            let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
+            let dist = lance_linalg::distance::l2_distance(query, mat.row_ref(i).unwrap());
             dists.push((dist, i as u32));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -625,12 +627,12 @@ mod tests {
         .unwrap();
 
         let results: HashSet<u32> = hnsw
-            .search(q, K, 128, None)
+            .search(q.clone(), K, 128, None)
             .unwrap()
             .iter()
             .map(|node| node.id)
             .collect();
-        let gt = ground_truth(&mat, q, K);
+        let gt = ground_truth(&mat, q.as_primitive::<Float32Type>().values(), K);
         let recall = results.intersection(&gt).count() as f32 / K as f32;
         assert!(recall >= 0.9, "Recall: {}", recall);
     }

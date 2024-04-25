@@ -4,7 +4,7 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow::{array::AsArray, datatypes::Float32Type};
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
 use async_trait::async_trait;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
@@ -30,6 +30,7 @@ pub const SQ_METADATA_KEY: &str = "lance:sq";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScalarQuantizationMetadata {
+    pub dim: usize,
     pub num_bits: u16,
     pub bounds: Range<f64>,
 }
@@ -212,7 +213,7 @@ impl VectorStorage for ScalarQuantizationStorage {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator> {
+    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator> {
         Box::new(SQDistCalculator::new(
             query,
             self.sq_codes.clone(),
@@ -237,18 +238,13 @@ impl VectorStorage for ScalarQuantizationStorage {
 
 struct SQDistCalculator {
     query_sq_code: Vec<u8>,
-
-    // flatten sq codes
     sq_codes: Arc<FixedSizeListArray>,
 }
 
 impl SQDistCalculator {
-    fn new(query: &[f32], sq_codes: Arc<FixedSizeListArray>, bounds: Range<f64>) -> Self {
-        // TODO: support f16/f64
-        let query_sq_code = scale_to_u8::<Float32Type>(query, bounds)
-            .into_iter()
-            .collect::<Vec<_>>();
-
+    fn new(query: ArrayRef, sq_codes: Arc<FixedSizeListArray>, bounds: Range<f64>) -> Self {
+        let query_sq_code =
+            scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), bounds);
         Self {
             query_sq_code,
             sq_codes,

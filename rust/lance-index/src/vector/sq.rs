@@ -9,7 +9,6 @@ use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 use itertools::Itertools;
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::MetricType;
 use num_traits::*;
 use snafu::{location, Location};
 
@@ -30,18 +29,14 @@ pub struct ScalarQuantizer {
     /// Original dimension of the vectors.
     pub dim: usize,
 
-    /// Distance type.
-    pub metric_type: MetricType,
-
     pub bounds: Range<f64>,
 }
 
 impl ScalarQuantizer {
-    pub fn new(num_bits: u16, dim: usize, metric_type: MetricType) -> Self {
+    pub fn new(num_bits: u16, dim: usize) -> Self {
         Self {
             num_bits,
             dim,
-            metric_type,
             bounds: Range::<f64> {
                 start: f64::MAX,
                 end: f64::MIN,
@@ -49,13 +44,8 @@ impl ScalarQuantizer {
         }
     }
 
-    pub fn with_bounds(
-        num_bits: u16,
-        dim: usize,
-        metric_type: MetricType,
-        bounds: Range<f64>,
-    ) -> Self {
-        let mut sq = Self::new(num_bits, dim, metric_type);
+    pub fn with_bounds(num_bits: u16, dim: usize, bounds: Range<f64>) -> Self {
+        let mut sq = Self::new(num_bits, dim);
         sq.bounds = bounds;
         sq
     }
@@ -163,7 +153,7 @@ mod tests {
         let vectors =
             FixedSizeListArray::try_new_from_values(float_array, float_values.len() as i32)
                 .unwrap();
-        let mut sq = ScalarQuantizer::new(8, float_values.len(), MetricType::L2);
+        let mut sq = ScalarQuantizer::new(8, float_values.len());
 
         sq.update_bounds::<Float16Type>(&vectors).unwrap();
         assert_eq!(sq.bounds.start, float_values[0].to_f64());
@@ -192,7 +182,7 @@ mod tests {
         let vectors =
             FixedSizeListArray::try_new_from_values(float_array, float_values.len() as i32)
                 .unwrap();
-        let mut sq = ScalarQuantizer::new(8, float_values.len(), MetricType::L2);
+        let mut sq = ScalarQuantizer::new(8, float_values.len());
 
         sq.update_bounds::<Float32Type>(&vectors).unwrap();
         assert_eq!(sq.bounds.start, float_values[0].to_f64().unwrap());
@@ -221,7 +211,7 @@ mod tests {
         let vectors =
             FixedSizeListArray::try_new_from_values(float_array, float_values.len() as i32)
                 .unwrap();
-        let mut sq = ScalarQuantizer::new(8, float_values.len(), MetricType::L2);
+        let mut sq = ScalarQuantizer::new(8, float_values.len());
 
         sq.update_bounds::<Float64Type>(&vectors).unwrap();
         assert_eq!(sq.bounds.start, float_values[0]);

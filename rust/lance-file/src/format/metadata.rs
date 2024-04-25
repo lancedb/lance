@@ -129,7 +129,8 @@ impl Metadata {
         let mut indices_per_batch: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
 
         let mut indices = Vec::from(indices);
-        indices.sort();
+        // sort unstable is quick sort and is almost always faster than sort
+        indices.sort_unstable();
 
         for idx in indices.iter() {
             while batch_id < num_batches && *idx >= self.batch_offsets[batch_id as usize + 1] as u32

@@ -124,7 +124,14 @@ class LanceFileWriter:
     Lance datasets then you should use the LanceDataset class instead.
     """
 
-    def __init__(self, path: str, schema: pa.Schema, **kwargs):
+    def __init__(
+        self,
+        path: str,
+        schema: pa.Schema,
+        *,
+        data_cache_bytes: int = None,
+        **kwargs,
+    ):
         """
         Create a new LanceFileWriter to write to the given path
 
@@ -135,8 +142,13 @@ class LanceFileWriter:
             or a URI for remote storage.
         schema: pa.Schema
             The schema of data that will be written
+        data_cache_bytes: int
+            How many bytes (per column) to cache before writing a page.  The
+            default is an appropriate value based on the filesystem.
         """
-        self._writer = _LanceFileWriter(path, schema, **kwargs)
+        self._writer = _LanceFileWriter(
+            path, schema, data_cache_bytes=data_cache_bytes, **kwargs
+        )
         self.closed = False
 
     def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]) -> None:
