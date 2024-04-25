@@ -904,7 +904,6 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
 
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
