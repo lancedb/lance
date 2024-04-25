@@ -89,7 +89,7 @@ message List {
     // contain `base + len(list) + first_invalid_offset` where `base`
     // is defined the same as above.
     //
-    // When reading a list at index i only only needs the offsets at
+    // When reading a list at index i only needs the offsets at
     // index i and index i-1 (if i > 0).
     //
     // If the offset at index i is greater than first_invalid_offset
