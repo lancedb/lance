@@ -2871,21 +2871,39 @@ mod tests {
         );
     }
 
-    // panics with (it shouldn't)
-    // ---- handler_tests::test::test_server_takes_errors stdout ----
-    // thread 'handler_tests::test::test_server_takes_errors' panicked at /Users/robmeng/workspace/sophon2/src/lance/rust/lance-file/src/format/metadata.rs:118:25:
-    // attempt to add with overflow
     #[tokio::test]
-    #[ignore]
     async fn test_take_rows_out_of_bound() {
         // a dataset with 1 fragment and 400 rows
         let test_ds = TestVectorDataset::new().await.unwrap();
         let ds = test_ds.dataset;
 
         // take the last row of first fragment
-        // garunteed out of bound with default max_rows_per_file
+        // this triggeres the contiguous branch
         let indices = &[(1 << 32) - 1];
-        let _values = ds.take_rows(indices, ds.schema()).await.unwrap_err();
+        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("out of bound"),
+            "{}",
+            err.to_string()
+        );
+
+        // this triggeres the sorted branch, but not continguous
+        let indices = &[(1 << 32) - 3, (1 << 32) - 1];
+        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("out of bound"),
+            "{}",
+            err.to_string()
+        );
+
+        // this triggeres the catch all branch
+        let indices = &[(1 << 32) - 1, (1 << 32) - 3];
+        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("out of bound"),
+            "{}",
+            err.to_string()
+        );
     }
 
     #[tokio::test]

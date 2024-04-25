@@ -359,16 +359,30 @@ impl FileReader {
         projection: &Schema,
         deletion_vector: Option<&DeletionVector>,
     ) -> Result<RecordBatch> {
+        let num_batches = self.num_batches();
+        let num_rows = self.len() as u32;
         let indices_in_batches = self.metadata.group_indices_to_batches(indices);
         let batches = stream::iter(indices_in_batches)
             .map(|batch| async move {
-                self.read_batch(
-                    batch.batch_id,
-                    batch.offsets.as_slice(),
-                    projection,
-                    deletion_vector,
-                )
-                .await
+                if batch.batch_id >= num_batches as i32 {
+                    Err(Error::InvalidInput {
+                        source: format!("batch_id: {} if out of bound", batch.batch_id).into(),
+                        location: location!(),
+                    })
+                } else if *batch.offsets.last().expect("got empty batch") > num_rows {
+                    Err(Error::InvalidInput {
+                        source: format!("indices: {:?} if out of bound", batch.offsets).into(),
+                        location: location!(),
+                    })
+                } else {
+                    self.read_batch(
+                        batch.batch_id,
+                        batch.offsets.as_slice(),
+                        projection,
+                        deletion_vector,
+                    )
+                    .await
+                }
             })
             .buffered(num_cpus::get() * 4)
             .try_collect::<Vec<_>>()
