@@ -4,6 +4,8 @@
 //! They do not work against any local emulator right now.
 #![cfg(feature = "gcs-test")]
 
+// TODO: Once we re-use this logic for S3, we can instead use tests against
+// Minio to validate the multipart upload logic.
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;

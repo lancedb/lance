@@ -146,19 +146,62 @@ impl Upload {
         })
     }
 
+    fn put_next_part(
+        path: &Arc<Path>,
+        store: &Arc<GoogleCloudStorage>,
+        buffer: &mut Vec<u8>,
+        part_idx: &mut u16,
+        multipart_id: &Arc<MultipartId>,
+    ) -> BoxFuture<'static, OSResult<(u16, PartId)>> {
+        // Increase the upload size every 100 parts. This gives maximum part size of 2.5TB.
+        let new_capacity = ((*part_idx / 100) as usize + 1) * INITIAL_UPLOAD_SIZE;
+        let new_buffer = Vec::with_capacity(new_capacity);
+        let part = std::mem::replace(buffer, new_buffer);
+        let part = Bytes::from(part);
+
+        let part_idx_clone = *part_idx;
+        *part_idx += 1;
+        let store = store.clone();
+        let multipart_id = multipart_id.clone();
+        let path = path.clone();
+        Box::pin(async move {
+            let part_id = store
+                .put_part(
+                    path.as_ref(),
+                    multipart_id.as_ref(),
+                    part_idx_clone as usize,
+                    part,
+                )
+                .await?;
+            Ok((part_idx_clone, part_id))
+        })
+    }
+
     fn poll_tasks(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Result<(), io::Error> {
+        let mut_self = &mut *self;
         loop {
-            match &mut self.state {
+            match &mut mut_self.state {
                 UploadState::Pending | UploadState::Done => break,
                 UploadState::CreatingUpload(ref mut fut) => match fut.poll_unpin(cx) {
                     Poll::Ready(Ok(multipart_id)) => {
-                        self.state = UploadState::InProgress {
-                            multipart_id: Arc::new(multipart_id),
-                            part_idx: 0,
-                            futures: FuturesUnordered::new(),
+                        let futures = FuturesUnordered::new();
+                        let multipart_id = Arc::new(multipart_id);
+
+                        futures.push(Self::put_next_part(
+                            &mut_self.path,
+                            &mut_self.store,
+                            &mut mut_self.buffer,
+                            &mut 0,
+                            &multipart_id,
+                        ));
+
+                        mut_self.state = UploadState::InProgress {
+                            multipart_id,
+                            part_idx: 1, // We just used 0
+                            futures,
                             part_ids: Vec::new(),
                         };
                     }
@@ -176,10 +219,11 @@ impl Upload {
                         part_ids.resize(total_parts.max(part_idx as usize + 1), None);
                         part_ids[part_idx as usize] = Some(part_id);
                     }
+                    break;
                 }
                 UploadState::PuttingSingle(ref mut fut) | UploadState::Completing(ref mut fut) => {
                     match fut.poll_unpin(cx) {
-                        Poll::Ready(Ok(())) => self.state = UploadState::Done,
+                        Poll::Ready(Ok(())) => mut_self.state = UploadState::Done,
                         Poll::Ready(Err(e)) => {
                             return Err(std::io::Error::new(std::io::ErrorKind::Other, e))
                         }
@@ -208,14 +252,10 @@ impl AsyncWrite for Upload {
         // Rust needs a little help to borrow self mutably and immutably at the same time
         // through a Pin.
         let mut_self = &mut *self;
-        let state_ref = &mut mut_self.state;
-        let buffer_ref = &mut mut_self.buffer;
-        let store_ref = &mut_self.store;
-        let path_ref = &mut_self.path;
 
         // Instantiate next request, if available.
-        if buffer_ref.capacity() == buffer_ref.len() {
-            match state_ref {
+        if mut_self.buffer.capacity() == mut_self.buffer.len() {
+            match &mut mut_self.state {
                 UploadState::Pending => {
                     let store = self.store.clone();
                     let path = self.path.clone();
@@ -229,30 +269,14 @@ impl AsyncWrite for Upload {
                     ..
                 } => {
                     // TODO: Make max concurrency configurable.
-                    if buffer_ref.len() >= buffer_ref.capacity() && futures.len() < 10 {
-                        // Increase the upload size every 100 parts. This gives maximum part size of 2.5TB.
-                        let new_capacity = ((*part_idx / 100) as usize + 1) * INITIAL_UPLOAD_SIZE;
-                        let new_buffer = Vec::with_capacity(new_capacity);
-                        let part = std::mem::replace(buffer_ref, new_buffer);
-                        let part = Bytes::from(part);
-
-                        let part_idx_clone = *part_idx;
-                        let store = store_ref.clone();
-                        let multipart_id = multipart_id.clone();
-                        let path = path_ref.clone();
-                        let fut = Box::pin(async move {
-                            let part_id = store
-                                .put_part(
-                                    path.as_ref(),
-                                    multipart_id.as_ref(),
-                                    part_idx_clone as usize,
-                                    part,
-                                )
-                                .await?;
-                            Ok((part_idx_clone, part_id))
-                        });
-                        futures.push(fut);
-                        *part_idx += 1;
+                    if futures.len() < 10 {
+                        futures.push(Self::put_next_part(
+                            &mut_self.path,
+                            &mut_self.store,
+                            &mut mut_self.buffer,
+                            part_idx,
+                            multipart_id,
+                        ));
                     }
                 }
                 _ => {}
@@ -292,66 +316,72 @@ impl AsyncWrite for Upload {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        self.as_mut().poll_tasks(cx)?;
-
         // Rust needs a little help to borrow self mutably and immutably at the same time
         // through a Pin.
-        let mut_self = &mut *self;
-        let state_ref = &mut mut_self.state;
-        let buffer_ref = &mut mut_self.buffer;
-        let store_ref = &mut_self.store;
-        let path_ref = &mut_self.path;
 
-        match state_ref {
-            UploadState::Done => Poll::Ready(Ok(())),
-            UploadState::CreatingUpload(_)
-            | UploadState::PuttingSingle(_)
-            | UploadState::Completing(_) => Poll::Pending,
-            UploadState::Pending => {
-                // If we didn't start a multipart upload, we can just do a single put.
-                let part = Bytes::from(std::mem::take(buffer_ref));
-                let path = path_ref.clone();
-                let store = store_ref.clone();
-                let fut = Box::pin(async move {
-                    store.put(&path, part).await?;
-                    Ok(())
-                });
-                self.state = UploadState::PuttingSingle(fut);
-                self.as_mut().poll_tasks(cx)?;
-                // Just in case the put immediately finishes, we recurse here.
-                self.poll_shutdown(cx)
-            }
-            UploadState::InProgress {
-                futures,
-                part_ids,
-                multipart_id,
-                ..
-            } => {
-                // We handle the transition from in progress to completing here.
-                if futures.is_empty() {
-                    let part_ids = std::mem::take(part_ids)
-                        .into_iter()
-                        .map(|maybe_id| {
-                            maybe_id.ok_or_else(|| {
-                                io::Error::new(io::ErrorKind::Other, "missing part id")
-                            })
-                        })
-                        .collect::<io::Result<Vec<_>>>()?;
-                    let path = path_ref.clone();
-                    let store = store_ref.clone();
-                    let multipart_id = multipart_id.clone();
+        loop {
+            self.as_mut().poll_tasks(cx)?;
+
+            let mut_self = &mut *self;
+            match &mut mut_self.state {
+                UploadState::Done => return Poll::Ready(Ok(())),
+                UploadState::CreatingUpload(_)
+                | UploadState::PuttingSingle(_)
+                | UploadState::Completing(_) => return Poll::Pending,
+                UploadState::Pending => {
+                    // If we didn't start a multipart upload, we can just do a single put.
+                    let part = Bytes::from(std::mem::take(&mut mut_self.buffer));
+                    let path = mut_self.path.clone();
+                    let store = mut_self.store.clone();
                     let fut = Box::pin(async move {
-                        store
-                            .complete_multipart(&path, &multipart_id, part_ids)
-                            .await?;
+                        store.put(&path, part).await?;
                         Ok(())
                     });
-                    self.state = UploadState::Completing(fut);
-                    self.as_mut().poll_tasks(cx)?;
-                    // Just in case the completion immediately finishes, we recurse here.
-                    self.poll_shutdown(cx)
-                } else {
-                    Poll::Pending
+                    self.state = UploadState::PuttingSingle(fut);
+                }
+                UploadState::InProgress {
+                    futures,
+                    part_ids,
+                    multipart_id,
+                    part_idx,
+                } => {
+                    // Flush final batch
+                    if !mut_self.buffer.is_empty() && futures.len() < 10 {
+                        futures.push(Self::put_next_part(
+                            &mut_self.path,
+                            &mut_self.store,
+                            &mut mut_self.buffer,
+                            part_idx,
+                            multipart_id,
+                        ));
+                        // We need to go back to beginning of loop to poll the
+                        // new feature and get the waker registered on the ctx.
+                        continue;
+                    }
+
+                    // We handle the transition from in progress to completing here.
+                    if futures.is_empty() {
+                        let part_ids = std::mem::take(part_ids)
+                            .into_iter()
+                            .map(|maybe_id| {
+                                maybe_id.ok_or_else(|| {
+                                    io::Error::new(io::ErrorKind::Other, "missing part id")
+                                })
+                            })
+                            .collect::<io::Result<Vec<_>>>()?;
+                        let path = mut_self.path.clone();
+                        let store = mut_self.store.clone();
+                        let multipart_id = multipart_id.clone();
+                        let fut = Box::pin(async move {
+                            store
+                                .complete_multipart(&path, &multipart_id, part_ids)
+                                .await?;
+                            Ok(())
+                        });
+                        self.state = UploadState::Completing(fut);
+                    } else {
+                        return Poll::Pending;
+                    }
                 }
             }
         }
