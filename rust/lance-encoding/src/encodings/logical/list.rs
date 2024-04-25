@@ -87,20 +87,39 @@ impl ListPageScheduler {
         }
     }
 
+    /// Given a list of offsets and a list of requested item ranges we need to rewrite the offsets so that
+    /// they appear as expected for a list array.  This involves a number of tasks:
+    ///
+    ///  * Nulls in the offsets are represented by oversize values and these need to be converted to
+    ///    the appropriate length
+    ///  * For each range we (usually) load N + 1 offsets, so if we have 5 ranges we have 5 extra values
+    ///    and we need to drop 4 of those.
+    ///  * Ranges may not start at 0 and, while we don't strictly need to, we want to go ahead and normalize
+    ///    the offsets so that the first offset is 0.
+    ///
+    /// Throughout the comments we will consider the following example case:
+    ///
+    /// The user requests the following ranges of lists: [0..3, 5..6]
+    ///
+    /// This is a total of 4 lists.  The loaded offsets are [10, 20, 120, 150, 60].  The last valid offset is 99.
+    ///
+    /// Our desired output offsets are going to be [0, 10, 20, 20, 30] and the item ranges are [0..20] and [50..60]
+    /// The validity array is [true, true, false, true]
     fn decode_offsets(
         offsets: &dyn Array,
         offset_ranges: &[Range<u32>],
         last_valid_offset: u64,
     ) -> (VecDeque<Range<u64>>, Vec<u64>, BooleanBuffer) {
+        // In our example this is [10, 20, 120, 50, 60]
         let numeric_offsets = offsets.as_primitive::<UInt64Type>();
-        // Given ranges [1..3, 5..6] where each list has 10 items we get offsets [[10, 20, 30], [50, 60]]
-        // and we need to normalize to [0, 10, 20, 30]
+        // In our example there are 4 total lists
         let total_num_lists = offset_ranges
             .iter()
             .map(|range| range.end - range.start)
             .sum::<u32>();
         let mut normalized_offsets = Vec::with_capacity(total_num_lists as usize);
         let mut validity_buffer = BooleanBufferBuilder::new(total_num_lists as usize);
+        // The first output offset is always 0 no matter what
         normalized_offsets.push(0);
         let mut last_normalized_offset = 0;
         let offsets_values = numeric_offsets.values();
@@ -110,31 +129,42 @@ impl ListPageScheduler {
         // Only the first range is allowed to start with 0
         debug_assert!(offset_ranges.iter().skip(1).all(|r| r.start > 0));
         for range in offset_ranges {
+            // The # of lists in this particular range
             let num_lists = range.end - range.start;
 
+            // Because we know the first offset is always 0 we don't store that.  This means we have special
+            // logic if a range starts at 0 (we didn't need to read an extra offset value in that case)
+            // In our example we enter this special case on the first range (0..3) but not the second (5..6)
+            // This means the first range, which has 3 lists, maps to 3 values in our offsets array [10, 20, 120]
+            // However, the second range, which has 1 list, maps to 2 values in our offsets array [150, 60]
             let (items_range, offsets_to_norm_start, num_offsets_to_norm) = if range.start == 0 {
+                // In our example items start is 0 and items_end is 20
+                let first_offset_idx = 0_usize;
+                let num_offsets = num_lists as usize;
                 let items_start = 0;
-                let mut items_end = offsets_values[(offsets_offset + num_lists - 1) as usize];
+                let mut items_end = offsets_values[num_offsets as usize - 1];
+                // Repair any null value
                 if items_end > last_valid_offset {
-                    items_end -= last_valid_offset;
+                    items_end = items_end - last_valid_offset - 1;
                 }
                 let items_range = items_start..items_end;
-                normalized_offsets.push(offsets_values[0]);
-                last_normalized_offset = offsets_values[0];
-                let offsets_to_norm_start = 0 as usize;
-                let num_offsets_to_norm = num_lists as usize;
-                (items_range, offsets_to_norm_start, num_offsets_to_norm)
+
+                (items_range, first_offset_idx, num_offsets)
             } else {
-                let mut items_start = offsets_values[offsets_offset as usize];
+                // In our example, offsets_offset will be 3, items_start will be 50, and items_end will
+                // be 60
+                let first_offset_idx = offsets_offset as usize;
+                let num_offsets = num_lists as usize + 1;
+                let mut items_start = offsets_values[first_offset_idx];
                 if items_start > last_valid_offset {
-                    items_start -= last_valid_offset;
+                    items_start = items_start - last_valid_offset - 1;
                 }
-                let mut items_end = offsets_values[(offsets_offset + num_lists) as usize];
+                let mut items_end = offsets_values[first_offset_idx + num_offsets - 1];
                 if items_end > last_valid_offset {
-                    items_end -= last_valid_offset;
+                    items_end = items_end - last_valid_offset - 1;
                 }
                 let items_range = items_start..items_end;
-                (items_range, offsets_offset as usize, num_lists as usize + 1)
+                (items_range, first_offset_idx, num_offsets)
             };
 
             // TODO: Maybe consider writing whether there are nulls or not as part of the
@@ -143,6 +173,12 @@ impl ListPageScheduler {
 
             // We calculate validity from all elements but the first (or all elements
             // if this is the special zero-start case)
+            //
+            // So, in our first pass through, we consider [10, 20, 120] (1 null)
+            // In our second pass through we only consider [60] (0 nulls)
+            // Note that the 150 is null but we only loaded it to know where the 50-60 list started
+            // and it doesn't actually correspond to a list (e.g. list 4 is null but we aren't loading it
+            // here)
             let validity_start = if range.start == 0 {
                 0
             } else {
@@ -155,21 +191,40 @@ impl ListPageScheduler {
                 validity_buffer.append(*off <= last_valid_offset);
             }
 
+            // In our special case we need to account for the offset 0-first_item
+            if range.start == 0 {
+                let first_item = offsets_values[0];
+                if first_item > last_valid_offset {
+                    let normalized = first_item - last_valid_offset - 1;
+                    normalized_offsets.push(normalized);
+                    last_normalized_offset = normalized;
+                } else {
+                    normalized_offsets.push(first_item);
+                    last_normalized_offset = first_item;
+                }
+            }
+
+            // Finally, we go through and shift the offsets.  If we just returned them as is (taking care of
+            // nulls) we would get [0, 10, 20, 20, 60] but our last list only has 10 items, not 40.
             normalized_offsets.extend(
                 offsets_values
                     .slice(offsets_to_norm_start, num_offsets_to_norm)
                     .windows(2)
                     .map(|w| {
                         let start = if w[0] > last_valid_offset {
-                            w[0] - last_valid_offset
+                            w[0] - last_valid_offset - 1
                         } else {
                             w[0]
                         };
                         let end = if w[1] > last_valid_offset {
-                            w[1] - last_valid_offset
+                            w[1] - last_valid_offset - 1
                         } else {
                             w[1]
                         };
+                        if end < start {
+                            panic!("End is less than start in window {:?} with last_valid_offset={} we get start={} and end={}", w, last_valid_offset, start, end);
+                        }
+                        debug_assert!(end >= start);
                         let length = end - start;
                         last_normalized_offset += length;
                         last_normalized_offset
@@ -227,7 +282,7 @@ impl LogicalPageScheduler for ListPageScheduler {
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.offsets_scheduler
             .schedule_ranges(&offsets_ranges, scheduler, &tx)?;
-        let mut scheduled_offsets = rx.recv().now_or_never().unwrap().unwrap();
+        let mut scheduled_offsets = rx.try_recv().unwrap();
         let items_schedulers = self.items_schedulers.clone();
         let ranges = ranges.to_vec();
         let scheduler = scheduler.clone();
@@ -254,6 +309,17 @@ impl LogicalPageScheduler for ListPageScheduler {
                 item_ranges,
                 items_schedulers.len()
             );
+
+            // This can happen, for example, when there are only empty lists
+            if items_schedulers.is_empty() {
+                debug_assert!(item_ranges.iter().all(|r| r.start == r.end));
+                return Ok(IndirectlyLoaded {
+                    item_decoders: Vec::new(),
+                    offsets,
+                    validity,
+                });
+            }
+
             let mut item_schedulers = VecDeque::from_iter(items_schedulers.iter());
             let mut row_offset = 0_u64;
             let mut next_scheduler = item_schedulers.pop_front().unwrap();
@@ -425,12 +491,11 @@ impl DecodeArrayTask for ListDecodeTask {
         } else {
             Some(validity)
         };
+        let min_offset = UInt64Array::new_scalar(offsets.value(0));
+        let offsets = arrow_arith::numeric::sub(&offsets, &min_offset)?;
         match &self.offset_type {
             DataType::Int32 => {
                 let offsets = arrow_cast::cast(&offsets, &DataType::Int32)?;
-                let offsets_i32 = offsets.as_primitive::<Int32Type>();
-                let min_offset = Int32Array::new_scalar(offsets_i32.value(0));
-                let offsets = arrow_arith::numeric::sub(&offsets_i32, &min_offset)?;
                 let offsets_i32 = offsets.as_primitive::<Int32Type>();
                 let offsets = OffsetBuffer::new(offsets_i32.values().clone());
 
@@ -440,9 +505,6 @@ impl DecodeArrayTask for ListDecodeTask {
             }
             DataType::Int64 => {
                 let offsets = arrow_cast::cast(&offsets, &DataType::Int64)?;
-                let offsets_i64 = offsets.as_primitive::<Int64Type>();
-                let min_offset = Int64Array::new_scalar(offsets_i64.value(0));
-                let offsets = arrow_arith::numeric::sub(&offsets_i64, &min_offset)?;
                 let offsets_i64 = offsets.as_primitive::<Int64Type>();
                 let offsets = OffsetBuffer::new(offsets_i64.values().clone());
 
@@ -468,7 +530,14 @@ impl LogicalPageDecoder for ListPageDecoder {
             // wait for anything after that because we eagerly load item pages as part of the
             // indirect thread
             if self.unloaded.is_some() {
-                let indirectly_loaded = self.unloaded.take().unwrap().await.unwrap()?;
+                let indirectly_loaded = self.unloaded.take().unwrap().await;
+                if indirectly_loaded.is_err() {
+                    match indirectly_loaded.unwrap_err().try_into_panic() {
+                        Ok(err) => std::panic::resume_unwind(err),
+                        Err(err) => panic!("{:?}", err),
+                    };
+                }
+                let indirectly_loaded = indirectly_loaded.unwrap()?;
                 self.offsets = indirectly_loaded.offsets;
                 self.validity = indirectly_loaded.validity;
                 self.item_decoders.extend(indirectly_loaded.item_decoders);
@@ -555,6 +624,15 @@ struct IndirectlyLoaded {
     offsets: Vec<u64>,
     validity: BooleanBuffer,
     item_decoders: Vec<Box<dyn LogicalPageDecoder>>,
+}
+
+impl std::fmt::Debug for IndirectlyLoaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndirectlyLoaded")
+            .field("offsets", &self.offsets)
+            .field("validity", &self.validity)
+            .finish()
+    }
 }
 
 /// An encoder for list offsets that "stitches" offsets
@@ -716,7 +794,7 @@ impl ListOffsetsEncoder {
                             .skip(1)
                             .zip(validity.values().iter())
                             .map(|(&off, valid)| {
-                                let end = if valid { 0 } else { end };
+                                let end = if valid { 0 } else { end + 1 };
                                 off as u64 - start + base + end
                             }),
                     );
@@ -741,7 +819,7 @@ impl ListOffsetsEncoder {
                             .skip(1)
                             .zip(validity.values().iter())
                             .map(|(&off, valid)| {
-                                let end = if valid { 0 } else { end };
+                                let end = if valid { 0 } else { end + 1 };
                                 off as u64 - start + base + end
                             }),
                     )
@@ -769,7 +847,10 @@ impl ListOffsetsEncoder {
     ) -> Result<EncodedArray> {
         let mut offsets = Vec::with_capacity(num_offsets as usize);
         for (offsets_arr, validity_arr) in offset_arrays.iter().zip(validity) {
-            let last_prev_offset = offsets.last().copied().unwrap_or(0);
+            let mut last_prev_offset = offsets.last().copied().unwrap_or(0);
+            if last_prev_offset > total_span {
+                last_prev_offset = last_prev_offset - total_span - 1;
+            }
             Self::extend_offsets_vec_u64(
                 &mut offsets,
                 &offsets_arr,
@@ -912,7 +993,11 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::builder::{Int32Builder, ListBuilder};
+    use arrow_array::{
+        builder::{Int32Builder, ListBuilder},
+        ArrayRef, BooleanArray, ListArray,
+    };
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field};
 
     use crate::testing::{
@@ -930,7 +1015,7 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_list_simple() {
+    async fn test_simple_list() {
         let items_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         list_builder.append_value([Some(1), Some(2), Some(3)]);
@@ -954,11 +1039,31 @@ mod tests {
         let items_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         list_builder.append(true);
-        list_builder.append(true);
+        list_builder.append_null();
         list_builder.append(true);
         let list_array = list_builder.finish();
 
         let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_jumbo_list() {
+        // This is an overflow test.  We have a list of lists where each list
+        // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
+        // offsets range
+        let items = BooleanArray::new_null(1024 * 1024);
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1024 * 1024]));
+        let list_arr = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            offsets,
+            Arc::new(items),
+            None,
+        )) as ArrayRef;
+        let arrs = vec![list_arr; 5000];
+
+        // We can't validate because our validation relies on concatenating all input arrays
+        let test_cases = TestCases::default().without_validation();
+        check_round_trip_encoding_of_data(arrs, &test_cases).await;
     }
 }
