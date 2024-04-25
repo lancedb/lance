@@ -12,10 +12,11 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 use futures::{future::BoxFuture, FutureExt};
-use log::{info, trace};
+use log::trace;
+use snafu::{location, Location};
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use lance_core::Result;
+use lance_core::{Error, Result};
 
 use crate::{
     decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
@@ -351,23 +352,7 @@ impl LogicalPageScheduler for ListPageScheduler {
             }
             let mut item_decoders = Vec::new();
             drop(tx);
-            // TODO(urgent): A single list page can have multiple item pages and they could be huge.
-            // For example, 1Mi lists with 100MiB of data in each list.
-            //
-            // The 1Mi offsets would fit neatly into a single page
-            //
-            // However, the 100GiB of data would be spread across many pages.
-            //
-            // This is all ok.  THhe problem is that we are currently waiting for all pages
-            // to finish loading.  If the read batch size is small (e.g. 10) then we should
-            // only wait for a few pages before returning a batch.
-            //
-            // TODO(not-so-urgent): Even further in the future we should be able to automatically
-            // shrink the read batch size if we detect the batches are going to be huge (maybe
-            // even achieve this with a read_batch_bytes parameter, though some estimation may
-            // still be required)
-            while let Some(mut item_decoder) = rx.recv().await {
-                item_decoder.wait(item_decoder.unawaited(), &mut rx).await?;
+            while let Some(item_decoder) = rx.recv().await {
                 item_decoders.push(item_decoder);
             }
 
@@ -380,9 +365,11 @@ impl LogicalPageScheduler for ListPageScheduler {
         sink.send(Box::new(ListPageDecoder {
             offsets: Vec::new(),
             validity: BooleanBuffer::new(Buffer::from_vec(Vec::<u8>::default()), 0, 0),
-            item_decoders: VecDeque::new(),
-            num_rows,
+            unawaited_item_decoders: VecDeque::new(),
+            awaited_item_decoders: VecDeque::new(),
             rows_drained: 0,
+            lists_available: 0,
+            num_rows,
             unloaded: Some(indirect_fut),
             items_type: self.items_type.clone(),
             offset_type: self.offset_type.clone(),
@@ -428,9 +415,10 @@ struct ListPageDecoder {
     // offsets and validity will have already been decoded as part of the indirect I/O
     offsets: Vec<u64>,
     validity: BooleanBuffer,
-    // Items will not yet be decoded, we at least try and do that part
-    // on the decode thread
-    item_decoders: VecDeque<Box<dyn LogicalPageDecoder>>,
+    // Items will not yet be decoded, that happens in the decode thread
+    unawaited_item_decoders: VecDeque<Box<dyn LogicalPageDecoder>>,
+    awaited_item_decoders: VecDeque<Box<dyn LogicalPageDecoder>>,
+    lists_available: u32,
     num_rows: u32,
     rows_drained: u32,
     items_type: DataType,
@@ -508,16 +496,14 @@ impl DecodeArrayTask for ListDecodeTask {
 impl LogicalPageDecoder for ListPageDecoder {
     fn wait<'a>(
         &'a mut self,
-        // No support for partial wait
-        _num_rows: u32,
+        num_rows: u32,
         // We will never pull from source because of indirect I/O
-        _source: &'a mut mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
+        source: &'a mut mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
     ) -> BoxFuture<'a, Result<()>> {
         async move {
-            // wait for the indirect I/O to finish, if we haven't already.  We don't need to
-            // wait for anything after that because we eagerly load item pages as part of the
-            // indirect thread
+            // wait for the indirect I/O to finish, then wait for enough items to arrive
             if self.unloaded.is_some() {
+                trace!("List scheduler needs to wait for indirect I/O to complete");
                 let indirectly_loaded = self.unloaded.take().unwrap().await;
                 if indirectly_loaded.is_err() {
                     match indirectly_loaded.unwrap_err().try_into_panic() {
@@ -528,21 +514,74 @@ impl LogicalPageDecoder for ListPageDecoder {
                 let indirectly_loaded = indirectly_loaded.unwrap()?;
                 self.offsets = indirectly_loaded.offsets;
                 self.validity = indirectly_loaded.validity;
-                self.item_decoders.extend(indirectly_loaded.item_decoders);
+                self.unawaited_item_decoders
+                    .extend(indirectly_loaded.item_decoders);
             }
+            trace!(
+                "List decoder is waiting for {} rows and {} are already available",
+                num_rows,
+                self.lists_available
+            );
+            if self.lists_available >= num_rows {
+                self.lists_available -= num_rows;
+                return Ok(());
+            }
+            let num_rows = num_rows - self.lists_available;
+            self.lists_available = 0;
+            let offset_wait_start = self.rows_drained + self.lists_available;
+            let item_start = self.offsets[offset_wait_start as usize];
+            let mut items_needed =
+                self.offsets[offset_wait_start as usize + num_rows as usize] - item_start;
+            // First discount any already available items
+            items_needed = items_needed.saturating_sub(
+                self.awaited_item_decoders
+                    .iter()
+                    .map(|d| d.avail() as u64)
+                    .sum::<u64>(),
+            );
+            // The last decoder in the awaited list may not be fully awaited
+            if let Some(last_decoder) = self.awaited_item_decoders.back_mut() {
+                let to_await = items_needed.min(last_decoder.unawaited() as u64) as u32;
+                trace!(
+                    "List decoder waiting for {} items from the last awaited page",
+                    to_await
+                );
+                if to_await > 0 {
+                    last_decoder.wait(to_await, source).await?;
+                    items_needed = items_needed.saturating_sub(last_decoder.avail() as u64);
+                }
+            }
+            // Finally wait for more I/O
+            while items_needed > 0 {
+                let mut next_item_decoder = self.unawaited_item_decoders.pop_front().unwrap();
+                let unawaited = next_item_decoder.unawaited() as u64;
+                trace!(
+                    "List decoder waiting on a new page that has {} items unawaited",
+                    unawaited
+                );
+                let to_await = items_needed.min(unawaited as u64) as u32;
+                // TODO: Seems like this will fail in List<Struct> case
+                next_item_decoder.wait(to_await, source).await?;
+                // Might end up loading more items than needed so use saturating_sub
+                items_needed = items_needed.saturating_sub(next_item_decoder.avail() as u64);
+                self.awaited_item_decoders.push_back(next_item_decoder);
+            }
+            // This is technically undercounting a little.  It's possible that we loaded a big items
+            // page with many items and then only needed a few of them for the requested lists.  However,
+            // to find the exact number of lists that are available we would need to walk through the item
+            // lengths and it's faster to just undercount here.
+            self.lists_available += num_rows;
             Ok(())
         }
         .boxed()
     }
 
     fn unawaited(&self) -> u32 {
-        match self.unloaded {
-            None => 0,
-            Some(_) => self.num_rows,
-        }
+        self.num_rows - self.lists_available - self.rows_drained
     }
 
     fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
+        self.lists_available -= num_rows;
         // We already have the offsets but need to drain the item pages
         let mut actual_num_rows = num_rows;
         let item_start = self.offsets[self.rows_drained as usize];
@@ -555,12 +594,17 @@ impl LogicalPageDecoder for ListPageDecoder {
                 if num_items <= i32::MAX as u64 {
                     break;
                 }
-                // TODO: This could be slow.  Maybe faster to start from zero?
+                // TODO: This could be slow.  Maybe faster to start from zero or do binary search.  Investigate when
+                // actually adding support for smaller than requested batches
                 actual_num_rows -= 1;
             }
         }
         if actual_num_rows < num_rows {
-            info!("Only decoding {} rows instead of {} because total data size would exceed 2^31 items", actual_num_rows, num_rows);
+            // TODO: We should be able to automatically
+            // shrink the read batch size if we detect the batches are going to be huge (maybe
+            // even achieve this with a read_batch_bytes parameter, though some estimation may
+            // still be required)
+            return Err(Error::NotSupported { source: format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into(), location: location!() });
         }
         let offsets = self.offsets
             [self.rows_drained as usize..(self.rows_drained + actual_num_rows + 1) as usize]
@@ -574,14 +618,14 @@ impl LogicalPageDecoder for ListPageDecoder {
 
         let mut item_decodes = Vec::new();
         while num_items_to_drain > 0 {
-            let next_item_page = self.item_decoders.front_mut().unwrap();
+            let next_item_page = self.awaited_item_decoders.front_mut().unwrap();
             let avail = next_item_page.avail();
             let to_take = num_items_to_drain.min(avail as u64) as u32;
             num_items_to_drain -= to_take as u64;
             let next_task = next_item_page.drain(to_take)?;
 
             if !next_task.has_more {
-                self.item_decoders.pop_front();
+                self.awaited_item_decoders.pop_front();
             }
             item_decodes.push(next_task.task);
         }
@@ -601,10 +645,7 @@ impl LogicalPageDecoder for ListPageDecoder {
     }
 
     fn avail(&self) -> u32 {
-        match self.unloaded {
-            Some(_) => 0,
-            None => self.num_rows - self.rows_drained,
-        }
+        self.lists_available
     }
 }
 
