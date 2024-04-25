@@ -166,10 +166,11 @@ pub struct BinaryFieldEncoder {
 }
 
 impl BinaryFieldEncoder {
-    pub fn new(cache_bytes_per_column: u64, column_index: u32) -> Self {
+    pub fn new(cache_bytes_per_column: u64, keep_original_array: bool, column_index: u32) -> Self {
         let items_encoder = Box::new(
             PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_column,
+                keep_original_array,
                 &DataType::UInt8,
                 column_index + 1,
             )
@@ -179,6 +180,7 @@ impl BinaryFieldEncoder {
             varbin_encoder: Box::new(ListFieldEncoder::new(
                 items_encoder,
                 cache_bytes_per_column,
+                keep_original_array,
                 column_index,
             )),
         }
