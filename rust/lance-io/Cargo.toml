@@ -37,10 +37,11 @@ pin-project.workspace = true
 prost.workspace = true
 shellexpand.workspace = true
 snafu.workspace = true
-tokio.workspace = true
 tokio-stream.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+path_abs.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

@@ -8,20 +8,18 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{cast::AsArray, types::Float32Type, Float32Array, RecordBatch, UInt64Array};
-
-use arrow_schema::DataType;
+use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use async_trait::async_trait;
-use lance_arrow::*;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
+use lance_index::vector::quantizer::Quantizer;
 use lance_index::{
     vector::{
         graph::{VectorStorage, NEIGHBORS_FIELD},
         hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
-        quantizer::{IvfQuantizationStorage, Quantization, Quantizer},
-        Query, DIST_COL,
+        quantizer::{IvfQuantizationStorage, Quantization},
+        Query,
     },
     Index, IndexType,
 };
@@ -37,6 +35,9 @@ use tracing::instrument;
 use super::opq::train_opq;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
+use crate::RESULT_SCHEMA;
+
+pub mod builder;
 
 #[derive(Clone)]
 pub(crate) struct HNSWIndexOptions {
@@ -143,6 +144,11 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
 impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+        let schema = RESULT_SCHEMA.clone();
+
+        if self.hnsw.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
         let row_ids = self.hnsw.storage().row_ids();
         let bitmap = if pre_filter.is_empty() {
             None
@@ -170,22 +176,13 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             });
         }
 
-        let results = self.hnsw.search(
-            query.key.as_primitive::<Float32Type>().as_slice(),
-            k,
-            ef,
-            bitmap,
-        )?;
+        let results = self.hnsw.search(query.key.clone(), k, ef, bitmap)?;
 
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.id as usize]));
         let distances = Arc::new(Float32Array::from_iter_values(
             results.iter().map(|x| x.dist.0),
         ));
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, true),
-        ]));
         Ok(RecordBatch::try_new(
             schema,
             vec![distances, Arc::new(row_ids)],

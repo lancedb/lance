@@ -79,7 +79,7 @@ impl<W: Writer + ?Sized> WriteExt for W {
 }
 
 #[async_trait]
-pub trait Reader: Send + Sync {
+pub trait Reader: std::fmt::Debug + Send + Sync {
     fn path(&self) -> &Path;
 
     /// Suggest optimal I/O size per storage device.

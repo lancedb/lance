@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -16,6 +16,8 @@ use datafusion::physical_plan::{
     stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
 };
+use datafusion::physical_plan::{ExecutionMode, PlanProperties};
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -133,6 +135,8 @@ pub struct KNNFlatExec {
 
     /// The vector query to execute.
     pub query: Query,
+    output_schema: SchemaRef,
+    properties: PlanProperties,
 }
 
 impl DisplayAs for KNNFlatExec {
@@ -177,7 +181,26 @@ impl KNNFlatExec {
             }
         }
 
-        Ok(Self { input, query })
+        let mut fields = schema.fields().to_vec();
+        if schema.field_with_name(DIST_COL).is_err() {
+            fields.push(Arc::new(Field::new(DIST_COL, DataType::Float32, true)));
+        }
+
+        let output_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+
+        // This node has the same partitioning & boundedness as the input node
+        // but it destroys any ordering.
+        let properties = input
+            .properties()
+            .clone()
+            .with_eq_properties(EquivalenceProperties::new(output_schema.clone()));
+
+        Ok(Self {
+            input,
+            query,
+            output_schema,
+            properties,
+        })
     }
 }
 
@@ -188,24 +211,7 @@ impl ExecutionPlan for KNNFlatExec {
 
     /// Flat KNN inherits the schema from input node, and add one distance column.
     fn schema(&self) -> arrow_schema::SchemaRef {
-        let input_schema = self.input.schema();
-        let mut fields = input_schema.fields().to_vec();
-        if input_schema.field_with_name(DIST_COL).is_err() {
-            fields.push(Arc::new(Field::new(DIST_COL, DataType::Float32, true)));
-        }
-
-        Arc::new(Schema::new_with_metadata(
-            fields,
-            input_schema.metadata().clone(),
-        ))
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
+        self.output_schema.clone()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -235,6 +241,10 @@ impl ExecutionPlan for KNNFlatExec {
             num_rows: Precision::Exact(self.query.k),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 }
 
@@ -334,6 +344,13 @@ pub enum PreFilterSource {
     None,
 }
 
+lazy_static::lazy_static! {
+    pub static ref KNN_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new(DIST_COL, DataType::Float32, true),
+        ROW_ID_FIELD.clone(),
+    ]));
+}
+
 /// [ExecutionPlan] for KNNIndex node.
 #[derive(Debug)]
 pub struct KNNIndexExec {
@@ -345,6 +362,8 @@ pub struct KNNIndexExec {
     indices: Vec<Index>,
     /// The vector query to execute.
     query: Query,
+    /// The datafusion plan properties
+    properties: PlanProperties,
 }
 
 impl DisplayAs for KNNIndexExec {
@@ -388,11 +407,18 @@ impl KNNIndexExec {
             });
         };
 
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            ExecutionMode::Bounded,
+        );
+
         Ok(Self {
             dataset,
             indices: indices.to_vec(),
             query: query.clone(),
             prefilter_source,
+            properties,
         })
     }
 }
@@ -403,18 +429,7 @@ impl ExecutionPlan for KNNIndexExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new(DIST_COL, DataType::Float32, true),
-            ROW_ID_FIELD.clone(),
-        ]))
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::RoundRobinBatch(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+        KNN_INDEX_SCHEMA.clone()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -464,6 +479,10 @@ impl ExecutionPlan for KNNIndexExec {
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 }
 

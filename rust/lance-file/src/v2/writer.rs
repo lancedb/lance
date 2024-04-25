@@ -3,14 +3,14 @@
 
 use arrow_array::RecordBatch;
 
-use arrow_schema::Schema;
-use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
-use lance_encoding::encoder::{BatchEncoder, EncodedPage, FieldEncoder};
+use lance_encoding::encoder::{BatchEncoder, EncodeTask, EncodedPage, FieldEncoder};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
+use log::debug;
 use prost::Message;
 use prost_types::Any;
 use snafu::{location, Location};
@@ -45,9 +45,11 @@ pub struct FileWriterOptions {
 
 pub struct FileWriter {
     writer: ObjectWriter,
-    schema: Schema,
+    path: String,
+    schema: LanceSchema,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
+    field_id_to_column_indices: Vec<(i32, i32)>,
     num_columns: u32,
     rows_written: u64,
 }
@@ -56,7 +58,8 @@ impl FileWriter {
     /// Create a new FileWriter
     pub fn try_new(
         object_writer: ObjectWriter,
-        schema: Schema,
+        path: String,
+        schema: LanceSchema,
         options: FileWriterOptions,
     ) -> Result<Self> {
         let cache_bytes_per_column = if let Some(data_cache_bytes) = options.data_cache_bytes {
@@ -64,6 +67,8 @@ impl FileWriter {
         } else {
             8 * 1024 * 1024
         };
+
+        schema.validate()?;
 
         let encoder = BatchEncoder::try_new(&schema, cache_bytes_per_column)?;
         let num_columns = encoder.num_columns();
@@ -73,18 +78,20 @@ impl FileWriter {
 
         Ok(Self {
             writer: object_writer,
+            path,
             schema,
             column_writers,
             column_metadata,
             num_columns,
             rows_written: 0,
+            field_id_to_column_indices: encoder.field_id_to_column_index,
         })
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
-        let mut buffer_offsets = Vec::with_capacity(encoded_page.buffers.len());
-        let mut buffer_sizes = Vec::with_capacity(encoded_page.buffers.len());
-        for buffer in encoded_page.buffers {
+        let mut buffer_offsets = Vec::with_capacity(encoded_page.array.buffers.len());
+        let mut buffer_sizes = Vec::with_capacity(encoded_page.array.buffers.len());
+        for buffer in encoded_page.array.buffers {
             buffer_offsets.push(self.writer.tell().await? as u64);
             buffer_sizes.push(
                 buffer
@@ -101,7 +108,7 @@ impl FileWriter {
                 self.writer.write_all(part).await?;
             }
         }
-        let encoded_encoding = Any::from_msg(&encoded_page.encoding)?;
+        let encoded_encoding = Any::from_msg(&encoded_page.array.encoding)?;
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -120,7 +127,7 @@ impl FileWriter {
 
     async fn write_pages(
         &mut self,
-        mut encoding_tasks: FuturesUnordered<BoxFuture<'static, Result<EncodedPage>>>,
+        mut encoding_tasks: FuturesUnordered<EncodeTask>,
     ) -> Result<()> {
         // As soon as an encoding task is done we write it.  There is no parallelism
         // needed here because "writing" is really just submitting the buffer to the
@@ -142,6 +149,10 @@ impl FileWriter {
     /// Note: the future returned by this method may complete before the data has been fully
     /// flushed to the file (some data may be in the data cache or the I/O cache)
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        debug!(
+            "write_batch called with {} bytes of data",
+            batch.get_array_memory_size()
+        );
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -167,11 +178,11 @@ impl FileWriter {
             .zip(self.column_writers.iter_mut())
             .map(|(field, column_writer)| {
                 let array = batch
-                    .column_by_name(field.name())
+                    .column_by_name(&field.name)
                     .ok_or(Error::InvalidInput {
                         source: format!(
                             "Cannot write batch.  The batch was missing the column `{}`",
-                            field.name()
+                            field.name
                         )
                         .into(),
                         location: location!(),
@@ -236,7 +247,9 @@ impl FileWriter {
     /// This method will wait until all data has been flushed to the file.  Then it
     /// will write the file metadata and the footer.  It will not return until all
     /// data has been flushed and the file has been closed.
-    pub async fn finish(&mut self) -> Result<()> {
+    ///
+    /// Returns the total number of rows written
+    pub async fn finish(&mut self) -> Result<u64> {
         // 1. flush any remaining data and write out those pages
         let encoding_tasks = self
             .column_writers
@@ -252,7 +265,7 @@ impl FileWriter {
         // No data, so don't create a file
         if self.rows_written == 0 {
             self.writer.shutdown().await?;
-            return Ok(());
+            return Ok(0);
         }
 
         // 2. write the column metadatas
@@ -291,7 +304,23 @@ impl FileWriter {
 
         // 7. close the writer
         self.writer.shutdown().await?;
-        Ok(())
+        Ok(self.rows_written)
+    }
+
+    pub fn multipart_id(&self) -> &str {
+        &self.writer.multipart_id
+    }
+
+    pub async fn tell(&mut self) -> Result<u64> {
+        Ok(self.writer.tell().await? as u64)
+    }
+
+    pub fn field_id_to_column_indices(&self) -> &[(i32, i32)] {
+        &self.field_id_to_column_indices
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
     }
 }
 
@@ -321,9 +350,13 @@ mod tests {
 
         let writer = obj_store.create(&tmp_path).await.unwrap();
 
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
+
         let mut file_writer = FileWriter::try_new(
             writer,
-            (*reader.schema()).clone(),
+            tmp_path.to_string(),
+            lance_schema,
             FileWriterOptions::default(),
         )
         .unwrap();

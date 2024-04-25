@@ -20,7 +20,7 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
-use log::trace;
+use log::{debug, trace};
 use snafu::{location, Location};
 
 use lance_core::{Error, Result};
@@ -31,8 +31,11 @@ use crate::{
         DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo,
         PhysicalPageDecoder, PhysicalPageScheduler,
     },
-    encoder::{ArrayEncoder, EncodedPage, FieldEncoder},
-    encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
+    encoder::{ArrayEncoder, EncodeTask, EncodedPage, FieldEncoder},
+    encodings::physical::{
+        basic::BasicEncoder, decoder_from_array_encoding, fixed_size_list::FslEncoder,
+        value::ValueEncoder, ColumnBuffers, PageBuffers,
+    },
     EncodingsIo,
 };
 
@@ -133,14 +136,22 @@ struct PrimitiveFieldDecodeTask {
 
 impl DecodeArrayTask for PrimitiveFieldDecodeTask {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
-        // There are two buffers, the validity buffer and the values buffer
-        // We start by assuming the validity buffer will not be required
-        let mut capacities = [(0, false), (0, true)];
+        // We start by assuming that no buffers are required.  The number of buffers needed is based
+        // on the data type.  Most data types need two buffers but each layer of fixed-size-list, for
+        // example, adds another validity buffer
+        let mut capacities = vec![(0, false); self.physical_decoder.num_buffers() as usize];
+        let mut all_null = false;
         self.physical_decoder.update_capacity(
             self.rows_to_skip,
             self.rows_to_take,
             &mut capacities,
+            &mut all_null,
         );
+
+        if all_null {
+            return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));
+        }
+
         // At this point we know the size needed for each buffer
         let mut bufs = capacities
             .into_iter()
@@ -187,13 +198,26 @@ impl PrimitiveFieldDecodeTask {
         };
 
         let data_buffer = buffer_iter.next().unwrap().freeze();
-        let data_buffer = Buffer::from(data_buffer);
+        let data_buffer = Buffer::from_bytes(data_buffer.into());
         let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
 
         // The with_data_type is needed here to recover the parameters for types like Decimal/Timestamp
         Arc::new(
             PrimitiveArray::<T>::new(data_buffer, null_buffer).with_data_type(data_type.clone()),
         )
+    }
+
+    fn bytes_to_validity(bytes: BytesMut, num_rows: u32) -> Option<NullBuffer> {
+        if bytes.is_empty() {
+            None
+        } else {
+            let null_buffer = bytes.freeze().into();
+            Some(NullBuffer::new(BooleanBuffer::new(
+                Buffer::from_bytes(null_buffer),
+                0,
+                num_rows as usize,
+            )))
+        }
     }
 
     fn primitive_array_from_buffers(
@@ -205,16 +229,7 @@ impl PrimitiveFieldDecodeTask {
             DataType::Boolean => {
                 let mut buffer_iter = buffers.into_iter();
                 let null_buffer = buffer_iter.next().unwrap();
-                let null_buffer = if null_buffer.is_empty() {
-                    None
-                } else {
-                    let null_buffer = null_buffer.freeze().into();
-                    Some(NullBuffer::new(BooleanBuffer::new(
-                        Buffer::from_bytes(null_buffer),
-                        0,
-                        num_rows as usize,
-                    )))
-                };
+                let null_buffer = Self::bytes_to_validity(null_buffer, num_rows);
 
                 let data_buffer = buffer_iter.next().unwrap().freeze();
                 let data_buffer = Buffer::from(data_buffer);
@@ -334,16 +349,21 @@ impl PrimitiveFieldDecodeTask {
                 buffers, num_rows, data_type,
             )),
             DataType::FixedSizeList(items, dimension) => {
+                let mut buffers_iter = buffers.into_iter();
+                let fsl_validity = buffers_iter.next().unwrap();
+                let fsl_nulls = Self::bytes_to_validity(fsl_validity, num_rows);
+
+                let remaining_buffers = buffers_iter.collect::<Vec<_>>();
                 let items_array = Self::primitive_array_from_buffers(
                     items.data_type(),
-                    buffers,
+                    remaining_buffers,
                     num_rows * (*dimension as u32),
                 )?;
                 Ok(Arc::new(FixedSizeListArray::new(
                     items.clone(),
                     *dimension,
                     items_array,
-                    None,
+                    fsl_nulls,
                 )))
             }
             _ => Err(Error::IO {
@@ -413,48 +433,94 @@ pub struct PrimitiveFieldEncoder {
     buffered_arrays: Vec<ArrayRef>,
     current_bytes: u64,
     encoder: Arc<dyn ArrayEncoder>,
+    column_index: u32,
 }
 
 impl PrimitiveFieldEncoder {
-    pub fn new(cache_bytes: u64, encoder: Arc<dyn ArrayEncoder>) -> Self {
+    pub fn array_encoder_from_data_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
+        match data_type {
+            DataType::FixedSizeList(inner, dimension) => {
+                Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
+                    Self::array_encoder_from_data_type(inner.data_type())?,
+                    *dimension as u32,
+                )))))
+            }
+            _ => Ok(Box::new(BasicEncoder::new(Box::new(
+                ValueEncoder::try_new(data_type)?,
+            )))),
+        }
+    }
+
+    pub fn try_new(cache_bytes: u64, data_type: &DataType, column_index: u32) -> Result<Self> {
+        Ok(Self {
+            cache_bytes,
+            column_index,
+            buffered_arrays: Vec::new(),
+            current_bytes: 0,
+            encoder: Arc::from(Self::array_encoder_from_data_type(data_type)?),
+        })
+    }
+
+    pub fn new_with_encoder(
+        cache_bytes: u64,
+        column_index: u32,
+        encoder: Arc<dyn ArrayEncoder>,
+    ) -> Self {
         Self {
             cache_bytes,
-            buffered_arrays: Vec::with_capacity(8),
+            column_index,
+            buffered_arrays: Vec::new(),
             current_bytes: 0,
             encoder,
         }
     }
 
     // Creates an encode task, consuming all buffered data
-    fn do_flush(&mut self) -> BoxFuture<'static, Result<EncodedPage>> {
+    fn do_flush(&mut self) -> EncodeTask {
         let mut arrays = Vec::new();
         std::mem::swap(&mut arrays, &mut self.buffered_arrays);
         self.current_bytes = 0;
         let encoder = self.encoder.clone();
+        let column_idx = self.column_index;
 
-        tokio::task::spawn(async move { encoder.encode(&arrays) })
-            .map(|res_res| res_res.unwrap())
-            .boxed()
+        tokio::task::spawn(async move {
+            let num_rows = arrays.iter().map(|arr| arr.len() as u32).sum();
+            let mut buffer_index = 0;
+            let array = encoder.encode(&arrays, &mut buffer_index)?;
+            Ok(EncodedPage {
+                array,
+                num_rows,
+                column_idx,
+            })
+        })
+        .map(|res_res| res_res.unwrap())
+        .boxed()
     }
 }
 
 impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
-    fn maybe_encode(
-        &mut self,
-        array: ArrayRef,
-    ) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         self.current_bytes += array.get_array_memory_size() as u64;
         self.buffered_arrays.push(array);
         if self.current_bytes > self.cache_bytes {
+            debug!(
+                "Flushing column {} page of size {} bytes (unencoded)",
+                self.column_index, self.current_bytes
+            );
             Ok(vec![self.do_flush()])
         } else {
+            trace!(
+                "Accumulating data for column {}.  Now at {} bytes",
+                self.column_index,
+                self.current_bytes
+            );
             Ok(vec![])
         }
     }
 
     // If there is any data left in the buffer then create an encode task from it
-    fn flush(&mut self) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
         if self.current_bytes > 0 {
             Ok(vec![self.do_flush()])
         } else {

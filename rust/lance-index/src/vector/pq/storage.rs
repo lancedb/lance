@@ -7,6 +7,7 @@
 
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
+use arrow_array::ArrayRef;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
@@ -410,15 +411,23 @@ impl VectorStorage for ProductQuantizationStorage {
         self.metric_type
     }
 
-    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator> {
+    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator> {
         Box::new(PQDistCalculator::new(
             self.codebook.values(),
             self.num_bits,
             self.num_sub_vectors,
             self.pq_code.clone(),
-            query,
+            query.as_primitive::<Float32Type>().values(),
             self.metric_type(),
         ))
+    }
+
+    fn dist_calculator_from_id(&self, _: u32) -> Box<dyn DistCalculator> {
+        todo!("distance_between not implemented for PQ storage")
+    }
+
+    fn distance_between(&self, _: u32, _: u32) -> f32 {
+        todo!("distance_between not implemented for PQ storage")
     }
 }
 
@@ -460,17 +469,13 @@ impl PQDistCalculator {
 }
 
 impl DistCalculator for PQDistCalculator {
-    fn distance(&self, ids: &[u32]) -> Vec<f32> {
-        ids.iter()
-            .map(|&id| {
-                let pq_code = self.get_pq_code(id);
-                pq_code
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
-                    .sum()
-            })
-            .collect()
+    fn distance(&self, id: u32) -> f32 {
+        let pq_code = self.get_pq_code(id);
+        pq_code
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
+            .sum()
     }
 }
 

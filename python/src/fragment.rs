@@ -22,19 +22,12 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
-use lance_file::datatypes::Fields;
-use lance_file::format::pb::Field as LanceField;
 use lance_io::object_store::ObjectStore;
-use lance_table::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
+use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
-use prost::Message;
 use pyo3::prelude::*;
-use pyo3::{
-    exceptions::*,
-    pyclass::CompareOp,
-    types::{PyBytes, PyDict},
-};
+use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
@@ -98,7 +91,7 @@ impl FileFragment {
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
         })??;
-        Ok(FragmentMetadata::new(metadata, schema))
+        Ok(FragmentMetadata::new(metadata))
     }
 
     #[staticmethod]
@@ -119,16 +112,12 @@ impl FileFragment {
 
         reader.py().allow_threads(|| {
             RT.runtime.block_on(async move {
-                let schema = batches.schema().clone();
-
                 let metadata =
                     LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
                         .await
                         .map_err(|err| PyIOError::new_err(err.to_string()))?;
-                let schema = Schema::try_from(schema.as_ref())
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-                Ok(FragmentMetadata::new(metadata, schema))
+                Ok(FragmentMetadata::new(metadata))
             })
         })
     }
@@ -138,10 +127,7 @@ impl FileFragment {
     }
 
     fn metadata(&self) -> FragmentMetadata {
-        FragmentMetadata::new(
-            self.fragment.metadata().clone(),
-            self.fragment.dataset().schema().clone(),
-        )
+        FragmentMetadata::new(self.fragment.metadata().clone())
     }
 
     fn count_rows(&self, _filter: Option<String>) -> PyResult<usize> {
@@ -322,21 +308,27 @@ impl DataFile {
     fn field_ids(&self) -> Vec<i32> {
         self.inner.fields.clone()
     }
+
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.inner == other.inner),
+            CompareOp::Ne => Ok(self.inner != other.inner),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only == and != are supported for DataFile",
+            )),
+        }
+    }
 }
 
 #[pyclass(name = "_FragmentMetadata", module = "lance")]
 #[derive(Clone, Debug)]
 pub struct FragmentMetadata {
     pub(crate) inner: LanceFragmentMetadata,
-    schema: Schema,
 }
 
 impl FragmentMetadata {
-    pub(crate) fn new(inner: LanceFragmentMetadata, full_schema: Schema) -> Self {
-        Self {
-            inner,
-            schema: full_schema,
-        }
+    pub(crate) fn new(inner: LanceFragmentMetadata) -> Self {
+        Self { inner }
     }
 }
 
@@ -346,7 +338,6 @@ impl FragmentMetadata {
     fn init() -> Self {
         Self {
             inner: LanceFragmentMetadata::new(0),
-            schema: Schema::from(&Fields(Vec::<LanceField>::new())),
         }
     }
 
@@ -356,17 +347,14 @@ impl FragmentMetadata {
             PyValueError::new_err(format!("Invalid metadata json payload: {json}: {}", err))
         })?;
 
-        Ok(Self {
-            inner: metadata,
-            schema: Schema::from(&Fields(Vec::<LanceField>::new())),
-        })
+        Ok(Self { inner: metadata })
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
         match op {
             CompareOp::Lt => Ok(self.inner.id < other.inner.id),
             CompareOp::Le => Ok(self.inner.id <= other.inner.id),
-            CompareOp::Eq => Ok(self.inner.id == other.inner.id && self.schema == other.schema),
+            CompareOp::Eq => Ok(self.inner == other.inner),
             CompareOp::Ne => self.__richcmp__(other, CompareOp::Eq).map(|v| !v),
             CompareOp::Gt => self.__richcmp__(other, CompareOp::Le).map(|v| !v),
             CompareOp::Ge => self.__richcmp__(other, CompareOp::Lt).map(|v| !v),
@@ -375,36 +363,6 @@ impl FragmentMetadata {
 
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
-    }
-
-    pub fn __setstate__(&mut self, py: Python, state: PyObject) -> PyResult<()> {
-        match state.extract::<&PyBytes>(py) {
-            Ok(bytes) => {
-                let bytes = bytes.as_bytes();
-                let manifest = pb::Manifest::decode(bytes).map_err(|e| {
-                    PyValueError::new_err(format!("Unable to unpickle FragmentMetadata: {}", e))
-                })?;
-                self.schema = Schema::from(&Fields(manifest.fields));
-                self.inner = LanceFragmentMetadata::from(&manifest.fragments[0]);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    pub fn __getstate__(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let container = pb::Manifest {
-            fields: Fields::from(&self_.schema).0,
-            fragments: vec![pb::DataFragment::from(&self_.inner)],
-            ..Default::default()
-        };
-
-        Ok(PyBytes::new(self_.py(), container.encode_to_vec().as_slice()).to_object(self_.py()))
-    }
-
-    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let arrow_schema: ArrowSchema = (&self_.schema).into();
-        arrow_schema.to_pyarrow(self_.py())
     }
 
     fn json(self_: PyRef<'_, Self>) -> PyResult<String> {
@@ -433,9 +391,42 @@ impl FragmentMetadata {
         )
     }
 
+    /// Get the physical rows statistic.
+    ///
+    /// This represents the original number of rows in the fragment
+    /// before any deletions.
+    ///
+    /// If this is None, it is unavailable.
     #[getter]
-    fn id(&self) -> PyResult<u64> {
-        Ok(self.inner.id)
+    fn physical_rows(&self) -> Option<usize> {
+        self.inner.physical_rows
+    }
+
+    /// Get the number of tombstoned rows in the fragment.
+    ///
+    /// If this is None, this statistic is unavailable. It does not necessarily
+    /// mean there are no deletions.
+    #[getter]
+    fn num_deletions(&self) -> Option<usize> {
+        self.inner
+            .deletion_file
+            .as_ref()
+            .and_then(|d| d.num_deleted_rows)
+    }
+
+    /// Get the number of rows in the fragment.
+    ///
+    /// This is equivalent to physical_rows minus num_deletions.
+    ///
+    /// If this is None, this statistic is unavailable.
+    #[getter]
+    fn num_rows(&self) -> Option<usize> {
+        self.inner.num_rows()
+    }
+
+    #[getter]
+    fn id(&self) -> u64 {
+        self.inner.id
     }
 }
 
@@ -473,12 +464,9 @@ pub fn write_fragments(
 ) -> PyResult<Vec<FragmentMetadata>> {
     let batches = convert_reader(reader)?;
 
-    let schema = batches.schema();
-    let schema =
-        Schema::try_from(schema.as_ref()).map_err(|err| PyValueError::new_err(err.to_string()))?;
-
     let params = kwargs
-        .and_then(|params| get_write_params(params).ok().flatten())
+        .and_then(|params| get_write_params(params).transpose())
+        .transpose()?
         .unwrap_or_default();
 
     let fragments = RT
@@ -489,7 +477,7 @@ pub fn write_fragments(
 
     fragments
         .into_iter()
-        .map(|f| Ok(FragmentMetadata::new(f, schema.clone())))
+        .map(|f| Ok(FragmentMetadata::new(f)))
         .collect()
 }
 

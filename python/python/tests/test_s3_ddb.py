@@ -163,9 +163,9 @@ def test_s3_ddb_concurrent_commit(
     assert len(lance.dataset(table_dir).versions()) == 6
     assert lance.dataset(table_dir).count_rows() == 6
 
-    assert sorted([
-        item["a"] for item in lance.dataset(table_dir).to_table().to_pylist()
-    ]) == [-1, 0, 1, 2, 3, 4]
+    assert sorted(
+        [item["a"] for item in lance.dataset(table_dir).to_table().to_pylist()]
+    ) == [-1, 0, 1, 2, 3, 4]
 
 
 @pytest.mark.integration

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -15,6 +16,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -28,6 +30,10 @@ from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner, ReaderLike
+    from .schema import LanceSchema
+
+
+DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
 
 
 class FragmentMetadata:
@@ -39,6 +45,12 @@ class FragmentMetadata:
         Internal use only.
         """
         self._metadata = _FragmentMetadata.from_json(metadata)
+
+    @classmethod
+    def from_metadata(cls, metadata: _FragmentMetadata):
+        instance = cls.__new__(cls)
+        instance._metadata = metadata
+        return instance
 
     def __repr__(self):
         return self._metadata.__repr__()
@@ -132,6 +144,9 @@ class LanceFragment(pa.dataset.Fragment):
         schema: Optional[pa.Schema] = None,
         max_rows_per_group: int = 1024,
         progress: Optional[FragmentWriteProgress] = None,
+        mode: str = "append",
+        *,
+        use_experimental_writer=False,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -158,6 +173,10 @@ class LanceFragment(pa.dataset.Fragment):
             *Experimental API*. Progress tracking for writing the fragment. Pass
             a custom class that defines hooks to be called when each fragment is
             starting to write and finishing writing.
+        mode: str, default "append"
+            The write mode. If "append" is specified, the data will be checked
+            against the existing dataset's schema. Otherwise, pass "create" or
+            "overwrite" to assign new field ids to the schema.
 
         See Also
         --------
@@ -195,6 +214,8 @@ class LanceFragment(pa.dataset.Fragment):
             reader,
             max_rows_per_group=max_rows_per_group,
             progress=progress,
+            mode=mode,
+            use_experimental_writer=use_experimental_writer,
         )
         return FragmentMetadata(inner_meta.json())
 
@@ -315,11 +336,11 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
         ).to_table()
 
-    def add_columns(
+    def merge_columns(
         self,
         value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
-    ) -> FragmentMetadata:
+    ) -> Tuple[FragmentMetadata, LanceSchema]:
         """Add columns to this Fragment.
 
         .. warning::
@@ -342,7 +363,8 @@ class LanceFragment(pa.dataset.Fragment):
 
         Returns
         -------
-            A new fragment with the added column(s).
+        Tuple[FragmentMetadata, LanceSchema]
+            A new fragment with the added column(s) and the final schema.
         """
         updater = self._fragment.updater(columns)
 
@@ -359,7 +381,48 @@ class LanceFragment(pa.dataset.Fragment):
 
             updater.update(new_value)
         metadata = updater.finish()
-        return FragmentMetadata(metadata.json())
+        schema = updater.schema()
+        return FragmentMetadata.from_metadata(metadata), schema
+
+    def add_columns(
+        self,
+        value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
+        columns: Optional[list[str]] = None,
+    ) -> FragmentMetadata:
+        """Add columns to this Fragment.
+
+        .. deprecated:: 0.10.14
+            Use :meth:`merge_columns` instead.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+
+        Parameters
+        ----------
+        value_func: Callable.
+            A function that takes a RecordBatch as input and returns a RecordBatch.
+        columns: Optional[list[str]].
+            If specified, only the columns in this list will be passed to the
+            value_func. Otherwise, all columns will be passed to the value_func.
+
+        See Also
+        --------
+        lance.dataset.LanceOperation.Merge :
+            The operation used to commit these changes to the dataset. See the
+            doc page for an example of using this API.
+
+        Returns
+        -------
+        FragmentMetadata
+            A new fragment with the added column(s).
+        """
+        warnings.warn(
+            "LanceFragment.add_columns is deprecated, use LanceFragment.merge_columns "
+            "instead",
+            DeprecationWarning,
+        )
+        return self.merge_columns(value_func, columns)[0]
 
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.
@@ -403,7 +466,7 @@ class LanceFragment(pa.dataset.Fragment):
         raw_fragment = self._fragment.delete(predicate)
         if raw_fragment is None:
             return None
-        return FragmentMetadata(raw_fragment.metadata().json())
+        return FragmentMetadata.from_metadata(raw_fragment.metadata())
 
     @property
     def schema(self) -> pa.Schema:
@@ -428,7 +491,7 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
-        return FragmentMetadata(self._fragment.metadata().json())
+        return FragmentMetadata.from_metadata(self._fragment.metadata())
 
 
 def write_fragments(
@@ -436,10 +499,12 @@ def write_fragments(
     dataset_uri: Union[str, Path],
     schema: Optional[pa.Schema] = None,
     *,
+    mode: str = "append",
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
-    max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
+    max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
+    use_experimental_writer: bool = False,
 ) -> List[FragmentMetadata]:
     """
     Write data into one or more fragments.
@@ -458,6 +523,10 @@ def write_fragments(
     schema : pa.Schema, optional
         The schema of the data. If not specified, the schema will be inferred
         from the data.
+    mode : str, default "append"
+        The write mode. If "append" is specified, the data will be checked
+        against the existing dataset's schema. Otherwise, pass "create" or
+        "overwrite" to assign new field ids to the schema.
     max_rows_per_file : int, default 1024 * 1024
         The maximum number of rows per data file.
     max_rows_per_group : int, default 1024
@@ -472,6 +541,9 @@ def write_fragments(
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
+    use_experimental_writer : optional, bool
+        Use the Lance v2 writer to write Lance v2 files.  This is not recommended
+        at this time as there are several known limitations in the v2 writer.
 
     Returns
     -------
@@ -497,9 +569,11 @@ def write_fragments(
     fragments = _write_fragments(
         dataset_uri,
         reader,
+        mode=mode,
         max_rows_per_file=max_rows_per_file,
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,
         progress=progress,
+        use_experimental_writer=use_experimental_writer,
     )
-    return [FragmentMetadata(frag.json()) for frag in fragments]
+    return [FragmentMetadata.from_metadata(frag) for frag in fragments]

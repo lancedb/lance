@@ -179,13 +179,12 @@ impl Manifest {
     /// the field ids in the data files that have been dropped from the schema.
     pub fn max_field_id(&self) -> i32 {
         let schema_max_id = self.schema.max_field_id().unwrap_or(-1);
-        let fragment_max_id = self.fragments.first().and_then(|f| {
-            f.files
-                .iter()
-                .flat_map(|file| file.fields.as_slice())
-                .max()
-                .cloned()
-        });
+        let fragment_max_id = self
+            .fragments
+            .iter()
+            .flat_map(|f| f.files.iter().flat_map(|file| file.fields.as_slice()))
+            .max()
+            .copied();
         let fragment_max_id = fragment_max_id.unwrap_or(-1);
         schema_max_id.max(fragment_max_id)
     }
@@ -454,7 +453,7 @@ impl SelfDescribingFileReader for FileReader {
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
         populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         let schema = manifest.schema;
-        let num_fields = schema.max_field_id().unwrap_or_default() + 1;
+        let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_from_reader(
             reader.path(),
             reader.clone(),
@@ -462,7 +461,7 @@ impl SelfDescribingFileReader for FileReader {
             schema,
             0,
             0,
-            num_fields as u32,
+            max_field_id,
             cache,
         )
         .await
@@ -471,9 +470,12 @@ impl SelfDescribingFileReader for FileReader {
 
 #[cfg(test)]
 mod tests {
+    use crate::format::DataFile;
+
     use super::*;
 
-    use arrow_schema::{Field, Schema as ArrowSchema};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::datatypes::Field;
 
     #[test]
     fn test_writer_version() {
@@ -503,13 +505,16 @@ mod tests {
 
     #[test]
     fn test_fragments_by_offset_range() {
-        let arrow_schema =
-            ArrowSchema::new(vec![Field::new("a", arrow_schema::DataType::Int64, false)]);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let fragments = vec![
-            Fragment::with_file(0, "path1", &schema, Some(10)),
-            Fragment::with_file(1, "path2", &schema, Some(15)),
-            Fragment::with_file(2, "path3", &schema, Some(20)),
+            Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
+            Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
+            Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
         ];
         let manifest = Manifest::new(schema, Arc::new(fragments));
 
@@ -537,5 +542,42 @@ mod tests {
         assert!(actual.is_empty());
 
         assert!(manifest.fragments_by_offset_range(200..400).is_empty());
+    }
+
+    #[test]
+    fn test_max_field_id() {
+        // Validate that max field id handles varying field ids by fragment.
+        let mut field0 =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+        let mut field2 =
+            Field::try_from(ArrowField::new("b", arrow_schema::DataType::Int64, false)).unwrap();
+        field2.set_id(-1, &mut 2);
+
+        let schema = Schema {
+            fields: vec![field0, field2],
+            metadata: Default::default(),
+        };
+        let fragments = vec![
+            Fragment {
+                id: 0,
+                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
+                deletion_file: None,
+                physical_rows: None,
+            },
+            Fragment {
+                id: 1,
+                files: vec![
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43]),
+                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                ],
+                deletion_file: None,
+                physical_rows: None,
+            },
+        ];
+
+        let manifest = Manifest::new(schema, Arc::new(fragments));
+
+        assert_eq!(manifest.max_field_id(), 43);
     }
 }

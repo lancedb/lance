@@ -14,20 +14,32 @@
 
 use std::sync::Arc;
 
+use arrow::compute::concat;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{
     cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use lance::{
+    datatypes::Schema,
+    index::vector::{hnsw::builder::*, sq},
+    io::ObjectStore,
+};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_file::writer::FileWriter;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::{
     distance::MetricType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
 };
+use lance_table::io::manifest::ManifestDescribing;
+use object_store::path::Path;
 use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
+    exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
+    types::{PyIterator, PyTuple},
 };
 
 use crate::RT;
@@ -126,4 +138,116 @@ impl KMeans {
             Ok(py.None())
         }
     }
+}
+
+#[pyclass(name = "_Hnsw")]
+pub struct Hnsw {
+    hnsw: lance_index::vector::hnsw::HNSW,
+    vectors: Arc<dyn Array>,
+}
+
+#[pymethods]
+impl Hnsw {
+    #[staticmethod]
+    #[pyo3(signature = (
+        vectors_array,
+        max_level=7,
+        m=20,
+        m_max=40,
+        ef_construction=100,
+        use_select_heuristic=true,
+    ))]
+    fn build(
+        vectors_array: &PyIterator,
+        max_level: u16,
+        m: usize,
+        m_max: usize,
+        ef_construction: usize,
+        use_select_heuristic: bool,
+    ) -> PyResult<Self> {
+        let params = HnswBuildParams::default()
+            .max_level(max_level)
+            .num_edges(m)
+            .max_num_edges(m_max)
+            .ef_construction(ef_construction)
+            .use_select_heuristic(use_select_heuristic);
+
+        let mut data: Vec<Arc<dyn Array>> = Vec::new();
+        for vectors in vectors_array {
+            let vectors = ArrayData::from_pyarrow(vectors?)?;
+            if !matches!(vectors.data_type(), DataType::FixedSizeList(_, _)) {
+                return Err(PyValueError::new_err("Must be a FixedSizeList"));
+            }
+            data.push(Arc::new(FixedSizeListArray::from(vectors)));
+        }
+        let array_refs = data.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let vectors = concat(&array_refs).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        std::mem::drop(data);
+
+        let hnsw = RT
+            .runtime
+            .block_on(build_hnsw_model(params, vectors.clone()))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(Self { hnsw, vectors })
+    }
+
+    #[pyo3(signature = (file_path))]
+    fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
+        let object_store = ObjectStore::local();
+        let path = Path::parse(file_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let mut writer = RT
+            .block_on(
+                Some(py),
+                FileWriter::<ManifestDescribing>::try_new(
+                    &object_store,
+                    &path,
+                    Schema::try_from(self.hnsw.schema().as_ref())
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                    &Default::default(),
+                ),
+            )?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        RT.block_on(Some(py), self.hnsw.write(&mut writer))?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    fn vectors(&self, py: Python) -> PyResult<PyObject> {
+        self.vectors.to_data().to_pyarrow(py)
+    }
+}
+
+#[pyfunction(name = "_build_sq_storage")]
+pub fn build_sq_storage(
+    py: Python,
+    row_ids_array: &PyIterator,
+    vectors: &PyAny,
+    dim: usize,
+    bounds: &PyTuple,
+) -> PyResult<PyObject> {
+    let mut row_ids_arr: Vec<Arc<dyn Array>> = Vec::new();
+    for row_ids in row_ids_array {
+        let row_ids = ArrayData::from_pyarrow(row_ids?)?;
+        if !matches!(row_ids.data_type(), DataType::UInt64) {
+            return Err(PyValueError::new_err("Must be a UInt64"));
+        }
+        row_ids_arr.push(Arc::new(UInt64Array::from(row_ids)));
+    }
+    let row_ids_refs = row_ids_arr.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+    let row_ids = concat(&row_ids_refs).map_err(|e| PyIOError::new_err(e.to_string()))?;
+    std::mem::drop(row_ids_arr);
+
+    let vectors = Arc::new(FixedSizeListArray::from(ArrayData::from_pyarrow(vectors)?));
+
+    let lower_bound = bounds.get_item(0)?.extract::<f64>()?;
+    let upper_bound = bounds.get_item(1)?.extract::<f64>()?;
+    let quantizer = lance_index::vector::sq::ScalarQuantizer::with_bounds(
+        8,
+        dim,
+        MetricType::L2,
+        lower_bound..upper_bound,
+    );
+    let storage = sq::build_sq_storage(MetricType::L2, row_ids, vectors, quantizer)
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    storage.batch().clone().to_pyarrow(py)
 }

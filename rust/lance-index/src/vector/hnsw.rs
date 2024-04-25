@@ -6,13 +6,13 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::datatypes::UInt32Type;
+use arrow_array::ArrayRef;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
@@ -37,10 +37,7 @@ use self::builder::{HnswBuildParams, HNSW_METADATA_KEY};
 use super::graph::memory::InMemoryVectorStorage;
 use super::graph::OrderedNode;
 use super::graph::{
-    builder::GraphBuilder,
-    greedy_search,
-    storage::{DistCalculator, VectorStorage},
-    Graph, OrderedFloat, NEIGHBORS_COL, NEIGHBORS_FIELD,
+    greedy_search, storage::VectorStorage, Graph, OrderedFloat, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use super::ivf::storage::IvfData;
 use crate::vector::graph::beam_search;
@@ -127,30 +124,6 @@ impl HnswLevel {
         }
     }
 
-    fn from_builder(builder: &GraphBuilder, vectors: Arc<dyn VectorStorage>) -> Result<Self> {
-        let mut vector_id_builder = UInt32Builder::with_capacity(builder.len());
-        let mut neighbours_builder =
-            ListBuilder::with_capacity(UInt32Builder::new(), builder.len());
-
-        for &id in builder.nodes.keys().sorted() {
-            let node = builder.nodes.get(&id).unwrap();
-            assert_eq!(node.id, id);
-            vector_id_builder.append_value(node.id);
-            neighbours_builder.append_value(node.neighbors.clone().iter().map(|n| Some(n.id)));
-        }
-
-        let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
-        let batch = RecordBatch::try_new(
-            schema.into(),
-            vec![
-                Arc::new(vector_id_builder.finish()),
-                Arc::new(neighbours_builder.finish()),
-            ],
-        )?;
-
-        Ok(Self::new(batch, vectors))
-    }
-
     fn schema(&self) -> SchemaRef {
         self.nodes.schema()
     }
@@ -202,7 +175,7 @@ impl Debug for HNSW {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HnswMetadata {
     pub entry_point: u32,
     pub params: HnswBuildParams,
@@ -221,7 +194,7 @@ impl HNSW {
 
     /// The number of nodes in the level 0 of the graph.
     pub fn len(&self) -> usize {
-        self.levels[0].len()
+        self.levels.first().map_or(0, |level| level.len())
     }
 
     pub fn storage(&self) -> &dyn VectorStorage {
@@ -288,6 +261,10 @@ impl HNSW {
         vector_storage: Arc<dyn VectorStorage>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
+        if range.is_empty() {
+            return Ok(Self::empty());
+        }
+
         let levels = futures::stream::iter(0..metadata.level_offsets.len() - 1)
             .map(|i| {
                 let start = range.start + metadata.level_offsets[i];
@@ -306,11 +283,46 @@ impl HNSW {
     }
 
     fn from_builder(
-        levels: Vec<HnswLevel>,
-        metric_type: MetricType,
+        builder: &HNSWBuilder,
         entry_point: u32,
+        metric_type: MetricType,
         params: HnswBuildParams,
     ) -> Self {
+        let mut levels = Vec::with_capacity(builder.num_levels());
+        for level in 0..builder.num_levels() {
+            let vector_id_builder = UInt32Builder::with_capacity(builder.num_nodes(level));
+            let neighbours_builder =
+                ListBuilder::with_capacity(UInt32Builder::new(), builder.num_nodes(level));
+            levels.push((vector_id_builder, neighbours_builder));
+        }
+
+        for node in builder.nodes().read().unwrap().iter() {
+            for (level, neighbors) in node.level_neighbors.iter().enumerate() {
+                let (vector_id_builder, neighbours_builder) = &mut levels[level];
+                vector_id_builder.append_value(node.id);
+                neighbours_builder.append_value(
+                    neighbors
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .map(|neighbors| Some(neighbors.id)),
+                );
+            }
+        }
+
+        let levels = levels
+            .into_iter()
+            .map(|(mut vid, mut nb)| {
+                let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
+                let batch = RecordBatch::try_new(
+                    schema.into(),
+                    vec![Arc::new(vid.finish()), Arc::new(nb.finish())],
+                )
+                .unwrap();
+                HnswLevel::new(batch, builder.storage())
+            })
+            .collect_vec();
+
         Self {
             levels,
             distance_type: metric_type,
@@ -337,27 +349,27 @@ impl HNSW {
     /// A list of `(id_in_graph, distance)` pairs. Or Error if the search failed.
     pub fn search(
         &self,
-        query: &[f32],
+        query: ArrayRef,
         k: usize,
         ef: usize,
         bitset: Option<RoaringBitmap>,
     ) -> Result<Vec<OrderedNode>> {
-        let mut ep = self.entry_point;
+        let dist_calc = self.levels[0].storage().dist_calculator(query);
+        let mut ep = OrderedNode::new(
+            self.entry_point,
+            dist_calc.distance(self.entry_point).into(),
+        );
         let num_layers = self.levels.len();
 
-        let dist_calc: Arc<dyn DistCalculator> =
-            self.levels[0].storage().dist_calculator(query).into();
-
         for level in self.levels.iter().rev().take(num_layers - 1) {
-            ep = greedy_search(level, ep, query, Some(dist_calc.clone()))?.1;
+            ep = greedy_search(level, ep, dist_calc.as_ref())?;
         }
 
         let candidates = beam_search(
             &self.levels[0],
-            &[ep],
-            query,
+            &ep,
             ef,
-            Some(dist_calc),
+            dist_calc.as_ref(),
             bitset.as_ref(),
         )?;
         Ok(select_neighbors(&candidates, k).cloned().collect())
@@ -381,8 +393,8 @@ impl HNSW {
     }
 
     /// Write the HNSW graph to a Lance file.
-    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
-        self.write_levels(writer).await?;
+    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
+        let total_rows = self.write_levels(writer).await?;
 
         let index_metadata = json!(IndexMetadata {
             index_type: HNSW_TYPE.to_string(),
@@ -400,7 +412,7 @@ impl HNSW {
             serde_json::to_string(&hnsw_metadata)?,
         );
         writer.finish_with_metadata(&metadata).await?;
-        Ok(())
+        Ok(total_rows)
     }
 
     /// Write partitioned HNSWs to the file.
@@ -444,16 +456,6 @@ impl HNSW {
     pub async fn write_levels(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
         let mut num_rows = 0;
         for level in self.levels.iter() {
-            debug_assert!(
-                level
-                    .nodes
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .unwrap()
-                    .value(0)
-                    == 0
-            );
             writer.write(&[level.nodes.clone()]).await?;
             num_rows += level.nodes.num_rows();
         }
@@ -465,54 +467,34 @@ impl HNSW {
 ///
 /// Algorithm 3 in the HNSW paper.
 fn select_neighbors(
-    orderd_candidates: &BinaryHeap<OrderedNode>,
+    orderd_candidates: &[OrderedNode],
     k: usize,
 ) -> impl Iterator<Item = &OrderedNode> + '_ {
-    orderd_candidates.iter().sorted().take(k)
+    orderd_candidates.iter().take(k)
 }
 
 /// Algorithm 4 in the HNSW paper.
 ///
 /// NOTE: the result is not ordered
 pub(crate) fn select_neighbors_heuristic(
-    graph: &GraphBuilder,
-    query: &[f32],
-    orderd_candidates: &BinaryHeap<OrderedNode>,
+    graph: &dyn Graph,
+    candidates: &[OrderedNode],
     k: usize,
-    extend_candidates: bool,
 ) -> impl Iterator<Item = OrderedNode> {
-    let mut w = orderd_candidates
-        .iter()
-        .cloned()
-        .map(Reverse)
-        .collect::<BinaryHeap<_>>();
-
-    if extend_candidates {
-        let dist_calc = graph.storage().dist_calculator(query);
-        let mut visited = HashSet::with_capacity(orderd_candidates.len() * k);
-        visited.extend(orderd_candidates.iter().map(|node| node.id));
-        orderd_candidates.iter().sorted().rev().for_each(|node| {
-            if let Some(neighbors) = graph.neighbors(node.id) {
-                neighbors.for_each(|n| {
-                    if !visited.contains(&n) {
-                        let d: OrderedFloat = dist_calc.distance(&[n])[0].into();
-                        w.push(Reverse((d, n).into()));
-                    }
-                    visited.insert(n);
-                });
-            }
-        });
+    if candidates.len() <= k {
+        return candidates.iter().cloned().collect_vec().into_iter();
     }
+    let mut candidates = candidates.to_vec();
+    candidates.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
-    let mut discarded = Vec::new();
     let storage = graph.storage();
     let storage = storage
         .as_any()
         .downcast_ref::<InMemoryVectorStorage>()
         .unwrap();
-    while !w.is_empty() && results.len() < k {
-        let u = w.pop().unwrap().0;
+    while !candidates.is_empty() && results.len() < k {
+        let u = candidates.pop().unwrap();
 
         if results.is_empty()
             || results
@@ -520,13 +502,7 @@ pub(crate) fn select_neighbors_heuristic(
                 .all(|v| u.dist < OrderedFloat(storage.distance_between(u.id, v.id)))
         {
             results.push(u);
-        } else {
-            discarded.push(u);
         }
-    }
-
-    while results.len() < k && !discarded.is_empty() {
-        results.push(discarded.pop().unwrap());
     }
 
     results.into_iter()
@@ -534,6 +510,8 @@ pub(crate) fn select_neighbors_heuristic(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     use arrow_array::types::Float32Type;
@@ -542,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_select_neighbors() {
-        let candidates: BinaryHeap<OrderedNode> =
+        let candidates: Vec<OrderedNode> =
             (1..6).map(|i| (OrderedFloat(i as f32), i).into()).collect();
 
         let result = select_neighbors(&candidates, 3)
@@ -578,8 +556,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_hnsw() {
+    #[tokio::test]
+    async fn test_build_hnsw() {
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
         const MAX_EDGES: usize = 32;
@@ -593,6 +571,7 @@ mod tests {
             store.clone(),
         )
         .build()
+        .await
         .unwrap();
         assert!(hnsw.levels.len() > 1);
         assert_eq!(hnsw.levels[0].len(), TOTAL);
@@ -616,7 +595,7 @@ mod tests {
     fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
         let mut dists = vec![];
         for i in 0..mat.num_rows() {
-            let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
+            let dist = lance_linalg::distance::l2_distance(query, mat.row_ref(i).unwrap());
             dists.push((dist, i as u32));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -624,8 +603,8 @@ mod tests {
         dists.into_iter().map(|(_, i)| i).collect()
     }
 
-    #[test]
-    fn test_search() {
+    #[tokio::test]
+    async fn test_search() {
         const DIM: usize = 32;
         const TOTAL: usize = 10_000;
         const MAX_EDGES: usize = 30;
@@ -644,15 +623,16 @@ mod tests {
             vectors.clone(),
         )
         .build()
+        .await
         .unwrap();
 
         let results: HashSet<u32> = hnsw
-            .search(q, K, 128, None)
+            .search(q.clone(), K, 128, None)
             .unwrap()
             .iter()
             .map(|node| node.id)
             .collect();
-        let gt = ground_truth(&mat, q, K);
+        let gt = ground_truth(&mat, q.as_primitive::<Float32Type>().values(), K);
         let recall = results.intersection(&gt).count() as f32 / K as f32;
         assert!(recall >= 0.9, "Recall: {}", recall);
     }

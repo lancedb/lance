@@ -6,7 +6,7 @@ authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
 repository = "https://github.com/eto-ai/lance"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 keywords = [
     "data-format",
     "data-science",
@@ -29,7 +29,6 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -62,7 +61,7 @@ tests = [
     "h5py<3.11",
     "tqdm",
 ]
-dev = ["ruff==0.2.2"]
+dev = ["ruff==0.4.1"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
 ray = ["ray[data]; python_version<'3.12'"]
@@ -74,7 +73,7 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 "*.pyi" = ["E301", "E302"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 check_untyped_defs = true
 warn_redundant_casts = true
 warn_unused_ignores = true

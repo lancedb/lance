@@ -12,9 +12,10 @@ use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
     Array, FixedSizeBinaryArray, FixedSizeListArray, ListArray, PrimitiveArray, RecordBatch,
-    RecordBatchReader, StringArray, StructArray,
+    RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, Schema, SchemaRef};
+use futures::{stream::BoxStream, StreamExt};
 use rand::{distributions::Uniform, Rng, RngCore, SeedableRng};
 
 use self::array::rand_with_distribution;
@@ -173,7 +174,7 @@ impl ArrayGenerator for NullGenerator {
             let mut null_count = 0;
             // Sampling the RNG once per bit is kind of slow so we do this to sample once
             // per byte.  We only get 8 bits of RNG resolution but that should be good enough.
-            let threshold = (self.null_probability * std::u8::MAX as f64) as u8;
+            let threshold = (self.null_probability * u8::MAX as f64) as u8;
             let bytes = (0..num_validity_bytes)
                 .map(|byte_idx| {
                     let mut sample = rng.gen::<u64>();
@@ -940,7 +941,12 @@ impl FixedSizeBatchGenerator {
             arrays.push(arr);
         }
         self.num_batches.0 -= 1;
-        Ok(RecordBatch::try_new(self.schema.clone(), arrays).unwrap())
+        Ok(RecordBatch::try_new_with_options(
+            self.schema.clone(),
+            arrays,
+            &RecordBatchOptions::new().with_row_count(Some(self.batch_size.0 as usize)),
+        )
+        .unwrap())
     }
 }
 
@@ -1031,6 +1037,18 @@ impl BatchGeneratorBuilder {
             self.seed,
             self.default_null_probability,
         )
+    }
+
+    pub fn into_reader_stream(
+        self,
+        batch_size: RowCount,
+        num_batches: BatchCount,
+    ) -> BoxStream<'static, Result<RecordBatch, ArrowError>> {
+        // TODO: this is pretty lazy and could be optimized
+        let batches = self
+            .into_reader_rows(batch_size, num_batches)
+            .collect::<Vec<_>>();
+        futures::stream::iter(batches).boxed()
     }
 
     /// Create a RecordBatchReader that generates batches of the given size (in bytes)

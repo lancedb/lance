@@ -4,19 +4,19 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::{Array, UInt32Array};
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
+use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt, StreamExt};
-use log::trace;
+use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::Result;
-use lance_datagen::{array, gen, RowCount};
+use lance_datagen::{array, gen, RowCount, Seed};
 
 use crate::{
     decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, LogicalPageDecoder, PageInfo},
-    encoder::{ArrayEncoder, EncodedPage, FieldEncoder},
-    encodings::logical::primitive::PrimitiveFieldEncoder,
+    encoder::{BatchEncoder, EncodedPage, FieldEncoder},
     EncodingsIo,
 };
 
@@ -27,10 +27,10 @@ pub(crate) struct SimulatedScheduler {
 impl SimulatedScheduler {
     pub fn new(data: Vec<EncodedPage>) -> Self {
         let mut bytes = BytesMut::new();
-        for arr in data.into_iter() {
-            for buf in arr.buffers.into_iter() {
+        for page in data.into_iter() {
+            for buf in page.array.buffers {
                 for part in buf.parts.into_iter() {
-                    bytes.extend(part.iter())
+                    bytes.extend_from_slice(&part)
                 }
             }
         }
@@ -51,14 +51,6 @@ impl EncodingsIo for SimulatedScheduler {
             .map(|range| self.satisfy_request(range))
             .collect::<Vec<_>>()))
         .boxed()
-    }
-}
-
-pub async fn check_round_trip_array_encoding(encoder: impl ArrayEncoder + 'static, field: Field) {
-    let array_encoder = Arc::new(encoder);
-    for page_size_bytes in [1024, 4 * 1024, 1024 * 1024] {
-        let field_encoder = PrimitiveFieldEncoder::new(page_size_bytes, array_encoder.clone());
-        check_round_trip_field_encoding(field_encoder, field.clone()).await
     }
 }
 
@@ -83,7 +75,7 @@ async fn test_decode(
 
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
-        let batch = batch.await.unwrap().unwrap();
+        let batch = batch.task.await.unwrap();
         let actual = batch.column(0);
         let expected_size = (BATCH_SIZE as usize).min(expected.len() - offset);
         let expected = expected.slice(offset, expected_size);
@@ -93,128 +85,292 @@ async fn test_decode(
     }
 }
 
-pub async fn check_round_trip_field_encoding(mut encoder: impl FieldEncoder, field: Field) {
-    let data = gen()
-        .col(None, array::rand_type(field.data_type()))
-        .into_batch_rows(RowCount::from(10000))
-        .unwrap()
-        .column(0)
-        .clone();
+/// Given a field this will test the round trip encoding and decoding of random data
+pub async fn check_round_trip_encoding_random(field: Field) {
+    let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    for page_size in [4096, 1024 * 1024] {
+        debug!("Testing random data with a page size of {}", page_size);
+        let encoder_factory = || {
+            let mut col_idx = 0;
+            let mut field_id_to_col_index = Vec::new();
+            BatchEncoder::get_encoder_for_field(
+                &lance_field,
+                page_size,
+                &mut col_idx,
+                &mut field_id_to_col_index,
+            )
+            .unwrap()
+        };
+        check_round_trip_field_encoding_random(encoder_factory, field.clone()).await
+    }
+}
 
-    let num_rows = data.len();
+fn supports_nulls(data_type: &DataType) -> bool {
+    // We don't yet have nullability support for all types.  Don't test nullability for the
+    // types we don't support.
+    !matches!(
+        data_type,
+        DataType::List(_) | DataType::Struct(_) | DataType::Utf8 | DataType::Binary
+    )
+}
 
-    for num_ingest_batches in [1, 5, 10] {
-        let rows_per_batch = num_rows / num_ingest_batches;
-        trace!(
-            "Testing with {} rows divided across {} batches for {} rows per batch",
-            num_rows,
-            num_ingest_batches,
-            rows_per_batch
-        );
+// The default will just test the full read
+#[derive(Clone, Default)]
+pub struct TestCases {
+    ranges: Vec<Range<u64>>,
+    indices: Vec<Vec<u32>>,
+}
 
-        let mut offset = 0;
-        let mut all_encoded_pages = Vec::new();
-        let mut page_infos: Vec<Vec<Arc<PageInfo>>> =
-            vec![Vec::new(); encoder.num_columns() as usize];
-        let mut buffer_offset = 0;
+impl TestCases {
+    pub fn with_range(mut self, range: Range<u64>) -> Self {
+        self.ranges.push(range);
+        self
+    }
 
-        let mut simulate_write = |encoded_page: EncodedPage| {
-            trace!("Encoded page {:?}", encoded_page);
-            let buffer_offsets = encoded_page
-                .buffers
-                .iter()
-                .map(|buf| {
-                    let offset = buffer_offset;
-                    buffer_offset += buf.parts.iter().map(|part| part.len() as u64).sum::<u64>();
-                    offset
-                })
-                .collect::<Vec<_>>();
+    pub fn with_indices(mut self, indices: Vec<u32>) -> Self {
+        self.indices.push(indices);
+        self
+    }
+}
 
-            let page_info = PageInfo {
-                num_rows: encoded_page.num_rows,
-                encoding: encoded_page.encoding.clone(),
-                buffer_offsets: Arc::new(buffer_offsets.clone()),
-            };
+/// Given specific data and test cases we check round trip encoding and decoding
+///
+/// Note that the input `data` is a `Vec` to simulate multiple calls to `maybe_encode`.
+/// In other words, these are multiple chunks of one long array and not multiple columns
+/// in a record batch.  To feed a "record batch" you should first convert the record batch
+/// to a struct array.
+pub async fn check_round_trip_encoding_of_data(data: Vec<Arc<dyn Array>>, test_cases: &TestCases) {
+    let example_data = data.first().expect("Data must have at least one array");
+    let field = Field::new("", example_data.data_type().clone(), true);
+    let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    for page_size in [4096, 1024 * 1024] {
+        let mut col_idx = 0;
+        let mut field_id_to_col_index = Vec::new();
+        let encoder = BatchEncoder::get_encoder_for_field(
+            &lance_field,
+            page_size,
+            &mut col_idx,
+            &mut field_id_to_col_index,
+        )
+        .unwrap();
+        check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases).await
+    }
+}
 
-            let col_idx = encoded_page.column_idx as usize;
-            all_encoded_pages.push(encoded_page);
-            page_infos[col_idx].push(Arc::new(page_info));
+/// This is the inner-most check function that actually runs the round trip and tests it
+async fn check_round_trip_encoding_inner(
+    mut encoder: Box<dyn FieldEncoder>,
+    field: &Field,
+    data: Vec<Arc<dyn Array>>,
+    test_cases: &TestCases,
+) {
+    let mut all_encoded_pages = Vec::new();
+    let mut page_infos: Vec<Vec<Arc<PageInfo>>> = vec![Vec::new(); encoder.num_columns() as usize];
+    let mut buffer_offset = 0;
+
+    let mut simulate_write = |mut encoded_page: EncodedPage| {
+        trace!("Encoded page {:?}", encoded_page);
+        encoded_page.array.buffers.sort_by_key(|b| b.index);
+        let buffer_offsets = encoded_page
+            .array
+            .buffers
+            .iter()
+            .map(|buf| {
+                let offset = buffer_offset;
+                buffer_offset += buf.parts.iter().map(|part| part.len() as u64).sum::<u64>();
+                offset
+            })
+            .collect::<Vec<_>>();
+
+        let page_info = PageInfo {
+            num_rows: encoded_page.num_rows,
+            encoding: encoded_page.array.encoding.clone(),
+            buffer_offsets: Arc::new(buffer_offsets.clone()),
         };
 
-        for _ in 0..num_ingest_batches {
-            let data = data.slice(offset, rows_per_batch);
+        let col_idx = encoded_page.column_idx as usize;
+        all_encoded_pages.push(encoded_page);
+        page_infos[col_idx].push(Arc::new(page_info));
+    };
 
-            for encode_task in encoder.maybe_encode(data).unwrap() {
-                let encoded_page = encode_task.await.unwrap();
-                simulate_write(encoded_page);
-            }
-
-            offset += rows_per_batch;
-        }
-
-        for encode_task in encoder.flush().unwrap() {
+    for arr in &data {
+        for encode_task in encoder.maybe_encode(arr.clone()).unwrap() {
             let encoded_page = encode_task.await.unwrap();
             simulate_write(encoded_page);
         }
+    }
 
-        let scheduler =
-            Arc::new(SimulatedScheduler::new(all_encoded_pages)) as Arc<dyn EncodingsIo>;
+    for encode_task in encoder.flush().unwrap() {
+        let encoded_page = encode_task.await.unwrap();
+        simulate_write(encoded_page);
+    }
 
-        let column_infos = page_infos
-            .into_iter()
-            .map(|page_infos| ColumnInfo::new(page_infos, Vec::new()))
-            .collect::<Vec<_>>();
-        let schema = Schema::new(vec![field.clone()]);
+    let scheduler = Arc::new(SimulatedScheduler::new(all_encoded_pages)) as Arc<dyn EncodingsIo>;
 
-        // Test range scheduling
-        for range in [0..500, 100..1100, 8000..8500] {
-            let range = range.start as u64..range.end as u64;
-            let num_rows = range.end - range.start;
-            let expected = data.slice(range.start as usize, num_rows as usize);
-            let scheduler = scheduler.clone();
-            test_decode(
-                num_rows,
-                &schema,
-                &column_infos,
-                expected,
-                |mut decode_scheduler, tx| {
-                    async move { decode_scheduler.schedule_range(range, tx, &scheduler).await }
-                        .boxed()
-                },
-            )
-            .await;
+    let column_infos = page_infos
+        .into_iter()
+        .map(|page_infos| ColumnInfo::new(page_infos, Vec::new()))
+        .collect::<Vec<_>>();
+    let schema = Schema::new(vec![field.clone()]);
+
+    let concat_data = concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap();
+
+    // We always try a full decode, regardless of the test cases provided
+    debug!("Testing full decode");
+    let num_rows = concat_data.len() as u64;
+    let scheduler_copy = scheduler.clone();
+    test_decode(
+        num_rows,
+        &schema,
+        &column_infos,
+        concat_data.clone(),
+        |mut decode_scheduler, tx| {
+            async move {
+                decode_scheduler
+                    .schedule_range(0..num_rows, tx, &scheduler_copy)
+                    .await
+            }
+            .boxed()
+        },
+    )
+    .await;
+
+    // Test range scheduling
+    for range in &test_cases.ranges {
+        debug!("Testing decode of range {:?}", range);
+        let num_rows = range.end - range.start;
+        let expected = concat_data.slice(range.start as usize, num_rows as usize);
+        let scheduler = scheduler.clone();
+        let range = range.clone();
+        test_decode(
+            num_rows,
+            &schema,
+            &column_infos,
+            expected,
+            |mut decode_scheduler, tx| {
+                async move { decode_scheduler.schedule_range(range, tx, &scheduler).await }.boxed()
+            },
+        )
+        .await;
+    }
+
+    // Test take scheduling
+    for indices in &test_cases.indices {
+        if indices.len() == 1 {
+            debug!("Testing decode of index {}", indices[0]);
+        } else {
+            debug!(
+                "Testing decode of {} indices spread across range [{}..{}]",
+                indices.len(),
+                indices[0],
+                indices[indices.len() - 1]
+            );
         }
+        let num_rows = indices.len() as u64;
+        let indices_arr = UInt32Array::from(indices.clone());
+        let expected = arrow_select::take::take(&concat_data, &indices_arr, None).unwrap();
+        let scheduler = scheduler.clone();
+        let indices = indices.clone();
+        test_decode(
+            num_rows,
+            &schema,
+            &column_infos,
+            expected,
+            |mut decode_scheduler, tx| {
+                async move {
+                    decode_scheduler
+                        .schedule_take(&indices, tx, &scheduler)
+                        .await
+                }
+                .boxed()
+            },
+        )
+        .await;
+    }
+}
 
-        // Test take scheduling
-        for indices in [
-            vec![100],
-            vec![0],
-            vec![9999],
-            vec![100, 1100, 5000],
-            vec![1000, 2000, 3000],
-            vec![2000, 2001, 2002, 2003, 2004],
-            // Big take that spans multiple pages and generates multiple output batches
-            (100..500).map(|i| i * 3).collect::<Vec<_>>(),
-        ] {
-            let num_rows = indices.len() as u64;
-            let indices_arr = UInt32Array::from(indices.clone());
-            let expected = arrow_select::take::take(&data, &indices_arr, None).unwrap();
-            let scheduler = scheduler.clone();
-            test_decode(
-                num_rows,
-                &schema,
-                &column_infos,
-                expected,
-                |mut decode_scheduler, tx| {
-                    async move {
-                        decode_scheduler
-                            .schedule_take(&indices, tx, &scheduler)
-                            .await
+const NUM_RANDOM_ROWS: u32 = 10000;
+
+/// Generates random data (parameterized by null rate, slicing, and # ingest batches)
+/// and tests with that.
+async fn check_round_trip_field_encoding_random(
+    encoder_factory: impl Fn() -> Box<dyn FieldEncoder>,
+    field: Field,
+) {
+    for null_rate in [None, Some(0.5), Some(1.0)] {
+        for use_slicing in [false, true] {
+            let field = if null_rate.is_some() {
+                if !supports_nulls(field.data_type()) {
+                    continue;
+                }
+                field.clone().with_nullable(true)
+            } else {
+                field.clone().with_nullable(false)
+            };
+
+            let test_cases = TestCases::default()
+                .with_range(0..500)
+                .with_range(100..1100)
+                .with_range(8000..8500)
+                .with_indices(vec![100])
+                .with_indices(vec![0])
+                .with_indices(vec![9999])
+                .with_indices(vec![100, 1100, 5000])
+                .with_indices(vec![1000, 2000, 3000])
+                .with_indices(vec![2000, 2001, 2002, 2003, 2004])
+                // Big take that spans multiple pages and generates multiple output batches
+                .with_indices((100..500).map(|i| i * 3).collect::<Vec<_>>());
+
+            for num_ingest_batches in [1, 5, 10] {
+                let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
+                let mut data = Vec::new();
+
+                // Test both ingesting one big array sliced into smaller arrays and smaller
+                // arrays independently generated.  These behave slightly differently.  For
+                // example, a list array sliced into smaller arrays will have arrays whose
+                // starting offset is not 0.
+                if use_slicing {
+                    let mut generator = gen().col(None, array::rand_type(field.data_type()));
+                    if let Some(null_rate) = null_rate {
+                        generator.with_random_nulls(null_rate);
                     }
-                    .boxed()
-                },
-            )
-            .await;
+                    let all_data = generator
+                        .into_batch_rows(RowCount::from(10000))
+                        .unwrap()
+                        .column(0)
+                        .clone();
+                    let mut offset = 0;
+                    for _ in 0..num_ingest_batches {
+                        data.push(all_data.slice(offset, rows_per_batch as usize));
+                        offset += rows_per_batch as usize;
+                    }
+                } else {
+                    for i in 0..num_ingest_batches {
+                        let mut generator = gen()
+                            .with_seed(Seed::from(i as u64))
+                            .col(None, array::rand_type(field.data_type()));
+                        if let Some(null_rate) = null_rate {
+                            generator.with_random_nulls(null_rate);
+                        }
+                        let arr = generator
+                            .into_batch_rows(RowCount::from(rows_per_batch as u64))
+                            .unwrap()
+                            .column(0)
+                            .clone();
+                        data.push(arr);
+                    }
+                }
+
+                debug!(
+                    "Testing with {} rows divided across {} batches for {} rows per batch with null_rate={:?} and use_slicing={}",
+                    NUM_RANDOM_ROWS,
+                    num_ingest_batches,
+                    rows_per_batch,
+                    null_rate,
+                    use_slicing
+                );
+                check_round_trip_encoding_inner(encoder_factory(), &field, data, &test_cases).await
+            }
         }
     }
 }

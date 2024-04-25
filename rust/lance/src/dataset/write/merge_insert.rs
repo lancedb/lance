@@ -431,6 +431,7 @@ impl MergeInsertJob {
                 vec![(Arc::new(target_key), Arc::new(source_key))],
                 None,
                 &JoinType::Full,
+                None,
                 PartitionMode::CollectLeft,
                 true,
             )
@@ -503,6 +504,7 @@ impl MergeInsertJob {
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let new_fragments = write_fragments_internal(
+            None,
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema(),

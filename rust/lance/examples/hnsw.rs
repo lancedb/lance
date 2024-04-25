@@ -44,7 +44,7 @@ struct Args {
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
     let mut dists = vec![];
     for i in 0..mat.num_rows() {
-        let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
+        let dist = lance_linalg::distance::l2_distance(query, mat.row_ref(i).unwrap());
         dists.push((dist, i as u32));
     }
     dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -80,7 +80,7 @@ async fn main() {
 
     let q = mat.row(0).unwrap();
     let k = 10;
-    let gt = ground_truth(&mat, q, k);
+    let gt = ground_truth(&mat, q.as_primitive::<Float32Type>().values(), k);
 
     for ef_construction in [15, 30, 50] {
         let now = std::time::Instant::now();
@@ -93,11 +93,12 @@ async fn main() {
             vector_store.clone(),
         )
         .build()
+        .await
         .unwrap();
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();
         let results: HashSet<u32> = hnsw
-            .search(q, k, args.ef, None)
+            .search(q.clone(), k, args.ef, None)
             .unwrap()
             .iter()
             .map(|node| node.id)

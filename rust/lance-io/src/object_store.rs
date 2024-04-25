@@ -4,7 +4,7 @@
 //! Extend [object_store::ObjectStore] functionalities
 
 use std::collections::HashMap;
-use std::path::{Path as StdPath, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -17,11 +17,9 @@ use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
-use object_store::azure::AzureConfigKey;
-use object_store::gcp::GoogleConfigKey;
 use object_store::{
-    aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory, CredentialProvider,
-    Error as ObjectStoreError, Result as ObjectStoreResult,
+    aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
+    memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
 };
 use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredentialProvider};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
@@ -31,7 +29,6 @@ use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
 use super::local::LocalObjectReader;
-
 mod tracing;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
@@ -371,28 +368,32 @@ impl ObjectStore {
 
     pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
-        let expanded_path = StdPath::new(&expanded);
 
-        if !expanded_path.try_exists()? {
-            std::fs::create_dir_all(expanded_path)?;
+        let mut expanded_path = path_abs::PathAbs::new(expanded)
+            .unwrap()
+            .as_path()
+            .to_path_buf();
+        // path_abs::PathAbs::new(".") returns an empty string.
+        if let Some(s) = expanded_path.as_path().to_str() {
+            if s.is_empty() {
+                expanded_path = std::env::current_dir()?.to_path_buf();
+            }
         }
-
-        let expanded_path = expanded_path.canonicalize()?;
-
         Ok((
             Self {
                 inner: Arc::new(LocalFileSystem::new()).traced(),
                 scheme: String::from("file"),
-                base_path: Path::from_absolute_path(&expanded_path)?,
+                base_path: Path::from_absolute_path(expanded_path.as_path())?,
                 block_size: 4 * 1024, // 4KB block size
             },
-            Path::from_filesystem_path(&expanded_path)?,
+            Path::from_absolute_path(expanded_path.as_path())?,
         ))
     }
 
     async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
         configure_store(url.as_str(), params).await
     }
+
     /// Local object store.
     pub fn local() -> Self {
         Self {
@@ -870,6 +871,7 @@ mod tests {
     use parquet::data_type::AsBytes;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
+    use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Write test content to file.

@@ -14,6 +14,7 @@
 
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
+    <packaging>jar</packaging>
 
     <dependencies>
         <dependency>
@@ -33,6 +34,10 @@
             <artifactId>arrow-dataset</artifactId>
         </dependency>
         <dependency>
+            <groupId>org.json</groupId>
+            <artifactId>json</artifactId>
+        </dependency>
+        <dependency>
             <groupId>org.questdb</groupId>
             <artifactId>jar-jni</artifactId>
         </dependency>
@@ -46,27 +51,6 @@
     <build>
         <plugins>
             <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-checkstyle-plugin</artifactId>
-                <version>3.3.1</version>
-                <configuration>
-                    <configLocation>google_checks.xml</configLocation>
-                    <consoleOutput>true</consoleOutput>
-                    <failsOnError>true</failsOnError>
-                    <violationSeverity>warning</violationSeverity>
-                    <linkXRef>false</linkXRef>
-                </configuration>
-                <executions>
-                    <execution>
-                        <id>validate</id>
-                        <phase>validate</phase>
-                        <goals>
-                            <goal>check</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
-            <plugin>
                 <groupId>org.questdb</groupId>
                 <artifactId>rust-maven-plugin</artifactId>
                 <version>1.1.1</version>
@@ -78,7 +62,7 @@
                         </goals>
                         <configuration>
                             <path>lance-jni</path>
-<!--                            <release>true</release>-->
+                            <!--<release>true</release>-->
                             <copyTo>src/main/resources/nativelib</copyTo>
                             <copyWithPlatformDir>true</copyWithPlatformDir>
                         </configuration>
@@ -97,44 +81,5 @@
                 </executions>
             </plugin>
         </plugins>
-        <pluginManagement>
-            <plugins>
-                <plugin>
-                    <artifactId>maven-clean-plugin</artifactId>
-                    <version>3.1.0</version>
-                </plugin>
-                <plugin>
-                    <artifactId>maven-resources-plugin</artifactId>
-                    <version>3.0.2</version>
-                </plugin>
-                <plugin>
-                    <artifactId>maven-compiler-plugin</artifactId>
-                    <version>3.8.1</version>
-                    <configuration>
-                        <compilerArgs>
-                            <arg>-h</arg>
-                            <arg>target/headers</arg>
-                        </compilerArgs>
-                    </configuration>
-                </plugin>
-                <plugin>
-                    <artifactId>maven-surefire-plugin</artifactId>
-                    <version>3.2.5</version>
-                    <configuration>
-                        <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
-                        <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory"/>
-                        <useSystemClassLoader>false</useSystemClassLoader>
-                    </configuration>
-                </plugin>
-                <plugin>
-                    <artifactId>maven-jar-plugin</artifactId>
-                    <version>3.0.2</version>
-                </plugin>
-                <plugin>
-                    <artifactId>maven-install-plugin</artifactId>
-                    <version>2.5.2</version>
-                </plugin>
-            </plugins>
-        </pluginManagement>
     </build>
 </project>

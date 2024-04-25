@@ -549,6 +549,18 @@ mod tests {
         fn options(&self) -> &ConfigOptions {
             todo!()
         }
+
+        fn udfs_names(&self) -> Vec<String> {
+            todo!()
+        }
+
+        fn udafs_names(&self) -> Vec<String> {
+            todo!()
+        }
+
+        fn udwfs_names(&self) -> Vec<String> {
+            todo!()
+        }
     }
 
     fn check(

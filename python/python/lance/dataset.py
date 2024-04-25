@@ -52,6 +52,7 @@ from .lance import (
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .optimize import Compaction
+from .schema import LanceSchema
 from .util import td_to_micros
 
 if TYPE_CHECKING:
@@ -327,6 +328,13 @@ class LanceDataset(pa.dataset.Dataset):
         The pyarrow Schema for this dataset
         """
         return self._ds.schema
+
+    @property
+    def lance_schema(self) -> "LanceSchema":
+        """
+        The LanceSchema for this dataset
+        """
+        return self._ds.lance_schema
 
     def to_table(
         self,
@@ -1195,10 +1203,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         index_type = index_type.upper()
         if index_type != "BTREE":
-            raise NotImplementedError((
-                'Only "BTREE" is supported for ',
-                f"index_type.  Received {index_type}",
-            ))
+            raise NotImplementedError(
+                (
+                    'Only "BTREE" is supported for ',
+                    f"index_type.  Received {index_type}",
+                )
+            )
 
         self._ds.create_index([column], index_type, name, replace)
 
@@ -1812,8 +1822,9 @@ class LanceOperation:
         ----------
         fragments: iterable of FragmentMetadata
             The fragments that make up the new dataset.
-        schema: pyarrow.Schema
-            The schema of the new dataset.
+        schema: LanceSchema or pyarrow.Schema
+            The schema of the new dataset. Passing a LanceSchema is preferred,
+            and passing a pyarrow.Schema is deprecated.
 
         Warning
         -------
@@ -1843,9 +1854,9 @@ class LanceOperation:
         ...     return pa.record_batch([doubled], ["a_doubled"])
         >>> fragments = []
         >>> for fragment in dataset.get_fragments():
-        ...     new_fragment = fragment.add_columns(double_a, columns=['a'])
+        ...     new_fragment, new_schema = fragment.merge_columns(double_a,
+        ...                                                       columns=['a'])
         ...     fragments.append(new_fragment)
-        >>> new_schema = table.schema.append(pa.field("a_doubled", pa.int64()))
         >>> operation = lance.LanceOperation.Merge(fragments, new_schema)
         >>> dataset = lance.LanceDataset.commit("example", operation,
         ...                                     read_version=dataset.version)
@@ -1858,13 +1869,20 @@ class LanceOperation:
         """
 
         fragments: Iterable[FragmentMetadata]
-        schema: pa.Schema
+        schema: LanceSchema | pa.Schema
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.fragments)
 
         def _to_inner(self):
             raw_fragments = [f._metadata for f in self.fragments]
+            if isinstance(self.schema, pa.Schema):
+                warnings.warn(
+                    "Passing a pyarrow.Schema to Merge is deprecated. "
+                    "Please use a LanceSchema instead.",
+                    DeprecationWarning,
+                )
+                self.schema = LanceSchema.from_pyarrow(self.schema)
             return _Operation.merge(raw_fragments, self.schema)
 
     @dataclass
@@ -2333,6 +2351,7 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
+    use_experimental_writer: bool = False,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2372,6 +2391,9 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
+    use_experimental_writer : optional, bool
+        Use the Lance v2 writer to write Lance v2 files.  This is not recommended
+        at this time as there are several known limitations in the v2 writer.
     """
     if _check_for_hugging_face(data_obj):
         # Huggingface datasets
@@ -2393,6 +2415,7 @@ def write_dataset(
         "max_bytes_per_file": max_bytes_per_file,
         "progress": progress,
         "storage_options": storage_options,
+        "use_experimental_writer": use_experimental_writer,
     }
 
     if commit_lock:

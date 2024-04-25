@@ -27,6 +27,7 @@ use chrono::Duration;
 use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::transaction::validate_operation;
 use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -63,6 +64,7 @@ use pyo3::{
 use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
+use crate::schema::LanceSchema;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -89,6 +91,7 @@ fn into_fragments(fragments: Vec<FragmentMetadata>) -> Vec<Fragment> {
 }
 
 fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
+    // Note: the field ids here are wrong.
     Schema::try_from(arrow_schema).map_err(|e| {
         PyValueError::new_err(format!(
             "Failed to convert Arrow schema to Lance schema: {}",
@@ -242,8 +245,8 @@ impl Operation {
     }
 
     #[staticmethod]
-    fn merge(fragments: Vec<FragmentMetadata>, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let schema = convert_schema(&schema.0)?;
+    fn merge(fragments: Vec<FragmentMetadata>, schema: LanceSchema) -> PyResult<Self> {
+        let schema = schema.0;
         let fragments = into_fragments(fragments);
         let op = LanceOperation::Merge { fragments, schema };
         Ok(Self(op))
@@ -320,6 +323,11 @@ impl Dataset {
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());
         arrow_schema.to_pyarrow(self_.py())
+    }
+
+    #[getter(lance_schema)]
+    fn lance_schema(self_: PyRef<'_, Self>) -> LanceSchema {
+        LanceSchema(self_.ds.schema().clone())
     }
 
     /// Get index statistics
@@ -971,10 +979,17 @@ impl Dataset {
                 as Arc<dyn CommitHandler>
         });
         let ds = RT
-            .block_on(
-                commit_lock.map(|cl| cl.py()),
-                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler),
-            )?
+            .block_on(commit_lock.map(|cl| cl.py()), async move {
+                let dataset = match DatasetBuilder::from_uri(dataset_uri).load().await {
+                    Ok(ds) => Some(ds),
+                    Err(lance::Error::DatasetNotFound { .. }) => None,
+                    Err(err) => return Err(err),
+                };
+                let manifest = dataset.as_ref().map(|ds| ds.manifest());
+                validate_operation(manifest, &operation.0)?;
+                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler)
+                    .await
+            })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             ds: Arc::new(ds),
@@ -1114,37 +1129,57 @@ pub fn get_commit_handler(options: &PyDict) -> Option<Arc<dyn CommitHandler>> {
     }
 }
 
+// Gets a value from the dictionary and attempts to extract it to
+// the desired type.  If the value is None then it treats it as if
+// it were never present in the dictionary.  If the value is not
+// None it will try and parse it and parsing failures will be
+// returned (e.g. a parsing failure is not considered `None`)
+fn get_dict_opt<'a, D: FromPyObject<'a>>(dict: &'a PyDict, key: &str) -> PyResult<Option<D>> {
+    let value = dict.get_item(key)?;
+    value
+        .and_then(|v| {
+            if v.is_none() {
+                None
+            } else {
+                Some(v.extract::<D>())
+            }
+        })
+        .transpose()
+}
+
 pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {
         let mut p = WriteParams::default();
-        if let Some(mode) = options.get_item("mode")? {
-            p.mode = parse_write_mode(mode.extract::<String>()?.as_str())?;
+        if let Some(mode) = get_dict_opt::<String>(options, "mode")? {
+            p.mode = parse_write_mode(mode.as_str())?;
         };
-        if let Some(maybe_nrows) = options.get_item("max_rows_per_file")? {
-            p.max_rows_per_file = usize::extract(maybe_nrows)?;
+        if let Some(maybe_nrows) = get_dict_opt::<usize>(options, "max_rows_per_file")? {
+            p.max_rows_per_file = maybe_nrows;
         }
-        if let Some(maybe_nrows) = options.get_item("max_rows_per_group")? {
-            p.max_rows_per_group = usize::extract(maybe_nrows)?;
+        if let Some(maybe_nrows) = get_dict_opt::<usize>(options, "max_rows_per_group")? {
+            p.max_rows_per_group = maybe_nrows;
         }
-        if let Some(maybe_nbytes) = options.get_item("max_bytes_per_file")? {
-            p.max_bytes_per_file = usize::extract(maybe_nbytes)?;
+        if let Some(maybe_nbytes) = get_dict_opt::<usize>(options, "max_bytes_per_file")? {
+            p.max_bytes_per_file = maybe_nbytes;
         }
-        if let Some(progress) = options.get_item("progress")? {
-            if !progress.is_none() {
-                p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
-            }
+        if let Some(use_experimental_writer) =
+            get_dict_opt::<bool>(options, "use_experimental_writer")?
+        {
+            p.use_experimental_writer = use_experimental_writer;
+        }
+        if let Some(progress) = get_dict_opt::<PyObject>(options, "progress")? {
+            p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
         }
 
-        if let Some(storage_options) = options.get_item("storage_options")? {
-            let storage_options = storage_options.extract::<Option<HashMap<String, String>>>()?;
-            if let Some(storage_options) = storage_options {
-                p.store_params = Some(ObjectStoreParams {
-                    storage_options: Some(storage_options),
-                    ..Default::default()
-                });
-            }
+        if let Some(storage_options) =
+            get_dict_opt::<HashMap<String, String>>(options, "storage_options")?
+        {
+            p.store_params = Some(ObjectStoreParams {
+                storage_options: Some(storage_options),
+                ..Default::default()
+            });
         }
 
         p.commit_handler = get_commit_handler(options);

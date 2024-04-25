@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use lance_arrow::{ArrowFloatType, FloatToArrayType};
+use lance_core::{Error, Result};
 use lance_linalg::MatrixView;
+use snafu::{location, Location};
 
 /// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
 ///
@@ -13,8 +15,18 @@ use lance_linalg::MatrixView;
 pub(super) fn divide_to_subvectors<T: ArrowFloatType>(
     data: &MatrixView<T>,
     m: usize,
-) -> Vec<Arc<T::ArrayType>> {
+) -> Result<Vec<Arc<T::ArrayType>>> {
     assert!(!data.num_rows() > 0);
+    if data.num_columns() % m != 0 {
+        return Err(Error::invalid_input(
+            format!(
+                "num_sub_vectors must divide vector dimension {}, but got {}",
+                data.num_columns(),
+                m
+            ),
+            location!(),
+        ));
+    }
 
     let sub_vector_length = data.num_columns() / m;
     let capacity = data.num_rows() * sub_vector_length;
@@ -25,14 +37,14 @@ pub(super) fn divide_to_subvectors<T: ArrowFloatType>(
     for i in 0..m {
         let mut builder = Vec::with_capacity(capacity);
         for j in 0..data.num_rows() {
-            let row = data.row(j).unwrap();
+            let row = data.row_ref(j).unwrap();
             let start = i * sub_vector_length;
             builder.extend_from_slice(&row[start..start + sub_vector_length]);
         }
         let values = T::ArrayType::from(builder);
         subarrays.push(Arc::new(values));
     }
-    subarrays
+    Ok(subarrays)
 }
 
 /// Number of PQ centroids, for the corresponding number of PQ bits.
@@ -72,7 +84,7 @@ mod tests {
         let values = Float32Array::from_iter((0..320).map(|v| v as f32));
         // A [10, 32] array.
         let mat = MatrixView::new(values.into(), 32);
-        let sub_vectors = divide_to_subvectors::<Float32Type>(&mat, 4);
+        let sub_vectors = divide_to_subvectors::<Float32Type>(&mat, 4).unwrap();
         assert_eq!(sub_vectors.len(), 4);
         assert_eq!(sub_vectors[0].len(), 10 * 8);
 

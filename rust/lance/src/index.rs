@@ -46,8 +46,8 @@ use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
 
 use self::append::merge_indices;
-use self::scalar::build_scalar_index;
-use self::vector::{build_vector_index, VectorIndex, VectorIndexParams};
+use self::scalar::{build_scalar_index, LANCE_SCALAR_INDEX};
+use self::vector::{build_vector_index, VectorIndex, VectorIndexParams, LANCE_VECTOR_INDEX};
 
 /// Builds index.
 #[async_trait]
@@ -192,11 +192,11 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_id = Uuid::new_v4();
-        match index_type {
-            IndexType::Scalar => {
+        match (index_type, params.index_name()) {
+            (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 build_scalar_index(self, column, &index_id.to_string()).await?;
             }
-            IndexType::Vector => {
+            (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
                 let vec_params = params
                     .as_any()
@@ -208,6 +208,39 @@ impl DatasetIndexExt for Dataset {
 
                 build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)
                     .await?;
+            }
+            // Can't use if let Some(...) here because it's not stable yet.
+            // TODO: fix after https://github.com/rust-lang/rust/issues/51114
+            (IndexType::Vector, name)
+                if self
+                    .session
+                    .index_extensions
+                    .contains_key(&(IndexType::Vector, name.to_string())) =>
+            {
+                let ext = self
+                    .session
+                    .index_extensions
+                    .get(&(IndexType::Vector, name.to_string()))
+                    .expect("already checked")
+                    .clone()
+                    .to_vector()
+                    // this should never happen beause we control the registration
+                    // if this fails, the registration logic has a bug
+                    .ok_or(Error::Internal {
+                        message: "unable to cast index extension to vector".to_string(),
+                        location: location!(),
+                    })?;
+
+                ext.create_index(self, column, &index_id.to_string(), params)
+                    .await?;
+            }
+            (index_type, index_name) => {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index type {index_type} with name {index_name} is not supported"
+                    ),
+                    location: location!(),
+                });
             }
         }
 

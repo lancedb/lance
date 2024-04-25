@@ -5,6 +5,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use arrow_array::{
     cast::AsArray,
+    new_empty_array,
     types::{Int32Type, Int64Type},
     ArrayRef, Int32Array, Int64Array, LargeListArray, ListArray, UInt32Array,
 };
@@ -18,8 +19,7 @@ use lance_core::Result;
 
 use crate::{
     decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
-    encoder::{EncodedPage, FieldEncoder},
-    encodings::physical::basic::BasicEncoder,
+    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
     format::pb,
     EncodingsIo,
 };
@@ -47,18 +47,19 @@ use super::primitive::PrimitiveFieldEncoder;
 ///
 /// Note: The length of the list page is 1 less than the length of the offsets page
 // TODO: Right now we are assuming that list offsets and list items are written at the same time.
-// As a result, we know which item pages correspond to which index page and there are no item
-// pages which overlap two different index pages.
+// As a result, we know which item pages correspond to which offsets page and there are no item
+// pages which overlap two different offsets pages.
 //
 // In the metadata for the page we store only the u64 num_items referenced by the page.
 //
-// We could relax this constraint.  Either each index page could store the u64 offset into
-// the total range of item pages or each index page could store a u64 num_items and a u32
+// We could relax this constraint.  Either each offsets page could store the u64 offset into
+// the total range of item pages or each offsets page could store a u64 num_items and a u32
 // first_item_page_offset.
 #[derive(Debug)]
 pub struct ListPageScheduler {
     offsets_scheduler: Box<dyn LogicalPageScheduler>,
     items_schedulers: Arc<Vec<Box<dyn LogicalPageScheduler>>>,
+    items_type: DataType,
     offset_type: DataType,
 }
 
@@ -67,6 +68,7 @@ impl ListPageScheduler {
     pub fn new(
         offsets_scheduler: Box<dyn LogicalPageScheduler>,
         items_schedulers: Vec<Box<dyn LogicalPageScheduler>>,
+        items_type: DataType,
         // Should be int32 or int64
         offset_type: DataType,
     ) -> Self {
@@ -77,6 +79,7 @@ impl ListPageScheduler {
         Self {
             offsets_scheduler,
             items_schedulers: Arc::new(items_schedulers),
+            items_type,
             offset_type,
         }
     }
@@ -234,6 +237,7 @@ impl LogicalPageScheduler for ListPageScheduler {
             num_rows,
             rows_drained: 0,
             unloaded: Some(indirect_fut),
+            items_type: self.items_type.clone(),
             offset_type: self.offset_type.clone(),
         }))
         .unwrap();
@@ -283,12 +287,14 @@ struct ListPageDecoder {
     item_decoders: VecDeque<Box<dyn LogicalPageDecoder>>,
     num_rows: u32,
     rows_drained: u32,
+    items_type: DataType,
     offset_type: DataType,
 }
 
 struct ListDecodeTask {
     offsets: Vec<u32>,
     items: Vec<Box<dyn DecodeArrayTask>>,
+    items_type: DataType,
     offset_type: DataType,
 }
 
@@ -302,10 +308,15 @@ impl DecodeArrayTask for ListDecodeTask {
         let item_refs = items.iter().map(|item| item.as_ref()).collect::<Vec<_>>();
         // TODO: could maybe try and "page bridge" these at some point
         // (assuming item type is primitive) to avoid the concat
-        let items = arrow_select::concat::concat(&item_refs)?;
+        let items = if item_refs.is_empty() {
+            // This can happen if we have are building an array made only of empty lists
+            new_empty_array(&self.items_type)
+        } else {
+            arrow_select::concat::concat(&item_refs)?
+        };
         // TODO: we default to nullable true here, should probably use the nullability given to
         // us from the input schema
-        let item_field = Arc::new(Field::new("item", items.data_type().clone(), true));
+        let item_field = Arc::new(Field::new("item", self.items_type.clone(), true));
 
         // The offsets are already decoded but they need to be shifted back to 0
         // TODO: Can these branches be simplified?
@@ -399,6 +410,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             task: Box::new(ListDecodeTask {
                 offsets,
                 items: item_decodes,
+                items_type: self.items_type.clone(),
                 offset_type: self.offset_type.clone(),
             }) as Box<dyn DecodeArrayTask>,
         })
@@ -417,8 +429,57 @@ struct IndirectlyLoaded {
     item_decoders: Vec<Box<dyn LogicalPageDecoder>>,
 }
 
+/// An encoder for list offsets that "stitches" offsets
+///
+/// If we need to encode several list arrays into a single page then we need to "stitch" the offsets
+/// For example, imagine we have list arrays [[0, 1], [2]] and [[3, 4, 5]].
+///
+/// We will have offset arrays [0, 2, 3] and [0, 3].  We don't want to encode [0, 2, 3, 0, 3].  What
+/// we want is [0, 2, 3, 6]
+#[derive(Debug)]
+struct ListOffsetsEncoder {
+    inner: Box<dyn ArrayEncoder>,
+}
+
+impl ArrayEncoder for ListOffsetsEncoder {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
+        if arrays.len() < 2 {
+            // Nothing to patch, don't incur a copy
+            return self.inner.encode(arrays, buffer_index);
+        }
+        println!("Stitching offsets {:?}", arrays);
+        let num_offsets =
+            arrays.iter().map(|array| array.len()).sum::<usize>() - (arrays.len() - 1);
+        let mut offsets = Vec::with_capacity(num_offsets);
+        offsets.extend_from_slice(arrays[0].as_primitive::<Int32Type>().values());
+        for array in &arrays[1..] {
+            let last_prev_offset = *offsets.last().unwrap();
+            let values = array.as_primitive::<Int32Type>().values();
+            if values.len() == 0 {
+                continue;
+            }
+            // The first offset doesn't have to be 0 (this happens when lists are sliced)
+            //
+            // So if the previous offsets are [0, 3, 5] and the current offsets are
+            // [10, 11, 12] then we want to add 5 - 10 to all of the current offsets
+            // (skipping the first) to get [6, 7] and then append them to the previous
+            // offsets to get [0, 3, 5, 6, 7]
+            let first_curr_offset = values[0];
+            offsets.extend(
+                values
+                    .iter()
+                    .skip(1)
+                    .map(|&v| v + last_prev_offset - first_curr_offset),
+            );
+        }
+        println!("Stitched offsets {:?}", offsets);
+        self.inner
+            .encode(&[Arc::new(Int32Array::from(offsets))], buffer_index)
+    }
+}
+
 pub struct ListFieldEncoder {
-    indices_encoder: PrimitiveFieldEncoder,
+    offsets_encoder: PrimitiveFieldEncoder,
     items_encoder: Box<dyn FieldEncoder>,
 }
 
@@ -428,46 +489,49 @@ impl ListFieldEncoder {
         cache_bytes_per_columns: u64,
         column_index: u32,
     ) -> Self {
+        let inner_encoder =
+            PrimitiveFieldEncoder::array_encoder_from_data_type(&DataType::Int32).unwrap();
+        let offsets_encoder = Arc::new(ListOffsetsEncoder {
+            inner: inner_encoder,
+        });
         Self {
-            indices_encoder: PrimitiveFieldEncoder::new(
+            offsets_encoder: PrimitiveFieldEncoder::new_with_encoder(
                 cache_bytes_per_columns,
-                Arc::new(BasicEncoder::new(column_index)),
+                column_index,
+                offsets_encoder,
             ),
             items_encoder,
         }
     }
 
-    fn combine_index_tasks(
-        index_tasks: Result<Vec<BoxFuture<'static, Result<EncodedPage>>>>,
-        item_tasks: Result<Vec<BoxFuture<'static, Result<EncodedPage>>>>,
-    ) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
-        let mut index_tasks = index_tasks?;
+    fn combine_tasks(
+        offsets_tasks: Result<Vec<EncodeTask>>,
+        item_tasks: Result<Vec<EncodeTask>>,
+    ) -> Result<Vec<EncodeTask>> {
+        let mut all_tasks = offsets_tasks?;
         let item_tasks = item_tasks?;
-        index_tasks.extend(item_tasks);
-        Ok(index_tasks)
+        all_tasks.extend(item_tasks);
+        Ok(all_tasks)
     }
 
-    fn wrap_index_encode_tasks(
-        tasks: Result<Vec<BoxFuture<'static, Result<EncodedPage>>>>,
-    ) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn wrap_offsets_encode_tasks(tasks: Result<Vec<EncodeTask>>) -> Result<Vec<EncodeTask>> {
         tasks.map(|tasks| {
             tasks
                 .into_iter()
                 .map(|page_task| {
                     async move {
                         let page = page_task.await?;
-                        Ok(EncodedPage {
-                            buffers: page.buffers,
-                            column_idx: page.column_idx,
-                            num_rows: page.num_rows,
+                        let array = EncodedArray {
+                            buffers: page.array.buffers,
                             encoding: pb::ArrayEncoding {
                                 array_encoding: Some(pb::array_encoding::ArrayEncoding::List(
                                     Box::new(pb::List {
-                                        offsets: Some(Box::new(page.encoding)),
+                                        offsets: Some(Box::new(page.array.encoding)),
                                     }),
                                 )),
                             },
-                        })
+                        };
+                        Ok(EncodedPage { array, ..page })
                     }
                     .boxed()
                 })
@@ -477,10 +541,7 @@ impl ListFieldEncoder {
 }
 
 impl FieldEncoder for ListFieldEncoder {
-    fn maybe_encode(
-        &mut self,
-        array: ArrayRef,
-    ) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
+    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         let items = match array.data_type() {
             DataType::List(_) => array.as_list::<i32>().values().clone(),
             DataType::LargeList(_) => array.as_list::<i64>().values().clone(),
@@ -497,17 +558,17 @@ impl FieldEncoder for ListFieldEncoder {
             }
             _ => panic!(),
         };
-        let index_tasks = self.indices_encoder.maybe_encode(offsets);
-        let index_tasks = Self::wrap_index_encode_tasks(index_tasks);
+        let offsets_tasks = self.offsets_encoder.maybe_encode(offsets);
+        let offsets_tasks = Self::wrap_offsets_encode_tasks(offsets_tasks);
         let item_tasks = self.items_encoder.maybe_encode(items);
-        Self::combine_index_tasks(index_tasks, item_tasks)
+        Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
-    fn flush(&mut self) -> Result<Vec<BoxFuture<'static, Result<EncodedPage>>>> {
-        let index_tasks = self.indices_encoder.flush();
-        let index_tasks = Self::wrap_index_encode_tasks(index_tasks);
+    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
+        let offsets_tasks = self.offsets_encoder.flush();
+        let offsets_tasks = Self::wrap_offsets_encode_tasks(offsets_tasks);
         let item_tasks = self.items_encoder.flush();
-        Self::combine_index_tasks(index_tasks, item_tasks)
+        Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
     fn num_columns(&self) -> u32 {
@@ -520,25 +581,32 @@ mod tests {
 
     use std::sync::Arc;
 
+    use arrow_array::builder::{Int32Builder, ListBuilder};
     use arrow_schema::{DataType, Field};
 
-    use crate::{
-        encodings::{
-            logical::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder},
-            physical::basic::BasicEncoder,
-        },
-        testing::check_round_trip_field_encoding,
+    use crate::testing::{
+        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
     };
 
     #[test_log::test(tokio::test)]
-    async fn test_simple_list() {
+    async fn test_list() {
         let data_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
-        let items_encoder = Box::new(PrimitiveFieldEncoder::new(
-            4096,
-            Arc::new(BasicEncoder::new(1)),
-        ));
-        let encoder = ListFieldEncoder::new(items_encoder, 4096, 0);
         let field = Field::new("", data_type, false);
-        check_round_trip_field_encoding(encoder, field).await;
+        check_round_trip_encoding_random(field).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_empty_lists() {
+        // When encoding a list of empty lists there are no items to encode
+        // which is strange and we want to ensure we handle it
+        let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append(true);
+        list_builder.append(true);
+        list_builder.append(true);
+        let list_array = list_builder.finish();
+
+        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
     }
 }

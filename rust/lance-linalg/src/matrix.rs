@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray};
 use arrow_schema::{ArrowError, DataType};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
@@ -134,7 +134,7 @@ impl<T: ArrowFloatType> MatrixView<T> {
     /// Returns a row at index `i`. Returns `None` if the index is out of bound.
     ///
     /// # Panics if the matrix is transposed.
-    pub fn row(&self, i: usize) -> Option<&[T::Native]> {
+    pub fn row_ref(&self, i: usize) -> Option<&[T::Native]> {
         assert!(
             !self.transpose,
             "Centroid is not defined for transposed matrix."
@@ -144,6 +144,19 @@ impl<T: ArrowFloatType> MatrixView<T> {
         } else {
             let dim = self.num_columns();
             Some(&self.data.as_slice()[i * dim..(i + 1) * dim])
+        }
+    }
+
+    pub fn row(&self, i: usize) -> Option<ArrayRef> {
+        assert!(
+            !self.transpose,
+            "Centroid is not defined for transposed matrix."
+        );
+        if i >= self.num_rows() {
+            None
+        } else {
+            let dim = self.num_columns();
+            Some(self.data.slice(i * dim, dim))
         }
     }
 
@@ -359,7 +372,7 @@ impl<'a, T: ArrowFloatType> Iterator for MatrixRowIter<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         let cur_idx = self.cur_idx;
         self.cur_idx += 1;
-        self.data.row(cur_idx)
+        self.data.row_ref(cur_idx)
     }
 }
 

@@ -6,12 +6,13 @@
 use arrow_schema::DataType;
 
 use datafusion::logical_expr::ScalarFunctionDefinition;
+use datafusion::logical_expr::ScalarUDFImpl;
 use datafusion::logical_expr::{
-    expr::ScalarFunction, BinaryExpr, BuiltinScalarFunction, GetFieldAccess, GetIndexedField,
-    Operator,
+    expr::ScalarFunction, BinaryExpr, GetFieldAccess, GetIndexedField, Operator,
 };
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
+use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::DataTypeExt;
 use lance_datafusion::expr::safe_coerce_scalar;
 
@@ -34,6 +35,15 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     }
 }
 
+/// A simple helper function that interprets an Expr as a string scalar
+/// or returns None if it is not.
+pub fn get_as_string_scalar_opt(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s))) => Some(s),
+        _ => None,
+    }
+}
+
 /// Given a Expr::Column or Expr::GetIndexedField, get the data type of referenced
 /// field in the schema.
 ///
@@ -48,6 +58,15 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
             Expr::Column(c) => {
                 field_path.push(c.name.as_str());
                 break;
+            }
+            Expr::ScalarFunction(udf) => {
+                if udf.name() == GetFieldFunc::default().name() {
+                    let name = get_as_string_scalar_opt(&udf.args[1])?;
+                    field_path.push(name);
+                    current_expr = &udf.args[0];
+                } else {
+                    return None;
+                }
             }
             Expr::GetIndexedField(GetIndexedField { expr, field }) => {
                 if let GetFieldAccess::NamedStructField {
@@ -87,52 +106,41 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             if matches!(op, Operator::And | Operator::Or) {
-                return Ok(Expr::BinaryExpr(BinaryExpr {
+                Ok(Expr::BinaryExpr(BinaryExpr {
                     left: Box::new(resolve_expr(left.as_ref(), schema)?),
                     op: *op,
                     right: Box::new(resolve_expr(right.as_ref(), schema)?),
-                }));
-            }
-            match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(_) | Expr::GetIndexedField(_), Expr::Literal(_)) => {
-                    if let Some(resolved_type) = resolve_column_type(left.as_ref(), schema) {
-                        Ok(Expr::BinaryExpr(BinaryExpr {
-                            left: left.clone(),
-                            op: *op,
-                            right: Box::new(resolve_value(right.as_ref(), &resolved_type)?),
-                        }))
-                    } else {
-                        Ok(expr.clone())
-                    }
+                }))
+            } else if let Some(left_type) = resolve_column_type(left.as_ref(), schema) {
+                match right.as_ref() {
+                    Expr::Literal(_) => Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: left.clone(),
+                        op: *op,
+                        right: Box::new(resolve_value(right.as_ref(), &left_type)?),
+                    })),
+                    // For cases complex expressions (not just literals) on right hand side like x = 1 + 1 + -2*2
+                    Expr::BinaryExpr(r) => Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: left.clone(),
+                        op: *op,
+                        right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                            left: coerce_expr(&r.left, &left_type).map(Box::new)?,
+                            op: r.op,
+                            right: coerce_expr(&r.right, &left_type).map(Box::new)?,
+                        })),
+                    })),
+                    _ => Ok(expr.clone()),
                 }
-                (Expr::Literal(_), Expr::Column(_) | Expr::GetIndexedField(_)) => {
-                    if let Some(resolved_type) = resolve_column_type(right.as_ref(), schema) {
-                        Ok(Expr::BinaryExpr(BinaryExpr {
-                            left: Box::new(resolve_value(left.as_ref(), &resolved_type)?),
-                            op: *op,
-                            right: right.clone(),
-                        }))
-                    } else {
-                        Ok(expr.clone())
-                    }
+            } else if let Some(right_type) = resolve_column_type(right.as_ref(), schema) {
+                match left.as_ref() {
+                    Expr::Literal(_) => Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(resolve_value(left.as_ref(), &right_type)?),
+                        op: *op,
+                        right: right.clone(),
+                    })),
+                    _ => Ok(expr.clone()),
                 }
-                // For cases complex expressions (not just literals) on right hand side like x = 1 + 1 + -2*2
-                (Expr::Column(_) | Expr::GetIndexedField(_), Expr::BinaryExpr(r)) => {
-                    if let Some(resolved_type) = resolve_column_type(left.as_ref(), schema) {
-                        Ok(Expr::BinaryExpr(BinaryExpr {
-                            left: left.clone(),
-                            op: *op,
-                            right: Box::new(Expr::BinaryExpr(BinaryExpr {
-                                left: coerce_expr(&r.left, &resolved_type).map(Box::new)?,
-                                op: r.op,
-                                right: coerce_expr(&r.right, &resolved_type).map(Box::new)?,
-                            })),
-                        }))
-                    } else {
-                        Ok(expr.clone())
-                    }
-                }
-                _ => Ok(expr.clone()),
+            } else {
+                Ok(expr.clone())
             }
         }
         Expr::InList(in_list) => {
@@ -189,25 +197,61 @@ pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
 ///
 /// - *expr*: a datafusion logical expression
 pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
-    match expr {
+    match &expr {
         // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
         // instead of hardcoding coerce method for each function
         Expr::ScalarFunction(ScalarFunction {
-            func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::RegexpMatch),
+            func_def: ScalarFunctionDefinition::UDF(udf),
             ..
-        }) => Ok(Expr::IsNotNull(Box::new(expr))),
-
+        }) => {
+            if udf.name() == "regexp_match" {
+                Ok(Expr::IsNotNull(Box::new(expr)))
+            } else {
+                Ok(expr)
+            }
+        }
         _ => Ok(expr),
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::sync::Arc;
 
     use super::*;
 
     use arrow_schema::{Field, Schema as ArrowSchema};
+    use datafusion::logical_expr::ScalarUDF;
+
+    // As part of the DF 37 release there are now two different ways to
+    // represent a nested field access in `Expr`.  The old way is to use
+    // `Expr::field` which returns a `GetStructField` and the new way is
+    // to use `Expr::ScalarFunction` with a `GetFieldFunc` UDF.
+    //
+    // Currently, the old path leads to bugs in DF.  This is probably a
+    // bug and will probably be fixed in a future version.  In the meantime
+    // we need to make sure we are always using the new way to avoid this
+    // bug.  This trait adds field_newstyle which lets us easily create
+    // logical `Expr` that use the new style.
+    pub trait ExprExt {
+        // Helper function to replace Expr::field in DF 37 since DF
+        // confuses itself with the GetStructField returned by Expr::field
+        fn field_newstyle(&self, name: &str) -> Expr;
+    }
+
+    impl ExprExt for Expr {
+        fn field_newstyle(&self, name: &str) -> Expr {
+            Self::ScalarFunction(ScalarFunction {
+                func_def: ScalarFunctionDefinition::UDF(Arc::new(ScalarUDF::new_from_impl(
+                    GetFieldFunc::default(),
+                ))),
+                args: vec![
+                    self.clone(),
+                    Self::Literal(ScalarValue::Utf8(Some(name.to_string()))),
+                ],
+            })
+        }
+    }
 
     #[test]
     fn test_resolve_large_utf8() {

@@ -2434,15 +2434,63 @@ mod tests {
         );
     }
 
-    fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
+    #[tokio::test]
+    async fn test_create_ivf_pq_with_invalid_num_sub_vectors() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float32Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(256),
+            PQBuildParams::new(6, 8),
+        );
+        let res = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await;
+        match &res {
+            Err(Error::InvalidInput { source, .. }) => {
+                assert!(
+                    source
+                        .to_string()
+                        .contains("num_sub_vectors must divide vector dimension"),
+                    "{:?}",
+                    res
+                );
+            }
+            _ => panic!("Expected InvalidInput error: {:?}", res),
+        }
+    }
+
+    fn ground_truth(
+        mat: &MatrixView<Float32Type>,
+        query: &[f32],
+        k: usize,
+        distance_type: DistanceType,
+    ) -> Vec<(f32, u32)> {
         let mut dists = vec![];
         for i in 0..mat.num_rows() {
-            let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
+            let dist = distance_type.func()(query, mat.row_ref(i).unwrap());
             dists.push((dist, i as u32));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         dists.truncate(k);
-        dists.into_iter().map(|(_, i)| i).collect()
+        dists
     }
 
     #[tokio::test]
@@ -2453,11 +2501,7 @@ mod tests {
         let nlist = 4;
         let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
-        let centroids = generate_random_array(nlist * DIM);
-        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf_params =
-            IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
-
+        let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -2510,7 +2554,7 @@ mod tests {
         assert_eq!(1, results.len());
         assert_eq!(k, results[0].num_rows());
 
-        let results = results[0]
+        let row_ids = results[0]
             .column_by_name(ROW_ID)
             .unwrap()
             .as_any()
@@ -2518,16 +2562,29 @@ mod tests {
             .unwrap()
             .iter()
             .map(|v| v.unwrap() as u32)
-            .collect::<HashSet<_>>();
+            .collect::<Vec<_>>();
+        let dists = results[0]
+            .column_by_name("_distance")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
 
-        let gt = ground_truth(&mat, query.values(), k);
-        let recall = results.intersection(&gt).count() as f32 / k as f32;
+        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
+        let gt = ground_truth(&mat, query.values(), k, DistanceType::L2);
+
+        let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
+        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+
+        let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 0.8,
+            recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
-            results.iter().sorted().collect_vec(),
-            gt.iter().sorted().collect_vec()
+            results,
+            gt,
         );
     }
 
@@ -2539,15 +2596,113 @@ mod tests {
         let nlist = 4;
         let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
+        let ivf_params = IvfBuildParams::new(nlist);
+        let sq_params = SQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::Cosine,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let indexes = dataset
+            .object_store()
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap();
+        assert_eq!(indexes.len(), 1);
+
+        let uuid = &indexes[0];
+        let index_path = dataset
+            .indices_dir()
+            .child(uuid.as_str())
+            .child(INDEX_FILE_NAME);
+        let aux_path = dataset
+            .indices_dir()
+            .child(uuid.as_str())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        assert!(dataset.object_store().exists(&index_path).await.unwrap());
+        assert!(dataset.object_store().exists(&aux_path).await.unwrap());
+
+        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
+        let query = vector_array.value(0);
+        let query = query.as_primitive::<Float32Type>();
+        let k = 100;
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .nearest("vector", query, k)
+            .unwrap()
+            .nprobs(nlist)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(1, results.len());
+        assert_eq!(k, results[0].num_rows());
+
+        let row_ids = results[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap() as u32)
+            .collect::<Vec<_>>();
+        let dists = results[0]
+            .column_by_name("_distance")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+
+        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
+        let gt = ground_truth(&mat, query.values(), k, DistanceType::Cosine);
+
+        let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
+        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+
+        let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
+        assert!(
+            recall >= 0.9,
+            "recall: {}\n results: {:?}\n\ngt: {:?}",
+            recall,
+            results,
+            gt,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_with_empty_partition() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // the generate_test_dataset function generates a dataset with 1000 vectors,
+        // so 1001 partitions will have at least one empty partition
+        let nlist = 1001;
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
         let centroids = generate_random_array(nlist * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
         let ivf_params =
             IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
 
+        let distance_type = MetricType::L2;
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::L2,
+            distance_type,
             ivf_params,
             hnsw_params,
             sq_params,
@@ -2606,14 +2761,15 @@ mod tests {
             .map(|v| v.unwrap() as u32)
             .collect::<HashSet<_>>();
 
-        let gt = ground_truth(&mat, query.values(), k);
-        let recall = results.intersection(&gt).count() as f32 / k as f32;
+        let gt = ground_truth(&mat, query.values(), k, distance_type);
+        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+        let recall = results.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
             recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results.iter().sorted().collect_vec(),
-            gt.iter().sorted().collect_vec()
+            gt_set.iter().sorted().collect_vec()
         );
     }
 

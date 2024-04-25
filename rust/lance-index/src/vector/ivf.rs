@@ -458,7 +458,7 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
             .chunks_exact(dim)
             .zip(part_ids.values())
             .flat_map(|(vector, &part_id)| {
-                let centroid = self.centroids.row(part_id as usize).unwrap();
+                let centroid = self.centroids.row_ref(part_id as usize).unwrap();
                 vector.iter().zip(centroid.iter()).map(|(&v, &c)| v - c)
             })
             .collect::<Vec<_>>();

@@ -25,6 +25,8 @@ fn bench_hnsw(c: &mut Criterion) {
     const SEED: [u8; 32] = [42; 32];
     const K: usize = 10;
 
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
     let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
     let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
@@ -33,15 +35,16 @@ fn bench_hnsw(c: &mut Criterion) {
     c.bench_function(
         format!("create_hnsw({TOTAL}x1024,levels=6)").as_str(),
         |b| {
-            b.iter(|| {
+            b.to_async(&rt).iter(|| async {
                 let hnsw = HNSWBuilder::with_params(
                     HnswBuildParams::default().max_level(6),
                     vectors.clone(),
                 )
                 .build()
+                .await
                 .unwrap();
                 let uids: HashSet<u32> = hnsw
-                    .search(query, K, 300, None)
+                    .search(query.clone(), K, 300, None)
                     .unwrap()
                     .iter()
                     .map(|node| node.id)

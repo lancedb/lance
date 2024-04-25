@@ -3,10 +3,11 @@
 
 use std::any::Any;
 
+use arrow_array::ArrayRef;
 use lance_linalg::distance::MetricType;
 
 pub trait DistCalculator {
-    fn distance(&self, ids: &[u32]) -> Vec<f32>;
+    fn distance(&self, id: u32) -> f32;
 }
 
 /// Vector Storage is the abstraction to store the vectors.
@@ -35,5 +36,9 @@ pub trait VectorStorage: Send + Sync {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator>;
+    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator>;
+
+    fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator>;
+
+    fn distance_between(&self, a: u32, b: u32) -> f32;
 }

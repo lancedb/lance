@@ -58,7 +58,7 @@ pub trait Index: Send + Sync {
 }
 
 /// Index Type
-#[derive(Debug, PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Hash, Clone)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
     Scalar = 0,
@@ -78,6 +78,10 @@ impl std::fmt::Display for IndexType {
 
 pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
+
+    fn index_type(&self) -> IndexType;
+
+    fn index_name(&self) -> &str;
 }
 
 #[derive(Serialize, Deserialize, Debug)]

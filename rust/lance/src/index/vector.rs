@@ -25,7 +25,7 @@ use lance_index::vector::pq::ProductQuantizerImpl;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
-use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
@@ -39,6 +39,8 @@ use self::{ivf::*, pq::PQIndex};
 use super::{pb, DatasetIndexInternalExt, IndexParams};
 use crate::{dataset::Dataset, index::pb::vector_index_stage::Stage, Error, Result};
 pub use traits::*;
+
+pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
 
 /// Parameters of each index stage.
 #[derive(Debug, Clone)]
@@ -115,6 +117,11 @@ impl VectorIndexParams {
         hnsw: HnswBuildParams,
         pq: PQBuildParams,
     ) -> Self {
+        let hnsw = match &hnsw.parallel_limit {
+            Some(_) => hnsw,
+            None => hnsw.parallel_limit(num_cpus::get().div_ceil(ivf.num_partitions)),
+        };
+
         let stages = vec![
             StageParams::Ivf(ivf),
             StageParams::Hnsw(hnsw),
@@ -134,6 +141,11 @@ impl VectorIndexParams {
         hnsw: HnswBuildParams,
         sq: SQBuildParams,
     ) -> Self {
+        let hnsw = match &hnsw.parallel_limit {
+            Some(_) => hnsw,
+            None => hnsw.parallel_limit(num_cpus::get().div_ceil(ivf.num_partitions)),
+        };
+
         let stages = vec![
             StageParams::Ivf(ivf),
             StageParams::Hnsw(hnsw),
@@ -149,6 +161,14 @@ impl VectorIndexParams {
 impl IndexParams for VectorIndexParams {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Vector
+    }
+
+    fn index_name(&self) -> &str {
+        LANCE_VECTOR_INDEX
     }
 }
 
@@ -424,14 +444,14 @@ pub(crate) async fn open_vector_index_v2(
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-    let aux_path = dataset
-        .indices_dir()
-        .child(uuid)
-        .child(INDEX_AUXILIARY_FILE_NAME);
-    let aux_reader = dataset.object_store().open(&aux_path).await?;
-
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
+            let aux_path = dataset
+                .indices_dir()
+                .child(uuid)
+                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_reader = dataset.object_store().open(&aux_path).await?;
+
             let ivf_data = IvfData::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizerImpl<Float32Type>>::try_new(
@@ -455,6 +475,12 @@ pub(crate) async fn open_vector_index_v2(
         }
 
         "IVF_HNSW_SQ" => {
+            let aux_path = dataset
+                .indices_dir()
+                .child(uuid)
+                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_reader = dataset.object_store().open(&aux_path).await?;
+
             let ivf_data = IvfData::load(&reader).await?;
             let options = HNSWIndexOptions {
                 use_residual: false,
@@ -479,11 +505,26 @@ pub(crate) async fn open_vector_index_v2(
             )?)
         }
 
-        _ => {
-            return Err(Error::Index {
-                message: format!("Unsupported index type: {}", index_metadata.index_type),
-                location: location!(),
-            })
+        index_type => {
+            if let Some(ext) = dataset
+                .session
+                .index_extensions
+                .get(&(IndexType::Vector, index_type.to_string()))
+            {
+                ext.clone()
+                    .to_vector()
+                    .ok_or(Error::Internal {
+                        message: "unable to cast index extension to vector".to_string(),
+                        location: location!(),
+                    })?
+                    .load_index(dataset.clone(), column, uuid, reader)
+                    .await?
+            } else {
+                return Err(Error::Index {
+                    message: format!("Unsupported index type: {}", index_metadata.index_type),
+                    location: location!(),
+                });
+            }
         }
     };
 

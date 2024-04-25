@@ -10,6 +10,7 @@ use self::{
 
 pub mod basic;
 pub mod bitmap;
+pub mod buffers;
 pub mod fixed_size_list;
 pub mod value;
 
@@ -47,18 +48,24 @@ fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> u64 {
 }
 
 /// Convert a protobuf buffer encoding into a physical page scheduler
-fn decoder_from_buffer_encoding(
-    encoding: &pb::BufferEncoding,
+fn get_buffer_decoder(
+    encoding: &pb::Flat,
     buffers: &PageBuffers,
 ) -> Box<dyn PhysicalPageScheduler> {
-    match encoding.buffer_encoding.as_ref().unwrap() {
-        pb::buffer_encoding::BufferEncoding::Value(value) => Box::new(ValuePageScheduler::new(
-            value.bytes_per_value,
-            get_buffer(value.buffer.as_ref().unwrap(), buffers),
-        )),
-        pb::buffer_encoding::BufferEncoding::Bitmap(bitmap) => Box::new(DenseBitmapScheduler::new(
-            get_buffer(bitmap.buffer.as_ref().unwrap(), buffers),
-        )),
+    match encoding.bits_per_value {
+        1 => Box::new(DenseBitmapScheduler::new(get_buffer(
+            encoding.buffer.as_ref().unwrap(),
+            buffers,
+        ))),
+        bits_per_value => {
+            if bits_per_value % 8 != 0 {
+                todo!("bits_per_value that are not multiples of 8");
+            }
+            Box::new(ValuePageScheduler::new(
+                bits_per_value / 8,
+                get_buffer(encoding.buffer.as_ref().unwrap(), buffers),
+            ))
+        }
     }
 }
 
@@ -68,25 +75,25 @@ pub fn decoder_from_array_encoding(
     buffers: &PageBuffers,
 ) -> Box<dyn PhysicalPageScheduler> {
     match encoding.array_encoding.as_ref().unwrap() {
-        pb::array_encoding::ArrayEncoding::Basic(basic) => {
+        pb::array_encoding::ArrayEncoding::Nullable(basic) => {
             match basic.nullability.as_ref().unwrap() {
-                pb::basic::Nullability::NoNulls(no_nulls) => {
+                pb::nullable::Nullability::NoNulls(no_nulls) => {
                     Box::new(BasicPageScheduler::new_non_nullable(
-                        decoder_from_buffer_encoding(no_nulls.values.as_ref().unwrap(), buffers),
+                        decoder_from_array_encoding(no_nulls.values.as_ref().unwrap(), buffers),
                     ))
                 }
-                pb::basic::Nullability::SomeNulls(some_nulls) => {
+                pb::nullable::Nullability::SomeNulls(some_nulls) => {
                     Box::new(BasicPageScheduler::new_nullable(
-                        decoder_from_buffer_encoding(
-                            some_nulls.validity.as_ref().unwrap(),
-                            buffers,
-                        ),
-                        decoder_from_buffer_encoding(some_nulls.values.as_ref().unwrap(), buffers),
+                        decoder_from_array_encoding(some_nulls.validity.as_ref().unwrap(), buffers),
+                        decoder_from_array_encoding(some_nulls.values.as_ref().unwrap(), buffers),
                     ))
                 }
-                pb::basic::Nullability::AllNulls(_) => todo!(),
+                pb::nullable::Nullability::AllNulls(_) => {
+                    Box::new(BasicPageScheduler::new_all_null())
+                }
             }
         }
+        pb::array_encoding::ArrayEncoding::Flat(flat) => get_buffer_decoder(flat, buffers),
         pb::array_encoding::ArrayEncoding::FixedSizeList(fixed_size_list) => {
             let item_encoding = fixed_size_list.items.as_ref().unwrap();
             let item_scheduler = decoder_from_array_encoding(item_encoding, buffers);
