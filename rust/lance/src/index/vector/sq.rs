@@ -68,7 +68,7 @@ pub fn build_sq_storage(
         (ROW_ID, row_ids, true),
         (sq.column(), code_column, false),
     ])?;
-    let store = ScalarQuantizationStorage::new(sq.num_bits(), metric_type, sq.bounds(), pq_batch)?;
+    let store = ScalarQuantizationStorage::new(sq.num_bits(), metric_type, sq.bounds().to_vec(), pq_batch)?;
 
     Ok(store)
 }
