@@ -28,8 +28,6 @@ use super::primitive::{AccumulationQueue, PrimitiveFieldEncoder};
 
 /// A page scheduler for list fields that encodes offsets in one field and items in another
 ///
-/// TODO: Implement list nullability
-///
 /// The list scheduler is somewhat unique because it requires indirect I/O.  We cannot know the
 /// ranges we need simply by looking at the metadata.  This means that list scheduling doesn't
 /// fit neatly into the two-thread schedule-loop / decode-loop model.  To handle this, when a
@@ -45,12 +43,9 @@ use super::primitive::{AccumulationQueue, PrimitiveFieldEncoder};
 ///
 /// TODO: Actually implement the priority system described above
 ///
-/// Note: The length of the list page is 1 less than the length of the offsets page
 // TODO: Right now we are assuming that list offsets and list items are written at the same time.
 // As a result, we know which item pages correspond to which offsets page and there are no item
 // pages which overlap two different offsets pages.
-//
-// In the metadata for the page we store only the u64 num_items referenced by the page.
 //
 // We could relax this constraint.  Either each offsets page could store the u64 offset into
 // the total range of item pages or each offsets page could store a u64 num_items and a u32
@@ -377,6 +372,21 @@ impl LogicalPageScheduler for ListPageScheduler {
             }
             let mut item_decoders = Vec::new();
             drop(tx);
+            // TODO(urgent): A single list page can have multiple item pages and they could be huge.
+            // For example, 1Mi lists with 100MiB of data in each list.
+            //
+            // The 1Mi offsets would fit neatly into a single page
+            //
+            // However, the 100GiB of data would be spread across many pages.
+            //
+            // This is all ok.  THhe problem is that we are currently waiting for all pages
+            // to finish loading.  If the read batch size is small (e.g. 10) then we should
+            // only wait for a few pages before returning a batch.
+            //
+            // TODO(not-so-urgent): Even further in the future we should be able to automatically
+            // shrink the read batch size if we detect the batches are going to be huge (maybe
+            // even achieve this with a read_batch_bytes parameter, though some estimation may
+            // still be required)
             while let Some(mut item_decoder) = rx.recv().await {
                 item_decoder.wait(item_decoder.unawaited(), &mut rx).await?;
                 item_decoders.push(item_decoder);
@@ -481,9 +491,8 @@ impl DecodeArrayTask for ListDecodeTask {
         // TODO: This shift is not strictly required since a list array's offsets don't have
         // to start at zero but doing the shift makes testing easier.
         //
-        // Also note, we are implicitly relying on the fact that null spots are filled in
-        // a certain way to do this shift (e.g. even if the first value is null it will still
-        // contain an appropriate starting point for the lengths)
+        // Although, in some cases, the shift IS strictly required since the unshifted offsets
+        // may cross i32::MAX even though the shifted offsets do not
         let offsets = UInt64Array::from(self.offsets);
         let validity = NullBuffer::new(self.validity);
         let validity = if validity.null_count() == 0 {
@@ -635,7 +644,7 @@ impl std::fmt::Debug for IndirectlyLoaded {
     }
 }
 
-/// An encoder for list offsets that "stitches" offsets
+/// An encoder for list offsets that "stitches" offsets and encodes nulls into the offsets
 ///
 /// If we need to encode several list arrays into a single page then we need to "stitch" the offsets
 /// For example, imagine we have list arrays [[0, 1], [2]] and [[3, 4, 5]].
@@ -643,18 +652,27 @@ impl std::fmt::Debug for IndirectlyLoaded {
 /// We will have offset arrays [0, 2, 3] and [0, 3].  We don't want to encode [0, 2, 3, 0, 3].  What
 /// we want is [0, 2, 3, 6]
 ///
-/// This encoder also handles validity by converting a null value into an oversized offset
+/// This encoder also handles validity by converting a null value into an oversized offset.  For example,
+/// if we have four lists with offsets [0, 20, 20, 20, 30] and the list at index 2 is null (note that
+/// the list at index 1 is empty) then we turn this into offsets [0, 20, 20, 51, 30].  We replace a null
+/// offset with previous_offset + max_offset + 1.  This makes it possible to load a single item from the
+/// list array.
 ///
-/// Some times we may accumulate many offsets (enough to form a page) and still fit in u32.  For example,
-/// if each list has 10 items then we will accumulate 8MiB (as an example buffer size) of offset info and
-/// only span about ~80MiB of offset range.  So we can easily use u32.
+/// These offsets are always stored on disk as a u64 array.  First, this is because its simply much more
+/// likely than one expects that this is needed, even if our lists are not massive.  This is because we
+/// only write an offsets page when we have enough data.  This means we will probably accumulate a million
+/// offsets or more before we bother to write a page. If our lists have a few thousand items a piece then
+/// we end up passing the u32::MAX boundary.
 ///
-/// Other times we may span beyond the u64 range with only a few items.  For example, if each list has
-/// 1Mi items then we will go beyond 4GiB with only 4Ki items which will probably easily fit within
-/// our accumulation buffer.
+/// The second reason is that list offsets are very easily compacted with delta + bit packing and so those
+/// u64 offsets should easily be shrunk down before being put on disk.
 ///
-/// As a result, we sometimes create u32 pages and we sometimes create u64 pages.  This could be simplified
-/// in the future once we support bit packing.  Then we can always use bit packed u64 pages.
+/// This encoder can encode both lists and large lists.  It can decode the resulting column into either type
+/// as well. (TODO: Test and enable large lists)
+///
+/// You can even write as a large list and decode as a regular list (as long as no single list has more than
+/// 2^31 items) or vice versa.  You could even encode a mixed stream of list and large list (but unclear that
+/// would ever be useful)
 #[derive(Debug)]
 struct ListOffsetsEncoder {
     // An accumulation queue, we insert both offset arrays and validity arrays into this queue
@@ -775,6 +793,8 @@ impl ListOffsetsEncoder {
         }
     }
 
+    // This is where we do the work to actually shift the offsets and encode nulls
+    // Note that the output is u64 and the input could be i32 OR i64.
     fn extend_offsets_vec_u64(
         dest: &mut Vec<u64>,
         offsets: &dyn Array,
@@ -942,7 +962,8 @@ impl ListFieldEncoder {
 impl FieldEncoder for ListFieldEncoder {
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         // The list may have an offset / shorter length which means the underlying
-        // values array could be longer than what we need to encode
+        // values array could be longer than what we need to encode and so we need
+        // to slice down to the region of interest.
         let items = match array.data_type() {
             DataType::List(_) => {
                 let list_arr = array.as_list::<i32>();
@@ -1048,6 +1069,7 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    #[ignore] // This test is quite slow in debug mode
     async fn test_jumbo_list() {
         // This is an overflow test.  We have a list of lists where each list
         // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
