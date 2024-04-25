@@ -244,7 +244,6 @@ pub fn build_sq_storage(
     let quantizer = lance_index::vector::sq::ScalarQuantizer::with_bounds(
         8,
         dim,
-        MetricType::L2,
         lower_bound..upper_bound,
     );
     let storage = sq::build_sq_storage(MetricType::L2, row_ids, vectors, quantizer)
