@@ -98,7 +98,7 @@ public class Dataset implements Closeable {
    * @param allocator Arrow buffer allocator.
    * @return Dataset
    */
-  public static Dataset open(String path, BufferAllocator allocator) throws IOException {
+  public static Dataset open(String path, BufferAllocator allocator) {
     var dataset = openNative(path);
     dataset.allocator = allocator;
     return dataset;
