@@ -34,7 +34,13 @@ class CompactionMetrics:
     files_added: int
 
 class LanceFileWriter:
-    def __init__(self, path: str, schema: pa.Schema): ...
+    def __init__(
+        self,
+        path: str,
+        schema: pa.Schema,
+        data_cache_bytes: int,
+        keep_original_array: bool,
+    ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...
     def finish(self) -> int: ...
 

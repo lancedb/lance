@@ -6,12 +6,13 @@ use std::sync::Arc;
 
 use lance_core::cache::FileMetadataCache;
 use lance_core::{Error, Result};
+use lance_index::IndexType;
 use snafu::{location, Location};
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::index::cache::IndexCache;
 
-use self::index_extension::VectorIndexExtension;
+use self::index_extension::IndexExtension;
 
 pub mod index_extension;
 
@@ -24,7 +25,7 @@ pub struct Session {
     /// Cache for file metadata
     pub(crate) file_metadata_cache: FileMetadataCache,
 
-    pub(crate) vector_index_extensions: HashMap<String, Arc<dyn VectorIndexExtension>>,
+    pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -43,22 +44,52 @@ impl Session {
         Self {
             index_cache: IndexCache::new(index_cache_size),
             file_metadata_cache: FileMetadataCache::new(metadata_cache_size),
-            vector_index_extensions: HashMap::new(),
+            index_extensions: HashMap::new(),
         }
     }
 
-    pub fn register_vector_index_extension(
+    /// Register a new index extension.
+    ///
+    /// A name can only be registered once per type of index extension.
+    ///
+    /// Parameters:
+    ///
+    /// - ***name***: the name of the extension.
+    /// - ***extension***: the extension to register.
+    pub fn register_index_extension(
         &mut self,
         name: String,
-        extension: Arc<dyn VectorIndexExtension>,
+        extension: Arc<dyn IndexExtension>,
     ) -> Result<()> {
-        if self.vector_index_extensions.contains_key(&name) {
-            return Err(Error::invalid_input(
-                format!("{name} is already registered"),
-                location!(),
-            ));
+        match extension.index_type() {
+            IndexType::Scalar => {
+                return Err(Error::invalid_input(
+                    "scalar index extension is not support yet".to_string(),
+                    location!(),
+                ));
+            }
+            IndexType::Vector => {
+                if self
+                    .index_extensions
+                    .contains_key(&(IndexType::Vector, name.clone()))
+                {
+                    return Err(Error::invalid_input(
+                        format!("{name} is already registered"),
+                        location!(),
+                    ));
+                }
+
+                if let Some(ext) = extension.to_vector() {
+                    self.index_extensions
+                        .insert((IndexType::Vector, name), ext.to_generic());
+                } else {
+                    return Err(Error::invalid_input(
+                        format!("{name} is not a vector index extension"),
+                        location!(),
+                    ));
+                }
+            }
         }
-        self.vector_index_extensions.insert(name, extension);
 
         Ok(())
     }
@@ -69,7 +100,7 @@ impl Default for Session {
         Self {
             index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
             file_metadata_cache: FileMetadataCache::new(DEFAULT_METADATA_CACHE_SIZE),
-            vector_index_extensions: HashMap::new(),
+            index_extensions: HashMap::new(),
         }
     }
 }

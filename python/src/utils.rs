@@ -241,12 +241,8 @@ pub fn build_sq_storage(
 
     let lower_bound = bounds.get_item(0)?.extract::<f64>()?;
     let upper_bound = bounds.get_item(1)?.extract::<f64>()?;
-    let quantizer = lance_index::vector::sq::ScalarQuantizer::with_bounds(
-        8,
-        dim,
-        MetricType::L2,
-        lower_bound..upper_bound,
-    );
+    let quantizer =
+        lance_index::vector::sq::ScalarQuantizer::with_bounds(8, dim, lower_bound..upper_bound);
     let storage = sq::build_sq_storage(MetricType::L2, row_ids, vectors, quantizer)
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
     storage.batch().clone().to_pyarrow(py)

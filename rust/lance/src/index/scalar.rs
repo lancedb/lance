@@ -9,11 +9,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
-use lance_index::scalar::{
-    btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
-    flat::FlatIndexMetadata,
-    lance_format::LanceIndexStore,
-    ScalarIndex,
+use lance_index::{
+    scalar::{
+        btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+        flat::FlatIndexMetadata,
+        lance_format::LanceIndexStore,
+        ScalarIndex,
+    },
+    IndexType,
 };
 use snafu::{location, Location};
 use tracing::instrument;
@@ -24,12 +27,22 @@ use crate::{dataset::scanner::ColumnOrdering, Dataset};
 
 use super::IndexParams;
 
+pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
+
 #[derive(Default)]
 pub struct ScalarIndexParams {}
 
 impl IndexParams for ScalarIndexParams {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Scalar
+    }
+
+    fn index_name(&self) -> &str {
+        LANCE_SCALAR_INDEX
     }
 }
 

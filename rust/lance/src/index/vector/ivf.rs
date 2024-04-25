@@ -29,7 +29,10 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::vector::quantizer::{QuantizationMetadata, Quantizer};
+use lance_index::vector::{
+    graph::VectorStorage,
+    quantizer::{Quantization, QuantizationMetadata, Quantizer},
+};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
@@ -50,7 +53,6 @@ use lance_index::{
 use lance_io::{
     encodings::plain::PlainEncoder,
     local::to_local_path,
-    object_store::ObjectStore,
     object_writer::ObjectWriter,
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
@@ -70,7 +72,10 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
+use self::io::write_hnsw_quantization_index_partitions;
+
 use super::{
+    hnsw::HNSWIndex,
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
     VectorIndex,
@@ -237,9 +242,7 @@ impl std::fmt::Debug for IVFIndex {
 ///
 /// Returns (new_uuid, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
-    object_store: &ObjectStore,
-    index_dir: &Path,
-    dataset_version: u64,
+    dataset: &Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
@@ -254,8 +257,12 @@ pub(crate) async fn optimize_vector_indices(
     }
 
     let new_uuid = Uuid::new_v4();
-    let index_file = index_dir.child(new_uuid.to_string()).child(INDEX_FILE_NAME);
-    let mut writer = object_store.create(&index_file).await?;
+    let object_store = dataset.object_store();
+    let index_file = dataset
+        .indices_dir()
+        .child(new_uuid.to_string())
+        .child(INDEX_FILE_NAME);
+    let writer = object_store.create(&index_file).await?;
 
     let first_idx = existing_indices[0]
         .as_any()
@@ -265,14 +272,61 @@ pub(crate) async fn optimize_vector_indices(
             location: location!(),
         })?;
 
-    let pq_index = first_idx
+    let merged = if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
+        optimize_ivf_pq_indices(
+            first_idx,
+            pq_index,
+            vector_column,
+            unindexed,
+            existing_indices,
+            options,
+            writer,
+            dataset.version().version,
+        )
+        .await?
+    } else if let Some(hnsw_sq) = first_idx
         .sub_index
         .as_any()
-        .downcast_ref::<PQIndex>()
-        .ok_or(Error::Index {
-            message: "optimizing vector index: it is not a IVF_PQ index".to_string(),
+        .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
+    {
+        let aux_file = dataset
+            .indices_dir()
+            .child(new_uuid.to_string())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        let aux_writer = object_store.create(&aux_file).await?;
+        optimize_ivf_hnsw_indices(
+            dataset,
+            first_idx,
+            hnsw_sq,
+            vector_column,
+            unindexed,
+            existing_indices,
+            options,
+            writer,
+            aux_writer,
+        )
+        .await?
+    } else {
+        return Err(Error::Index {
+            message: "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
             location: location!(),
-        })?;
+        });
+    };
+
+    Ok((new_uuid, merged))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn optimize_ivf_pq_indices(
+    first_idx: &IVFIndex,
+    pq_index: &PQIndex,
+    vector_column: &str,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    existing_indices: &[Arc<dyn Index>],
+    options: &OptimizeOptions,
+    mut writer: ObjectWriter,
+    dataset_version: u64,
+) -> Result<usize> {
     let metric_type = first_idx.metric_type;
     let dim = first_idx.ivf.dimension();
 
@@ -342,7 +396,176 @@ pub(crate) async fn optimize_vector_indices(
     writer.write_magics(pos, 0, 1, MAGIC).await?;
     writer.shutdown().await?;
 
-    Ok((new_uuid, existing_indices.len() - start_pos))
+    Ok(existing_indices.len() - start_pos)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn optimize_ivf_hnsw_indices<Q: Quantization>(
+    dataset: &Dataset,
+    first_idx: &IVFIndex,
+    hnsw_index: &HNSWIndex<Q>,
+    vector_column: &str,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    existing_indices: &[Arc<dyn Index>],
+    options: &OptimizeOptions,
+    writer: ObjectWriter,
+    aux_writer: ObjectWriter,
+) -> Result<usize> {
+    let distance_type = first_idx.metric_type;
+    let quantizer = hnsw_index.quantizer().clone();
+    let ivf = lance_index::vector::ivf::new_ivf_with_quantizer(
+        first_idx.ivf.centroids.values(),
+        first_idx.ivf.dimension(),
+        distance_type,
+        vector_column,
+        quantizer.clone(),
+        None,
+    )?;
+
+    // Shuffled un-indexed data with partition.
+    let shuffled = if let Some(stream) = unindexed {
+        Some(
+            shuffle_dataset(
+                stream,
+                vector_column,
+                ivf,
+                None,
+                first_idx.ivf.num_partitions() as u32,
+                quantizer.code_dim(),
+                10000,
+                2,
+                None,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let mut ivf_mut = Ivf::new(first_idx.ivf.centroids.clone());
+
+    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+        0
+    } else {
+        existing_indices.len() - options.num_indices_to_merge
+    };
+
+    let indices_to_merge = existing_indices[start_pos..]
+        .iter()
+        .map(|idx| {
+            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::Index {
+                message: "optimizing vector index: it is not a IVF index".to_string(),
+                location: location!(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Prepare the HNSW writer
+    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
+    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
+    writer.add_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        json!(IndexMetadata {
+            index_type: format!("IVF_HNSW_{}", quantizer.quantization_type()),
+            distance_type: distance_type.to_string(),
+        })
+        .to_string()
+        .as_str(),
+    );
+
+    // Prepare the quantization storage writer
+    let schema = Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        arrow_schema::Field::new(
+            quantizer.column(),
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
+                quantizer.code_dim() as i32,
+            ),
+            false,
+        ),
+    ]);
+    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let mut aux_writer =
+        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+    aux_writer.add_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        json!(IndexMetadata {
+            index_type: quantizer.quantization_type().to_string(),
+            distance_type: distance_type.to_string(),
+        })
+        .to_string()
+        .as_str(),
+    );
+
+    // Write the metadata of quantizer
+    let quantization_metadata = match &quantizer {
+        Quantizer::Product(pq) => {
+            let mat = MatrixView::<Float32Type>::new(
+                Arc::new(
+                    pq.codebook_as_fsl()
+                        .values()
+                        .as_primitive::<Float32Type>()
+                        .clone(),
+                ),
+                pq.dimension(),
+            );
+            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_pos = aux_writer.tell().await?;
+            aux_writer
+                .object_writer
+                .write_protobuf(&codebook_tensor)
+                .await?;
+
+            Some(QuantizationMetadata {
+                codebook_position: Some(codebook_pos),
+                ..Default::default()
+            })
+        }
+        Quantizer::Scalar(_) => None,
+    };
+
+    aux_writer.add_metadata(
+        quantizer.metadata_key(),
+        quantizer
+            .metadata(quantization_metadata)?
+            .to_string()
+            .as_str(),
+    );
+
+    let hnsw_params = &hnsw_index.metadata().params;
+    let (hnsw_metadata, aux_ivf) = write_hnsw_quantization_index_partitions(
+        dataset,
+        vector_column,
+        distance_type,
+        hnsw_params,
+        &mut writer,
+        Some(&mut aux_writer),
+        &mut ivf_mut,
+        quantizer,
+        shuffled,
+        Some(&indices_to_merge),
+    )
+    .await?;
+
+    // Add the metadata of HNSW partitions
+    let hnsw_metadata_json = json!(hnsw_metadata);
+    writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
+
+    // Convert ['Ivf'] to [`IvfData`] for new index format
+    let mut ivf_data = IvfData::with_centroids(ivf_mut.centroids.clone());
+    for length in ivf_mut.lengths {
+        ivf_data.add_partition(length);
+    }
+    ivf_data.write(&mut writer).await?;
+    writer.finish().await?;
+
+    // Write the aux file
+    aux_ivf.write(&mut aux_writer).await?;
+    aux_writer.finish().await?;
+
+    Ok(existing_indices.len() - start_pos)
 }
 
 #[derive(Serialize)]
@@ -504,6 +727,10 @@ impl VectorIndex for IVFIndex {
             message: "Flat index does not support load".to_string(),
             location: location!(),
         })
+    }
+
+    fn storage(&self) -> &dyn VectorStorage {
+        todo!("this method is for only IVF_HNSW_* index");
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
@@ -2471,10 +2698,11 @@ mod tests {
         let ivf_params =
             IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
 
+        let distance_type = MetricType::L2;
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::L2,
+            distance_type,
             ivf_params,
             hnsw_params,
             sq_params,
