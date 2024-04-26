@@ -428,10 +428,15 @@ impl DecodeBatchScheduler {
                                 offsets_column_buffers,
                             ))
                                 as Box<dyn LogicalPageScheduler>;
-                            let mut num_items = list_encoding.first_invalid_offset;
                             let mut items_schedulers = Vec::new();
+                            let mut num_items = list_encoding.num_items;
                             while num_items > 0 {
                                 let next_items_page = items.next().unwrap();
+                                println!(
+                                    "num_items = {} and next_items_page.num_rows() = {}",
+                                    num_items,
+                                    next_items_page.num_rows() as u64
+                                );
                                 num_items -= next_items_page.num_rows() as u64;
                                 items_schedulers.push(next_items_page);
                             }
@@ -440,7 +445,7 @@ impl DecodeBatchScheduler {
                                 items_schedulers,
                                 items_field.data_type().clone(),
                                 DataType::Int32,
-                                list_encoding.first_invalid_offset,
+                                list_encoding.null_offset_adjustment,
                             )) as Box<dyn LogicalPageScheduler>
                         } else {
                             // TODO: Should probably return Err here

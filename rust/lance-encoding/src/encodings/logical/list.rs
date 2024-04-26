@@ -56,7 +56,7 @@ pub struct ListPageScheduler {
     items_schedulers: Arc<Vec<Box<dyn LogicalPageScheduler>>>,
     items_type: DataType,
     offset_type: DataType,
-    last_valid_offset: u64,
+    null_offset_adjustment: u64,
 }
 
 impl ListPageScheduler {
@@ -67,7 +67,7 @@ impl ListPageScheduler {
         items_type: DataType,
         // Should be int32 or int64
         offset_type: DataType,
-        last_valid_offset: u64,
+        null_offset_adjustment: u64,
     ) -> Self {
         match &offset_type {
             DataType::Int32 | DataType::Int64 => {}
@@ -78,7 +78,7 @@ impl ListPageScheduler {
             items_schedulers: Arc::new(items_schedulers),
             items_type,
             offset_type,
-            last_valid_offset,
+            null_offset_adjustment,
         }
     }
 
@@ -97,13 +97,14 @@ impl ListPageScheduler {
     /// The user requests the following ranges of lists: [0..3, 5..6]
     ///
     /// This is a total of 4 lists.  The loaded offsets are [10, 20, 120, 150, 60].  The last valid offset is 99.
+    /// The null_offset_adjustment will be 100.
     ///
     /// Our desired output offsets are going to be [0, 10, 20, 20, 30] and the item ranges are [0..20] and [50..60]
     /// The validity array is [true, true, false, true]
     fn decode_offsets(
         offsets: &dyn Array,
         offset_ranges: &[Range<u32>],
-        last_valid_offset: u64,
+        null_offset_adjustment: u64,
     ) -> (VecDeque<Range<u64>>, Vec<u64>, BooleanBuffer) {
         // In our example this is [10, 20, 120, 50, 60]
         let numeric_offsets = offsets.as_primitive::<UInt64Type>();
@@ -137,34 +138,24 @@ impl ListPageScheduler {
                 let first_offset_idx = 0_usize;
                 let num_offsets = num_lists as usize;
                 let items_start = 0;
-                let mut items_end = offsets_values[num_offsets - 1];
-                // Repair any null value
-                if items_end > last_valid_offset {
-                    items_end = items_end - last_valid_offset - 1;
-                }
+                let items_end = offsets_values[num_offsets - 1] % null_offset_adjustment;
                 let items_range = items_start..items_end;
-
                 (items_range, first_offset_idx, num_offsets)
             } else {
                 // In our example, offsets_offset will be 3, items_start will be 50, and items_end will
                 // be 60
                 let first_offset_idx = offsets_offset as usize;
                 let num_offsets = num_lists as usize + 1;
-                let mut items_start = offsets_values[first_offset_idx];
-                if items_start > last_valid_offset {
-                    items_start = items_start - last_valid_offset - 1;
-                }
-                let mut items_end = offsets_values[first_offset_idx + num_offsets - 1];
-                if items_end > last_valid_offset {
-                    items_end = items_end - last_valid_offset - 1;
-                }
+                let items_start = offsets_values[first_offset_idx] % null_offset_adjustment;
+                let items_end =
+                    offsets_values[first_offset_idx + num_offsets - 1] % null_offset_adjustment;
                 let items_range = items_start..items_end;
                 (items_range, first_offset_idx, num_offsets)
             };
 
             // TODO: Maybe consider writing whether there are nulls or not as part of the
-            // page description.  Then we can skip all validity work (and all these if branches
-            // comparing with last_valid_offset) when there are no nulls.
+            // page description.  Then we can skip all validity work.  Not clear if that will
+            // be any benefit though.
 
             // We calculate validity from all elements but the first (or all elements
             // if this is the special zero-start case)
@@ -183,43 +174,29 @@ impl ListPageScheduler {
                 .slice(validity_start, num_lists as usize)
                 .iter()
             {
-                validity_buffer.append(*off <= last_valid_offset);
+                validity_buffer.append(*off < null_offset_adjustment);
             }
 
             // In our special case we need to account for the offset 0-first_item
             if range.start == 0 {
-                let first_item = offsets_values[0];
-                if first_item > last_valid_offset {
-                    let normalized = first_item - last_valid_offset - 1;
-                    normalized_offsets.push(normalized);
-                    last_normalized_offset = normalized;
-                } else {
-                    normalized_offsets.push(first_item);
-                    last_normalized_offset = first_item;
-                }
+                let first_item = offsets_values[0] % null_offset_adjustment;
+                normalized_offsets.push(first_item);
+                last_normalized_offset = first_item;
             }
 
             // Finally, we go through and shift the offsets.  If we just returned them as is (taking care of
-            // nulls) we would get [0, 10, 20, 20, 60] but our last list only has 10 items, not 40.
+            // nulls) we would get [0, 10, 20, 20, 60] but our last list only has 10 items, not 40 and so we
+            // need to shift that 60 to a 40.
             normalized_offsets.extend(
                 offsets_values
                     .slice(offsets_to_norm_start, num_offsets_to_norm)
                     .windows(2)
                     .map(|w| {
-                        let start = if w[0] > last_valid_offset {
-                            w[0] - last_valid_offset - 1
-                        } else {
-                            w[0]
-                        };
-                        let end = if w[1] > last_valid_offset {
-                            w[1] - last_valid_offset - 1
-                        } else {
-                            w[1]
-                        };
+                        let start = w[0] % null_offset_adjustment;
+                        let end = w[1] % null_offset_adjustment;
                         if end < start {
-                            panic!("End is less than start in window {:?} with last_valid_offset={} we get start={} and end={}", w, last_valid_offset, start, end);
+                            panic!("End is less than start in window {:?} with null_offset_adjustment={} we get start={} and end={}", w, null_offset_adjustment, start, end);
                         }
-                        debug_assert!(end >= start);
                         let length = end - start;
                         last_normalized_offset += length;
                         last_normalized_offset
@@ -270,7 +247,7 @@ impl LogicalPageScheduler for ListPageScheduler {
             .iter()
             .map(|range| range.end - range.start)
             .sum();
-        let last_valid_offset = self.last_valid_offset;
+        let null_offset_adjustment = self.null_offset_adjustment;
         trace!("Scheduling list offsets ranges: {:?}", offsets_ranges);
         // Create a channel for the internal schedule / decode loop that is unique
         // to this page.
@@ -295,8 +272,9 @@ impl LogicalPageScheduler for ListPageScheduler {
             let decode_task = scheduled_offsets.drain(num_offsets)?;
             let offsets = decode_task.task.decode()?;
 
+            println!("Decoding offsets: {:?}", offsets);
             let (mut item_ranges, offsets, validity) =
-                Self::decode_offsets(offsets.as_ref(), &ranges, last_valid_offset);
+                Self::decode_offsets(offsets.as_ref(), &ranges, null_offset_adjustment);
             let (tx, mut rx) = mpsc::unbounded_channel();
 
             trace!(
@@ -307,6 +285,7 @@ impl LogicalPageScheduler for ListPageScheduler {
 
             // This can happen, for example, when there are only empty lists
             if items_schedulers.is_empty() {
+                println!("{:?}", item_ranges);
                 debug_assert!(item_ranges.iter().all(|r| r.start == r.end));
                 return Ok(IndirectlyLoaded {
                     item_decoders: Vec::new(),
@@ -727,8 +706,8 @@ impl ListOffsetsEncoder {
     fn make_encode_task(&self, arrays: Vec<ArrayRef>) -> EncodeTask {
         let inner_encoder = self.inner_encoder.clone();
         let column_idx = self.column_index;
-        // At this point we should have 2*N arrays where the 0, 2, ... arrays are integer offsets
-        // and the 1, 3, ... arrays are boolean
+        // At this point we should have 2*N arrays where the even-indexed arrays are integer offsets
+        // and the odd-indexed arrays are boolean validity bitmaps
         let offset_arrays = arrays.iter().step_by(2).cloned().collect::<Vec<_>>();
         let validity_arrays = arrays.into_iter().skip(1).step_by(2).collect::<Vec<_>>();
 
@@ -799,13 +778,18 @@ impl ListOffsetsEncoder {
         dest: &mut Vec<u64>,
         offsets: &dyn Array,
         validity: Option<&BooleanArray>,
+        // The offset of this list into the destination
         base: u64,
-        end: u64,
+        null_offset_adjustment: u64,
     ) {
         match offsets.data_type() {
             DataType::Int32 => {
                 let offsets_i32 = offsets.as_primitive::<Int32Type>();
                 let start = offsets_i32.value(0) as u64;
+                // If we want to take a list from start..X and change it into
+                // a list from end..X then we need to add (base - start) to all elements
+                // Note that `modifier` may be negative but (item + modifier) will always be >= 0
+                let modifier = base as i64 - start as i64;
                 if let Some(validity) = validity {
                     dest.extend(
                         offsets_i32
@@ -814,8 +798,8 @@ impl ListOffsetsEncoder {
                             .skip(1)
                             .zip(validity.values().iter())
                             .map(|(&off, valid)| {
-                                let end = if valid { 0 } else { end + 1 };
-                                off as u64 - start + base + end
+                                (off as i64 + modifier) as u64
+                                    + (!valid as u64 * null_offset_adjustment)
                             }),
                     );
                 } else {
@@ -824,13 +808,18 @@ impl ListOffsetsEncoder {
                             .values()
                             .iter()
                             .skip(1)
-                            .map(|&v| v as u64 - start + base),
+                            // Subtract by `start` so offsets start at 0
+                            .map(|&v| (v as i64 + modifier) as u64),
                     );
                 }
             }
             DataType::Int64 => {
                 let offsets_i64 = offsets.as_primitive::<Int32Type>();
                 let start = offsets_i64.value(0) as u64;
+                // If we want to take a list from start..X and change it into
+                // a list from end..X then we need to add (base - start) to all elements
+                // Note that `modifier` may be negative but (item + modifier) will always be >= 0
+                let modifier = (base - start) as i64;
                 if let Some(validity) = validity {
                     dest.extend(
                         offsets_i64
@@ -839,8 +828,8 @@ impl ListOffsetsEncoder {
                             .skip(1)
                             .zip(validity.values().iter())
                             .map(|(&off, valid)| {
-                                let end = if valid { 0 } else { end + 1 };
-                                off as u64 - start + base + end
+                                (off as i64 + modifier) as u64
+                                    + (!valid as u64 * null_offset_adjustment)
                             }),
                     )
                 } else {
@@ -849,7 +838,7 @@ impl ListOffsetsEncoder {
                             .values()
                             .iter()
                             .skip(1)
-                            .map(|&v| v as u64 - start + base),
+                            .map(|&v| (v as i64 + modifier) as u64),
                     );
                 }
             }
@@ -861,22 +850,19 @@ impl ListOffsetsEncoder {
         offset_arrays: Vec<ArrayRef>,
         validity: Vec<Option<&BooleanArray>>,
         num_offsets: u32,
-        total_span: u64,
+        null_offset_adjustment: u64,
         buffer_index: &mut u32,
         inner_encoder: Arc<dyn ArrayEncoder>,
     ) -> Result<EncodedArray> {
         let mut offsets = Vec::with_capacity(num_offsets as usize);
         for (offsets_arr, validity_arr) in offset_arrays.iter().zip(validity) {
-            let mut last_prev_offset = offsets.last().copied().unwrap_or(0);
-            if last_prev_offset > total_span {
-                last_prev_offset = last_prev_offset - total_span - 1;
-            }
+            let last_prev_offset = offsets.last().copied().unwrap_or(0) % null_offset_adjustment;
             Self::extend_offsets_vec_u64(
                 &mut offsets,
                 &offsets_arr,
                 validity_arr,
                 last_prev_offset,
-                total_span,
+                null_offset_adjustment,
             );
         }
         inner_encoder.encode(&[Arc::new(UInt64Array::from(offsets))], buffer_index)
@@ -904,11 +890,13 @@ impl ListOffsetsEncoder {
             .iter()
             .map(|arr| Self::get_offset_span(arr.as_ref()))
             .sum::<u64>();
+        // See encodings.proto for reasoning behind this value
+        let null_offset_adjustment = total_span + 1;
         let encoded_offsets = Self::do_encode_u64(
             offset_arrays,
             validity_arrays,
             num_offsets,
-            total_span,
+            null_offset_adjustment,
             buffer_index,
             inner_encoder,
         )?;
@@ -918,7 +906,8 @@ impl ListOffsetsEncoder {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::List(Box::new(
                     pb::List {
                         offsets: Some(Box::new(encoded_offsets.encoding)),
-                        first_invalid_offset: total_span,
+                        null_offset_adjustment,
+                        num_items: total_span,
                     },
                 ))),
             },
@@ -949,11 +938,11 @@ impl ListFieldEncoder {
     }
 
     fn combine_tasks(
-        offsets_tasks: Result<Vec<EncodeTask>>,
-        item_tasks: Result<Vec<EncodeTask>>,
+        offsets_tasks: Vec<EncodeTask>,
+        item_tasks: Vec<EncodeTask>,
     ) -> Result<Vec<EncodeTask>> {
-        let mut all_tasks = offsets_tasks?;
-        let item_tasks = item_tasks?;
+        let mut all_tasks = offsets_tasks;
+        let item_tasks = item_tasks;
         all_tasks.extend(item_tasks);
         Ok(all_tasks)
     }
@@ -988,9 +977,17 @@ impl FieldEncoder for ListFieldEncoder {
         let offsets_tasks = self
             .offsets_encoder
             .maybe_encode_offsets_and_validity(array.as_ref())
-            .map(|task| Ok(vec![task]))
-            .unwrap_or_else(|| Ok(Vec::default()));
-        let item_tasks = self.items_encoder.maybe_encode(items);
+            .map(|task| vec![task])
+            .unwrap_or_else(|| Vec::default());
+        let mut item_tasks = self.items_encoder.maybe_encode(items)?;
+        if !offsets_tasks.is_empty() && item_tasks.is_empty() {
+            // An items page cannot currently be shared by two different offsets pages.  This is
+            // a limitation in the current scheduler and could be addressed in the future.  As a result
+            // we always need to encode the items page if we encode the offsets page.
+            //
+            // In practice this isn't usually too bad unless we are targetting very small pages.
+            item_tasks = self.items_encoder.flush()?;
+        }
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
@@ -998,9 +995,9 @@ impl FieldEncoder for ListFieldEncoder {
         let offsets_tasks = self
             .offsets_encoder
             .flush()
-            .map(|task| Ok(vec![task]))
-            .unwrap_or_else(|| Ok(Vec::default()));
-        let item_tasks = self.items_encoder.flush();
+            .map(|task| vec![task])
+            .unwrap_or_else(|| Vec::default());
+        let item_tasks = self.items_encoder.flush()?;
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
