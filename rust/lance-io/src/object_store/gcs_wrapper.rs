@@ -18,9 +18,10 @@ use object_store::gcp::GoogleCloudStorage;
 use object_store::multipart::{MultiPartStore, PartId};
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore, PutOptions, PutResult,
-    Result as OSResult,
+    Error as OSError, GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore,
+    PutOptions, PutResult, Result as OSResult,
 };
+use rand::Rng;
 use tokio::io::AsyncWrite;
 
 /// Wrapper around GoogleCloudStorage with a larger maximum upload size.
@@ -118,7 +119,9 @@ enum UploadState {
     InProgress {
         multipart_id: Arc<MultipartId>,
         part_idx: u16,
-        futures: FuturesUnordered<BoxFuture<'static, OSResult<(u16, PartId)>>>,
+        futures: FuturesUnordered<
+            BoxFuture<'static, std::result::Result<(u16, PartId), UploadPutError>>,
+        >,
         part_ids: Vec<Option<PartId>>,
     },
     PuttingSingle(BoxFuture<'static, OSResult<()>>),
@@ -134,6 +137,7 @@ struct Upload {
     path: Arc<Path>,
     buffer: Vec<u8>,
     state: UploadState,
+    connection_resets: u16,
 }
 
 impl Upload {
@@ -143,6 +147,7 @@ impl Upload {
             path: Arc::new(path),
             buffer: Vec::with_capacity(INITIAL_UPLOAD_SIZE),
             state: UploadState::Pending,
+            connection_resets: 0,
         })
     }
 
@@ -152,7 +157,7 @@ impl Upload {
         buffer: &mut Vec<u8>,
         part_idx: &mut u16,
         multipart_id: &Arc<MultipartId>,
-    ) -> BoxFuture<'static, OSResult<(u16, PartId)>> {
+    ) -> BoxFuture<'static, std::result::Result<(u16, PartId), UploadPutError>> {
         // Increase the upload size every 100 parts. This gives maximum part size of 2.5TB.
         let new_capacity = ((*part_idx / 100) as usize + 1) * INITIAL_UPLOAD_SIZE;
         let new_buffer = Vec::with_capacity(new_capacity);
@@ -164,16 +169,42 @@ impl Upload {
         let store = store.clone();
         let multipart_id = multipart_id.clone();
         let path = path.clone();
+        Self::put_part(
+            path.clone(),
+            store.clone(),
+            part,
+            part_idx_clone,
+            multipart_id.clone(),
+            None,
+        )
+    }
+
+    fn put_part(
+        path: Arc<Path>,
+        store: Arc<GoogleCloudStorage>,
+        buffer: Bytes,
+        part_idx: u16,
+        multipart_id: Arc<MultipartId>,
+        sleep: Option<std::time::Duration>,
+    ) -> BoxFuture<'static, std::result::Result<(u16, PartId), UploadPutError>> {
         Box::pin(async move {
+            if let Some(sleep) = sleep {
+                tokio::time::sleep(sleep).await;
+            }
             let part_id = store
                 .put_part(
                     path.as_ref(),
                     multipart_id.as_ref(),
-                    part_idx_clone as usize,
-                    part,
+                    part_idx as usize,
+                    buffer.clone(),
                 )
-                .await?;
-            Ok((part_idx_clone, part_id))
+                .await
+                .map_err(|source| UploadPutError {
+                    part_idx,
+                    buffer,
+                    source,
+                })?;
+            Ok((part_idx, part_id))
         })
     }
 
@@ -211,13 +242,43 @@ impl Upload {
                     Poll::Pending => break,
                 },
                 UploadState::InProgress {
-                    futures, part_ids, ..
+                    futures,
+                    part_ids,
+                    multipart_id,
+                    ..
                 } => {
                     while let Poll::Ready(Some(res)) = futures.poll_next_unpin(cx) {
-                        let (part_idx, part_id) = res?;
-                        let total_parts = part_ids.len();
-                        part_ids.resize(total_parts.max(part_idx as usize + 1), None);
-                        part_ids[part_idx as usize] = Some(part_id);
+                        match res {
+                            Ok((part_idx, part_id)) => {
+                                let total_parts = part_ids.len();
+                                part_ids.resize(total_parts.max(part_idx as usize + 1), None);
+                                part_ids[part_idx as usize] = Some(part_id);
+                            }
+                            Err(UploadPutError {
+                                source: OSError::Generic { source, .. },
+                                part_idx,
+                                buffer,
+                            }) if source.to_string().contains("Connection reset by peer")
+                                && mut_self.connection_resets < 20 =>
+                            {
+                                // Retry, but only up to 20 of them.
+                                mut_self.connection_resets += 1;
+
+                                // Resubmit with random jitter
+                                let sleep_time_ms = rand::thread_rng().gen_range(2_000..8_000);
+                                let sleep_time = std::time::Duration::from_millis(sleep_time_ms);
+
+                                futures.push(Self::put_part(
+                                    mut_self.path.clone(),
+                                    mut_self.store.clone(),
+                                    buffer,
+                                    part_idx,
+                                    multipart_id.clone(),
+                                    Some(sleep_time),
+                                ));
+                            }
+                            Err(err) => return Err(err.source.into()),
+                        }
                     }
                     break;
                 }
@@ -386,4 +447,12 @@ impl AsyncWrite for Upload {
             }
         }
     }
+}
+
+/// Returned error from trying to upload a part.
+/// Has the part_idx and buffer so we can
+struct UploadPutError {
+    part_idx: u16,
+    buffer: Bytes,
+    source: OSError,
 }
