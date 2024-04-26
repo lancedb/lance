@@ -14,13 +14,15 @@
 
 package com.lancedb.lance;
 
+import java.io.Serializable;
 import org.json.JSONObject;
 
 /**
  * Metadata of a Fragment in the dataset. 
  * Matching to lance Fragment.
  * */
-public class FragmentMetadata {
+public class FragmentMetadata implements Serializable {
+  private static final long serialVersionUID = -5886811251944130460L;
   private static final String ID_KEY = "id";
   private static final String PHYSICAL_ROWS_KEY = "physical_rows";
   private final String jsonMetadata;

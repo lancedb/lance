@@ -36,6 +36,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -59,21 +60,22 @@ public class TestUtils {
       return schema;
     }
     
-    public void createEmptyDataset() {
-      try (Dataset dataset = Dataset.create(allocator, datasetPath,
-          schema, new WriteParams.Builder().build())) {
-        assertEquals(0, dataset.countRows());
-        assertEquals(schema, dataset.getSchema());
-        var fragments = dataset.getFragments();
-        assertEquals(0, fragments.size());
-      }
+    public Dataset createEmptyDataset() {
+      Dataset dataset = Dataset.create(allocator, datasetPath,
+        schema, new WriteParams.Builder().build());
+      assertEquals(0, dataset.countRows());
+      assertEquals(schema, dataset.getSchema());
+      var fragments = dataset.getFragments();
+      assertEquals(0, fragments.size());
+      assertEquals(1, dataset.version());
+      assertEquals(1, dataset.latestVersion());
+      return dataset;
     }
 
     public FragmentMetadata createNewFragment(int fragmentId, int rowCount) {
       FragmentMetadata fragmentMeta;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
         root.allocateNew();
-        // Fill data
         VarCharVector nameVector = (VarCharVector) root.getVector("name");
         IntVector ageVector = (IntVector) root.getVector("age");
         for (int i = 0; i < rowCount; i++) {
@@ -90,6 +92,12 @@ public class TestUtils {
         assertEquals(rowCount, fragmentMeta.getPhysicalRows());
       }
       return fragmentMeta;
+    }
+
+    public Dataset write(long version, int rowCount) {
+      FragmentMetadata metadata = createNewFragment(rowCount, rowCount);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(metadata));
+      return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
     }
   }
 
@@ -127,14 +135,18 @@ public class TestUtils {
           assertEquals(ROW_COUNT, dataset.countRows());
           schema = reader.getVectorSchemaRoot().getSchema();
           validateFragments(dataset);
+          assertEquals(1, dataset.version());
+          assertEquals(1, dataset.latestVersion());
         }
       }
     }
 
     public void openDatasetAndValidate() throws IOException {
-      try (Dataset datasetRead = Dataset.open(datasetPath, allocator)) {
-        assertEquals(ROW_COUNT, datasetRead.countRows());
-        validateFragments(datasetRead);
+      try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
+        assertEquals(ROW_COUNT, dataset.countRows());
+        validateFragments(dataset);
       }
     }
 

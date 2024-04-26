@@ -40,6 +40,7 @@ fn fragment_count_rows(dataset: &BlockingDataset, fragment_id: jlong) -> Result<
     let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
         return Err(Error::InvalidArgument {
             message: format!("Fragment not found: {}", fragment_id),
+            location: location!(),
         });
     };
     Ok(RT.block_on(fragment.count_rows())? as jint)
@@ -69,6 +70,7 @@ impl FragmentScanner {
                 .project(&columns)
                 .map_err(|e| Error::InvalidArgument {
                     message: format!("Failed to select columns: {}", e),
+                    location: location!(),
                 })?
         } else {
             schema.clone()
