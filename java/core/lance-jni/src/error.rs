@@ -17,7 +17,7 @@ use std::str::Utf8Error;
 use arrow_schema::ArrowError;
 use jni::errors::Error as JniError;
 use serde_json::Error as JsonError;
-use snafu::{location, Location, Snafu};
+use snafu::{Location, Snafu};
 
 /// Java Exception types
 pub enum JavaException {
@@ -39,24 +39,24 @@ impl JavaException {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("JNI error: {}", message))]
-    Jni { message: String },
-    #[snafu(display("Invalid argument: {}, location: {}", message, location))]
+    #[snafu(display("JNI error: {message}, {location}"))]
+    Jni { message: String, location: Location },
+    #[snafu(display("Invalid argument: {message}, {location}"))]
     InvalidArgument { message: String, location: Location },
-    #[snafu(display("IO error: {}, location: {}", message, location))]
+    #[snafu(display("IO error: {message}, {location}"))]
     IO { message: String, location: Location },
-    #[snafu(display("Arrow error: {}", message))]
+    #[snafu(display("Arrow error: {message}, {location}"))]
     Arrow { message: String, location: Location },
-    #[snafu(display("Index error: {}, location", message))]
+    #[snafu(display("Index error: {message}, {location}"))]
     Index { message: String, location: Location },
-    #[snafu(display("JSON error: {}, location: {}", message, location))]
+    #[snafu(display("JSON error: {message}, {location}"))]
     JSON { message: String, location: Location },
-    #[snafu(display("Dataset not found error: {}, location {}", path, location))]
+    #[snafu(display("Dataset at path {path} was not found, {location}"))]
     DatasetNotFound { path: String, location: Location },
-    #[snafu(display("Dataset already exists error: {}, location {}", uri, location))]
+    #[snafu(display("Dataset already exists: {uri}, {location}"))]
     DatasetAlreadyExists { uri: String, location: Location },
-    #[snafu(display("Unknown error: {}", message))]
-    Other { message: String },
+    #[snafu(display("Unknown error: {message}, {location}"))]
+    Other { message: String, location: Location },
 }
 
 impl Error {
@@ -85,42 +85,58 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+trait ToSnafuLocation {
+    fn to_snafu_location(&'static self) -> snafu::Location;
+}
+
+impl ToSnafuLocation for std::panic::Location<'static> {
+    fn to_snafu_location(&'static self) -> snafu::Location {
+        snafu::Location::new(self.file(), self.line(), self.column())
+    }
+}
+
 impl From<JniError> for Error {
+    #[track_caller]
     fn from(source: JniError) -> Self {
         Self::Jni {
             message: source.to_string(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<Utf8Error> for Error {
+    #[track_caller]
     fn from(source: Utf8Error) -> Self {
         Self::InvalidArgument {
             message: source.to_string(),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<ArrowError> for Error {
+    #[track_caller]
     fn from(source: ArrowError) -> Self {
         Self::Arrow {
             message: source.to_string(),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<JsonError> for Error {
+    #[track_caller]
     fn from(source: JsonError) -> Self {
         Self::JSON {
             message: source.to_string(),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<lance::Error> for Error {
+    #[track_caller]
     fn from(source: lance::Error) -> Self {
         match source {
             lance::Error::DatasetNotFound {
@@ -140,6 +156,7 @@ impl From<lance::Error> for Error {
             },
             _ => Self::Other {
                 message: source.to_string(),
+                location: std::panic::Location::caller().to_snafu_location(),
             },
         }
     }
