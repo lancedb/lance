@@ -132,6 +132,14 @@ impl object_store::ObjectStore for TracedObjectStore {
         self.target.delete(location).await
     }
 
+    #[instrument(level = "debug", skip_all)]
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OSResult<Path>>,
+    ) -> BoxStream<'a, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
     #[instrument(level = "debug", skip(self))]
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
         self.target.list(prefix)
