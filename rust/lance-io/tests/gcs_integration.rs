@@ -18,6 +18,7 @@ async fn get_store() -> ObjectStore {
         .0
 }
 
+#[ignore = "Must be run manually on GCS"]
 #[tokio::test]
 async fn test_small_upload() {
     let store = get_store().await;
@@ -44,6 +45,7 @@ async fn test_small_upload() {
     store.delete(&path).await.unwrap();
 }
 
+#[ignore = "Must be run manually on GCS"]
 #[tokio::test]
 async fn test_large_upload() {
     let store = get_store().await;
