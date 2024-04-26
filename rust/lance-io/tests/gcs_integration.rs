@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-//! These integration tests can be run against a real GCS bucket.
+//! These integration tests can only be run against a real GCS bucket.  
 //! They do not work against any local emulator right now.
 #![cfg(feature = "gcs-test")]
 
@@ -75,7 +75,7 @@ async fn test_large_upload() {
         .await
         .unwrap();
 
-    // Write a 40MB buffers
+    // Write a 40MB buffer
     writer
         .write_all(&vec![b'e'; 40 * 1024 * 1024])
         .await

@@ -24,6 +24,8 @@ use object_store::{
 use rand::Rng;
 use tokio::io::AsyncWrite;
 
+const MAX_UPLOAD_PARALLELISM: usize = 10;
+
 /// Wrapper around GoogleCloudStorage with a larger maximum upload size.
 ///
 /// This will be obsolete once object_store 0.10.0 is released.
@@ -61,8 +63,11 @@ impl ObjectStore for PatchedGoogleCloudStorage {
             .map(|upload| (MultipartId::default(), Box::new(upload) as _))
     }
 
-    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
-        MultiPartStore::abort_multipart(self.0.as_ref(), location, multipart_id).await
+    async fn abort_multipart(&self, _location: &Path, _multipart_id: &MultipartId) -> OSResult<()> {
+        // TODO: Once we fix the API above, we can support this.
+        return Err(OSError::NotSupported {
+            source: "abort_multipart is not supported for Google Cloud Storage".into(),
+        });
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -114,8 +119,12 @@ impl ObjectStore for PatchedGoogleCloudStorage {
 }
 
 enum UploadState {
-    Pending,
+    /// The writer has been opened but no data has been written yet. Will be in
+    /// this state until the buffer is full or the writer is shut down.
+    Started,
+    /// The writer is in the process of creating a multipart upload.
     CreatingUpload(BoxFuture<'static, OSResult<MultipartId>>),
+    /// The writer is in the process of uploading parts.
     InProgress {
         multipart_id: Arc<MultipartId>,
         part_idx: u16,
@@ -124,8 +133,12 @@ enum UploadState {
         >,
         part_ids: Vec<Option<PartId>>,
     },
+    /// The writer is in the process of uploading data in a single PUT request.
+    /// This happens when shutdown is called before the buffer is full.
     PuttingSingle(BoxFuture<'static, OSResult<()>>),
+    /// The writer is in the process of completing the multipart upload.
     Completing(BoxFuture<'static, OSResult<()>>),
+    /// The writer has been shut down and all data has been written.
     Done,
 }
 
@@ -146,37 +159,19 @@ impl Upload {
             store,
             path: Arc::new(path),
             buffer: Vec::with_capacity(INITIAL_UPLOAD_SIZE),
-            state: UploadState::Pending,
+            state: UploadState::Started,
             connection_resets: 0,
         })
     }
 
-    fn put_next_part(
-        path: &Arc<Path>,
-        store: &Arc<GoogleCloudStorage>,
-        buffer: &mut Vec<u8>,
-        part_idx: &mut u16,
-        multipart_id: &Arc<MultipartId>,
-    ) -> BoxFuture<'static, std::result::Result<(u16, PartId), UploadPutError>> {
+    /// Returns the contents of `buffer` as a `Bytes` object and resets `buffer`.
+    /// The new capacity of `buffer` is determined by the current part index.
+    fn next_part_buffer(buffer: &mut Vec<u8>, part_idx: u16) -> Bytes {
         // Increase the upload size every 100 parts. This gives maximum part size of 2.5TB.
-        let new_capacity = ((*part_idx / 100) as usize + 1) * INITIAL_UPLOAD_SIZE;
+        let new_capacity = ((part_idx / 100) as usize + 1) * INITIAL_UPLOAD_SIZE;
         let new_buffer = Vec::with_capacity(new_capacity);
         let part = std::mem::replace(buffer, new_buffer);
-        let part = Bytes::from(part);
-
-        let part_idx_clone = *part_idx;
-        *part_idx += 1;
-        let store = store.clone();
-        let multipart_id = multipart_id.clone();
-        let path = path.clone();
-        Self::put_part(
-            path.clone(),
-            store.clone(),
-            part,
-            part_idx_clone,
-            multipart_id.clone(),
-            None,
-        )
+        Bytes::from(part)
     }
 
     fn put_part(
@@ -215,18 +210,20 @@ impl Upload {
         let mut_self = &mut *self;
         loop {
             match &mut mut_self.state {
-                UploadState::Pending | UploadState::Done => break,
+                UploadState::Started | UploadState::Done => break,
                 UploadState::CreatingUpload(ref mut fut) => match fut.poll_unpin(cx) {
                     Poll::Ready(Ok(multipart_id)) => {
                         let futures = FuturesUnordered::new();
                         let multipart_id = Arc::new(multipart_id);
 
-                        futures.push(Self::put_next_part(
-                            &mut_self.path,
-                            &mut_self.store,
-                            &mut mut_self.buffer,
-                            &mut 0,
-                            &multipart_id,
+                        let data = Self::next_part_buffer(&mut mut_self.buffer, 0);
+                        futures.push(Self::put_part(
+                            mut_self.path.clone(),
+                            mut_self.store.clone(),
+                            data,
+                            0,
+                            multipart_id.clone(),
+                            None,
                         ));
 
                         mut_self.state = UploadState::InProgress {
@@ -258,7 +255,10 @@ impl Upload {
                                 source: OSError::Generic { source, .. },
                                 part_idx,
                                 buffer,
-                            }) if source.to_string().contains("Connection reset by peer")
+                            }) if source
+                                .to_string()
+                                .to_lowercase()
+                                .contains("Connection reset by peer")
                                 && mut_self.connection_resets < 20 =>
                             {
                                 // Retry, but only up to 20 of them.
@@ -317,7 +317,7 @@ impl AsyncWrite for Upload {
         // Instantiate next request, if available.
         if mut_self.buffer.capacity() == mut_self.buffer.len() {
             match &mut mut_self.state {
-                UploadState::Pending => {
+                UploadState::Started => {
                     let store = self.store.clone();
                     let path = self.path.clone();
                     let fut = Box::pin(async move { store.create_multipart(path.as_ref()).await });
@@ -330,14 +330,17 @@ impl AsyncWrite for Upload {
                     ..
                 } => {
                     // TODO: Make max concurrency configurable.
-                    if futures.len() < 10 {
-                        futures.push(Self::put_next_part(
-                            &mut_self.path,
-                            &mut_self.store,
-                            &mut mut_self.buffer,
-                            part_idx,
-                            multipart_id,
+                    if futures.len() < MAX_UPLOAD_PARALLELISM {
+                        let data = Self::next_part_buffer(&mut mut_self.buffer, *part_idx);
+                        futures.push(Self::put_part(
+                            mut_self.path.clone(),
+                            mut_self.store.clone(),
+                            data,
+                            *part_idx,
+                            multipart_id.clone(),
+                            None,
                         ));
+                        *part_idx += 1;
                     }
                 }
                 _ => {}
@@ -359,7 +362,7 @@ impl AsyncWrite for Upload {
         self.as_mut().poll_tasks(cx)?;
 
         match &self.state {
-            UploadState::Pending | UploadState::Done => Poll::Ready(Ok(())),
+            UploadState::Started | UploadState::Done => Poll::Ready(Ok(())),
             UploadState::CreatingUpload(_)
             | UploadState::Completing(_)
             | UploadState::PuttingSingle(_) => Poll::Pending,
@@ -377,19 +380,18 @@ impl AsyncWrite for Upload {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        // Rust needs a little help to borrow self mutably and immutably at the same time
-        // through a Pin.
-
         loop {
             self.as_mut().poll_tasks(cx)?;
 
+            // Rust needs a little help to borrow self mutably and immutably at the same time
+            // through a Pin.
             let mut_self = &mut *self;
             match &mut mut_self.state {
                 UploadState::Done => return Poll::Ready(Ok(())),
                 UploadState::CreatingUpload(_)
                 | UploadState::PuttingSingle(_)
                 | UploadState::Completing(_) => return Poll::Pending,
-                UploadState::Pending => {
+                UploadState::Started => {
                     // If we didn't start a multipart upload, we can just do a single put.
                     let part = Bytes::from(std::mem::take(&mut mut_self.buffer));
                     let path = mut_self.path.clone();
@@ -407,13 +409,16 @@ impl AsyncWrite for Upload {
                     part_idx,
                 } => {
                     // Flush final batch
-                    if !mut_self.buffer.is_empty() && futures.len() < 10 {
-                        futures.push(Self::put_next_part(
-                            &mut_self.path,
-                            &mut_self.store,
-                            &mut mut_self.buffer,
-                            part_idx,
-                            multipart_id,
+                    if !mut_self.buffer.is_empty() && futures.len() < MAX_UPLOAD_PARALLELISM {
+                        // We can just use `take` since we don't need the buffer anymore.
+                        let data = Bytes::from(std::mem::take(&mut mut_self.buffer));
+                        futures.push(Self::put_part(
+                            mut_self.path.clone(),
+                            mut_self.store.clone(),
+                            data,
+                            *part_idx,
+                            multipart_id.clone(),
+                            None,
                         ));
                         // We need to go back to beginning of loop to poll the
                         // new feature and get the waker registered on the ctx.
@@ -450,7 +455,8 @@ impl AsyncWrite for Upload {
 }
 
 /// Returned error from trying to upload a part.
-/// Has the part_idx and buffer so we can
+/// Has the part_idx and buffer so we can pass
+/// them to the retry logic.
 struct UploadPutError {
     part_idx: u16,
     buffer: Bytes,
