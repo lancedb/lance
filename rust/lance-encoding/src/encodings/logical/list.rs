@@ -978,7 +978,7 @@ impl FieldEncoder for ListFieldEncoder {
             .offsets_encoder
             .maybe_encode_offsets_and_validity(array.as_ref())
             .map(|task| vec![task])
-            .unwrap_or_else(|| Vec::default());
+            .unwrap_or_default();
         let mut item_tasks = self.items_encoder.maybe_encode(items)?;
         if !offsets_tasks.is_empty() && item_tasks.is_empty() {
             // An items page cannot currently be shared by two different offsets pages.  This is
@@ -996,7 +996,7 @@ impl FieldEncoder for ListFieldEncoder {
             .offsets_encoder
             .flush()
             .map(|task| vec![task])
-            .unwrap_or_else(|| Vec::default());
+            .unwrap_or_default();
         let item_tasks = self.items_encoder.flush()?;
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
