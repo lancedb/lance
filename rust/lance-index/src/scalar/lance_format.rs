@@ -177,10 +177,7 @@ mod tests {
     impl MockTrainingSource {
         async fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
             Self {
-                data: lance_datafusion::utils::reader_to_stream(Box::new(data))
-                    .await
-                    .unwrap()
-                    .0,
+                data: lance_datafusion::utils::reader_to_stream(Box::new(data)),
             }
         }
     }
@@ -268,10 +265,7 @@ mod tests {
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data))
-                    .await
-                    .unwrap()
-                    .0,
+                lance_datafusion::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
             )
             .await

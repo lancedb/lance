@@ -6,6 +6,8 @@
 pub(crate) mod future;
 pub mod sql;
 pub(crate) mod temporal;
+#[cfg(test)]
+pub(crate) mod test;
 #[cfg(feature = "tfrecord")]
 pub mod tfrecord;
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::RecordBatchReader;
+use arrow_array::{RecordBatchIterator, RecordBatchReader};
 use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
 use datafusion_common::DataFusionError;
 use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
@@ -20,16 +20,16 @@ where
     .fuse()
 }
 
-/// Convert reader to a stream and a schema.
+/// Infer the Lance schema from the first batch.
 ///
-/// Will peek the first batch to get the dictionaries for dictionary columns.
+/// This will peek the first batch to get the dictionaries for dictionary columns.
 ///
 /// NOTE: this does not validate the schema. For example, for appends the schema
 /// should be checked to make sure it matches the existing dataset schema before
 /// writing.
-pub async fn reader_to_stream(
+pub async fn peek_reader_schema(
     batches: Box<dyn RecordBatchReader + Send>,
-) -> Result<(SendableRecordBatchStream, Schema)> {
+) -> Result<(Box<dyn RecordBatchReader + Send>, Schema)> {
     let arrow_schema = batches.schema();
     let (peekable, schema) = spawn_blocking(move || {
         let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
@@ -46,12 +46,21 @@ pub async fn reader_to_stream(
     .await
     .unwrap()?;
     schema.validate()?;
+    let reader = RecordBatchIterator::new(peekable, arrow_schema);
+    Ok((
+        Box::new(reader) as Box<dyn RecordBatchReader + Send>,
+        schema,
+    ))
+}
 
+/// Convert reader to a stream.
+///
+/// The reader will be called in a background thread.
+pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableRecordBatchStream {
+    let arrow_schema = batches.schema();
     let stream = RecordBatchStreamAdapter::new(
         arrow_schema,
-        background_iterator(peekable).map_err(DataFusionError::from),
+        background_iterator(batches).map_err(DataFusionError::from),
     );
-    let stream = Box::pin(stream) as SendableRecordBatchStream;
-
-    Ok((stream, schema))
+    Box::pin(stream)
 }
