@@ -20,19 +20,19 @@ import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
-import com.lancedb.lance.ipc.DatasetScanner;
-import com.lancedb.lance.ipc.FragmentScanner;
 import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import io.substrait.isthmus.SqlExpressionToSubstrait;
+import io.substrait.proto.ExtendedExpression;
 
 public class FragmentTest {
   @TempDir private static Path tempDir; // Temporary directory for the tests
@@ -63,7 +63,6 @@ public class FragmentTest {
   }
 
   @Test
-  @Disabled
   void testFragmentScannerSubstrait() throws Exception {
     String datasetPath = tempDir.resolve("fragment_substrait").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
@@ -71,11 +70,19 @@ public class FragmentTest {
       testDataset.createEmptyDataset().close();
       try (Dataset dataset = testDataset.write(1, 40)) {
         var fragment = dataset.getFragments().get(0);
-        // TODO(lu): Create a valid substrait
-        ByteBuffer substraitExpressionFilter = TestUtils.getSubstraitByteBuffer("");
+        // This feature is not implemented: Unsupported function name: "equal:any_any", /Users/alluxio/alluxioFolder/lance/rust/lance-datafusion/src/expr.rs:496:9
+        String filterStatement = "id = 20";
+        String tableStatement =
+            "CREATE TABLE fragment_substrait (id INT NOT NULL, name VARCHAR(255) NOT NULL)";
+        SqlExpressionToSubstrait expressionToSubstrait = new SqlExpressionToSubstrait();
+        ExtendedExpression expression =
+            expressionToSubstrait.convert(filterStatement, Collections.singletonList(tableStatement));
+        byte[] expressionToByte = expression.toByteArray();
+        ByteBuffer expressionBuffer = ByteBuffer.allocateDirect(expressionToByte.length);
+        expressionBuffer.put(expressionToByte);
         ScanOptions options = new ScanOptions.Builder(/*batchSize*/ 1024)
             .columns(Optional.empty())
-            .substraitFilter(substraitExpressionFilter)
+            .substraitFilter(expressionBuffer)
             .build();
         try (Scanner scanner = fragment.newScan(options)) {
           try (ArrowReader reader = scanner.scanBatches()) {

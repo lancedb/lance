@@ -46,6 +46,16 @@
             <artifactId>junit-jupiter</artifactId>
              <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>io.substrait</groupId>
+            <artifactId>core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.substrait</groupId>
+            <artifactId>isthmus</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
