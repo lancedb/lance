@@ -462,53 +462,59 @@ impl PyCompaction {
     /// CompactionMetrics
     ///     The metrics from the compaction operation.
     #[staticmethod]
-    pub fn execute(dataset: PyObject, options: PyObject, merge_indices: Option<&PyAny>,
-        index_new_data: Option<&PyAny>,) -> PyResult<PyCompactionMetrics> {
+    pub fn execute(
+        dataset: PyObject,
+        options: PyObject,
+        merge_indices: Option<&PyAny>,
+        index_new_data: Option<&PyAny>,
+    ) -> PyResult<PyCompactionMetrics> {
         let dataset_ref = unwrap_dataset(dataset)?;
         let dataset = Python::with_gil(|py| dataset_ref.borrow(py).clone());
 
-        let index_opts = if let Some((merge_indices, index_new_data)) = merge_indices.zip(index_new_data) {
+        let index_opts = if let Some((merge_indices, index_new_data)) =
+            merge_indices.zip(index_new_data)
+        {
             let mut index_opts: OptimizeOptions = Default::default();
-        if let Ok(merge_indices_bool) = merge_indices.extract::<bool>() {
-            if merge_indices_bool {
-                index_opts.index_handling = IndexHandling::MergeAll;
+            if let Ok(merge_indices_bool) = merge_indices.extract::<bool>() {
+                if merge_indices_bool {
+                    index_opts.index_handling = IndexHandling::MergeAll;
+                } else {
+                    index_opts.index_handling = IndexHandling::NewDelta;
+                }
+            } else if let Ok(merge_indices_int) = merge_indices.extract::<usize>() {
+                index_opts.index_handling = IndexHandling::MergeLatestN(merge_indices_int as usize);
+            } else if let Ok(merge_indices_ids) = merge_indices.extract::<Vec<String>>() {
+                let index_ids = merge_indices_ids
+                    .iter()
+                    .map(|id_str| {
+                        Uuid::parse_str(id_str)
+                            .map_err(|err| PyValueError::new_err(err.to_string()))
+                    })
+                    .collect::<PyResult<Vec<Uuid>>>()?;
+                index_opts.index_handling = IndexHandling::MergeIndices(index_ids);
             } else {
-                index_opts.index_handling = IndexHandling::NewDelta;
+                return Err(PyValueError::new_err(
+                    "merge_indices must be a boolean value, integer, or list of str.",
+                ));
             }
-        } else if let Ok(merge_indices_int) = merge_indices.extract::<usize>() {
-            index_opts.index_handling = IndexHandling::MergeLatestN(merge_indices_int as usize);
-        } else if let Ok(merge_indices_ids) = merge_indices.extract::<Vec<String>>() {
-            let index_ids = merge_indices_ids
-                .iter()
-                .map(|id_str| {
-                    Uuid::parse_str(id_str).map_err(|err| PyValueError::new_err(err.to_string()))
-                })
-                .collect::<PyResult<Vec<Uuid>>>()?;
-            index_opts.index_handling = IndexHandling::MergeIndices(index_ids);
-        } else {
-            return Err(PyValueError::new_err(
-                "merge_indices must be a boolean value, integer, or list of str.",
-            ));
-        }
 
-        if let Ok(index_new_data_bool) = index_new_data.extract::<bool>() {
-            if index_new_data_bool {
-                index_opts.new_data_handling = NewDataHandling::IndexAll;
+            if let Ok(index_new_data_bool) = index_new_data.extract::<bool>() {
+                if index_new_data_bool {
+                    index_opts.new_data_handling = NewDataHandling::IndexAll;
+                } else {
+                    index_opts.new_data_handling = NewDataHandling::Ignore;
+                }
+            } else if let Ok(index_new_data_ids) = index_new_data.extract::<Vec<u32>>() {
+                index_opts.new_data_handling = NewDataHandling::Fragments(index_new_data_ids);
             } else {
-                index_opts.new_data_handling = NewDataHandling::Ignore;
+                return Err(PyValueError::new_err(
+                    "index_new_data must be a boolean value.",
+                ));
             }
-        } else if let Ok(index_new_data_ids) = index_new_data.extract::<Vec<u32>>() {
-            index_opts.new_data_handling = NewDataHandling::Fragments(index_new_data_ids);
-        } else {
-            return Err(PyValueError::new_err(
-                "index_new_data must be a boolean value.",
-            ));
-        }
-        Some(index_opts)
+            Some(index_opts)
         } else {
             None
         };
-        
 
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.

@@ -321,7 +321,7 @@ impl DatasetIndexExt for Dataset {
         let indices = self.load_indices().await?;
 
         let (removed_indices, new_indices) =
-            optimize_indices(self, indices.as_slice(), options).await?;
+            optimize_indices(self, None, indices.as_slice(), options).await?;
 
         if new_indices.is_empty() {
             return Ok(());
@@ -412,6 +412,7 @@ impl DatasetIndexExt for Dataset {
 
 pub(crate) async fn optimize_indices(
     dataset: &Dataset,
+    fragments: Option<&[Fragment]>,
     indices: &[IndexMetadata],
     options: &OptimizeOptions,
 ) -> Result<(Vec<IndexMetadata>, Vec<IndexMetadata>)> {
@@ -424,7 +425,7 @@ pub(crate) async fn optimize_indices(
     let mut removed_indices = vec![];
     for deltas in name_to_indices.values() {
         let Some((new_id, removed, mut new_frag_ids)) =
-            merge_indices(dataset, deltas.as_slice(), options).await?
+            merge_indices(dataset, fragments, deltas.as_slice(), options).await?
         else {
             continue;
         };
@@ -593,20 +594,28 @@ impl DatasetIndexInternalExt for Dataset {
 
     async fn unindexed_fragments(&self, name: &str) -> Result<Vec<Fragment>> {
         let indices = self.load_indices_by_name(name).await?;
-        let mut total_fragment_bitmap = RoaringBitmap::new();
-        for idx in indices.iter() {
-            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::Index {
-                message: "Please upgrade lance to 0.8+ to use this function".to_string(),
-                location: location!(),
-            })?;
-        }
-        Ok(self
-            .fragments()
-            .iter()
-            .filter(|f| !total_fragment_bitmap.contains(f.id as u32))
-            .cloned()
-            .collect())
+        let indices_refs = indices.iter().collect::<Vec<_>>();
+        let fragments = self.fragments();
+        unindexed_fragments(&indices_refs, fragments.as_slice())
     }
+}
+
+fn unindexed_fragments(
+    indices: &[&IndexMetadata],
+    fragments: &[Fragment],
+) -> Result<Vec<Fragment>> {
+    let mut total_fragment_bitmap = RoaringBitmap::new();
+    for idx in indices.iter() {
+        total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::Index {
+            message: "Please upgrade lance to 0.8+ to use this function".to_string(),
+            location: location!(),
+        })?;
+    }
+    Ok(fragments
+        .iter()
+        .filter(|f| !total_fragment_bitmap.contains(f.id as u32))
+        .cloned()
+        .collect())
 }
 
 #[cfg(test)]

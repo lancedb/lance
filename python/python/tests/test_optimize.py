@@ -262,16 +262,17 @@ def test_compact_and_optimize(tmp_path: Path):
     dataset.create_scalar_index("id", index_type="BTREE", name="id_index")
 
     # Append new data
-    dataset = lance.write_dataset(data(100, 200), tmp_path, mode="append")
+    dataset = lance.write_dataset(data(2000, 2100), tmp_path, mode="append")
 
     # Add index segments
     dataset.optimize.optimize_indices(merge_indices=False, index_new_data=True)
 
     # Append new data
-    # dataset = lance.write_dataset(data(200, 300), tmp_path, mode="append")
-    # assert len(dataset.get_fragments()) == 3
+    dataset = lance.write_dataset(data(2100, 2200), tmp_path, mode="append")
+    assert len(dataset.get_fragments()) == 3
 
-    # Compact and optimize -> Should have 1 fragment with 1 vector index and 1 scalar index
+    # Compact and optimize -> Should have 1 fragment with 1 vector index and
+    # 1 scalar index
     # Right now, plan_compaction won't compact fragments with different indices.
     # So we manually create a compaction task.
     task_data = dict(
@@ -310,6 +311,8 @@ def test_compact_and_optimize(tmp_path: Path):
     q = {"column": "vec", "q": np.random.rand(128).astype(np.float32), "k": 5}
     results = dataset.to_table(nearest=q)
     assert results.num_rows == 5
+
+    assert dataset.count_rows() == 2200
 
 
 def test_compact_and_optimize_targetted(tmp_path: Path):

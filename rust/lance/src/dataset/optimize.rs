@@ -926,8 +926,24 @@ pub async fn commit_compaction(
             existing_indices[old_index].uuid = new_id;
         }
 
-        let (removed_indices, new_indices) =
-            optimize_indices(dataset, &existing_indices, &optimize_index_opts).await?;
+        // Figure out the active fragments. These are used to index new data.
+        let mut fragments = dataset
+            .get_fragments()
+            .into_iter()
+            .map(|f| f.metadata)
+            .collect::<Vec<_>>();
+        for group in &rewrite_groups {
+            fragments.retain(|f| !group.old_fragments.iter().any(|frag| frag.id == f.id));
+            fragments.extend(group.new_fragments.iter().cloned());
+        }
+
+        let (removed_indices, new_indices) = optimize_indices(
+            dataset,
+            Some(&fragments),
+            &existing_indices,
+            optimize_index_opts,
+        )
+        .await?;
 
         // TODO: Clean up any tmp indices created by re-mapping.
         rewritten_indices.retain(|r| !removed_indices.iter().any(|i| i.uuid == r.new_id));
@@ -947,8 +963,6 @@ pub async fn commit_compaction(
         },
         None,
     );
-
-    dbg!(&transaction);
 
     let manifest = commit_transaction(
         dataset,

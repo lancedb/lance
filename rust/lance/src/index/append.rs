@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use futures::future::try_join_all;
 use lance_core::{Error, Result};
 use lance_index::optimize::{IndexHandling, NewDataHandling, OptimizeOptions};
-use lance_index::IndexType;
-use lance_table::format::Index as IndexMetadata;
+use lance_index::{Index, IndexType};
+use lance_table::format::{Fragment, Index as IndexMetadata};
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use std::borrow::Cow;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::scalar::optimize_scalar_index;
 use super::vector::ivf::optimize_vector_indices;
-use super::DatasetIndexInternalExt;
+use super::{unindexed_fragments, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 
 /// Merge in-inflight unindexed data, with a specific number of previous indices
@@ -27,6 +29,7 @@ use crate::dataset::Dataset;
 /// - Bitmap of the fragments that covered in the newly created index.
 pub async fn merge_indices<'a>(
     dataset: &Dataset,
+    fragments: Option<&[Fragment]>,
     old_indices: &[&'a IndexMetadata],
     options: &OptimizeOptions,
 ) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, RoaringBitmap)>> {
@@ -48,43 +51,9 @@ pub async fn merge_indices<'a>(
             location: location!(),
         })?;
 
-    let merge_indices_meta: Cow<'_, [&IndexMetadata]> = match &options.index_handling {
-        IndexHandling::NewDelta => Cow::Borrowed(&[]),
-        IndexHandling::MergeLatestN(n) => {
-            let start_pos = if *n > old_indices.len() {
-                0
-            } else {
-                old_indices.len() - n
-            };
-            Cow::Borrowed(&old_indices[start_pos..])
-        }
-        IndexHandling::MergeAll => Cow::Borrowed(old_indices),
-        IndexHandling::MergeIndices(target_uuids) => Cow::Owned(
-            old_indices
-                .iter()
-                .filter(|&idx| target_uuids.contains(&idx.uuid))
-                .cloned()
-                .collect::<Vec<_>>(),
-        ),
-    };
+    let merge_indices_meta = indices_to_merge(old_indices, &options.index_handling);
 
-    let mut merge_indices = Vec::with_capacity(merge_indices_meta.len());
-    for idx in merge_indices_meta.as_ref() {
-        let index = dataset
-            .open_generic_index(&column.name, &idx.uuid.to_string())
-            .await?;
-        merge_indices.push(index);
-    }
-
-    if merge_indices
-        .windows(2)
-        .any(|w| w[0].index_type() != w[1].index_type())
-    {
-        return Err(Error::Index {
-            message: format!("Append index: invalid index deltas: {:?}", old_indices),
-            location: location!(),
-        });
-    }
+    let merge_indices = open_indices(dataset, &column.name, merge_indices_meta.as_ref()).await?;
 
     // We need one index to get the parameters.
     let reference_index = if let Some(idx) = merge_indices.first() {
@@ -99,15 +68,11 @@ pub async fn merge_indices<'a>(
             .await?
     };
 
-    let frags_to_index = match options.new_data_handling {
-        NewDataHandling::IndexAll => dataset.unindexed_fragments(&old_indices[0].name).await?,
-        NewDataHandling::Fragments(ref target_frags) => {
-            let mut fragments = dataset.unindexed_fragments(&old_indices[0].name).await?;
-            fragments.retain(|frag| target_frags.contains(&(frag.id as u32)));
-            fragments
-        }
-        NewDataHandling::Ignore => vec![],
-    };
+    let frags_to_index = fragments_to_index(
+        fragments.unwrap_or_else(|| dataset.fragments().as_slice()),
+        merge_indices_meta.as_ref(),
+        &options.new_data_handling,
+    )?;
 
     if frags_to_index.is_empty()
         && (options.index_handling == IndexHandling::NewDelta || merge_indices_meta.len() == 1)
@@ -153,6 +118,71 @@ pub async fn merge_indices<'a>(
     }?;
 
     Ok(Some((new_uuid, merge_indices_meta.to_vec(), frag_bitmap)))
+}
+
+fn indices_to_merge<'a, 'b>(
+    old_indices: &'b [&'a IndexMetadata],
+    index_handling: &IndexHandling,
+) -> Cow<'b, [&'a IndexMetadata]> {
+    match index_handling {
+        IndexHandling::NewDelta => Cow::Borrowed(&[]),
+        IndexHandling::MergeLatestN(n) => {
+            let start_pos = if *n > old_indices.len() {
+                0
+            } else {
+                old_indices.len() - n
+            };
+            Cow::Borrowed(&old_indices[start_pos..])
+        }
+        IndexHandling::MergeAll => Cow::Borrowed(old_indices),
+        IndexHandling::MergeIndices(target_uuids) => Cow::Owned(
+            old_indices
+                .iter()
+                .filter(|&idx| target_uuids.contains(&idx.uuid))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+async fn open_indices(
+    dataset: &Dataset,
+    col_name: &str,
+    indices: &[&IndexMetadata],
+) -> Result<Vec<Arc<dyn Index>>> {
+    let opening = indices.iter().map(|idx| async move {
+        let uuid_str = idx.uuid.to_string();
+        dataset.open_generic_index(col_name, &uuid_str).await
+    });
+    let opened = try_join_all(opening).await?;
+
+    if opened
+        .windows(2)
+        .any(|w| w[0].index_type() != w[1].index_type())
+    {
+        return Err(Error::Index {
+            message: format!("Append index: invalid index deltas: {:?}", indices),
+            location: location!(),
+        });
+    }
+
+    Ok(opened)
+}
+
+fn fragments_to_index(
+    fragments: &[Fragment],
+    existing_indices: &[&IndexMetadata],
+    new_data_handling: &NewDataHandling,
+) -> Result<Vec<Fragment>> {
+    match new_data_handling {
+        NewDataHandling::IndexAll => unindexed_fragments(existing_indices, fragments),
+        NewDataHandling::Fragments(ref target_frags) => {
+            let mut fragments = unindexed_fragments(existing_indices, fragments)?;
+            fragments.retain(|frag| target_frags.contains(&(frag.id as u32)));
+            Ok(fragments)
+        }
+        NewDataHandling::Ignore => Ok(vec![]),
+    }
 }
 
 #[cfg(test)]
