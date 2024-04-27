@@ -25,6 +25,7 @@ import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.dataset.scanner.ScanTask;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -34,27 +35,33 @@ public class FragmentScanner implements Scanner {
   private final int fragmentId;
 
   private final ScanOptions options;
+  private final Optional<String> filter;
 
   private final BufferAllocator allocator;
 
   /** Create FragmentScanner. */
   public FragmentScanner(
-      Dataset dataset, int fragmentId, ScanOptions options, BufferAllocator allocator) {
+      Dataset dataset, int fragmentId, ScanOptions options,
+      Optional<String> filter, BufferAllocator allocator) {
+    Preconditions.checkArgument(!(options.getSubstraitFilter().isPresent() && filter.isPresent()), 
+        "cannot set both substrait filter and string filter");
     this.dataset = dataset;
     this.fragmentId = fragmentId;
     this.options = options;
+    this.filter = filter;
     this.allocator = allocator;
   }
 
   private static native long getSchema(Dataset dataset, int fragmentId, Optional<String[]> columns);
 
   static native void openStream(Dataset dataset, int fragmentId, Optional<String[]> columns,
-      Optional<ByteBuffer> substraitFilter, long batchSize, long stream) throws IOException;
+      Optional<ByteBuffer> substraitFilter, Optional<String> filter,
+      long batchSize, long stream) throws IOException;
 
   @Override
   public ArrowReader scanBatches() {
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
-      openStream(dataset, fragmentId, options.getColumns(), options.getSubstraitFilter(),
+      openStream(dataset, fragmentId, options.getColumns(), options.getSubstraitFilter(), filter,
           options.getBatchSize(), s.memoryAddress());
       return Data.importArrayStream(allocator, s);
     } catch (IOException e) {

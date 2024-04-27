@@ -18,9 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
-import java.nio.ByteBuffer;
 import java.nio.file.Path;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -31,8 +29,6 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import io.substrait.isthmus.SqlExpressionToSubstrait;
-import io.substrait.proto.ExtendedExpression;
 
 public class FragmentTest {
   @TempDir private static Path tempDir; // Temporary directory for the tests
@@ -46,7 +42,7 @@ public class FragmentTest {
 
       try (var dataset = Dataset.open(datasetPath, allocator)) {
         var fragment = dataset.getFragments().get(0);
-        var scanner = fragment.newScan(new ScanOptions(1024));
+        var scanner = fragment.newScan(new ScanOptions(1024), Optional.empty());
         var schema = scanner.schema();
         assertEquals(testDataset.getSchema(), schema);
 
@@ -63,35 +59,45 @@ public class FragmentTest {
   }
 
   @Test
-  void testFragmentScannerSubstrait() throws Exception {
-    String datasetPath = tempDir.resolve("fragment_substrait").toString();
+  void testFragmentScannerBatchSize() throws Exception {
+    String datasetPath = tempDir.resolve("fragment_scan_batch_size").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 40;
+      int batchRows = 20;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        var fragment = dataset.getFragments().get(0);
+        try (Scanner scanner = fragment.newScan(new ScanOptions(batchRows), Optional.empty())) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+            int rowcount = 0;
+            while (reader.loadNextBatch()) {
+              int currentRowCount = reader.getVectorSchemaRoot().getRowCount();
+              assertEquals(batchRows, currentRowCount);
+              rowcount += currentRowCount;
+            }
+            assertEquals(totalRows, rowcount);
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentScannerFilter() throws Exception {
+    String datasetPath = tempDir.resolve("fragment_scan_filter").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       try (Dataset dataset = testDataset.write(1, 40)) {
         var fragment = dataset.getFragments().get(0);
-        // This feature is not implemented: Unsupported function name: "equal:any_any", /Users/alluxio/alluxioFolder/lance/rust/lance-datafusion/src/expr.rs:496:9
-        String filterStatement = "id = 20";
-        String tableStatement =
-            "CREATE TABLE fragment_substrait (id INT NOT NULL, name VARCHAR(255) NOT NULL)";
-        SqlExpressionToSubstrait expressionToSubstrait = new SqlExpressionToSubstrait();
-        ExtendedExpression expression =
-            expressionToSubstrait.convert(filterStatement, Collections.singletonList(tableStatement));
-        byte[] expressionToByte = expression.toByteArray();
-        ByteBuffer expressionBuffer = ByteBuffer.allocateDirect(expressionToByte.length);
-        expressionBuffer.put(expressionToByte);
-        ScanOptions options = new ScanOptions.Builder(/*batchSize*/ 1024)
-            .columns(Optional.empty())
-            .substraitFilter(expressionBuffer)
-            .build();
-        try (Scanner scanner = fragment.newScan(options)) {
+        try (Scanner scanner = fragment.newScan(new ScanOptions(1024), Optional.of("id < 20"))) {
           try (ArrowReader reader = scanner.scanBatches()) {
             assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
-            int rowcount = 0;
             while (reader.loadNextBatch()) {
-              rowcount += reader.getVectorSchemaRoot().getRowCount();
+              assertEquals(20, reader.getVectorSchemaRoot().getRowCount());
             }
-            assertEquals(40, rowcount);
           }
         }
       }
@@ -127,7 +133,7 @@ public class FragmentTest {
         var fragment = dataset.getFragments().get(0);
         assertEquals(fragmentId, fragment.getId());
   
-        var scanner = fragment.newScan(new ScanOptions(1024));
+        var scanner = fragment.newScan(new ScanOptions(1024), Optional.empty());
         var schemaRes = scanner.schema();
         assertEquals(testDataset.getSchema(), schemaRes);
       }

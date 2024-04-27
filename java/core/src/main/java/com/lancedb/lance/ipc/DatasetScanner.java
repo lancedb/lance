@@ -33,14 +33,16 @@ public class DatasetScanner implements Scanner {
   private final Dataset dataset;
 
   private final ScanOptions options;
+  private final Optional<String> filter;
 
   private final BufferAllocator allocator;
 
   /** Create FragmentScanner. */
   public DatasetScanner(
-      Dataset dataset, ScanOptions options, BufferAllocator allocator) {
+      Dataset dataset, ScanOptions options, Optional<String> filter, BufferAllocator allocator) {
     this.dataset = dataset;
     this.options = options;
+    this.filter = filter;
     this.allocator = allocator;
   }
 
@@ -48,13 +50,13 @@ public class DatasetScanner implements Scanner {
 
   static native void openStream(
       Dataset dataset, Optional<String[]> columns, Optional<ByteBuffer> substraitFilter,
-      long batchSize, long stream) throws IOException;
+      Optional<String> filter, long batchSize, long stream) throws IOException;
 
   @Override
   public ArrowReader scanBatches() {
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
       openStream(dataset, options.getColumns(), options.getSubstraitFilter(),
-          options.getBatchSize(), s.memoryAddress());
+          filter, options.getBatchSize(), s.memoryAddress());
       return Data.importArrayStream(allocator, s);
     } catch (IOException e) {
       // TODO: handle IO exception?

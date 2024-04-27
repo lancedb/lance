@@ -142,8 +142,8 @@ public class Dataset implements Closeable {
       List<String> fragmentsMetadata);
 
   /** Create a new Dataset Scanner. */
-  public Scanner newScan(ScanOptions options) {
-    return new DatasetScanner(this, options, allocator);
+  public Scanner newScan(ScanOptions options, Optional<String> filter) {
+    return new DatasetScanner(this, options, filter, allocator);
   }
 
   /**

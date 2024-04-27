@@ -13,18 +13,14 @@
  */
 package com.lancedb.lance;
 
-import static com.lancedb.lance.TestUtils.getSubstraitByteBuffer;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
-import java.nio.ByteBuffer;
 import java.nio.file.Path;
-import java.util.Base64;
 import java.util.Optional;
 
-import com.lancedb.lance.ipc.DatasetScanner;
 import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
@@ -32,12 +28,10 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 public class DatasetTest {
-
   @TempDir static Path tempDir; // Temporary directory for the tests
   private static Dataset dataset;
 
@@ -81,7 +75,6 @@ public class DatasetTest {
         });
   }
 
-
   @Test
   void testDatasetVersion() {
     String datasetPath = tempDir.resolve("dataset_version").toString();
@@ -116,7 +109,7 @@ public class DatasetTest {
       testDataset.createDatasetAndValidate();
 
       try (var dataset = Dataset.open(datasetPath, allocator)) {
-        var scanner = dataset.newScan(new ScanOptions(1024));
+        var scanner = dataset.newScan(new ScanOptions(1024), Optional.empty());
         var schema = scanner.schema();
         assertEquals(testDataset.getSchema(), schema);
 
@@ -133,27 +126,43 @@ public class DatasetTest {
   }
 
   @Test
-  @Disabled
-  void testDatasetScannerSubstrait() throws IOException {
-    String datasetPath = tempDir.resolve("dataset_scan_subtrait").toString();
+  void testDatasetScannerBatchSize() throws IOException {
+    String datasetPath = tempDir.resolve("dataset_scan_batch_size").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      try (Dataset dataset = testDataset.write(1, 40)) {
-        // TODO(lu): Create a valid substrait
-        ByteBuffer substraitExpressionFilter = getSubstraitByteBuffer("id < 20");
-        ScanOptions options = new ScanOptions.Builder(/*batchSize*/ 1024)
-            .columns(Optional.empty())
-            .substraitFilter(substraitExpressionFilter)
-            .build();
-        Scanner scanner = dataset.newScan(options);
+      int totalRows = 40;
+      int batchRows = 20;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        Scanner scanner = dataset.newScan(new ScanOptions(batchRows), Optional.empty());
         try (ArrowReader reader = scanner.scanBatches()) {
           assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
           int rowcount = 0;
           while (reader.loadNextBatch()) {
-            rowcount += reader.getVectorSchemaRoot().getRowCount();
+            int currentRowCount = reader.getVectorSchemaRoot().getRowCount();
+            assertEquals(batchRows, currentRowCount);
+            rowcount += currentRowCount;
           }
           assertEquals(40, rowcount);
+        }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentScannerFilter() throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scan_filter").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        try (Scanner scanner = dataset.newScan(new ScanOptions(1024), Optional.of("id < 20"))) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+            while (reader.loadNextBatch()) {
+              assertEquals(20, reader.getVectorSchemaRoot().getRowCount());
+            }
+          }
         }
       }
     }

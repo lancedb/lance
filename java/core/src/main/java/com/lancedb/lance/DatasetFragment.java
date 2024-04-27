@@ -15,6 +15,7 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.FragmentScanner;
+import java.util.Optional;
 import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
 
@@ -49,7 +50,7 @@ public class DatasetFragment {
   }
 
   /** Create a new Fragment Scanner. */
-  public Scanner newScan(ScanOptions options) {
-    return new FragmentScanner(dataset, metadata.getId(), options, dataset.allocator);
+  public Scanner newScan(ScanOptions options, Optional<String> filter) {
+    return new FragmentScanner(dataset, metadata.getId(), options, filter, dataset.allocator);
   }
 }

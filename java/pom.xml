@@ -60,16 +60,6 @@
                 <artifactId>json</artifactId>
                 <version>20210307</version>
             </dependency>
-            <dependency>
-                <groupId>io.substrait</groupId>
-                <artifactId>core</artifactId>
-                <version>${substrait.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>io.substrait</groupId>
-                <artifactId>isthmus</artifactId>
-                <version>${substrait.version}</version>
-            </dependency>
         </dependencies>
     </dependencyManagement>
 

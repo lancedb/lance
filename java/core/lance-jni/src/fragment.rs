@@ -16,6 +16,7 @@ use arrow::array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StructAr
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::{DataType, Schema};
+use datafusion::logical_expr::Join;
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
@@ -250,7 +251,8 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_openStream(
     jdataset: JObject,
     fragment_id: jint,
     columns: JObject,       // Optional<String[]>
-    substrait_obj: JObject, // Optional<ByteBuffer>
+    substrait_filter_obj: JObject, // Optional<ByteBuffer>
+    filter_obj: JObject,    // Optional<String>
     batch_size: jlong,
     stream_addr: jlong,
 ) {
@@ -270,12 +272,16 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_openStream(
     if let Some(cols) = columns {
         ok_or_throw_without_return!(env, scanner.project(&cols));
     };
-    let substrait = ok_or_throw_without_return!(env, env.get_bytes_opt(&substrait_obj));
+    let substrait = ok_or_throw_without_return!(env, env.get_bytes_opt(&substrait_filter_obj));
     if let Some(substrait) = substrait {
         ok_or_throw_without_return!(
             env,
             RT.block_on(async { scanner.filter_substrait(substrait).await })
         );
+    }
+    let filter = ok_or_throw_without_return!(env, env.get_string_opt(&filter_obj));
+    if let Some(filter) = filter {
+        ok_or_throw_without_return!(env, scanner.filter(filter.as_str()));
     }
     scanner.batch_size(batch_size as usize);
 
