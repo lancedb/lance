@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use jni::objects::JString;
+use core::slice;
+
+use jni::objects::{JByteBuffer, JString};
 use jni::{objects::JObject, JNIEnv};
 
 use crate::Result;
@@ -39,6 +41,9 @@ pub trait JNIEnvExt {
 
     /// Get Option<u64> from Java Optional<Long>.
     fn get_u64_opt(&mut self, obj: &JObject) -> Result<Option<u64>>;
+
+    /// Get Option<&[u8]> from Java Optional<ByteBuffer>.
+    fn get_bytes_opt(&mut self, obj: &JObject) -> Result<Option<&[u8]>>;
 
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
     where
@@ -115,6 +120,18 @@ impl JNIEnvExt for JNIEnv<'_> {
             let long_obj = env.call_method(java_long_obj, "longValue", "()J", &[])?;
             let long_value = long_obj.j()?;
             Ok(long_value as u64)
+        })
+    }
+
+    fn get_bytes_opt(&mut self, obj: &JObject) -> Result<Option<&[u8]>> {
+        self.get_optional(obj, |env, inner_obj| {
+            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
+            let java_byte_buffer_obj = java_obj_gen.l()?;
+            let j_byte_buffer = JByteBuffer::from(java_byte_buffer_obj);
+            let raw_data = env.get_direct_buffer_address(&j_byte_buffer)?;
+            let capacity = env.get_direct_buffer_capacity(&j_byte_buffer)?;
+            let data = unsafe { slice::from_raw_parts(raw_data, capacity) };
+            Ok(data)
         })
     }
 

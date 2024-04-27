@@ -14,6 +14,8 @@
 
 package com.lancedb.lance;
 
+import com.lancedb.lance.ipc.DatasetScanner;
+import com.lancedb.lance.ipc.FragmentScanner;
 import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
 import java.io.IOException;
@@ -23,14 +25,19 @@ import java.util.stream.Collectors;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
+import org.apache.arrow.dataset.scanner.ScanOptions;
+import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
- * Class representing a Lance dataset, interfacing with the native lance library. This class
- * provides functionality to open and manage datasets with native code. The native library is loaded
- * statically and utilized through native methods. It implements the {@link java.io.Closeable}
+ * Class representing a Lance dataset, interfacing with the native lance
+ * library. This class
+ * provides functionality to open and manage datasets with native code. The
+ * native library is loaded
+ * statically and utilized through native methods. It implements the
+ * {@link java.io.Closeable}
  * interface to ensure proper resource management.
  */
 public class Dataset implements Closeable {
@@ -42,22 +49,23 @@ public class Dataset implements Closeable {
 
   BufferAllocator allocator;
 
-  private Dataset() {}
+  private Dataset() {
+  }
 
   /**
    * Creates an empty dataset.
    *
    * @param allocator the buffer allocator
-   * @param path dataset uri
-   * @param schema dataset schema
-   * @param params write params
+   * @param path      dataset uri
+   * @param schema    dataset schema
+   * @param params    write params
    * @return Dataset
    */
   public static Dataset create(BufferAllocator allocator, String path, Schema schema,
       WriteParams params) {
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
       Data.exportSchema(allocator, schema, null, arrowSchema);
-      var dataset =  createWithFfiSchema(arrowSchema.memoryAddress(),
+      var dataset = createWithFfiSchema(arrowSchema.memoryAddress(),
           path, params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
           params.getMaxBytesPerFile(), params.getMode());
       dataset.allocator = allocator;
@@ -73,9 +81,9 @@ public class Dataset implements Closeable {
    * Write a dataset to the specified path.
    *
    * @param allocator buffer allocator
-   * @param stream arrow stream
-   * @param path dataset uri
-   * @param params write parameters
+   * @param stream    arrow stream
+   * @param path      dataset uri
+   * @param params    write parameters
    * @return Dataset
    */
   public static Dataset write(BufferAllocator allocator, ArrowArrayStream stream,
@@ -94,7 +102,7 @@ public class Dataset implements Closeable {
   /**
    * Open a dataset from the specified path.
    *
-   * @param path file path
+   * @param path      file path
    * @param allocator Arrow buffer allocator.
    * @return Dataset
    */
@@ -115,11 +123,12 @@ public class Dataset implements Closeable {
   /**
    * Create a new version of dataset.
    *
-   * @param allocator the buffer allocator
-   * @param path The file path of the dataset to open.
-   * @param operation The operation to apply to the dataset.
-   * @param readVersion The version of the dataset that was used as the base for the changes.
-   *     This is not needed for overwrite or restore operations.
+   * @param allocator   the buffer allocator
+   * @param path        The file path of the dataset to open.
+   * @param operation   The operation to apply to the dataset.
+   * @param readVersion The version of the dataset that was used as the base for
+   *                    the changes.
+   *                    This is not needed for overwrite or restore operations.
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
   public static Dataset commit(BufferAllocator allocator, String path,
@@ -131,6 +140,11 @@ public class Dataset implements Closeable {
 
   public static native Dataset commitAppend(String path, Optional<Long> readVersion,
       List<String> fragmentsMetadata);
+
+  /** Create a new Dataset Scanner. */
+  public Scanner newScan(ScanOptions options) {
+    return new DatasetScanner(this, options, allocator);
+  }
 
   /**
    * Gets the currently checked out version of the dataset.
@@ -155,11 +169,12 @@ public class Dataset implements Closeable {
    * @return A list of {@link DatasetFragment}.
    */
   public List<DatasetFragment> getFragments() {
-    // Set a pointer in Fragment to dataset, to make it is easier to issue IOs later.
+    // Set a pointer in Fragment to dataset, to make it is easier to issue IOs
+    // later.
     //
     // We do not need to close Fragments.
-    return this.getJsonFragments().stream().map(jsonFragment 
-        -> new DatasetFragment(this, FragmentMetadata.fromJson(jsonFragment)))
+    return this.getJsonFragments().stream()
+        .map(jsonFragment -> new DatasetFragment(this, FragmentMetadata.fromJson(jsonFragment)))
         .collect(Collectors.toList());
   }
 
@@ -180,7 +195,8 @@ public class Dataset implements Closeable {
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
 
   /**
-   * Closes this dataset and releases any system resources associated with it. If the dataset is
+   * Closes this dataset and releases any system resources associated with it. If
+   * the dataset is
    * already closed, then invoking this method has no effect.
    */
   @Override
@@ -192,7 +208,8 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Native method to release the Lance dataset resources associated with the given handle.
+   * Native method to release the Lance dataset resources associated with the
+   * given handle.
    *
    * @param handle The native handle to the dataset resource.
    */

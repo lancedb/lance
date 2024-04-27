@@ -13,18 +13,26 @@
  */
 package com.lancedb.lance;
 
+import static com.lancedb.lance.TestUtils.getSubstraitByteBuffer;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.Optional;
 
+import com.lancedb.lance.ipc.DatasetScanner;
+import org.apache.arrow.dataset.scanner.ScanOptions;
+import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -95,6 +103,57 @@ public class DatasetTest {
             assertEquals(3, dataset3.version());
             assertEquals(3, dataset3.latestVersion());
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDatasetScannerSchema() throws IOException, URISyntaxException {
+    String datasetPath = tempDir.resolve("dataset_scan").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.RandomAccessDataset testDataset = new TestUtils.RandomAccessDataset(allocator, datasetPath);
+      testDataset.createDatasetAndValidate();
+
+      try (var dataset = Dataset.open(datasetPath, allocator)) {
+        var scanner = dataset.newScan(new ScanOptions(1024));
+        var schema = scanner.schema();
+        assertEquals(testDataset.getSchema(), schema);
+
+        try (var datasetReader = scanner.scanBatches()) {
+          var batchCount = 0;
+          while (datasetReader.loadNextBatch()) {
+            datasetReader.getVectorSchemaRoot();
+            batchCount++;
+          }
+          assert (batchCount > 0);
+        }
+      }
+    }
+  }
+
+  @Test
+  @Disabled
+  void testDatasetScannerSubstrait() throws IOException {
+    String datasetPath = tempDir.resolve("dataset_scan_subtrait").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        // TODO(lu): Create a valid substrait
+        ByteBuffer substraitExpressionFilter = getSubstraitByteBuffer("id < 20");
+        ScanOptions options = new ScanOptions.Builder(/*batchSize*/ 1024)
+            .columns(Optional.empty())
+            .substraitFilter(substraitExpressionFilter)
+            .build();
+        Scanner scanner = dataset.newScan(options);
+        try (ArrowReader reader = scanner.scanBatches()) {
+          assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+          int rowcount = 0;
+          while (reader.loadNextBatch()) {
+            rowcount += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(40, rowcount);
         }
       }
     }

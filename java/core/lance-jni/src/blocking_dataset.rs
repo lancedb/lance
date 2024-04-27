@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ffi::JNIEnvExt;
 use crate::{traits::IntoJava, Error, Result, RT};
 use arrow::array::RecordBatchReader;
 use arrow::ffi::FFI_ArrowSchema;
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::Schema;
 use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::fragment::FileFragment;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{Dataset, WriteParams};
+use lance::dataset::{scanner::Scanner, Dataset, WriteParams};
+use lance_io::ffi::to_ffi_arrow_array_stream;
 use snafu::{location, Location};
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
@@ -144,6 +147,69 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
         std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
         std::mem::forget(c_schema);
     };
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_openStream(
+    mut env: JNIEnv,
+    _reader: JObject,
+    jdataset: JObject,
+    columns: JObject,       // Optional<String[]>
+    substrait_obj: JObject, // Optional<ByteBuffer>
+    batch_size: jlong,
+    stream_addr: jlong,
+) {
+    let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
+    let dataset = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Dataset handle not set");
+        dataset.clone()
+    };
+    let mut scanner: Scanner = dataset.inner.scan();
+    if let Some(cols) = columns {
+        ok_or_throw_without_return!(env, scanner.project(&cols));
+    };
+    let substrait = ok_or_throw_without_return!(env, env.get_bytes_opt(&substrait_obj));
+    if let Some(substrait) = substrait {
+        ok_or_throw_without_return!(
+            env,
+            RT.block_on(async { scanner.filter_substrait(substrait).await })
+        );
+    }
+    scanner.batch_size(batch_size as usize);
+
+    let stream =
+        ok_or_throw_without_return!(env, RT.block_on(async { scanner.try_into_stream().await }));
+    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone()).unwrap();
+    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_getSchema(
+    mut env: JNIEnv,
+    _scanner: JObject,
+    jdataset: JObject,
+    columns: JObject, // Optional<String[]>
+) -> jlong {
+    let columns = ok_or_throw_with_return!(env, env.get_strings_opt(&columns), -1);
+
+    let res = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Dataset handle not set");
+        dataset.clone()
+    };
+    let ds_schema = res.inner.schema();
+    let schema = if let Some(columns) = columns {
+        ok_or_throw_with_return!(env, ds_schema.project(&columns), -1)
+    } else {
+        ds_schema.clone()
+    };
+    let arrow_schema: arrow::datatypes::Schema = (&schema).into();
+    let ffi_schema =
+        Box::new(FFI_ArrowSchema::try_from(&arrow_schema).expect("Failed to convert schema"));
+    Box::into_raw(ffi_schema) as jlong
 }
 
 fn create_json_fragment_list<'a>(

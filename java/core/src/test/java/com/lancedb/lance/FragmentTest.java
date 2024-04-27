@@ -18,12 +18,19 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+
+import com.lancedb.lance.ipc.DatasetScanner;
+import com.lancedb.lance.ipc.FragmentScanner;
 import org.apache.arrow.dataset.scanner.ScanOptions;
+import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -50,6 +57,35 @@ public class FragmentTest {
             batchCount++;
           }
           assert (batchCount > 0);
+        }
+      }
+    }
+  }
+
+  @Test
+  @Disabled
+  void testFragmentScannerSubstrait() throws Exception {
+    String datasetPath = tempDir.resolve("fragment_substrait").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        var fragment = dataset.getFragments().get(0);
+        // TODO(lu): Create a valid substrait
+        ByteBuffer substraitExpressionFilter = TestUtils.getSubstraitByteBuffer("");
+        ScanOptions options = new ScanOptions.Builder(/*batchSize*/ 1024)
+            .columns(Optional.empty())
+            .substraitFilter(substraitExpressionFilter)
+            .build();
+        try (Scanner scanner = fragment.newScan(options)) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+            int rowcount = 0;
+            while (reader.loadNextBatch()) {
+              rowcount += reader.getVectorSchemaRoot().getRowCount();
+            }
+            assertEquals(40, rowcount);
+          }
         }
       }
     }

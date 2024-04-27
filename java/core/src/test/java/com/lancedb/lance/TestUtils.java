@@ -31,6 +31,7 @@ import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -45,9 +46,9 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 public class TestUtils {
   public static class SimpleTestDataset {
     private final Schema schema = new Schema(Arrays.asList(
-        new Field("name", FieldType.nullable(new ArrowType.Utf8()), null),
-        new Field("age", FieldType.nullable(new ArrowType.Int(32, true)), null)
-    ));
+      Field.nullable("id", new ArrowType.Int(32, true)),
+      Field.nullable("name", new ArrowType.Utf8())
+  ), null);
     private final BufferAllocator allocator;
     private final String datasetPath;
 
@@ -76,13 +77,13 @@ public class TestUtils {
       FragmentMetadata fragmentMeta;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
         root.allocateNew();
+        IntVector idVector = (IntVector) root.getVector("id");
         VarCharVector nameVector = (VarCharVector) root.getVector("name");
-        IntVector ageVector = (IntVector) root.getVector("age");
         for (int i = 0; i < rowCount; i++) {
+          int id = i;
+          idVector.setSafe(i, id);
           String name = "Person " + i;
-          int age = 20 + i;  // Example age increment
           nameVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
-          ageVector.setSafe(i, age);
         }
         root.setRowCount(rowCount);
 
@@ -164,5 +165,12 @@ public class TestUtils {
       assertEquals(9, fragments.get(0).countRows());
       assertEquals(schema, dataset.getSchema());
     }
+  }
+
+  public static ByteBuffer getSubstraitByteBuffer(String substrait) {
+    byte[] decodedSubstrait = substrait.getBytes();
+    ByteBuffer substraitExpression = ByteBuffer.allocateDirect(decodedSubstrait.length);
+    substraitExpression.put(decodedSubstrait);
+    return substraitExpression;
   }
 }

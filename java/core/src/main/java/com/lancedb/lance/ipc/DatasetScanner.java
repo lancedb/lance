@@ -29,32 +29,31 @@ import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /** Scanner over a Fragment. */
-public class FragmentScanner implements Scanner {
+public class DatasetScanner implements Scanner {
   private final Dataset dataset;
-  private final int fragmentId;
 
   private final ScanOptions options;
 
   private final BufferAllocator allocator;
 
   /** Create FragmentScanner. */
-  public FragmentScanner(
-      Dataset dataset, int fragmentId, ScanOptions options, BufferAllocator allocator) {
+  public DatasetScanner(
+      Dataset dataset, ScanOptions options, BufferAllocator allocator) {
     this.dataset = dataset;
-    this.fragmentId = fragmentId;
     this.options = options;
     this.allocator = allocator;
   }
 
-  private static native long getSchema(Dataset dataset, int fragmentId, Optional<String[]> columns);
+  private static native long getSchema(Dataset dataset, Optional<String[]> columns);
 
-  static native void openStream(Dataset dataset, int fragmentId, Optional<String[]> columns,
-      Optional<ByteBuffer> substraitFilter, long batchSize, long stream) throws IOException;
+  static native void openStream(
+      Dataset dataset, Optional<String[]> columns, Optional<ByteBuffer> substraitFilter,
+      long batchSize, long stream) throws IOException;
 
   @Override
   public ArrowReader scanBatches() {
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
-      openStream(dataset, fragmentId, options.getColumns(), options.getSubstraitFilter(),
+      openStream(dataset, options.getColumns(), options.getSubstraitFilter(),
           options.getBatchSize(), s.memoryAddress());
       return Data.importArrayStream(allocator, s);
     } catch (IOException e) {
@@ -72,7 +71,7 @@ public class FragmentScanner implements Scanner {
   /** Get the schema of the Scanner. */
   @Override
   public Schema schema() {
-    long address = getSchema(dataset, fragmentId, options.getColumns());
+    long address = getSchema(dataset, options.getColumns());
     try (ArrowSchema schema = ArrowSchema.wrap(address)) {
       return Data.importSchema(allocator, schema, null);
     }

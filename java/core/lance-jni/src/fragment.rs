@@ -249,7 +249,8 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_openStream(
     _reader: JObject,
     jdataset: JObject,
     fragment_id: jint,
-    columns: JObject, // Optional<String[]>
+    columns: JObject,       // Optional<String[]>
+    substrait_obj: JObject, // Optional<ByteBuffer>
     batch_size: jlong,
     stream_addr: jlong,
 ) {
@@ -269,6 +270,13 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_openStream(
     if let Some(cols) = columns {
         ok_or_throw_without_return!(env, scanner.project(&cols));
     };
+    let substrait = ok_or_throw_without_return!(env, env.get_bytes_opt(&substrait_obj));
+    if let Some(substrait) = substrait {
+        ok_or_throw_without_return!(
+            env,
+            RT.block_on(async { scanner.filter_substrait(substrait).await })
+        );
+    }
     scanner.batch_size(batch_size as usize);
 
     let stream =
