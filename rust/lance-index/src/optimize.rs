@@ -43,19 +43,21 @@ pub enum IndexHandling {
 /// To create a delta index with new data, write:
 ///
 /// ```rust
+/// # use lance_index::optimize::{OptimizeOptions, NewDataHandling, IndexHandling};
 /// OptimizeOptions {
 ///     new_data_handling: NewDataHandling::IndexAll,
-///     merge_index_options: MergeIndexOptions::NewDelta,
-/// }
+///     index_handling: IndexHandling::NewDelta,
+/// };
 /// ```
 ///
 /// To merge all existing indices without adding new data, write:
 ///
 /// ```rust
+/// # use lance_index::optimize::{OptimizeOptions, NewDataHandling, IndexHandling};
 /// OptimizeOptions {
 ///    new_data_handling: NewDataHandling::Ignore,
-///    merge_index_options: MergeIndexOptions::MergeAll,
-/// }
+///    index_handling: IndexHandling::MergeAll,
+/// };
 #[derive(Debug, Clone, PartialEq)]
 pub struct OptimizeOptions {
     /// How to handle new unindexed data.

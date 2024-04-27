@@ -613,7 +613,7 @@ mod tests {
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
-    use lance_linalg::distance::MetricType;
+    use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::{
         generate_random_array, some_indexable_batch, BatchGenerator, IncrementingInt32,
         RandomVector,
@@ -938,6 +938,7 @@ mod tests {
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
     }
+
     // Validate different NewDataHandling options for optimize_indices
     #[tokio::test]
     async fn test_optimize_index_data_handling() {
@@ -1021,15 +1022,14 @@ mod tests {
         assert_eq!(stats["num_indices"], 1);
     }
 
-    // TODO: Test more new data handling options
-    // TODO: test optimizing specific indices and specific fragments.
     #[tokio::test]
     async fn test_optimize_indices_target_frags() {
         // Create a table with 2 indices: scalar and vector index.
         let test_dir = tempdir().unwrap();
-        let vec = Box::new(RandomVector::new().named("vec"));
+        let vec1 = Box::new(RandomVector::new().named("vec1"));
+        let vec2 = Box::new(RandomVector::new().named("vec2"));
         let id = Box::new(IncrementingInt32::new().named("id"));
-        let mut data_generator = BatchGenerator::new().col(vec).col(id);
+        let mut data_generator = BatchGenerator::new().col(vec1).col(vec2).col(id);
         let data = data_generator.batch(1024);
         let mut dataset = Dataset::write(data, test_dir.path().to_str().unwrap(), None)
             .await
@@ -1039,9 +1039,25 @@ mod tests {
         let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
         dataset
             .create_index(
-                &["vec"],
+                &["vec1"],
                 IndexType::Vector,
-                Some("vec_idx".to_string()),
+                Some("pq_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        dataset
+            .create_index(
+                &["vec2"],
+                IndexType::Vector,
+                Some("hnsw_idx".to_string()),
                 &params,
                 false,
             )
@@ -1074,7 +1090,9 @@ mod tests {
                 .unwrap();
         }
 
-        for idx_name in &["vec_idx", "id_idx"] {
+        let idx_names = ["pq_idx", "hnsw_idx", "id_idx"];
+
+        for idx_name in idx_names {
             let stats: serde_json::Value =
                 serde_json::from_str(&dataset.index_statistics(idx_name).await.unwrap()).unwrap();
             assert_eq!(stats["num_indexed_fragments"], 3);
@@ -1084,23 +1102,22 @@ mod tests {
 
         // Validate we can merge just some of the indices, in one go.
         let indices = dataset.load_indices().await.unwrap();
-        let vec_idx = indices
+        let mut indices_to_merge = Vec::new();
+        for idx_name in idx_names {
+            // Use the first 2 index segments for each index.
+            indices_to_merge.extend(
+                indices
+                    .iter()
+                    .filter(|idx| idx.name == idx_name)
+                    .map(|idx| idx.uuid)
+                    .take(2),
+            );
+        }
+        let indices_to_keep = indices
             .iter()
-            .filter(|idx| idx.name == "vec_idx")
+            .filter(|idx| !indices_to_merge.contains(&idx.uuid))
             .map(|idx| idx.uuid)
             .collect::<Vec<_>>();
-        let id_idx = indices
-            .iter()
-            .filter(|idx| idx.name == "id_idx")
-            .map(|idx| idx.uuid)
-            .collect::<Vec<_>>();
-        // We will merge 2/3 from each index.
-        let indices_to_merge = vec_idx[0..2]
-            .iter()
-            .chain(id_idx[0..2].iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        let indices_to_keep = [vec_idx[2], id_idx[2]];
 
         dataset
             .optimize_indices(&OptimizeOptions {
@@ -1110,7 +1127,7 @@ mod tests {
             .await
             .unwrap();
 
-        for idx_name in &["vec_idx", "id_idx"] {
+        for idx_name in idx_names {
             let stats: serde_json::Value =
                 serde_json::from_str(&dataset.index_statistics(idx_name).await.unwrap()).unwrap();
             assert_eq!(stats["num_indexed_fragments"], 3);

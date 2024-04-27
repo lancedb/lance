@@ -886,7 +886,7 @@ impl Dataset {
                 options.index_handling = IndexHandling::NewDelta;
             }
         } else if let Ok(merge_indices_int) = merge_indices.extract::<usize>() {
-            options.index_handling = IndexHandling::MergeLatestN(merge_indices_int as usize);
+            options.index_handling = IndexHandling::MergeLatestN(merge_indices_int);
         } else if let Ok(merge_indices_ids) = merge_indices.extract::<Vec<String>>() {
             let index_ids = merge_indices_ids
                 .iter()

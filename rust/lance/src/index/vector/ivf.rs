@@ -296,8 +296,9 @@ pub(crate) async fn optimize_vector_indices(
         )
         .await?;
     } else {
+        // TODO: support HNSW-PQ
         return Err(Error::Index {
-            message: "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
+            message: "optimizing vector index: the sub index isn't PQ or HNSW-SQ".to_string(),
             location: location!(),
         });
     };

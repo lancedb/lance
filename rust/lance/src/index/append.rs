@@ -142,7 +142,7 @@ pub async fn merge_indices<'a>(
             };
 
             optimize_vector_indices(
-                &dataset,
+                dataset,
                 new_data_stream,
                 &column.name,
                 reference_index.as_ref(),
