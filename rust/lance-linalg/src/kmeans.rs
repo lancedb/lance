@@ -721,21 +721,34 @@ where
                 .enumerate()
                 .map(|(i, d)| (i as u32, d))
                 .collect::<Vec<_>>();
-            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            dists.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
             let min_dist = dists[0].1;
             if min_dist.is_nan() {
                 return None;
             }
-            let mut keep_length = 1;
-            while keep_length < max_replica
-                && keep_length < dists.len()
-                && dists[keep_length].1 < min_dist * replicate_factor
-            {
-                keep_length += 1;
+
+            let mut result = vec![dists[0].clone()];
+            for i in 1..dists.len() {
+                if result.len() >= max_replica {
+                    break;
+                }
+                
+                let (cluster, dist) = dists[i];
+                let cluster = cluster as usize;
+                let last_cluster = dists[i - 1].0 as usize;
+                let centroid_dist = l2_distance_batch(
+                    &centroids[cluster * dim..(cluster + 1) * dim],
+                    &centroids[last_cluster * dim..(last_cluster + 1) * dim],
+                    dim,
+                )
+                .next()
+                .unwrap();
+                if dist <= min_dist * replicate_factor && dist <= centroid_dist {
+                    result.push((cluster as u32, dist));
+                }
             }
 
-            dists.truncate(keep_length);
-            Some(dists)
+            Some(result)
         })
         .collect()
 }
