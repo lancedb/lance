@@ -16,12 +16,14 @@ package com.lancedb.lance;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
+import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowFileReader;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.SeekableReadChannel;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -99,6 +101,20 @@ public class TestUtils {
       FragmentMetadata metadata = createNewFragment(rowCount, rowCount);
       FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(metadata));
       return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
+    }
+    
+    public void validateScanResults(Dataset dataset, Scanner scanner, int totalRows, int batchRows)
+        throws IOException {
+      try (ArrowReader reader = scanner.scanBatches()) {
+        assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+        int rowcount = 0;
+        while (reader.loadNextBatch()) {
+          int currentRowCount = reader.getVectorSchemaRoot().getRowCount();
+          assertEquals(batchRows, currentRowCount);
+          rowcount += currentRowCount;
+        }
+        assertEquals(totalRows, rowcount);
+      }
     }
   }
 

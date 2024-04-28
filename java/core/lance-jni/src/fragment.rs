@@ -16,7 +16,6 @@ use arrow::array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StructAr
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::{DataType, Schema};
-use datafusion::logical_expr::Join;
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
@@ -25,8 +24,7 @@ use jni::{
 use snafu::{location, Location};
 use std::iter::once;
 
-use lance::dataset::{fragment::FileFragment, scanner::Scanner};
-use lance_io::ffi::to_ffi_arrow_array_stream;
+use lance::dataset::fragment::FileFragment;
 
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -242,51 +240,4 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
     let ffi_schema =
         Box::new(FFI_ArrowSchema::try_from(&schema).expect("Failed to convert schema"));
     Box::into_raw(ffi_schema) as jlong
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_openStream(
-    mut env: JNIEnv,
-    _reader: JObject,
-    jdataset: JObject,
-    fragment_id: jint,
-    columns: JObject,       // Optional<String[]>
-    substrait_filter_obj: JObject, // Optional<ByteBuffer>
-    filter_obj: JObject,    // Optional<String>
-    batch_size: jlong,
-    stream_addr: jlong,
-) {
-    let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
-    let dataset = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-                .expect("Dataset handle not set");
-        dataset.clone()
-    };
-    let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
-        env.throw("Fragment not found")
-            .expect("Throw exception failed");
-        return;
-    };
-    let mut scanner: Scanner = fragment.scan();
-    if let Some(cols) = columns {
-        ok_or_throw_without_return!(env, scanner.project(&cols));
-    };
-    let substrait = ok_or_throw_without_return!(env, env.get_bytes_opt(&substrait_filter_obj));
-    if let Some(substrait) = substrait {
-        ok_or_throw_without_return!(
-            env,
-            RT.block_on(async { scanner.filter_substrait(substrait).await })
-        );
-    }
-    let filter = ok_or_throw_without_return!(env, env.get_string_opt(&filter_obj));
-    if let Some(filter) = filter {
-        ok_or_throw_without_return!(env, scanner.filter(filter.as_str()));
-    }
-    scanner.batch_size(batch_size as usize);
-
-    let stream =
-        ok_or_throw_without_return!(env, RT.block_on(async { scanner.try_into_stream().await }));
-    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone()).unwrap();
-    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
 }

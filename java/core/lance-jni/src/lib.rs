@@ -19,12 +19,14 @@ use arrow::array::{RecordBatchIterator, RecordBatchReader};
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::Schema;
+use blocking_dataset::NATIVE_DATASET;
 use ffi::JNIEnvExt;
 use jni::objects::{JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use lance::dataset::transaction::Operation;
 use lance::table::format::Fragment;
+use lance_io::ffi::to_ffi_arrow_array_stream;
 use lazy_static::lazy_static;
 use snafu::{location, Location};
 use traits::IntoJava;
@@ -262,4 +264,58 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_countRows(
             as jint,
         Err(_) => -1,
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_openStream(
+    mut env: JNIEnv,
+    _reader: JObject,
+    jdataset: JObject,
+    fragment_id_obj: JObject,      // Optional<Integer>
+    columns: JObject,              // Optional<String[]>
+    substrait_filter_obj: JObject, // Optional<ByteBuffer>
+    filter_obj: JObject,           // Optional<String>
+    batch_size: jlong,
+    stream_addr: jlong,
+) {
+    let dataset = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Dataset handle not set");
+        dataset.clone()
+    };
+    let mut scanner = dataset.inner.scan();
+    let fragment_id_opt = ok_or_throw_without_return!(env, env.get_int_opt(&fragment_id_obj));
+    if let Some(fragment_id) = fragment_id_opt {
+        let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
+            env.throw_new(
+                "java/lang/RuntimeException",
+                format!("fragment id {fragment_id} not found"),
+            )
+            .expect("failed to throw java exception");
+            return;
+        };
+        scanner.with_fragments(vec![fragment.metadata().clone()]);
+    }
+    let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
+    if let Some(cols) = columns {
+        ok_or_throw_without_return!(env, scanner.project(&cols));
+    };
+    let substrait = ok_or_throw_without_return!(env, env.get_bytes_opt(&substrait_filter_obj));
+    if let Some(substrait) = substrait {
+        ok_or_throw_without_return!(
+            env,
+            RT.block_on(async { scanner.filter_substrait(substrait).await })
+        );
+    }
+    let filter = ok_or_throw_without_return!(env, env.get_string_opt(&filter_obj));
+    if let Some(filter) = filter {
+        ok_or_throw_without_return!(env, scanner.filter(filter.as_str()));
+    }
+    scanner.batch_size(batch_size as usize);
+
+    let stream =
+        ok_or_throw_without_return!(env, RT.block_on(async { scanner.try_into_stream().await }));
+    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone()).unwrap();
+    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
 }

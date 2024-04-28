@@ -16,14 +16,12 @@ use crate::ffi::JNIEnvExt;
 use crate::{traits::IntoJava, Error, Result, RT};
 use arrow::array::RecordBatchReader;
 use arrow::ffi::FFI_ArrowSchema;
-use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::Schema;
 use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::fragment::FileFragment;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{scanner::Scanner, Dataset, WriteParams};
-use lance_io::ffi::to_ffi_arrow_array_stream;
+use lance::dataset::{Dataset, WriteParams};
 use snafu::{location, Location};
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
@@ -147,47 +145,6 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
         std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
         std::mem::forget(c_schema);
     };
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_openStream(
-    mut env: JNIEnv,
-    _reader: JObject,
-    jdataset: JObject,
-    columns: JObject,       // Optional<String[]>
-    substrait_filter_obj: JObject, // Optional<ByteBuffer>
-    filter_obj: JObject,    // Optional<String>
-    batch_size: jlong,
-    stream_addr: jlong,
-) {
-    let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
-    let dataset = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-                .expect("Dataset handle not set");
-        dataset.clone()
-    };
-    let mut scanner: Scanner = dataset.inner.scan();
-    if let Some(cols) = columns {
-        ok_or_throw_without_return!(env, scanner.project(&cols));
-    };
-    let substrait = ok_or_throw_without_return!(env, env.get_bytes_opt(&substrait_filter_obj));
-    if let Some(substrait) = substrait {
-        ok_or_throw_without_return!(
-            env,
-            RT.block_on(async { scanner.filter_substrait(substrait).await })
-        );
-    }
-    let filter = ok_or_throw_without_return!(env, env.get_string_opt(&filter_obj));
-    if let Some(filter) = filter {
-        ok_or_throw_without_return!(env, scanner.filter(filter.as_str()));
-    }
-    scanner.batch_size(batch_size as usize);
-
-    let stream =
-        ok_or_throw_without_return!(env, RT.block_on(async { scanner.try_into_stream().await }));
-    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone()).unwrap();
-    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
 }
 
 #[no_mangle]

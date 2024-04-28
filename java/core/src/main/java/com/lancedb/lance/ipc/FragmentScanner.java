@@ -15,65 +15,44 @@
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.Dataset;
+import com.lancedb.lance.Utils;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.Optional;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.ScanOptions;
-import org.apache.arrow.dataset.scanner.ScanTask;
-import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /** Scanner over a Fragment. */
-public class FragmentScanner implements Scanner {
-  private final Dataset dataset;
+public class FragmentScanner extends DatasetScanner {
   private final int fragmentId;
-
-  private final ScanOptions options;
-  private final Optional<String> filter;
-
-  private final BufferAllocator allocator;
 
   /** Create FragmentScanner. */
   public FragmentScanner(
       Dataset dataset, int fragmentId, ScanOptions options,
       Optional<String> filter, BufferAllocator allocator) {
+    super(dataset, options, filter, allocator);
     Preconditions.checkArgument(!(options.getSubstraitFilter().isPresent() && filter.isPresent()), 
         "cannot set both substrait filter and string filter");
-    this.dataset = dataset;
     this.fragmentId = fragmentId;
-    this.options = options;
-    this.filter = filter;
-    this.allocator = allocator;
   }
 
   private static native long getSchema(Dataset dataset, int fragmentId, Optional<String[]> columns);
 
-  static native void openStream(Dataset dataset, int fragmentId, Optional<String[]> columns,
-      Optional<ByteBuffer> substraitFilter, Optional<String> filter,
-      long batchSize, long stream) throws IOException;
-
   @Override
   public ArrowReader scanBatches() {
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
-      openStream(dataset, fragmentId, options.getColumns(), options.getSubstraitFilter(), filter,
-          options.getBatchSize(), s.memoryAddress());
+      openStream(dataset, Optional.of(fragmentId), Utils.convert(options.getColumns()),
+          options.getSubstraitFilter(), filter, options.getBatchSize(), s.memoryAddress());
       return Data.importArrayStream(allocator, s);
     } catch (IOException e) {
       // TODO: handle IO exception?
       throw new RuntimeException(e);
     }
-  }
-
-  @Override
-  public Iterable<? extends ScanTask> scan() {
-    // Marked as deprecated in Scanner
-    throw new UnsupportedOperationException();
   }
 
   /** Get the schema of the Scanner. */
@@ -84,7 +63,4 @@ public class FragmentScanner implements Scanner {
       return Data.importSchema(allocator, schema, null);
     }
   }
-
-  @Override
-  public void close() throws Exception {}
 }

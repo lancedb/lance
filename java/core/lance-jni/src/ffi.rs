@@ -14,7 +14,8 @@
 
 use core::slice;
 
-use jni::objects::{JByteBuffer, JString};
+use jni::objects::{JByteBuffer, JObjectArray, JString};
+use jni::sys::jobjectArray;
 use jni::{objects::JObject, JNIEnv};
 
 use crate::Result;
@@ -26,6 +27,10 @@ pub trait JNIEnvExt {
 
     /// Get strings from Java List<String> object.
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>>;
+
+    /// Get strings from Java String[] object.
+    /// Note that get Option<Vec<String>> from Java Optional<String[]> just doesn't work.
+    fn get_strings_array(&mut self, obj: jobjectArray) -> Result<Vec<String>>;
 
     /// Get Option<String> from Java Optional<String>.
     fn get_string_opt(&mut self, obj: &JObject) -> Result<Option<String>>;
@@ -73,6 +78,17 @@ impl JNIEnvExt for JNIEnv<'_> {
             results.push(val.to_str()?.to_string())
         }
         Ok(results)
+    }
+
+    fn get_strings_array(&mut self, obj: jobjectArray) -> Result<Vec<String>> {
+        let jobject_array = unsafe { JObjectArray::from_raw(obj) };
+        let array_len = self.get_array_length(&jobject_array)?;
+        let mut res: Vec<String> = Vec::new();
+        for i in 0..array_len {
+            let item: JString = self.get_object_array_element(&jobject_array, i)?.into();
+            res.push(self.get_string(&item)?.into());
+        }
+        Ok(res)
     }
 
     fn get_string_opt(&mut self, obj: &JObject) -> Result<Option<String>> {

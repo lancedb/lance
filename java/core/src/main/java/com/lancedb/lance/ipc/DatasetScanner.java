@@ -15,8 +15,10 @@
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.Dataset;
+import com.lancedb.lance.Utils;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.Optional;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -30,12 +32,12 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 /** Scanner over a Fragment. */
 public class DatasetScanner implements Scanner {
-  private final Dataset dataset;
+  final Dataset dataset;
 
-  private final ScanOptions options;
-  private final Optional<String> filter;
+  final ScanOptions options;
+  final Optional<String> filter;
 
-  private final BufferAllocator allocator;
+  final BufferAllocator allocator;
 
   /** Create FragmentScanner. */
   public DatasetScanner(
@@ -49,13 +51,15 @@ public class DatasetScanner implements Scanner {
   private static native long getSchema(Dataset dataset, Optional<String[]> columns);
 
   static native void openStream(
-      Dataset dataset, Optional<String[]> columns, Optional<ByteBuffer> substraitFilter,
-      Optional<String> filter, long batchSize, long stream) throws IOException;
+      Dataset dataset, Optional<Integer> fragmentId, Optional<List<String>> columns,
+      Optional<ByteBuffer> substraitFilter, Optional<String> filter, long batchSize, long stream)
+      throws IOException;
 
   @Override
   public ArrowReader scanBatches() {
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
-      openStream(dataset, options.getColumns(), options.getSubstraitFilter(),
+      openStream(dataset, Optional.empty(), Utils.convert(options.getColumns()),
+          options.getSubstraitFilter(),
           filter, options.getBatchSize(), s.memoryAddress());
       return Data.importArrayStream(allocator, s);
     } catch (IOException e) {
