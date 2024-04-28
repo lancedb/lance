@@ -46,7 +46,7 @@ public class FragmentTest {
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         var fragment = dataset.getFragments().get(0);
-        try (Scanner scanner = fragment.newScan(new ScanOptions(batchRows), Optional.empty())) {
+        try (Scanner scanner = fragment.newScan(batchRows)) {
           testDataset.validateScanResults(dataset, scanner, totalRows, batchRows);
         }
       }
@@ -82,7 +82,7 @@ public class FragmentTest {
         var fragment = dataset.getFragments().get(0);
         ScanOptions scanOptions = new ScanOptions.Builder(batchRows)
             .columns(Optional.of(new String[]{"id"})).build();
-        try (Scanner scanner = fragment.newScan(scanOptions, Optional.empty())) {
+        try (Scanner scanner = fragment.newScan(scanOptions)) {
           try (ArrowReader reader = scanner.scanBatches()) {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
             int index = 0;

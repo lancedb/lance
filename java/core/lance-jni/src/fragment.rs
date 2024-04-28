@@ -215,14 +215,15 @@ pub extern "system" fn Java_com_lancedb_lance_DatasetFragment_countRowsNative(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
+pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_importFfiSchema(
     mut env: JNIEnv,
     _scanner: JObject,
     jdataset: JObject,
+    arrow_schema_addr: jlong,
     fragment_id: jint,
     columns: JObject, // Optional<String[]>
-) -> jlong {
-    let columns = ok_or_throw_with_return!(env, env.get_strings_opt(&columns), -1);
+) {
+    let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
 
     let res = {
         let dataset =
@@ -230,14 +231,16 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
                 .expect("Dataset handle not set");
         dataset.clone()
     };
-    let scanner = ok_or_throw_with_return!(
+    let scanner = ok_or_throw_without_return!(
         env,
-        RT.block_on(async { FragmentScanner::try_open(&res, fragment_id as usize).await }),
-        0
+        RT.block_on(async { FragmentScanner::try_open(&res, fragment_id as usize).await })
     );
 
-    let schema = ok_or_throw_with_return!(env, scanner.schema(columns), 0);
-    let ffi_schema =
-        Box::new(FFI_ArrowSchema::try_from(&schema).expect("Failed to convert schema"));
-    Box::into_raw(ffi_schema) as jlong
+    let schema = ok_or_throw_without_return!(env, scanner.schema(columns));
+    let c_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&schema));
+    let out_c_schema = arrow_schema_addr as *mut FFI_ArrowSchema;
+    unsafe {
+        std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
+        std::mem::forget(c_schema);
+    };
 }

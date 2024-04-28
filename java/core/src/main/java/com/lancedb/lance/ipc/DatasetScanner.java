@@ -48,7 +48,8 @@ public class DatasetScanner implements Scanner {
     this.allocator = allocator;
   }
 
-  private static native long getSchema(Dataset dataset, Optional<String[]> columns);
+  private static native void importFfiSchema(Dataset dataset, long arrowSchemaMemoryAddress,
+      Optional<String[]> columns);
 
   static native void openStream(
       Dataset dataset, Optional<Integer> fragmentId, Optional<List<String>> columns,
@@ -77,9 +78,9 @@ public class DatasetScanner implements Scanner {
   /** Get the schema of the Scanner. */
   @Override
   public Schema schema() {
-    long address = getSchema(dataset, options.getColumns());
-    try (ArrowSchema schema = ArrowSchema.wrap(address)) {
-      return Data.importSchema(allocator, schema, null);
+    try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+      importFfiSchema(dataset, ffiArrowSchema.memoryAddress(), options.getColumns());
+      return Data.importSchema(allocator, ffiArrowSchema, null);
     }
   }
 

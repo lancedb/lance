@@ -141,7 +141,33 @@ public class Dataset implements Closeable {
   public static native Dataset commitAppend(String path, Optional<Long> readVersion,
       List<String> fragmentsMetadata);
 
-  /** Create a new Dataset Scanner. */
+  /**
+   * Create a new Dataset Scanner.
+   *
+   * @param batchSize the scan options with batch size, columns filter, and substrait
+   * @return a dataset scanner
+   */
+  public Scanner newScan(long batchSize) {
+    return newScan(new ScanOptions(batchSize), Optional.empty());
+  }
+
+  /**
+   * Create a new Dataset Scanner.
+   *
+   * @param options the scan options
+   * @return a dataset scanner
+   */
+  public Scanner newScan(ScanOptions options) {
+    return newScan(options, Optional.empty());
+  }
+
+  /**
+   * Create a new Dataset Scanner.
+   *
+   * @param options the scan options with batch size, columns filter, and substrait
+   * @param filter the string filter e.g. id > 20
+   * @return a dataset scanner
+   */
   public Scanner newScan(ScanOptions options, Optional<String> filter) {
     return new DatasetScanner(this, options, filter, allocator);
   }

@@ -13,10 +13,9 @@
 // limitations under the License.
 
 use crate::ffi::JNIEnvExt;
+use crate::utils::import_ffi_schema;
 use crate::{traits::IntoJava, Error, Result, RT};
 use arrow::array::RecordBatchReader;
-use arrow::ffi::FFI_ArrowSchema;
-use arrow_schema::Schema;
 use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::fragment::FileFragment;
@@ -128,50 +127,23 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_getJsonFragments<'a>(
 
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
-    mut env: JNIEnv,
+    env: JNIEnv,
     jdataset: JObject,
     arrow_schema_addr: jlong,
 ) {
-    let schema = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-                .expect("Failed to get native dataset handle");
-        Schema::from(dataset.inner.schema())
-    };
-    let out_c_schema = arrow_schema_addr as *mut FFI_ArrowSchema;
-    let c_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&schema));
-
-    unsafe {
-        std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
-        std::mem::forget(c_schema);
-    };
+    import_ffi_schema(env, jdataset, arrow_schema_addr, None)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_getSchema(
+pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_importFfiSchema(
     mut env: JNIEnv,
     _scanner: JObject,
     jdataset: JObject,
+    arrow_schema_addr: jlong,
     columns: JObject, // Optional<String[]>
-) -> jlong {
-    let columns = ok_or_throw_with_return!(env, env.get_strings_opt(&columns), -1);
-
-    let res = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-                .expect("Dataset handle not set");
-        dataset.clone()
-    };
-    let ds_schema = res.inner.schema();
-    let schema = if let Some(columns) = columns {
-        ok_or_throw_with_return!(env, ds_schema.project(&columns), -1)
-    } else {
-        ds_schema.clone()
-    };
-    let arrow_schema: arrow::datatypes::Schema = (&schema).into();
-    let ffi_schema =
-        Box::new(FFI_ArrowSchema::try_from(&arrow_schema).expect("Failed to convert schema"));
-    Box::into_raw(ffi_schema) as jlong
+) {
+    let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
+    import_ffi_schema(env, jdataset, arrow_schema_addr, columns);
 }
 
 fn create_json_fragment_list<'a>(

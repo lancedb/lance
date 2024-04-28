@@ -34,14 +34,41 @@ public class DatasetFragment {
     this.metadata = metadata;
   }
 
+  /**
+   * Create a new Fragment Scanner.
+   *
+   * @param batchSize the scan options with batch size, columns filter, and substrait
+   * @return a fragment scanner
+   */
+  public Scanner newScan(long batchSize) {
+    return newScan(new ScanOptions(batchSize), Optional.empty());
+  }
+
+  /**
+   * Create a new Fragment Scanner.
+   *
+   * @param options the scan options
+   * @return a fragment scanner
+   */
+  public Scanner newScan(ScanOptions options) {
+    return newScan(options, Optional.empty());
+  }
+
+  /**
+   * Create a new Fragment Scanner.
+   *
+   * @param options the scan options with batch size, columns filter, and substrait
+   * @param filter the string filter e.g. id > 20
+   * @return a fragment scanner
+   */
+  public Scanner newScan(ScanOptions options, Optional<String> filter) {
+    return new FragmentScanner(dataset, metadata.getId(), options, filter, dataset.allocator);
+  }
+
   private native int countRowsNative(Dataset dataset, long fragmentId);
 
   public int getId() {
     return metadata.getId();
-  }
-
-  public String toString() {
-    return String.format("Fragment(%s)", metadata.getJsonMetadata());
   }
 
   /** Count rows in this Fragment. */
@@ -49,8 +76,7 @@ public class DatasetFragment {
     return countRowsNative(dataset, metadata.getId());
   }
 
-  /** Create a new Fragment Scanner. */
-  public Scanner newScan(ScanOptions options, Optional<String> filter) {
-    return new FragmentScanner(dataset, metadata.getId(), options, filter, dataset.allocator);
+  public String toString() {
+    return String.format("Fragment(%s)", metadata.getJsonMetadata());
   }
 }

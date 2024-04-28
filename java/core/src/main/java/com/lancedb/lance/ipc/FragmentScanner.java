@@ -41,7 +41,8 @@ public class FragmentScanner extends DatasetScanner {
     this.fragmentId = fragmentId;
   }
 
-  private static native long getSchema(Dataset dataset, int fragmentId, Optional<String[]> columns);
+  private static native void importFfiSchema(Dataset dataset, long arrowSchemaMemoryAddress,
+      int fragmentId, Optional<String[]> columns);
 
   @Override
   public ArrowReader scanBatches() {
@@ -58,9 +59,9 @@ public class FragmentScanner extends DatasetScanner {
   /** Get the schema of the Scanner. */
   @Override
   public Schema schema() {
-    long address = getSchema(dataset, fragmentId, options.getColumns());
-    try (ArrowSchema schema = ArrowSchema.wrap(address)) {
-      return Data.importSchema(allocator, schema, null);
+    try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+      importFfiSchema(dataset, ffiArrowSchema.memoryAddress(), fragmentId, options.getColumns());
+      return Data.importSchema(allocator, ffiArrowSchema, null);
     }
   }
 }

@@ -116,7 +116,7 @@ public class DatasetTest {
       int totalRows = 40;
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        Scanner scanner = dataset.newScan(new ScanOptions(batchRows), Optional.empty());
+        Scanner scanner = dataset.newScan(batchRows);
         testDataset.validateScanResults(dataset, scanner, totalRows, batchRows);
       }
     }
@@ -150,7 +150,7 @@ public class DatasetTest {
         var fragment = dataset.getFragments().get(0);
         ScanOptions scanOptions = new ScanOptions.Builder(batchRows)
             .columns(Optional.of(new String[]{"id"})).build();
-        try (Scanner scanner = fragment.newScan(scanOptions, Optional.empty())) {
+        try (Scanner scanner = fragment.newScan(scanOptions)) {
           try (ArrowReader reader = scanner.scanBatches()) {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
             int index = 0;
