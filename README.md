@@ -54,6 +54,16 @@ The key features of Lance include:
 pip install pylance
 ```
 
+To install a preview release:
+
+```shell
+pip install --pre --repo https://pypi.fury.io/lancedb/ pylance
+```
+
+> [!TIP]
+> Preview releases are released more often than full releases and contain the
+> latest features and bug fixes. They receive the same level of testing as full releases.
+
 **Converting to Lance**
 
 ```python
