@@ -41,9 +41,9 @@ jobs:
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
           python ci/setup_version.py $TAG
-          echo "::set-output name=repo::fury"
+          echo "repo=fury" >> $GITHUB_OUTPUT
         else
-          echo "::set-output name=repo::pypi"
+          echo "repo=pypi" >> $GITHUB_OUTPUT
         fi
     - uses: ./.github/workflows/build_linux_wheel
       with:
@@ -87,9 +87,9 @@ jobs:
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
           python ci/setup_version.py $TAG
-          echo "::set-output name=repo::fury"
+          echo "repo=fury" >> $GITHUB_OUTPUT
         else
-          echo "::set-output name=repo::pypi"
+          echo "repo=pypi" >> $GITHUB_OUTPUT
         fi
     - uses: ./.github/workflows/build_mac_wheel
       with:
@@ -124,9 +124,9 @@ jobs:
           if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
             TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
             python ci/setup_version.py $TAG
-            echo "::set-output name=repo::fury"
+            echo "repo=fury" >> $GITHUB_OUTPUT
           else
-            echo "::set-output name=repo::pypi"
+            echo "repo=pypi" >> $GITHUB_OUTPUT
           fi
       - uses: ./.github/workflows/build_windows_wheel
         with:

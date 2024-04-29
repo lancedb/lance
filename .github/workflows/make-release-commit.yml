@@ -75,7 +75,7 @@ jobs:
         fi
 
         git tag $TAG
-        echo "::set-output name=tag::$TAG"
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
     - name: Push new version tag
       if: ${{ inputs.dry_run }} == "false"
       uses: ad-m/github-push-action@master
