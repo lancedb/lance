@@ -401,6 +401,7 @@ mod tests {
             value,
             json!({
                 "id": 123,
+                "blobs": [],
                 "files":[
                     {"path": "foobar.lance", "fields": [0], "column_indices": [], "file_major_version": 0, "file_minor_version": 0}],
                      "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
