@@ -33,6 +33,18 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: 3.${{ matrix.python-minor-version }}
+    - name: Handle tag
+      id: handle_tag
+      run: |
+        # If the tag ends with -beta.N, we need to call setup_version.py 
+        # and export repo as "fury" instead of "pypi"
+        if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
+          TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
+          python setup.py $TAG
+          echo "::set-output name=repo::fury"
+        else
+          echo "::set-output name=repo::pypi"
+        fi
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
@@ -41,8 +53,9 @@ jobs:
         manylinux: ${{ matrix.config.manylinux }}
     - uses: ./.github/workflows/upload_wheel
       with:
-        token: ${{ secrets.PYPI_TOKEN }}
-        repo: "pypi"
+        pypi_token: ${{ secrets.PYPI_TOKEN }}
+        fury_token: ${{ secrets.FURY_TOKEN }}
+        repo: ${{ steps.handle_tag.outputs.repo }}
   mac:
     timeout-minutes: 60
     runs-on: ${{ matrix.config.runner }}
@@ -66,15 +79,27 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: 3.12
+    - name: Handle tag
+      id: handle_tag
+      run: |
+        # If the tag ends with -beta.N, we need to call setup_version.py 
+        # and export repo as "fury" instead of "pypi"
+        if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
+          TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
+          python setup.py $TAG
+          echo "::set-output name=repo::fury"
+        else
+          echo "::set-output name=repo::pypi"
+        fi
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release --strip --target ${{ matrix.config.target }} --features fp16kernels"
     - uses: ./.github/workflows/upload_wheel
       with:
-        python-minor-version: ${{ matrix.python-minor-version }}
-        token: ${{ secrets.PYPI_TOKEN }}
-        repo: "pypi"
+        pypi_token: ${{ secrets.PYPI_TOKEN }}
+        fury_token: ${{ secrets.FURY_TOKEN }}
+        repo: ${{ steps.handle_tag.outputs.repo }}
   windows:
     timeout-minutes: 60
     runs-on: windows-latest
@@ -91,6 +116,18 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: 3.${{ matrix.python-minor-version }}
+      - name: Handle tag
+        id: handle_tag
+        run: |
+          # If the tag ends with -beta.N, we need to call setup_version.py 
+          # and export repo as "fury" instead of "pypi"
+          if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
+            TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
+            python setup.py $TAG
+            echo "::set-output name=repo::fury"
+          else
+            echo "::set-output name=repo::pypi"
+          fi
       - uses: ./.github/workflows/build_windows_wheel
         with:
           python-minor-version: ${{ matrix.python-minor-version }}
@@ -98,6 +135,6 @@ jobs:
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
       - uses: ./.github/workflows/upload_wheel
         with:
-          python-minor-version: ${{ matrix.python-minor-version }}
-          token: ${{ secrets.PYPI_TOKEN }}
-          repo: "pypi"
+          pypi_token: ${{ secrets.PYPI_TOKEN }}
+          fury_token: ${{ secrets.FURY_TOKEN }}
+          repo: ${{ steps.handle_tag.outputs.repo }}

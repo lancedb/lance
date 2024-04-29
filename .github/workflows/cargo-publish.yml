@@ -2,7 +2,9 @@ name: Publish Rust crate
 
 on:
   release:
-    types: [published]
+    # Use released instead of published, since we don't publish preview/beta
+    # versions. Users instead install them from the git repo.
+    types: [released]
 
 env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache

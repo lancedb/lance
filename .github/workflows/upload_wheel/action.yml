@@ -8,10 +8,18 @@ inputs:
   repo:
     required: false
     description: "pypi or testpypi"
+    type: choice
+    options:
+      - "pypi"
+      - "testpypi"
+      - "fury"
     default: "pypi"
-  token:
+  pypi_token:
     required: true
     description: "release token for the repo"
+  fury_token:
+    required: true
+    description: "release token for the fury repo"
 
 runs:
   using: "composite"
@@ -21,10 +29,24 @@ runs:
     run: |
       python -m pip install --upgrade pip
       pip install twine
-  - name: Build and publish
+  - name: Publish to PyPI
     working-directory: python
     env:
       TWINE_USERNAME: __token__
       TWINE_PASSWORD: ${{ inputs.token }}
     shell: bash
-    run: twine upload --repository ${{ inputs.repo }} target/wheels/pylance-*.whl
+    run: |
+      if [ ${{ inputs.repo }} == "fury" ]; then
+        REPO=https://pypi.fury.io/lancedb/
+        # For some reason, they use the token as the username
+        USERNAME=${{ inputs.fury_token }}
+      else
+        REPO=${{ inputs.repo }}
+        USERNAME=__token__
+        PASSWORD=${{ inputs.pypi_token }}
+      fi
+
+      twine upload --repository $REPO \
+        --username $USERNAME \
+        --password $PASSWORD \
+        target/wheels/pylance-*.whl
