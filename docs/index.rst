@@ -33,7 +33,7 @@ For the latest features and bug fixes, you can install the preview version:
 
 .. code-block:: bash
 
-    pip install --pre --repo https://pypi.fury.io/lancedb/ pylance
+    pip install --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance
 
 Preview releases receive the same level of testing as regular releases.
 
