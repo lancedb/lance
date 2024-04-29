@@ -40,7 +40,7 @@ jobs:
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
-          python setup.py $TAG
+          python ci/setup_version.py $TAG
           echo "::set-output name=repo::fury"
         else
           echo "::set-output name=repo::pypi"
@@ -86,7 +86,7 @@ jobs:
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
-          python setup.py $TAG
+          python ci/setup_version.py $TAG
           echo "::set-output name=repo::fury"
         else
           echo "::set-output name=repo::pypi"
@@ -123,7 +123,7 @@ jobs:
           # and export repo as "fury" instead of "pypi"
           if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
             TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
-            python setup.py $TAG
+            python ci/setup_version.py $TAG
             echo "::set-output name=repo::fury"
           else
             echo "::set-output name=repo::pypi"

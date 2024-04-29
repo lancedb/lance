@@ -2,7 +2,7 @@
 
 We create a full release of Lance up to every 4 weeks. In between full releases,
 we make preview releases of the latest features and bug fixes, which are hosted
-on fury.io. This allows us to release frequency and get feedback on new features
+on fury.io. This allows us to release frequently and get feedback on new features
 while keeping under the PyPI project size limits.
 
 ## Make a preview release
@@ -14,7 +14,11 @@ use the default parameters.
 
 This will create a tag on the current main with format `vX.Y.Z-beta.N`. After
 creating the tag, the action will create a GitHub release for the new tag.
-Once that release is published, it will trigger publish jobs for Rust and Python.
+Once that release is published, it will trigger publish jobs for Python.
+
+> [!NOTE]  
+> Preview releases are not published to crates.io, since Rust is a source
+> distribution. Users can simply point to the tag on GitHub in their `Cargo.toml`.
 
 ## Make a full release
 
