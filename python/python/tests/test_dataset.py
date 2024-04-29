@@ -1657,3 +1657,51 @@ def test_v2_dataset(tmp_path: Path):
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
     assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+
+
+def test_blobs(tmp_path: Path):
+    import os
+
+    os.environ["LANCE_USE_BLOBS"] = "1"
+    try:
+        table = pa.table(
+            {"blobs": pa.array([b"foo", b"bar", b"baz"], pa.large_binary())}
+        )
+        dataset = lance.write_dataset(table, tmp_path)
+        batch = next(dataset.to_batches())
+        blob_descriptors = batch["blobs"]
+        blobs = dataset.open_blobs(blob_descriptors)
+        assert blobs[0].read() == b"foo"
+        assert blobs[1].read(1) == b"b"
+        assert blobs[1].read(5) == b"ar"
+        assert blobs[2].read(1) == b"b"
+        assert blobs[2].read(1) == b"a"
+        assert blobs[2].read(1) == b"z"
+        blobs[0].close()
+        blobs[1].close()
+        blobs[2].close()
+        with pytest.raises(ValueError):
+            blobs[0].read()
+
+        frag = dataset.get_fragments()[0]
+        assert len(frag.blob_files()) == 1
+
+        # Write again, then compact, blobs should still be readable
+        dataset = lance.write_dataset(table, tmp_path, mode="append")
+        assert len(dataset.get_fragments()) == 2
+        assert len(dataset.get_fragments()[0].blob_files()) == 1
+        assert len(dataset.get_fragments()[1].blob_files()) == 1
+
+        dataset.optimize.compact_files()
+
+        assert len(dataset.get_fragments()) == 1
+        # TODO: Fragment->Blob file mapping is not preserved after compaction
+        # To fix in https://github.com/lancedb/lance/issues/2268
+        # assert len(dataset.get_fragments()[0].blob_files()) == 2
+        batch = next(dataset.to_batches())
+        assert batch.num_rows == 6
+        blobs = dataset.open_blobs(batch["blobs"])
+        assert blobs[0].read() == b"foo"
+        assert blobs[3].read() == b"foo"
+    finally:
+        del os.environ["LANCE_USE_BLOBS"]

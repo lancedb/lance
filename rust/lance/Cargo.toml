@@ -28,6 +28,7 @@ lance-table = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
@@ -91,6 +92,7 @@ approx.workspace = true
 dirs = "5.0.0"
 all_asserts = "2.3.1"
 mock_instant.workspace = true
+rstest = { version = "0.19" }
 lance-testing = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger = "0.10.0"

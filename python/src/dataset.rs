@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
+use arrow_array::{make_array, Float32Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -26,6 +26,7 @@ use chrono::Duration;
 
 use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
+use lance::dataset::blob::BlobExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::validate_operation;
 use lance::dataset::ColumnAlteration;
@@ -68,9 +69,11 @@ use crate::schema::LanceSchema;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
+use self::blob::BlobReader;
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
 
+pub mod blob;
 pub mod cleanup;
 pub mod commit;
 pub mod optimize;
@@ -668,6 +671,18 @@ impl Dataset {
         let stream = self.ds.take_scan(slice_stream, projection, batch_readahead);
 
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
+    }
+
+    pub fn open_blobs(&mut self, blobs: PyArrowType<ArrayData>) -> PyResult<Vec<Option<BlobReader>>> {
+        let blobs_arr = make_array(blobs.0);
+        let lance_blobs = RT
+            .runtime
+            .block_on(self.ds.open_blobs(blobs_arr.as_ref()))
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(lance_blobs
+            .into_iter()
+            .map(|b| b.map(BlobReader::new))
+            .collect())
     }
 
     fn alter_columns(&mut self, alterations: &PyList) -> PyResult<()> {

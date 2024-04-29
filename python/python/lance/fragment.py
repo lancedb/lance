@@ -479,6 +479,10 @@ class LanceFragment(pa.dataset.Fragment):
 
         return self._fragment.data_files()
 
+    def blob_files(self):
+        """Return the blob files referenced by this fragment."""
+        return self._fragment.blob_files()
+
     def deletion_file(self):
         """Return the deletion file, if any"""
         return self._fragment.deletion_file()

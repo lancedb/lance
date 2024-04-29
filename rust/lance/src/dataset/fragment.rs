@@ -404,7 +404,7 @@ impl FileFragment {
                 Ok(None)
             }
         } else {
-            if schema_per_file.fields.len() != data_file.fields.len() {
+            if schema_per_file.fields_pre_order().count() != data_file.fields.len() {
                 todo!("support for projection in v2")
             }
             if schema_per_file.fields.is_empty() {

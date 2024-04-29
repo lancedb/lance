@@ -41,6 +41,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
+pub mod blob;
 pub mod builder;
 pub mod cleanup;
 mod feature_flags;
@@ -61,7 +62,7 @@ use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_datas
 use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
-use self::write::write_fragments_internal;
+use self::write::{deblob_schema, write_fragments_internal};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
@@ -80,6 +81,7 @@ pub use write::{write_fragments, WriteMode, WriteParams};
 const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
+pub const BLOB_DIR: &str = "blobs";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
@@ -404,7 +406,7 @@ impl Dataset {
             Err(e) => return Err(e),
         };
 
-        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let (batches, mut schema) = peek_reader_schema(Box::new(batches)).await?;
         let stream = reader_to_stream(batches);
 
         // Running checks for the different write modes
@@ -445,6 +447,9 @@ impl Dataset {
             )
         };
 
+        deblob_schema(&mut schema);
+        let mut schema_ref = &schema;
+
         // append + input schema different from existing schema = error
         if matches!(params.mode, WriteMode::Append) {
             if let Some(d) = dataset.as_ref() {
@@ -456,6 +461,9 @@ impl Dataset {
                         ..Default::default()
                     },
                 )?;
+                // If appending, use the existing dataset schema in the file
+                // writer to preserve field ids / metadata / dictionary information
+                schema_ref = d.schema();
             }
         }
 
@@ -478,7 +486,7 @@ impl Dataset {
             dataset.as_ref(),
             object_store.clone(),
             &base,
-            &schema,
+            schema_ref,
             stream,
             params.clone(),
         )
@@ -560,8 +568,10 @@ impl Dataset {
             });
         }
 
-        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let (batches, mut schema) = peek_reader_schema(Box::new(batches)).await?;
         let stream = reader_to_stream(batches);
+
+        deblob_schema(&mut schema);
 
         // Return Error if append and input schema differ
         self.manifest.schema.check_compatible(
@@ -576,7 +586,7 @@ impl Dataset {
             Some(self),
             self.object_store.clone(),
             &self.base,
-            &schema,
+            &self.manifest.schema,
             stream,
             params.clone(),
         )
@@ -1345,6 +1355,10 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
+    pub(crate) fn blob_dir(&self) -> Path {
+        self.base.child(BLOB_DIR)
+    }
+
     pub(crate) fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
     }
@@ -2085,6 +2099,7 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::TestDatasetGenerator;
 
+    use arrow::array::LargeBinaryBuilder;
     use arrow_array::types::Int64Type;
     use arrow_array::{
         builder::StringDictionaryBuilder, cast::as_string_array, types::Int32Type, ArrayRef,
@@ -2096,6 +2111,7 @@ mod tests {
     use arrow_schema::{Field, Fields as ArrowFields, Schema as ArrowSchema};
     use half::f16;
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+    use lance_core::utils::testing::EnvGuard;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
@@ -4584,6 +4600,7 @@ mod tests {
                 if fragment_id == 0 {
                     Ok(Some(Fragment {
                         files: vec![],
+                        blobs: vec![],
                         id: 0,
                         deletion_file: None,
                         physical_rows: Some(50),
@@ -4973,5 +4990,34 @@ mod tests {
         assert!(res.is_err());
 
         assert!(!dataset_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_blobs() {
+        let _guard = EnvGuard::new("LANCE_USE_BLOBS", "1");
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut my_blobs_builder = LargeBinaryBuilder::with_capacity(3, 10);
+        my_blobs_builder.append_value([0, 1, 2]);
+        my_blobs_builder.append_value([3, 4]);
+        my_blobs_builder.append_value([5, 6, 7, 8, 9]);
+        let my_blobs = Arc::new(my_blobs_builder.finish());
+        let with_blobs_schema =
+            ArrowSchema::new(vec![Field::new("my_blob", DataType::LargeBinary, true)]);
+        let batch = RecordBatch::try_new(Arc::new(with_blobs_schema), vec![my_blobs]).unwrap();
+        let schema = batch.schema();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                use_experimental_writer: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
     }
 }

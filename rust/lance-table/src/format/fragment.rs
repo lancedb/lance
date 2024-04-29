@@ -163,6 +163,32 @@ impl From<&pb::DeletionFile> for DeletionFile {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobFile {
+    /// Path to the blob file (relative to the dataset)
+    pub path: String,
+    /// Number of items in the blob file
+    pub num_items: u32,
+}
+
+impl From<&pb::BlobFile> for BlobFile {
+    fn from(value: &pb::BlobFile) -> Self {
+        Self {
+            path: value.path.clone(),
+            num_items: value.num_items,
+        }
+    }
+}
+
+impl From<&BlobFile> for pb::BlobFile {
+    fn from(value: &BlobFile) -> Self {
+        Self {
+            path: value.path.clone(),
+            num_items: value.num_items,
+        }
+    }
+}
+
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -174,6 +200,9 @@ pub struct Fragment {
 
     /// Files within the fragment.
     pub files: Vec<DataFile>,
+
+    /// Blob files referenced by the fragment's data files.
+    pub blobs: Vec<BlobFile>,
 
     /// Optional file with deleted row ids.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,6 +221,7 @@ impl Fragment {
             files: vec![],
             deletion_file: None,
             physical_rows: None,
+            blobs: vec![],
         }
     }
 
@@ -226,6 +256,7 @@ impl Fragment {
         Self {
             id,
             files: vec![DataFile::new_legacy(path, schema)],
+            blobs: vec![],
             deletion_file: None,
             physical_rows,
         }
@@ -261,6 +292,7 @@ impl From<&pb::DataFragment> for Fragment {
         };
         Self {
             id: p.id,
+            blobs: p.blobs.iter().map(BlobFile::from).collect(),
             files: p.files.iter().map(DataFile::from).collect(),
             deletion_file: p.deletion_file.as_ref().map(DeletionFile::from),
             physical_rows,
@@ -284,6 +316,7 @@ impl From<&Fragment> for pb::DataFragment {
         });
         Self {
             id: f.id,
+            blobs: f.blobs.iter().map(pb::BlobFile::from).collect(),
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,

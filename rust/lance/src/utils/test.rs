@@ -208,6 +208,7 @@ impl TestDatasetGenerator {
         Fragment {
             id: 0,
             files,
+            blobs: vec![],
             deletion_file: None,
             physical_rows: Some(batch.num_rows()),
         }

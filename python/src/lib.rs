@@ -29,6 +29,7 @@ use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
+use dataset::blob::BlobReader;
 use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
@@ -72,7 +73,7 @@ use crate::utils::KMeans;
 pub use dataset::write_dataset;
 pub use dataset::{Dataset, Operation};
 pub use fragment::FragmentMetadata;
-use fragment::{DataFile, FileFragment};
+use fragment::{BlobFile, DataFile, FileFragment};
 pub use reader::LanceReader;
 pub use scanner::Scanner;
 
@@ -117,6 +118,8 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<LanceColumnMetadata>()?;
     m.add_class::<LancePageMetadata>()?;
     m.add_class::<LanceBufferDescriptor>()?;
+    m.add_class::<BlobFile>()?;
+    m.add_class::<BlobReader>()?;
     m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;

@@ -61,6 +61,12 @@ pub struct FileWriterOptions {
     pub keep_original_array: Option<bool>,
 }
 
+/// Writes Lance files from data
+///
+/// Unlike the reader, the FileWriter is aware of the concept of field ids.  While writing
+/// a batch it will keep track of a field id to column index map which will be returned when
+/// the writer is finished.  This can be used for later reading to map field ids to the correct
+/// column.
 pub struct FileWriter {
     writer: ObjectWriter,
     path: String,

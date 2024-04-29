@@ -595,7 +595,11 @@ impl FieldEncoder for StructFieldEncoder {
     }
 
     fn num_columns(&self) -> u32 {
-        self.children.len() as u32 + 1
+        self.children
+            .iter()
+            .map(|child| child.num_columns())
+            .sum::<u32>()
+            + 1
     }
 }
 

@@ -444,7 +444,7 @@ impl Schema {
             .for_each(|f| f.set_id(-1, &mut current_id));
     }
 
-    fn reset_id(&mut self) {
+    pub fn reset_id(&mut self) {
         self.fields.iter_mut().for_each(|f| f.reset_id());
     }
 

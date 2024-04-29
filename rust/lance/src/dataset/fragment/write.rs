@@ -19,6 +19,7 @@ use snafu::{location, Location};
 use uuid::Uuid;
 
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::write::deblob_schema;
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
 use crate::Result;
 
@@ -115,18 +116,21 @@ impl<'a> FragmentCreateBuilder<'a> {
         &self,
         reader: Box<dyn RecordBatchReader + Send>,
     ) -> Result<(SendableRecordBatchStream, Schema)> {
-        if let Some(schema) = self.schema {
+        if let Some(mut schema) = self.schema.cloned() {
+            deblob_schema(&mut schema);
             // Just wrap the stream and use as usual.
             let stream = reader_to_stream(reader);
 
             return Ok((stream, schema.clone()));
         } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append)) {
             if let Some(schema) = self.existing_dataset_schema().await? {
+                // No need to deblob here
                 return Ok((reader_to_stream(reader), schema));
             }
         }
         // Infer the schema from the first batch.
-        let (reader, schema) = peek_reader_schema(reader).await?;
+        let (reader, mut schema) = peek_reader_schema(reader).await?;
+        deblob_schema(&mut schema);
         let stream = reader_to_stream(reader);
         Ok((stream, schema))
     }

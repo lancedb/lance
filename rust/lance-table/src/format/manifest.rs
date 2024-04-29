@@ -562,6 +562,7 @@ mod tests {
             Fragment {
                 id: 0,
                 files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
+                blobs: vec![],
                 deletion_file: None,
                 physical_rows: None,
             },
@@ -571,6 +572,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 43]),
                     DataFile::new_legacy_from_fields("path3", vec![2]),
                 ],
+                blobs: vec![],
                 deletion_file: None,
                 physical_rows: None,
             },

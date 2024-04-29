@@ -171,6 +171,14 @@ message DataFragment {
   // the current number of rows, subtract `deletion_file.num_deleted_rows` from
   // this value.
   uint64 physical_rows = 4;
+
+  // Blob files that are referenced by the fragment.
+  //
+  // A fragment may reference multiple blob files.
+  // Multiple fragments may reference the same blob file (e.g. when two fragments
+  // are compacted into a third combined fragment both the original fragment and the
+  // combined fragment will reference the same blob files).
+  repeated BlobFile blobs = 5;
 }
 
 // Lance Data File
@@ -243,6 +251,13 @@ message DataFile {
   // then this is a version 0.1 or version 0.2 file.
   uint32 file_minor_version = 5;
 } // DataFile
+
+message BlobFile {
+  // Path to the file (relative to the dataset root).
+  string path = 1;
+  // The number of items in the file.
+  uint32 num_items = 2;
+}
 
 // Deletion File
 //

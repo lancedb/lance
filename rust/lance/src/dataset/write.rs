@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::{DataType, Field as ArrowField, Fields};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{
+    datatypes::{Field, Schema},
+    Error, Result,
+};
 use lance_datafusion::chunker::chunk_stream;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
@@ -17,6 +22,7 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::manifest::ManifestDescribing;
+use log::warn;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -24,9 +30,12 @@ use uuid::Uuid;
 
 use crate::Dataset;
 
-use super::builder::DatasetBuilder;
-use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::DATA_DIR;
+use super::{blob::BlobWriter, builder::DatasetBuilder};
+use super::{
+    progress::{NoopFragmentWriteProgress, WriteFragmentProgress},
+    BLOB_DIR,
+};
 
 pub mod merge_insert;
 pub mod update;
@@ -80,6 +89,15 @@ pub struct WriteParams {
     /// currently have a hard 100 GB limit.
     pub max_bytes_per_file: usize,
 
+    /// Max file size, in bytes, for blob files.
+    ///
+    /// This limit is checked after writing each incoming batch, so if a batch
+    /// has a lot of blob data, this limit may be exceeded by a large amount.
+    ///
+    /// The default is 90 GB. If you are using an object store such as S3, we
+    /// currently have a hard 100 GB limit.
+    pub max_bytes_per_blob_file: u64,
+
     /// Write mode
     pub mode: WriteMode,
 
@@ -111,6 +129,7 @@ impl Default for WriteParams {
             // object-store has a 100GB limit, so we should at least make sure
             // we are under that.
             max_bytes_per_file: 90 * 1024 * 1024 * 1024, // 90 GB
+            max_bytes_per_blob_file: 90 * 1024 * 1024 * 1024, // 90 GB
             mode: WriteMode::Create,
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
@@ -118,6 +137,58 @@ impl Default for WriteParams {
             use_experimental_writer: false,
         }
     }
+}
+
+fn maybe_deblob_field(field: &Field) -> Option<Field> {
+    if field.data_type() == DataType::LargeBinary {
+        let path_field = ArrowField::new("path", DataType::Utf8, true);
+        let size_field = ArrowField::new("size", DataType::UInt64, true);
+        let position_field = ArrowField::new("position", DataType::UInt64, true);
+        let blob_field = ArrowField::new(
+            field.name.clone(),
+            DataType::Struct(Fields::from(vec![path_field, position_field, size_field])),
+            true,
+        );
+        let mut metadata = HashMap::new();
+        metadata.insert("lance:blob".to_string(), "true".to_string());
+        let blob_field = blob_field.with_metadata(metadata);
+        let blob_field = Field::try_from(&blob_field).unwrap();
+        Some(blob_field)
+    } else {
+        None
+    }
+}
+
+fn deblob_field_children(field: &mut Field) {
+    for child in &mut field.children {
+        if let Some(new_val) = maybe_deblob_field(child) {
+            *child = new_val;
+        } else {
+            deblob_field_children(child);
+        }
+    }
+}
+
+/// This can be used when creating the initial schema for a dataset
+///
+/// The initial schema has large_binary fields and we want these to be replaced by
+/// "description" fields containing the position / size.
+///
+/// Note: This method is ONLY safe when creating a NEW dataset because it modifies
+/// field ids.
+pub fn deblob_schema(schema: &mut Schema) {
+    if !(std::env::var("LANCE_USE_BLOBS").is_ok()) {
+        return;
+    }
+    for field in &mut schema.fields {
+        if let Some(new_val) = maybe_deblob_field(field) {
+            *field = new_val;
+        } else {
+            deblob_field_children(field);
+        }
+    }
+    schema.reset_id();
+    schema.set_field_id(None);
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -160,13 +231,25 @@ pub async fn write_fragments(
         (None, object_store, base)
     };
 
-    let (data, schema) = peek_reader_schema(Box::new(data)).await?;
+    let (data, mut schema) = peek_reader_schema(Box::new(data)).await?;
     let stream = reader_to_stream(data);
+
+    // Prefer the dataset schema if it exists
+    // Otherwise, if we are creating a new dataset, then it is safe to use the
+    // deblobbed schema from the incoming data
+    let schema = dataset
+        .as_ref()
+        .map(|dataset| Result::Ok(dataset.schema()))
+        .unwrap_or_else(|| {
+            deblob_schema(&mut schema);
+            Ok(&schema)
+        })?;
+
     write_fragments_internal(
         dataset.as_ref(),
         Arc::new(object_store),
         &base,
-        &schema,
+        schema,
         stream,
         params,
     )
@@ -208,6 +291,13 @@ pub async fn write_fragments_internal(
         schema
     };
 
+    let has_blobs = std::env::var("LANCE_USE_BLOBS").is_ok()
+        && data
+            .schema()
+            .all_fields()
+            .iter()
+            .any(|f| *f.data_type() == DataType::LargeBinary);
+
     // TODO: When writing v2 we could consider skipping this chunking step.  However, leaving in
     // for now as it doesn't hurt anything
     let mut buffered_reader = if params.use_experimental_writer {
@@ -216,6 +306,17 @@ pub async fn write_fragments_internal(
             .boxed()
     } else {
         chunk_stream(data, params.max_rows_per_group)
+    };
+
+    let mut blob_writer = if has_blobs {
+        warn!("Blobs are a highly experimental feature and data may be lost in future releases. Use with caution.");
+        Some(BlobWriter::new(
+            object_store.clone(),
+            base_dir.child(BLOB_DIR),
+            params.max_bytes_per_blob_file,
+        ))
+    } else {
+        None
     };
 
     let writer_generator = WriterGenerator::new(
@@ -228,7 +329,15 @@ pub async fn write_fragments_internal(
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
     while let Some(batch_chunk) = buffered_reader.next().await {
-        let batch_chunk = batch_chunk?;
+        let mut batch_chunk = batch_chunk?;
+
+        if let Some(blob_writer) = blob_writer.as_mut() {
+            let mut deblobbed = Vec::with_capacity(batch_chunk.len());
+            for batch in batch_chunk.into_iter() {
+                deblobbed.push(blob_writer.write_blobs(batch).await?);
+            }
+            batch_chunk = deblobbed;
+        }
 
         if writer.is_none() {
             let (new_writer, new_fragment) = writer_generator.new_writer().await?;
@@ -249,11 +358,17 @@ pub async fn write_fragments_internal(
             || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
         {
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
+            let blob_files = if let Some(blob_writer) = blob_writer.as_mut() {
+                blob_writer.flush().await?
+            } else {
+                vec![]
+            };
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             params.progress.complete(fragments.last().unwrap()).await?;
             let last_fragment = fragments.last_mut().unwrap();
             last_fragment.physical_rows = Some(num_rows as usize);
             last_fragment.files.push(data_file);
+            last_fragment.blobs = blob_files;
             num_rows_in_current_file = 0;
         }
     }
@@ -262,8 +377,14 @@ pub async fn write_fragments_internal(
     if let Some(mut writer) = writer.take() {
         let (num_rows, data_file) = writer.finish().await?;
         let last_fragment = fragments.last_mut().unwrap();
+        let blob_files = if let Some(mut blob_writer) = blob_writer.take() {
+            blob_writer.flush().await?
+        } else {
+            vec![]
+        };
         last_fragment.physical_rows = Some(num_rows as usize);
         last_fragment.files.push(data_file);
+        last_fragment.blobs = blob_files;
     }
 
     Ok(fragments)

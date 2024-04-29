@@ -23,7 +23,9 @@ use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
 use lance_io::object_store::ObjectStore;
-use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
+use lance_table::format::{
+    BlobFile as LanceBlobFile, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata,
+};
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::prelude::*;
@@ -258,6 +260,18 @@ impl FileFragment {
         Ok(data_files)
     }
 
+    /// Returns the blob file objects associated with this fragment.
+    fn blob_files(self_: PyRef<'_, Self>) -> PyResult<Vec<BlobFile>> {
+        let blob_files = self_
+            .fragment
+            .metadata()
+            .blobs
+            .iter()
+            .map(|f| BlobFile::new(f.clone()))
+            .collect();
+        Ok(blob_files)
+    }
+
     fn deletion_file(&self) -> PyResult<Option<String>> {
         let deletion = self.fragment.metadata().deletion_file.clone();
         Ok(deletion
@@ -315,6 +329,39 @@ impl DataFile {
             CompareOp::Ne => Ok(self.inner != other.inner),
             _ => Err(PyNotImplementedError::new_err(
                 "Only == and != are supported for DataFile",
+            )),
+        }
+    }
+}
+
+/// Metadata of a BlobFile
+#[pyclass(name = "_BlobFile", module = "_lib")]
+pub struct BlobFile {
+    pub(crate) inner: LanceBlobFile,
+}
+
+impl BlobFile {
+    fn new(inner: LanceBlobFile) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl BlobFile {
+    fn __repr__(&self) -> String {
+        format!("BlobFile({})", self.path())
+    }
+
+    fn path(&self) -> String {
+        self.inner.path.clone()
+    }
+
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.inner == other.inner),
+            CompareOp::Ne => Ok(self.inner != other.inner),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only == and != are supported for BlobFile",
             )),
         }
     }
@@ -381,6 +428,16 @@ impl FragmentMetadata {
             .map(|f| DataFile::new(f.clone()))
             .collect();
         Ok(data_files)
+    }
+
+    fn blob_files(self_: PyRef<'_, Self>) -> PyResult<Vec<BlobFile>> {
+        let blob_files = self_
+            .inner
+            .blobs
+            .iter()
+            .map(|f| BlobFile::new(f.clone()))
+            .collect();
+        Ok(blob_files)
     }
 
     fn deletion_file(&self) -> PyResult<Option<String>> {

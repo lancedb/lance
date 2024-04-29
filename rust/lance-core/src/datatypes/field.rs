@@ -198,6 +198,10 @@ impl Field {
         differences
     }
 
+    pub fn is_blob(&self) -> bool {
+        self.metadata.contains_key("lance:blob")
+    }
+
     pub fn explain_difference(
         &self,
         expected: &Self,

@@ -927,12 +927,14 @@ mod tests {
         let frags = vec![
             Fragment {
                 id: 0,
+                blobs: Vec::new(),
                 files: Vec::new(),
                 deletion_file: None,
                 physical_rows: Some(5),
             },
             Fragment {
                 id: 3,
+                blobs: Vec::new(),
                 files: Vec::new(),
                 deletion_file: None,
                 physical_rows: Some(3),
@@ -1058,6 +1060,7 @@ mod tests {
 
         let fragment = Fragment {
             id: 0,
+            blobs: vec![],
             files: vec![],
             deletion_file: None,
             physical_rows: Some(0),
@@ -1565,18 +1568,21 @@ mod tests {
             Fragment {
                 id: 0,
                 files: Vec::new(),
+                blobs: Vec::new(),
                 deletion_file: None,
                 physical_rows: Some(5),
             },
             Fragment {
                 id: 3,
                 files: Vec::new(),
+                blobs: Vec::new(),
                 deletion_file: None,
                 physical_rows: Some(3),
             },
             Fragment {
                 id: 1,
                 files: Vec::new(),
+                blobs: Vec::new(),
                 deletion_file: None,
                 physical_rows: Some(3),
             },

@@ -244,3 +244,28 @@ impl<'a> Drop for MockClock<'a> {
         mock_instant::MockClock::set_system_time(TimeDelta::try_days(0).unwrap().to_std().unwrap());
     }
 }
+
+/// A guard that sets an environment variable to a given value and restores it when dropped.
+pub struct EnvGuard {
+    key: String,
+    old_value: Option<String>,
+}
+
+impl EnvGuard {
+    pub fn new(key: &str, value: &str) -> Self {
+        let key = key.to_string();
+        let old_value = std::env::var(&key).ok();
+        std::env::set_var(&key, value);
+        Self { key, old_value }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(old_value) = &self.old_value {
+            std::env::set_var(&self.key, old_value);
+        } else {
+            std::env::remove_var(&self.key);
+        }
+    }
+}

@@ -13,6 +13,7 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from io import BufferedReader, RawIOBase, UnsupportedOperation
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -42,6 +43,7 @@ from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
+    BlobReader,
     CleanupStats,
     _Dataset,
     _MergeInsertBuilder,
@@ -77,6 +79,47 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[float],
     ]
+
+
+class BlobIo(RawIOBase):
+    """
+    A RawIOBase implementation that reads from a Lance Blob
+    """
+
+    def __init__(self, blob_reader: BlobReader):
+        self.blob_reader = blob_reader
+        self.cursor = 0
+        self.len = blob_reader.size()
+
+    def close(self):
+        self.blob_reader.close()
+
+    @property
+    def closed(self):
+        return self.blob_reader.is_closed()
+
+    def readable(self):
+        return True
+
+    def read(self, size=-1) -> bytes:
+        if size < 0:
+            return self.readall()
+        if self.cursor + size > self.len:
+            size = self.len - self.cursor
+        value = self.blob_reader.read_range(self.cursor, self.cursor + size)
+        self.cursor += size
+        return value
+
+    def readall(self) -> bytes:
+        return self.read(self.len - self.cursor)
+
+    def readinto(self, b: bytearray) -> int:
+        data = self.read(len(b))
+        b[: len(data)] = data
+        return len(data)
+
+    def write(self, b: bytes) -> int:
+        raise UnsupportedOperation("write")
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -634,6 +677,27 @@ class LanceDataset(pa.dataset.Dataset):
         Not implemented (just override pyarrow dataset to prevent segfault)
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
+
+    def open_blobs(self, blobs: pa.Array):
+        """
+        Open blobs in the dataset
+
+        This is an experimental feature in development and not yet complete
+
+        Parameters
+        ----------
+        blobs : pa.Array
+            An array of blob descriptors to open.  Blob descriptors can be
+            obtained by querying the dataset and retrieving a blob column.
+
+        Returns
+        -------
+        blobs : List[BlobIo]
+            A list of BlobIo objects.  These objects are python file-like
+            objects that can be read from (and closed).
+        """
+        blobs = self._ds.open_blobs(blobs)
+        return [BufferedReader(BlobIo(blob), blob.block_size()) for blob in blobs]
 
     def alter_columns(self, *alterations: Iterable[Dict[str, Any]]):
         """Alter column name, data type, and nullability.
