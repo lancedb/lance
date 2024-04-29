@@ -15,20 +15,17 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.DatasetScanner;
-import com.lancedb.lance.ipc.FragmentScanner;
+import com.lancedb.lance.ipc.ScanOptions;
 import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
-import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
-import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
@@ -144,11 +141,20 @@ public class Dataset implements Closeable {
   /**
    * Create a new Dataset Scanner.
    *
+   * @return a dataset scanner
+   */
+  public Scanner newScan() {
+    return newScan(new ScanOptions.Builder().build());
+  }
+
+  /**
+   * Create a new Dataset Scanner.
+   *
    * @param batchSize the scan options with batch size, columns filter, and substrait
    * @return a dataset scanner
    */
   public Scanner newScan(long batchSize) {
-    return newScan(new ScanOptions(batchSize), Optional.empty());
+    return newScan(new ScanOptions.Builder().batchSize(batchSize).build());
   }
 
   /**
@@ -158,18 +164,7 @@ public class Dataset implements Closeable {
    * @return a dataset scanner
    */
   public Scanner newScan(ScanOptions options) {
-    return newScan(options, Optional.empty());
-  }
-
-  /**
-   * Create a new Dataset Scanner.
-   *
-   * @param options the scan options with batch size, columns filter, and substrait
-   * @param filter the string filter e.g. id > 20
-   * @return a dataset scanner
-   */
-  public Scanner newScan(ScanOptions options, Optional<String> filter) {
-    return new DatasetScanner(this, options, filter, allocator);
+    return new DatasetScanner(this, options, allocator);
   }
 
   /**

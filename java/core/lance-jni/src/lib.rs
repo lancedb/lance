@@ -272,10 +272,10 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_openStream(
     _reader: JObject,
     jdataset: JObject,
     fragment_id_obj: JObject,      // Optional<Integer>
-    columns: JObject,              // Optional<String[]>
+    columns: JObject,              // Optional<List<String>>
     substrait_filter_obj: JObject, // Optional<ByteBuffer>
     filter_obj: JObject,           // Optional<String>
-    batch_size: jlong,
+    batch_size_obj: JObject,       // Optional<Long>
     stream_addr: jlong,
 ) {
     let dataset = {
@@ -312,7 +312,10 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_openStream(
     if let Some(filter) = filter {
         ok_or_throw_without_return!(env, scanner.filter(filter.as_str()));
     }
-    scanner.batch_size(batch_size as usize);
+    let batch_size = ok_or_throw_without_return!(env, env.get_long_opt(&batch_size_obj));
+    if let Some(batch_size) = batch_size {
+        scanner.batch_size(batch_size as usize);
+    }
 
     let stream =
         ok_or_throw_without_return!(env, RT.block_on(async { scanner.try_into_stream().await }));

@@ -140,7 +140,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_importFfiSchema
     _scanner: JObject,
     jdataset: JObject,
     arrow_schema_addr: jlong,
-    columns: JObject, // Optional<String[]>
+    columns: JObject, // Optional<List<String>>
 ) {
     let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
     import_ffi_schema(env, jdataset, arrow_schema_addr, columns);

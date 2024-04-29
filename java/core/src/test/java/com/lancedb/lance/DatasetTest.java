@@ -16,13 +16,12 @@ package com.lancedb.lance;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import com.lancedb.lance.ipc.ScanOptions;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Optional;
-
-import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -130,7 +129,7 @@ public class DatasetTest {
       testDataset.createEmptyDataset().close();
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
-        try (Scanner scanner = dataset.newScan(new ScanOptions(1024), Optional.of("id < 20"))) {
+        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
           testDataset.validateScanResults(dataset, scanner, 20, 20);
         }
       }
@@ -148,9 +147,8 @@ public class DatasetTest {
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         var fragment = dataset.getFragments().get(0);
-        ScanOptions scanOptions = new ScanOptions.Builder(batchRows)
-            .columns(Optional.of(new String[]{"id"})).build();
-        try (Scanner scanner = fragment.newScan(scanOptions)) {
+        try (Scanner scanner = fragment.newScan(new ScanOptions.Builder()
+            .batchSize(batchRows).columns(List.of("id")).build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
             int index = 0;

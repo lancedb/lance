@@ -15,7 +15,6 @@
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.Dataset;
-import com.lancedb.lance.Utils;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -23,7 +22,6 @@ import java.util.Optional;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
-import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.dataset.scanner.ScanTask;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
@@ -35,33 +33,31 @@ public class DatasetScanner implements Scanner {
   final Dataset dataset;
 
   final ScanOptions options;
-  final Optional<String> filter;
 
   final BufferAllocator allocator;
 
   /** Create FragmentScanner. */
   public DatasetScanner(
-      Dataset dataset, ScanOptions options, Optional<String> filter, BufferAllocator allocator) {
+      Dataset dataset, ScanOptions options, BufferAllocator allocator) {
     this.dataset = dataset;
     this.options = options;
-    this.filter = filter;
     this.allocator = allocator;
   }
 
   private static native void importFfiSchema(Dataset dataset, long arrowSchemaMemoryAddress,
-      Optional<String[]> columns);
+      Optional<List<String>> columns);
 
-  static native void openStream(
-      Dataset dataset, Optional<Integer> fragmentId, Optional<List<String>> columns,
-      Optional<ByteBuffer> substraitFilter, Optional<String> filter, long batchSize, long stream)
+  static native void openStream(Dataset dataset, Optional<Integer> fragmentId,
+      Optional<List<String>> columns, Optional<ByteBuffer> substraitFilter,
+      Optional<String> filter, Optional<Long> batchSize, long stream)
       throws IOException;
 
   @Override
   public ArrowReader scanBatches() {
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
-      openStream(dataset, Optional.empty(), Utils.convert(options.getColumns()),
-          options.getSubstraitFilter(),
-          filter, options.getBatchSize(), s.memoryAddress());
+      openStream(dataset, Optional.empty(), options.getColumns(),
+          options.getSubstraitFilter(), options.getFilter(),
+          options.getBatchSize(), s.memoryAddress());
       return Data.importArrayStream(allocator, s);
     } catch (IOException e) {
       // TODO: handle IO exception?

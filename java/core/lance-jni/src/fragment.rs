@@ -221,7 +221,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_importFfiSchem
     jdataset: JObject,
     arrow_schema_addr: jlong,
     fragment_id: jint,
-    columns: JObject, // Optional<String[]>
+    columns: JObject, // Optional<List<String>>
 ) {
     let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
 
