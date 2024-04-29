@@ -9,12 +9,12 @@ labels:
 - label: breaking-change
   title: "^[^:]+!:.*"
 - label: enhancement
-  title: "^feat(\(.+\))?!?:.*"
+  title: "^feat(\\(.+\\))?!?:.*"
 - label: bug
-  title: "^fix(\(.+\))?!?:.*"
+  title: "^fix(\\(.+\\))?!?:.*"
 - label: documentation
-  title: "^docs(\(.+\))?!?:.*"
+  title: "^docs(\\(.+\\))?!?:.*"
 - label: performance
-  title: "^perf(\(.+\))?!?:.*"
+  title: "^perf(\\(.+\\))?!?:.*"
 - label: ci
-  title: "^ci(\(.+\))?!?:.*"
+  title: "^ci(\\(.+\\))?!?:.*"
