@@ -673,7 +673,10 @@ impl Dataset {
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
     }
 
-    pub fn open_blobs(&mut self, blobs: PyArrowType<ArrayData>) -> PyResult<Vec<Option<BlobReader>>> {
+    pub fn open_blobs(
+        &mut self,
+        blobs: PyArrowType<ArrayData>,
+    ) -> PyResult<Vec<Option<BlobReader>>> {
         let blobs_arr = make_array(blobs.0);
         let lance_blobs = RT
             .runtime
