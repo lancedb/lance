@@ -238,9 +238,6 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_importFfiSchem
 
     let schema = ok_or_throw_without_return!(env, scanner.schema(columns));
     let c_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&schema));
-    let out_c_schema = arrow_schema_addr as *mut FFI_ArrowSchema;
-    unsafe {
-        std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
-        std::mem::forget(c_schema);
-    };
+    let out_c_schema = unsafe { &mut *(arrow_schema_addr as *mut FFI_ArrowSchema) };
+    let _old = std::mem::replace(out_c_schema, c_schema);
 }

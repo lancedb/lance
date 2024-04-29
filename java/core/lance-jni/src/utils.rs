@@ -66,11 +66,7 @@ pub fn import_ffi_schema(
         Schema::from(dataset.inner.schema())
     };
 
-    let out_c_schema = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&schema));
-
-    unsafe {
-        std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
-        std::mem::forget(c_schema);
-    };
+    let out_c_schema = unsafe { &mut *(arrow_schema_addr as *mut FFI_ArrowSchema) };
+    let _old = std::mem::replace(out_c_schema, c_schema);
 }
