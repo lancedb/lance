@@ -10,6 +10,8 @@ concurrency:
 
 jobs:
   labeler:
+    permissions:
+      pull-requests: write
     name: Label PR
     runs-on: ubuntu-latest
     steps:
