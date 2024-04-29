@@ -177,7 +177,7 @@ fn deblob_field_children(field: &mut Field) {
 /// Note: This method is ONLY safe when creating a NEW dataset because it modifies
 /// field ids.
 pub fn deblob_schema(schema: &mut Schema) {
-    if !(std::env::var("LANCE_USE_BLOBS").is_ok()) {
+    if std::env::var("LANCE_USE_BLOBS").is_err() {
         return;
     }
     for field in &mut schema.fields {

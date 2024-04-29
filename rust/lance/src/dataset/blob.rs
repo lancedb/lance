@@ -597,7 +597,7 @@ mod tests {
         let make_blob_batch = |num_rows| {
             let mut blobs_builder = LargeBinaryBuilder::new();
             for _ in 0..num_rows {
-                blobs_builder.append_value(&[42; 17]);
+                blobs_builder.append_value([42; 17]);
             }
             let blobs_arr = blobs_builder.finish();
             let schema =
@@ -611,7 +611,7 @@ mod tests {
             let deblobbed = writer.write_blobs(make_blob_batch(10)).await.unwrap();
             let paths = deblobbed.column_by_qualified_name("blobs.path").unwrap();
             let paths = paths.as_string::<i32>();
-            assert!((0..10).all(|idx| paths.value(idx).len() > 0));
+            assert!((0..10).all(|idx| !paths.value(idx).is_empty()));
 
             let positions = deblobbed
                 .column_by_qualified_name("blobs.position")
