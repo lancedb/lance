@@ -34,11 +34,8 @@ runs:
     shell: bash
     run: |
       if [ ${{ inputs.repo }} == "fury" ]; then
-        # For some reason, they use the token as the username
-        twine upload --repository-url https://pypi.fury.io/lancedb/ \
-          --username ${{ inputs.fury_token }} \
-          --password "" \
-          target/wheels/pylance-*.whl
+        WHEEL=$(ls target_pyo3/wheels/pylance-*.whl 2> /dev/null | head -n 1)
+        curl -F package=@WHEEL https://${{ inputs.fury_token }}@push.fury.io/lancedb/
       else
         twine upload --repository ${{ inputs.repo }} \
           --username __token__ \
