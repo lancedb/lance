@@ -15,7 +15,8 @@
 use std::sync::Arc;
 
 use crate::ffi::JNIEnvExt;
-use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
+use arrow_schema::SchemaRef;
 use jni::{objects::JObject, sys::jlong, JNIEnv};
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
 use lance_io::ffi::to_ffi_arrow_array_stream;
@@ -41,8 +42,11 @@ impl BlockingScanner {
     }
 
     pub fn open_stream(&self) -> Result<DatasetRecordBatchStream> {
-        RT.block_on(async { self.inner.try_into_stream().await })
-            .map_err(Error::from)
+        Ok(RT.block_on(self.inner.try_into_stream())?)
+    }
+
+    pub fn schema(&self) -> Result<SchemaRef> {
+        Ok(RT.block_on(self.inner.schema())?)
     }
 }
 
@@ -163,4 +167,21 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_openStream(
     let record_batch_stream = ok_or_throw_without_return!(env, scanner.open_stream());
     let ffi_stream = to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone()).unwrap();
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_importFfiSchema(
+    mut env: JNIEnv,
+    j_scanner: JObject,
+    schema_addr: jlong,
+) {
+    let scanner = {
+        let scanner_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
+                .expect("Failed to get native scanner handle");
+        scanner_guard.clone()
+    };
+    let schema = ok_or_throw_without_return!(env, scanner.schema());
+    let ffi_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&*schema));
+    unsafe { std::ptr::write_unaligned(schema_addr as *mut FFI_ArrowSchema, ffi_schema) }
 }

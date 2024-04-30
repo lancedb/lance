@@ -20,6 +20,7 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.ScanTask;
 import org.apache.arrow.memory.BufferAllocator;
@@ -101,6 +102,11 @@ public class Scanner implements org.apache.arrow.dataset.scanner.Scanner {
 
   @Override
   public Schema schema() {
-    return null;
+    try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+      importFfiSchema(ffiArrowSchema.memoryAddress());
+      return Data.importSchema(allocator, ffiArrowSchema, null);
+    }
   }
+
+  private native void importFfiSchema(long arrowSchemaMemoryAddress);
 }

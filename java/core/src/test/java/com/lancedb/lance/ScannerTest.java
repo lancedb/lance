@@ -16,6 +16,7 @@ package com.lancedb.lance;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
 import com.lancedb.lance.ipc.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
@@ -26,9 +27,10 @@ import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -52,7 +54,7 @@ public class ScannerTest {
 
   @Test
   void testDatasetScanner() throws IOException {
-    String datasetPath = tempDir.resolve("dataset_scan").toString();
+    String datasetPath = tempDir.resolve("dataset_scanner").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
@@ -67,7 +69,7 @@ public class ScannerTest {
 
   @Test
   void testDatasetScannerFilter() throws Exception {
-    String datasetPath = tempDir.resolve("dataset_scan_filter").toString();
+    String datasetPath = tempDir.resolve("dataset_scanner_filter").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
@@ -82,7 +84,7 @@ public class ScannerTest {
 
   @Test
   void testDatasetScannerColumns() throws Exception {
-    String datasetPath = tempDir.resolve("dataset_scan_columns").toString();
+    String datasetPath = tempDir.resolve("dataset_scanner_columns").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
@@ -107,6 +109,25 @@ public class ScannerTest {
               }
             }
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDatasetScannerSchema() throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_schema").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 40;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder()
+            .batchSize(totalRows).columns(List.of("id")).build())) {
+          Schema expectedSchema = new Schema(Arrays.asList(
+              Field.nullable("id", new ArrowType.Int(32, true))
+          ));
+          assertEquals(expectedSchema, scanner.schema());
         }
       }
     }

@@ -50,7 +50,7 @@ public class TestUtils {
     private final Schema schema = new Schema(Arrays.asList(
       Field.nullable("id", new ArrowType.Int(32, true)),
       Field.nullable("name", new ArrowType.Utf8())
-  ), null);
+    ), null);
     private final BufferAllocator allocator;
     private final String datasetPath;
 
