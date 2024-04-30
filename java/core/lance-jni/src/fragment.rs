@@ -15,7 +15,7 @@
 use arrow::array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StructArray};
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::DataType;
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
@@ -43,39 +43,6 @@ fn fragment_count_rows(dataset: &BlockingDataset, fragment_id: jlong) -> Result<
         });
     };
     Ok(RT.block_on(fragment.count_rows())? as jint)
-}
-
-struct FragmentScanner {
-    fragment: FileFragment,
-}
-
-impl FragmentScanner {
-    async fn try_open(dataset: &BlockingDataset, fragment_id: usize) -> Result<Self> {
-        let fragment = dataset
-            .inner
-            .get_fragment(fragment_id)
-            .ok_or_else(|| Error::IO {
-                message: format!("Fragment not found: {}", fragment_id),
-                location: location!(),
-            })?;
-        Ok(Self { fragment })
-    }
-
-    /// Returns the schema of the scanner, with optional columns.
-    fn schema(&self, columns: Option<Vec<String>>) -> Result<Schema> {
-        let schema = self.fragment.schema();
-        let schema = if let Some(columns) = columns {
-            schema
-                .project(&columns)
-                .map_err(|e| Error::InvalidArgument {
-                    message: format!("Failed to select columns: {}", e),
-                    location: location!(),
-                })?
-        } else {
-            schema.clone()
-        };
-        Ok((&schema).into())
-    }
 }
 
 #[no_mangle]
@@ -212,32 +179,4 @@ pub extern "system" fn Java_com_lancedb_lance_DatasetFragment_countRowsNative(
         },
         -1
     )
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_importFfiSchema(
-    mut env: JNIEnv,
-    _scanner: JObject,
-    jdataset: JObject,
-    arrow_schema_addr: jlong,
-    fragment_id: jint,
-    columns: JObject, // Optional<List<String>>
-) {
-    let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
-
-    let res = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-                .expect("Dataset handle not set");
-        dataset.clone()
-    };
-    let scanner = ok_or_throw_without_return!(
-        env,
-        RT.block_on(async { FragmentScanner::try_open(&res, fragment_id as usize).await })
-    );
-
-    let schema = ok_or_throw_without_return!(env, scanner.schema(columns));
-    let c_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&schema));
-    let out_c_schema = unsafe { &mut *(arrow_schema_addr as *mut FFI_ArrowSchema) };
-    let _old = std::mem::replace(out_c_schema, c_schema);
 }

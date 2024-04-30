@@ -14,9 +14,8 @@
 
 package com.lancedb.lance;
 
-import com.lancedb.lance.ipc.FragmentScanner;
 import com.lancedb.lance.ipc.ScanOptions;
-import org.apache.arrow.dataset.scanner.Scanner;
+import com.lancedb.lance.ipc.Scanner;
 
 /**
  * Dataset format.
@@ -39,17 +38,20 @@ public class DatasetFragment {
    * @return a dataset scanner
    */
   public Scanner newScan() {
-    return newScan(new com.lancedb.lance.ipc.ScanOptions.Builder().build());
+    return Scanner.create(dataset,
+        new ScanOptions.Builder().fragmentId(metadata.getId()).build(), dataset.allocator);
   }
 
   /**
    * Create a new Dataset Scanner.
    *
-   * @param batchSize the scan options with batch size, columns filter, and substrait
+   * @param batchSize scan batch size
    * @return a dataset scanner
    */
   public Scanner newScan(long batchSize) {
-    return newScan(new com.lancedb.lance.ipc.ScanOptions.Builder().batchSize(batchSize).build());
+    return Scanner.create(dataset,
+        new ScanOptions.Builder().fragmentId(metadata.getId()).batchSize(batchSize).build(),
+        dataset.allocator);
   }
 
   /**
@@ -59,7 +61,9 @@ public class DatasetFragment {
    * @return a dataset scanner
    */
   public Scanner newScan(ScanOptions options) {
-    return new FragmentScanner(dataset, metadata.getId(), options, dataset.allocator);
+    return Scanner.create(dataset,
+        new ScanOptions.Builder(options).fragmentId(metadata.getId()).build(),
+        dataset.allocator);
   }
 
   private native int countRowsNative(Dataset dataset, long fragmentId);

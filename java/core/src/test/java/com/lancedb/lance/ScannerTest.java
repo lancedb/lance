@@ -132,4 +132,70 @@ public class ScannerTest {
       }
     }
   }
+
+
+  @Test
+  void testFragmentScanner() throws Exception {
+    String datasetPath = tempDir.resolve("fragment_scanner").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 40;
+      int batchRows = 20;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        var fragment = dataset.getFragments().get(0);
+        try (Scanner scanner = fragment.newScan(batchRows)) {
+          testDataset.validateScanResults(dataset, scanner, totalRows, batchRows);
+        }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentScannerFilter() throws Exception {
+    String datasetPath = tempDir.resolve("fragment_scanner_filter").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      // write id with value from 0 to 39
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        var fragment = dataset.getFragments().get(0);
+        try (Scanner scanner = fragment.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
+          testDataset.validateScanResults(dataset, scanner, 20, 20);
+        }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentScannerColumns() throws Exception {
+    String datasetPath = tempDir.resolve("fragment_scanner_columns").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 40;
+      int batchRows = 20;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        var fragment = dataset.getFragments().get(0);
+        try (Scanner scanner = fragment.newScan(new ScanOptions.Builder().batchSize(batchRows).columns(List.of("id")).build())) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            VectorSchemaRoot root = reader.getVectorSchemaRoot();
+            int index = 0;
+            while (reader.loadNextBatch()) {
+              List<FieldVector> fieldVectors = root.getFieldVectors();
+              assertEquals(1, fieldVectors.size());
+              FieldVector fieldVector = fieldVectors.get(0);
+              assertEquals(ArrowType.ArrowTypeID.Int, fieldVector.getField().getType().getTypeID());
+              assertEquals(batchRows, fieldVector.getValueCount());
+              IntVector vector = (IntVector) fieldVector;
+              for (int i = 0; i < batchRows; i++) {
+                assertEquals(index, vector.get(i));
+                index++;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 }

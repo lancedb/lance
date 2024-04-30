@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ffi::JNIEnvExt;
 use crate::utils::import_ffi_schema;
 use crate::{traits::IntoJava, Error, Result, RT};
 use arrow::array::RecordBatchReader;
@@ -132,18 +131,6 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
     arrow_schema_addr: jlong,
 ) {
     import_ffi_schema(env, jdataset, arrow_schema_addr, None)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_DatasetScanner_importFfiSchema(
-    mut env: JNIEnv,
-    _scanner: JObject,
-    jdataset: JObject,
-    arrow_schema_addr: jlong,
-    columns: JObject, // Optional<List<String>>
-) {
-    let columns = ok_or_throw_without_return!(env, env.get_strings_opt(&columns));
-    import_ffi_schema(env, jdataset, arrow_schema_addr, columns);
 }
 
 fn create_json_fragment_list<'a>(
