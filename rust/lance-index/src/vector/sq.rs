@@ -68,9 +68,9 @@ impl ScalarQuantizer {
                 .downcast_ref::<T::ArrayType>()
                 .unwrap()
                 .as_slice();
-            for j in 0..self.dim {
-                self.bounds[j] = self.bounds[j].start.min(vector[j].to_f64().unwrap())
-                    ..self.bounds[j].end.max(vector[j].to_f64().unwrap());
+            for (j, bounds) in self.bounds.iter_mut().enumerate() {
+                *bounds = bounds.start.min(vector[j].to_f64().unwrap())
+                    ..bounds.end.max(vector[j].to_f64().unwrap());
             }
         }
 
