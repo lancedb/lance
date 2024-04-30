@@ -118,7 +118,7 @@ class _BaseLanceDatasink(ray.data.Datasink):
         return True
 
     def on_write_start(self):
-        if self.mode == "append":
+        if self.mode in set(["append", "merge"]):
             ds = lance.LanceDataset(self.uri)
             self.read_version = ds.version
             if self.schema is None:
@@ -135,10 +135,13 @@ class _BaseLanceDatasink(ray.data.Datasink):
                 fragment = pickle.loads(fragment_str)
                 fragments.append(fragment)
                 schema = pickle.loads(schema_str)
+        # TODO: use pattern matching after python 3.10
         if self.mode in set(["create", "overwrite"]):
             op = lance.LanceOperation.Overwrite(schema, fragments)
         elif self.mode == "append":
             op = lance.LanceOperation.Append(fragments)
+        elif self.mode == "merge":
+            op = lance.LanceOperation.Merge(fragments, schema=schema)
         lance.LanceDataset.commit(self.uri, op, read_version=self.read_version)
 
 
@@ -172,7 +175,7 @@ class LanceDatasink(_BaseLanceDatasink):
         self,
         uri: str,
         schema: Optional[pa.Schema] = None,
-        mode: Literal["create", "append", "overwrite"] = "create",
+        mode: Literal["create", "append", "overwrite", "merge"] = "create",
         max_rows_per_file: int = 1024 * 1024,
         use_experimental_writer: bool = True,
         *args,
