@@ -429,11 +429,76 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
     }
 }
 
-pub struct PrimitiveFieldEncoder {
+#[derive(Debug)]
+pub struct AccumulationQueue {
     cache_bytes: u64,
     keep_original_array: bool,
     buffered_arrays: Vec<ArrayRef>,
     current_bytes: u64,
+    // This is only for logging / debugging purposes
+    column_index: u32,
+}
+
+impl AccumulationQueue {
+    pub fn new(cache_bytes: u64, column_index: u32, keep_original_array: bool) -> Self {
+        Self {
+            cache_bytes,
+            buffered_arrays: Vec::new(),
+            current_bytes: 0,
+            column_index,
+            keep_original_array,
+        }
+    }
+
+    /// Adds an array to the queue, if there is enough data then the queue is flushed
+    /// and returned
+    pub fn insert(&mut self, array: ArrayRef) -> Option<Vec<ArrayRef>> {
+        self.current_bytes += array.get_array_memory_size() as u64;
+        if self.current_bytes > self.cache_bytes {
+            debug!(
+                "Flushing column {} page of size {} bytes (unencoded)",
+                self.column_index, self.current_bytes
+            );
+            // Push into buffered_arrays without copy since we are about to flush anyways
+            self.buffered_arrays.push(array);
+            self.current_bytes = 0;
+            Some(std::mem::take(&mut self.buffered_arrays))
+        } else {
+            trace!(
+                "Accumulating data for column {}.  Now at {} bytes",
+                self.column_index,
+                self.current_bytes
+            );
+            if self.keep_original_array {
+                self.buffered_arrays.push(array);
+            } else {
+                self.buffered_arrays.push(deep_copy_array(array.as_ref()))
+            }
+            None
+        }
+    }
+
+    pub fn flush(&mut self) -> Option<Vec<ArrayRef>> {
+        if self.buffered_arrays.is_empty() {
+            trace!(
+                "No final flush since no data at column {}",
+                self.column_index
+            );
+            None
+        } else {
+            trace!(
+                "Final flush of column {} which has {} bytes",
+                self.column_index,
+                self.current_bytes
+            );
+            self.current_bytes = 0;
+            Some(std::mem::take(&mut self.buffered_arrays))
+        }
+    }
+}
+
+pub struct PrimitiveFieldEncoder {
+    accumulation_queue: AccumulationQueue,
     encoder: Arc<dyn ArrayEncoder>,
     column_index: u32,
 }
@@ -460,11 +525,12 @@ impl PrimitiveFieldEncoder {
         column_index: u32,
     ) -> Result<Self> {
         Ok(Self {
-            cache_bytes,
-            keep_original_array,
+            accumulation_queue: AccumulationQueue::new(
+                cache_bytes,
+                column_index,
+                keep_original_array,
+            ),
             column_index,
-            buffered_arrays: Vec::new(),
-            current_bytes: 0,
             encoder: Arc::from(Self::array_encoder_from_data_type(data_type)?),
         })
     }
@@ -476,20 +542,18 @@ impl PrimitiveFieldEncoder {
         encoder: Arc<dyn ArrayEncoder>,
     ) -> Self {
         Self {
-            cache_bytes,
-            keep_original_array,
+            accumulation_queue: AccumulationQueue::new(
+                cache_bytes,
+                column_index,
+                keep_original_array,
+            ),
             column_index,
-            buffered_arrays: Vec::new(),
-            current_bytes: 0,
             encoder,
         }
     }
 
     // Creates an encode task, consuming all buffered data
-    fn do_flush(&mut self) -> EncodeTask {
-        let mut arrays = Vec::new();
-        std::mem::swap(&mut arrays, &mut self.buffered_arrays);
-        self.current_bytes = 0;
+    fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> EncodeTask {
         let encoder = self.encoder.clone();
         let column_idx = self.column_index;
 
@@ -511,34 +575,17 @@ impl PrimitiveFieldEncoder {
 impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
-        self.current_bytes += array.get_array_memory_size() as u64;
-        if self.current_bytes > self.cache_bytes {
-            // Push into buffered_arrays without copy since we are about to flush anyways
-            self.buffered_arrays.push(array);
-            debug!(
-                "Flushing column {} page of size {} bytes (unencoded)",
-                self.column_index, self.current_bytes
-            );
-            Ok(vec![self.do_flush()])
+        if let Some(arrays) = self.accumulation_queue.insert(array) {
+            Ok(vec![self.do_flush(arrays)])
         } else {
-            if self.keep_original_array {
-                self.buffered_arrays.push(array);
-            } else {
-                self.buffered_arrays.push(deep_copy_array(array.as_ref()))
-            }
-            trace!(
-                "Accumulating data for column {}.  Now at {} bytes",
-                self.column_index,
-                self.current_bytes
-            );
             Ok(vec![])
         }
     }
 
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self) -> Result<Vec<EncodeTask>> {
-        if self.current_bytes > 0 {
-            Ok(vec![self.do_flush()])
+        if let Some(arrays) = self.accumulation_queue.flush() {
+            Ok(vec![self.do_flush(arrays)])
         } else {
             Ok(vec![])
         }

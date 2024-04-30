@@ -151,6 +151,9 @@ pub trait FieldEncoder: Send {
     /// It could also return an empty Vec if there is not enough data yet to encode any pages.
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
+    ///
+    /// This may be called intermittently throughout encoding but will always be called
+    /// once at the end of encoding.
     fn flush(&mut self) -> Result<Vec<EncodeTask>>;
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
