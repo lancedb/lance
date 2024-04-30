@@ -28,7 +28,7 @@ import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /** Scanner over a Fragment. */
-public class Scanner implements org.apache.arrow.dataset.scanner.Scanner {
+public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   Dataset dataset;
 
   ScanOptions options;
@@ -37,7 +37,7 @@ public class Scanner implements org.apache.arrow.dataset.scanner.Scanner {
 
   private long nativeScannerHandle;
 
-  private Scanner() {}
+  private LanceScanner() {}
 
   /**
    * Create a Scanner.
@@ -47,9 +47,9 @@ public class Scanner implements org.apache.arrow.dataset.scanner.Scanner {
    * @param allocator allocator
    * @return a Scanner
    */
-  public static Scanner create(Dataset dataset, ScanOptions options,
+  public static LanceScanner create(Dataset dataset, ScanOptions options,
       BufferAllocator allocator) {
-    Scanner scanner = createScanner(dataset, Optional.empty(), options.getColumns(),
+    LanceScanner scanner = createScanner(dataset, Optional.empty(), options.getColumns(),
         options.getSubstraitFilter(), options.getFilter(), options.getBatchSize());
     scanner.allocator = allocator;
     scanner.dataset = dataset;
@@ -57,7 +57,7 @@ public class Scanner implements org.apache.arrow.dataset.scanner.Scanner {
     return scanner;
   }
 
-  static native Scanner createScanner(Dataset dataset, Optional<Integer> fragmentId,
+  static native LanceScanner createScanner(Dataset dataset, Optional<Integer> fragmentId,
       Optional<List<String>> columns, Optional<ByteBuffer> substraitFilter,
       Optional<String> filter, Optional<Long> batchSize);
 
@@ -109,4 +109,11 @@ public class Scanner implements org.apache.arrow.dataset.scanner.Scanner {
   }
 
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
+
+  /**
+   * Count the number of rows filtered by the scanner.
+   *
+   * @return num of rows.
+   */
+  public native long countRows();
 }

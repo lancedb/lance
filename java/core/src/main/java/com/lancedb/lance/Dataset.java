@@ -14,8 +14,8 @@
 
 package com.lancedb.lance;
 
+import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
-import com.lancedb.lance.ipc.Scanner;
 import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
 import java.util.List;
@@ -142,7 +142,7 @@ public class Dataset implements Closeable {
    *
    * @return a dataset scanner
    */
-  public Scanner newScan() {
+  public LanceScanner newScan() {
     return newScan(new ScanOptions.Builder().build());
   }
 
@@ -152,7 +152,7 @@ public class Dataset implements Closeable {
    * @param batchSize the scan options with batch size, columns filter, and substrait
    * @return a dataset scanner
    */
-  public Scanner newScan(long batchSize) {
+  public LanceScanner newScan(long batchSize) {
     return newScan(new ScanOptions.Builder().batchSize(batchSize).build());
   }
 
@@ -162,8 +162,8 @@ public class Dataset implements Closeable {
    * @param options the scan options
    * @return a dataset scanner
    */
-  public Scanner newScan(ScanOptions options) {
-    return Scanner.create(this, options, allocator);
+  public LanceScanner newScan(ScanOptions options) {
+    return LanceScanner.create(this, options, allocator);
   }
 
   /**

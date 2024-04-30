@@ -18,6 +18,8 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+
+import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
@@ -133,6 +135,20 @@ public class ScannerTest {
     }
   }
 
+  @Test
+  void testDatasetScannerCountRows() throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_count").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      // write id with value from 0 to 39
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        try (LanceScanner scanner = dataset.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
+          assertEquals(20, scanner.countRows());
+        }
+      }
+    }
+  }
 
   @Test
   void testFragmentScanner() throws Exception {

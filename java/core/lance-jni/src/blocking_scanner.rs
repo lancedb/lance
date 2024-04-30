@@ -48,6 +48,10 @@ impl BlockingScanner {
     pub fn schema(&self) -> Result<SchemaRef> {
         Ok(RT.block_on(self.inner.schema())?)
     }
+
+    pub fn count_rows(&self) -> Result<u64> {
+        Ok(RT.block_on(self.inner.count_rows())?)
+    }
 }
 
 impl IntoJava for BlockingScanner {
@@ -84,12 +88,12 @@ fn attach_native_scanner<'local>(
 }
 
 fn create_java_scanner_object<'a>(env: &mut JNIEnv<'a>) -> JObject<'a> {
-    env.new_object("com/lancedb/lance/ipc/Scanner", "()V", &[])
-        .expect("Failed to create Java Scanner instance")
+    env.new_object("com/lancedb/lance/ipc/LanceScanner", "()V", &[])
+        .expect("Failed to create Java Lance Scanner instance")
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_createScanner<'local>(
+pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'local>(
     mut env: JNIEnv<'local>,
     _reader: JObject,
     jdataset: JObject,
@@ -142,7 +146,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_createScanner<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_releaseNativeScanner(
+pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_releaseNativeScanner(
     mut env: JNIEnv,
     j_scanner: JObject,
 ) {
@@ -153,7 +157,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_releaseNativeScanner(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_openStream(
+pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_openStream(
     mut env: JNIEnv,
     j_scanner: JObject,
     stream_addr: jlong,
@@ -170,7 +174,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_openStream(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_importFfiSchema(
+pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_importFfiSchema(
     mut env: JNIEnv,
     j_scanner: JObject,
     schema_addr: jlong,
@@ -184,4 +188,19 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_Scanner_importFfiSchema(
     let schema = ok_or_throw_without_return!(env, scanner.schema());
     let ffi_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&*schema));
     unsafe { std::ptr::write_unaligned(schema_addr as *mut FFI_ArrowSchema, ffi_schema) }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_countRows(
+    mut env: JNIEnv,
+    j_scanner: JObject,
+) -> jlong {
+    let scanner = {
+        let scanner_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
+                .expect("Failed to get native scanner handle");
+        scanner_guard.clone()
+    };
+    let rows = ok_or_throw_with_return!(env, scanner.count_rows(), -1);
+    rows as jlong
 }
