@@ -31,7 +31,7 @@ impl Default for SQBuildParams {
         Self {
             num_bits: 8,
             sample_rate: 256,
-            extend_scale: 1.0,
+            extend_scale: 1.1,
         }
     }
 }
