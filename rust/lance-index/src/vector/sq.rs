@@ -136,7 +136,7 @@ pub(crate) fn scale_to_u8<T: ArrowFloatType>(
         .iter()
         .enumerate()
         .map(|(i, &v)| {
-            let bounds = &bounds[i];
+            let bounds = &bounds[i % bounds.len()];
             let range = bounds.end - bounds.start;
             let v = v.to_f64().unwrap();
             match v {
