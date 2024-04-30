@@ -103,7 +103,7 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>> {
         self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/util/List;", &[])?;
+            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
             let java_list_obj = java_obj_gen.l()?;
             env.get_strings(&java_list_obj)
         })
@@ -160,6 +160,7 @@ impl JNIEnvExt for JNIEnv<'_> {
         }
         let is_empty = self.call_method(obj, "isEmpty", "()Z", &[])?;
         if is_empty.z()? {
+            // TODO(lu): put get java object into here cuz can only get java Object
             Ok(None)
         } else {
             f(self, obj).map(Some)

@@ -16,23 +16,13 @@ package com.lancedb.lance;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import com.lancedb.lance.ipc.ScanOptions;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.List;
-import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowReader;
-import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -100,70 +90,6 @@ public class DatasetTest {
             assertEquals(3, dataset2.latestVersion());
             assertEquals(3, dataset3.version());
             assertEquals(3, dataset3.latestVersion());
-          }
-        }
-      }
-    }
-  }
-
-  @Test
-  void testDatasetScanner() throws IOException {
-    String datasetPath = tempDir.resolve("dataset_scan").toString();
-    try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      int totalRows = 40;
-      int batchRows = 20;
-      try (Dataset dataset = testDataset.write(1, totalRows)) {
-        Scanner scanner = dataset.newScan(batchRows);
-        testDataset.validateScanResults(dataset, scanner, totalRows, batchRows);
-      }
-    }
-  }
-
-  @Test
-  void testDatasetScannerFilter() throws Exception {
-    String datasetPath = tempDir.resolve("dataset_scan_filter").toString();
-    try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      // write id with value from 0 to 39
-      try (Dataset dataset = testDataset.write(1, 40)) {
-        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
-          testDataset.validateScanResults(dataset, scanner, 20, 20);
-        }
-      }
-    }
-  }
-
-  @Test
-  @Disabled
-  void testFragmentScannerColumns() throws Exception {
-    String datasetPath = tempDir.resolve("fragment_scan_columns").toString();
-    try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      int totalRows = 40;
-      int batchRows = 20;
-      try (Dataset dataset = testDataset.write(1, totalRows)) {
-        var fragment = dataset.getFragments().get(0);
-        try (Scanner scanner = fragment.newScan(new ScanOptions.Builder()
-            .batchSize(batchRows).columns(List.of("id")).build())) {
-          try (ArrowReader reader = scanner.scanBatches()) {
-            VectorSchemaRoot root = reader.getVectorSchemaRoot();
-            int index = 0;
-            while (reader.loadNextBatch()) {
-              List<FieldVector> fieldVectors = root.getFieldVectors();
-              assertEquals(1, fieldVectors.size());
-              FieldVector fieldVector = fieldVectors.get(0);
-              assertEquals(ArrowType.ArrowTypeID.Int, fieldVector.getField().getType().getTypeID());
-              assertEquals(batchRows, fieldVector.getValueCount());
-              IntVector vector = (IntVector) fieldVector;
-              for (int i = 0; i < batchRows; i++) {
-                assertEquals(index, vector.get(i));
-                index++;
-              }
-            }
           }
         }
       }

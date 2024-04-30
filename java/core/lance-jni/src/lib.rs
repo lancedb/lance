@@ -72,6 +72,7 @@ macro_rules! ok_or_throw_with_return {
 }
 
 mod blocking_dataset;
+mod blocking_scanner;
 pub mod error;
 mod ffi;
 mod fragment;

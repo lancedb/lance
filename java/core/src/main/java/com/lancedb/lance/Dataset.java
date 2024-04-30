@@ -14,8 +14,8 @@
 
 package com.lancedb.lance;
 
-import com.lancedb.lance.ipc.DatasetScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+import com.lancedb.lance.ipc.Scanner;
 import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
 import java.util.List;
@@ -24,7 +24,6 @@ import java.util.stream.Collectors;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
-import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -164,7 +163,7 @@ public class Dataset implements Closeable {
    * @return a dataset scanner
    */
   public Scanner newScan(ScanOptions options) {
-    return new DatasetScanner(this, options, allocator);
+    return Scanner.create(this, options, allocator);
   }
 
   /**
