@@ -118,7 +118,7 @@ impl ScalarQuantizer {
         )?))
     }
 
-    pub fn bounds(&self) -> &Vec<Range<f64>> {
+    pub fn bounds(&self) -> &[Range<f64>] {
         &self.bounds
     }
 
