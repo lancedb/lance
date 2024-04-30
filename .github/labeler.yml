@@ -9,7 +9,7 @@ labels:
 - label: breaking-change
   title: "^[^:]+!:.*"
 - label: breaking-change
-  body: "BREAKING CHANGE:"
+  body: "BREAKING CHANGE"
 - label: enhancement
   title: "^feat(\\(.+\\))?!?:.*"
 - label: bug
