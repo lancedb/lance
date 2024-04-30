@@ -9,7 +9,6 @@ use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 use itertools::Itertools;
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::MetricType;
 use num_traits::*;
 use snafu::{location, Location};
 
@@ -30,18 +29,14 @@ pub struct ScalarQuantizer {
     /// Original dimension of the vectors.
     pub dim: usize,
 
-    /// Distance type.
-    pub metric_type: MetricType,
-
     pub bounds: Vec<Range<f64>>,
 }
 
 impl ScalarQuantizer {
-    pub fn new(num_bits: u16, dim: usize, metric_type: MetricType) -> Self {
+    pub fn new(num_bits: u16, dim: usize) -> Self {
         Self {
             num_bits,
             dim,
-            metric_type,
             bounds: vec![
                 Range::<f64> {
                     start: f64::MAX,
@@ -52,13 +47,8 @@ impl ScalarQuantizer {
         }
     }
 
-    pub fn with_bounds(
-        num_bits: u16,
-        dim: usize,
-        metric_type: MetricType,
-        bounds: Vec<Range<f64>>,
-    ) -> Self {
-        let mut sq = Self::new(num_bits, dim, metric_type);
+    pub fn with_bounds(num_bits: u16, dim: usize, bounds: Vec<Range<f64>>) -> Self {
+        let mut sq = Self::new(num_bits, dim);
         sq.bounds = bounds;
         sq
     }
@@ -128,7 +118,7 @@ impl ScalarQuantizer {
         )?))
     }
 
-    pub fn bounds(&self) -> &[Range<f64>] {
+    pub fn bounds(&self) -> &Vec<Range<f64>> {
         &self.bounds
     }
 
@@ -174,7 +164,7 @@ mod tests {
         let float_values = Vec::from_iter((0..DIM * 2).map(|v| f16::from_usize(v).unwrap()));
         let float_array = Float16Array::from_iter_values(float_values.clone());
         let vectors = FixedSizeListArray::try_new_from_values(float_array, DIM as i32).unwrap();
-        let mut sq = ScalarQuantizer::new(8, DIM, MetricType::L2);
+        let mut sq = ScalarQuantizer::new(8, DIM);
 
         sq.update_bounds::<Float16Type>(&vectors).unwrap();
         for i in 0..DIM {
@@ -201,7 +191,7 @@ mod tests {
         let float_values = Vec::from_iter((0..DIM * 2).map(|v| v as f32));
         let float_array = Float32Array::from_iter_values(float_values.clone());
         let vectors = FixedSizeListArray::try_new_from_values(float_array, DIM as i32).unwrap();
-        let mut sq = ScalarQuantizer::new(8, DIM, MetricType::L2);
+        let mut sq = ScalarQuantizer::new(8, DIM);
 
         sq.update_bounds::<Float32Type>(&vectors).unwrap();
         for i in 0..DIM {
@@ -228,7 +218,7 @@ mod tests {
         let float_values = Vec::from_iter((0..DIM * 2).map(|v| v as f64));
         let float_array = Float64Array::from_iter_values(float_values.clone());
         let vectors = FixedSizeListArray::try_new_from_values(float_array, DIM as i32).unwrap();
-        let mut sq = ScalarQuantizer::new(8, DIM, MetricType::L2);
+        let mut sq = ScalarQuantizer::new(8, DIM);
 
         sq.update_bounds::<Float64Type>(&vectors).unwrap();
         for i in 0..DIM {

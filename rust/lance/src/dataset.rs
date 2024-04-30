@@ -22,7 +22,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, SchemaCompareOptions};
-use lance_datafusion::utils::reader_to_stream;
+use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::ObjectWriter;
@@ -404,7 +404,8 @@ impl Dataset {
             Err(e) => return Err(e),
         };
 
-        let (stream, schema) = reader_to_stream(batches).await?;
+        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let stream = reader_to_stream(batches);
 
         // Running checks for the different write modes
         // create + dataset already exists = error
@@ -559,7 +560,8 @@ impl Dataset {
             });
         }
 
-        let (stream, schema) = reader_to_stream(batches).await?;
+        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let stream = reader_to_stream(batches);
 
         // Return Error if append and input schema differ
         self.manifest.schema.check_compatible(
@@ -2081,6 +2083,7 @@ mod tests {
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::TestDatasetGenerator;
 
     use arrow_array::types::Int64Type;
     use arrow_array::{
@@ -2101,6 +2104,7 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
+    use tests::scanner::test_dataset::TestVectorDataset;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -2871,6 +2875,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_take_rows_out_of_bound() {
+        // a dataset with 1 fragment and 400 rows
+        let test_ds = TestVectorDataset::new().await.unwrap();
+        let ds = test_ds.dataset;
+
+        // take the last row of first fragment
+        // this triggeres the contiguous branch
+        let indices = &[(1 << 32) - 1];
+        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("out of bound"),
+            "{}",
+            err.to_string()
+        );
+
+        // this triggeres the sorted branch, but not continguous
+        let indices = &[(1 << 32) - 3, (1 << 32) - 1];
+        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("out of bound"),
+            "{}",
+            err.to_string()
+        );
+
+        // this triggeres the catch all branch
+        let indices = &[(1 << 32) - 1, (1 << 32) - 3];
+        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("out of bound"),
+            "{}",
+            err.to_string()
+        );
+    }
+
+    #[tokio::test]
     async fn test_take_rows() {
         let test_dir = tempdir().unwrap();
 
@@ -3462,32 +3501,33 @@ mod tests {
     #[tokio::test]
     async fn test_delete() {
         fn sequence_data(range: Range<u32>) -> RecordBatch {
-            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-                "i",
-                DataType::UInt32,
-                false,
-            )]));
-            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
-                .unwrap()
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("i", DataType::UInt32, false),
+                Field::new("x", DataType::UInt32, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt32Array::from_iter_values(range.clone())),
+                    Arc::new(UInt32Array::from_iter_values(range.map(|v| v * 2))),
+                ],
+            )
+            .unwrap()
         }
         // Write a dataset
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "i",
-            DataType::UInt32,
-            false,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::UInt32, false),
+            Field::new("x", DataType::UInt32, false),
+        ]));
         let data = sequence_data(0..100);
-        let batches = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
-        let write_params = WriteParams {
-            max_rows_per_file: 50, // Split over two files.
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
-            .await
-            .unwrap();
+        // Split over two files.
+        let batches = vec![data.slice(0, 50), data.slice(50, 50)];
+        let mut dataset = TestDatasetGenerator::new(batches)
+            .make_hostile(test_uri)
+            .await;
 
         // Delete nothing
         dataset.delete("i < 0").await.unwrap();

@@ -3,6 +3,8 @@
 
 //! Wraps a Fragment of the dataset.
 
+pub mod write;
+
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -20,31 +22,27 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::ROW_ID_FIELD;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
-use lance_datafusion::chunker::chunk_stream;
-use lance_datafusion::utils::reader_to_stream;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
-use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::StoreScheduler;
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
-use lance_table::io::manifest::ManifestDescribing;
 use lance_table::utils::stream::{
     wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
     RowIdAndDeletesConfig,
 };
 use snafu::{location, Location};
-use uuid::Uuid;
 
-use super::builder::DatasetBuilder;
+use self::write::FragmentCreateBuilder;
+
 use super::hash_joiner::HashJoiner;
 use super::scanner::Scanner;
 use super::updater::Updater;
-use super::{WriteMode, WriteParams};
+use super::WriteParams;
 use crate::arrow::*;
-use crate::dataset::{Dataset, DATA_DIR};
+use crate::dataset::Dataset;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -284,66 +282,13 @@ impl FileFragment {
         reader: impl RecordBatchReader + Send + 'static,
         params: Option<WriteParams>,
     ) -> Result<Fragment> {
-        let params = params.unwrap_or_default();
-        let progress = params.progress.as_ref();
+        let mut builder = FragmentCreateBuilder::new(dataset_uri);
 
-        let reader = Box::new(reader);
-        let (stream, schema) = reader_to_stream(reader).await?;
-
-        let schema = if matches!(params.mode, WriteMode::Append) {
-            // TODO: we need to pass down params somehow.
-            match DatasetBuilder::from_uri(dataset_uri).load().await {
-                Ok(dataset) => {
-                    schema.check_compatible(dataset.schema(), &Default::default())?;
-                    // Use the schema from the dataset, because it has the correct
-                    // field ids.
-                    dataset.schema().clone()
-                }
-                Err(Error::DatasetNotFound { .. }) => {
-                    // If the dataset does not exist, we can use the schema from
-                    // the reader.
-                    schema
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        } else {
-            schema
-        };
-
-        if schema.fields.is_empty() {
-            return Err(Error::invalid_input(
-                "Cannot write with an empty schema.",
-                location!(),
-            ));
+        if let Some(params) = params.as_ref() {
+            builder = builder.write_params(params);
         }
 
-        let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
-        let filename = format!("{}.lance", Uuid::new_v4());
-        let mut fragment = Fragment::with_file_legacy(id as u64, &filename, &schema, None);
-        let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let mut writer = FileWriter::<ManifestDescribing>::try_new(
-            &object_store,
-            &full_path,
-            schema.clone(),
-            &Default::default(),
-        )
-        .await?;
-
-        progress.begin(&fragment, writer.multipart_id()).await?;
-
-        let mut buffered_reader = chunk_stream(stream, params.max_rows_per_group);
-        while let Some(batched_chunk) = buffered_reader.next().await {
-            let batch = batched_chunk?;
-            writer.write(&batch).await?;
-        }
-
-        fragment.physical_rows = Some(writer.finish().await?);
-
-        progress.complete(&fragment).await?;
-
-        Ok(fragment)
+        builder.write(reader, Some(id as u64)).await
     }
 
     pub async fn create_from_file(
@@ -411,6 +356,7 @@ impl FileFragment {
             deletion_vec,
             opened_files,
             ArrowSchema::from(projection),
+            self.count_rows().await?,
         )?;
 
         if with_row_id {
@@ -1093,6 +1039,9 @@ pub struct FragmentReader {
     /// If true, deleted rows will be set to null, which is fast
     /// If false, deleted rows will be removed from the batch, requiring a copy
     make_deletions_null: bool,
+
+    // total number of rows in the fragment
+    num_rows: usize,
 }
 
 // Custom clone impl needed because it is not easy to clone Box<dyn GenericFileReader>
@@ -1112,6 +1061,7 @@ impl Clone for FragmentReader {
             fragment_id: self.fragment_id,
             with_row_id: self.with_row_id,
             make_deletions_null: self.make_deletions_null,
+            num_rows: self.num_rows,
         }
     }
 }
@@ -1143,6 +1093,7 @@ impl FragmentReader {
         deletion_vec: Option<Arc<DeletionVector>>,
         readers: Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>,
         output_schema: ArrowSchema,
+        num_rows: usize,
     ) -> Result<Self> {
         if readers.is_empty() {
             return Err(Error::IO {
@@ -1178,6 +1129,7 @@ impl FragmentReader {
             fragment_id,
             with_row_id: false,
             make_deletions_null: false,
+            num_rows,
         })
     }
 
@@ -1463,6 +1415,15 @@ impl FragmentReader {
     //
     // TODO: Move away from this by changing callers to support consuming a stream
     pub async fn legacy_read_range_as_batch(&self, range: Range<usize>) -> Result<RecordBatch> {
+        if range.start >= self.num_rows || range.end > self.num_rows {
+            return Err(Error::invalid_input(
+                format!(
+                    "range {:?} is out of bounds for fragment {} with {} rows",
+                    range, self.fragment_id, self.num_rows
+                ),
+                location!(),
+            ));
+        }
         let batches = self
             .read_range(
                 range.start as u32..range.end as u32,

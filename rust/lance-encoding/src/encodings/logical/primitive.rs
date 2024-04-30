@@ -20,6 +20,7 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
+use lance_arrow::deepcopy::deep_copy_array;
 use log::{debug, trace};
 use snafu::{location, Location};
 
@@ -430,6 +431,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
 
 pub struct PrimitiveFieldEncoder {
     cache_bytes: u64,
+    keep_original_array: bool,
     buffered_arrays: Vec<ArrayRef>,
     current_bytes: u64,
     encoder: Arc<dyn ArrayEncoder>,
@@ -451,9 +453,15 @@ impl PrimitiveFieldEncoder {
         }
     }
 
-    pub fn try_new(cache_bytes: u64, data_type: &DataType, column_index: u32) -> Result<Self> {
+    pub fn try_new(
+        cache_bytes: u64,
+        keep_original_array: bool,
+        data_type: &DataType,
+        column_index: u32,
+    ) -> Result<Self> {
         Ok(Self {
             cache_bytes,
+            keep_original_array,
             column_index,
             buffered_arrays: Vec::new(),
             current_bytes: 0,
@@ -463,11 +471,13 @@ impl PrimitiveFieldEncoder {
 
     pub fn new_with_encoder(
         cache_bytes: u64,
+        keep_original_array: bool,
         column_index: u32,
         encoder: Arc<dyn ArrayEncoder>,
     ) -> Self {
         Self {
             cache_bytes,
+            keep_original_array,
             column_index,
             buffered_arrays: Vec::new(),
             current_bytes: 0,
@@ -502,14 +512,20 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         self.current_bytes += array.get_array_memory_size() as u64;
-        self.buffered_arrays.push(array);
         if self.current_bytes > self.cache_bytes {
+            // Push into buffered_arrays without copy since we are about to flush anyways
+            self.buffered_arrays.push(array);
             debug!(
                 "Flushing column {} page of size {} bytes (unencoded)",
                 self.column_index, self.current_bytes
             );
             Ok(vec![self.do_flush()])
         } else {
+            if self.keep_original_array {
+                self.buffered_arrays.push(array);
+            } else {
+                self.buffered_arrays.push(deep_copy_array(array.as_ref()))
+            }
             trace!(
                 "Accumulating data for column {}.  Now at {} bytes",
                 self.column_index,

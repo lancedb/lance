@@ -14,10 +14,13 @@
 package com.lancedb.lance;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
+import java.util.Optional;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.AfterAll;
@@ -56,7 +59,7 @@ public class DatasetTest {
     String datasetPath = tempDir.resolve("new_empty_dataset").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset();
+      testDataset.createEmptyDataset().close();
     }
   }
 
@@ -68,5 +71,32 @@ public class DatasetTest {
         () -> {
           dataset = Dataset.open(validPath, new RootAllocator());
         });
+  }
+
+
+  @Test
+  void testDatasetVersion() {
+    String datasetPath = tempDir.resolve("dataset_version").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
+        try (Dataset dataset2 = testDataset.write(1, 5)) {
+          assertEquals(1, dataset.version());
+          assertEquals(2, dataset.latestVersion());
+          assertEquals(2, dataset2.version());
+          assertEquals(2, dataset2.latestVersion());
+          try (Dataset dataset3 = testDataset.write(2, 3)) {
+            assertEquals(1, dataset.version());
+            assertEquals(3, dataset.latestVersion());
+            assertEquals(2, dataset2.version());
+            assertEquals(3, dataset2.latestVersion());
+            assertEquals(3, dataset3.version());
+            assertEquals(3, dataset3.latestVersion());
+          }
+        }
+      }
+    }
   }
 }

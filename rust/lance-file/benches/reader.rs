@@ -10,7 +10,6 @@ use lance_file::v2::{
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::{object_store::ObjectStore, scheduler::StoreScheduler};
-use pprof::criterion::{Output, PProfProfiler};
 
 fn bench_reader(c: &mut Criterion) {
     let mut group = c.benchmark_group("reader");
@@ -69,7 +68,7 @@ fn bench_reader(c: &mut Criterion) {
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+        .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
     targets = bench_reader);
 
 // Non-linux version does not support pprof.
@@ -77,5 +76,5 @@ criterion_group!(
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_distance, bench_small_distance);
+    targets = bench_reader);
 criterion_main!(benches);

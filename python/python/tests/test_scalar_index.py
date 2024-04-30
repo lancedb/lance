@@ -168,6 +168,21 @@ def test_indexed_vector_scan_postfilter(
     assert scanner.to_table().num_rows == 0
 
 
+def test_all_null_chunk(tmp_path):
+    def gen_string(idx: int):
+        if idx % 2 == 0:
+            return None
+        return f"string-{idx}"
+
+    strings = pa.array([gen_string(i) for i in range(100 * 1024)], pa.string())
+    table = pa.Table.from_arrays([strings], ["str"])
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("str", index_type="BTREE")
+    scanner = dataset.scanner(prefilter=True, filter="str='string-501'")
+
+    assert scanner.to_table().num_rows == 1
+
+
 # We currently allow the memory pool default size to be configured with an
 # environment variable.  This test ensures that the environment variable
 # is respected.

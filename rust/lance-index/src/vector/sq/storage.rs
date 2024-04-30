@@ -4,7 +4,9 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow::{array::AsArray, datatypes::Float32Type};
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
+};
 use async_trait::async_trait;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
@@ -30,6 +32,7 @@ pub const SQ_METADATA_KEY: &str = "lance:sq";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScalarQuantizationMetadata {
+    pub dim: usize,
     pub num_bits: u16,
     pub bounds: Vec<Range<f64>>,
 }
@@ -69,6 +72,9 @@ pub struct ScalarQuantizationStorage {
     // Helper fields, references to the batch
     row_ids: Arc<UInt64Array>,
     sq_codes: Arc<FixedSizeListArray>,
+
+    // Helper bounds length to boost distance computation
+    bounds_len_square: Float32Array,
 }
 
 impl ScalarQuantizationStorage {
@@ -100,6 +106,8 @@ impl ScalarQuantizationStorage {
                 .as_fixed_size_list()
                 .clone(),
         );
+        let bounds_len_square =
+            Float32Array::from_iter(bounds.iter().map(|r| ((r.end - r.start) as f32).powi(2)));
 
         Ok(Self {
             num_bits,
@@ -108,6 +116,7 @@ impl ScalarQuantizationStorage {
             batch,
             row_ids,
             sq_codes,
+            bounds_len_square,
         })
     }
 
@@ -221,9 +230,14 @@ impl VectorStorage for ScalarQuantizationStorage {
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator> {
+        let bounds_scale = Float32Array::from_iter(
+            self.bounds
+                .iter()
+                .map(|r| ((r.end - r.start) as f32).powi(2)),
+        );
         Box::new(SQDistCalculator {
             query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
-            bounds: self.bounds.clone(),
+            bounds_scale,
             sq_codes: self.sq_codes.clone(),
         })
     }
@@ -232,14 +246,14 @@ impl VectorStorage for ScalarQuantizationStorage {
         l2_distance_uint_scalar(
             get_sq_code(&self.sq_codes, a),
             get_sq_code(&self.sq_codes, b),
-            &self.bounds,
+            self.bounds_len_square.values(),
         )
     }
 }
 
 struct SQDistCalculator {
     query_sq_code: Vec<u8>,
-    bounds: Vec<Range<f64>>,
+    bounds_scale: Float32Array,
     sq_codes: Arc<FixedSizeListArray>,
 }
 
@@ -247,9 +261,12 @@ impl SQDistCalculator {
     fn new(query: ArrayRef, sq_codes: Arc<FixedSizeListArray>, bounds: Vec<Range<f64>>) -> Self {
         let query_sq_code =
             scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), &bounds);
+
+        let bounds_scale =
+            Float32Array::from_iter(bounds.iter().map(|r| ((r.end - r.start) as f32).powi(2)));
         Self {
             query_sq_code,
-            bounds,
+            bounds_scale,
             sq_codes,
         }
     }
@@ -258,7 +275,7 @@ impl SQDistCalculator {
 impl DistCalculator for SQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let sq_code = get_sq_code(&self.sq_codes, id);
-        l2_distance_uint_scalar(sq_code, &self.query_sq_code, &self.bounds)
+        l2_distance_uint_scalar(sq_code, &self.query_sq_code, self.bounds_scale.values())
     }
 }
 

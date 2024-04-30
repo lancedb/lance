@@ -5,7 +5,7 @@
 //!
 
 use std::iter::Sum;
-use std::ops::{AddAssign, Range};
+use std::ops::AddAssign;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -54,19 +54,11 @@ where
 
 /// Calculate L2 distance between two uint8 slices.
 #[inline]
-pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8], bounds: &[Range<f64>]) -> f32 {
+pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8], bounds_scale: &[f32]) -> f32 {
     key.iter()
-        .enumerate()
         .zip(target.iter())
-        .map(|((i, &x), &y)| {
-            let bounds = &bounds[i];
-            let range = (bounds.end - bounds.start) as f32;
-            println!(
-                "start: {}, end: {}, range: {:.6}",
-                bounds.start, bounds.end, range
-            );
-            (x.abs_diff(y) as f32 * range).powi(2)
-        })
+        .zip(bounds_scale)
+        .map(|((&x, &y), &len)| (x.abs_diff(y) as f32).powi(2) * len)
         .sum()
 }
 
@@ -464,12 +456,12 @@ mod tests {
     fn test_uint8_l2_edge_cases() {
         let q = vec![0_u8; 2048];
         let v = vec![0_u8; 2048];
-        let bounds = vec![0.0..0.0; 2048];
+        let bounds = vec![1.0; 2048];
         assert_eq!(l2_distance_uint_scalar(&q, &v, &bounds), 0.0);
 
         let q = vec![0_u8; 2048];
         let v = vec![255_u8; 2048];
-        let bounds = vec![0.0..1.0; 2048];
+        let bounds = vec![1.0; 2048];
         let dist = (0..2048).map(|_| 255_f32.powi(2)).sum::<f32>();
         assert_eq!(l2_distance_uint_scalar(&q, &v, &bounds), dist);
         assert_eq!(l2_distance_uint_scalar(&v, &q, &bounds), dist);

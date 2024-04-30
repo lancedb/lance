@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
+use lance_index::vector::graph::VectorStorage;
 use lance_index::vector::pq::storage::ProductQuantizationStorage;
 use lance_index::vector::quantizer::Quantization;
 use lance_index::{
@@ -235,6 +236,10 @@ impl VectorIndex for PQIndex {
             pq: self.pq.clone(),
             metric_type: self.metric_type,
         }))
+    }
+
+    fn storage(&self) -> &dyn VectorStorage {
+        todo!("this method is for only IVF_HNSW_* index");
     }
 
     fn check_can_remap(&self) -> Result<()> {

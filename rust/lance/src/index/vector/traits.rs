@@ -10,7 +10,10 @@ use arrow_array::{types::Float32Type, FixedSizeListArray, RecordBatch};
 use async_trait::async_trait;
 
 use lance_core::Result;
-use lance_index::{vector::Query, Index};
+use lance_index::{
+    vector::{graph::VectorStorage, Query},
+    Index,
+};
 use lance_io::{object_writer::ObjectWriter, traits::Reader};
 use lance_linalg::{distance::MetricType, MatrixView};
 
@@ -69,6 +72,8 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ) -> Result<Box<dyn VectorIndex>> {
         self.load(reader, offset, length).await
     }
+
+    fn storage(&self) -> &dyn VectorStorage;
 
     /// Remap the index according to mapping
     ///

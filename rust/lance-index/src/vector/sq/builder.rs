@@ -33,7 +33,7 @@ impl Default for SQBuildParams {
 }
 
 impl SQBuildParams {
-    pub fn build(&self, data: &dyn Array, metric_type: MetricType) -> Result<ScalarQuantizer> {
+    pub fn build(&self, data: &dyn Array, _: MetricType) -> Result<ScalarQuantizer> {
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
                 "SQ builder: input is not a FixedSizeList: {}",
@@ -42,8 +42,7 @@ impl SQBuildParams {
             location: location!(),
         })?;
 
-        let mut quantizer =
-            ScalarQuantizer::new(self.num_bits, fsl.value_length() as usize, metric_type);
+        let mut quantizer = ScalarQuantizer::new(self.num_bits, fsl.value_length() as usize);
 
         match fsl.value_type() {
             DataType::Float16 => {

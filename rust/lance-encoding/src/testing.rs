@@ -96,6 +96,7 @@ pub async fn check_round_trip_encoding_random(field: Field) {
             BatchEncoder::get_encoder_for_field(
                 &lance_field,
                 page_size,
+                /*keep_original_array=*/ true,
                 &mut col_idx,
                 &mut field_id_to_col_index,
             )
@@ -149,6 +150,7 @@ pub async fn check_round_trip_encoding_of_data(data: Vec<Arc<dyn Array>>, test_c
         let encoder = BatchEncoder::get_encoder_for_field(
             &lance_field,
             page_size,
+            /*keep_original=*/ true,
             &mut col_idx,
             &mut field_id_to_col_index,
         )

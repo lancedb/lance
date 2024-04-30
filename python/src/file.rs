@@ -168,7 +168,12 @@ pub struct LanceFileWriter {
 }
 
 impl LanceFileWriter {
-    async fn open(uri_or_path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
+    async fn open(
+        uri_or_path: String,
+        schema: PyArrowType<ArrowSchema>,
+        data_cache_bytes: Option<u64>,
+        keep_original_array: Option<bool>,
+    ) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
         let object_writer = object_store.create(&path).await.infer_error()?;
         let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
@@ -176,7 +181,10 @@ impl LanceFileWriter {
             object_writer,
             path.to_string(),
             lance_schema,
-            FileWriterOptions::default(),
+            FileWriterOptions {
+                data_cache_bytes,
+                keep_original_array,
+            },
         )
         .infer_error()?;
         Ok(Self {
@@ -188,8 +196,18 @@ impl LanceFileWriter {
 #[pymethods]
 impl LanceFileWriter {
     #[new]
-    pub fn new(path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        RT.runtime.block_on(Self::open(path, schema))
+    pub fn new(
+        path: String,
+        schema: PyArrowType<ArrowSchema>,
+        data_cache_bytes: Option<u64>,
+        keep_original_array: Option<bool>,
+    ) -> PyResult<Self> {
+        RT.runtime.block_on(Self::open(
+            path,
+            schema,
+            data_cache_bytes,
+            keep_original_array,
+        ))
     }
 
     pub fn write_batch(&mut self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
