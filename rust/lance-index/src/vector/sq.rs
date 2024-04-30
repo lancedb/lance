@@ -77,11 +77,11 @@ impl ScalarQuantizer {
         Ok(self.bounds.clone())
     }
 
-    pub fn extend(&mut self, rate: f64) {
+    pub fn extend(&mut self, scale: f64) {
         for bounds in self.bounds.iter_mut() {
             let range = bounds.end - bounds.start;
-            bounds.start -= range * rate / 2.0;
-            bounds.end += range * rate / 2.0;
+            bounds.start -= range * (scale - 1.0) / 2.0;
+            bounds.end += range * (scale - 1.0) / 2.0;
         }
     }
 

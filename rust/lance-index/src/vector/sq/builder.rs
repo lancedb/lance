@@ -21,6 +21,9 @@ pub struct SQBuildParams {
 
     /// Sample rate for training.
     pub sample_rate: usize,
+
+    /// extend scale
+    pub extend_scale: f64,
 }
 
 impl Default for SQBuildParams {
@@ -28,6 +31,7 @@ impl Default for SQBuildParams {
         Self {
             num_bits: 8,
             sample_rate: 256,
+            extend_scale: 1.0,
         }
     }
 }
@@ -61,6 +65,8 @@ impl SQBuildParams {
                 })
             }
         }
+
+        quantizer.extend(self.extend_scale);
 
         Ok(quantizer)
     }
