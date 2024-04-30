@@ -63,6 +63,8 @@ pip install --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance
 > [!TIP]
 > Preview releases are released more often than full releases and contain the
 > latest features and bug fixes. They receive the same level of testing as full releases.
+> We guarantee they will remain published and available for download for at 
+> least 6 months. When you want to pin to a specific version, prefer a stable release.
 
 **Converting to Lance**
 
