@@ -2,6 +2,7 @@ changelog:
   exclude:
     labels:
       - ci
+      - chore
   categories:
     - title: Breaking Changes 🛠
       labels:

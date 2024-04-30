@@ -8,6 +8,8 @@ labels:
 # For example, `feat!: add new feature` will be considered a breaking change
 - label: breaking-change
   title: "^[^:]+!:.*"
+- label: breaking-change
+  body: "BREAKING CHANGE:"
 - label: enhancement
   title: "^feat(\\(.+\\))?!?:.*"
 - label: bug
@@ -18,3 +20,5 @@ labels:
   title: "^perf(\\(.+\\))?!?:.*"
 - label: ci
   title: "^ci(\\(.+\\))?!?:.*"
+- label: chore
+  title: "^(chore|test|build|style)(\\(.+\\))?!?:.*"
