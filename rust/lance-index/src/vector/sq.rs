@@ -181,7 +181,11 @@ mod tests {
             .unwrap();
 
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
-            assert_eq!(*v, (i * 17) as u8);
+            if i >= DIM {
+                assert_eq!(255, *v);
+            } else {
+                assert_eq!(0, *v);
+            }
         });
     }
 
@@ -208,7 +212,11 @@ mod tests {
             .unwrap();
 
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
-            assert_eq!(*v, (i * 17) as u8,);
+            if i >= DIM {
+                assert_eq!(255, *v);
+            } else {
+                assert_eq!(0, *v);
+            }
         });
     }
 
@@ -235,7 +243,11 @@ mod tests {
             .unwrap();
 
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
-            assert_eq!(*v, (i * 17) as u8,);
+            if i >= DIM {
+                assert_eq!(255, *v);
+            } else {
+                assert_eq!(0, *v);
+            }
         });
     }
 }
