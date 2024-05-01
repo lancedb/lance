@@ -295,13 +295,12 @@ impl DecodeBatchScheduler {
         }
     }
 
-    fn create_primitive_scheduler<'a>(
+    fn create_primitive_scheduler(
         data_type: &DataType,
-        column_infos: &mut impl Iterator<Item = &'a ColumnInfo>,
+        column: &ColumnInfo,
         buffers: FileBuffers,
     ) -> Vec<Box<dyn LogicalPageScheduler>> {
         // Primitive fields map to a single column
-        let column = column_infos.next().unwrap();
         let column_buffers = ColumnBuffers {
             file_buffers: buffers,
             positions: &column.buffer_offsets,
@@ -385,14 +384,16 @@ impl DecodeBatchScheduler {
         buffers: FileBuffers,
     ) -> Vec<Box<dyn LogicalPageScheduler>> {
         if Self::is_primitive(data_type) {
-            return Self::create_primitive_scheduler(data_type, column_infos, buffers);
+            let primitive_col = column_infos.next().unwrap();
+            return Self::create_primitive_scheduler(data_type, primitive_col, buffers);
         }
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 // A fixed size list column could either be a physical or a logical decoder
                 // depending on the child data type.
                 if Self::is_primitive(inner.data_type()) {
-                    Self::create_primitive_scheduler(data_type, column_infos, buffers)
+                    let primitive_col = column_infos.next().unwrap();
+                    Self::create_primitive_scheduler(data_type, primitive_col, buffers)
                 } else {
                     let inner_schedulers =
                         Self::create_field_scheduler(inner.data_type(), column_infos, buffers);
@@ -406,21 +407,50 @@ impl DecodeBatchScheduler {
                 }
             }
             DataType::List(items_field) => {
-                let offsets = Self::create_field_scheduler(&DataType::Int32, column_infos, buffers);
+                let offsets_column = column_infos.next().unwrap();
+                let offsets_column_buffers = ColumnBuffers {
+                    file_buffers: buffers,
+                    positions: &offsets_column.buffer_offsets,
+                };
                 let items =
                     Self::create_field_scheduler(items_field.data_type(), column_infos, buffers);
-                // TODO: This may need to be more flexible in the future if an items page can
-                // be shared by multiple offsets pages.
-                offsets
-                    .into_iter()
-                    .zip(items)
-                    .map(|(offsets_page, items_page)| {
-                        Box::new(ListPageScheduler::new(
-                            offsets_page,
-                            vec![items_page],
-                            items_field.data_type().clone(),
-                            DataType::Int32,
-                        )) as Box<dyn LogicalPageScheduler>
+                let mut items = items.into_iter();
+                offsets_column
+                    .page_infos
+                    .iter()
+                    .map(|offsets_page| {
+                        if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
+                            &offsets_page.encoding.array_encoding
+                        {
+                            let inner = Box::new(PrimitivePageScheduler::new(
+                                DataType::UInt64,
+                                offsets_page.clone(),
+                                offsets_column_buffers,
+                            ))
+                                as Box<dyn LogicalPageScheduler>;
+                            let mut items_schedulers = Vec::new();
+                            let mut num_items = list_encoding.num_items;
+                            while num_items > 0 {
+                                let next_items_page = items.next().unwrap();
+                                println!(
+                                    "num_items = {} and next_items_page.num_rows() = {}",
+                                    num_items,
+                                    next_items_page.num_rows() as u64
+                                );
+                                num_items -= next_items_page.num_rows() as u64;
+                                items_schedulers.push(next_items_page);
+                            }
+                            Box::new(ListPageScheduler::new(
+                                inner,
+                                items_schedulers,
+                                items_field.data_type().clone(),
+                                DataType::Int32,
+                                list_encoding.null_offset_adjustment,
+                            )) as Box<dyn LogicalPageScheduler>
+                        } else {
+                            // TODO: Should probably return Err here
+                            panic!("Expected a list column");
+                        }
                     })
                     .collect::<Vec<_>>()
             }
