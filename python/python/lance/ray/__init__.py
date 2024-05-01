@@ -3,23 +3,14 @@
 
 """Ray integration."""
 
-from typing import Union
-
-import ray.data
-
-from .. import LanceDataset, dataset
-from .schema import merge_columns
+from .schema import LanceMergeColumn, merge_columns
+from .sink import LanceCommitter, LanceDatasink, LanceFragmentWriter, _register_hooks
 
 __all__ = [
+    "_register_hooks",
+    "LanceCommitter",
+    "LanceDatasink",
+    "LanceFragmentWriter",
+    "LanceMergeColumn",
     "merge_columns",
 ]
-
-
-def fragments(data: Union[str, LanceDataset]):
-    """Get fragments from a dataset."""
-    if isinstance(data, LanceDataset):
-        ds = data
-    else:
-        ds = dataset(data)
-
-    return ray.data.from_items(ds.get_fragments())

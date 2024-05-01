@@ -11,12 +11,12 @@ import pytest
 ray = pytest.importorskip("ray")
 
 
-from lance.ray import merge_columns
-from lance.ray.sink import (  # noqa: E402
+from lance.ray import (  # noqa: E402
     LanceCommitter,
     LanceDatasink,
     LanceFragmentWriter,
     _register_hooks,
+    merge_columns,
 )
 
 # Use this hook until we have offical DataSink in Ray.
