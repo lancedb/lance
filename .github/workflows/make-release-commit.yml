@@ -85,7 +85,7 @@ jobs:
       with:
         prerelease: ${{ inputs.type == 'preview' }}
         draft: ${{ inputs.draft-release }}
-        target_commitish: ${{ steps.create_tag.outputs.tag }}
+        tag_name: ${{ steps.create_tag.outputs.tag }}
         token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         generate_release_notes: true
 
