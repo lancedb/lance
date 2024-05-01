@@ -869,7 +869,7 @@ impl Scanner {
                     self.scalar_indexed_scan(&filter_schema, index_query)
                         .await?
                 }
-                (None, Some(_)) if self.use_stats => {
+                (None, Some(_)) if self.use_stats && self.batch_size == DEFAULT_BATCH_SIZE => {
                     self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
                 }
                 (None, _) => {
@@ -1681,30 +1681,33 @@ mod test {
             })
             .collect();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let write_params = WriteParams {
-            max_rows_per_file: 40,
-            max_rows_per_group: 10,
-            ..Default::default()
-        };
-        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
-            .await
-            .unwrap();
+        for use_filter in [false, true] {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 40,
+                max_rows_per_group: 10,
+                ..Default::default()
+            };
+            let batches =
+                RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
+            Dataset::write(batches, test_uri, Some(write_params))
+                .await
+                .unwrap();
 
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        let mut stream = dataset
-            .scan()
-            .batch_size(8)
-            .try_into_stream()
-            .await
-            .unwrap();
-        for expected_len in [8, 2, 8, 2, 8, 2, 8, 2, 8, 2] {
-            assert_eq!(
-                stream.next().await.unwrap().unwrap().num_rows(),
-                expected_len as usize
-            );
+            let dataset = Dataset::open(test_uri).await.unwrap();
+            let mut builder = dataset.scan();
+            builder.batch_size(8);
+            if use_filter {
+                builder.filter("i IS NOT NULL").unwrap();
+            }
+            let mut stream = builder.try_into_stream().await.unwrap();
+            for expected_len in [8, 2, 8, 2, 8, 2, 8, 2, 8, 2] {
+                assert_eq!(
+                    stream.next().await.unwrap().unwrap().num_rows(),
+                    expected_len as usize
+                );
+            }
         }
     }
 
