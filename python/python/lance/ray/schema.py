@@ -37,7 +37,20 @@ def merge_columns(
     *,
     columns: Optional[list[str]] = None,
 ):
-    """Run merge_columns distributedly with Ray."""
+    """Run merge_columns distributedly with Ray.
+
+    Parameters
+    ----------
+    value_func: Callable.
+        A function that takes a RecordBatch as input and returns a RecordBatch.
+    columns: Optional[list[str]].
+        If specified, only the columns in this list will be passed to the
+        value_func. Otherwise, all columns will be passed to the value_func.
+
+    See Also
+    --------
+    lance.fragment.LanceFragment.merge_columns
+    """
     import ray
 
     if isinstance(data, LanceDataset):
