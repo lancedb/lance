@@ -18,14 +18,14 @@ __all__ = [
 
 @torch.jit.script
 def _pairwise_cosine(
-    x: torch.Tensor, y: torch.Tensor, y2: torch.Tensor
+    x: torch.Tensor, y: torch.Tensor, ynorm: torch.Tensor
 ) -> torch.Tensor:
-    x2 = torch.linalg.norm(x, dim=1).reshape((-1, 1))
-    return 1 - (x @ y.T).div_(x2).div_(y2)
+    xnorm = torch.linalg.norm(x, dim=1).reshape((-1, 1))
+    return 1 - (x @ y.T).div_(xnorm).div_(ynorm)
 
 
 def pairwise_cosine(
-    x: torch.Tensor, y: torch.Tensor, *, y2: Optional[torch.Tensor] = None
+    x: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:
     """Compute pair-wise cosine distance between x and y.
 
@@ -44,9 +44,8 @@ def pairwise_cosine(
         raise ValueError(
             f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
         )
-    if y2 is None:
-        y2: torch.Tensor = torch.linalg.norm(y, dim=1)
-    return _pairwise_cosine(x, y, y2)
+    ynorm: torch.Tensor = torch.linalg.norm(y, dim=1)
+    return _pairwise_cosine(x, y, ynorm)
 
 
 @torch.jit.script
