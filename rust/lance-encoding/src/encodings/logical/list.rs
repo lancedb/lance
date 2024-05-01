@@ -559,7 +559,7 @@ impl LogicalPageDecoder for ListPageDecoder {
                     "List decoder waiting on a new page that has {} items unawaited",
                     unawaited
                 );
-                let to_await = items_needed.min(unawaited as u64) as u32;
+                let to_await = items_needed.min(unawaited) as u32;
                 // TODO: Seems like this will fail in List<Struct> case
                 next_item_decoder.wait(to_await, source).await?;
                 // Might end up loading more items than needed so use saturating_sub
