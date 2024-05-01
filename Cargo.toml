@@ -19,7 +19,7 @@ exclude = ["python"]
 resolver = "2"
 
 [workspace.package]
-version = "0.10.17"
+version = "0.10.18"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
