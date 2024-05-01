@@ -8,10 +8,18 @@ inputs:
   repo:
     required: false
     description: "pypi or testpypi"
+    type: choice
+    options:
+      - "pypi"
+      - "testpypi"
+      - "fury"
     default: "pypi"
-  token:
+  pypi_token:
     required: true
     description: "release token for the repo"
+  fury_token:
+    required: true
+    description: "release token for the fury repo"
 
 runs:
   using: "composite"
@@ -21,10 +29,16 @@ runs:
     run: |
       python -m pip install --upgrade pip
       pip install twine
-  - name: Build and publish
+  - name: Publish to PyPI
     working-directory: python
-    env:
-      TWINE_USERNAME: __token__
-      TWINE_PASSWORD: ${{ inputs.token }}
     shell: bash
-    run: twine upload --repository ${{ inputs.repo }} target/wheels/pylance-*.whl
+    run: |
+      if [ ${{ inputs.repo }} == "fury" ]; then
+        WHEEL=$(ls target_pyo3/wheels/pylance-*.whl 2> /dev/null | head -n 1)
+        curl -F package=@WHEEL https://${{ inputs.fury_token }}@push.fury.io/lancedb/
+      else
+        twine upload --repository ${{ inputs.repo }} \
+          --username __token__ \
+          --password ${{ inputs.pypi_token }} \
+          target/wheels/pylance-*.whl
+      fi
