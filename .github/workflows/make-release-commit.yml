@@ -17,7 +17,7 @@ on:
           - preview
           - stable
       draft-release:
-        description: 'When creating release, should it be a draft?'
+        description: 'Create a draft release on GitHub'
         required: true
         default: false
         type: boolean
@@ -101,7 +101,7 @@ jobs:
         git add -u
         git commit -m "Bump version"
     - name: Push new version 
-      if: ${{ inputs.type == 'stable' }} && ${{ inputs.dry_run == 'false' }}
+      if: ${{ inputs.type == 'stable' && inputs.dry_run == 'false' }}
       uses: ad-m/github-push-action@master
       with:
         github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
