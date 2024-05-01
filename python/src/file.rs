@@ -264,8 +264,8 @@ impl LanceFileReader {
     async fn open(uri_or_path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
         let io_parallelism = std::env::var("IO_THREADS")
-        .map(|val| val.parse::<u32>().unwrap_or(8))
-        .unwrap_or(8);
+            .map(|val| val.parse::<u32>().unwrap_or(8))
+            .unwrap_or(8);
         let scheduler = StoreScheduler::new(Arc::new(object_store), io_parallelism);
         let file = scheduler.open_file(&path).await.infer_error()?;
         let inner = FileReader::try_open(file, schema.0.clone())
