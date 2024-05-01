@@ -6,11 +6,8 @@ on:
       dry_run:
         description: 'Dry run (create the local commit/tags but do not push it)'
         required: true
-        default: "false"
-        type: choice
-        options:
-          - "true"
-          - "false"
+        default: false
+        type: boolean
       type:
         description: 'What kind of release is this?'
         required: true
@@ -22,16 +19,15 @@ on:
       draft-release:
         description: 'When creating release, should it be a draft?'
         required: true
-        default: "false"
-        type: choice
-        options:
-          - "true"
-          - "false"
+        default: false
+        type: boolean
 
 jobs:
   bump-version:
     runs-on: ubuntu-latest
     steps:
+    - name: Output Inputs
+      run: echo "${{ toJSON(github.event.inputs) }}"
     - name: Check out main
       uses: actions/checkout@v4
       with:
@@ -77,7 +73,7 @@ jobs:
         git tag $TAG
         echo "tag=$TAG" >> $GITHUB_OUTPUT
     - name: Push new version tag
-      if: ${{ inputs.dry_run }} == "false"
+      if: ! ${{ inputs.dry_run }}
       uses: ad-m/github-push-action@master
       with:
         github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
@@ -88,7 +84,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         prerelease: ${{ inputs.type }} == "preview"
-        draft: ${{ inputs.draft-release }} == "true"
+        draft: ${{ inputs.draft-release }}
         target_commitish: ${{ steps.create_tag.outputs.tag }}
         token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         generate_release_notes: true
@@ -105,7 +101,7 @@ jobs:
         git add -u
         git commit -m "Bump version"
     - name: Push new version 
-      if: ${{ inputs.type }} == "stable" && ${{ inputs.dry_run }} == "false"
+      if: ${{ inputs.type }} == "stable" && ! ${{ inputs.dry_run }}
       uses: ad-m/github-push-action@master
       with:
         github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
