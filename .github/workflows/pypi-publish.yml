@@ -120,6 +120,7 @@ jobs:
           python-version: 3.${{ matrix.python-minor-version }}
       - name: Handle tag
         id: handle_tag
+        shell: bash
         run: |
           # If the tag ends with -beta.N, we need to call setup_version.py 
           # and export repo as "fury" instead of "pypi"
