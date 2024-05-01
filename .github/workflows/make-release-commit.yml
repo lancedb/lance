@@ -73,14 +73,14 @@ jobs:
         git tag $TAG
         echo "tag=$TAG" >> $GITHUB_OUTPUT
     - name: Push new version tag
-      if: ${{ inputs.dry_run == 'false' }}
+      if: !inputs.dry_run
       uses: ad-m/github-push-action@master
       with:
         github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         branch: ${{ github.ref }}
         tags: true
     - name: Create GH release
-      if: ${{ inputs.dry_run == 'false' }}
+      if: !inputs.dry_run
       uses: softprops/action-gh-release@v2
       with:
         prerelease: ${{ inputs.type == 'preview' }}
@@ -92,16 +92,16 @@ jobs:
     # Remaining steps only apply to stable releases
     - name: Call bumpversion
       uses: ./.github/workflows/bump-version
-      if: ${{ inputs.type == 'stable' }}
+      if: inputs.type == 'stable'
       with:
         part: patch
     - name: Commit bump version
-      if: ${{ inputs.type == 'stable' }}
+      if: inputs.type == 'stable'
       run: |
         git add -u
         git commit -m "Bump version"
     - name: Push new version 
-      if: ${{ inputs.type == 'stable' && inputs.dry_run == 'false' }}
+      if: inputs.type == 'stable' && !inputs.dry_run
       uses: ad-m/github-push-action@master
       with:
         github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
