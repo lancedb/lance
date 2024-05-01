@@ -277,8 +277,10 @@ def pairwise_scaql(nu: float, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     x_normalized = torch.nn.functional.normalize(x)
     y_normalized = torch.nn.functional.normalize(y)
     residuals = x_normalized[:, None, :] - y_normalized[None, :, :]
+    del y_normalized
     dots = torch.sum(residuals * x_normalized[:, None, :].expand(-1, residuals.shape[1], -1), dim=2)
     parallel_residual = dots[..., None] * x_normalized[:, None, :]
+    del dots
     parallel_ql = torch.sum(parallel_residual ** 2, dim=2)
     orthogonal_residual = residuals - parallel_residual
     orthogonal_ql = torch.sum(orthogonal_residual ** 2, dim=2)
@@ -311,6 +313,8 @@ def _scaql(nu: float, x: torch.Tensor, y: torch.Tensor, split_size: int) -> Tupl
 
 def create_scaql(nu: float):
     def scaql(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        split = _suggest_batch_size(y)
-        _scaql(nu, x, y, split)
+        #split = max(_suggest_batch_size(y)//24,1)
+        #print(_suggest_batch_size(y))
+        split = 100
+        return _scaql(nu, x, y, split)
     return scaql

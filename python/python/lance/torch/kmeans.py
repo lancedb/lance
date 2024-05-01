@@ -172,13 +172,20 @@ class KMeans:
     ) -> torch.Tensor:
         zero_counts = counts == 0
         if self.metric == "scaql":
-            identity_matrix = torch.eye(outer_product_sums.size(1), device=outer_product_sums.device)
-            centroids = centroids * self.scaql_nu
-            outer_product_sums = outer_product_sums * (self.scaql_nu - 1)
-            scaled_identity_matrices = counts[:, None, None] * identity_matrix
-            outer_product_sums += scaled_identity_matrices
-            inversed_outer_product_sums = torch.linalg.inv(outer_product_sums)
-            centroids = torch.matmul(inversed_outer_product_sums, centroids.unsqueeze(-1)).squeeze(-1)
+            nonempty_centroids = centroids[counts!=0,:]
+            nonzero_counts = counts[counts!=0]
+            nonzero_outer_product_sums = outer_product_sums[counts!=0,:,:]
+            identity_matrix = torch.eye(nonzero_outer_product_sums.size(1), device=nonzero_outer_product_sums.device)
+            nonempty_centroids = nonempty_centroids * self.scaql_nu
+            nonzero_outer_product_sums = nonzero_outer_product_sums * (self.scaql_nu - 1)
+            scaled_identity_matrices = nonzero_counts[:, None, None] * identity_matrix
+            nonzero_outer_product_sums += scaled_identity_matrices
+            inversed_outer_product_sums = torch.linalg.inv(nonzero_outer_product_sums)
+            nonempty_centroids = torch.matmul(inversed_outer_product_sums, nonempty_centroids.unsqueeze(-1)).squeeze(-1)
+            zero_counts = torch.zeros((counts==0).sum(), device=centroids.device)
+            zero_centroids = torch.zeros((counts==0).sum(), centroids.shape[1], device=centroids.device)
+            centroids = torch.concatenate((nonempty_centroids, zero_centroids))
+            counts = torch.concatenate((nonzero_counts, zero_counts))
         else:
             centroids = centroids / counts[:, None]
         for idx in zero_counts.nonzero(as_tuple=False):
@@ -241,6 +248,7 @@ class KMeans:
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
         y2 = (self.centroids * self.centroids).sum(dim=1)
+        #y2 = torch.linalg.norm(self.centroids, dim=1)
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
@@ -294,6 +302,8 @@ class KMeans:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.metric in ["cosine", "scaql"]:
             data = torch.nn.functional.normalize(data)
+        if self.metric == "scaql":
+            return self.dist_func(data, self.centroids)
         return self.dist_func(data, self.centroids, y2=y2)
 
     def transform(
