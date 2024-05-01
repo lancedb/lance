@@ -13,6 +13,7 @@ __all__ = [
     "pairwise_l2",
     "l2_distance",
     "dot_distance",
+    "create_scaql",
 ]
 
 
@@ -252,3 +253,64 @@ def dot_distance(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.
     dists = dists.take_along_dim(idx, dim=1).reshape(-1)
     idx = torch.where(dists.isnan(), torch.nan, idx)
     return idx.reshape(-1), dists.reshape(-1)
+
+@torch.jit.script
+def pairwise_scaql(nu: float, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Pair-wise score-aware quantization loss between two 2-D Tensors.
+    See: https://arxiv.org/pdf/1908.10396
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        A 2-D [N, D] tensor
+    y : torch.Tensor
+        A 2-D [M, D] tensor
+
+    Returns
+    -------
+    A 2-D [N, M] tensor of score-aware quantization losses between x and y.
+    """
+    if len(x.shape) != 2 or len(y.shape) != 2:
+        raise ValueError(
+            f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
+        )
+    x_normalized = torch.nn.functional.normalize(x)
+    y_normalized = torch.nn.functional.normalize(y)
+    residuals = x_normalized[:, None, :] - y_normalized[None, :, :]
+    dots = torch.sum(residuals * x_normalized[:, None, :].expand(-1, residuals.shape[1], -1), dim=2)
+    parallel_residual = dots[..., None] * x_normalized[:, None, :]
+    parallel_ql = torch.sum(parallel_residual ** 2, dim=2)
+    orthogonal_residual = residuals - parallel_residual
+    orthogonal_ql = torch.sum(orthogonal_residual ** 2, dim=2)
+    dists = nu * parallel_ql + orthogonal_ql # Weighted loss formula
+    return dists
+
+@torch.jit.script
+def _scaql(nu: float, x: torch.Tensor, y: torch.Tensor, split_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    if len(x.shape) != 2 or len(y.shape) != 2:
+        raise ValueError(
+            f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
+        )
+
+    part_ids = []
+    distances = []
+
+    for sub_vectors in x.split(split_size):
+        dists = pairwise_scaql(nu, sub_vectors, y)
+        min_dists, idx = torch.min(dists, dim=1, keepdim=True)
+        part_ids.append(idx)
+        distances.append(min_dists)
+
+    if len(part_ids) == 1:
+        idx, dists = part_ids[0].reshape(-1), distances[0].reshape(-1)
+    else:
+        idx, dists = torch.cat(part_ids).reshape(-1), torch.cat(distances).reshape(-1)
+
+    idx = torch.where(dists.isnan(), -1, idx)
+    return idx, dists
+
+def create_scaql(nu: float):
+    def scaql(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        split = _suggest_batch_size(y)
+        _scaql(nu, x, y, split)
+    return scaql

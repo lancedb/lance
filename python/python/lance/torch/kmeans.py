@@ -13,7 +13,7 @@ from lance.dependencies import numpy as np
 
 from . import preferred_device
 from .data import TensorDataset
-from .distance import dot_distance, l2_distance
+from .distance import dot_distance, l2_distance, create_scaql
 
 __all__ = ["KMeans"]
 
@@ -49,16 +49,18 @@ class KMeans:
         self,
         k: int,
         *,
-        metric: Literal["l2", "euclidean", "cosine", "dot"] = "l2",
+        metric: Literal["l2", "euclidean", "cosine", "dot", "scaql"] = "l2",
         init: Literal["random"] = "random",
         max_iters: int = 50,
         tolerance: float = 1e-4,
         centroids: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
         device: Optional[str] = None,
+        scaql_nu: Optional[float] = None,
     ):
         self.k = k
         self.max_iters = max_iters
+        self.scaql_nu = scaql_nu
 
         metric = metric.lower()
         self.metric = metric
@@ -67,6 +69,12 @@ class KMeans:
             self.dist_func = l2_distance
         elif metric == "dot":
             self.dist_func = dot_distance
+        elif metric == "scaql":
+            if scaql_nu == None or scaql_nu < 1.:
+                raise ValueError(
+                    "KMeans::Using scaql as metric type requires scaql_nu parameter >= 1."
+                )
+            self.dist_func = create_scaql(scaql_nu)
         else:
             raise ValueError(
                 f"Only l2/cosine/dot is supported as metric type, got: {metric}"
@@ -160,10 +168,19 @@ class KMeans:
         logging.info("Finish KMean training in %s", time.time() - start)
 
     def _updated_centroids(
-        self, centroids: torch.Tensor, counts: torch.Tensor
+        self, centroids: torch.Tensor, counts: torch.Tensor, outer_product_sums: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        centroids = centroids / counts[:, None]
         zero_counts = counts == 0
+        if self.metric == "scaql":
+            identity_matrix = torch.eye(outer_product_sums.size(1), device=outer_product_sums.device)
+            centroids = centroids * self.scaql_nu
+            outer_product_sums = outer_product_sums * (self.scaql_nu - 1)
+            scaled_identity_matrices = counts[:, None, None] * identity_matrix
+            outer_product_sums += scaled_identity_matrices
+            inversed_outer_product_sums = torch.linalg.inv(outer_product_sums)
+            centroids = torch.matmul(inversed_outer_product_sums, centroids.unsqueeze(-1)).squeeze(-1)
+        else:
+            centroids = centroids / counts[:, None]
         for idx in zero_counts.nonzero(as_tuple=False):
             # split the largest cluster and remove empty cluster
             max_idx = torch.argmax(counts).item()
@@ -175,7 +192,7 @@ class KMeans:
             noise = (torch.rand_like(centroids[idx]) - 0.5) * 0.01 + 1
             centroids[max_idx] = centroids[max_idx] * noise
 
-        if self.metric == "cosine":
+        if self.metric in ["cosine", "scaql"]:
             # normalize the centroids
             centroids = torch.nn.functional.normalize(centroids)
         return centroids
@@ -215,6 +232,12 @@ class KMeans:
         new_centroids = torch.zeros_like(
             self.centroids, device=self.device, dtype=torch.float32
         )
+        outer_product_sums = None
+        if self.metric == "scaql":
+            num_centroids, centroid_dimension = self.centroids.shape
+            outer_product_sums = torch.zeros(
+                num_centroids, centroid_dimension, centroid_dimension, device=self.device, dtype=torch.float32
+            )
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
         y2 = (self.centroids * self.centroids).sum(dim=1)
@@ -235,7 +258,11 @@ class KMeans:
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
+            typed_chunk = chunk.type(torch.float32)
             new_centroids.index_add_(0, ids, chunk.type(torch.float32))
+            if self.metric == "scaql":
+                outer_products = torch.bmm(typed_chunk.unsqueeze(-1), typed_chunk.unsqueeze(1))
+                outer_product_sums.index_add_(0, ids, outer_products)
             counts_per_part.index_add_(0, ids, ones[: ids.shape[0]])
             del ids
             del dists
@@ -255,7 +282,7 @@ class KMeans:
             raise StopIteration("kmeans: converged")
 
         # cast to the type we get the data in
-        self.centroids = self._updated_centroids(new_centroids, counts_per_part).type(
+        self.centroids = self._updated_centroids(new_centroids, counts_per_part, outer_product_sums).type(
             dtype
         )
         return total_dist
@@ -265,7 +292,7 @@ class KMeans:
         data: torch.Tensor,
         y2: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.metric == "cosine":
+        if self.metric in ["cosine", "scaql"]:
             data = torch.nn.functional.normalize(data)
         return self.dist_func(data, self.centroids, y2=y2)
 
