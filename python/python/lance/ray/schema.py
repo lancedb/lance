@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import pickle
-from pathlib import Path
 from typing import Callable, Optional, Union
 
 import pyarrow as pa
