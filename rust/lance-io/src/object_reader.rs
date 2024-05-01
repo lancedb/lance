@@ -9,6 +9,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use lance_core::Result;
 use object_store::{path::Path, ObjectStore};
+use tracing::instrument;
 
 use crate::traits::Reader;
 
@@ -75,6 +76,7 @@ impl Reader for CloudObjectReader {
         Ok(meta.size)
     }
 
+    #[instrument(level = "debug", skip(self))]
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         self.do_with_retry(|| self.object_store.get_range(&self.path, range.clone()))
             .await
