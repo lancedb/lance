@@ -58,7 +58,7 @@ async fn test_decode(
     num_rows: u64,
     schema: &Schema,
     column_infos: &[ColumnInfo],
-    expected: Arc<dyn Array>,
+    expected: Option<Arc<dyn Array>>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<Box<dyn LogicalPageDecoder>>,
@@ -76,11 +76,13 @@ async fn test_decode(
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
         let batch = batch.task.await.unwrap();
-        let actual = batch.column(0);
-        let expected_size = (BATCH_SIZE as usize).min(expected.len() - offset);
-        let expected = expected.slice(offset, expected_size);
-        assert_eq!(expected.data_type(), actual.data_type());
-        assert_eq!(&expected, actual);
+        if let Some(expected) = expected.as_ref() {
+            let actual = batch.column(0);
+            let expected_size = (BATCH_SIZE as usize).min(expected.len() - offset);
+            let expected = expected.slice(offset, expected_size);
+            assert_eq!(expected.data_type(), actual.data_type());
+            assert_eq!(&expected, actual);
+        }
         offset += BATCH_SIZE as usize;
     }
 }
@@ -109,10 +111,7 @@ pub async fn check_round_trip_encoding_random(field: Field) {
 fn supports_nulls(data_type: &DataType) -> bool {
     // We don't yet have nullability support for all types.  Don't test nullability for the
     // types we don't support.
-    !matches!(
-        data_type,
-        DataType::List(_) | DataType::Struct(_) | DataType::Utf8 | DataType::Binary
-    )
+    !matches!(data_type, DataType::Struct(_))
 }
 
 // The default will just test the full read
@@ -120,6 +119,7 @@ fn supports_nulls(data_type: &DataType) -> bool {
 pub struct TestCases {
     ranges: Vec<Range<u64>>,
     indices: Vec<Vec<u32>>,
+    skip_validation: bool,
 }
 
 impl TestCases {
@@ -130,6 +130,11 @@ impl TestCases {
 
     pub fn with_indices(mut self, indices: Vec<u32>) -> Self {
         self.indices.push(indices);
+        self
+    }
+
+    pub fn without_validation(mut self) -> Self {
+        self.skip_validation = true;
         self
     }
 }
@@ -215,11 +220,15 @@ async fn check_round_trip_encoding_inner(
         .collect::<Vec<_>>();
     let schema = Schema::new(vec![field.clone()]);
 
-    let concat_data = concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap();
+    let num_rows = data.iter().map(|arr| arr.len() as u64).sum::<u64>();
+    let concat_data = if test_cases.skip_validation {
+        None
+    } else {
+        Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
+    };
 
     // We always try a full decode, regardless of the test cases provided
     debug!("Testing full decode");
-    let num_rows = concat_data.len() as u64;
     let scheduler_copy = scheduler.clone();
     test_decode(
         num_rows,
@@ -241,7 +250,9 @@ async fn check_round_trip_encoding_inner(
     for range in &test_cases.ranges {
         debug!("Testing decode of range {:?}", range);
         let num_rows = range.end - range.start;
-        let expected = concat_data.slice(range.start as usize, num_rows as usize);
+        let expected = concat_data
+            .as_ref()
+            .map(|concat_data| concat_data.slice(range.start as usize, num_rows as usize));
         let scheduler = scheduler.clone();
         let range = range.clone();
         test_decode(
@@ -270,7 +281,9 @@ async fn check_round_trip_encoding_inner(
         }
         let num_rows = indices.len() as u64;
         let indices_arr = UInt32Array::from(indices.clone());
-        let expected = arrow_select::take::take(&concat_data, &indices_arr, None).unwrap();
+        let expected = concat_data
+            .as_ref()
+            .map(|concat_data| arrow_select::take::take(&concat_data, &indices_arr, None).unwrap());
         let scheduler = scheduler.clone();
         let indices = indices.clone();
         test_decode(

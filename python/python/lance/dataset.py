@@ -1143,6 +1143,10 @@ class LanceDataset(pa.dataset.Dataset):
         combines is inspired by the btree data structure although only the first few
         layers of the btree are cached in memory.
 
+        Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
+        bypass spilling to disk. Setting this to true can avoid memory exhaustion
+        issues (see https://github.com/apache/datafusion/issues/10073 for more info).
+
         **Experimental API**
 
         Parameters

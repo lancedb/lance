@@ -1,4 +1,4 @@
-name: PR Title Check
+name: PR Checks
 
 on:
   pull_request_target:
@@ -9,6 +9,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  labeler:
+    permissions:
+      pull-requests: write
+    name: Label PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: srvaroa/labeler@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   commitlint:
     permissions:
       pull-requests: write
