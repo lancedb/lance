@@ -58,10 +58,8 @@ jobs:
       - name: Rust Clippy
         working-directory: java/core/lance-jni
         run: cargo clippy --all-targets -- -D warnings
-      - name: Build with Maven with Java 11
-        run: mvn package -DskipTests=true
       - name: Running tests with Java 11
-        run: mvn test
+        run: mvn clean test
       - name: Running tests with Java 17
         run: |
           export JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS \
@@ -83,4 +81,4 @@ jobs:
           --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED \
           -Djdk.reflect.useDirectMethodHandle=false \
           -Dio.netty.tryReflectionSetAccessible=true"
-          JAVA_HOME=$JAVA_17 mvn test
+          JAVA_HOME=$JAVA_17 mvn clean test
