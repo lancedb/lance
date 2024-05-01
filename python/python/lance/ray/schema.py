@@ -16,16 +16,9 @@ class LanceMergeColumn:
 
     def __init__(
         self,
-        data: Union[str, Path, LanceDataset],
         value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
     ):
-        if isinstance(data, LanceDataset):
-            ds = data
-        else:
-            ds = dataset(data)
-        self.uri = ds.uri
-        self.version = ds.version
         self.value_func = value_func
         self.columns = columns
 
@@ -54,9 +47,8 @@ def merge_columns(
         ds = dataset(data)
 
     fragments = ds.get_fragments()
-    print("All fragments")
 
     ray_ds = ray.data.from_items(fragments)
-    ray_ds.map(LanceMergeColumn(data, value_func, columns)).write_datasink(
+    ray_ds.map(LanceMergeColumn(value_func, columns)).write_datasink(
         LanceCommitter(ds.uri, mode="merge")
     )
