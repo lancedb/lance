@@ -55,7 +55,7 @@ jobs:
 
         if [ "$RELEASE_TYPE" == "stable" ]; then
           echo "Creating stable release for version $CURRENT_VERSION"
-          TAG = "v${CURRENT_VERSION}"
+          TAG="v${CURRENT_VERSION}"
         else
           # Get a list of all tags, filter for current version beta tags, sort them and get the last one
           LAST_BETA_TAG=$(git tag | grep "^v${CURRENT_VERSION}-beta." | sort -V | tail -n 1)
@@ -71,7 +71,7 @@ jobs:
           fi
 
           echo "Creating beta release for version $CURRENT_VERSION: $NEXT_BETA_TAG"
-          TAG = $NEXT_BETA_TAG
+          TAG=$NEXT_BETA_TAG
         fi
 
         git tag $TAG
