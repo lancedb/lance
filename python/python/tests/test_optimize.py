@@ -314,6 +314,75 @@ def test_compact_and_optimize(tmp_path: Path):
 
     assert dataset.count_rows() == 2200
 
+    indices = dataset.list_indices()
+    assert len(indices) == 2
+    vec_idx = [idx for idx in indices if idx["name"] == "vec_index"][0]
+    assert vec_idx["fragment_ids"] == {dataset.get_fragments()[0].fragment_id}
+    id_idx = [idx for idx in indices if idx["name"] == "id_index"][0]
+    assert id_idx["fragment_ids"] == {dataset.get_fragments()[0].fragment_id}
+
 
 def test_compact_and_optimize_targetted(tmp_path: Path):
-    pass
+    def data(id_start, id_end):
+        num_rows = id_end - id_start
+        dim = 128
+        vector_values = pc.random(num_rows * dim).cast(pa.float32())
+        vectors = pa.FixedSizeListArray.from_arrays(vector_values, dim)
+        return pa.table({"id": range(id_start, id_end), "vec": vectors})
+
+    # Create a dataset
+    dataset = lance.write_dataset(data(0, 2000), tmp_path)
+
+    # Add a vector and scalar index
+    dataset.create_index(
+        "vec",
+        index_type="IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=8,
+        name="vec_index",
+    )
+    dataset.create_scalar_index("id", index_type="BTREE", name="id_index")
+
+    # Append two fragments
+    dataset = lance.write_dataset(data(2000, 2100), tmp_path, mode="append")
+    dataset = lance.write_dataset(data(2100, 2200), tmp_path, mode="append")
+
+    fragment_ids = [frag.fragment_id for frag in dataset.get_fragments()]
+    assert fragment_ids == [0, 1, 2]
+
+    # Compact and create a delta
+    task_data = dict(
+        task=dict(
+            fragments=[
+                candidate.metadata.to_json()
+                for candidate in dataset.get_fragments()[1:]
+            ]
+        ),
+        read_version=dataset.version,
+        options=dict(
+            target_rows_per_fragment=10 * 1024 * 1024,
+            max_rows_per_group=1024,
+            materialize_deletions=True,
+            materialize_deletions_threshold=0,
+            num_threads=1,
+        ),
+    )
+    task = lance.lance.CompactionTask.from_json(json.dumps(task_data))
+    result = task.execute(dataset)
+    lance.optimize.Compaction.commit(
+        dataset, [result], merge_indices=False, index_new_data=[1, 2]
+    )
+    assert len(dataset.get_fragments()) == 2
+    fragment_ids = [frag.fragment_id for frag in dataset.get_fragments()]
+    assert fragment_ids == [0, 3]
+    # breakpoint()
+    indices_coverage = [
+        (idx["name"], list(idx["fragment_ids"])) for idx in dataset.list_indices()
+    ]
+    indices_coverage.sort()
+    assert indices_coverage == [
+        ("id_index", [0]),
+        ("id_index", [3]),
+        ("vec_index", [0]),
+        ("vec_index", [3]),
+    ]

@@ -82,7 +82,7 @@ pub async fn merge_indices<'a>(
     }
 
     let mut frag_bitmap = RoaringBitmap::new();
-    old_indices.iter().for_each(|idx| {
+    merge_indices_meta.iter().for_each(|idx| {
         frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
     });
     frags_to_index.iter().for_each(|frag| {

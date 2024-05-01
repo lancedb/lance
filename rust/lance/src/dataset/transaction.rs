@@ -98,6 +98,12 @@ pub enum Operation {
         new_indices: Vec<Index>,
         /// The indices that have been modified.
         removed_indices: Vec<Index>,
+        /// The names of indices to be removed. This is applied prior to `new_indices`,
+        /// so this can be used to replace an existing index with a new one.
+        /// (It's preferable to use this rather than trying to list the current
+        /// indices in `removed_indices`, since a concurrent writer might try
+        /// to add an index delta to the same index.)
+        remove_index_names: Vec<String>,
     },
     /// Data is rewritten but *not* modified. This is used for things like
     /// compaction or re-ordering. Contains the old fragments and the new
@@ -464,24 +470,27 @@ impl Transaction {
                 )?;
                 Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
                 final_indices.retain(|existing_index| {
-                    !new_indices
+                    // !new_indices
+                    //     .iter()
+                    //     .any(|new_index| new_index.name == existing_index.name)
+                    //     &&
+                    !removed_indices
                         .iter()
-                        .any(|new_index| new_index.name == existing_index.name)
-                        && !removed_indices
-                            .iter()
-                            .any(|old_index| old_index.uuid == existing_index.uuid)
+                        .any(|old_index| old_index.uuid == existing_index.uuid)
                 });
                 final_indices.extend(new_indices.clone());
             }
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                remove_index_names,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
+
                 final_indices.retain(|existing_index| {
-                    !new_indices
+                    !remove_index_names
                         .iter()
-                        .any(|new_index| new_index.name == existing_index.name)
+                        .any(|remove_name| &existing_index.name == remove_name)
                         && !removed_indices
                             .iter()
                             .any(|old_index| old_index.uuid == existing_index.uuid)
@@ -548,6 +557,37 @@ impl Transaction {
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
 
+        // TODO: remove this
+        // Make sure final_indices fragment bitmaps only contain actual fragments
+        // if it doesn't, return an error
+        // let fragment_ids = manifest
+        //     .fragments
+        //     .iter()
+        //     .map(|f| f.id)
+        //     .collect::<HashSet<_>>();
+        // for index in final_indices.iter() {
+        //     if !index
+        //         .fragment_bitmap
+        //         .as_ref()
+        //         .map(|bitmap| {
+        //             bitmap
+        //                 .iter()
+        //                 .all(|id| fragment_ids.contains(&(id as u64)))
+        //         })
+        //         .unwrap_or(true)
+        //     {
+        //         return Err(Error::invalid_input(
+        //             format!(
+        //                 "Index {} contains fragments that do not exist in the manifest\nmanifest fragments: {:?}\nindex fragments: {:?}",
+        //                 index.uuid,
+        //                 fragment_ids,
+        //                 index.fragment_bitmap.as_ref().map(|bitmap| bitmap.iter().collect::<Vec<_>>())
+        //             ),
+        //             location!(),
+        //         ));
+        //     }
+        // }
+
         Ok((manifest, final_indices))
     }
 
@@ -564,7 +604,7 @@ impl Transaction {
         });
     }
 
-    fn recalculate_fragment_bitmap(
+    pub(crate) fn recalculate_fragment_bitmap(
         old: &RoaringBitmap,
         groups: &[RewriteGroup],
     ) -> Result<RoaringBitmap> {
@@ -756,6 +796,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
                 new_indices,
                 removed_indices,
+                remove_index_names,
             })) => Operation::CreateIndex {
                 new_indices: new_indices
                     .iter()
@@ -765,6 +806,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
                     .iter()
                     .map(Index::try_from)
                     .collect::<Result<_>>()?,
+                remove_index_names: remove_index_names.clone(),
             },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
                 fragments,
@@ -900,9 +942,11 @@ impl From<&Transaction> for pb::Transaction {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                remove_index_names,
             } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
                 new_indices: new_indices.iter().map(IndexMetadata::from).collect(),
                 removed_indices: removed_indices.iter().map(IndexMetadata::from).collect(),
+                remove_index_names: remove_index_names.clone(),
             }),
             Operation::Merge { fragments, schema } => {
                 pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -1063,6 +1107,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index0.clone()],
                 removed_indices: vec![index0.clone()],
+                remove_index_names: vec![],
             },
             Operation::Delete {
                 updated_fragments: vec![fragment0.clone()],
@@ -1138,6 +1183,7 @@ mod tests {
                 Operation::CreateIndex {
                     new_indices: vec![index0.clone()],
                     removed_indices: vec![index0.clone()],
+                    remove_index_names: vec![],
                 },
                 // Will only conflict with operations that modify row ids.
                 [false, false, false, false, true, true, false, false],

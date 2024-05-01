@@ -882,9 +882,11 @@ pub async fn commit_compaction(
         .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
         .collect::<Vec<_>>();
 
+    dbg!(&affected_ids);
     let remapped_indices = index_remapper
         .remap_indices(row_id_map, &affected_ids)
         .await?;
+    dbg!(&remapped_indices);
     let mut rewritten_indices = remapped_indices
         .iter()
         .map(|rewritten| RewrittenIndex {
@@ -937,7 +939,8 @@ pub async fn commit_compaction(
             fragments.extend(group.new_fragments.iter().cloned());
         }
 
-        let (removed_indices, new_indices) = optimize_indices(
+        // Here, new_indices are the net set of indices, not the one that were just created.
+        let (mut removed_indices, mut new_indices) = optimize_indices(
             dataset,
             Some(&fragments),
             &existing_indices,
@@ -945,8 +948,46 @@ pub async fn commit_compaction(
         )
         .await?;
 
+        dbg!(&new_indices);
+
+        new_indices.retain(|index| {
+            // filter out those in existing indices
+            !existing_indices
+                .iter()
+                .any(|existing_index| existing_index.uuid == index.uuid)
+        });
+
+        for index in &mut new_indices {
+            // Also rewrite the fragment bitmap here.
+            if let Some(fragment_bitmap) = index.fragment_bitmap.as_mut() {
+                let mut new_bitmap = fragment_bitmap.clone();
+                for frag_id in rewrite_groups
+                    .iter()
+                    .flat_map(|group| group.new_fragments.iter().map(|frag| frag.id))
+                {
+                    new_bitmap.insert(frag_id as u32);
+                }
+                for frag_id in rewrite_groups
+                    .iter()
+                    .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
+                {
+                    new_bitmap.remove(frag_id as u32);
+                }
+                *fragment_bitmap = new_bitmap;
+                dbg!(&fragment_bitmap);
+            }
+        }
+
         // TODO: Clean up any tmp indices created by re-mapping.
         rewritten_indices.retain(|r| !removed_indices.iter().any(|i| i.uuid == r.new_id));
+
+        // Removed indices need to be mapped back, since the versions of the indices
+        // committed to the dataset are the original ones.
+        for removed_index in &mut removed_indices {
+            if let Some(rewritten) = remapped_indices.iter().find(|r| r.new == removed_index.uuid) {
+                removed_index.uuid = rewritten.original;
+            }
+        }
 
         (removed_indices, new_indices)
     } else {

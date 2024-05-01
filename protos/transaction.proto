@@ -67,9 +67,13 @@ message Transaction {
   //
   // - new_indices: the modified indices
   // - removed_indices: the indices that are being replaced
+  // - remove_index_names: the names of the indices that are being removed
+  //     This is used to remove or overwrite entire indices, even if a 
+  //     concurrent transaction might be adding one at the same time.
   message CreateIndex {
     repeated IndexMetadata new_indices = 1;
     repeated IndexMetadata removed_indices = 2;
+    repeated string remove_index_names = 3;
   }
 
   // An operation that rewrites but does not change the data in the table. These

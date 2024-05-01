@@ -251,11 +251,15 @@ impl DatasetIndexExt for Dataset {
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
         };
+
+        // We already checked that if the name is there, we should replace it.
+        let remove_index_names = vec![new_idx.name.clone()];
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
+                remove_index_names,
             },
             None,
         );
@@ -332,6 +336,7 @@ impl DatasetIndexExt for Dataset {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                remove_index_names: vec![],
             },
             None,
         );
@@ -443,14 +448,15 @@ pub(crate) async fn optimize_indices(
         };
         removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
         // To keep the existing deltas, we need to add them to the new list.
-        if deltas.len() > removed.len() {
-            new_indices.extend(
-                deltas
-                    .iter()
-                    .filter(|idx| !removed.iter().any(|&r| r.uuid == idx.uuid))
-                    .map(|&idx| idx.clone()),
-            );
-        }
+        // TODO: fix this.
+        // if deltas.len() > removed.len() {
+        //     new_indices.extend(
+        //         deltas
+        //             .iter()
+        //             .filter(|idx| !removed.iter().any(|&r| r.uuid == idx.uuid))
+        //             .map(|&idx| idx.clone()),
+        //     );
+        // }
         new_indices.push(new_idx);
     }
 
