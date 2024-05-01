@@ -40,6 +40,7 @@ jobs:
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
+          pip install -y packaging
           python ci/setup_version.py $TAG
           echo "repo=fury" >> $GITHUB_OUTPUT
         else
@@ -86,6 +87,7 @@ jobs:
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
+          pip install -y packaging
           python ci/setup_version.py $TAG
           echo "repo=fury" >> $GITHUB_OUTPUT
         else
@@ -123,6 +125,7 @@ jobs:
           # and export repo as "fury" instead of "pypi"
           if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
             TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
+            pip install -y packaging
             python ci/setup_version.py $TAG
             echo "repo=fury" >> $GITHUB_OUTPUT
           else
