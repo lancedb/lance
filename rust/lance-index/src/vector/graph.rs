@@ -12,9 +12,9 @@ use arrow_schema::{DataType, Field};
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
-pub(crate) mod builder;
+pub mod builder;
 pub mod memory;
-pub(super) mod storage;
+pub mod storage;
 
 /// Vector storage to back a graph.
 pub use storage::VectorStorage;
@@ -169,7 +169,8 @@ pub trait Graph {
 /// -------
 /// A descending sorted list of ``(dist, node_id)`` pairs.
 ///
-pub(super) fn beam_search(
+/// WARNING: Internal API, do not use it directly.
+pub fn beam_search(
     graph: &dyn Graph,
     ep: &OrderedNode,
     k: usize,
@@ -249,7 +250,8 @@ pub(super) fn beam_search(
 /// -------
 /// A ``(dist, node_id)`` pair.
 ///
-pub(super) fn greedy_search(
+/// WARNING: Internal API, do not use it directly.
+pub fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
     dist_calc: &dyn DistCalculator,

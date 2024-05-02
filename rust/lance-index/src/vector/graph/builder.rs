@@ -8,6 +8,8 @@ use super::OrderedFloat;
 use super::OrderedNode;
 
 /// GraphNode during build.
+/// 
+/// WARNING: Internal API, do not use it directly.
 #[derive(Debug)]
 pub struct GraphBuilderNode {
     /// Node ID

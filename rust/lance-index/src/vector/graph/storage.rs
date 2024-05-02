@@ -6,6 +6,7 @@ use std::any::Any;
 use arrow_array::ArrayRef;
 use lance_linalg::distance::MetricType;
 
+/// WARNING: Internal API, do not use it directly.
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
 }
@@ -17,6 +18,8 @@ pub trait DistCalculator {
 /// It abstracts away the logic to compute the distance between vectors.
 ///
 /// TODO: should we rename this to "VectorDistance"?;
+/// 
+/// WARNING: Internal API, do not use it directly.
 pub trait VectorStorage: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
