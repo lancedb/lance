@@ -14,9 +14,9 @@
 
 package com.lancedb.lance;
 
-import com.lancedb.lance.ipc.FragmentScanner;
-import org.apache.arrow.dataset.scanner.ScanOptions;
-import org.apache.arrow.dataset.scanner.Scanner;
+import com.lancedb.lance.ipc.LanceScanner;
+import com.lancedb.lance.ipc.ScanOptions;
+import java.util.List;
 
 /**
  * Dataset format.
@@ -33,14 +33,45 @@ public class DatasetFragment {
     this.metadata = metadata;
   }
 
+  /**
+   * Create a new Dataset Scanner.
+   *
+   * @return a dataset scanner
+   */
+  public LanceScanner newScan() {
+    return LanceScanner.create(dataset, new ScanOptions.Builder()
+        .fragmentIds(List.of(metadata.getId())).build(), dataset.allocator);
+  }
+
+  /**
+   * Create a new Dataset Scanner.
+   *
+   * @param batchSize scan batch size
+   * @return a dataset scanner
+   */
+  public LanceScanner newScan(long batchSize) {
+    return LanceScanner.create(dataset,
+        new ScanOptions.Builder()
+            .fragmentIds(List.of(metadata.getId())).batchSize(batchSize).build(), 
+        dataset.allocator);
+  }
+
+  /**
+   * Create a new Dataset Scanner.
+   *
+   * @param options the scan options
+   * @return a dataset scanner
+   */
+  public LanceScanner newScan(ScanOptions options) {
+    return LanceScanner.create(dataset,
+        new ScanOptions.Builder(options).fragmentIds(List.of(metadata.getId())).build(),
+        dataset.allocator);
+  }
+
   private native int countRowsNative(Dataset dataset, long fragmentId);
 
   public int getId() {
     return metadata.getId();
-  }
-
-  public String toString() {
-    return String.format("Fragment(%s)", metadata.getJsonMetadata());
   }
 
   /** Count rows in this Fragment. */
@@ -48,8 +79,7 @@ public class DatasetFragment {
     return countRowsNative(dataset, metadata.getId());
   }
 
-  /** Create a new Fragment Scanner. */
-  public Scanner newScan(ScanOptions options) {
-    return new FragmentScanner(dataset, metadata.getId(), options, dataset.allocator);
+  public String toString() {
+    return String.format("Fragment(%s)", metadata.getJsonMetadata());
   }
 }

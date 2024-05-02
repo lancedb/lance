@@ -14,6 +14,9 @@
 
 package com.lancedb.lance;
 
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
@@ -27,5 +30,13 @@ public class Utils {
     var arrowSchema = ArrowSchema.allocateNew(allocator);
     Data.exportSchema(allocator, schema, null, arrowSchema);
     return arrowSchema;
+  }
+
+  /** Convert optional array to optional list for JNI processing. */
+  public static Optional<List<String>> convert(Optional<String[]> optionalArray) {
+    if (optionalArray.isEmpty()) {
+      return Optional.empty();
+    }
+    return Optional.of(Arrays.asList(optionalArray.get()));
   }
 }
