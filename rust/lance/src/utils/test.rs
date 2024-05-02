@@ -226,6 +226,14 @@ impl TestDatasetGenerator {
     }
 }
 
+fn get_field_structure(dataset: &Dataset) -> Vec<Vec<Vec<i32>>> {
+    dataset
+        .get_fragments()
+        .into_iter()
+        .map(|frag| field_structure(frag.metadata()))
+        .collect::<Vec<_>>()
+}
+
 fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
     fragment
         .files
@@ -367,5 +375,186 @@ impl ObjectStore for IoTrackingStore {
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.copy_if_not_exists(from, to).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, StructArray};
+    use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields};
+
+    #[test]
+    fn test_make_schema() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("f1", DataType::Utf8, true),
+                        ArrowField::new("f2", DataType::Boolean, false),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]));
+        let data = vec![RecordBatch::new_empty(arrow_schema.clone())];
+
+        let generator = TestDatasetGenerator::new(data);
+        let schema = generator.make_schema(&mut rand::thread_rng());
+
+        let roundtripped_schema = ArrowSchema::from(&schema);
+        assert_eq!(&roundtripped_schema, arrow_schema.as_ref());
+
+        let field_ids = schema.fields_pre_order().map(|f| f.id).collect::<Vec<_>>();
+        let mut sorted_ids = field_ids.clone();
+        sorted_ids.sort_unstable();
+        assert_ne!(field_ids, sorted_ids);
+
+        let mut num_holes = 0;
+        for w in sorted_ids.windows(2) {
+            let prev = w[0];
+            let next = w[1];
+            if next - prev > 1 {
+                num_holes += 1;
+            }
+        }
+        assert!(num_holes > 0, "Expected at least one hole in the field ids");
+    }
+
+    #[tokio::test]
+    async fn test_make_fragment() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let struct_fields: ArrowFields = vec![
+            ArrowField::new("f1", DataType::Utf8, true),
+            ArrowField::new("f2", DataType::Boolean, false),
+        ]
+        .into();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Struct(struct_fields.clone()), true),
+            ArrowField::new("c", DataType::Float64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![
+                        Arc::new(StringArray::from(vec!["foo", "bar", "baz"])) as ArrayRef,
+                        Arc::new(BooleanArray::from(vec![true, false, true])),
+                    ],
+                    None,
+                )),
+                Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
+            ],
+        )
+        .unwrap();
+
+        let generator = TestDatasetGenerator::new(vec![data.clone()]);
+        let mut rng = rand::thread_rng();
+        for _ in 1..50 {
+            let schema = generator.make_schema(&mut rng);
+            let fragment = generator
+                .make_fragment(
+                    tmp_dir.path().to_str().unwrap(),
+                    &data,
+                    &schema,
+                    &mut rng,
+                    2,
+                )
+                .await;
+
+            assert!(fragment.files.len() > 1, "Expected multiple files");
+
+            let mut field_ids_frags = fragment
+                .files
+                .iter()
+                .flat_map(|file| file.fields.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut field_ids = schema.fields_pre_order().map(|f| f.id).collect::<Vec<_>>();
+            assert_ne!(field_ids_frags, field_ids);
+            field_ids_frags.sort_unstable();
+            field_ids.sort_unstable();
+            assert_eq!(field_ids_frags, field_ids);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_make_hostile() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+            ArrowField::new("c", DataType::Float64, false),
+        ]));
+        let data = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(Int32Array::from(vec![10, 20, 30])),
+                    Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
+                ],
+            )
+            .unwrap(),
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![4, 5, 6])),
+                    Arc::new(Int32Array::from(vec![40, 50, 60])),
+                    Arc::new(Float64Array::from(vec![4.4, 5.5, 6.6])),
+                ],
+            )
+            .unwrap(),
+        ];
+
+        let seed = 42;
+        let generator = TestDatasetGenerator::new(data.clone()).seed(seed);
+
+        let path = tmp_dir.path().join("ds1");
+        let dataset = generator.make_hostile(path.to_str().unwrap()).await;
+
+        let path2 = tmp_dir.path().join("ds2");
+        let dataset2 = generator.make_hostile(path2.to_str().unwrap()).await;
+
+        // Given the same seed, should produce the same layout.
+        assert_eq!(dataset.schema(), dataset2.schema());
+        let field_structure_1 = get_field_structure(&dataset);
+        let field_structure_2 = get_field_structure(&dataset2);
+        assert_eq!(field_structure_1, field_structure_2);
+
+        // Make sure we handle different numbers of columns
+        for num_cols in 1..4 {
+            let projection = (0..num_cols).collect::<Vec<_>>();
+            let data = data
+                .iter()
+                .map(|rb| rb.project(&projection).unwrap())
+                .collect::<Vec<RecordBatch>>();
+
+            let generator = TestDatasetGenerator::new(data.clone());
+            // Sample a few
+            for i in 1..20 {
+                let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));
+                let dataset = generator.make_hostile(path.to_str().unwrap()).await;
+
+                let field_structure = get_field_structure(&dataset);
+
+                // The two fragments should have different layout.
+                assert_eq!(field_structure.len(), 2);
+                if num_cols > 1 {
+                    assert_ne!(field_structure[0], field_structure[1]);
+                }
+            }
+        }
     }
 }
