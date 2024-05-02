@@ -49,7 +49,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    */
   public static LanceScanner create(Dataset dataset, ScanOptions options,
       BufferAllocator allocator) {
-    LanceScanner scanner = createScanner(dataset, Optional.empty(), options.getColumns(),
+    LanceScanner scanner = createScanner(dataset, options.getFragmentId(), options.getColumns(),
         options.getSubstraitFilter(), options.getFilter(), options.getBatchSize());
     scanner.allocator = allocator;
     scanner.dataset = dataset;

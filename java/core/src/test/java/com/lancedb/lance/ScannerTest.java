@@ -18,6 +18,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
@@ -37,6 +38,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 public class ScannerTest {
   @TempDir
@@ -211,6 +213,38 @@ public class ScannerTest {
             }
           }
         }
+      }
+    }
+  }
+
+  @Test
+  void testScanFragments() throws Exception {
+    String datasetPath = tempDir.resolve("fragments_scanner").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int[] fragment0 = new int[]{0, 3};
+      int[] fragment1 = new int[]{1, 5};
+      int[] fragment2 = new int[]{2, 7};
+      FragmentMetadata metadata0 = testDataset.createNewFragment(fragment0[0], fragment0[1]);
+      FragmentMetadata metadata1 = testDataset.createNewFragment(fragment1[0], fragment1[1]);
+      FragmentMetadata metadata2 = testDataset.createNewFragment(fragment2[0], fragment2[1]);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(metadata0, metadata1, metadata2));
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        validScanResult(dataset, fragment0[0], fragment0[1]);
+        validScanResult(dataset, fragment1[0], fragment1[1]);
+        validScanResult(dataset, fragment2[0], fragment2[1]);
+      }
+    }
+  }
+  
+  private void validScanResult(Dataset dataset, int fragmentId, int rowCount) throws Exception {
+    try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentId(fragmentId).build())) {
+      try (ArrowReader reader = scanner.scanBatches()) {
+        assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+        reader.loadNextBatch();
+        assertEquals(rowCount, reader.getVectorSchemaRoot().getRowCount());
+        assertFalse(reader.loadNextBatch());
       }
     }
   }
