@@ -466,8 +466,8 @@ impl HNSW {
 /// Select neighbors from the ordered candidate list.
 ///
 /// Algorithm 3 in the HNSW paper.
-/// 
-/// WARNING: Internal API, do not use it directly.
+///
+/// WARNING: Internal API,  API stability is not guaranteed
 pub fn select_neighbors(
     orderd_candidates: &[OrderedNode],
     k: usize,
@@ -478,8 +478,8 @@ pub fn select_neighbors(
 /// Algorithm 4 in the HNSW paper.
 ///
 /// NOTE: the result is not ordered
-/// 
-/// WARNING: Internal API, do not use it directly.
+///
+/// WARNING: Internal API,  API stability is not guaranteed
 pub fn select_neighbors_heuristic(
     graph: &dyn Graph,
     candidates: &[OrderedNode],

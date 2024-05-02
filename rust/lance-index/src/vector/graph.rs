@@ -169,7 +169,7 @@ pub trait Graph {
 /// -------
 /// A descending sorted list of ``(dist, node_id)`` pairs.
 ///
-/// WARNING: Internal API, do not use it directly.
+/// WARNING: Internal API,  API stability is not guaranteed
 pub fn beam_search(
     graph: &dyn Graph,
     ep: &OrderedNode,
@@ -250,7 +250,7 @@ pub fn beam_search(
 /// -------
 /// A ``(dist, node_id)`` pair.
 ///
-/// WARNING: Internal API, do not use it directly.
+/// WARNING: Internal API,  API stability is not guaranteed
 pub fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
