@@ -505,6 +505,7 @@ def write_fragments(
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
     use_experimental_writer: bool = False,
+    storage_options: Optional[Dict[str, str]] = None,
 ) -> List[FragmentMetadata]:
     """
     Write data into one or more fragments.
@@ -544,6 +545,9 @@ def write_fragments(
     use_experimental_writer : optional, bool
         Use the Lance v2 writer to write Lance v2 files.  This is not recommended
         at this time as there are several known limitations in the v2 writer.
+    storage_options : Optional[Dict[str, str]]
+        Extra options that make sense for a particular storage connection. This is
+        used to store connection parameters like credentials, endpoint, etc.
 
     Returns
     -------
@@ -575,5 +579,6 @@ def write_fragments(
         max_bytes_per_file=max_bytes_per_file,
         progress=progress,
         use_experimental_writer=use_experimental_writer,
+        storage_options=storage_options,
     )
     return [FragmentMetadata.from_metadata(frag) for frag in fragments]
