@@ -6,11 +6,8 @@ on:
       dry_run:
         description: 'Dry run (create the local commit/tags but do not push it)'
         required: true
-        default: "false"
-        type: choice
-        options:
-          - "true"
-          - "false"
+        default: false
+        type: boolean
       type:
         description: 'What kind of release is this?'
         required: true
@@ -20,18 +17,17 @@ on:
           - preview
           - stable
       draft-release:
-        description: 'When creating release, should it be a draft?'
+        description: 'Create a draft release on GitHub'
         required: true
-        default: "false"
-        type: choice
-        options:
-          - "true"
-          - "false"
+        default: false
+        type: boolean
 
 jobs:
   bump-version:
     runs-on: ubuntu-latest
     steps:
+    - name: Output Inputs
+      run: echo "${{ toJSON(github.event.inputs) }}"
     - name: Check out main
       uses: actions/checkout@v4
       with:
@@ -55,7 +51,7 @@ jobs:
 
         if [ "$RELEASE_TYPE" == "stable" ]; then
           echo "Creating stable release for version $CURRENT_VERSION"
-          TAG = "v${CURRENT_VERSION}"
+          TAG="v${CURRENT_VERSION}"
         else
           # Get a list of all tags, filter for current version beta tags, sort them and get the last one
           LAST_BETA_TAG=$(git tag | grep "^v${CURRENT_VERSION}-beta." | sort -V | tail -n 1)
@@ -71,41 +67,41 @@ jobs:
           fi
 
           echo "Creating beta release for version $CURRENT_VERSION: $NEXT_BETA_TAG"
-          TAG = $NEXT_BETA_TAG
+          TAG=$NEXT_BETA_TAG
         fi
 
         git tag $TAG
         echo "tag=$TAG" >> $GITHUB_OUTPUT
     - name: Push new version tag
-      if: ${{ inputs.dry_run }} == "false"
+      if: ${{ !inputs.dry_run }}
       uses: ad-m/github-push-action@master
       with:
         github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         branch: ${{ github.ref }}
         tags: true
     - name: Create GH release
-      if: ${{ inputs.dry_run }} == "false"
+      if: ${{ !inputs.dry_run }}
       uses: softprops/action-gh-release@v2
       with:
-        prerelease: ${{ inputs.type }} == "preview"
-        draft: ${{ inputs.draft-release }} == "true"
-        target_commitish: ${{ steps.create_tag.outputs.tag }}
+        prerelease: ${{ inputs.type == 'preview' }}
+        draft: ${{ inputs.draft-release }}
+        tag_name: ${{ steps.create_tag.outputs.tag }}
         token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         generate_release_notes: true
 
     # Remaining steps only apply to stable releases
     - name: Call bumpversion
       uses: ./.github/workflows/bump-version
-      if: ${{ inputs.type }} == "stable"
+      if: inputs.type == 'stable'
       with:
         part: patch
     - name: Commit bump version
-      if: ${{ inputs.type }} == "stable"
+      if: inputs.type == 'stable'
       run: |
         git add -u
         git commit -m "Bump version"
     - name: Push new version 
-      if: ${{ inputs.type }} == "stable" && ${{ inputs.dry_run }} == "false"
+      if: ${{ inputs.type == 'stable' && !inputs.dry_run }}
       uses: ad-m/github-push-action@master
       with:
         github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}

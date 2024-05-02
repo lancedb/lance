@@ -19,7 +19,7 @@ exclude = ["python"]
 resolver = "2"
 
 [workspace.package]
-version = "0.10.17"
+version = "0.10.18"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -42,19 +42,19 @@ categories = [
 rust-version = "1.75"
 
 [workspace.dependencies]
-lance = { version = "=0.10.17", path = "./rust/lance" }
-lance-arrow = { version = "=0.10.17", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.10.17", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.10.17", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.10.17", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.10.17", path = "./rust/lance-encoding" }
-lance-file = { version = "=0.10.17", path = "./rust/lance-file" }
-lance-index = { version = "=0.10.17", path = "./rust/lance-index" }
-lance-io = { version = "=0.10.17", path = "./rust/lance-io" }
-lance-linalg = { version = "=0.10.17", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.10.17", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.10.17", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.10.17", path = "./rust/lance-testing" }
+lance = { version = "=0.10.18", path = "./rust/lance" }
+lance-arrow = { version = "=0.10.18", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.10.18", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.10.18", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.10.18", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.10.18", path = "./rust/lance-encoding" }
+lance-file = { version = "=0.10.18", path = "./rust/lance-file" }
+lance-index = { version = "=0.10.18", path = "./rust/lance-index" }
+lance-io = { version = "=0.10.18", path = "./rust/lance-io" }
+lance-linalg = { version = "=0.10.18", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.10.18", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.10.18", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.10.18", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "51.0.0", optional = false, features = ["prettyprint"] }

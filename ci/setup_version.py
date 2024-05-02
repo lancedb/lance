@@ -19,7 +19,8 @@ def main():
         for i, line in enumerate(lines):
             if line.startswith("version = "):
                 current_version = line.split('"')[1]
-                lines[i] = f'version = "{args.version}"\n'
+                # Remove the v prefix
+                lines[i] = f'version = "{args.version[1:]}"\n'
                 break
         else:
             raise ValueError("Could not find version in Cargo.toml")
