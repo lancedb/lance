@@ -497,7 +497,6 @@ impl LogicalPageDecoder for ListPageDecoder {
     fn wait<'a>(
         &'a mut self,
         num_rows: u32,
-        // We will never pull from source because of indirect I/O
         source: &'a mut mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
     ) -> BoxFuture<'a, Result<()>> {
         async move {
