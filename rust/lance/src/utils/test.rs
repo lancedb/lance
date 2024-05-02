@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::fmt::{Display, Formatter};
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
+use lance_io::object_store::WrappingObjectStore;
 use lance_table::format::Fragment;
+use object_store::path::Path;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore, PutOptions, PutResult,
+    Result as OSResult,
+};
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
+use tokio::io::AsyncWrite;
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
@@ -230,183 +241,138 @@ fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
         .collect::<Vec<_>>()
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
+#[derive(Debug, Default)]
+pub struct IoStats {
+    pub read_iops: u64,
+    pub read_bytes: u64,
+}
 
-    use super::*;
-    use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, StructArray};
-    use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields};
+impl Display for IoStats {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#?}", self)
+    }
+}
 
-    #[test]
-    fn test_make_schema() {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, false),
-            ArrowField::new(
-                "b",
-                DataType::Struct(
-                    vec![
-                        ArrowField::new("f1", DataType::Utf8, true),
-                        ArrowField::new("f2", DataType::Boolean, false),
-                    ]
-                    .into(),
-                ),
-                true,
-            ),
-            ArrowField::new("c", DataType::Float64, false),
-        ]));
-        let data = vec![RecordBatch::new_empty(arrow_schema.clone())];
+#[derive(Debug)]
+pub struct IoTrackingStore {
+    target: Arc<dyn ObjectStore>,
+    stats: Arc<Mutex<IoStats>>,
+}
 
-        let generator = TestDatasetGenerator::new(data);
-        let schema = generator.make_schema(&mut rand::thread_rng());
+impl Display for IoTrackingStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#?}", self)
+    }
+}
 
-        let roundtripped_schema = ArrowSchema::from(&schema);
-        assert_eq!(&roundtripped_schema, arrow_schema.as_ref());
+#[derive(Debug)]
+struct StatsHolder(Arc<Mutex<IoStats>>);
 
-        let field_ids = schema.fields_pre_order().map(|f| f.id).collect::<Vec<_>>();
-        let mut sorted_ids = field_ids.clone();
-        sorted_ids.sort_unstable();
-        assert_ne!(field_ids, sorted_ids);
+impl WrappingObjectStore for StatsHolder {
+    fn wrap(&self, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(IoTrackingStore {
+            target,
+            stats: self.0.clone(),
+        })
+    }
+}
 
-        let mut num_holes = 0;
-        for w in sorted_ids.windows(2) {
-            let prev = w[0];
-            let next = w[1];
-            if next - prev > 1 {
-                num_holes += 1;
-            }
-        }
-        assert!(num_holes > 0, "Expected at least one hole in the field ids");
+impl IoTrackingStore {
+    pub fn new_wrapper() -> (Arc<dyn WrappingObjectStore>, Arc<Mutex<IoStats>>) {
+        let stats = Arc::new(Mutex::new(IoStats::default()));
+        (Arc::new(StatsHolder(stats.clone())), stats)
     }
 
-    #[tokio::test]
-    async fn test_make_fragment() {
-        let tmp_dir = tempfile::tempdir().unwrap();
+    fn record_read(&self, num_bytes: u64) {
+        let mut stats = self.stats.lock().unwrap();
+        stats.read_iops += 1;
+        stats.read_bytes += num_bytes as u64;
+    }
+}
 
-        let struct_fields: ArrowFields = vec![
-            ArrowField::new("f1", DataType::Utf8, true),
-            ArrowField::new("f2", DataType::Boolean, false),
-        ]
-        .into();
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, false),
-            ArrowField::new("b", DataType::Struct(struct_fields.clone()), true),
-            ArrowField::new("c", DataType::Float64, false),
-        ]));
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StructArray::new(
-                    struct_fields,
-                    vec![
-                        Arc::new(StringArray::from(vec!["foo", "bar", "baz"])) as ArrayRef,
-                        Arc::new(BooleanArray::from(vec![true, false, true])),
-                    ],
-                    None,
-                )),
-                Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
-            ],
-        )
-        .unwrap();
-
-        let generator = TestDatasetGenerator::new(vec![data.clone()]);
-        let mut rng = rand::thread_rng();
-        for _ in 1..50 {
-            let schema = generator.make_schema(&mut rng);
-            let fragment = generator
-                .make_fragment(
-                    tmp_dir.path().to_str().unwrap(),
-                    &data,
-                    &schema,
-                    &mut rng,
-                    2,
-                )
-                .await;
-
-            assert!(fragment.files.len() > 1, "Expected multiple files");
-
-            let mut field_ids_frags = fragment
-                .files
-                .iter()
-                .flat_map(|file| file.fields.iter())
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut field_ids = schema.fields_pre_order().map(|f| f.id).collect::<Vec<_>>();
-            assert_ne!(field_ids_frags, field_ids);
-            field_ids_frags.sort_unstable();
-            field_ids.sort_unstable();
-            assert_eq!(field_ids_frags, field_ids);
-        }
+#[async_trait::async_trait]
+impl ObjectStore for IoTrackingStore {
+    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
+        self.target.put(location, bytes).await
     }
 
-    #[tokio::test]
-    async fn test_make_hostile() {
-        let tmp_dir = tempfile::tempdir().unwrap();
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: Bytes,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, bytes, opts).await
+    }
 
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, false),
-            ArrowField::new("b", DataType::Int32, false),
-            ArrowField::new("c", DataType::Float64, false),
-        ]));
-        let data = vec![
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![1, 2, 3])),
-                    Arc::new(Int32Array::from(vec![10, 20, 30])),
-                    Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
-                ],
-            )
-            .unwrap(),
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![4, 5, 6])),
-                    Arc::new(Int32Array::from(vec![40, 50, 60])),
-                    Arc::new(Float64Array::from(vec![4.4, 5.5, 6.6])),
-                ],
-            )
-            .unwrap(),
-        ];
+    async fn put_multipart(
+        &self,
+        location: &Path,
+    ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+        self.target.put_multipart(location).await
+    }
 
-        let seed = 42;
-        let generator = TestDatasetGenerator::new(data.clone()).seed(seed);
+    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
+        self.target.abort_multipart(location, multipart_id).await
+    }
 
-        let path = tmp_dir.path().join("ds1");
-        let dataset = generator.make_hostile(path.to_str().unwrap()).await;
-
-        let path2 = tmp_dir.path().join("ds2");
-        let dataset2 = generator.make_hostile(path2.to_str().unwrap()).await;
-
-        // Given the same seed, should produce the same layout.
-        assert_eq!(dataset.schema(), dataset2.schema());
-        let field_structure_1 = get_field_structure(&dataset);
-        let field_structure_2 = get_field_structure(&dataset2);
-        assert_eq!(field_structure_1, field_structure_2);
-
-        // Make sure we handle different numbers of columns
-        for num_cols in 1..4 {
-            let projection = (0..num_cols).collect::<Vec<_>>();
-            let data = data
-                .iter()
-                .map(|rb| rb.project(&projection).unwrap())
-                .collect::<Vec<RecordBatch>>();
-
-            let generator = TestDatasetGenerator::new(data.clone());
-            // Sample a few
-            for i in 1..20 {
-                let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));
-                let dataset = generator.make_hostile(path.to_str().unwrap()).await;
-
-                let field_structure = get_field_structure(&dataset);
-
-                // The two fragments should have different layout.
-                assert_eq!(field_structure.len(), 2);
-                if num_cols > 1 {
-                    assert_ne!(field_structure[0], field_structure[1]);
-                }
-            }
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        let result = self.target.get_opts(location, options).await;
+        if let Ok(result) = &result {
+            let num_bytes = result.range.end - result.range.start;
+            self.record_read(num_bytes as u64);
         }
+        result
+    }
+
+    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+        let result = self.target.get_range(location, range).await;
+        if let Ok(result) = &result {
+            self.record_read(result.len() as u64);
+        }
+        result
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+        let result = self.target.get_ranges(location, ranges).await;
+        if let Ok(result) = &result {
+            self.record_read(result.iter().map(|b| b.len() as u64).sum());
+        }
+        result
+    }
+
+    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
+        self.target.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OSResult<()> {
+        self.target.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OSResult<Path>>,
+    ) -> BoxStream<'a, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.copy(from, to).await
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.rename(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.copy_if_not_exists(from, to).await
     }
 }
