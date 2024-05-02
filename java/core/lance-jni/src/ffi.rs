@@ -18,7 +18,7 @@ use jni::objects::{JByteBuffer, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{objects::JObject, JNIEnv};
 
-use crate::Result;
+use crate::error::{Error, Result};
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
@@ -40,6 +40,9 @@ pub trait JNIEnvExt {
 
     /// Get Option<i32> from Java Optional<Integer>.
     fn get_int_opt(&mut self, obj: &JObject) -> Result<Option<i32>>;
+
+    /// Get Option<Vec<i32>> from Java Optional<List<Integer>>.
+    fn get_ints_opt(&mut self, obj: &JObject) -> Result<Option<Vec<i32>>>;
 
     /// Get Option<i64> from Java Optional<Long>.
     fn get_long_opt(&mut self, obj: &JObject) -> Result<Option<i64>>;
@@ -119,6 +122,14 @@ impl JNIEnvExt for JNIEnv<'_> {
         })
     }
 
+    fn get_ints_opt(&mut self, obj: &JObject) -> Result<Option<Vec<i32>>> {
+        self.get_optional(obj, |env, inner_obj| {
+            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
+            let java_list_obj = java_obj_gen.l()?;
+            env.get_integers(&java_list_obj)
+        })
+    }
+
     fn get_long_opt(&mut self, obj: &JObject) -> Result<Option<i64>> {
         self.get_optional(obj, |env, inner_obj| {
             let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
@@ -166,4 +177,22 @@ impl JNIEnvExt for JNIEnv<'_> {
             f(self, obj).map(Some)
         }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseInts(
+    mut env: JNIEnv,
+    _obj: JObject,
+    list_obj: JObject, // List<Integer>
+) {
+    ok_or_throw_without_return!(env, env.get_integers(&list_obj));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseIntsOpt(
+    mut env: JNIEnv,
+    _obj: JObject,
+    list_obj: JObject, // Optional<List<Integer>>
+) {
+    ok_or_throw_without_return!(env, env.get_ints_opt(&list_obj));
 }

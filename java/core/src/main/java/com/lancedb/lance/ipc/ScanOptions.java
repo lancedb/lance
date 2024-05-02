@@ -23,7 +23,7 @@ import org.apache.arrow.util.Preconditions;
  * Lance scan options.
  */
 public class ScanOptions {
-  private final Optional<Integer> fragmentId;
+  private final Optional<List<Integer>> fragmentIds;
   private final Optional<Long> batchSize;
   private final Optional<List<String>> columns;
   private final Optional<String> filter;
@@ -32,7 +32,7 @@ public class ScanOptions {
   /**
    * Constructor for LanceScanOptions.
    *
-   * @param fragmentId the fragment to scan
+   * @param fragmentIds the id of the fragments to scan
    * @param batchSize Maximum row number of each returned ArrowRecordBatch.
    *                  Optional, use Optional.empty() if unspecified.
    * @param columns   (Optional) Projected columns. Optional.empty() for scanning all columns.
@@ -40,12 +40,12 @@ public class ScanOptions {
    * @param filter    (Optional) Filter expression. Optional.empty() for no filter.
    * @param substraitFilter (Optional) Substrait filter expression.
    */
-  public ScanOptions(Optional<Integer> fragmentId, Optional<Long> batchSize,
+  public ScanOptions(Optional<List<Integer>> fragmentIds, Optional<Long> batchSize,
       Optional<List<String>> columns, Optional<String> filter,
       Optional<ByteBuffer> substraitFilter) {
     Preconditions.checkArgument(!(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
-    this.fragmentId = fragmentId;
+    this.fragmentIds = fragmentIds;
     this.batchSize = batchSize;
     this.columns = columns;
     this.filter = filter;
@@ -53,12 +53,12 @@ public class ScanOptions {
   }
 
   /**
-   * Get the fragment id.
+   * Get the fragment ids.
    *
-   * @return Optional containing the fragment id if specified, otherwise empty.
+   * @return Optional containing the fragment ids if specified, otherwise empty.
    */
-  public Optional<Integer> getFragmentId() {
-    return fragmentId;
+  public Optional<List<Integer>> getFragmentIds() {
+    return fragmentIds;
   }
 
   /**
@@ -101,7 +101,7 @@ public class ScanOptions {
    * Builder for constructing LanceScanOptions.
    */
   public static class Builder {
-    private Optional<Integer> fragmentId = Optional.empty();
+    private Optional<List<Integer>> fragmentIds = Optional.empty();
     private Optional<Long> batchSize = Optional.empty();
     private Optional<List<String>> columns = Optional.empty();
     private Optional<String> filter = Optional.empty();
@@ -115,7 +115,7 @@ public class ScanOptions {
      * @param options another scan options
      */
     public Builder(ScanOptions options) {
-      this.fragmentId = options.getFragmentId();
+      this.fragmentIds = options.getFragmentIds();
       this.batchSize = options.getBatchSize();
       this.columns = options.getColumns();
       this.filter = options.getFilter();
@@ -123,13 +123,13 @@ public class ScanOptions {
     }
 
     /**
-     * Set the fragment ID.
+     * Set the fragment IDs.
      *
-     * @param fragmentId fragment id to scan
+     * @param fragmentIds fragment ids to scan
      * @return Builder instance for method chaining.
      */
-    public Builder fragmentId(int fragmentId) {
-      this.fragmentId = Optional.of(fragmentId);
+    public Builder fragmentIds(List<Integer> fragmentIds) {
+      this.fragmentIds = Optional.of(fragmentIds);
       return this;
     }
 
@@ -186,7 +186,7 @@ public class ScanOptions {
      * @return LanceScanOptions instance with the specified parameters.
      */
     public ScanOptions build() {
-      return new ScanOptions(fragmentId, batchSize, columns, filter, substraitFilter);
+      return new ScanOptions(fragmentIds, batchSize, columns, filter, substraitFilter);
     }
   }
 }

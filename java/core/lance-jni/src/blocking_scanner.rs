@@ -97,7 +97,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
     mut env: JNIEnv<'local>,
     _reader: JObject,
     jdataset: JObject,
-    fragment_id_obj: JObject,      // Optional<Integer>
+    fragment_ids_obj: JObject,     // Optional<List<Integer>>
     columns_obj: JObject,          // Optional<List<String>>
     substrait_filter_obj: JObject, // Optional<ByteBuffer>
     filter_obj: JObject,           // Optional<String>
@@ -110,17 +110,21 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
         dataset.clone()
     };
     let mut scanner = dataset.inner.scan();
-    let fragment_id_opt = ok_or_throw!(env, env.get_int_opt(&fragment_id_obj));
-    if let Some(fragment_id) = fragment_id_opt {
-        let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
-            env.throw_new(
-                "java/lang/RuntimeException",
-                format!("fragment id {fragment_id} not found"),
-            )
-            .expect("failed to throw java exception");
-            return JObject::null();
-        };
-        scanner.with_fragments(vec![fragment.metadata().clone()]);
+    let fragment_ids_opt = ok_or_throw!(env, env.get_ints_opt(&fragment_ids_obj));
+    if let Some(fragment_ids) = fragment_ids_opt {
+        let mut fragments = Vec::with_capacity(fragment_ids.len());
+        for fragment_id in fragment_ids {
+            let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
+                env.throw_new(
+                    "java/lang/RuntimeException",
+                    format!("fragment id {fragment_id} not found"),
+                )
+                .expect("failed to throw java exception");
+                return JObject::null();
+            };
+            fragments.push(fragment.metadata().clone());
+        }
+        scanner.with_fragments(fragments);
     }
     let columns_opt = ok_or_throw!(env, env.get_strings_opt(&columns_obj));
     if let Some(columns) = columns_opt {

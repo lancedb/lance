@@ -49,7 +49,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    */
   public static LanceScanner create(Dataset dataset, ScanOptions options,
       BufferAllocator allocator) {
-    LanceScanner scanner = createScanner(dataset, options.getFragmentId(), options.getColumns(),
+    LanceScanner scanner = createScanner(dataset, options.getFragmentIds(), options.getColumns(),
         options.getSubstraitFilter(), options.getFilter(), options.getBatchSize());
     scanner.allocator = allocator;
     scanner.dataset = dataset;
@@ -57,7 +57,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
     return scanner;
   }
 
-  static native LanceScanner createScanner(Dataset dataset, Optional<Integer> fragmentId,
+  static native LanceScanner createScanner(Dataset dataset, Optional<List<Integer>> fragmentIds,
       Optional<List<String>> columns, Optional<ByteBuffer> substraitFilter,
       Optional<String> filter, Optional<Long> batchSize);
 
@@ -111,7 +111,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
 
   /**
-   * Count the number of rows filtered by the scanner.
+   * Scan and return the number of matching rows (fulfill the given scan options).
    *
    * @return num of rows.
    */

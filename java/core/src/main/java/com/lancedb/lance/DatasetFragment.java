@@ -16,6 +16,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+import java.util.List;
 
 /**
  * Dataset format.
@@ -38,8 +39,8 @@ public class DatasetFragment {
    * @return a dataset scanner
    */
   public LanceScanner newScan() {
-    return LanceScanner.create(dataset,
-        new ScanOptions.Builder().fragmentId(metadata.getId()).build(), dataset.allocator);
+    return LanceScanner.create(dataset, new ScanOptions.Builder()
+        .fragmentIds(List.of(metadata.getId())).build(), dataset.allocator);
   }
 
   /**
@@ -50,7 +51,8 @@ public class DatasetFragment {
    */
   public LanceScanner newScan(long batchSize) {
     return LanceScanner.create(dataset,
-        new ScanOptions.Builder().fragmentId(metadata.getId()).batchSize(batchSize).build(),
+        new ScanOptions.Builder()
+            .fragmentIds(List.of(metadata.getId())).batchSize(batchSize).build(), 
         dataset.allocator);
   }
 
@@ -62,7 +64,7 @@ public class DatasetFragment {
    */
   public LanceScanner newScan(ScanOptions options) {
     return LanceScanner.create(dataset,
-        new ScanOptions.Builder(options).fragmentId(metadata.getId()).build(),
+        new ScanOptions.Builder(options).fragmentIds(List.of(metadata.getId())).build(),
         dataset.allocator);
   }
 
