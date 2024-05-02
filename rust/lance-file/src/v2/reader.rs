@@ -547,7 +547,7 @@ mod tests {
         let scheduler = StoreScheduler::new(obj_store.clone(), 8);
 
         let reader = gen()
-            .col(Some("score".to_string()), array::rand::<Float64Type>())
+            .col("score", array::rand::<Float64Type>())
             .into_reader_rows(RowCount::from(1000), BatchCount::from(100));
 
         let writer = obj_store.create(&tmp_path).await.unwrap();

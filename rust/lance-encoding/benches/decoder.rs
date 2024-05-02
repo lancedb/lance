@@ -52,7 +52,7 @@ fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_primitive");
     for data_type in PRIMITIVE_TYPES {
         let data = lance_datagen::gen()
-            .col(None, lance_datagen::array::rand_type(&DataType::Int32))
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
             .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024))
             .unwrap();
         let input_bytes = data.get_array_memory_size();
@@ -74,13 +74,10 @@ fn bench_decode_fsl(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_primitive_fsl");
     for data_type in PRIMITIVE_TYPES_FOR_FSL {
         let data = lance_datagen::gen()
-            .col(
-                None,
-                lance_datagen::array::rand_type(&DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Int32, true)),
-                    1024,
-                )),
-            )
+            .anon_col(lance_datagen::array::rand_type(&DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                1024,
+            )))
             .into_batch_rows(lance_datagen::RowCount::from(1024))
             .unwrap();
         let input_bytes = data.get_array_memory_size();

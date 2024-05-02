@@ -2235,34 +2235,25 @@ mod test {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let data = gen()
+            .col("int", array::cycle::<Int32Type>(vec![5, 4, 1, 2, 3]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![5, 4, 1, 2, 3]),
-            )
-            .col(
-                Some("str".to_string()),
+                "str",
                 array::cycle_utf8_literals(&["a", "b", "c", "e", "d"]),
             );
 
         let sorted_by_int = gen()
+            .col("int", array::cycle::<Int32Type>(vec![1, 2, 3, 4, 5]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![1, 2, 3, 4, 5]),
-            )
-            .col(
-                Some("str".to_string()),
+                "str",
                 array::cycle_utf8_literals(&["c", "e", "d", "b", "a"]),
             )
             .into_batch_rows(RowCount::from(5))
             .unwrap();
 
         let sorted_by_str = gen()
+            .col("int", array::cycle::<Int32Type>(vec![5, 4, 1, 3, 2]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![5, 4, 1, 3, 2]),
-            )
-            .col(
-                Some("str".to_string()),
+                "str",
                 array::cycle_utf8_literals(&["a", "b", "c", "d", "e"]),
             )
             .into_batch_rows(RowCount::from(5))
@@ -2327,22 +2318,16 @@ mod test {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let data = gen()
+            .col("int", array::cycle::<Int32Type>(vec![5, 5, 1, 1, 3]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![5, 5, 1, 1, 3]),
-            )
-            .col(
-                Some("float".to_string()),
+                "float",
                 array::cycle::<Float32Type>(vec![7.3, -f32::NAN, f32::NAN, 4.3, f32::INFINITY]),
             );
 
         let sorted_by_int_then_float = gen()
+            .col("int", array::cycle::<Int32Type>(vec![1, 1, 3, 5, 5]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![1, 1, 3, 5, 5]),
-            )
-            .col(
-                Some("float".to_string()),
+                "float",
                 // floats should be sorted using total order so -NAN is before all and NAN is after all
                 array::cycle::<Float32Type>(vec![4.3, f32::NAN, f32::INFINITY, -f32::NAN, 7.3]),
             )
@@ -2967,11 +2952,11 @@ mod test {
             // The first row where indexed == 75 is our deleted row (and delete query)
             let data = gen()
                 .col(
-                    Some("vector".to_string()),
+                    "vector",
                     array::rand_vec::<Float32Type>(Dimension::from(32)),
                 )
-                .col(Some("indexed".to_string()), array::step::<Int32Type>())
-                .col(Some("not_indexed".to_string()), array::step::<Int32Type>())
+                .col("indexed", array::step::<Int32Type>())
+                .col("not_indexed", array::step::<Int32Type>())
                 .into_batch_rows(RowCount::from(1000))
                 .unwrap();
 

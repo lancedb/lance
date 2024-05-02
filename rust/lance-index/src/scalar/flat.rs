@@ -269,13 +269,10 @@ mod tests {
     fn example_index() -> FlatIndex {
         let batch = gen()
             .col(
-                Some("values".to_string()),
+                "values",
                 array::cycle::<Int32Type>(vec![10, 100, 1000, 1234]),
             )
-            .col(
-                Some("ids".to_string()),
-                array::cycle::<UInt64Type>(vec![5, 0, 3, 100]),
-            )
+            .col("ids", array::cycle::<UInt64Type>(vec![5, 0, 3, 100]))
             .into_batch_rows(RowCount::from(4))
             .unwrap();
 
@@ -352,14 +349,8 @@ mod tests {
             .unwrap();
 
         let expected = gen()
-            .col(
-                Some("values".to_string()),
-                array::cycle::<Int32Type>(vec![10, 100, 1234]),
-            )
-            .col(
-                Some("ids".to_string()),
-                array::cycle::<UInt64Type>(vec![5, 2000, 100]),
-            )
+            .col("values", array::cycle::<Int32Type>(vec![10, 100, 1234]))
+            .col("ids", array::cycle::<UInt64Type>(vec![5, 2000, 100]))
             .into_batch_rows(RowCount::from(3))
             .unwrap();
         assert_eq!(remapped, expected);

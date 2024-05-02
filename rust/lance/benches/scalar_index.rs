@@ -36,8 +36,8 @@ struct BenchmarkDataSource {}
 impl BenchmarkDataSource {
     fn test_data() -> impl RecordBatchReader {
         gen()
-            .col(Some("values".to_string()), array::step::<UInt32Type>())
-            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+            .col("values", array::step::<UInt32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(100 * 1024))
     }
 }
