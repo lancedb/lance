@@ -48,6 +48,7 @@ impl TestDatasetGenerator {
     /// Set the seed for the random number generator.
     ///
     /// If not set, a random seed will be generated on each call to [`Self::make_hostile`].
+    #[allow(dead_code)]
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -225,14 +226,6 @@ impl TestDatasetGenerator {
     }
 }
 
-fn get_field_structure(dataset: &Dataset) -> Vec<Vec<Vec<i32>>> {
-    dataset
-        .get_fragments()
-        .into_iter()
-        .map(|frag| field_structure(frag.metadata()))
-        .collect::<Vec<_>>()
-}
-
 fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
     fragment
         .files
@@ -286,7 +279,7 @@ impl IoTrackingStore {
     fn record_read(&self, num_bytes: u64) {
         let mut stats = self.stats.lock().unwrap();
         stats.read_iops += 1;
-        stats.read_bytes += num_bytes as u64;
+        stats.read_bytes += num_bytes;
     }
 }
 
