@@ -268,7 +268,7 @@ def pairwise_scaql(nu: float, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
     Returns
     -------
-    A 2-D [N, M] tensor of score-aware quantization losses between x and y.
+    A 2-D [N, M] tensor of score-aware quantization losses between x and y, parametrized by nu
     """
     if len(x.shape) != 2 or len(y.shape) != 2:
         raise ValueError(
