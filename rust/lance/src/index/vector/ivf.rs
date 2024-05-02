@@ -117,7 +117,9 @@ pub struct IVFIndex {
 
 impl IVFIndex {
     /// Create a new IVF index.
-    pub(crate) fn try_new(
+    ///
+    /// Internal API with no stability guarantees.
+    pub fn try_new(
         session: Arc<Session>,
         uuid: &str,
         ivf: Ivf,
@@ -828,13 +830,17 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
     }
 }
 /// Ivf Model
+///
+/// Internal API with no stability guarantees.
 #[derive(Debug, Clone)]
-pub(crate) struct Ivf {
+pub struct Ivf {
     /// Centroids of each partition.
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
     /// memory allocator.
     pub(crate) centroids: Arc<FixedSizeListArray>,
+
+    ivf_impl: Option<Arc<dyn lance_index::vector::ivf::Ivf>>,
 
     /// Offset of each partition in the file.
     offsets: Vec<usize>,
@@ -844,11 +850,20 @@ pub(crate) struct Ivf {
 }
 
 impl Ivf {
-    pub(super) fn new(centroids: Arc<FixedSizeListArray>) -> Self {
+    /// Internal API with no stability guarantees.
+    pub fn new(centroids: Arc<FixedSizeListArray>) -> Self {
         Self {
             centroids,
+            ivf_impl: None,
             offsets: vec![],
             lengths: vec![],
+        }
+    }
+
+    pub fn with_ivf_impl(self, ivf_impl: Arc<dyn lance_index::vector::ivf::Ivf>) -> Self {
+        Self {
+            ivf_impl: Some(ivf_impl),
+            ..self
         }
     }
 
@@ -869,14 +884,19 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        let internal = lance_index::vector::ivf::new_ivf(
-            self.centroids.values(),
-            self.dimension(),
-            metric_type,
-            vec![],
-            None,
-        )?;
-        internal.find_partitions(query, nprobes)
+        match self.ivf_impl {
+            None => {
+                let internal = lance_index::vector::ivf::new_ivf(
+                    self.centroids.values(),
+                    self.dimension(),
+                    metric_type,
+                    vec![],
+                    None,
+                )?;
+                internal.find_partitions(query, nprobes)
+            }
+            Some(internal) => internal.find_partitions(query, nprobes),
+        }
     }
 
     /// Add the offset and length of one partition.
