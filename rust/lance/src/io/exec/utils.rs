@@ -199,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn test_replay() {
         let data = lance_datagen::gen()
-            .col(Some("x".to_string()), array::step::<UInt32Type>())
+            .col("x", array::step::<UInt32Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(16));
         let schema = data.schema().clone();
         let data = Box::pin(RecordBatchStreamAdapter::new(

@@ -298,18 +298,12 @@ mod tests {
     async fn test_basic_zip() {
         let left = batch_task_stream(
             lance_datagen::gen()
-                .col(
-                    Some("x".to_string()),
-                    lance_datagen::array::step::<Int32Type>(),
-                )
+                .col("x", lance_datagen::array::step::<Int32Type>())
                 .into_reader_stream(RowCount::from(100), BatchCount::from(10)),
         );
         let right = batch_task_stream(
             lance_datagen::gen()
-                .col(
-                    Some("y".to_string()),
-                    lance_datagen::array::step::<Int32Type>(),
-                )
+                .col("y", lance_datagen::array::step::<Int32Type>())
                 .into_reader_stream(RowCount::from(100), BatchCount::from(10)),
         );
 
@@ -321,14 +315,8 @@ mod tests {
             .unwrap();
 
         let expected = lance_datagen::gen()
-            .col(
-                Some("x".to_string()),
-                lance_datagen::array::step::<Int32Type>(),
-            )
-            .col(
-                Some("y".to_string()),
-                lance_datagen::array::step::<Int32Type>(),
-            )
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .col("y", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(10))
             .collect::<Result<Vec<_>, ArrowError>>()
             .unwrap();
@@ -343,10 +331,7 @@ mod tests {
                 // 100 rows across 10 batches of 10 rows
                 let mut datagen = lance_datagen::gen();
                 if has_columns {
-                    datagen = datagen.col(
-                        Some("x".to_string()),
-                        lance_datagen::array::rand::<Int32Type>(),
-                    );
+                    datagen = datagen.col("x", lance_datagen::array::rand::<Int32Type>());
                 }
                 let data = batch_task_stream(
                     datagen.into_reader_stream(RowCount::from(10), BatchCount::from(10)),
@@ -436,10 +421,8 @@ mod tests {
 
                             let mut datagen = lance_datagen::gen();
                             if has_columns {
-                                datagen = datagen.col(
-                                    Some("x".to_string()),
-                                    lance_datagen::array::rand::<Int32Type>(),
-                                );
+                                datagen =
+                                    datagen.col("x", lance_datagen::array::rand::<Int32Type>());
                             }
                             // 100 rows across 10 batches of 10 rows
                             let data = batch_task_stream(

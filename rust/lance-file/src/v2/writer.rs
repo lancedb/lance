@@ -365,7 +365,7 @@ mod tests {
         let obj_store = Arc::new(ObjectStore::local());
 
         let reader = gen()
-            .col(Some("score".to_string()), array::rand::<Float64Type>())
+            .col("score", array::rand::<Float64Type>())
             .into_reader_rows(RowCount::from(1000), BatchCount::from(10));
 
         let writer = obj_store.create(&tmp_path).await.unwrap();

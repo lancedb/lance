@@ -14,7 +14,7 @@ use lance_io::{object_store::ObjectStore, scheduler::StoreScheduler};
 fn bench_reader(c: &mut Criterion) {
     let mut group = c.benchmark_group("reader");
     let data = lance_datagen::gen()
-        .col(None, lance_datagen::array::rand_type(&DataType::Int32))
+        .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
         .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024))
         .unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();

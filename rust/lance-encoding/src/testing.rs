@@ -345,7 +345,7 @@ async fn check_round_trip_field_encoding_random(
                 // example, a list array sliced into smaller arrays will have arrays whose
                 // starting offset is not 0.
                 if use_slicing {
-                    let mut generator = gen().col(None, array::rand_type(field.data_type()));
+                    let mut generator = gen().anon_col(array::rand_type(field.data_type()));
                     if let Some(null_rate) = null_rate {
                         generator.with_random_nulls(null_rate);
                     }
@@ -363,7 +363,7 @@ async fn check_round_trip_field_encoding_random(
                     for i in 0..num_ingest_batches {
                         let mut generator = gen()
                             .with_seed(Seed::from(i as u64))
-                            .col(None, array::rand_type(field.data_type()));
+                            .anon_col(array::rand_type(field.data_type()));
                         if let Some(null_rate) = null_rate {
                             generator.with_random_nulls(null_rate);
                         }

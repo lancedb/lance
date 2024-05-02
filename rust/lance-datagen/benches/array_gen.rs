@@ -29,7 +29,7 @@ fn bench_gen<M: Measurement>(
     group.bench_function(id, |b| {
         b.iter(|| {
             let reader = lance_datagen::gen()
-                .col(None, gen_factory())
+                .anon_col(gen_factory())
                 .into_reader_bytes(
                     ByteCount::from(BYTES_PER_BATCH),
                     num_batches,

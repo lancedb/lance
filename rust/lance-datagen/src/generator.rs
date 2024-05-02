@@ -1001,8 +1001,16 @@ impl BatchGeneratorBuilder {
     /// Adds a new column to the generator
     ///
     /// See [`crate::generator::array`] for methods to create generators
-    pub fn col(mut self, name: Option<String>, gen: Box<dyn ArrayGenerator>) -> Self {
-        self.generators.push((name, gen));
+    pub fn col(mut self, name: impl Into<String>, gen: Box<dyn ArrayGenerator>) -> Self {
+        self.generators.push((Some(name.into()), gen));
+        self
+    }
+
+    /// Adds a new column to the generator with a generated unique name
+    ///
+    /// See [`crate::generator::array`] for methods to create generators
+    pub fn anon_col(mut self, gen: Box<dyn ArrayGenerator>) -> Self {
+        self.generators.push((None, gen));
         self
     }
 
@@ -1632,10 +1640,7 @@ pub fn gen() -> BatchGeneratorBuilder {
 pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
     let mut builder = BatchGeneratorBuilder::default();
     for field in schema.fields() {
-        builder = builder.col(
-            Some(field.name().clone()),
-            array::rand_type(field.data_type()),
-        );
+        builder = builder.col(field.name(), array::rand_type(field.data_type()));
     }
     builder
 }
