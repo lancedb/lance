@@ -42,7 +42,10 @@ def _to_tensor(
         if (
             pa.types.is_fixed_size_list(arr.type)
             or isinstance(arr.type, pa.FixedShapeTensorType)
-        ) and pa.types.is_floating(arr.type.value_type):
+        ) and (
+            pa.types.is_floating(arr.type.value_type)
+            or pa.types.is_integer(arr.type.value_type)
+        ):
             np_arrs = arr.to_numpy(zero_copy_only=False)
             np_tensor = np.stack(np_arrs)
             del np_arrs
