@@ -1104,7 +1104,7 @@ mod tests {
     async fn test_empty_lists() {
         // Scenario 1: Some lists are empty
 
-        let values = vec![vec![Some(1), Some(2), Some(3)], vec![], vec![None]];
+        let values = [vec![Some(1), Some(2), Some(3)], vec![], vec![None]];
         // Test empty list at beginning, middle, and end
         for order in [[0, 1, 2], [1, 0, 2], [2, 0, 1]] {
             let items_builder = Int32Builder::new();
