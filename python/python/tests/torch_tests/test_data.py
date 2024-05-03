@@ -237,8 +237,9 @@ def test_sample_batches_with_filter(tmp_path: Path):
     assert randomized_ids == all_ids
 
 
-def test_convert_int_tensors(tmp_path: Path):
-    data = np.random.randint(0, 256, size=128 * 32, dtype=np.uint8)
+@pytest.mark.parametrize("dtype", [np.uint8, np.int64])
+def test_convert_int_tensors(tmp_path: Path, dtype):
+    data = np.random.randint(0, 256, size=128 * 32, dtype=dtype)
     fsl = pa.FixedSizeListArray.from_arrays(data, 32)
     ids = pa.array(range(0, 128), type=pa.int32())
     tbl = pa.Table.from_arrays([ids, fsl], ["ids", "vec"])
@@ -250,5 +251,5 @@ def test_convert_int_tensors(tmp_path: Path):
         batch_size=4,
     )
     first = next(iter(torch_ds))
-    assert first["vec"].dtype == torch.uint8
+    assert first["vec"].dtype == torch.uint8 if dtype == np.uint8 else torch.int64
     assert first["vec"].shape == (4, 32)
