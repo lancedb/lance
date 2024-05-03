@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{cast::AsArray, ArrayRef};
 use std::io::{Cursor, Write};
 
+use arrow_array::{cast::AsArray, Array, ArrayRef};
 use arrow_buffer::{BooleanBufferBuilder, Buffer};
 use arrow_schema::DataType;
+
 use lance_core::Result;
 
 use crate::encoder::{BufferEncoder, EncodedBuffer};
