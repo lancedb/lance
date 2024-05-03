@@ -55,6 +55,7 @@ def _write_fragment(
     max_bytes_per_file: Optional[int] = None,
     max_rows_per_group: int = 1024,  # Only useful for v1 writer.
     use_experimental_writer: bool = False,
+    storage_options: Optional[Dict[str, Any]] = None,
 ) -> Tuple[FragmentMetadata, pa.Schema]:
     from ..dependencies import _PANDAS_AVAILABLE
     from ..dependencies import pandas as pd
@@ -88,6 +89,7 @@ def _write_fragment(
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,
         use_experimental_writer=use_experimental_writer,
+        storage_options=storage_options,
     )
     return [(fragment, schema) for fragment in fragments]
 
@@ -235,6 +237,8 @@ class LanceFragmentWriter:
         Only useful for v1 writer.
     use_experimental_writer : bool, optional
         Set true to use v2 writer. Default is True.
+    storage_options : Dict[str, Any], optional
+        The storage options for the writer. Default is None.
 
     """
 
@@ -248,6 +252,7 @@ class LanceFragmentWriter:
         max_bytes_per_file: Optional[int] = None,
         max_rows_per_group: Optional[int] = None,  # Only useful for v1 writer.
         use_experimental_writer: bool = True,
+        storage_options: Optional[Dict[str, Any]] = None,
     ):
         self.uri = uri
         self.schema = schema
@@ -257,6 +262,7 @@ class LanceFragmentWriter:
         self.max_rows_per_file = max_rows_per_file
         self.max_bytes_per_file = max_bytes_per_file
         self.use_experimental_writer = use_experimental_writer
+        self.storage_options = storage_options
 
     def __call__(self, batch: Union[pa.Table, "pd.DataFrame"]) -> Dict[str, Any]:
         """Write a Batch to the Lance fragment."""
@@ -272,6 +278,7 @@ class LanceFragmentWriter:
             max_rows_per_file=self.max_rows_per_file,
             max_rows_per_group=self.max_rows_per_group,
             use_experimental_writer=self.use_experimental_writer,
+            storage_options=self.storage_options,
         )
         return pa.Table.from_pydict(
             {
