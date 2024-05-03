@@ -343,6 +343,7 @@ pub async fn encode_batch(
             }))
         }
         page_table.push(ColumnInfo {
+            index: 0,
             buffer_offsets: vec![],
             page_infos: pages,
         })

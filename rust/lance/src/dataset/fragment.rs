@@ -6,7 +6,7 @@
 pub mod write;
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ use lance_core::ROW_ID_FIELD;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
+use lance_file::v2::reader::ReaderProjection;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::StoreScheduler;
 use lance_io::ReadBatchParams;
@@ -207,19 +208,50 @@ impl GenericFileReader for FileReader {
     }
 }
 
+#[derive(Debug, Clone)]
+struct V2Reader {
+    reader: Arc<v2::reader::FileReader>,
+    field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
+}
+
+impl V2Reader {
+    fn projection_from_lance(&self, schema: &Schema) -> ReaderProjection {
+        let arrow_schema = Arc::new(ArrowSchema::from(schema));
+        let column_indices = schema
+            .fields
+            .iter()
+            .map(|f| {
+                *self.field_id_to_column_idx.get(&f.id).unwrap_or_else(|| {
+                    panic!(
+                        "attempt to project field with id {} which did not exist in the data file",
+                        f.id
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        ReaderProjection {
+            schema: arrow_schema,
+            column_indices,
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl GenericFileReader for Arc<v2::reader::FileReader> {
+impl GenericFileReader for V2Reader {
     /// Reads the requested range of rows from the file, returning as a stream
     fn read_range_tasks(
         &self,
         range: Range<u64>,
         batch_size: u32,
-        _projection: Arc<Schema>,
+        projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
+        let projection = self.projection_from_lance(projection.as_ref());
         Ok(self
+            .reader
             .read_tasks(
                 ReadBatchParams::Range(range.start as usize..range.end as usize),
                 batch_size,
+                &projection,
             )?
             .map(|v2_task| ReadBatchTask {
                 task: v2_task.task.map_err(Error::from).boxed(),
@@ -231,10 +263,12 @@ impl GenericFileReader for Arc<v2::reader::FileReader> {
     fn read_all_tasks(
         &self,
         batch_size: u32,
-        _projection: Arc<Schema>,
+        projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
+        let projection = self.projection_from_lance(projection.as_ref());
         Ok(self
-            .read_tasks(ReadBatchParams::RangeFull, batch_size)?
+            .reader
+            .read_tasks(ReadBatchParams::RangeFull, batch_size, &projection)?
             .map(|v2_task| ReadBatchTask {
                 task: v2_task.task.map_err(Error::from).boxed(),
                 num_rows: v2_task.num_rows,
@@ -244,7 +278,7 @@ impl GenericFileReader for Arc<v2::reader::FileReader> {
 
     /// Return the number of rows in the file
     fn len(&self) -> u32 {
-        self.metadata().num_rows as u32
+        self.reader.metadata().num_rows as u32
     }
 
     fn clone_box(&self) -> Box<dyn GenericFileReader> {
@@ -380,7 +414,7 @@ impl FileFragment {
         let data_file_schema = data_file.schema(full_schema);
         let projection = projection.unwrap_or(full_schema);
         // Also remove any fields that are not part of the user's provided projection
-        let schema_per_file = data_file_schema.intersection(projection)?;
+        let schema_per_file = Arc::new(data_file_schema.intersection(projection)?);
 
         if data_file.is_legacy_file() {
             let max_field_id = data_file.fields.iter().max().unwrap();
@@ -398,25 +432,41 @@ impl FileFragment {
                 )
                 .await?;
                 reader.with_row_id(with_row_id);
-                let initialized_schema = reader.schema().project_by_schema(&schema_per_file)?;
+                let initialized_schema = reader
+                    .schema()
+                    .project_by_schema(schema_per_file.as_ref())?;
                 Ok(Some((Box::new(reader), Arc::new(initialized_schema))))
             } else {
                 Ok(None)
             }
         } else {
-            if schema_per_file.fields.len() != data_file.fields.len() {
-                todo!("support for projection in v2")
-            }
             if schema_per_file.fields.is_empty() {
                 Ok(None)
             } else {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
                 let store_scheduler = StoreScheduler::new(self.dataset.object_store.clone(), 16);
                 let file_scheduler = store_scheduler.open_file(&path).await?;
-                let schema = arrow_schema::Schema::from(&schema_per_file);
                 let reader =
-                    Arc::new(v2::reader::FileReader::try_open(file_scheduler, schema).await?);
-                Ok(Some((Box::new(reader), Arc::new(schema_per_file))))
+                    Arc::new(v2::reader::FileReader::try_open(file_scheduler, None).await?);
+                let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
+                    data_file
+                        .fields
+                        .iter()
+                        .copied()
+                        .zip(data_file.column_indices.iter().copied())
+                        .filter_map(|(field_id, column_index)| {
+                            if column_index < 0 {
+                                None
+                            } else {
+                                Some((field_id, column_index as u32))
+                            }
+                        }),
+                ));
+                let reader = V2Reader {
+                    reader,
+                    field_id_to_column_idx,
+                };
+                Ok(Some((Box::new(reader), schema_per_file)))
             }
         }
     }
