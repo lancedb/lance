@@ -1663,7 +1663,7 @@ mod test {
     use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     use super::*;
     use crate::arrow::*;
@@ -2927,6 +2927,7 @@ mod test {
     }
 
     struct ScalarIndexTestFixture {
+        _test_dir: TempDir,
         dataset: Dataset,
         sample_query: Arc<dyn Array>,
         delete_query: Arc<dyn Array>,
@@ -3070,6 +3071,7 @@ mod test {
             dataset.restore().await.unwrap();
 
             Self {
+                _test_dir: test_dir,
                 dataset,
                 sample_query,
                 delete_query,
