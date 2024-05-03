@@ -558,18 +558,21 @@ impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerato
 pub struct RandomBinaryGenerator {
     bytes_per_element: ByteCount,
     scale_to_utf8: bool,
+    is_large: bool,
     data_type: DataType,
 }
 
 impl RandomBinaryGenerator {
-    pub fn new(bytes_per_element: ByteCount, scale_to_utf8: bool) -> Self {
+    pub fn new(bytes_per_element: ByteCount, scale_to_utf8: bool, is_large: bool) -> Self {
         Self {
             bytes_per_element,
             scale_to_utf8,
-            data_type: if scale_to_utf8 {
-                Utf8Type::DATA_TYPE.clone()
-            } else {
-                BinaryType::DATA_TYPE.clone()
+            is_large,
+            data_type: match (scale_to_utf8, is_large) {
+                (false, false) => DataType::Binary,
+                (false, true) => DataType::LargeBinary,
+                (true, false) => DataType::Utf8,
+                (true, true) => DataType::LargeUtf8,
             },
         }
     }
@@ -589,21 +592,41 @@ impl ArrayGenerator for RandomBinaryGenerator {
             bytes = bytes.into_iter().map(|val| (val % 95) + 32).collect();
         }
         let bytes = Buffer::from(bytes);
-        let offsets = OffsetBuffer::from_lengths(
-            iter::repeat(self.bytes_per_element.0 as usize).take(length.0 as usize),
-        );
-        if self.scale_to_utf8 {
-            // This is safe because we are only using printable characters
-            unsafe {
-                Ok(Arc::new(arrow_array::StringArray::new_unchecked(
-                    offsets, bytes, None,
-                )))
+        if self.is_large {
+            let offsets = OffsetBuffer::from_lengths(
+                iter::repeat(self.bytes_per_element.0 as usize).take(length.0 as usize),
+            );
+            if self.scale_to_utf8 {
+                // This is safe because we are only using printable characters
+                unsafe {
+                    Ok(Arc::new(arrow_array::LargeStringArray::new_unchecked(
+                        offsets, bytes, None,
+                    )))
+                }
+            } else {
+                unsafe {
+                    Ok(Arc::new(arrow_array::LargeBinaryArray::new_unchecked(
+                        offsets, bytes, None,
+                    )))
+                }
             }
         } else {
-            unsafe {
-                Ok(Arc::new(arrow_array::BinaryArray::new_unchecked(
-                    offsets, bytes, None,
-                )))
+            let offsets = OffsetBuffer::from_lengths(
+                iter::repeat(self.bytes_per_element.0 as usize).take(length.0 as usize),
+            );
+            if self.scale_to_utf8 {
+                // This is safe because we are only using printable characters
+                unsafe {
+                    Ok(Arc::new(arrow_array::StringArray::new_unchecked(
+                        offsets, bytes, None,
+                    )))
+                }
+            } else {
+                unsafe {
+                    Ok(Arc::new(arrow_array::BinaryArray::new_unchecked(
+                        offsets, bytes, None,
+                    )))
+                }
             }
         }
     }
@@ -1522,15 +1545,23 @@ pub mod array {
     }
 
     /// Create a generator of random binary values
-    pub fn rand_varbin(bytes_per_element: ByteCount) -> Box<dyn ArrayGenerator> {
-        Box::new(RandomBinaryGenerator::new(bytes_per_element, false))
+    pub fn rand_varbin(bytes_per_element: ByteCount, is_large: bool) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomBinaryGenerator::new(
+            bytes_per_element,
+            false,
+            is_large,
+        ))
     }
 
     /// Create a generator of random strings
     ///
     /// All strings will consist entirely of printable ASCII characters
-    pub fn rand_utf8(bytes_per_element: ByteCount) -> Box<dyn ArrayGenerator> {
-        Box::new(RandomBinaryGenerator::new(bytes_per_element, true))
+    pub fn rand_utf8(bytes_per_element: ByteCount, is_large: bool) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomBinaryGenerator::new(
+            bytes_per_element,
+            true,
+            is_large,
+        ))
     }
 
     /// Create a random generator of boolean values
@@ -1568,8 +1599,10 @@ pub mod array {
             DataType::Float64 => rand::<Float64Type>(),
             DataType::Decimal128(_, _) => rand_primitive::<Decimal128Type>(data_type.clone()),
             DataType::Decimal256(_, _) => rand_primitive::<Decimal256Type>(data_type.clone()),
-            DataType::Utf8 => rand_utf8(ByteCount::from(12)),
-            DataType::Binary => rand_varbin(ByteCount::from(12)),
+            DataType::Utf8 => rand_utf8(ByteCount::from(12), false),
+            DataType::LargeUtf8 => rand_utf8(ByteCount::from(12), true),
+            DataType::Binary => rand_varbin(ByteCount::from(12), false),
+            DataType::LargeBinary => rand_varbin(ByteCount::from(12), true),
             DataType::Dictionary(key_type, value_type) => {
                 dict_type(rand_type(value_type), key_type)
             }
@@ -1749,7 +1782,7 @@ mod tests {
             Int32Array::from_iter([-797553329, 1369325940, -69174021])
         );
 
-        let mut gen = array::rand_varbin(ByteCount::from(3));
+        let mut gen = array::rand_varbin(ByteCount::from(3), false);
         assert_eq!(
             *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::BinaryArray::from_iter_values([
@@ -1759,7 +1792,7 @@ mod tests {
             ])
         );
 
-        let mut gen = array::rand_utf8(ByteCount::from(3));
+        let mut gen = array::rand_utf8(ByteCount::from(3), false);
         assert_eq!(
             *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::StringArray::from_iter_values([">@p", "n `", "NWa"])

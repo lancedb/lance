@@ -119,16 +119,19 @@ fn bench_rand_gen(c: &mut Criterion) {
         lance_datagen::array::rand::<Int64Type>()
     });
     bench_gen(&mut group, "rand_varbin", || {
-        lance_datagen::array::rand_varbin(ByteCount::from(12))
+        lance_datagen::array::rand_varbin(ByteCount::from(12), false)
     });
     bench_gen(&mut group, "rand_utf8", || {
-        lance_datagen::array::rand_utf8(ByteCount::from(12))
+        lance_datagen::array::rand_utf8(ByteCount::from(12), false)
     });
     bench_gen(&mut group, "rand_vec", || {
         lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(512))
     });
     bench_gen(&mut group, "rand_dict_i32_utf8", || {
-        lance_datagen::array::dict::<Int32Type>(lance_datagen::array::rand_utf8(ByteCount::from(8)))
+        lance_datagen::array::dict::<Int32Type>(lance_datagen::array::rand_utf8(
+            ByteCount::from(8),
+            false,
+        ))
     });
     group.finish();
 }

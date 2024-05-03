@@ -854,12 +854,12 @@ impl ListOffsetsEncoder {
                 }
             }
             DataType::Int64 => {
-                let offsets_i64 = offsets.as_primitive::<Int32Type>();
+                let offsets_i64 = offsets.as_primitive::<Int64Type>();
                 let start = offsets_i64.value(0) as u64;
                 // If we want to take a list from start..X and change it into
                 // a list from end..X then we need to add (base - start) to all elements
                 // Note that `modifier` may be negative but (item + modifier) will always be >= 0
-                let modifier = (base - start) as i64;
+                let modifier = base as i64 - start as i64;
                 if let Some(validity) = validity {
                     dest.extend(
                         offsets_i64
@@ -868,8 +868,7 @@ impl ListOffsetsEncoder {
                             .skip(1)
                             .zip(validity.values().iter())
                             .map(|(&off, valid)| {
-                                (off as i64 + modifier) as u64
-                                    + (!valid as u64 * null_offset_adjustment)
+                                (off + modifier) as u64 + (!valid as u64 * null_offset_adjustment)
                             }),
                     )
                 } else {
@@ -878,7 +877,7 @@ impl ListOffsetsEncoder {
                             .values()
                             .iter()
                             .skip(1)
-                            .map(|&v| (v as i64 + modifier) as u64),
+                            .map(|&v| (v + modifier) as u64),
                     );
                 }
             }
