@@ -3620,9 +3620,9 @@ mod test {
                     .filter("i > 10 and i < 20")
             },
             "Projection: fields=[s]
-  FilterExec: i@2 > 10 AND i@2 < 20
-    Take: columns=\"s, _rowid, i\"
-      LanceScan: uri..., projection=[s], row_id=true, ordered=true",
+  Take: columns=\"i, _rowid, s\"
+    FilterExec: i@0 > 10 AND i@0 < 20
+      LanceScan: uri..., projection=[i], row_id=true, ordered=true",
         )
         .await?;
 
