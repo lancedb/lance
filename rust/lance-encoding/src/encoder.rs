@@ -247,7 +247,7 @@ impl BatchEncoder {
                     header_col_idx,
                 )))
             }
-            DataType::Utf8 | DataType::Binary => {
+            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
                 let my_col_idx = *col_idx;
                 field_col_mapping.push((field.id, my_col_idx as i32));
                 *col_idx += 2;

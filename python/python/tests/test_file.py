@@ -33,6 +33,29 @@ def test_multiple_close(tmp_path):
     writer.close()
 
 
+def test_different_types(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema(
+        [
+            pa.field("large_string", pa.large_string()),
+            pa.field("large_binary", pa.large_binary()),
+        ]
+    )
+    writer = LanceFileWriter(str(path), schema)
+    data = pa.table(
+        {
+            "large_string": pa.array(["foo", "bar", "baz"], pa.large_string()),
+            "large_binary": pa.array([b"foo", b"bar", b"baz"], pa.large_binary()),
+        }
+    )
+    writer.write_batch(data)
+    writer.close()
+
+    reader = LanceFileReader(str(path), schema)
+    result = reader.read_all().to_table()
+    assert result == data
+
+
 def test_round_trip(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])

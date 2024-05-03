@@ -606,7 +606,7 @@ mod tests {
         let batch = gen()
             .col(
                 "values",
-                array::rand_utf8(ByteCount::from(0)).with_nulls(&[true]),
+                array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
             )
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1]))
             .into_batch_rows(RowCount::from(4096));
