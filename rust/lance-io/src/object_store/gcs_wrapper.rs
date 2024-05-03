@@ -276,43 +276,37 @@ impl Upload {
                             }) if source
                                 .to_string()
                                 .to_lowercase()
-                                .contains("Connection reset by peer")
-                                && mut_self.connection_resets < max_conn_reset_retries() =>
+                                .contains("connection reset by peer") =>
                             {
-                                // Retry, but only up to max_conn_reset_retries of them.
-                                mut_self.connection_resets += 1;
+                                if mut_self.connection_resets < max_conn_reset_retries() {
+                                    // Retry, but only up to max_conn_reset_retries of them.
+                                    mut_self.connection_resets += 1;
 
-                                // Resubmit with random jitter
-                                let sleep_time_ms = rand::thread_rng().gen_range(2_000..8_000);
-                                let sleep_time = std::time::Duration::from_millis(sleep_time_ms);
+                                    // Resubmit with random jitter
+                                    let sleep_time_ms = rand::thread_rng().gen_range(2_000..8_000);
+                                    let sleep_time =
+                                        std::time::Duration::from_millis(sleep_time_ms);
 
-                                futures.push(Self::put_part(
-                                    mut_self.path.clone(),
-                                    mut_self.store.clone(),
-                                    buffer,
-                                    part_idx,
-                                    multipart_id.clone(),
-                                    Some(sleep_time),
-                                ));
-                            }
-                            Err(UploadPutError {
-                                source: OSError::Generic { source, .. },
-                                ..
-                            }) if source
-                                .to_string()
-                                .to_lowercase()
-                                .contains("Connection reset by peer") =>
-                            {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::ConnectionReset,
-                                    Box::new(ConnectionResetError {
-                                        message: format!(
-                                            "Hit max retries ({}) for connection reset",
-                                            max_conn_reset_retries()
-                                        ),
-                                        source,
-                                    }),
-                                ))
+                                    futures.push(Self::put_part(
+                                        mut_self.path.clone(),
+                                        mut_self.store.clone(),
+                                        buffer,
+                                        part_idx,
+                                        multipart_id.clone(),
+                                        Some(sleep_time),
+                                    ));
+                                } else {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::ConnectionReset,
+                                        Box::new(ConnectionResetError {
+                                            message: format!(
+                                                "Hit max retries ({}) for connection reset",
+                                                max_conn_reset_retries()
+                                            ),
+                                            source,
+                                        }),
+                                    ));
+                                }
                             }
                             Err(err) => return Err(err.source.into()),
                         }
