@@ -327,6 +327,7 @@ def write_lance(
     ] = None,
     max_rows_per_file: int = 1024 * 1024,
     max_bytes_per_file: Optional[int] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Write Ray dataset at scale.
 
@@ -347,6 +348,8 @@ def write_lance(
         The maximum number of rows per file. Default is 1024 * 1024.
     max_bytes_per_file: int, optional
         The maximum number of bytes per file. Default is 90GB.
+    storage_options : Dict[str, Any], optional
+        The storage options for the writer. Default is None.
     """
     data.map_batches(
         LanceFragmentWriter(
@@ -355,6 +358,7 @@ def write_lance(
             transform=transform,
             max_rows_per_file=max_rows_per_file,
             max_bytes_per_file=max_bytes_per_file,
+            storage_options=storage_options,
         ),
         batch_size=max_rows_per_file,
     ).write_datasink(LanceCommitter(output_uri, schema=schema))
