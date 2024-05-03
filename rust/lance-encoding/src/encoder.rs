@@ -7,10 +7,15 @@ use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
+use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
 use crate::encodings::physical::fsst::FsstArrayEncoder;
+use crate::encodings::physical::bitpack::{num_compressed_bits, BitpackingBufferEncoder};
+use crate::encodings::physical::buffers::{
+    BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder,
+};
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -40,6 +45,12 @@ pub struct EncodedBuffer {
     /// For example, if we are asked to write 3 primitive arrays of 1000 rows and we can write them all
     /// as one page then this will be the value buffers from the 3 primitive arrays
     pub parts: Vec<Buffer>,
+
+    pub bits_per_value: u64,
+
+    pub bitpacked_bits_per_value: Option<u64>,
+
+    pub compression_scheme: Option<CompressionScheme>,
 }
 
 // Custom impl because buffers shouldn't be included in debug output
@@ -88,7 +99,12 @@ impl EncodedArray {
         (
             self.buffers
                 .into_iter()
-                .map(|b| EncodedBuffer { parts: b.parts })
+                .map(|b| EncodedBuffer { 
+                    parts: b.parts,
+                    bits_per_value: 0, // TODO
+                    compression_scheme: None,
+                    bitpacked_bits_per_value: None,
+                })
                 .collect(),
             self.encoding,
         )
@@ -174,6 +190,12 @@ impl Default for EncodedColumn {
 /// A task to create a page of data
 pub type EncodeTask = BoxFuture<'static, Result<EncodedPage>>;
 
+/// A buffer of encoded metadata to be placed in the column metadata
+pub struct EncodedMetadataBuffer {
+    // Different parts that will be written to a single buffer on disk
+    pub parts: Vec<Buffer>,
+}
+
 /// Top level encoding trait to code any Arrow array type into one or more pages.
 ///
 /// The field encoder implements buffering and encoding of a single input column
@@ -206,8 +228,9 @@ pub trait FieldEncoder: Send {
     ///
     /// This is called only once, after all encode tasks have completed
     ///
-    /// This returns a Vec because a single field may have created multiple columns
+    /// By default, returns an empty Vec (no column metadata buffers)
     fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>>;
+    
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
 }
@@ -277,7 +300,9 @@ impl CoreArrayEncodingStrategy {
                 }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(data_type, get_compression_scheme())?,
+                ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
+                    compression_scheme: get_compression_scheme(),
+                }))?,
             )))),
         }
     }
@@ -331,6 +356,66 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
         let use_dict_encoding = data_type == &DataType::Utf8
             && check_dict_encoding(arrays, get_dict_encoding_threshold());
         Self::array_encoder_from_type(data_type, data_size, use_dict_encoding)
+    }
+}
+
+/// A trait to pick which encoding strategy will be used for a single buffer of data
+pub trait BufferEncodingStrategy: Send + Sync + std::fmt::Debug {
+    fn create_buffer_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn BufferEncoder>>;
+}
+
+#[derive(Debug)]
+pub struct CoreBufferEncodingStrategy {
+    pub compression_scheme: CompressionScheme,
+}
+
+impl Default for CoreBufferEncodingStrategy {
+    fn default() -> Self {
+        Self {
+            compression_scheme: CompressionScheme::None,
+        }
+    }
+}
+
+impl CoreBufferEncodingStrategy {
+    fn try_bitpacked_encoding(&self, arrays: &[ArrayRef]) -> Option<BitpackingBufferEncoder> {
+        // calculate the number of bits to compress array items into
+        let mut num_bits = 0;
+        for arr in arrays {
+            match num_compressed_bits(arr.clone()) {
+                Some(arr_max) => num_bits = num_bits.max(arr_max),
+                None => return None,
+            }
+        }
+
+        // check that the number of bits in the compressed array is less than the
+        // number of bits in the native type. Otherwise there's no point to bitpacking
+        let data_type = arrays[0].data_type();
+        let native_num_bits = 8 * data_type.byte_width() as u64;
+        if num_bits >= native_num_bits {
+            return None;
+        }
+
+        Some(BitpackingBufferEncoder::default())
+    }
+}
+
+impl BufferEncodingStrategy for CoreBufferEncodingStrategy {
+    fn create_buffer_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn BufferEncoder>> {
+        let data_type = arrays[0].data_type();
+        if *data_type == DataType::Boolean {
+            return Ok(Box::<BitmapBufferEncoder>::default());
+        }
+
+        if self.compression_scheme != CompressionScheme::None {
+            return Ok(Box::<CompressedBufferEncoder>::default());
+        }
+
+        if let Some(bitpacking_encoder) = self.try_bitpacked_encoding(arrays) {
+            return Ok(Box::new(bitpacking_encoder));
+        }
+
+        Ok(Box::<FlatBufferEncoder>::default())
     }
 }
 
