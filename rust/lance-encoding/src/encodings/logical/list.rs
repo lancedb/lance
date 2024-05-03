@@ -303,7 +303,6 @@ impl LogicalPageScheduler for ListPageScheduler {
             let mut next_range = item_ranges.pop_front().unwrap();
             let mut next_item_ranges = Vec::new();
 
-            // TODO: Test List<List<...>>
             // This is a bit complicated.  We have a list of ranges and we have a list of
             // item schedulers.  We walk through both lists, scheduling the overlap.  For
             // example, if we need items [500...1000], [2200..2300] [2500...4000] and we have 5 item
