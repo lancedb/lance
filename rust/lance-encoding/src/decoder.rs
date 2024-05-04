@@ -432,11 +432,6 @@ impl DecodeBatchScheduler {
                             let mut num_items = list_encoding.num_items;
                             while num_items > 0 {
                                 let next_items_page = items.next().unwrap();
-                                println!(
-                                    "num_items = {} and next_items_page.num_rows() = {}",
-                                    num_items,
-                                    next_items_page.num_rows() as u64
-                                );
                                 num_items -= next_items_page.num_rows() as u64;
                                 items_schedulers.push(next_items_page);
                             }

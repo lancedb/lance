@@ -125,6 +125,8 @@ impl ListPageScheduler {
         let mut offsets_offset: u32 = 0;
         // Only the first range is allowed to start with 0
         debug_assert!(offset_ranges.iter().skip(1).all(|r| r.start > 0));
+        // All ranges should be non-empty
+        debug_assert!(offset_ranges.iter().all(|r| r.end > r.start));
         for range in offset_ranges {
             // The # of lists in this particular range
             let num_lists = range.end - range.start;
@@ -209,7 +211,9 @@ impl ListPageScheduler {
                 items_range
             );
             offsets_offset += num_offsets_to_norm as u32;
-            item_ranges.push_back(items_range);
+            if !items_range.is_empty() {
+                item_ranges.push_back(items_range);
+            }
         }
 
         let validity = validity_buffer.finish();
@@ -273,7 +277,6 @@ impl LogicalPageScheduler for ListPageScheduler {
             let decode_task = scheduled_offsets.drain(num_offsets)?;
             let offsets = decode_task.task.decode()?;
 
-            println!("Decoding offsets: {:?}", offsets);
             let (mut item_ranges, offsets, validity) =
                 Self::decode_offsets(offsets.as_ref(), &ranges, null_offset_adjustment);
             let (tx, mut rx) = mpsc::unbounded_channel();
@@ -284,9 +287,8 @@ impl LogicalPageScheduler for ListPageScheduler {
                 items_schedulers.len()
             );
 
-            // This can happen, for example, when there are only empty lists
-            if items_schedulers.is_empty() {
-                println!("{:?}", item_ranges);
+            // All requested lists are empty
+            if items_schedulers.is_empty() || item_ranges.is_empty() {
                 debug_assert!(item_ranges.iter().all(|r| r.start == r.end));
                 return Ok(IndirectlyLoaded {
                     item_decoders: Vec::new(),
@@ -301,7 +303,6 @@ impl LogicalPageScheduler for ListPageScheduler {
             let mut next_range = item_ranges.pop_front().unwrap();
             let mut next_item_ranges = Vec::new();
 
-            // TODO: Test List<List<...>>
             // This is a bit complicated.  We have a list of ranges and we have a list of
             // item schedulers.  We walk through both lists, scheduling the overlap.  For
             // example, if we need items [500...1000], [2200..2300] [2500...4000] and we have 5 item
@@ -455,8 +456,6 @@ impl DecodeArrayTask for ListDecodeTask {
 
         // The offsets are already decoded but they need to be shifted back to 0 and cast
         // to the appropriate type
-        // TODO: This shift is not strictly required since a list array's offsets don't have
-        // to start at zero but doing the shift makes testing easier.
         //
         // Although, in some cases, the shift IS strictly required since the unshifted offsets
         // may cross i32::MAX even though the shifted offsets do not
@@ -532,12 +531,17 @@ impl LogicalPageDecoder for ListPageDecoder {
             let mut items_needed =
                 self.offsets[offset_wait_start as usize + num_rows as usize] - item_start;
             // First discount any already available items
-            items_needed = items_needed.saturating_sub(
-                self.awaited_item_decoders
-                    .iter()
-                    .map(|d| d.avail() as u64)
-                    .sum::<u64>(),
+            let items_already_available = self
+                .awaited_item_decoders
+                .iter()
+                .map(|d| d.avail() as u64)
+                .sum::<u64>();
+            trace!(
+                "List's items decoder already has {} items available in {} awaited pages",
+                items_already_available,
+                self.awaited_item_decoders.len(),
             );
+            items_needed = items_needed.saturating_sub(items_already_available);
             // The last decoder in the awaited list may not be fully awaited
             if let Some(last_decoder) = self.awaited_item_decoders.back_mut() {
                 let to_await = items_needed.min(last_decoder.unawaited() as u64) as u32;
@@ -631,7 +635,7 @@ impl LogicalPageDecoder for ListPageDecoder {
 
         self.rows_drained += num_rows;
         Ok(NextDecodeTask {
-            has_more: self.avail() > 0,
+            has_more: self.avail() > 0 || self.unawaited() > 0,
             num_rows,
             task: Box::new(ListDecodeTask {
                 offsets,
@@ -1041,7 +1045,7 @@ impl FieldEncoder for ListFieldEncoder {
     }
 
     fn num_columns(&self) -> u32 {
-        2
+        self.items_encoder.num_columns() + 1
     }
 }
 
@@ -1072,6 +1076,12 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn test_nested_list() {
+        let field = Field::new("", make_list_type(DataType::Utf8), true);
+        check_round_trip_encoding_random(field).await;
+    }
+
+    #[test_log::test(tokio::test)]
     async fn test_simple_list() {
         let items_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
@@ -1091,6 +1101,26 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_empty_lists() {
+        // Scenario 1: Some lists are empty
+
+        let values = [vec![Some(1), Some(2), Some(3)], vec![], vec![None]];
+        // Test empty list at beginning, middle, and end
+        for order in [[0, 1, 2], [1, 0, 2], [2, 0, 1]] {
+            let items_builder = Int32Builder::new();
+            let mut list_builder = ListBuilder::new(items_builder);
+            for idx in order {
+                list_builder.append_value(values[idx].clone());
+            }
+            let list_array = list_builder.finish();
+            let test_cases = TestCases::default()
+                .with_indices(vec![1])
+                .with_indices(vec![0])
+                .with_indices(vec![2]);
+            check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
+        }
+
+        // Scenario 2: All lists are empty
+
         // When encoding a list of empty lists there are no items to encode
         // which is strange and we want to ensure we handle it
         let items_builder = Int32Builder::new();
