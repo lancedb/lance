@@ -46,6 +46,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 arrow-schema.workspace = true
+pretty_assertions.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
