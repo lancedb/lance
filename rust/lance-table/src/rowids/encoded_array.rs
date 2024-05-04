@@ -144,12 +144,14 @@ impl EncodedU64Array {
 
     pub fn slice(&self, offset: usize, len: usize) -> Self {
         match self {
-            EncodedU64Array::U16 { base, offsets } => {
-                offsets[offset..(offset + len)].iter().map(|o| *base + *o as u64).collect()
-            }
-            EncodedU64Array::U32 { base, offsets } => {
-                offsets[offset..(offset + len)].iter().map(|o| *base + *o as u64).collect()
-            }
+            EncodedU64Array::U16 { base, offsets } => offsets[offset..(offset + len)]
+                .iter()
+                .map(|o| *base + *o as u64)
+                .collect(),
+            EncodedU64Array::U32 { base, offsets } => offsets[offset..(offset + len)]
+                .iter()
+                .map(|o| *base + *o as u64)
+                .collect(),
             EncodedU64Array::U64(values) => {
                 let values = values[offset..(offset + len)].to_vec();
                 EncodedU64Array::U64(values)
@@ -291,13 +293,17 @@ mod test {
         let range = (2 * u16::MAX as u64)..(40 + 2 * u16::MAX as u64);
         let encoded = EncodedU64Array::from(range.clone());
         let expected_base = 2 * u16::MAX as u64;
-        assert!(matches!(
-            encoded,
-            EncodedU64Array::U16 {
-                base,
-                ..
-            } if base == expected_base
-        ), "{:?}", encoded);
+        assert!(
+            matches!(
+                encoded,
+                EncodedU64Array::U16 {
+                    base,
+                    ..
+                } if base == expected_base
+            ),
+            "{:?}",
+            encoded
+        );
         let roundtripped = encoded.into_iter().collect::<Vec<_>>();
         assert_eq!(range.collect::<Vec<_>>(), roundtripped);
 
@@ -316,7 +322,7 @@ mod test {
         assert_eq!(range.collect::<Vec<_>>(), roundtripped);
 
         // We'll skip u64 since it would take a lot of memory.
-    
+
         // Empty one
         let range = 42..42;
         let encoded = EncodedU64Array::from(range.clone());

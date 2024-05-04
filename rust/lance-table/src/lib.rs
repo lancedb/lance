@@ -3,5 +3,5 @@
 
 pub mod format;
 pub mod io;
-pub mod utils;
 pub mod rowids;
+pub mod utils;
