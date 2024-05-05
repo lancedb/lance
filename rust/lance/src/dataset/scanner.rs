@@ -861,6 +861,17 @@ impl Scanner {
                 self.knn(&FilterPlan::default()).await?
             }
         } else {
+            // Avoid pushdown scan node if using v2 files
+            let fragments = if let Some(fragments) = self.fragments.as_ref() {
+                fragments
+            } else {
+                self.dataset.fragments()
+            };
+            let use_stats = if fragments.iter().any(|f| !f.has_legacy_files()) {
+                false
+            } else {
+                self.use_stats
+            };
             match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
                 (Some(index_query), None) => {
                     self.scalar_indexed_scan(&self.phyical_columns, index_query)
@@ -875,7 +886,7 @@ impl Scanner {
                     self.scalar_indexed_scan(&filter_schema, index_query)
                         .await?
                 }
-                (None, Some(_)) if self.use_stats && self.batch_size.is_none() => {
+                (None, Some(_)) if use_stats && self.batch_size.is_none() => {
                     self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
                 }
                 (None, _) => {

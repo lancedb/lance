@@ -95,6 +95,7 @@ lance-testing = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger = "0.10.0"
 tracing-chrome = "0.7.1"
+rstest = "0.19.0"
 
 [features]
 fp16kernels = ["lance-linalg/fp16kernels"]

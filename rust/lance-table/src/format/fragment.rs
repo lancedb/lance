@@ -250,6 +250,12 @@ impl Fragment {
     pub fn add_file_legacy(&mut self, path: &str, schema: &Schema) {
         self.files.push(DataFile::new_legacy(path, schema));
     }
+
+    // True if this fragment is made up of legacy v1 files, false otherwise
+    pub fn has_legacy_files(&self) -> bool {
+        // If any file in a fragment is legacy then all files in the fragment must be
+        self.files[0].is_legacy_file()
+    }
 }
 
 impl From<&pb::DataFragment> for Fragment {

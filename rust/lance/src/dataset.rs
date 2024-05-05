@@ -2343,8 +2343,8 @@ mod tests {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment.open(dataset.schema(), false).await.unwrap();
             assert_eq!(reader.legacy_num_batches(), 10);
-            for i in 0..reader.legacy_num_batches() {
-                assert_eq!(reader.legacy_num_rows_in_batch(i), 10);
+            for i in 0..reader.legacy_num_batches() as u32 {
+                assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
             }
         }
     }
@@ -3385,117 +3385,124 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge() {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("i", DataType::Int32, false),
-            Field::new("x", DataType::Float32, false),
-        ]));
-        let batch1 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(Float32Array::from(vec![1.0, 2.0])),
-            ],
-        )
-        .unwrap();
-        let batch2 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![3, 2])),
-                Arc::new(Float32Array::from(vec![3.0, 4.0])),
-            ],
-        )
-        .unwrap();
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let write_params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
-
-        let batches = RecordBatchIterator::new(vec![batch1].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
-
-        let batches = RecordBatchIterator::new(vec![batch2].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
-
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.fragments().len(), 2);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
-
-        let right_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("i2", DataType::Int32, false),
-            Field::new("y", DataType::Utf8, true),
-        ]));
-        let right_batch1 = RecordBatch::try_new(
-            right_schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["a", "b"])),
-            ],
-        )
-        .unwrap();
-
-        let batches =
-            RecordBatchIterator::new(vec![right_batch1].into_iter().map(Ok), right_schema.clone());
-        let mut dataset = Dataset::open(test_uri).await.unwrap();
-        dataset.merge(batches, "i", "i2").await.unwrap();
-        dataset.validate().await.unwrap();
-
-        assert_eq!(dataset.version().version, 3);
-        assert_eq!(dataset.fragments().len(), 2);
-        assert_eq!(dataset.fragments()[0].files.len(), 2);
-        assert_eq!(dataset.fragments()[1].files.len(), 2);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
-
-        let actual_batches = dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
-        let expected = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
+        for use_v2_format in [true, false] {
+            let schema = Arc::new(ArrowSchema::new(vec![
                 Field::new("i", DataType::Int32, false),
                 Field::new("x", DataType::Float32, false),
-                Field::new("y", DataType::Utf8, true),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3, 2])),
-                Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
-                Arc::new(StringArray::from(vec![
-                    Some("a"),
-                    Some("b"),
-                    None,
-                    Some("b"),
-                ])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(actual, expected);
-
-        // Validate we can still read after re-instantiating dataset, which
-        // clears the cache.
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        let actual_batches = dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
+            ]));
+            let batch1 = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(Float32Array::from(vec![1.0, 2.0])),
+                ],
+            )
             .unwrap();
-        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
-        assert_eq!(actual, expected);
+            let batch2 = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![3, 2])),
+                    Arc::new(Float32Array::from(vec![3.0, 4.0])),
+                ],
+            )
+            .unwrap();
+
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+
+            let write_params = WriteParams {
+                mode: WriteMode::Append,
+                use_experimental_writer: use_v2_format,
+                ..Default::default()
+            };
+
+            let batches =
+                RecordBatchIterator::new(vec![batch1].into_iter().map(Ok), schema.clone());
+            Dataset::write(batches, test_uri, Some(write_params.clone()))
+                .await
+                .unwrap();
+
+            let batches =
+                RecordBatchIterator::new(vec![batch2].into_iter().map(Ok), schema.clone());
+            Dataset::write(batches, test_uri, Some(write_params.clone()))
+                .await
+                .unwrap();
+
+            let dataset = Dataset::open(test_uri).await.unwrap();
+            assert_eq!(dataset.fragments().len(), 2);
+            assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
+
+            let right_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("i2", DataType::Int32, false),
+                Field::new("y", DataType::Utf8, true),
+            ]));
+            let right_batch1 = RecordBatch::try_new(
+                right_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(StringArray::from(vec!["a", "b"])),
+                ],
+            )
+            .unwrap();
+
+            let batches = RecordBatchIterator::new(
+                vec![right_batch1].into_iter().map(Ok),
+                right_schema.clone(),
+            );
+            let mut dataset = Dataset::open(test_uri).await.unwrap();
+            dataset.merge(batches, "i", "i2").await.unwrap();
+            dataset.validate().await.unwrap();
+
+            assert_eq!(dataset.version().version, 3);
+            assert_eq!(dataset.fragments().len(), 2);
+            assert_eq!(dataset.fragments()[0].files.len(), 2);
+            assert_eq!(dataset.fragments()[1].files.len(), 2);
+            assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
+
+            let actual_batches = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+            let expected = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("i", DataType::Int32, false),
+                    Field::new("x", DataType::Float32, false),
+                    Field::new("y", DataType::Utf8, true),
+                ])),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 2])),
+                    Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+                    Arc::new(StringArray::from(vec![
+                        Some("a"),
+                        Some("b"),
+                        None,
+                        Some("b"),
+                    ])),
+                ],
+            )
+            .unwrap();
+
+            assert_eq!(actual, expected);
+
+            // Validate we can still read after re-instantiating dataset, which
+            // clears the cache.
+            let dataset = Dataset::open(test_uri).await.unwrap();
+            let actual_batches = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[tokio::test]

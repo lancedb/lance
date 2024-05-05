@@ -618,8 +618,13 @@ impl FragmentScanner {
         let num_batches = self.reader.legacy_num_batches();
 
         if let Some(stats) = &self.stats {
-            let batch_sizes: Vec<usize> = (0..num_batches)
-                .map(|batch_id| self.reader.legacy_num_rows_in_batch(batch_id))
+            let batch_sizes: Vec<usize> = (0..num_batches as u32)
+                .map(|batch_id| {
+                    self.reader
+                        .legacy_num_rows_in_batch(batch_id)
+                        .expect("Operation does not yet support v2 fragments")
+                        as usize
+                })
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
