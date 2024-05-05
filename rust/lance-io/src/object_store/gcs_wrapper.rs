@@ -6,7 +6,7 @@
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 
 use async_trait::async_trait;
@@ -24,7 +24,25 @@ use object_store::{
 use rand::Rng;
 use tokio::io::AsyncWrite;
 
-const MAX_UPLOAD_PARALLELISM: usize = 10;
+fn max_upload_parallelism() -> usize {
+    static MAX_UPLOAD_PARALLELISM: OnceLock<usize> = OnceLock::new();
+    *MAX_UPLOAD_PARALLELISM.get_or_init(|| {
+        std::env::var("LANCE_UPLOAD_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10)
+    })
+}
+
+fn max_conn_reset_retries() -> u16 {
+    static MAX_CONN_RESET_RETRIES: OnceLock<u16> = OnceLock::new();
+    *MAX_CONN_RESET_RETRIES.get_or_init(|| {
+        std::env::var("LANCE_CONN_RESET_RETRIES")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(20)
+    })
+}
 
 /// Wrapper around GoogleCloudStorage with a larger maximum upload size.
 ///
@@ -258,24 +276,37 @@ impl Upload {
                             }) if source
                                 .to_string()
                                 .to_lowercase()
-                                .contains("Connection reset by peer")
-                                && mut_self.connection_resets < 20 =>
+                                .contains("connection reset by peer") =>
                             {
-                                // Retry, but only up to 20 of them.
-                                mut_self.connection_resets += 1;
+                                if mut_self.connection_resets < max_conn_reset_retries() {
+                                    // Retry, but only up to max_conn_reset_retries of them.
+                                    mut_self.connection_resets += 1;
 
-                                // Resubmit with random jitter
-                                let sleep_time_ms = rand::thread_rng().gen_range(2_000..8_000);
-                                let sleep_time = std::time::Duration::from_millis(sleep_time_ms);
+                                    // Resubmit with random jitter
+                                    let sleep_time_ms = rand::thread_rng().gen_range(2_000..8_000);
+                                    let sleep_time =
+                                        std::time::Duration::from_millis(sleep_time_ms);
 
-                                futures.push(Self::put_part(
-                                    mut_self.path.clone(),
-                                    mut_self.store.clone(),
-                                    buffer,
-                                    part_idx,
-                                    multipart_id.clone(),
-                                    Some(sleep_time),
-                                ));
+                                    futures.push(Self::put_part(
+                                        mut_self.path.clone(),
+                                        mut_self.store.clone(),
+                                        buffer,
+                                        part_idx,
+                                        multipart_id.clone(),
+                                        Some(sleep_time),
+                                    ));
+                                } else {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::ConnectionReset,
+                                        Box::new(ConnectionResetError {
+                                            message: format!(
+                                                "Hit max retries ({}) for connection reset",
+                                                max_conn_reset_retries()
+                                            ),
+                                            source,
+                                        }),
+                                    ));
+                                }
                             }
                             Err(err) => return Err(err.source.into()),
                         }
@@ -294,6 +325,20 @@ impl Upload {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionResetError {
+    message: String,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::error::Error for ConnectionResetError {}
+
+impl std::fmt::Display for ConnectionResetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.message, self.source)
     }
 }
 
@@ -330,7 +375,7 @@ impl AsyncWrite for Upload {
                     ..
                 } => {
                     // TODO: Make max concurrency configurable.
-                    if futures.len() < MAX_UPLOAD_PARALLELISM {
+                    if futures.len() < max_upload_parallelism() {
                         let data = Self::next_part_buffer(&mut mut_self.buffer, *part_idx);
                         futures.push(Self::put_part(
                             mut_self.path.clone(),
@@ -409,7 +454,7 @@ impl AsyncWrite for Upload {
                     part_idx,
                 } => {
                     // Flush final batch
-                    if !mut_self.buffer.is_empty() && futures.len() < MAX_UPLOAD_PARALLELISM {
+                    if !mut_self.buffer.is_empty() && futures.len() < max_upload_parallelism() {
                         // We can just use `take` since we don't need the buffer anymore.
                         let data = Bytes::from(std::mem::take(&mut mut_self.buffer));
                         futures.push(Self::put_part(

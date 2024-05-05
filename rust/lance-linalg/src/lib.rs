@@ -3,7 +3,7 @@
 
 //! High-performance [Apache Arrow](https://docs.rs/arrow/latest/arrow/) native Linear Algebra algorithms.
 
-// #![cfg_attr(feature = "avx512", feature(stdsimd))]
+#![deny(clippy::unused_async)]
 
 pub mod distance;
 pub mod kernels;
