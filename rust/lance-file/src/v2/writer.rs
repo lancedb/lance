@@ -161,6 +161,11 @@ impl FileWriter {
             let encoded_page = encoding_task?;
             self.write_page(encoded_page).await?;
         }
+        // It's important to flush here, we don't know when the next batch will arrive
+        // and the underlying cloud store could have writes in progress that won't advance
+        // until we interact with the writer again.  These in-progress writes will time out
+        // if we don't flush.
+        self.writer.flush().await?;
         Ok(())
     }
 
