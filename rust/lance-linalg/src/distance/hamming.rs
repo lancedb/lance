@@ -7,7 +7,7 @@
 pub fn hamming(x: &[u8], y: &[u8]) -> u32 {
     x.iter()
         .zip(y.iter())
-        .map(|(&xi, &yi)| (xi ^ yi).count_ones())
+        .map(|(xi, yi)| (xi ^ yi).count_ones())
         .sum()
 }
 
