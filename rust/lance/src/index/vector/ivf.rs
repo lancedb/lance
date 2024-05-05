@@ -221,7 +221,7 @@ impl IVFIndex {
     /// Internal API with no stability guarantees.
     ///
     /// Assumes the query vector is normalized if the metric type is cosine.
-    pub async fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+    pub fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
         let mt = if self.metric_type == MetricType::Cosine {
             MetricType::L2
         } else {
@@ -677,7 +677,7 @@ impl VectorIndex for IVFIndex {
             query.key = key;
         };
 
-        let partition_ids = self.find_partitions(&query).await?;
+        let partition_ids = self.find_partitions(&query)?;
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)

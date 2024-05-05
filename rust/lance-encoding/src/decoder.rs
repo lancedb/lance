@@ -551,7 +551,7 @@ impl DecodeBatchScheduler {
     /// * `indices` - The row indices to load (these must be in ascending order!)
     /// * `sink` - A channel to send the decode tasks
     /// * `scheduler` An I/O scheduler to issue I/O requests
-    pub async fn schedule_take(
+    pub fn schedule_take(
         &mut self,
         indices: &[u32],
         sink: mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,

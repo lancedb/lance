@@ -292,12 +292,7 @@ async fn check_round_trip_encoding_inner(
             &column_infos,
             expected,
             |mut decode_scheduler, tx| {
-                async move {
-                    decode_scheduler
-                        .schedule_take(&indices, tx, &scheduler)
-                        .await
-                }
-                .boxed()
+                async move { decode_scheduler.schedule_take(&indices, tx, &scheduler) }.boxed()
             },
         )
         .await;

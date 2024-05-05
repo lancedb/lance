@@ -116,7 +116,7 @@ where
 /// Randomly initialize kmeans centroids.
 ///
 ///
-async fn kmeans_random_init<T: ArrowFloatType + Dot + L2 + Normalize>(
+fn kmeans_random_init<T: ArrowFloatType + Dot + L2 + Normalize>(
     data: &T::ArrayType,
     dimension: usize,
     k: usize,
@@ -127,9 +127,7 @@ where
     T::Native: AsPrimitive<f32>,
 {
     assert!(data.len() >= k * dimension);
-    let chosen = (0..data.len() / dimension)
-        .choose_multiple(&mut rng, k)
-        .to_vec();
+    let chosen = (0..data.len() / dimension).choose_multiple(&mut rng, k);
     let mut builder: Vec<T::Native> = Vec::with_capacity(k * dimension);
     for i in chosen {
         builder.extend(data.as_slice()[i * dimension..(i + 1) * dimension].iter());
@@ -173,7 +171,7 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
 
 impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
-    async fn to_kmeans<T: ArrowFloatType + Dot + L2 + Normalize>(
+    fn to_kmeans<T: ArrowFloatType + Dot + L2 + Normalize>(
         &self,
         data: &[T::Native],
     ) -> Result<KMeans<T>> {
@@ -317,7 +315,7 @@ where
     /// - *k*: the number of clusters.
     /// - *metric_type*: the metric type to calculate distance.
     /// - *rng*: random generator.
-    pub async fn init_random(
+    pub fn init_random(
         data: &MatrixView<T>,
         k: usize,
         metric_type: MetricType,
@@ -330,7 +328,6 @@ where
             rng,
             metric_type,
         )
-        .await
     }
 
     /// Train a KMeans model on data with `k` clusters.
@@ -392,7 +389,7 @@ where
             } else {
                 match params.init {
                     KMeanInit::Random => {
-                        Self::init_random(&mat, k, params.metric_type, rng.clone()).await?
+                        Self::init_random(&mat, k, params.metric_type, rng.clone())?
                     }
                     KMeanInit::KMeanPlusPlus => {
                         unimplemented!()
@@ -412,7 +409,7 @@ where
                 let last_membership = kmeans.train_once(&mat).await;
                 let last_dist_sum = last_membership.distance_sum();
                 stddev = last_membership.hist_stddev();
-                kmeans = last_membership.to_kmeans(data.as_slice()).await.unwrap();
+                kmeans = last_membership.to_kmeans(data.as_slice()).unwrap();
                 if (dist_sum - last_dist_sum).abs() / last_dist_sum < params.tolerance {
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}",

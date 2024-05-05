@@ -143,14 +143,14 @@ impl<'a> DictionaryDecoder<'a> {
         let keys = decoder.get(params.into()).await?;
 
         match index_type {
-            DataType::Int8 => self.make_dict_array::<Int8Type>(keys).await,
-            DataType::Int16 => self.make_dict_array::<Int16Type>(keys).await,
-            DataType::Int32 => self.make_dict_array::<Int32Type>(keys).await,
-            DataType::Int64 => self.make_dict_array::<Int64Type>(keys).await,
-            DataType::UInt8 => self.make_dict_array::<UInt8Type>(keys).await,
-            DataType::UInt16 => self.make_dict_array::<UInt16Type>(keys).await,
-            DataType::UInt32 => self.make_dict_array::<UInt32Type>(keys).await,
-            DataType::UInt64 => self.make_dict_array::<UInt64Type>(keys).await,
+            DataType::Int8 => self.make_dict_array::<Int8Type>(keys),
+            DataType::Int16 => self.make_dict_array::<Int16Type>(keys),
+            DataType::Int32 => self.make_dict_array::<Int32Type>(keys),
+            DataType::Int64 => self.make_dict_array::<Int64Type>(keys),
+            DataType::UInt8 => self.make_dict_array::<UInt8Type>(keys),
+            DataType::UInt16 => self.make_dict_array::<UInt16Type>(keys),
+            DataType::UInt32 => self.make_dict_array::<UInt32Type>(keys),
+            DataType::UInt64 => self.make_dict_array::<UInt64Type>(keys),
             _ => Err(Error::Arrow {
                 message: format!("Dictionary encoding does not support index type: {index_type}",),
                 location: location!(),
@@ -158,7 +158,7 @@ impl<'a> DictionaryDecoder<'a> {
         }
     }
 
-    async fn make_dict_array<T: ArrowDictionaryKeyType + Sync + Send>(
+    fn make_dict_array<T: ArrowDictionaryKeyType + Sync + Send>(
         &self,
         index_array: ArrayRef,
     ) -> Result<ArrayRef> {

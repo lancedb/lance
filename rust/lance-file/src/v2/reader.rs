@@ -288,7 +288,7 @@ impl FileReader {
         })
     }
 
-    pub async fn print_all_metadata(metadata: &CachedFileMetadata) -> Result<()> {
+    pub fn print_all_metadata(metadata: &CachedFileMetadata) -> Result<()> {
         // 1. read and print the footer
         println!("# Footer");
         println!();

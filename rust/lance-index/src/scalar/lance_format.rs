@@ -175,7 +175,7 @@ mod tests {
     }
 
     impl MockTrainingSource {
-        async fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
+        fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
             Self {
                 data: lance_datafusion::utils::reader_to_stream(Box::new(data)),
             }
@@ -199,7 +199,7 @@ mod tests {
     ) {
         let sub_index_trainer = FlatIndexMetadata::new(value_type);
 
-        let data = Box::new(MockTrainingSource::new(data).await);
+        let data = Box::new(MockTrainingSource::new(data));
         train_btree_index(data, &sub_index_trainer, index_store.as_ref())
             .await
             .unwrap();
@@ -589,7 +589,7 @@ mod tests {
         let data = RecordBatchIterator::new(batches, schema);
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-        let data = Box::new(MockTrainingSource::new(data).await);
+        let data = Box::new(MockTrainingSource::new(data));
         // Until DF handles NaN reliably we need to make sure we reject input
         // containing NaN
         assert!(
@@ -619,7 +619,7 @@ mod tests {
         let data = RecordBatchIterator::new(batches, schema);
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Utf8);
 
-        let data = Box::new(MockTrainingSource::new(data).await);
+        let data = Box::new(MockTrainingSource::new(data));
         train_btree_index(data, &sub_index_trainer, index_store.as_ref())
             .await
             .unwrap();

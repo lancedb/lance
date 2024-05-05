@@ -164,11 +164,7 @@ impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
     ///
     /// This method is just for debugging purpose.
     #[allow(dead_code)]
-    pub(crate) async fn distortion(
-        &self,
-        data: &MatrixView<T>,
-        metric_type: MetricType,
-    ) -> Result<f64> {
+    pub(crate) fn distortion(&self, data: &MatrixView<T>, metric_type: MetricType) -> Result<f64> {
         let sub_vector_width = self.dimension / self.num_sub_vectors;
         let total_distortion = data
             .iter()

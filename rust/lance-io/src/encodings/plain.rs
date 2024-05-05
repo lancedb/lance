@@ -544,7 +544,7 @@ mod tests {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let mut arrs: Vec<ArrayRef> = Vec::new();
             for _ in 0..10 {
-                arrs.push(Arc::new(make_array_(&t, &buffer).await));
+                arrs.push(Arc::new(make_array_(&t, &buffer)));
             }
             test_round_trip(arrs.as_slice(), t).await;
         }
@@ -557,7 +557,7 @@ mod tests {
             let mut arrs: Vec<ArrayRef> = Vec::new();
 
             for _ in 0..10 {
-                arrs.push(Arc::new(make_array_(&t, &buffer).await));
+                arrs.push(Arc::new(make_array_(&t, &buffer)));
             }
             test_round_trip(arrs.as_slice(), t).await;
         }
@@ -626,7 +626,7 @@ mod tests {
             let mut arrs: Vec<ArrayRef> = Vec::new();
 
             for _ in 0..10 {
-                let items = make_array_(&t.clone(), &buffer).await;
+                let items = make_array_(&t.clone(), &buffer);
                 let arr = FixedSizeListArray::try_new_from_values(items, 3).unwrap();
                 arrs.push(Arc::new(arr) as ArrayRef);
             }
@@ -682,7 +682,7 @@ mod tests {
         test_round_trip(arrs.as_slice(), t).await;
     }
 
-    async fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
+    fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
         make_array(
             ArrayDataBuilder::new(data_type.clone())
                 .len(126)

@@ -291,7 +291,7 @@ impl FileFragment {
         builder.write(reader, Some(id as u64)).await
     }
 
-    pub async fn create_from_file(
+    pub fn create_from_file(
         filename: &str,
         schema: &Schema,
         fragment_id: usize,
@@ -1767,9 +1767,7 @@ mod tests {
 
         let mut fragments: Vec<Fragment> = Vec::new();
         for (idx, path) in paths.iter().enumerate() {
-            let f = FileFragment::create_from_file(path, schema, idx, None)
-                .await
-                .unwrap();
+            let f = FileFragment::create_from_file(path, schema, idx, None).unwrap();
             fragments.push(f)
         }
 

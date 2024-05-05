@@ -298,7 +298,7 @@ async fn build_dynamodb_external_store(
     DynamoDBExternalManifestStore::new_external_store(client.into(), table_name, app_name).await
 }
 
-pub async fn commit_handler_from_url(
+pub fn commit_handler_from_url(
     url_or_path: &str,
     // This looks unused if dynamodb feature disabled
     #[allow(unused_variables)] options: &Option<ObjectStoreParams>,

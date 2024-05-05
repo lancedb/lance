@@ -499,7 +499,7 @@ impl MergeInsertJob {
         let merger = Merger::try_new(self.params, schema.clone())?;
         let deleted_rows = merger.deleted_rows.clone();
         let stream = joined
-            .and_then(move |batch| merger.clone().execute_batch(batch))
+            .map(move |batch| merger.clone().execute_batch(batch?))
             .try_flatten();
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
@@ -716,7 +716,7 @@ impl Merger {
     //
     // Returns 0, 1, or 2 batches
     // Potentially updates (as a side-effect) the deleted rows vec
-    async fn execute_batch(
+    fn execute_batch(
         self,
         batch: RecordBatch,
     ) -> datafusion::common::Result<impl Stream<Item = datafusion::common::Result<RecordBatch>>>

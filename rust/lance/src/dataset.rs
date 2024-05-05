@@ -219,7 +219,7 @@ impl Dataset {
                 {
                     return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
                 }
-                commit_handler_from_url(uri, store_options).await?
+                commit_handler_from_url(uri, store_options)?
             }
             Some(commit_handler) => {
                 if uri.starts_with("s3+ddb") {

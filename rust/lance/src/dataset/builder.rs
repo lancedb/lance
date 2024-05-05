@@ -179,7 +179,7 @@ impl DatasetBuilder {
     pub async fn build_object_store(self) -> Result<(ObjectStore, Arc<dyn CommitHandler>)> {
         let commit_handler = match self.commit_handler {
             Some(commit_handler) => Ok(commit_handler),
-            None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await,
+            None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())),
         }?;
 
         match &self.options.object_store {
