@@ -4,7 +4,35 @@
 //! Hamming distance.
 
 /// Hamming distance between two vectors.
+#[inline]
 pub fn hamming(x: &[u8], y: &[u8]) -> f32 {
+    hamming_autovec::<64>(x, y)
+}
+
+#[inline]
+fn hamming_autovec<const L: usize>(x: &[u8], y: &[u8]) -> f32 {
+    let x_chunk = x.chunks_exact(L);
+    let y_chunk = y.chunks_exact(L);
+    let sum = x_chunk
+        .remainder()
+        .iter()
+        .zip(y_chunk.remainder())
+        .map(|(&a, &b)| (a ^ b).count_ones())
+        .sum::<u32>();
+    (sum + x_chunk
+        .zip(y_chunk)
+        .map(|(x, y)| {
+            x.iter()
+                .zip(y.iter())
+                .map(|(&a, &b)| (a ^ b).count_ones())
+                .sum::<u32>()
+        })
+        .sum::<u32>()) as f32
+}
+
+/// Scalar version of hamming distance. Used for benchmarks.
+#[inline]
+pub fn hamming_scalar(x: &[u8], y: &[u8]) -> f32 {
     x.iter()
         .zip(y.iter())
         .map(|(xi, yi)| (xi ^ yi).count_ones())
