@@ -821,7 +821,8 @@ class LanceDataset(pa.dataset.Dataset):
         elif isinstance(transforms, dict):
             for k, v in transforms.items():
                 if not isinstance(k, str):
-                    raise TypeError(f"Column names must be a string. Got {type(k)}")
+                    raise TypeError(
+                        f"Column names must be a string. Got {type(k)}")
                 if not isinstance(v, str):
                     raise TypeError(
                         f"Column expressions must be a string. Got {type(k)}"
@@ -1246,7 +1247,7 @@ class LanceDataset(pa.dataset.Dataset):
         column : str
             The column to be indexed.
         index_type : str
-            The type of the index. Only ``"IVF_PQ"`` is supported now.
+            The type of the index. ``"IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ"`` are supported now.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1290,21 +1291,31 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs :
             Parameters passed to the index building process.
 
-        If ``index_type`` is "IVF_PQ", then the following parameters are required:
-        - **num_partitions**
-        - **num_sub_vectors**
+        If ``index_type`` is "IVF_*", then the following parameters are required:
+            num_partitions
+
+        If ``index_type`` is with "PQ", then the following parameters are required:
+            num_sub_vectors
 
         Optional parameters for "IVF_PQ":
-        - **use_opq**: whether to use OPQ (Optimized Product Quantization).
-            Must have feature 'opq' enabled in Rust.
-        - **max_opq_iterations**: the maximum number of iterations for training OPQ.
-        - **ivf_centroids**: K-mean centroids for IVF clustering.
+
+            use_opq : bool
+                whether to use OPQ (Optimized Product Quantization).
+                Must have feature 'opq' enabled in Rust.
+            max_opq_iterations : int
+                the maximum number of iterations for training OPQ.
+            ivf_centroids : 
+                K-mean centroids for IVF clustering.
 
         Optional parameters for "IVF_HNSW_*":
-        - **max_level**: the maximum number of levels in the graph.
-        - **m**: the number of edges per node in the graph.
-        - **m_max**: the maximum number of edges per node in the graph.
-        - **ef_construction**: the number of nodes to examine during the construction.
+            max_level : int
+                the maximum number of levels in the graph.
+            m : int
+                the number of edges per node in the graph.
+            m_max : int
+                the maximum number of edges per node in the graph.
+            ef_construction : int
+                the number of nodes to examine during the construction.
 
         Examples
         --------
@@ -1319,6 +1330,17 @@ class LanceDataset(pa.dataset.Dataset):
                 "IVF_PQ",
                 num_partitions=256,
                 num_sub_vectors=16
+            )
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_HNSW_SQ",
+                num_partitions=256,
             )
 
         Experimental Accelerator (GPU) support:
@@ -1444,7 +1466,8 @@ class LanceDataset(pa.dataset.Dataset):
                         )
                     dim = ivf_centroids.shape[1]
                     values = pa.array(ivf_centroids.reshape(-1))
-                    ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
+                    ivf_centroids = pa.FixedSizeListArray.from_arrays(
+                        values, dim)
                 # Convert it to RecordBatch because Rust side only accepts RecordBatch.
                 ivf_centroids_batch = pa.RecordBatch.from_arrays(
                     [ivf_centroids], ["_ivf_centroids"]
@@ -1585,7 +1608,8 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
+        _Dataset.commit(base_uri, operation._to_inner(),
+                        read_version, commit_lock)
         return LanceDataset(base_uri)
 
     def validate(self):
@@ -1811,7 +1835,8 @@ class LanceOperation:
             LanceOperation._validate_fragments(self.updated_fragments)
 
         def _to_inner(self):
-            raw_updated_fragments = [f._metadata for f in self.updated_fragments]
+            raw_updated_fragments = [
+                f._metadata for f in self.updated_fragments]
             return _Operation.delete(
                 raw_updated_fragments, self.deleted_fragment_ids, self.predicate
             )
@@ -1993,7 +2018,8 @@ class ScannerBuilder:
                         pos = counter
                         counter += 1
                         fields_without_lists.append(
-                            pa.field(f"__unlikely_name_placeholder_{pos}", pa.int8())
+                            pa.field(
+                                f"__unlikely_name_placeholder_{pos}", pa.int8())
                         )
                     else:
                         fields_without_lists.append(field)
@@ -2061,7 +2087,8 @@ class ScannerBuilder:
         q = _coerce_query_vector(q)
 
         if self.ds.schema.get_field_index(column) < 0:
-            raise ValueError(f"Embedding column {column} is not in the dataset")
+            raise ValueError(
+                f"Embedding column {column} is not in the dataset")
 
         column_field = self.ds.schema.field(column)
         column_type = column_field.type
@@ -2082,7 +2109,8 @@ class ScannerBuilder:
         if nprobes is not None and int(nprobes) <= 0:
             raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
         if refine_factor is not None and int(refine_factor) < 1:
-            raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
+            raise ValueError(
+                f"Refine factor must be 1 or more got {refine_factor}")
         self._nearest = {
             "column": column,
             "q": q,
@@ -2424,7 +2452,8 @@ def write_dataset(
 
     if commit_lock:
         if not callable(commit_lock):
-            raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+            raise TypeError(
+                f"commit_lock must be a function, got {type(commit_lock)}")
         params["commit_handler"] = commit_lock
 
     uri = os.fspath(uri) if isinstance(uri, Path) else uri
@@ -2557,7 +2586,8 @@ def _casting_recordbatch_iter(
         if batch.schema != schema:
             try:
                 # RecordBatch doesn't have a cast method, but table does.
-                batch = pa.Table.from_batches([batch]).cast(schema).to_batches()[0]
+                batch = pa.Table.from_batches(
+                    [batch]).cast(schema).to_batches()[0]
             except pa.lib.ArrowInvalid:
                 raise ValueError(
                     f"Input RecordBatch iterator yielded a batch with schema that "
@@ -2707,5 +2737,6 @@ class BatchUDFCheckpoint:
             "INSERT INTO fragments (fragment_id, data) VALUES (?, ?)",
             (fragment_id, fragment),
         )
-        conn.execute("DELETE FROM batches WHERE fragment_id = ?", (fragment_id,))
+        conn.execute("DELETE FROM batches WHERE fragment_id = ?",
+                     (fragment_id,))
         conn.commit()
