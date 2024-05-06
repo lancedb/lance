@@ -119,6 +119,7 @@ prost = "0.12.2"
 prost-build = "0.12.2"
 prost-types = "0.12.2"
 rand = { version = "0.8.3", features = ["small_rng"] }
+rangemap = { version = "1.0" }
 rayon = "1.10"
 roaring = "0.10.1"
 rustc_version = "0.4"

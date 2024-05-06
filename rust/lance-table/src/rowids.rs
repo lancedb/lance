@@ -10,8 +10,8 @@ use lance_core::{Error, Result};
 use self::encoded_array::EncodedU64Array;
 
 mod encoded_array;
-pub mod serde;
 mod index;
+pub mod serde;
 
 pub use index::RowIdIndex;
 
@@ -61,7 +61,7 @@ impl std::fmt::Display for RowIdSequence {
         let mut iter = self.iter();
         let mut first_10 = Vec::new();
         let mut last_10 = Vec::new();
-        while let Some(row_id) = iter.next() {
+        for row_id in iter.by_ref() {
             first_10.push(row_id);
             if first_10.len() > 10 {
                 break;
@@ -94,7 +94,7 @@ impl std::fmt::Display for RowIdSequence {
 
 impl From<Range<u64>> for RowIdSequence {
     fn from(range: Range<u64>) -> Self {
-        RowIdSequence(vec![U64Segment::Range(range)])
+        Self(vec![U64Segment::Range(range)])
     }
 }
 
@@ -112,7 +112,7 @@ impl RowIdSequence {
     }
 
     /// Combines this row id sequence with another row id sequence.
-    pub fn extend(&mut self, other: RowIdSequence) {
+    pub fn extend(&mut self, other: Self) {
         // If the last element of this sequence and the first element of next
         // sequence are ranges, we might be able to combine them into a single
         // range.
@@ -134,16 +134,14 @@ impl RowIdSequence {
     pub fn delete(&mut self, row_ids: impl IntoIterator<Item = u64>) {
         // Order the row ids by position in which they appear in the sequence.
         let mut positions = self.find_ids(row_ids);
-        positions.sort_by_key(|(_, pos)| pos.clone());
+        positions.sort_by_key(|(_, pos)| *pos);
 
         let capacity = self.0.capacity();
         let old_segments = std::mem::replace(&mut self.0, Vec::with_capacity(capacity));
         let mut remaining_segments = old_segments.as_slice();
 
         let mut positions_iter = positions.into_iter().peekable();
-        let mut position = if let Some(pos) = positions_iter.next() {
-            pos
-        } else {
+        let Some(mut position) = positions_iter.next() else {
             // No row ids to delete.
             self.0 = old_segments;
             return;
@@ -180,7 +178,7 @@ impl RowIdSequence {
         }
 
         // Add the remaining segments.
-        self.0.extend_from_slice(&remaining_segments);
+        self.0.extend_from_slice(remaining_segments);
     }
 
     /// Find the row ids in the sequence.
@@ -272,34 +270,34 @@ enum U64Segment {
 impl U64Segment {
     fn iter(&self) -> Box<dyn DoubleEndedIterator<Item = u64> + '_> {
         match self {
-            U64Segment::Tombstones(count) => Box::new((0..*count).map(|_| RowId::tombstone())),
-            U64Segment::Range(range) => Box::new(range.clone()),
-            U64Segment::SortedArray(array) => Box::new(array.iter()),
-            U64Segment::Array(array) => Box::new(array.iter()),
+            Self::Tombstones(count) => Box::new((0..*count).map(|_| RowId::tombstone())),
+            Self::Range(range) => Box::new(range.clone()),
+            Self::SortedArray(array) => Box::new(array.iter()),
+            Self::Array(array) => Box::new(array.iter()),
         }
     }
 
     fn len(&self) -> usize {
         match self {
-            U64Segment::Tombstones(count) => *count as usize,
-            U64Segment::Range(range) => (range.end - range.start) as usize,
-            U64Segment::SortedArray(array) => array.len(),
-            U64Segment::Array(array) => array.len(),
+            Self::Tombstones(count) => *count as usize,
+            Self::Range(range) => (range.end - range.start) as usize,
+            Self::SortedArray(array) => array.len(),
+            Self::Array(array) => array.len(),
         }
     }
 
     /// Get the min and max value of the segment, excluding tombstones.
     fn range(&self) -> Option<RangeInclusive<u64>> {
         match self {
-            U64Segment::Tombstones(_) => None,
-            U64Segment::Range(range) => Some(range.start..=(range.end - 1)),
-            U64Segment::SortedArray(array) => {
+            Self::Tombstones(_) => None,
+            Self::Range(range) => Some(range.start..=(range.end - 1)),
+            Self::SortedArray(array) => {
                 // We can assume that the array is sorted.
                 let min_value = array.first().unwrap();
                 let max_value = array.last().unwrap();
                 Some(min_value..=max_value)
             }
-            U64Segment::Array(array) => {
+            Self::Array(array) => {
                 let min_value = array.min().unwrap();
                 let max_value = array.max().unwrap();
                 Some(min_value..=max_value)
@@ -309,16 +307,43 @@ impl U64Segment {
 
     fn slice(&self, offset: usize, len: usize) -> Self {
         match self {
-            U64Segment::Tombstones(_) => U64Segment::Tombstones(len as u64),
-            U64Segment::Range(range) => {
+            Self::Tombstones(_) => Self::Tombstones(len as u64),
+            Self::Range(range) => {
                 let start = range.start + offset as u64;
-                U64Segment::Range(start..(start + len as u64))
+                Self::Range(start..(start + len as u64))
             }
-            U64Segment::SortedArray(array) => {
+            Self::SortedArray(array) => {
                 // TODO: this could be optimized.
-                U64Segment::SortedArray(array.slice(offset, len))
+                Self::SortedArray(array.slice(offset, len))
             }
-            U64Segment::Array(array) => U64Segment::Array(array.slice(offset, len)),
+            Self::Array(array) => Self::Array(array.slice(offset, len)),
+        }
+    }
+
+    fn position(&self, val: u64) -> Option<usize> {
+        match self {
+            Self::Tombstones(_) => None,
+            Self::Range(range) => {
+                if range.contains(&val) {
+                    Some((val - range.start) as usize)
+                } else {
+                    None
+                }
+            }
+            Self::SortedArray(array) => array.binary_search(val).ok(),
+            Self::Array(array) => array.iter().position(|v| v == val),
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<u64> {
+        match self {
+            Self::Tombstones(_) => None,
+            Self::Range(range) => match range.start.checked_add(i as u64) {
+                Some(val) if val < range.end => Some(val),
+                _ => None,
+            },
+            Self::SortedArray(array) => array.get(i),
+            Self::Array(array) => array.get(i),
         }
     }
 }

@@ -24,137 +24,153 @@ pub enum EncodedU64Array {
 impl EncodedU64Array {
     pub fn len(&self) -> usize {
         match self {
-            EncodedU64Array::U16 { offsets, .. } => offsets.len(),
-            EncodedU64Array::U32 { offsets, .. } => offsets.len(),
-            EncodedU64Array::U64(values) => values.len(),
+            Self::U16 { offsets, .. } => offsets.len(),
+            Self::U32 { offsets, .. } => offsets.len(),
+            Self::U64(values) => values.len(),
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     pub fn iter(&self) -> Box<dyn DoubleEndedIterator<Item = u64> + '_> {
         match self {
-            EncodedU64Array::U16 { base, offsets } => {
+            Self::U16 { base, offsets } => {
                 Box::new(offsets.iter().cloned().map(move |o| base + o as u64))
             }
-            EncodedU64Array::U32 { base, offsets } => {
+            Self::U32 { base, offsets } => {
                 Box::new(offsets.iter().cloned().map(move |o| base + o as u64))
             }
-            EncodedU64Array::U64(values) => Box::new(values.iter().cloned()),
+            Self::U64(values) => Box::new(values.iter().cloned()),
+        }
+    }
+
+    pub fn get(&self, i: usize) -> Option<u64> {
+        match self {
+            Self::U16 { base, offsets } => {
+                if i < offsets.len() {
+                    Some(*base + offsets[i] as u64)
+                } else {
+                    None
+                }
+            }
+            Self::U32 { base, offsets } => {
+                if i < offsets.len() {
+                    Some(*base + offsets[i] as u64)
+                } else {
+                    None
+                }
+            }
+            Self::U64(values) => values.get(i).copied(),
         }
     }
 
     pub fn min(&self) -> Option<u64> {
         match self {
-            EncodedU64Array::U16 { base, offsets } => {
+            Self::U16 { base, offsets } => {
                 if offsets.is_empty() {
                     None
                 } else {
                     Some(*base)
                 }
             }
-            EncodedU64Array::U32 { base, offsets } => {
+            Self::U32 { base, offsets } => {
                 if offsets.is_empty() {
                     None
                 } else {
                     Some(*base)
                 }
             }
-            EncodedU64Array::U64(values) => values.iter().copied().min(),
+            Self::U64(values) => values.iter().copied().min(),
         }
     }
 
     pub fn max(&self) -> Option<u64> {
         match self {
-            EncodedU64Array::U16 { base, offsets } => {
+            Self::U16 { base, offsets } => {
                 if offsets.is_empty() {
                     None
                 } else {
                     Some(*base + *offsets.last().unwrap() as u64)
                 }
             }
-            EncodedU64Array::U32 { base, offsets } => {
+            Self::U32 { base, offsets } => {
                 if offsets.is_empty() {
                     None
                 } else {
                     Some(*base + *offsets.last().unwrap() as u64)
                 }
             }
-            EncodedU64Array::U64(values) => values.iter().copied().max(),
+            Self::U64(values) => values.iter().copied().max(),
         }
     }
 
     pub fn first(&self) -> Option<u64> {
         match self {
-            EncodedU64Array::U16 { base, offsets } => {
+            Self::U16 { base, offsets } => {
                 if offsets.is_empty() {
                     None
                 } else {
                     Some(*base + *offsets.first().unwrap() as u64)
                 }
             }
-            EncodedU64Array::U32 { base, offsets } => {
+            Self::U32 { base, offsets } => {
                 if offsets.is_empty() {
                     None
                 } else {
                     Some(*base + *offsets.first().unwrap() as u64)
                 }
             }
-            EncodedU64Array::U64(values) => values.first().copied(),
+            Self::U64(values) => values.first().copied(),
         }
     }
 
     pub fn last(&self) -> Option<u64> {
         match self {
-            EncodedU64Array::U16 { base, offsets } => {
+            Self::U16 { base, offsets } => {
                 if offsets.is_empty() {
                     None
                 } else {
                     Some(*base + *offsets.last().unwrap() as u64)
                 }
             }
-            EncodedU64Array::U32 { base, offsets } => {
+            Self::U32 { base, offsets } => {
                 if offsets.is_empty() {
                     None
                 } else {
                     Some(*base + *offsets.last().unwrap() as u64)
                 }
             }
-            EncodedU64Array::U64(values) => values.last().copied(),
+            Self::U64(values) => values.last().copied(),
         }
     }
 
     pub fn binary_search(&self, val: u64) -> std::result::Result<usize, usize> {
         match self {
-            EncodedU64Array::U16 { base, offsets } => {
+            Self::U16 { base, offsets } => {
                 let u16 = val as u16;
                 let base = *base as u16;
                 offsets.binary_search(&(u16 - base))
             }
-            EncodedU64Array::U32 { base, offsets } => {
+            Self::U32 { base, offsets } => {
                 let u32 = val as u32;
                 let base = *base as u32;
                 offsets.binary_search(&(u32 - base))
             }
-            EncodedU64Array::U64(values) => values.binary_search(&val),
+            Self::U64(values) => values.binary_search(&val),
         }
     }
 
     pub fn slice(&self, offset: usize, len: usize) -> Self {
         match self {
-            EncodedU64Array::U16 { base, offsets } => offsets[offset..(offset + len)]
+            Self::U16 { base, offsets } => offsets[offset..(offset + len)]
                 .iter()
                 .map(|o| *base + *o as u64)
                 .collect(),
-            EncodedU64Array::U32 { base, offsets } => offsets[offset..(offset + len)]
+            Self::U32 { base, offsets } => offsets[offset..(offset + len)]
                 .iter()
                 .map(|o| *base + *o as u64)
                 .collect(),
-            EncodedU64Array::U64(values) => {
+            Self::U64(values) => {
                 let values = values[offset..(offset + len)].to_vec();
-                EncodedU64Array::U64(values)
+                Self::U64(values)
             }
         }
     }
@@ -168,13 +184,13 @@ impl From<Vec<u64>> for EncodedU64Array {
         if range < u16::MAX as u64 {
             let base = min;
             let offsets = values.iter().map(|v| (*v - base) as u16).collect();
-            EncodedU64Array::U16 { base, offsets }
+            Self::U16 { base, offsets }
         } else if range < u32::MAX as u64 {
             let base = min;
             let offsets = values.iter().map(|v| (*v - base) as u32).collect();
-            EncodedU64Array::U32 { base, offsets }
+            Self::U32 { base, offsets }
         } else {
-            EncodedU64Array::U64(values)
+            Self::U64(values)
         }
     }
 }
@@ -187,13 +203,13 @@ impl From<Range<u64>> for EncodedU64Array {
         if range < u16::MAX as u64 {
             let base = min;
             let offsets = (0..range as u16).collect();
-            EncodedU64Array::U16 { base, offsets }
+            Self::U16 { base, offsets }
         } else if range < u32::MAX as u64 {
             let base = min;
             let offsets = (0..range as u32).collect();
-            EncodedU64Array::U32 { base, offsets }
+            Self::U32 { base, offsets }
         } else {
-            EncodedU64Array::U64((min..max).collect())
+            Self::U64((min..max).collect())
         }
     }
 }
@@ -207,13 +223,13 @@ impl FromIterator<u64> for EncodedU64Array {
         if range < u16::MAX as u64 {
             let base = min;
             let offsets = values.iter().map(|v| (*v - base) as u16).collect();
-            EncodedU64Array::U16 { base, offsets }
+            Self::U16 { base, offsets }
         } else if range < u32::MAX as u64 {
             let base = min;
             let offsets = values.iter().map(|v| (*v - base) as u32).collect();
-            EncodedU64Array::U32 { base, offsets }
+            Self::U32 { base, offsets }
         } else {
-            EncodedU64Array::U64(values)
+            Self::U64(values)
         }
     }
 }
@@ -223,13 +239,13 @@ impl IntoIterator for EncodedU64Array {
     type IntoIter = Box<dyn DoubleEndedIterator<Item = u64>>;
     fn into_iter(self) -> Self::IntoIter {
         match self {
-            EncodedU64Array::U16 { base, offsets } => {
+            Self::U16 { base, offsets } => {
                 Box::new(offsets.into_iter().map(move |o| base + o as u64))
             }
-            EncodedU64Array::U32 { base, offsets } => {
+            Self::U32 { base, offsets } => {
                 Box::new(offsets.into_iter().map(move |o| base + o as u64))
             }
-            EncodedU64Array::U64(values) => Box::new(values.into_iter()),
+            Self::U64(values) => Box::new(values.into_iter()),
         }
     }
 }

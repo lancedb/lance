@@ -8,27 +8,27 @@ use super::{encoded_array::EncodedU64Array, RowIdSequence, U64Segment};
 /// Serialize a rowid sequence to a writer.
 pub fn write_row_ids<W: Write>(sequence: &RowIdSequence, writer: &mut W) -> std::io::Result<()> {
     // First, write number of segmens
-    writer.write(&(sequence.0.len() as u64).to_le_bytes())?;
+    writer.write_all(&(sequence.0.len() as u64).to_le_bytes())?;
 
     // Then write each segment
     for segment in &sequence.0 {
         match segment {
             U64Segment::Tombstones(n) => {
-                writer.write(&0u8.to_le_bytes())?;
-                writer.write(&n.to_le_bytes())?;
+                writer.write_all(&0u8.to_le_bytes())?;
+                writer.write_all(&n.to_le_bytes())?;
             }
             U64Segment::Range(range) => {
-                writer.write(&1u8.to_le_bytes())?;
-                writer.write(&range.start.to_le_bytes())?;
-                writer.write(&range.end.to_le_bytes())?;
+                writer.write_all(&1u8.to_le_bytes())?;
+                writer.write_all(&range.start.to_le_bytes())?;
+                writer.write_all(&range.end.to_le_bytes())?;
             }
             U64Segment::SortedArray(array) => {
-                writer.write(&2u8.to_le_bytes())?;
-                write_array(&array, writer)?;
+                writer.write_all(&2u8.to_le_bytes())?;
+                write_array(array, writer)?;
             }
             U64Segment::Array(array) => {
-                writer.write(&3u8.to_le_bytes())?;
-                write_array(&array, writer)?;
+                writer.write_all(&3u8.to_le_bytes())?;
+                write_array(array, writer)?;
             }
         }
     }
@@ -38,26 +38,26 @@ pub fn write_row_ids<W: Write>(sequence: &RowIdSequence, writer: &mut W) -> std:
 
 fn write_array<W: Write>(array: &EncodedU64Array, writer: &mut W) -> std::io::Result<()> {
     // length
-    writer.write(&array.len().to_le_bytes())?;
+    writer.write_all(&array.len().to_le_bytes())?;
     match array {
         EncodedU64Array::U16 { offsets, base } => {
-            writer.write(&16u8.to_le_bytes())?;
-            writer.write(&base.to_le_bytes())?;
+            writer.write_all(&16u8.to_le_bytes())?;
+            writer.write_all(&base.to_le_bytes())?;
             for &value in offsets {
-                writer.write(&value.to_le_bytes())?;
+                writer.write_all(&value.to_le_bytes())?;
             }
         }
         EncodedU64Array::U32 { offsets, base } => {
-            writer.write(&32u8.to_le_bytes())?;
-            writer.write(&base.to_le_bytes())?;
+            writer.write_all(&32u8.to_le_bytes())?;
+            writer.write_all(&base.to_le_bytes())?;
             for &value in offsets {
-                writer.write(&value.to_le_bytes())?;
+                writer.write_all(&value.to_le_bytes())?;
             }
         }
         EncodedU64Array::U64(offsets) => {
-            writer.write(&64u8.to_le_bytes())?;
+            writer.write_all(&64u8.to_le_bytes())?;
             for &value in offsets {
-                writer.write(&value.to_le_bytes())?;
+                writer.write_all(&value.to_le_bytes())?;
             }
         }
     }
