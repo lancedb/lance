@@ -153,6 +153,9 @@ enum VectorMetricType {
 
   // Dot Product
   Dot = 2;
+
+  // Hamming Distance
+  Hamming = 3;
 }
 
 // Vector Index Metadata

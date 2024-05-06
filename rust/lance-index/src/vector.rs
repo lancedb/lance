@@ -5,7 +5,7 @@
 //!
 
 use arrow_array::ArrayRef;
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::DistanceType;
 
 pub mod bq;
 pub mod flat;
@@ -53,28 +53,30 @@ pub struct Query {
     pub refine_factor: Option<u32>,
 
     /// Distance metric type
-    pub metric_type: MetricType,
+    pub metric_type: DistanceType,
 
     /// Whether to use an ANN index if available
     pub use_index: bool,
 }
 
-impl From<pb::VectorMetricType> for MetricType {
+impl From<pb::VectorMetricType> for DistanceType {
     fn from(proto: pb::VectorMetricType) -> Self {
         match proto {
             pb::VectorMetricType::L2 => Self::L2,
             pb::VectorMetricType::Cosine => Self::Cosine,
             pb::VectorMetricType::Dot => Self::Dot,
+            pb::VectorMetricType::Hamming => Self::Hamming,
         }
     }
 }
 
-impl From<MetricType> for pb::VectorMetricType {
-    fn from(mt: MetricType) -> Self {
+impl From<DistanceType> for pb::VectorMetricType {
+    fn from(mt: DistanceType) -> Self {
         match mt {
-            MetricType::L2 => Self::L2,
-            MetricType::Cosine => Self::Cosine,
-            MetricType::Dot => Self::Dot,
+            DistanceType::L2 => Self::L2,
+            DistanceType::Cosine => Self::Cosine,
+            DistanceType::Dot => Self::Dot,
+            DistanceType::Hamming => Self::Hamming,
         }
     }
 }

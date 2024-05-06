@@ -61,6 +61,10 @@ name = "cosine"
 harness = false
 
 [[bench]]
+name = "hamming"
+harness = false
+
+[[bench]]
 name = "norm_l2"
 harness = false
 

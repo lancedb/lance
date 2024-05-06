@@ -820,6 +820,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                     MetricType::L2 => pb::VectorMetricType::L2.into(),
                     MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
                     MetricType::Dot => pb::VectorMetricType::Dot.into(),
+                    MetricType::Hamming => pb::VectorMetricType::Hamming.into(),
                 },
             })),
         })

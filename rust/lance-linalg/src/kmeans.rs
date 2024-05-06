@@ -24,8 +24,8 @@ use num_traits::{AsPrimitive, Float, FromPrimitive, Zero};
 use rand::prelude::*;
 use tracing::instrument;
 
-use crate::distance::dot_distance_batch;
 use crate::distance::norm_l2::Normalize;
+use crate::distance::{dot_distance_batch, DistanceType};
 use crate::kernels::{argmax, argmin_value_float};
 use crate::{
     distance::{
@@ -459,7 +459,7 @@ where
     pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
-        let metric_type = self.metric_type;
+        let distance_type = self.metric_type;
         const CHUNK_SIZE: usize = 1024;
 
         let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
@@ -472,20 +472,20 @@ where
                     let centroids_array = centroids.as_slice();
                     let values = &data.as_slice()[start_idx * dimension..last_idx * dimension];
 
-                    match metric_type {
-                        MetricType::L2 => {
+                    match distance_type {
+                        DistanceType::L2 => {
                             return compute_partitions_l2(centroids_array, values, dimension)
                                 .collect();
                         }
-                        MetricType::Dot => values
+                        DistanceType::Dot => values
                             .chunks_exact(dimension)
                             .map(|vector| {
                                 let centroid_stream = centroids_array.chunks_exact(dimension);
                                 argmin_value(centroid_stream.map(|cent| dot_distance(vector, cent)))
                             })
                             .collect::<Vec<_>>(),
-                        MetricType::Cosine => {
-                            panic!("KMeans: should not use cosine distance to train kmeans, use L2 instead.");
+                        _ => {
+                            panic!("KMeans: distance type {} is not supported", distance_type);
                         }
                     }
                 })
@@ -520,13 +520,15 @@ where
             MetricType::L2 => {
                 l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
             }
-            MetricType::Cosine => {
-                panic!(
-                    "KMeans::find_partitions: cosine is not supported, use Normalized L2 instead"
-                );
-            }
+
             MetricType::Dot => {
                 dot_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
+            }
+            _ => {
+                panic!(
+                    "KMeans::find_partitions: {} is not supported",
+                    self.metric_type
+                );
             }
         };
 
