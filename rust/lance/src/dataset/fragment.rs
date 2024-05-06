@@ -1328,12 +1328,13 @@ impl FragmentReader {
                     u64::from(RowAddress::new_from_parts(self.fragment_id as u32, *row_id))
                 })
                 .collect();
+            let num_valid_rows = row_ids.len() as u32;
             let row_ids_array = UInt64Array::from(row_ids);
             let row_id_schema = Arc::new(self.output_schema.clone());
-            let tasks = (0..total_num_rows)
+            let tasks = (0..num_valid_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {
-                    let length = batch_size.min(total_num_rows - offset);
+                    let length = batch_size.min(num_valid_rows - offset);
                     let array = Arc::new(row_ids_array.slice(offset as usize, length as usize));
                     let batch = RecordBatch::try_new(row_id_schema.clone(), vec![array]);
                     std::future::ready(batch.map_err(Error::from)).boxed()
