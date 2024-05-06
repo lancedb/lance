@@ -39,7 +39,7 @@ runs:
       if [ ${{ inputs.repo }} == "fury" ]; then
         WHEEL=$(ls target/wheels/pylance-*.whl 2> /dev/null | head -n 1)
         echo "Uploading $WHEEL to Fury"
-        curl -F package=@$WHEEL https://$FURY_TOKEN@push.fury.io/lancedb/
+        curl -f -F package=@$WHEEL https://$FURY_TOKEN@push.fury.io/lancedb/
       else
         twine upload --repository ${{ inputs.repo }} \
           --username __token__ \
