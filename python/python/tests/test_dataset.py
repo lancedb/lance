@@ -1333,6 +1333,14 @@ def test_scan_no_columns(tmp_path: Path):
     with pytest.raises(ValueError, match="no columns were selected"):
         dataset.scanner(columns=[]).to_table()
 
+    # also test with deleted data to make sure deleted ids not included
+    dataset.delete("a = 5")
+    num_rows = 0
+    for batch in dataset.scanner(columns=[], with_row_id=True).to_batches():
+        num_rows += batch.num_rows
+
+    assert num_rows == 99
+
 
 def test_scan_prefilter(tmp_path: Path):
     base_dir = tmp_path / "dataset"
