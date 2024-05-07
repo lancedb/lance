@@ -535,10 +535,7 @@ impl FileReader {
     ) -> Result<()> {
         column_infos.push(self.metadata.column_infos[*column_idx].clone());
         *column_idx += 1;
-        if matches!(
-            field.data_type(),
-            DataType::Utf8 | DataType::Binary | DataType::LargeBinary
-        ) {
+        if field.data_type().is_binary_like() {
             // These types are 2 columns in a lance file but a single field id in a lance schema
             column_infos.push(self.metadata.column_infos[*column_idx].clone());
             *column_idx += 1;

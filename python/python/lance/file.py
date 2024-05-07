@@ -55,7 +55,7 @@ class LanceFileReader:
     """
 
     # TODO: make schema optional
-    def __init__(self, path: str, schema: pa.Schema):
+    def __init__(self, path: str):
         """
         Creates a new file reader to read the given file
 
@@ -65,10 +65,8 @@ class LanceFileReader:
         path: str
             The path to read, can be a pathname for local storage
             or a URI to read from cloud storage.
-        schema: pa.Schema
-            The desired projection schema
         """
-        self._reader = _LanceFileReader(path, schema)
+        self._reader = _LanceFileReader(path)
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
         """

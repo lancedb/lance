@@ -131,7 +131,8 @@ pub struct LanceFileMetadata {
 
 impl LanceFileMetadata {
     fn new(inner: &CachedFileMetadata, py: Python) -> Self {
-        let schema = Some(PyArrowType(inner.file_schema.clone()).into_py(py));
+        let arrow_schema = arrow_schema::Schema::from(inner.file_schema.as_ref());
+        let schema = Some(PyArrowType(arrow_schema).into_py(py));
         Self {
             major_version: inner.major_version,
             minor_version: inner.minor_version,
@@ -261,16 +262,14 @@ pub struct LanceFileReader {
 }
 
 impl LanceFileReader {
-    async fn open(uri_or_path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
+    async fn open(uri_or_path: String) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
         let io_parallelism = std::env::var("IO_THREADS")
             .map(|val| val.parse::<u32>().unwrap_or(8))
             .unwrap_or(8);
         let scheduler = StoreScheduler::new(Arc::new(object_store), io_parallelism);
         let file = scheduler.open_file(&path).await.infer_error()?;
-        let inner = FileReader::try_open(file, schema.0.clone())
-            .await
-            .infer_error()?;
+        let inner = FileReader::try_open(file, None).await.infer_error()?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -315,8 +314,8 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    pub fn new(path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        RT.runtime.block_on(Self::open(path, schema))
+    pub fn new(path: String) -> PyResult<Self> {
+        RT.runtime.block_on(Self::open(path))
     }
 
     pub fn read_all(
