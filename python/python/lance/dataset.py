@@ -1291,6 +1291,10 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs :
             Parameters passed to the index building process.
 
+        The SQ (Scalar Quantization) is available for only "IVF_HNSW_SQ" index type,
+        this quantization method is used to reduce the memory usage of the index,
+        it maps the float vectors to integer vectors, each integer is of ``num_bits``, now only 8 bits are supported.
+
         If ``index_type`` is "IVF_*", then the following parameters are required:
             num_partitions
 
