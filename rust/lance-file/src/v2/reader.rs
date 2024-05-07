@@ -405,7 +405,7 @@ impl FileReader {
         }
     }
 
-    fn meta_to_col_infos(column_metadatas: &Vec<pbfile::ColumnMetadata>) -> Vec<Arc<ColumnInfo>> {
+    fn meta_to_col_infos(column_metadatas: &[pbfile::ColumnMetadata]) -> Vec<Arc<ColumnInfo>> {
         column_metadatas
             .iter()
             .enumerate()
@@ -515,7 +515,7 @@ impl FileReader {
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
         if let Some(base_projection) = base_projection.as_ref() {
-            Self::validate_projection(&base_projection, &file_metadata)?;
+            Self::validate_projection(base_projection, &file_metadata)?;
         }
         let num_rows = file_metadata.num_rows;
         Ok(Self {
@@ -659,7 +659,7 @@ impl FileReader {
             }
             ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size, projection),
         };
-        Ok(tasks_stream?)
+        tasks_stream
     }
 
     /// Reads data from the file as a stream of record batches
@@ -817,7 +817,7 @@ mod tests {
             .col("categories", array::rand_type(&categories_type))
             .into_reader_rows(RowCount::from(1000), BatchCount::from(100));
 
-        let writer = object_store.create(&path).await.unwrap();
+        let writer = object_store.create(path).await.unwrap();
 
         let lance_schema =
             lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
@@ -841,11 +841,13 @@ mod tests {
         (Arc::new(lance_schema), data)
     }
 
+    type Transformer = Box<dyn Fn(&RecordBatch) -> RecordBatch>;
+
     async fn verify_expected(
         expected: &[RecordBatch],
         mut actual: Pin<Box<dyn RecordBatchStream>>,
         read_size: u32,
-        transform: Option<Box<dyn Fn(&RecordBatch) -> RecordBatch>>,
+        transform: Option<Transformer>,
     ) {
         let mut remaining = expected.iter().map(|batch| batch.num_rows()).sum::<usize>() as u32;
         let mut expected_iter = expected.iter().map(|batch| {

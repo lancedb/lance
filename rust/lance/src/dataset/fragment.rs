@@ -208,93 +208,107 @@ impl GenericFileReader for FileReader {
     }
 }
 
-#[derive(Debug, Clone)]
-struct V2Reader {
-    reader: Arc<v2::reader::FileReader>,
-    field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
-}
+mod v2_adapter {
+    use super::*;
 
-impl V2Reader {
-    fn projection_from_lance(&self, schema: &Schema) -> ReaderProjection {
-        let arrow_schema = Arc::new(ArrowSchema::from(schema));
-        let column_indices = schema
-            .fields
-            .iter()
-            .map(|f| {
-                *self.field_id_to_column_idx.get(&f.id).unwrap_or_else(|| {
-                    panic!(
-                        "attempt to project field with id {} which did not exist in the data file",
-                        f.id
-                    )
+    #[derive(Debug, Clone)]
+    pub struct Reader {
+        reader: Arc<v2::reader::FileReader>,
+        field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
+    }
+
+    impl Reader {
+        pub fn new(
+            reader: Arc<v2::reader::FileReader>,
+            field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
+        ) -> Self {
+            Self {
+                reader,
+                field_id_to_column_idx,
+            }
+        }
+
+        pub fn projection_from_lance(&self, schema: &Schema) -> ReaderProjection {
+            let arrow_schema = Arc::new(ArrowSchema::from(schema));
+            let column_indices = schema
+                .fields
+                .iter()
+                .map(|f| {
+                    *self.field_id_to_column_idx.get(&f.id).unwrap_or_else(|| {
+                        panic!(
+                            "attempt to project field with id {} which did not exist in the data file",
+                            f.id
+                        )
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        ReaderProjection {
-            schema: arrow_schema,
-            column_indices,
+                .collect::<Vec<_>>();
+            ReaderProjection {
+                schema: arrow_schema,
+                column_indices,
+            }
         }
     }
-}
 
-#[async_trait::async_trait]
-impl GenericFileReader for V2Reader {
-    /// Reads the requested range of rows from the file, returning as a stream
-    fn read_range_tasks(
-        &self,
-        range: Range<u64>,
-        batch_size: u32,
-        projection: Arc<Schema>,
-    ) -> Result<ReadBatchTaskStream> {
-        let projection = self.projection_from_lance(projection.as_ref());
-        Ok(self
-            .reader
-            .read_tasks(
-                ReadBatchParams::Range(range.start as usize..range.end as usize),
-                batch_size,
-                &projection,
-            )?
-            .map(|v2_task| ReadBatchTask {
-                task: v2_task.task.map_err(Error::from).boxed(),
-                num_rows: v2_task.num_rows,
-            })
-            .boxed())
-    }
+    #[async_trait::async_trait]
+    impl GenericFileReader for Reader {
+        /// Reads the requested range of rows from the file, returning as a stream
+        fn read_range_tasks(
+            &self,
+            range: Range<u64>,
+            batch_size: u32,
+            projection: Arc<Schema>,
+        ) -> Result<ReadBatchTaskStream> {
+            let projection = self.projection_from_lance(projection.as_ref());
+            Ok(self
+                .reader
+                .read_tasks(
+                    ReadBatchParams::Range(range.start as usize..range.end as usize),
+                    batch_size,
+                    &projection,
+                )?
+                .map(|v2_task| ReadBatchTask {
+                    task: v2_task.task.map_err(Error::from).boxed(),
+                    num_rows: v2_task.num_rows,
+                })
+                .boxed())
+        }
 
-    fn read_all_tasks(
-        &self,
-        batch_size: u32,
-        projection: Arc<Schema>,
-    ) -> Result<ReadBatchTaskStream> {
-        let projection = self.projection_from_lance(projection.as_ref());
-        Ok(self
-            .reader
-            .read_tasks(ReadBatchParams::RangeFull, batch_size, &projection)?
-            .map(|v2_task| ReadBatchTask {
-                task: v2_task.task.map_err(Error::from).boxed(),
-                num_rows: v2_task.num_rows,
-            })
-            .boxed())
-    }
+        fn read_all_tasks(
+            &self,
+            batch_size: u32,
+            projection: Arc<Schema>,
+        ) -> Result<ReadBatchTaskStream> {
+            let projection = self.projection_from_lance(projection.as_ref());
+            Ok(self
+                .reader
+                .read_tasks(ReadBatchParams::RangeFull, batch_size, &projection)?
+                .map(|v2_task| ReadBatchTask {
+                    task: v2_task.task.map_err(Error::from).boxed(),
+                    num_rows: v2_task.num_rows,
+                })
+                .boxed())
+        }
 
-    /// Return the number of rows in the file
-    fn len(&self) -> u32 {
-        self.reader.metadata().num_rows as u32
-    }
+        /// Return the number of rows in the file
+        fn len(&self) -> u32 {
+            self.reader.metadata().num_rows as u32
+        }
 
-    fn clone_box(&self) -> Box<dyn GenericFileReader> {
-        Box::new(self.clone())
-    }
+        fn clone_box(&self) -> Box<dyn GenericFileReader> {
+            Box::new(self.clone())
+        }
 
-    fn is_legacy(&self) -> bool {
-        false
-    }
+        fn is_legacy(&self) -> bool {
+            false
+        }
 
-    fn as_legacy_opt(&self) -> Option<&FileReader> {
-        None
-    }
+        fn as_legacy_opt(&self) -> Option<&FileReader> {
+            None
+        }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
-        None
+        fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
+            None
+        }
     }
 }
 
@@ -439,35 +453,29 @@ impl FileFragment {
             } else {
                 Ok(None)
             }
+        } else if schema_per_file.fields.is_empty() {
+            Ok(None)
         } else {
-            if schema_per_file.fields.is_empty() {
-                Ok(None)
-            } else {
-                let path = self.dataset.data_dir().child(data_file.path.as_str());
-                let store_scheduler = StoreScheduler::new(self.dataset.object_store.clone(), 16);
-                let file_scheduler = store_scheduler.open_file(&path).await?;
-                let reader =
-                    Arc::new(v2::reader::FileReader::try_open(file_scheduler, None).await?);
-                let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
-                    data_file
-                        .fields
-                        .iter()
-                        .copied()
-                        .zip(data_file.column_indices.iter().copied())
-                        .filter_map(|(field_id, column_index)| {
-                            if column_index < 0 {
-                                None
-                            } else {
-                                Some((field_id, column_index as u32))
-                            }
-                        }),
-                ));
-                let reader = V2Reader {
-                    reader,
-                    field_id_to_column_idx,
-                };
-                Ok(Some((Box::new(reader), schema_per_file)))
-            }
+            let path = self.dataset.data_dir().child(data_file.path.as_str());
+            let store_scheduler = StoreScheduler::new(self.dataset.object_store.clone(), 16);
+            let file_scheduler = store_scheduler.open_file(&path).await?;
+            let reader = Arc::new(v2::reader::FileReader::try_open(file_scheduler, None).await?);
+            let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
+                data_file
+                    .fields
+                    .iter()
+                    .copied()
+                    .zip(data_file.column_indices.iter().copied())
+                    .filter_map(|(field_id, column_index)| {
+                        if column_index < 0 {
+                            None
+                        } else {
+                            Some((field_id, column_index as u32))
+                        }
+                    }),
+            ));
+            let reader = v2_adapter::Reader::new(reader, field_id_to_column_idx);
+            Ok(Some((Box::new(reader), schema_per_file)))
         }
     }
 
