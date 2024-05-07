@@ -4,7 +4,7 @@
 use std::{collections::BTreeSet, io::Cursor, ops::Range, pin::Pin, sync::Arc};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::{stream::BoxStream, Future, Stream, StreamExt};
@@ -640,7 +640,7 @@ impl FileReader {
                 Ok(())
             }
         };
-        let tasks_stream = match &params {
+        match &params {
             ReadBatchParams::Indices(_) => todo!(),
             ReadBatchParams::Range(range) => {
                 verify_bound(&params, range.end)?;
@@ -655,8 +655,7 @@ impl FileReader {
                 self.read_range(0..range.end as u64, batch_size, projection)
             }
             ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size, projection),
-        };
-        tasks_stream
+        }
     }
 
     /// Reads data from the file as a stream of record batches
