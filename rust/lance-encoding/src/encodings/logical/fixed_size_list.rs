@@ -95,6 +95,7 @@ impl LogicalPageScheduler for FslPageScheduler {
     }
 }
 
+#[derive(Debug)]
 struct FslPageDecoder {
     inner: Box<dyn LogicalPageDecoder>,
     dimension: u32,

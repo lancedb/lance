@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 use arrow_array::{
     new_null_array,
@@ -126,6 +126,16 @@ struct PrimitiveFieldDecoder {
     physical_decoder: Option<Arc<dyn PhysicalPageDecoder>>,
     num_rows: u32,
     rows_drained: u32,
+}
+
+impl Debug for PrimitiveFieldDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrimitiveFieldDecoder")
+            .field("data_type", &self.data_type)
+            .field("num_rows", &self.num_rows)
+            .field("rows_drained", &self.rows_drained)
+            .finish()
+    }
 }
 
 struct PrimitiveFieldDecodeTask {

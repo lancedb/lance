@@ -817,7 +817,7 @@ pub struct NextDecodeTask {
 ///
 /// Unlike the other decoder types it is assumed that `LogicalPageDecoder` is stateful
 /// and only `Send`.  This is why we don't need a `rows_to_skip` argument in [`Self::drain`]
-pub trait LogicalPageDecoder: Send {
+pub trait LogicalPageDecoder: std::fmt::Debug + Send {
     /// Waits for enough data to be loaded to decode `num_rows` of data
     fn wait<'a>(
         &'a mut self,

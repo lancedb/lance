@@ -191,6 +191,8 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                         status.rows_to_skip = 0;
 
                         min_rows_added = min_rows_added.min(rows_to_take);
+                    } else {
+                        min_rows_added = min_rows_added.min(status.rows_queued);
                     }
                 }
                 if min_rows_added == 0 {
@@ -287,6 +289,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
     }
 }
 
+#[derive(Debug)]
 struct ChildState {
     // As we decode a column we pull pages out of the channel source and into
     // a queue for that column.  Since we await as soon as we pull the page from
@@ -306,6 +309,8 @@ struct ChildState {
     // Rows that have been pulled out of the channel source, awaited, and are ready to
     // be drained
     rows_available: u32,
+    // The field index in the struct (used for debugging / logging)
+    field_index: u32,
 }
 
 struct CompositeDecodeTask {
@@ -334,11 +339,12 @@ impl CompositeDecodeTask {
 }
 
 impl ChildState {
-    fn new(num_rows: u32) -> Self {
+    fn new(num_rows: u32, field_index: u32) -> Self {
         Self {
             awaited: VecDeque::new(),
             rows_unawaited: num_rows,
             rows_available: 0,
+            field_index,
         }
     }
 
@@ -351,11 +357,12 @@ impl ChildState {
         source: &mut mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
     ) -> Result<bool> {
         trace!(
-            "Struct waiting for {} rows and {} are available already",
+            "Struct child {} waiting for {} rows and {} are available already",
+            self.field_index,
             num_rows,
             self.rows_available
         );
-        let remaining = num_rows.saturating_sub(self.rows_available);
+        let mut remaining = num_rows.saturating_sub(self.rows_available);
         if remaining > 0 {
             if let Some(back) = self.awaited.back_mut() {
                 if back.unawaited() > 0 {
@@ -372,7 +379,10 @@ impl ChildState {
                     trace!("The await loaded {} rows", newly_avail);
                     self.rows_available += newly_avail;
                     self.rows_unawaited -= newly_avail;
-                    return Ok(remaining == rows_to_wait);
+                    remaining -= rows_to_wait;
+                    if remaining == 0 {
+                        return Ok(true);
+                    }
                 }
             }
 
@@ -436,6 +446,7 @@ impl ChildState {
     }
 }
 
+#[derive(Debug)]
 struct SimpleStructDecoder {
     children: Vec<ChildState>,
     child_fields: Fields,
@@ -446,7 +457,8 @@ impl SimpleStructDecoder {
         Self {
             children: child_fields
                 .iter()
-                .map(|_| ChildState::new(num_rows))
+                .enumerate()
+                .map(|(idx, _)| ChildState::new(num_rows, idx as u32))
                 .collect(),
             child_fields,
         }
@@ -595,16 +607,28 @@ impl FieldEncoder for StructFieldEncoder {
     }
 
     fn num_columns(&self) -> u32 {
-        self.children.len() as u32 + 1
+        self.children
+            .iter()
+            .map(|child| child.num_columns())
+            .sum::<u32>()
+            + 1
     }
 }
 
 #[cfg(test)]
 mod tests {
 
+    use std::sync::Arc;
+
+    use arrow_array::{
+        builder::{Int32Builder, ListBuilder},
+        Array, ArrayRef, Int32Array, StructArray,
+    };
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::testing::check_round_trip_encoding_random;
+    use crate::testing::{
+        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+    };
 
     #[test_log::test(tokio::test)]
     async fn test_simple_struct() {
@@ -614,5 +638,34 @@ mod tests {
         ]));
         let field = Field::new("", data_type, false);
         check_round_trip_encoding_random(field).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ragged_scheduling() {
+        // This test covers scheduling when batches straddle page boundaries
+
+        // Create a list with 10k nulls
+        let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        for _ in 0..10000 {
+            list_builder.append_null();
+        }
+        let list_array = Arc::new(list_builder.finish());
+        let int_array = Arc::new(Int32Array::from_iter_values(0..10000));
+        let fields = vec![
+            Field::new("", list_array.data_type().clone(), true),
+            Field::new("", int_array.data_type().clone(), true),
+        ];
+        let struct_array = Arc::new(StructArray::new(
+            Fields::from(fields),
+            vec![list_array, int_array],
+            None,
+        )) as ArrayRef;
+        let struct_arrays = (0..10000)
+            // Intentionally skip in some randomish amount to create more ragged scheduling
+            .step_by(437)
+            .map(|offset| struct_array.slice(offset, 437.min(10000 - offset)))
+            .collect::<Vec<_>>();
+        check_round_trip_encoding_of_data(struct_arrays, &TestCases::default()).await;
     }
 }
