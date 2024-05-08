@@ -1355,9 +1355,8 @@ impl FragmentReader {
     ) -> Result<ReadBatchFutStream> {
         let total_num_rows = self.readers[0].0.len();
         // Note that the fragment length might be considerably smaller if there are deleted rows.
-        // E.g. if a fragment has 100 rows but rows 90..100 are deleted we still need to make
-        // sure it is valid to read / take 0..100.  This is because some index paths might take
-        // deleted rows (e.g. when doing KNN without an index)
+        // E.g. if a fragment has 100 rows but rows 0..10 are deleted we still need to make
+        // sure it is valid to read / take 0..100
         if !params.valid_given_len(total_num_rows as usize) {
             return Err(Error::invalid_input(
                 format!(
