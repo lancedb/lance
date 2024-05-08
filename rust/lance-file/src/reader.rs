@@ -366,12 +366,12 @@ impl FileReader {
             .map(|batch| async move {
                 if batch.batch_id >= num_batches as i32 {
                     Err(Error::InvalidInput {
-                        source: format!("batch_id: {} if out of bound", batch.batch_id).into(),
+                        source: format!("batch_id: {} out of bounds", batch.batch_id).into(),
                         location: location!(),
                     })
                 } else if *batch.offsets.last().expect("got empty batch") > num_rows {
                     Err(Error::InvalidInput {
-                        source: format!("indices: {:?} if out of bound", batch.offsets).into(),
+                        source: format!("indices: {:?} out of bounds", batch.offsets).into(),
                         location: location!(),
                     })
                 } else {

@@ -994,6 +994,25 @@ def test_merge_insert(tmp_path: Path):
         dataset.merge_insert("a").execute(new_table)
 
 
+def test_flat_vector_search_with_delete(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "id": [i for i in range(10)],
+            "vector": pa.array(
+                [[1.0, 1.0] for _ in range(10)], pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path / "dataset", mode="create")
+    dataset.delete("id = 0")
+    assert (
+        dataset.scanner(nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]})
+        .to_table()
+        .num_rows
+        == 9
+    )
+
+
 def test_merge_insert_conditional_upsert_example(tmp_path: Path):
     table = pa.Table.from_pydict(
         {

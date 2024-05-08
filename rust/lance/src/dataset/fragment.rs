@@ -1354,6 +1354,18 @@ impl FragmentReader {
         read_fn: impl Fn(&dyn GenericFileReader, &Arc<Schema>) -> Result<ReadBatchTaskStream>,
     ) -> Result<ReadBatchFutStream> {
         let total_num_rows = self.readers[0].0.len();
+        // Note that the fragment length might be considerably smaller if there are deleted rows.
+        // E.g. if a fragment has 100 rows but rows 0..10 are deleted we still need to make
+        // sure it is valid to read / take 0..100
+        if !params.valid_given_len(total_num_rows as usize) {
+            return Err(Error::invalid_input(
+                format!(
+                    "Invalid read params {:?} for fragment with {} addressible rows",
+                    params, total_num_rows
+                ),
+                location!(),
+            ));
+        }
         // If just the row id there is no need to actually read any data
         // and we don't need to involve the readers at all.
         //
@@ -1474,15 +1486,6 @@ impl FragmentReader {
     //
     // TODO: Move away from this by changing callers to support consuming a stream
     pub async fn legacy_read_range_as_batch(&self, range: Range<usize>) -> Result<RecordBatch> {
-        if range.start >= self.num_rows || range.end > self.num_rows {
-            return Err(Error::invalid_input(
-                format!(
-                    "range {:?} is out of bounds for fragment {} with {} rows",
-                    range, self.fragment_id, self.num_rows
-                ),
-                location!(),
-            ));
-        }
         let batches = self
             .read_range(
                 range.start as u32..range.end as u32,
@@ -1662,6 +1665,35 @@ mod tests {
             batches[1].column_by_name("i").unwrap().as_ref(),
             &Int32Array::from_iter_values(100..120)
         );
+    }
+
+    #[tokio::test]
+    async fn test_out_of_range() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        // Creates 400 rows in 10 fragments
+        let mut dataset = create_dataset(test_uri).await;
+        // Delete last 20 rows in first fragment
+        dataset.delete("i >= 20").await.unwrap();
+        // Last fragment has 20 rows but 40 addressible rows
+        let fragment = &dataset.get_fragments()[0];
+        assert_eq!(fragment.metadata.num_rows().unwrap(), 20);
+
+        for with_row_id in [false, true] {
+            let reader = fragment.open(fragment.schema(), with_row_id).await.unwrap();
+            for valid_range in [0..40, 20..40] {
+                reader
+                    .read_range(valid_range, 100)
+                    .unwrap()
+                    .buffered(1)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+            }
+            for invalid_range in [0..41, 41..42] {
+                assert!(reader.read_range(invalid_range, 100).is_err());
+            }
+        }
     }
 
     #[tokio::test]

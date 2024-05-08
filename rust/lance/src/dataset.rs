@@ -2885,7 +2885,7 @@ mod tests {
         let indices = &[(1 << 32) - 1];
         let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
         assert!(
-            err.to_string().contains("out of bound"),
+            err.to_string().contains("Invalid read params"),
             "{}",
             err.to_string()
         );
@@ -2894,7 +2894,7 @@ mod tests {
         let indices = &[(1 << 32) - 3, (1 << 32) - 1];
         let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
         assert!(
-            err.to_string().contains("out of bound"),
+            err.to_string().contains("out of bounds"),
             "{}",
             err.to_string()
         );
@@ -2903,7 +2903,7 @@ mod tests {
         let indices = &[(1 << 32) - 1, (1 << 32) - 3];
         let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
         assert!(
-            err.to_string().contains("out of bound"),
+            err.to_string().contains("out of bounds"),
             "{}",
             err.to_string()
         );
