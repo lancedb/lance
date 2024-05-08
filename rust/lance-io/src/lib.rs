@@ -84,6 +84,17 @@ impl From<&Self> for ReadBatchParams {
 }
 
 impl ReadBatchParams {
+    /// Validate that the selection is valid given the length of the batch
+    pub fn valid_given_len(&self, len: usize) -> bool {
+        match self {
+            Self::Indices(indices) => indices.iter().all(|i| i.unwrap_or(0) < len as u32),
+            Self::Range(r) => r.start < len && r.end <= len,
+            Self::RangeFull => true,
+            Self::RangeTo(r) => r.end <= len,
+            Self::RangeFrom(r) => r.start < len,
+        }
+    }
+
     /// Slice the selection
     ///
     /// For example, given ReadBatchParams::RangeFull and slice(10, 20), the output will be
