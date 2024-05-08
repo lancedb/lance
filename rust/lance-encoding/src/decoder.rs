@@ -241,15 +241,19 @@ pub struct PageInfo {
 /// This is typically created by reading the metadata section of a Lance file
 #[derive(Debug)]
 pub struct ColumnInfo {
+    /// The index of the column in the file
+    pub index: u32,
     /// The metadata for each page in the column
     pub page_infos: Vec<Arc<PageInfo>>,
+    /// File positions of the column-level buffers
     pub buffer_offsets: Vec<u64>,
 }
 
 impl ColumnInfo {
     /// Create a new instance
-    pub fn new(page_infos: Vec<Arc<PageInfo>>, buffer_offsets: Vec<u64>) -> Self {
+    pub fn new(index: u32, page_infos: Vec<Arc<PageInfo>>, buffer_offsets: Vec<u64>) -> Self {
         Self {
+            index,
             page_infos,
             buffer_offsets,
         }
@@ -494,16 +498,12 @@ impl DecodeBatchScheduler {
 
     /// Creates a new decode scheduler with the expected schema and the column
     /// metadata of the file.
-    ///
-    /// TODO: How does this work when doing projection?  Need to add tests.  Can
-    /// probably take care of this in lance-file by only passing in the appropriate
-    /// columns with the projected schema.
-    pub fn new(
-        schema: &Schema,
-        column_infos: &[ColumnInfo],
-        file_buffer_positions: &Vec<u64>,
+    pub fn new<'a>(
+        schema: &'a Schema,
+        column_infos: impl IntoIterator<Item = &'a ColumnInfo>,
+        file_buffer_positions: &'a Vec<u64>,
     ) -> Self {
-        let mut col_info_iter = column_infos.iter();
+        let mut col_info_iter = column_infos.into_iter();
         let buffers = FileBuffers {
             positions: file_buffer_positions,
         };
@@ -817,7 +817,7 @@ pub struct NextDecodeTask {
 ///
 /// Unlike the other decoder types it is assumed that `LogicalPageDecoder` is stateful
 /// and only `Send`.  This is why we don't need a `rows_to_skip` argument in [`Self::drain`]
-pub trait LogicalPageDecoder: Send {
+pub trait LogicalPageDecoder: std::fmt::Debug + Send {
     /// Waits for enough data to be loaded to decode `num_rows` of data
     fn wait<'a>(
         &'a mut self,

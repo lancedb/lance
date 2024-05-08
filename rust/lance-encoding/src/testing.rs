@@ -216,7 +216,8 @@ async fn check_round_trip_encoding_inner(
 
     let column_infos = page_infos
         .into_iter()
-        .map(|page_infos| ColumnInfo::new(page_infos, Vec::new()))
+        .enumerate()
+        .map(|(col_idx, page_infos)| ColumnInfo::new(col_idx as u32, page_infos, Vec::new()))
         .collect::<Vec<_>>();
     let schema = Schema::new(vec![field.clone()]);
 

@@ -411,6 +411,7 @@ impl LogicalPageScheduler for ListPageScheduler {
 /// them.
 ///
 /// TODO: Test the case where a single list page has multiple items pages
+#[derive(Debug)]
 struct ListPageDecoder {
     unloaded: Option<JoinHandle<Result<IndirectlyLoaded>>>,
     // offsets and validity will have already been decoded as part of the indirect I/O

@@ -25,7 +25,6 @@ fn bench_reader(c: &mut Criterion) {
         ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
     let file_path = base_path.child("foo.lance");
     let object_writer = rt.block_on(object_store.create(&file_path)).unwrap();
-    let schema = data.schema().as_ref().clone();
 
     let mut writer = FileWriter::try_new(
         object_writer,
@@ -43,14 +42,11 @@ fn bench_reader(c: &mut Criterion) {
         b.iter(|| {
             let object_store = &object_store;
             let file_path = &file_path;
-            let schema = &schema;
             let data = &data;
             rt.block_on(async move {
                 let store_scheduler = StoreScheduler::new(Arc::new(object_store.clone()), 8);
                 let scheduler = store_scheduler.open_file(file_path).await.unwrap();
-                let reader = FileReader::try_open(scheduler.clone(), schema.clone())
-                    .await
-                    .unwrap();
+                let reader = FileReader::try_open(scheduler.clone(), None).await.unwrap();
                 let mut stream = reader
                     .read_stream(lance_io::ReadBatchParams::RangeFull, 16 * 1024, 16)
                     .unwrap();

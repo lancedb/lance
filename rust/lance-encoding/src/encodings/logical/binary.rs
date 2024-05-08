@@ -86,6 +86,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
     }
 }
 
+#[derive(Debug)]
 pub struct BinaryPageDecoder {
     inner: Box<dyn LogicalPageDecoder>,
     data_type: DataType,
