@@ -80,12 +80,13 @@ impl LogicalPageScheduler for PrimitivePageScheduler {
         ranges: &[std::ops::Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         trace!("Scheduling ranges {:?} from physical page", ranges);
-        let physical_decoder = self
-            .physical_decoder
-            .schedule_ranges(ranges, scheduler.as_ref());
+        let physical_decoder =
+            self.physical_decoder
+                .schedule_ranges(ranges, scheduler.as_ref(), top_level_row);
 
         let logical_decoder = PrimitiveFieldDecoder {
             data_type: self.data_type.clone(),
@@ -104,6 +105,7 @@ impl LogicalPageScheduler for PrimitivePageScheduler {
         indices: &[u32],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         trace!(
             "Scheduling take of {} indices from physical page",
@@ -116,6 +118,7 @@ impl LogicalPageScheduler for PrimitivePageScheduler {
                 .collect::<Vec<_>>(),
             scheduler,
             sink,
+            top_level_row,
         )
     }
 }

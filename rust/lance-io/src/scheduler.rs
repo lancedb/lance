@@ -3,14 +3,15 @@
 
 use bytes::Bytes;
 use futures::channel::oneshot;
+use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryFutureExt};
 use object_store::path::Path;
 use snafu::{location, Location};
+use std::cmp::Reverse;
+use std::fmt::Debug;
 use std::future::Future;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use lance_core::{Error, Result};
 
@@ -95,10 +96,25 @@ impl IoTask {
     }
 }
 
+fn receiver_to_stream<T: Send + 'static, P: Ord + Send + 'static>(
+    tasks: async_priority_channel::Receiver<T, P>,
+) -> BoxStream<'static, T> {
+    futures::stream::unfold(tasks, |state| async move {
+        match state.recv().await {
+            Ok(val) => Some((val.0, state)),
+            Err(async_priority_channel::RecvError) => None,
+        }
+    })
+    .boxed()
+}
+
 // Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
 // repeats endlessly until the scheduler is destroyed.
-async fn run_io_loop(tasks: mpsc::UnboundedReceiver<IoTask>, io_capacity: u32) {
-    let io_stream = UnboundedReceiverStream::new(tasks);
+async fn run_io_loop(
+    tasks: async_priority_channel::Receiver<IoTask, Reverse<u128>>,
+    io_capacity: u32,
+) {
+    let io_stream = receiver_to_stream(tasks);
     let tokio_task_stream = io_stream.map(|task| tokio::spawn(task.run()));
     let mut tokio_task_stream = tokio_task_stream.buffer_unordered(io_capacity as usize);
     while tokio_task_stream.next().await.is_some() {
@@ -109,17 +125,26 @@ async fn run_io_loop(tasks: mpsc::UnboundedReceiver<IoTask>, io_capacity: u32) {
     }
 }
 
-/// An I/O scheduler which wraps an ObjectStore and throttles the amount of\
+/// An I/O scheduler which wraps an ObjectStore and throttles the amount of
 /// parallel I/O that can be run.
 ///
 /// TODO: This will also add coalescing
-#[derive(Debug)]
-pub struct StoreScheduler {
+pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
-    io_submitter: mpsc::UnboundedSender<IoTask>,
+    io_submitter: async_priority_channel::Sender<IoTask, Reverse<u128>>,
+    file_counter: Mutex<u32>,
 }
 
-impl StoreScheduler {
+impl Debug for ScanScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanScheduler")
+            .field("object_store", &self.object_store)
+            .field("file_counter", &self.file_counter)
+            .finish()
+    }
+}
+
+impl ScanScheduler {
     /// Create a new scheduler with the given I/O capacity
     ///
     /// # Arguments
@@ -137,10 +162,11 @@ impl StoreScheduler {
         // Once the reader is finished we should revisit.  We will probably want to convert
         // from `when_done` futures to delivering data into a queue.  That queue should fill
         // up, causing the I/O loop to pause.
-        let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+        let (reg_tx, reg_rx) = async_priority_channel::unbounded();
         let scheduler = Self {
             object_store,
             io_submitter: reg_tx,
+            file_counter: Mutex::new(0),
         };
         tokio::task::spawn(async move { run_io_loop(reg_rx, io_capacity).await });
         Arc::new(scheduler)
@@ -149,9 +175,13 @@ impl StoreScheduler {
     /// Open a file for reading
     pub async fn open_file(self: &Arc<Self>, path: &Path) -> Result<FileScheduler> {
         let reader = self.object_store.open(path).await?;
+        let mut file_counter = self.file_counter.lock().unwrap();
+        let file_index = *file_counter;
+        *file_counter += 1;
         Ok(FileScheduler {
             reader: reader.into(),
             root: self.clone(),
+            file_index,
         })
     }
 
@@ -160,11 +190,12 @@ impl StoreScheduler {
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         tx: oneshot::Sender<Result<Vec<Bytes>>>,
+        priority: u128,
     ) {
         let num_iops = request.len() as u32;
 
         let when_all_io_done = move |bytes| {
-            // We don't care if the receiver has given up
+            // We don't care if the receiver has given up so discard the result
             let _ = tx.send(bytes);
         };
 
@@ -183,7 +214,7 @@ impl StoreScheduler {
                     dest.deliver_data(bytes.map(|bytes| (task_idx, bytes)));
                 }),
             };
-            if self.io_submitter.send(task).is_err() {
+            if self.io_submitter.try_send(task, Reverse(priority)).is_err() {
                 panic!("unable to submit I/O because the I/O thread has panic'd");
             }
         }
@@ -193,10 +224,11 @@ impl StoreScheduler {
         &self,
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
+        priority: u128,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
         let (tx, rx) = oneshot::channel::<Result<Vec<Bytes>>>();
 
-        self.do_submit_request(reader, request, tx);
+        self.do_submit_request(reader, request, tx, priority);
 
         // Right now, it isn't possible for I/O to be cancelled so a cancel error should
         // not occur
@@ -208,7 +240,8 @@ impl StoreScheduler {
 #[derive(Clone, Debug)]
 pub struct FileScheduler {
     reader: Arc<dyn Reader>,
-    root: Arc<StoreScheduler>,
+    root: Arc<ScanScheduler>,
+    file_index: u32,
 }
 
 impl FileScheduler {
@@ -219,16 +252,24 @@ impl FileScheduler {
     pub fn submit_request(
         &self,
         request: Vec<Range<u64>>,
+        priority: u64,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
-        self.root.submit_request(self.reader.clone(), request)
+        // The final priority is a combination of the row offset and the file number
+        let priority = ((self.file_index as u128) << 64) + priority as u128;
+        self.root
+            .submit_request(self.reader.clone(), request, priority)
     }
 
     /// Submit a single IOP to the reader
     ///
     /// If you have multpile IOPS to perform then [`Self::submit_request`] is going
     /// to be more efficient.
-    pub fn submit_single(&self, range: Range<u64>) -> impl Future<Output = Result<Bytes>> + Send {
-        self.submit_request(vec![range])
+    pub fn submit_single(
+        &self,
+        range: Range<u64>,
+        priority: u64,
+    ) -> impl Future<Output = Result<Bytes>> + Send {
+        self.submit_request(vec![range], priority)
             .map_ok(|vec_bytes| vec_bytes.into_iter().next().unwrap())
     }
 
@@ -244,10 +285,17 @@ impl FileScheduler {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, time::Duration};
 
+    use futures::poll;
     use rand::RngCore;
     use tempfile::tempdir;
+
+    use object_store::{memory::InMemory, ObjectStore as OSObjectStore};
+    use tokio::time::timeout;
+    use url::Url;
+
+    use crate::testing::MockObjectStore;
 
     use super::*;
 
@@ -266,7 +314,7 @@ mod tests {
         rand::thread_rng().fill_bytes(&mut some_data);
         obj_store.put(&tmp_file, &some_data).await.unwrap();
 
-        let scheduler = StoreScheduler::new(obj_store, 16);
+        let scheduler = ScanScheduler::new(obj_store, 16);
 
         let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
 
@@ -278,7 +326,7 @@ mod tests {
             reqs.push_back(
                 #[allow(clippy::single_range_in_vec_init)]
                 file_scheduler
-                    .submit_request(vec![offset..offset + READ_SIZE])
+                    .submit_request(vec![offset..offset + READ_SIZE], 0)
                     .await
                     .unwrap(),
             );
@@ -294,5 +342,85 @@ mod tests {
             assert_eq!(expected, actual);
             offset += READ_SIZE;
         }
+    }
+
+    #[tokio::test]
+    async fn test_priority() {
+        let some_path = Path::parse("foo").unwrap();
+        let base_store = Arc::new(InMemory::new());
+        base_store
+            .put(&some_path, Bytes::from(vec![0; 1000]))
+            .await
+            .unwrap();
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut obj_store = MockObjectStore::default();
+        let semaphore_copy = semaphore.clone();
+        obj_store
+            .expect_get_opts()
+            .returning(move |location, options| {
+                let semaphore = semaphore.clone();
+                let base_store = base_store.clone();
+                let location = location.clone();
+                async move {
+                    semaphore.acquire().await.unwrap().forget();
+                    let res = base_store.get_opts(&location, options).await;
+                    res
+                }
+                .boxed()
+            });
+        let obj_store = Arc::new(ObjectStore::new(
+            Arc::new(obj_store),
+            Url::parse("mem://").unwrap(),
+            None,
+            None,
+        ));
+
+        let scan_scheduler = ScanScheduler::new(obj_store, 1);
+
+        let file_scheduler = scan_scheduler
+            .open_file(&Path::parse("foo").unwrap())
+            .await
+            .unwrap();
+
+        // Issue a request, priority doesn't matter, it will be submitted
+        // immediately (it will go pending)
+        // Note: the timeout is to prevent a deadlock if the test fails.
+        let first_fut = timeout(
+            Duration::from_secs(10),
+            file_scheduler.submit_single(0..10, 0),
+        )
+        .boxed();
+
+        // Issue another low priority request (it will go in queue)
+        let mut second_fut = timeout(
+            Duration::from_secs(10),
+            file_scheduler.submit_single(0..20, 100),
+        )
+        .boxed();
+
+        // Issue a high priority request (it will go in queue and should bump
+        // the other queued request down)
+        let mut third_fut = timeout(
+            Duration::from_secs(10),
+            file_scheduler.submit_single(0..30, 0),
+        )
+        .boxed();
+
+        // Finish one file, should be the in-flight first request
+        semaphore_copy.add_permits(1);
+        assert!(first_fut.await.unwrap().unwrap().len() == 10);
+        // Other requests should not be finished
+        assert!(poll!(&mut second_fut).is_pending());
+        assert!(poll!(&mut third_fut).is_pending());
+
+        // Next should be high priority request
+        semaphore_copy.add_permits(1);
+        assert!(third_fut.await.unwrap().unwrap().len() == 30);
+        assert!(poll!(&mut second_fut).is_pending());
+
+        // Finally, the low priority request
+        semaphore_copy.add_permits(1);
+        assert!(second_fut.await.unwrap().unwrap().len() == 20);
     }
 }

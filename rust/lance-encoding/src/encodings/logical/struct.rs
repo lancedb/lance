@@ -110,6 +110,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
         ranges: &[Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         for range in ranges.iter().cloned() {
             let mut rows_to_read = range.end - range.start;
@@ -156,6 +157,8 @@ impl LogicalPageScheduler for SimpleStructScheduler {
             // The downside of the current algorithm is that many tiny I/O batches means less opportunity for in-batch coalescing.
             // Then again, if our outer batch coalescing is super good then maybe we don't bother
 
+            let mut current_top_level_row = top_level_row;
+
             while rows_to_read > 0 {
                 let mut min_rows_added = u32::MAX;
                 for (col_idx, field_scheduler) in self.children.iter().enumerate() {
@@ -183,7 +186,12 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                             page_range_start,
                             next_page
                         );
-                        next_page.schedule_ranges(&[page_range], scheduler, sink)?;
+                        next_page.schedule_ranges(
+                            &[page_range],
+                            scheduler,
+                            sink,
+                            current_top_level_row,
+                        )?;
 
                         status.rows_queued += rows_to_take;
                         status.rows_to_take -= rows_to_take;
@@ -199,6 +207,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                     panic!("Error in scheduling logic, panic to avoid infinite loop");
                 }
                 rows_to_read -= min_rows_added;
+                current_top_level_row += min_rows_added as u64;
                 for field_status in &mut field_status {
                     field_status.rows_queued -= min_rows_added;
                 }
@@ -216,6 +225,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
         indices: &[u32],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling struct decode of {} indices", indices.len());
 
@@ -236,7 +246,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
         let mut rows_to_read = indices.len() as u32;
 
         // NOTE: See schedule_range for a description of the scheduling algorithm
-
+        let mut current_top_level_row = top_level_row;
         while rows_to_read > 0 {
             let mut min_rows_added = u32::MAX;
             for (col_idx, field_scheduler) in self.children.iter().enumerate() {
@@ -269,7 +279,12 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                     // We should be guaranteed to get at least one page
                     let next_page = next_page.unwrap();
 
-                    next_page.schedule_take(&indices_in_page, scheduler, sink)?;
+                    next_page.schedule_take(
+                        &indices_in_page,
+                        scheduler,
+                        sink,
+                        current_top_level_row,
+                    )?;
 
                     let rows_scheduled = indices_in_page.len() as u32;
                     status.rows_queued += rows_scheduled;
@@ -281,6 +296,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                 panic!("Error in scheduling logic, panic to avoid infinite loop");
             }
             rows_to_read -= min_rows_added;
+            current_top_level_row += min_rows_added as u64;
             for field_status in &mut field_status {
                 field_status.rows_queued -= min_rows_added;
             }

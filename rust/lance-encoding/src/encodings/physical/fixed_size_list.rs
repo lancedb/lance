@@ -36,6 +36,7 @@ impl PhysicalPageScheduler for FixedListScheduler {
         &self,
         ranges: &[std::ops::Range<u32>],
         scheduler: &dyn EncodingsIo,
+        top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let expanded_ranges = ranges
             .iter()
@@ -49,9 +50,9 @@ impl PhysicalPageScheduler for FixedListScheduler {
             expanded_ranges[0].start,
             expanded_ranges[expanded_ranges.len() - 1].end
         );
-        let inner_page_decoder = self
-            .items_scheduler
-            .schedule_ranges(&expanded_ranges, scheduler);
+        let inner_page_decoder =
+            self.items_scheduler
+                .schedule_ranges(&expanded_ranges, scheduler, top_level_row);
         let dimension = self.dimension;
         async move {
             let items_decoder = inner_page_decoder.await?;

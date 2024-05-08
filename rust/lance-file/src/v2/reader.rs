@@ -128,7 +128,7 @@ impl FileReader {
         } else {
             file_size - scheduler.reader().block_size() as u64
         };
-        let tail_bytes = scheduler.submit_single(begin..file_size).await?;
+        let tail_bytes = scheduler.submit_single(begin..file_size, 0).await?;
         Ok((tail_bytes, file_size))
     }
 
@@ -198,7 +198,7 @@ impl FileReader {
         // We can't just grab col_meta_start..cmo_table_start because there may be padding
         // between the last column and the start of the cmo table.
         let column_metadata_range = column_metadata_start..footer.global_buff_start;
-        let column_metadata_bytes = scheduler.submit_single(column_metadata_range).await?;
+        let column_metadata_bytes = scheduler.submit_single(column_metadata_range, 0).await?;
 
         // cmo == column_metadata_offsets
         let cmo_table_size = 16 * footer.num_columns as usize;
@@ -232,6 +232,7 @@ impl FileReader {
             let missing_bytes = scheduler
                 .submit_single(
                     footer.column_meta_start..footer.column_meta_start + num_bytes_missing,
+                    0,
                 )
                 .await;
             let mut combined =
@@ -762,7 +763,7 @@ mod tests {
     use lance_core::datatypes::Schema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_io::{
-        object_store::ObjectStore, scheduler::StoreScheduler, stream::RecordBatchStream,
+        object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStream,
     };
     use log::debug;
     use object_store::path::Path;
@@ -777,7 +778,7 @@ mod tests {
         _tmp_dir: TempDir,
         tmp_path: Path,
         object_store: Arc<ObjectStore>,
-        scheduler: Arc<StoreScheduler>,
+        scheduler: Arc<ScanScheduler>,
     }
 
     impl Default for FsFixture {
@@ -787,7 +788,7 @@ mod tests {
             let tmp_path = Path::parse(tmp_path).unwrap();
             let tmp_path = tmp_path.child("some_file.lance");
             let object_store = Arc::new(ObjectStore::local());
-            let scheduler = StoreScheduler::new(object_store.clone(), 8);
+            let scheduler = ScanScheduler::new(object_store.clone(), 8);
             Self {
                 _tmp_dir: tmp_dir,
                 object_store,

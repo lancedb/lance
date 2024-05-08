@@ -123,18 +123,27 @@ impl PhysicalPageScheduler for BasicPageScheduler {
         &self,
         ranges: &[std::ops::Range<u32>],
         scheduler: &dyn EncodingsIo,
+        top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let validity_future = match &self.mode {
             SchedulerNullStatus::None(_) | SchedulerNullStatus::All => None,
             SchedulerNullStatus::Some(schedulers) => {
                 trace!("Scheduling ranges {:?} from validity", ranges);
-                Some(schedulers.validity.schedule_ranges(ranges, scheduler))
+                Some(
+                    schedulers
+                        .validity
+                        .schedule_ranges(ranges, scheduler, top_level_row),
+                )
             }
         };
 
         let values_future = if let Some(values_scheduler) = self.mode.values_scheduler() {
             trace!("Scheduling range {:?} from values", ranges);
-            Some(values_scheduler.schedule_ranges(ranges, scheduler).boxed())
+            Some(
+                values_scheduler
+                    .schedule_ranges(ranges, scheduler, top_level_row)
+                    .boxed(),
+            )
         } else {
             trace!("No values fetch needed since values all null");
             None
