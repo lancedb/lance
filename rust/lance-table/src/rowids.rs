@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use core::num;
 use std::ops::{Range, RangeInclusive};
 
 use snafu::{location, Location};
@@ -99,7 +100,7 @@ impl From<Range<u64>> for RowIdSequence {
 }
 
 impl RowIdSequence {
-    fn iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
         self.0.iter().flat_map(|segment| segment.iter())
     }
 
@@ -257,6 +258,26 @@ impl RowIdSequence {
 ///
 /// This is designed to be especially efficient for sequences that are sorted,
 /// but not meaningfully larger than a Vec<u64> in the worst case.
+/// 
+/// The representation is chosen based on the properties of the sequence:
+///                                                           
+///  Sorted?───►Yes ───►Contiguous?─► Yes─► Range            
+///  │                  ▼                                 
+///  │                  No                                
+///  │                  ▼                                 
+///  │                Dense?─────► Yes─► RangeWithBitmap  
+///  │                  ▼                                 
+///  │                  No─────────────► SortedArray      
+///  ▼                                                    
+///  No────────────────────────────────► Array            
+/// 
+/// "Dense" is decided based on ____.
+/// 
+/// Size of RangeWithBitMap for N values:
+///     8 bytes + 8 bytes + ceil((max - min) / 8) bytes
+/// Size of SortedArray for N values (assuming u16 packed):
+///     8 bytes + 8 bytes + 8 bytes + 2 bytes * N
+/// 
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum U64Segment {
     /// A contiguous sequence of tombstones. This is the only way to represent
@@ -266,6 +287,30 @@ enum U64Segment {
     SortedArray(EncodedU64Array),
     Array(EncodedU64Array),
 }
+
+// struct SegmentStats {
+//     sorted: bool,
+//     min: u64,
+//     max: u64,
+//     num_holes: u64,
+//     num_tombstones: u64,
+//     len: u64,
+// }
+
+// fn choose_representation(stats: SegmentStats) {
+//     if stats.sorted {
+//         if stats.num_holes == 0 && stats.num_tombstones == 0 {
+//             // Can use Range
+//         } else if 
+//         } else if (stats.max - stats.min) > 16 * stats.len{
+//             // Dense enough to use RangeWithBitmap
+//         } else {
+//             // Sparse enough for array to make sense
+//         }
+//     } else {
+//         // Must use Array
+//     }
+// }
 
 impl U64Segment {
     fn iter(&self) -> Box<dyn DoubleEndedIterator<Item = u64> + '_> {

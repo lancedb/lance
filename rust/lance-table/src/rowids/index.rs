@@ -31,7 +31,7 @@ impl RowIdIndex {
         // We don't expect this pattern yet.
         if pieces.windows(2).any(|w| w[0].0.end() >= w[1].0.start()) {
             return Err(Error::NotSupported {
-                source: "".into(),
+                source: "Overlapping ranges are not yet supported".into(),
                 location: location!(),
             });
         }
