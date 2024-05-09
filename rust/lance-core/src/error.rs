@@ -150,30 +150,29 @@ impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(err: object_store::Error) -> Self {
         match err {
-            object_store::Error::NotFound { path, source } => Error::DatasetNotFound {
+            object_store::Error::NotFound { path, source } => Self::DatasetNotFound {
                 path,
                 source, // Directly use the source as it already is a BoxedError
                 location: std::panic::Location::caller().to_snafu_location(),
             },
-            object_store::Error::InvalidPath { source } => Error::InvalidInput {
-                source: Box::new(source), 
+            object_store::Error::InvalidPath { source } => Self::InvalidInput {
+                source: Box::new(source),
                 location: std::panic::Location::caller().to_snafu_location(),
             },
-            object_store::Error::JoinError { source } => Error::Internal {
+            object_store::Error::JoinError { source } => Self::Internal {
                 message: format!("Join error: {}", source),
                 location: std::panic::Location::caller().to_snafu_location(),
             },
-            object_store::Error::NotSupported { source } => Error::NotSupported {
+            object_store::Error::NotSupported { source } => Self::NotSupported {
                 source,
                 location: std::panic::Location::caller().to_snafu_location(),
             },
-            object_store::Error::AlreadyExists { path, ..} => Error::DatasetAlreadyExists {
+            object_store::Error::AlreadyExists { path, .. } => Self::DatasetAlreadyExists {
                 uri: path,
                 location: std::panic::Location::caller().to_snafu_location(),
             },
 
             // Map other `object_store::Error` variants as needed.
-
             _ => Self::IO {
                 message: (err.to_string()),
                 location: std::panic::Location::caller().to_snafu_location(),
