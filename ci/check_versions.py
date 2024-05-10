@@ -49,8 +49,8 @@ if __name__ == "__main__":
         # bumped correctly.
         pr_number = int(os.environ["PR_NUMBER"])
         pr = repo.get_pull(pr_number)
-        pr.labels = [label.name for label in pr.get_labels()]
-        has_breaking_changes = "breaking-change" in pr.labels or has_breaking_changes
+        pr_labels = [label.name for label in pr.get_labels()]
+        has_breaking_changes = "breaking-change" in pr_labels or has_breaking_changes
 
     if has_breaking_changes:
         # Minor version needs to have been bumped.
