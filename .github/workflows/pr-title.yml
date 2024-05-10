@@ -25,6 +25,9 @@ jobs:
     needs: labeler
     steps:
       - uses: actions/checkout@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - run: |
           pip install PyGithub
           python ci/check_versions.py
