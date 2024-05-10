@@ -44,10 +44,10 @@ if __name__ == "__main__":
     pr_labels = (label.name for pr in prs for label in pr.labels)
     has_breaking_changes = any(label == "breaking-change" for label in pr_labels)
 
-    if os.environ.get("GITHUB_REF_NAME"):
+    if os.environ.get("PR_NUMBER"):
         # If we're running on a PR, we should validate that the version has been
         # bumped correctly.
-        pr_number = int(os.environ["GITHUB_REF_NAME"].split("/")[2])
+        pr_number = int(os.environ["PR_NUMBER"])
         pr = repo.get_pull(pr_number)
         pr.labels = [label.name for label in pr.get_labels()]
         has_breaking_changes = "breaking-change" in pr.labels or has_breaking_changes
