@@ -713,7 +713,7 @@ mod tests {
 
         // From initial version, concurrently call create index 3 times,
         // two of which will be for the same column.
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
         let futures: Vec<_> = ["vector1", "vector1", "vector2"]
             .iter()
             .map(|col_name| {

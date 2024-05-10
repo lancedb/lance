@@ -2807,7 +2807,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_pq(2, 8, 4, false, MetricType::Cosine, 50);
+        let params = VectorIndexParams::ivf_pq(2, 8, 4, MetricType::Cosine, 50);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await

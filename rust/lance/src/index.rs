@@ -643,7 +643,7 @@ mod tests {
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
+        let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2);
         dataset
             .create_index(&["v"], IndexType::Vector, None, &params, true)
             .await
@@ -704,7 +704,7 @@ mod tests {
         // Make sure it returns None if there's no index with the passed identifier
         assert!(dataset.index_statistics("bad_id").await.is_err());
         // Create an index
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 10);
         dataset
             .create_index(
                 &[column_name],
@@ -767,7 +767,7 @@ mod tests {
 
         let test_uri = test_dir.path().to_str().unwrap();
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 10);
         dataset
             .create_index(
                 &[column_name],
