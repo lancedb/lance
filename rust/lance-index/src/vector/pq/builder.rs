@@ -16,7 +16,7 @@ use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_core::{Error, Result};
-use lance_linalg::distance::{Dot, L2};
+use lance_linalg::distance::{Dot, Normalize, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
 use snafu::{location, Location};
@@ -84,11 +84,14 @@ impl PQBuildParams {
         }
     }
 
-    pub async fn build_from_matrix<T: ArrowFloatType + Dot + L2 + 'static>(
+    pub async fn build_from_matrix<T: ArrowFloatType + 'static>(
         &self,
         data: &MatrixView<T>,
         metric_type: MetricType,
-    ) -> Result<Arc<dyn ProductQuantizer + 'static>> {
+    ) -> Result<Arc<dyn ProductQuantizer + 'static>>
+    where
+        T::Native: Dot + L2 + Normalize,
+    {
         assert_ne!(
             metric_type,
             MetricType::Cosine,
@@ -175,13 +178,14 @@ impl PQBuildParams {
     }
 }
 
-fn create_typed_pq<
-    T: ArrowFloatType<ArrayType = PrimitiveArray<T>> + ArrowNumericType + L2 + Dot,
->(
+fn create_typed_pq<T: ArrowFloatType<ArrayType = PrimitiveArray<T>> + ArrowNumericType>(
     proto: &Pq,
     metric_type: MetricType,
     array: &dyn Array,
-) -> Arc<dyn ProductQuantizer> {
+) -> Arc<dyn ProductQuantizer>
+where
+    <T as ArrowFloatType>::Native: Dot + L2,
+{
     Arc::new(ProductQuantizerImpl::<T>::new(
         proto.num_sub_vectors as usize,
         proto.num_bits,

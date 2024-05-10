@@ -12,6 +12,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use lance_linalg::distance::Normalize;
 use snafu::{location, Location};
 
 pub use builder::IvfBuildParams;
@@ -19,7 +20,7 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::kmeans::KMeans;
 use lance_linalg::{
-    distance::{Cosine, Dot, MetricType, L2},
+    distance::{Dot, MetricType, L2},
     MatrixView,
 };
 
@@ -39,13 +40,16 @@ pub mod shuffler;
 pub mod storage;
 mod transform;
 
-fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(
+fn new_ivf_impl<T: ArrowFloatType + ArrowPrimitiveType>(
     centroids: &T::ArrayType,
     dimension: usize,
     metric_type: MetricType,
     transforms: Vec<Arc<dyn Transformer>>,
     range: Option<Range<u32>>,
-) -> Arc<dyn Ivf> {
+) -> Arc<dyn Ivf>
+where
+    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
+{
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
     Arc::new(IvfImpl::<T>::new(mat, metric_type, "", transforms, range))
 }
@@ -98,14 +102,17 @@ pub fn new_ivf(
     }
 }
 
-fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(
+fn new_ivf_with_pq_impl<T: ArrowFloatType + ArrowPrimitiveType>(
     centroids: &T::ArrayType,
     dimension: usize,
     metric_type: MetricType,
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
-) -> Arc<dyn Ivf> {
+) -> Arc<dyn Ivf>
+where
+    <T as ArrowFloatType>::Native: Dot + L2,
+{
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
     Arc::new(IvfImpl::<T>::new_with_pq(
         mat,
@@ -202,13 +209,16 @@ pub fn new_ivf_with_sq(
     Ok(ivf)
 }
 
-fn new_ivf_with_sq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(
+fn new_ivf_with_sq_impl<T: ArrowFloatType + ArrowPrimitiveType>(
     centroids: &T::ArrayType,
     dimension: usize,
     metric_type: MetricType,
     vector_column: &str,
     range: Option<Range<u32>>,
-) -> Arc<dyn Ivf> {
+) -> Arc<dyn Ivf>
+where
+    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
+{
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
     Arc::new(IvfImpl::<T>::new_with_sq(
         mat,
@@ -276,7 +286,10 @@ pub trait Ivf: Send + Sync + std::fmt::Debug + Transformer {
 /// IVF - IVF file partition
 ///
 #[derive(Debug, Clone)]
-pub struct IvfImpl<T: ArrowFloatType + Dot + L2> {
+pub struct IvfImpl<T: ArrowFloatType>
+where
+    T::Native: Dot + L2,
+{
     /// KMean model of the IVF
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
@@ -292,7 +305,10 @@ pub struct IvfImpl<T: ArrowFloatType + Dot + L2> {
     metric_type: MetricType,
 }
 
-impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
+impl<T: ArrowFloatType + ArrowPrimitiveType> IvfImpl<T>
+where
+    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
+{
     pub fn new(
         centroids: MatrixView<T>,
         metric_type: MetricType,
@@ -411,7 +427,10 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
 }
 
 #[async_trait]
-impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
+impl<T: ArrowFloatType + ArrowPrimitiveType> Ivf for IvfImpl<T>
+where
+    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
+{
     async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
         let array = data
             .values()
@@ -490,7 +509,10 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
 }
 
 #[async_trait]
-impl<T: ArrowFloatType + Dot + L2> Transformer for IvfImpl<T> {
+impl<T: ArrowFloatType> Transformer for IvfImpl<T>
+where
+    T::Native: Dot + L2,
+{
     async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut batch = batch.clone();
         for transform in self.transforms.as_slice() {

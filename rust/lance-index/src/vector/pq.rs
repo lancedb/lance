@@ -58,7 +58,10 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 //
 // TODO: move this to be pub(crate) once we have a better way to test it.
 #[derive(Debug, Clone)]
-pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
+pub struct ProductQuantizerImpl<T: ArrowFloatType>
+where
+    T::Native: Dot + L2,
+{
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -93,7 +96,10 @@ pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
     pub codebook: Arc<T::ArrayType>,
 }
 
-impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType> ProductQuantizerImpl<T>
+where
+    T::Native: Dot + L2,
+{
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
     pub fn new(
         m: usize,
@@ -305,7 +311,10 @@ impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
 }
 
 #[async_trait]
-impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + 'static> ProductQuantizer for ProductQuantizerImpl<T>
+where
+    T::Native: Dot + L2,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
