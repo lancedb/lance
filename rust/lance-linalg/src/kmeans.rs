@@ -47,7 +47,7 @@ pub enum KMeanInit {
 
 /// KMean Training Parameters
 #[derive(Debug)]
-pub struct KMeansParams<T: ArrowFloatType> {
+pub struct KMeansParams {
     /// Max number of iterations.
     pub max_iters: u32,
 
@@ -62,32 +62,27 @@ pub struct KMeansParams<T: ArrowFloatType> {
     pub init: KMeanInit,
 
     /// The metric to calculate distance.
-    pub metric_type: MetricType,
-
-    /// Centroids to continuous training. If present, it will continuously train
-    /// from the given centroids. If None, it will initialize centroids via init method.
-    pub centroids: Option<Arc<T::ArrayType>>,
+    pub distance_type: DistanceType,
 }
 
-impl<T: ArrowFloatType> Default for KMeansParams<T> {
+impl Default for KMeansParams {
     fn default() -> Self {
         Self {
             max_iters: 50,
             tolerance: 1e-4,
             redos: 1,
             init: KMeanInit::Random,
-            metric_type: MetricType::L2,
-            centroids: None,
+            distance_type: DistanceType::L2,
         }
     }
 }
 
-impl<T: ArrowFloatType> KMeansParams<T> {
+impl KMeansParams {
     /// Create a new KMeansParams with cosine distance.
     #[allow(dead_code)]
     fn cosine() -> Self {
         Self {
-            metric_type: MetricType::Cosine,
+            distance_type: DistanceType::Cosine,
             ..Default::default()
         }
     }
@@ -335,7 +330,7 @@ where
     pub async fn new(data: &FixedSizeListArray, k: usize, max_iters: u32) -> Result<Self> {
         let params = KMeansParams {
             max_iters,
-            metric_type: MetricType::L2,
+            distance_type: MetricType::L2,
             ..Default::default()
         };
         Self::new_with_params(data, k, &params).await
@@ -347,7 +342,7 @@ where
     pub async fn new_with_params(
         data: &FixedSizeListArray,
         k: usize,
-        params: &KMeansParams<T>,
+        params: &KMeansParams,
     ) -> Result<Self> {
         let dimension = data.value_length() as usize;
         let n = data.len();
@@ -378,23 +373,16 @@ where
 
         let mat = MatrixView::<T>::new(Arc::new(data.clone()), dimension);
         // TODO: refactor kmeans to work with reference instead of Arc?
-        let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
+        let mut best_kmeans = Self::empty(k, dimension, params.distance_type);
         let mut best_stddev = f32::MAX;
 
         // TODO: use seed for Rng.
         let rng = SmallRng::from_entropy();
         for redo in 1..=params.redos {
-            let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
-                // Use existing centroids.
-                Self::with_centroids(centroids.clone(), dimension, params.metric_type)
-            } else {
-                match params.init {
-                    KMeanInit::Random => {
-                        Self::init_random(&mat, k, params.metric_type, rng.clone())?
-                    }
-                    KMeanInit::KMeanPlusPlus => {
-                        unimplemented!()
-                    }
+            let mut kmeans = match params.init {
+                KMeanInit::Random => Self::init_random(&mat, k, params.distance_type, rng.clone())?,
+                KMeanInit::KMeanPlusPlus => {
+                    unimplemented!()
                 }
             };
 
