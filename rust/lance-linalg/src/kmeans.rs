@@ -20,7 +20,7 @@ use arrow_schema::ArrowError;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use log::{info, warn};
-use num_traits::{AsPrimitive, Float, FromPrimitive, Zero};
+use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use tracing::instrument;
 
@@ -97,7 +97,8 @@ impl<T: ArrowFloatType> KMeansParams<T> {
 #[derive(Debug, Clone)]
 pub struct KMeans<T: ArrowFloatType>
 where
-    T: L2 + Dot,
+    T: Dot,
+    T::Native: L2,
 {
     /// Centroids for each of the k clusters.
     ///
@@ -116,7 +117,7 @@ where
 /// Randomly initialize kmeans centroids.
 ///
 ///
-fn kmeans_random_init<T: ArrowFloatType + Dot + L2 + Normalize>(
+fn kmeans_random_init<T: ArrowFloatType + Dot + Normalize>(
     data: &T::ArrayType,
     dimension: usize,
     k: usize,
@@ -124,7 +125,7 @@ fn kmeans_random_init<T: ArrowFloatType + Dot + L2 + Normalize>(
     metric_type: MetricType,
 ) -> Result<KMeans<T>>
 where
-    T::Native: AsPrimitive<f32>,
+    T::Native: AsPrimitive<f32> + L2,
 {
     assert!(data.len() >= k * dimension);
     let chosen = (0..data.len() / dimension)
@@ -173,10 +174,13 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
 
 impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
-    fn to_kmeans<T: ArrowFloatType + Dot + L2 + Normalize>(
+    fn to_kmeans<T: ArrowFloatType + Dot + Normalize>(
         &self,
         data: &[T::Native],
-    ) -> Result<KMeans<T>> {
+    ) -> Result<KMeans<T>>
+    where
+        T::Native: L2,
+    {
         let dimension = self.dimension;
 
         let mut cluster_cnts = vec![0_u64; self.k];
@@ -282,8 +286,8 @@ impl KMeanMembership {
 
 impl<T: ArrowFloatType> KMeans<T>
 where
-    T: L2 + Dot + Normalize,
-    T::Native: AsPrimitive<f32>,
+    T: Dot + Normalize,
+    T::Native: AsPrimitive<f32> + L2,
 {
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
         Self {
@@ -539,19 +543,16 @@ where
 
 /// Return a slice of `data[x,y..y+strip]`.
 #[inline]
-fn get_slice<T: Float>(data: &[T], x: usize, y: usize, dim: usize, strip: usize) -> &[T] {
+fn get_slice<T: Num>(data: &[T], x: usize, y: usize, dim: usize, strip: usize) -> &[T] {
     &data[x * dim + y..x * dim + y + strip]
 }
 
 /// Compute L2 kmeans partitions with small number of centroids, while the tiling overhead is big.
-fn compute_partitions_l2_small<'a, T: FloatToArrayType>(
+fn compute_partitions_l2_small<'a, T: L2>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
-) -> impl Iterator<Item = Option<(u32, f32)>> + 'a
-where
-    T::ArrowType: L2,
-{
+) -> impl Iterator<Item = Option<(u32, f32)>> + 'a {
     data.chunks(dim)
         .map(move |row| argmin_value_float(l2_distance_batch(row, centroids, dim)))
 }
@@ -570,14 +571,11 @@ where
 ///
 /// If the distance is not valid, returns ``None`` as placeholder.
 ///
-fn compute_partitions_l2<'a, T: FloatToArrayType>(
+fn compute_partitions_l2<'a, T: L2>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
-) -> Box<dyn Iterator<Item = Option<(u32, f32)>> + 'a>
-where
-    T::ArrowType: L2,
-{
+) -> Box<dyn Iterator<Item = Option<(u32, f32)>> + 'a> {
     if std::mem::size_of_val(centroids) <= 16 * 1024 {
         return Box::new(compute_partitions_l2_small(centroids, data, dim));
     }
@@ -646,7 +644,8 @@ pub async fn compute_partitions<T: ArrowFloatType>(
     metric_type: MetricType,
 ) -> Vec<Option<u32>>
 where
-    <T::Native as FloatToArrayType>::ArrowType: Dot + L2 + Normalize,
+    <T::Native as FloatToArrayType>::ArrowType: Dot + Normalize,
+    T::Native: L2,
 {
     let kmeans: KMeans<T> = KMeans::with_centroids(centroids, dimension, metric_type);
     let membership = kmeans.compute_membership(vectors).await;

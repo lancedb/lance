@@ -59,9 +59,9 @@ impl DistanceType {
     }
 
     /// Returns the distance function between two vectors.
-    pub fn func<T: FloatToArrayType>(&self) -> DistanceFunc<T>
+    pub fn func<T: FloatToArrayType + L2>(&self) -> DistanceFunc<T>
     where
-        T::ArrowType: L2 + Cosine + Dot,
+        T::ArrowType: Cosine + Dot,
     {
         match self {
             Self::L2 => l2,
