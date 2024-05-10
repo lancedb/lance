@@ -79,7 +79,7 @@ impl KMeans {
         }
         let fixed_size_arr = FixedSizeListArray::from(data);
         let params = KMeansParams {
-            metric_type: self.metric_type,
+            distance_type: self.metric_type,
             max_iters: self.max_iters,
             ..Default::default()
         };
