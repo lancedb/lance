@@ -6,8 +6,9 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::types::UInt32Type;
-use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
+use arrow_array::{cast::AsArray, Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use futures::{stream, StreamExt};
 use log::info;
@@ -115,9 +116,9 @@ where
 }
 
 #[async_trait::async_trait]
-impl<T: ArrowFloatType> Transformer for IvfTransformer<T>
+impl<T: ArrowFloatType + ArrowPrimitiveType> Transformer for IvfTransformer<T>
 where
-    T::Native: Dot + L2 + Normalize,
+    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
     async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {

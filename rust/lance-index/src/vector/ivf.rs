@@ -111,7 +111,7 @@ fn new_ivf_with_pq_impl<T: ArrowFloatType + ArrowPrimitiveType>(
     range: Option<Range<u32>>,
 ) -> Arc<dyn Ivf>
 where
-    <T as ArrowFloatType>::Native: Dot + L2,
+    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
     Arc::new(IvfImpl::<T>::new_with_pq(

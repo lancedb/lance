@@ -519,7 +519,6 @@ where
             MetricType::L2 => {
                 l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
             }
-
             MetricType::Dot => {
                 dot_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
             }

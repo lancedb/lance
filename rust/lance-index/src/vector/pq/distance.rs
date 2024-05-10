@@ -3,7 +3,6 @@
 
 use std::cmp::min;
 
-use lance_arrow::FloatToArrayType;
 use lance_linalg::distance::{l2_distance_batch, L2};
 
 use super::{num_centroids, utils::get_sub_vector_centroids};

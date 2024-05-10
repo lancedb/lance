@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use lance_arrow::{ArrowFloatType, FloatToArrayType};
+use lance_arrow::ArrowFloatType;
 use lance_core::{Error, Result};
 use lance_linalg::MatrixView;
 use snafu::{location, Location};
