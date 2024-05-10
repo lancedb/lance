@@ -4,7 +4,7 @@
 //! Dot product.
 
 use std::iter::Sum;
-use std::ops::{AddAssign, Neg};
+use std::ops::AddAssign;
 use std::sync::Arc;
 
 use crate::Error;
@@ -12,13 +12,11 @@ use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 use half::{bf16, f16};
-use lance_arrow::bfloat16::BFloat16Type;
-use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
+use lance_arrow::{ArrowFloatType, FloatArray};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
-use num_traits::real::Real;
-use num_traits::AsPrimitive;
+use num_traits::{real::Real, AsPrimitive, Num};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -64,29 +62,23 @@ fn dot_scalar<
 
 /// Dot product.
 #[inline]
-pub fn dot<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> f32
-where
-    T::ArrowType: Dot,
-{
-    T::ArrowType::dot(from, to)
+pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
+    T::dot(from, to)
 }
 
 /// Negative dot distance.
 #[inline]
-pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> f32
-where
-    T::ArrowType: Dot,
-{
-    T::ArrowType::dot(from, to).neg()
+pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
+    -T::dot(from, to)
 }
 
 /// Dot product
-pub trait Dot: ArrowFloatType {
+pub trait Dot: Num {
     /// Dot product.
-    fn dot(x: &[Self::Native], y: &[Self::Native]) -> f32;
+    fn dot(x: &[Self], y: &[Self]) -> f32;
 }
 
-impl Dot for BFloat16Type {
+impl Dot for bf16 {
     #[inline]
     fn dot(x: &[bf16], y: &[bf16]) -> f32 {
         dot_scalar::<bf16, f32, 32>(x, y)
@@ -109,7 +101,7 @@ mod kernel {
     }
 }
 
-impl Dot for Float16Type {
+impl Dot for f16 {
     #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f32 {
         match *FP16_SIMD_SUPPORT {
@@ -134,7 +126,7 @@ impl Dot for Float16Type {
     }
 }
 
-impl Dot for Float32Type {
+impl Dot for f32 {
     #[inline]
     fn dot(x: &[f32], y: &[f32]) -> f32 {
         // Manually unrolled 8 times to get enough registers.
@@ -190,7 +182,7 @@ impl Dot for Float32Type {
     }
 }
 
-impl Dot for Float64Type {
+impl Dot for f64 {
     #[inline]
     fn dot(x: &[f64], y: &[f64]) -> f32 {
         dot_scalar::<f64, f64, 8>(x, y) as f32
@@ -198,23 +190,23 @@ impl Dot for Float64Type {
 }
 
 /// Negative dot product, to present the relative order of dot distance.
-pub fn dot_distance_batch<'a, T: FloatToArrayType>(
+pub fn dot_distance_batch<'a, T: Dot>(
     from: &'a [T],
     to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a>
-where
-    T::ArrowType: Dot,
-{
+) -> Box<dyn Iterator<Item = f32> + 'a> {
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
     Box::new(to.chunks_exact(dimension).map(|v| dot_distance(from, v)))
 }
 
-fn do_dot_distance_arrow_batch<T: ArrowFloatType + Dot>(
+fn do_dot_distance_arrow_batch<T: ArrowFloatType>(
     from: &T::ArrayType,
     to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>> {
+) -> Result<Arc<Float32Array>>
+where
+    T::Native: Dot,
+{
     let dimension = to.value_length() as usize;
     debug_assert_eq!(from.len(), dimension);
 
@@ -285,20 +277,20 @@ mod tests {
         let x: Vec<f32> = (0..20).map(|v| v as f32).collect();
         let y: Vec<f32> = (100..120).map(|v| v as f32).collect();
 
-        assert_eq!(Float32Type::dot(&x, &y), dot(&x, &y));
+        assert_eq!(f32::dot(&x, &y), dot(&x, &y));
 
         let x: Vec<f32> = (0..512).map(|v| v as f32).collect();
         let y: Vec<f32> = (100..612).map(|v| v as f32).collect();
 
-        assert_eq!(Float32Type::dot(&x, &y), dot(&x, &y));
+        assert_eq!(f32::dot(&x, &y), dot(&x, &y));
 
         let x: Vec<f16> = (0..20).map(|v| f16::from_i32(v).unwrap()).collect();
         let y: Vec<f16> = (100..120).map(|v| f16::from_i32(v).unwrap()).collect();
-        assert_eq!(Float16Type::dot(&x, &y), dot(&x, &y));
+        assert_eq!(f16::dot(&x, &y), dot(&x, &y));
 
         let x: Vec<f64> = (20..40).map(|v| f64::from_i32(v).unwrap()).collect();
         let y: Vec<f64> = (120..140).map(|v| f64::from_i32(v).unwrap()).collect();
-        assert_eq!(Float64Type::dot(&x, &y), dot(&x, &y));
+        assert_eq!(f64::dot(&x, &y), dot(&x, &y));
     }
 
     /// Reference implementation of dot product.
@@ -325,10 +317,10 @@ mod tests {
         (2.0 * T::epsilon().as_() * dot) as f32
     }
 
-    fn do_dot_test<T: FloatToArrayType>(x: &[T], y: &[T]) -> std::result::Result<(), TestCaseError>
-    where
-        T::ArrowType: Dot,
-    {
+    fn do_dot_test<T: Dot + AsPrimitive<f64> + Float>(
+        x: &[T],
+        y: &[T],
+    ) -> std::result::Result<(), TestCaseError> {
         let f64_x = x.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
         let f64_y = y.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
 

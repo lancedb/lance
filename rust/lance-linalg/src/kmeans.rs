@@ -18,7 +18,7 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::ArrowError;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
-use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
+use lance_arrow::{ArrowFloatType, FloatArray};
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
@@ -97,8 +97,7 @@ impl<T: ArrowFloatType> KMeansParams<T> {
 #[derive(Debug, Clone)]
 pub struct KMeans<T: ArrowFloatType>
 where
-    T: Dot,
-    T::Native: L2,
+    T::Native: L2 + Dot,
 {
     /// Centroids for each of the k clusters.
     ///
@@ -117,7 +116,7 @@ where
 /// Randomly initialize kmeans centroids.
 ///
 ///
-fn kmeans_random_init<T: ArrowFloatType + Dot + Normalize>(
+fn kmeans_random_init<T: ArrowFloatType>(
     data: &T::ArrayType,
     dimension: usize,
     k: usize,
@@ -125,7 +124,7 @@ fn kmeans_random_init<T: ArrowFloatType + Dot + Normalize>(
     metric_type: MetricType,
 ) -> Result<KMeans<T>>
 where
-    T::Native: AsPrimitive<f32> + L2,
+    T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
 {
     assert!(data.len() >= k * dimension);
     let chosen = (0..data.len() / dimension)
@@ -174,12 +173,9 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
 
 impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
-    fn to_kmeans<T: ArrowFloatType + Dot + Normalize>(
-        &self,
-        data: &[T::Native],
-    ) -> Result<KMeans<T>>
+    fn to_kmeans<T: ArrowFloatType>(&self, data: &[T::Native]) -> Result<KMeans<T>>
     where
-        T::Native: L2,
+        T::Native: L2 + Dot + Normalize,
     {
         let dimension = self.dimension;
 
@@ -286,8 +282,7 @@ impl KMeanMembership {
 
 impl<T: ArrowFloatType> KMeans<T>
 where
-    T: Dot + Normalize,
-    T::Native: AsPrimitive<f32> + L2,
+    T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
 {
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
         Self {
@@ -644,8 +639,7 @@ pub async fn compute_partitions<T: ArrowFloatType>(
     metric_type: MetricType,
 ) -> Vec<Option<u32>>
 where
-    <T::Native as FloatToArrayType>::ArrowType: Dot + Normalize,
-    T::Native: L2,
+    T::Native: L2 + Dot + Normalize,
 {
     let kmeans: KMeans<T> = KMeans::with_centroids(centroids, dimension, metric_type);
     let membership = kmeans.compute_membership(vectors).await;
