@@ -31,12 +31,16 @@ def get_versions():
     return pylance_version
 
 
+def parse_version(version: str) -> tuple[int, int, int]:
+    return tuple(map(int, version.split(".")))
+
+
 if __name__ == "__main__":
-    new_version = get_versions().split(".")
+    new_version = parse_version(get_versions())
 
     repo = Github().get_repo(os.environ["GITHUB_REPOSITORY"])
     latest_release = repo.get_latest_release()
-    last_version = latest_release.tag_name[1:].split(".")
+    last_version = parse_version(latest_release.tag_name[1:])
 
     # Check for a breaking-change label in the PRs between the last release and the current commit.
     commits = repo.compare(latest_release.tag_name, os.environ["GITHUB_SHA"]).commits
