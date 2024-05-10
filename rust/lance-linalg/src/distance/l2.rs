@@ -100,9 +100,9 @@ pub fn l2_scalar<
 
 impl L2 for bf16 {
     #[inline]
-    fn l2(x: &[bf16], y: &[bf16]) -> f32 {
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
         // TODO: add SIMD support
-        l2_scalar::<bf16, f32, 16>(x, y)
+        l2_scalar::<Self, f32, 16>(x, y)
     }
 }
 
@@ -124,7 +124,7 @@ mod kernel {
 
 impl L2 for f16 {
     #[inline]
-    fn l2(x: &[f16], y: &[f16]) -> f32 {
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -142,20 +142,20 @@ impl L2 for f16 {
             SimdSupport::Avx2 => unsafe {
                 kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            _ => l2_scalar::<f16, f32, 16>(x, y),
+            _ => l2_scalar::<Self, f32, 16>(x, y),
         }
     }
 }
 
 impl L2 for f32 {
     #[inline]
-    fn l2(x: &[f32], y: &[f32]) -> f32 {
-        l2_scalar::<f32, f32, 32>(x, y)
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
+        l2_scalar::<Self, Self, 32>(x, y)
     }
 
     fn l2_batch<'a>(
-        x: &'a [f32],
-        y: &'a [f32],
+        x: &'a [Self],
+        y: &'a [Self],
         dimension: usize,
     ) -> Box<dyn Iterator<Item = f32> + 'a> {
         use self::f32::l2_once;
@@ -176,10 +176,8 @@ impl L2 for f32 {
 
 impl L2 for f64 {
     #[inline]
-    fn l2(x: &[f64], y: &[f64]) -> f32 {
-        // TODO: add SIMD support
-        // TODO: should we let this return f64 to avoid overflow?
-        l2_scalar::<f64, f64, 8>(x, y) as f32
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
+        l2_scalar::<Self, Self, 8>(x, y) as f32
     }
 }
 

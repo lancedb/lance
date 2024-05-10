@@ -32,7 +32,10 @@ fn cosine_scalar<T: Float>(x: &[T], y: &[T], dim: usize) -> Vec<T> {
         .collect()
 }
 
-fn run_bench<T: Cosine>(c: &mut Criterion) {
+fn run_bench<T: ArrowFloatType>(c: &mut Criterion)
+where
+    T::Native: Cosine,
+{
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
 
@@ -51,7 +54,7 @@ fn run_bench<T: Cosine>(c: &mut Criterion) {
         |b| {
             b.iter(|| {
                 black_box(
-                    cosine_distance_batch::<T>(key.as_slice(), target.as_slice(), DIMENSION)
+                    cosine_distance_batch(key.as_slice(), target.as_slice(), DIMENSION)
                         .collect::<Vec<_>>(),
                 );
             })

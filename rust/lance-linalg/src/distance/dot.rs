@@ -80,8 +80,8 @@ pub trait Dot: Num {
 
 impl Dot for bf16 {
     #[inline]
-    fn dot(x: &[bf16], y: &[bf16]) -> f32 {
-        dot_scalar::<bf16, f32, 32>(x, y)
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
+        dot_scalar::<Self, f32, 32>(x, y)
     }
 }
 
@@ -103,7 +103,7 @@ mod kernel {
 
 impl Dot for f16 {
     #[inline]
-    fn dot(x: &[f16], y: &[f16]) -> f32 {
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -121,14 +121,14 @@ impl Dot for f16 {
             SimdSupport::Avx2 => unsafe {
                 kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            _ => dot_scalar::<f16, f32, 16>(x, y),
+            _ => dot_scalar::<Self, f32, 16>(x, y),
         }
     }
 }
 
 impl Dot for f32 {
     #[inline]
-    fn dot(x: &[f32], y: &[f32]) -> f32 {
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
         // Manually unrolled 8 times to get enough registers.
         // TODO: avx512 can unroll more
         let x_unrolled_chunks = x.chunks_exact(64);
@@ -184,8 +184,8 @@ impl Dot for f32 {
 
 impl Dot for f64 {
     #[inline]
-    fn dot(x: &[f64], y: &[f64]) -> f32 {
-        dot_scalar::<f64, f64, 8>(x, y) as f32
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
+        dot_scalar::<Self, Self, 8>(x, y) as f32
     }
 }
 

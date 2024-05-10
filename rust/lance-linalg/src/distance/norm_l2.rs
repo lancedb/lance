@@ -39,7 +39,7 @@ mod kernel {
 
 impl Normalize for f16 {
     #[inline]
-    fn norm_l2(vector: &[f16]) -> f32 {
+    fn norm_l2(vector: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -57,21 +57,21 @@ impl Normalize for f16 {
             SimdSupport::Avx2 => unsafe {
                 kernel::norm_l2_f16_avx2(vector.as_ptr(), vector.len() as u32)
             },
-            _ => norm_l2_impl::<f16, f32, 32>(vector),
+            _ => norm_l2_impl::<Self, f32, 32>(vector),
         }
     }
 }
 
 impl Normalize for bf16 {
     #[inline]
-    fn norm_l2(vector: &[bf16]) -> f32 {
-        norm_l2_impl::<bf16, f32, 32>(vector)
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, f32, 32>(vector)
     }
 }
 
 impl Normalize for f32 {
     #[inline]
-    fn norm_l2(vector: &[f32]) -> f32 {
+    fn norm_l2(vector: &[Self]) -> f32 {
         let dim = vector.len();
         if dim % 16 == 0 {
             let mut sum = f32x16::zeros();
@@ -89,15 +89,15 @@ impl Normalize for f32 {
             sum.reduce_sum().sqrt()
         } else {
             // Fallback to scalar
-            norm_l2_impl::<f32, f32, 16>(vector)
+            norm_l2_impl::<Self, Self, 16>(vector)
         }
     }
 }
 
 impl Normalize for f64 {
     #[inline]
-    fn norm_l2(vector: &[f64]) -> f32 {
-        norm_l2_impl::<f64, f64, 8>(vector) as f32
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, Self, 8>(vector) as f32
     }
 }
 

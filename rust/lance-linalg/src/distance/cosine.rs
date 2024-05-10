@@ -84,7 +84,7 @@ mod kernel {
 }
 
 impl Cosine for f16 {
-    fn cosine_fast(x: &[f16], x_norm: f32, y: &[f16]) -> f32 {
+    fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -128,7 +128,7 @@ mod f32 {
 
 impl Cosine for f32 {
     #[inline]
-    fn cosine_fast(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
+    fn cosine_fast(x: &[Self], x_norm: Self, other: &[Self]) -> f32 {
         let dim = x.len();
         let unrolled_len = dim / 16 * 16;
         let mut y_norm16 = f32x16::zeros();
@@ -160,7 +160,7 @@ impl Cosine for f32 {
     }
 
     #[inline]
-    fn cosine_with_norms(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> Self {
+    fn cosine_with_norms(x: &[Self], x_norm: Self, y_norm: Self, y: &[Self]) -> Self {
         let dim = x.len();
         let unrolled_len = dim / 16 * 16;
         let mut xy16 = f32x16::zeros();
