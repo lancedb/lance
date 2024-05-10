@@ -1694,7 +1694,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         // Creates 400 rows in 10 fragments
-        let mut dataset = create_dataset(test_uri).await;
+        let mut dataset = create_dataset(test_uri, false).await;
         // Delete last 20 rows in first fragment
         dataset.delete("i >= 20").await.unwrap();
         // Last fragment has 20 rows but 40 addressible rows
