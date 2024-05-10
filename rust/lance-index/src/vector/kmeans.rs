@@ -6,11 +6,10 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use log::info;
 use rand::{seq::IteratorRandom, Rng};
 use snafu::{location, Location};
-use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use lance_linalg::{
-    distance::{Dot, MetricType, Normalize, L2},
+    distance::{DistanceType, Dot, Normalize, L2},
     kmeans::{KMeans, KMeansParams},
 };
 
@@ -18,13 +17,12 @@ use lance_linalg::{
 #[allow(clippy::too_many_arguments)]
 pub async fn train_kmeans<T: ArrowFloatType>(
     array: &T::ArrayType,
-    centroids: Option<Arc<T::ArrayType>>,
     dimension: usize,
     k: usize,
     max_iterations: u32,
     redos: usize,
     mut rng: impl Rng,
-    metric_type: MetricType,
+    distance_type: DistanceType,
     sample_rate: usize,
 ) -> Result<T::ArrayType>
 where
@@ -60,8 +58,7 @@ where
 
     let params = KMeansParams {
         max_iters: max_iterations,
-        metric_type,
-        centroids,
+        distance_type,
         redos,
         ..Default::default()
     };

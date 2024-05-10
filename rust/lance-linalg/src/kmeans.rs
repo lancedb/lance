@@ -47,7 +47,7 @@ pub enum KMeanInit {
 
 /// KMean Training Parameters
 #[derive(Debug)]
-pub struct KMeansParams<T: ArrowFloatType> {
+pub struct KMeansParams {
     /// Max number of iterations.
     pub max_iters: u32,
 
@@ -62,32 +62,27 @@ pub struct KMeansParams<T: ArrowFloatType> {
     pub init: KMeanInit,
 
     /// The metric to calculate distance.
-    pub metric_type: MetricType,
-
-    /// Centroids to continuous training. If present, it will continuously train
-    /// from the given centroids. If None, it will initialize centroids via init method.
-    pub centroids: Option<Arc<T::ArrayType>>,
+    pub distance_type: DistanceType,
 }
 
-impl<T: ArrowFloatType> Default for KMeansParams<T> {
+impl Default for KMeansParams {
     fn default() -> Self {
         Self {
             max_iters: 50,
             tolerance: 1e-4,
             redos: 1,
             init: KMeanInit::Random,
-            metric_type: MetricType::L2,
-            centroids: None,
+            distance_type: DistanceType::L2,
         }
     }
 }
 
-impl<T: ArrowFloatType> KMeansParams<T> {
+impl KMeansParams {
     /// Create a new KMeansParams with cosine distance.
     #[allow(dead_code)]
     fn cosine() -> Self {
         Self {
-            metric_type: MetricType::Cosine,
+            distance_type: DistanceType::Cosine,
             ..Default::default()
         }
     }
@@ -110,7 +105,7 @@ where
     /// The number of clusters
     pub k: usize,
 
-    pub metric_type: MetricType,
+    pub distance_type: DistanceType,
 }
 
 /// Randomly initialize kmeans centroids.
@@ -151,7 +146,7 @@ pub struct KMeanMembership {
     /// Number of centroids.
     k: usize,
 
-    metric_type: MetricType,
+    distance_type: DistanceType,
 }
 
 /// Split one big cluster into two smaller clusters. After split, each
@@ -233,7 +228,7 @@ impl KMeanMembership {
             centroids: Arc::new(new_centroids.into()),
             dimension,
             k: self.k,
-            metric_type: self.metric_type,
+            distance_type: self.distance_type,
         })
     }
 
@@ -284,12 +279,12 @@ impl<T: ArrowFloatType> KMeans<T>
 where
     T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
 {
-    fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
+    fn empty(k: usize, dimension: usize, distance_type: DistanceType) -> Self {
         Self {
             centroids: T::empty_array().into(),
             dimension,
             k,
-            metric_type,
+            distance_type,
         }
     }
 
@@ -298,14 +293,14 @@ where
     pub fn with_centroids(
         centroids: Arc<T::ArrayType>,
         dimension: usize,
-        metric_type: MetricType,
+        distance_type: DistanceType,
     ) -> Self {
         let k = centroids.len() / dimension;
         Self {
             centroids,
             dimension,
             k,
-            metric_type,
+            distance_type,
         }
     }
 
@@ -335,7 +330,7 @@ where
     pub async fn new(data: &FixedSizeListArray, k: usize, max_iters: u32) -> Result<Self> {
         let params = KMeansParams {
             max_iters,
-            metric_type: MetricType::L2,
+            distance_type: MetricType::L2,
             ..Default::default()
         };
         Self::new_with_params(data, k, &params).await
@@ -347,7 +342,7 @@ where
     pub async fn new_with_params(
         data: &FixedSizeListArray,
         k: usize,
-        params: &KMeansParams<T>,
+        params: &KMeansParams,
     ) -> Result<Self> {
         let dimension = data.value_length() as usize;
         let n = data.len();
@@ -378,23 +373,16 @@ where
 
         let mat = MatrixView::<T>::new(Arc::new(data.clone()), dimension);
         // TODO: refactor kmeans to work with reference instead of Arc?
-        let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
+        let mut best_kmeans = Self::empty(k, dimension, params.distance_type);
         let mut best_stddev = f32::MAX;
 
         // TODO: use seed for Rng.
         let rng = SmallRng::from_entropy();
         for redo in 1..=params.redos {
-            let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
-                // Use existing centroids.
-                Self::with_centroids(centroids.clone(), dimension, params.metric_type)
-            } else {
-                match params.init {
-                    KMeanInit::Random => {
-                        Self::init_random(&mat, k, params.metric_type, rng.clone())?
-                    }
-                    KMeanInit::KMeanPlusPlus => {
-                        unimplemented!()
-                    }
+            let mut kmeans = match params.init {
+                KMeanInit::Random => Self::init_random(&mat, k, params.distance_type, rng.clone())?,
+                KMeanInit::KMeanPlusPlus => {
+                    unimplemented!()
                 }
             };
 
@@ -458,7 +446,7 @@ where
     pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
-        let distance_type = self.metric_type;
+        let distance_type = self.distance_type;
         const CHUNK_SIZE: usize = 1024;
 
         let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
@@ -502,7 +490,7 @@ where
             dimension,
             cluster_id_and_distances: cluster_with_distances.iter().flatten().copied().collect(),
             k: self.k,
-            metric_type: self.metric_type,
+            distance_type: self.distance_type,
         }
     }
 
@@ -515,7 +503,7 @@ where
             )));
         };
 
-        let dists: Vec<f32> = match self.metric_type {
+        let dists: Vec<f32> = match self.distance_type {
             MetricType::L2 => {
                 l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
             }
@@ -525,7 +513,7 @@ where
             _ => {
                 panic!(
                     "KMeans::find_partitions: {} is not supported",
-                    self.metric_type
+                    self.distance_type
                 );
             }
         };

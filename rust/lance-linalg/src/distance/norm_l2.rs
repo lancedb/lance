@@ -10,11 +10,6 @@ use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Float, Num};
 
-use crate::simd::{
-    f32::{f32x16, f32x8},
-    SIMD,
-};
-
 /// L2 normalization
 pub trait Normalize: Num {
     /// L2 Normalization over a Vector.
@@ -72,25 +67,7 @@ impl Normalize for bf16 {
 impl Normalize for f32 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        let dim = vector.len();
-        if dim % 16 == 0 {
-            let mut sum = f32x16::zeros();
-            for i in (0..dim).step_by(16) {
-                let x = unsafe { f32x16::load_unaligned(vector.as_ptr().add(i)) };
-                sum += x * x;
-            }
-            sum.reduce_sum().sqrt()
-        } else if dim % 8 == 0 {
-            let mut sum = f32x8::zeros();
-            for i in (0..dim).step_by(8) {
-                let x = unsafe { f32x8::load_unaligned(vector.as_ptr().add(i)) };
-                sum += x * x;
-            }
-            sum.reduce_sum().sqrt()
-        } else {
-            // Fallback to scalar
-            norm_l2_impl::<Self, Self, 16>(vector)
-        }
+        norm_l2_impl::<Self, Self, 16>(vector)
     }
 }
 
