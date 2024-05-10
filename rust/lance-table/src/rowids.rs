@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use core::num;
-use std::ops::{Range, RangeInclusive};
+use std::{f32::consts::E, ops::{Range, RangeInclusive}};
 
 use snafu::{location, Location};
 
@@ -280,12 +280,85 @@ impl RowIdSequence {
 /// 
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum U64Segment {
-    /// A contiguous sequence of tombstones. This is the only way to represent
-    /// tombstones. All other segments are assumed to not contain tombstones.
-    Tombstones(u64),
+    /// A contiguous sorted range of row ids.
+    /// 
+    /// Total size: 16 bytes
     Range(Range<u64>),
+    /// A sorted range of row ids, that is mostly contiguous.
+    /// 
+    /// Total size: 24 bytes + n_holes * 4 bytes
+    /// Use when: 32 * n_holes < max - min
+    RangeWithHoles {
+        range: Range<u64>,
+        /// Bitmap of offsets from the start of the range that are holes.
+        /// This is sorted, so binary search can be used. It's typically
+        /// relatively small.
+        holes: EncodedU64Array,
+    },
+    /// A sorted range of row ids, that is mostly contiguous.
+    /// 
+    /// Total size: 24 bytes + ceil((max - min) / 8) bytes
+    /// Use when: max - min > 16 * len
+    RangeWithBitmap {
+        range: Range<u64>,
+        bitmap: Vec<u8>,
+    },
+    /// A sorted array of row ids, that is sparse.
+    /// 
+    /// Total size: 24 bytes + 2 * n_values bytes
     SortedArray(EncodedU64Array),
+    /// An array of row ids, that is not sorted.
     Array(EncodedU64Array),
+}
+
+impl U64Segment {
+    fn from_slice(slice: &[u64]) -> Self {
+        // Stats to collect
+        let mut sorted = true;
+        let mut min = u64::MAX;
+        let mut max = 0;
+        let mut count = 0;
+
+        for &val in slice {
+            count += 1;
+            if val < min {
+                min = val;
+            }
+            if val > max {
+                max = val;
+            }
+            if sorted && count > 1 && val < slice[count - 2] {
+                sorted = false;
+            }
+        }
+
+        let n_holes = max - min - count + 1;
+        if sorted {
+            if n_holes == 0 {
+                Self::Range(min..max)
+            } else if 32 * n_holes < max - min {
+                // Use RangeWithHoles
+                todo!("Use range with holes")
+            } else if max - min > 16 * count as u64 {
+                let range = min..max;
+                let mut bitmap = vec![0; ((max - min) / 8) as usize];
+                
+                let mut slice_iter = slice.iter().copied();
+                
+                for (offset, val) in range.clone().enumerate() {
+                    todo!("fill in bitmap");
+                }
+                
+                Self::RangeWithBitmap { range, bitmap }
+            } else {
+                // Must use array, but at least it's sorted
+                Self::SortedArray(EncodedU64Array::from_iter(slice.iter().copied()))
+            }
+        } else {
+            // Must use array
+            Self::Array(EncodedU64Array::from_iter(slice.iter().copied()))
+        }
+    }
 }
 
 // struct SegmentStats {
