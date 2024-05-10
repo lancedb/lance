@@ -105,7 +105,7 @@ where
     /// The number of clusters
     pub k: usize,
 
-    pub metric_type: MetricType,
+    pub distance_type: DistanceType,
 }
 
 /// Randomly initialize kmeans centroids.
@@ -146,7 +146,7 @@ pub struct KMeanMembership {
     /// Number of centroids.
     k: usize,
 
-    metric_type: MetricType,
+    distance_type: DistanceType,
 }
 
 /// Split one big cluster into two smaller clusters. After split, each
@@ -228,7 +228,7 @@ impl KMeanMembership {
             centroids: Arc::new(new_centroids.into()),
             dimension,
             k: self.k,
-            metric_type: self.metric_type,
+            distance_type: self.distance_type,
         })
     }
 
@@ -279,12 +279,12 @@ impl<T: ArrowFloatType> KMeans<T>
 where
     T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
 {
-    fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
+    fn empty(k: usize, dimension: usize, distance_type: DistanceType) -> Self {
         Self {
             centroids: T::empty_array().into(),
             dimension,
             k,
-            metric_type,
+            distance_type,
         }
     }
 
@@ -293,14 +293,14 @@ where
     pub fn with_centroids(
         centroids: Arc<T::ArrayType>,
         dimension: usize,
-        metric_type: MetricType,
+        distance_type: DistanceType,
     ) -> Self {
         let k = centroids.len() / dimension;
         Self {
             centroids,
             dimension,
             k,
-            metric_type,
+            distance_type,
         }
     }
 
@@ -446,7 +446,7 @@ where
     pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
-        let distance_type = self.metric_type;
+        let distance_type = self.distance_type;
         const CHUNK_SIZE: usize = 1024;
 
         let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
@@ -490,7 +490,7 @@ where
             dimension,
             cluster_id_and_distances: cluster_with_distances.iter().flatten().copied().collect(),
             k: self.k,
-            metric_type: self.metric_type,
+            distance_type: self.distance_type,
         }
     }
 
@@ -503,7 +503,7 @@ where
             )));
         };
 
-        let dists: Vec<f32> = match self.metric_type {
+        let dists: Vec<f32> = match self.distance_type {
             MetricType::L2 => {
                 l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
             }
@@ -513,7 +513,7 @@ where
             _ => {
                 panic!(
                     "KMeans::find_partitions: {} is not supported",
-                    self.metric_type
+                    self.distance_type
                 );
             }
         };
