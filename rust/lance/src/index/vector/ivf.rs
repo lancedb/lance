@@ -1095,11 +1095,8 @@ async fn build_ivf_model_and_pq(
     sanity_check_params(ivf_params, pq_params)?;
 
     info!(
-        "Building vector index: IVF{},{}PQ{}, metric={}",
-        ivf_params.num_partitions,
-        if pq_params.use_opq { "O" } else { "" },
-        pq_params.num_sub_vectors,
-        metric_type,
+        "Building vector index: IVF{},PQ{}, metric={}",
+        ivf_params.num_partitions, pq_params.num_sub_vectors, metric_type,
     );
 
     let field = sanity_check(dataset, column)?;

@@ -1301,16 +1301,6 @@ fn prepare_vector_index_params(
             pq_params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
         };
 
-        if let Some(o) = kwargs.get_item("use_opq")? {
-            #[cfg(not(feature = "opq"))]
-            if PyAny::downcast::<PyBool>(o)?.extract()? {
-                return Err(PyValueError::new_err(
-                    "Feature 'opq' is not installed.".to_string(),
-                ));
-            }
-            pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
-        };
-
         if let Some(c) = kwargs.get_item("pq_codebook")? {
             let batch = RecordBatch::from_pyarrow(c)?;
             if "_pq_codebook" != batch.schema().field(0).name() {
@@ -1320,10 +1310,6 @@ fn prepare_vector_index_params(
             }
             let codebook = as_fixed_size_list_array(batch.column(0));
             pq_params.codebook = Some(codebook.values().clone())
-        };
-
-        if let Some(o) = kwargs.get_item("max_opq_iterations")? {
-            pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
         };
     }
 
