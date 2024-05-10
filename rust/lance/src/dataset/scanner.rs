@@ -1594,7 +1594,7 @@ pub mod test_dataset {
         }
 
         pub async fn make_vector_index(&mut self) -> Result<()> {
-            let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
+            let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2);
             self.dataset
                 .create_index(
                     &["vec"],
@@ -2409,7 +2409,7 @@ mod test {
                 &["vector"],
                 IndexType::Vector,
                 None,
-                &VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2),
+                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
                 false,
             )
             .await
@@ -2635,7 +2635,7 @@ mod test {
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
-            VectorIndexParams::ivf_pq(4, 8, 2, false, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
         ];
         for params in vec_params {
             let test_dir = tempdir().unwrap();
@@ -2993,7 +2993,7 @@ mod test {
                     &["vector"],
                     IndexType::Vector,
                     None,
-                    &VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2),
+                    &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
                     false,
                 )
                 .await

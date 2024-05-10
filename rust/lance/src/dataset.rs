@@ -3064,7 +3064,7 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Make sure valid arguments should create index successfully
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
         dataset
             .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
             .await
@@ -4827,7 +4827,7 @@ mod tests {
         )
         .await?;
 
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
         dataset
             .create_index(&["vec"], IndexType::Vector, None, &params, false)
             .await?;

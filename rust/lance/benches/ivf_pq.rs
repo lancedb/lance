@@ -84,7 +84,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
         |b| {
             b.to_async(&rt).iter(|| async {
                 let params =
-                    VectorIndexParams::ivf_pq(ivf_partition, 8, pq, false, MetricType::Cosine, 50);
+                    VectorIndexParams::ivf_pq(ivf_partition, 8, pq, MetricType::Cosine, 50);
 
                 dataset
                     .clone()
@@ -105,8 +105,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
         format!("CreateIVF{},PQ{}(d={},metric=l2)", ivf_partition, pq, DIM).as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
-                let params =
-                    VectorIndexParams::ivf_pq(ivf_partition, 8, pq, false, MetricType::L2, 50);
+                let params = VectorIndexParams::ivf_pq(ivf_partition, 8, pq, MetricType::L2, 50);
 
                 dataset
                     .clone()

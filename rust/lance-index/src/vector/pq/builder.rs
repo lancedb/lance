@@ -35,15 +35,8 @@ pub struct PQBuildParams {
     /// The number of bits to present one PQ centroid.
     pub num_bits: usize,
 
-    /// Train as optimized product quantization.
-    pub use_opq: bool,
-
     /// The max number of iterations for kmeans training.
     pub max_iters: usize,
-
-    /// Max number of iterations to train Optimized Product Quantization,
-    /// if `use_opq` is true.
-    pub max_opq_iters: usize,
 
     /// User provided codebook.
     pub codebook: Option<ArrayRef>,
@@ -57,9 +50,7 @@ impl Default for PQBuildParams {
         Self {
             num_sub_vectors: 16,
             num_bits: 8,
-            use_opq: false,
             max_iters: 50,
-            max_opq_iters: 50,
             codebook: None,
             sample_rate: 256,
         }

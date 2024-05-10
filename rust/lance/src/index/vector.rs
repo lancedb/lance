@@ -73,7 +73,6 @@ impl VectorIndexParams {
         num_partitions: usize,
         num_bits: u8,
         num_sub_vectors: usize,
-        use_opq: bool,
         metric_type: MetricType,
         max_iterations: usize,
     ) -> Self {
@@ -83,9 +82,7 @@ impl VectorIndexParams {
         let pq_params = PQBuildParams {
             num_bits: num_bits as usize,
             num_sub_vectors,
-            use_opq,
             max_iters: max_iterations,
-            max_opq_iters: max_iterations,
             ..Default::default()
         };
         stages.push(StageParams::PQ(pq_params));
@@ -357,25 +354,6 @@ pub(crate) async fn open_vector_index(
                         message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
                         location: location!(),
                     });
-                }
-                #[cfg(feature = "opq")]
-                match tf.r#type() {
-                    pb::TransformType::Opq => {
-                        let opq = OptimizedProductQuantizer::load(
-                            reader.as_ref(),
-                            tf.position as usize,
-                            tf.shape
-                                .iter()
-                                .map(|s| *s as usize)
-                                .collect::<Vec<_>>()
-                                .as_slice(),
-                        )
-                        .await?;
-                        last_stage = Some(Arc::new(OPQIndex::new(
-                            last_stage.as_ref().unwrap().clone(),
-                            opq,
-                        )));
-                    }
                 }
             }
             Some(Stage::Ivf(ivf_pb)) => {
