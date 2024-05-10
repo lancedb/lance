@@ -10,13 +10,13 @@ use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use lance_linalg::{
-    distance::{Dot, MetricType, L2},
+    distance::{Dot, MetricType, Normalize, L2},
     kmeans::{KMeans, KMeansParams},
 };
 
 /// Train KMeans model and returns the centroids of each cluster.
 #[allow(clippy::too_many_arguments)]
-pub async fn train_kmeans<T: ArrowFloatType + Dot + L2>(
+pub async fn train_kmeans<T: ArrowFloatType>(
     array: &T::ArrayType,
     centroids: Option<Arc<T::ArrayType>>,
     dimension: usize,
@@ -26,7 +26,10 @@ pub async fn train_kmeans<T: ArrowFloatType + Dot + L2>(
     mut rng: impl Rng,
     metric_type: MetricType,
     sample_rate: usize,
-) -> Result<T::ArrayType> {
+) -> Result<T::ArrayType>
+where
+    T::Native: Dot + L2 + Normalize,
+{
     let num_rows = array.len() / dimension;
     if num_rows < k {
         return Err(Error::Index{message: format!(

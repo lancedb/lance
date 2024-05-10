@@ -57,9 +57,12 @@ use lance_io::{
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
-use lance_linalg::kernels::{normalize_arrow, normalize_fsl};
 use lance_linalg::{
-    distance::{Cosine, DistanceType, Dot, MetricType, L2},
+    distance::Normalize,
+    kernels::{normalize_arrow, normalize_fsl},
+};
+use lance_linalg::{
+    distance::{DistanceType, Dot, MetricType, L2},
     MatrixView,
 };
 use log::{debug, info};
@@ -1615,12 +1618,15 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-async fn do_train_ivf_model<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+async fn do_train_ivf_model<T: ArrowFloatType + 'static>(
     data: &T::ArrayType,
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
-) -> Result<Ivf> {
+) -> Result<Ivf>
+where
+    T::Native: Dot + L2 + Normalize,
+{
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
     let centroids = lance_index::vector::kmeans::train_kmeans::<T>(

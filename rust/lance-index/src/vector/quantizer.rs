@@ -234,7 +234,10 @@ impl Quantization for dyn ProductQuantizer {
     }
 }
 
-impl<T: ArrowFloatType + Dot + L2 + 'static> Quantization for ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + 'static> Quantization for ProductQuantizerImpl<T>
+where
+    T::Native: Dot + L2,
+{
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
 
