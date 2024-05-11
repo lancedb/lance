@@ -69,12 +69,8 @@ public class Dataset implements Closeable {
     }
   }
 
-  private static native Dataset createWithFfiSchema(long arrowSchemaMemoryAddress, String path,
-      Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile, Optional<String> mode);
-
   /**
-   * Write a dataset to the specified path.
+   * Create a dataset with given stream.
    *
    * @param allocator buffer allocator
    * @param stream    arrow stream
@@ -82,16 +78,20 @@ public class Dataset implements Closeable {
    * @param params    write parameters
    * @return Dataset
    */
-  public static Dataset write(BufferAllocator allocator, ArrowArrayStream stream,
+  public static Dataset create(BufferAllocator allocator, ArrowArrayStream stream,
       String path, WriteParams params) {
-    var dataset = writeWithFfiStream(stream.memoryAddress(), path,
+    var dataset = createWithFfiStream(stream.memoryAddress(), path,
         params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
         params.getMaxBytesPerFile(), params.getMode());
     dataset.allocator = allocator;
     return dataset;
   }
 
-  private static native Dataset writeWithFfiStream(long arrowStreamMemoryAddress, String path,
+  private static native Dataset createWithFfiSchema(long arrowSchemaMemoryAddress, String path,
+      Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile, Optional<String> mode);
+
+  private static native Dataset createWithFfiStream(long arrowStreamMemoryAddress, String path,
       Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile, Optional<String> mode);
 
