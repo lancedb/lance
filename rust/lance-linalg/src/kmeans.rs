@@ -300,7 +300,6 @@ where
     /// - *data*: a `N * dimension` floating array. Not necessarily normalized.
     ///
     fn compute_membership_and_loss(&self, data: &[T::Native]) -> (Vec<Option<u32>>, f64) {
-        // TODO: consolidate with `compute_membership`.
         let centroids = self.centroids.as_ref().as_slice();
         let cluster_and_dists = data
             .par_chunks(self.dimension)
