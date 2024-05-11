@@ -535,17 +535,18 @@ where
         assert!(_nprobes.is_none());
         let centroids = self.centroids.as_ref().as_slice();
         data.par_chunks(self.dimension)
-            .map(|vec| match self.distance_type {
-                MetricType::L2 => argmin_value(l2_distance_batch(vec, centroids, self.dimension))
-                    .map(|(idx, _)| idx),
-                MetricType::Dot => argmin_value(dot_distance_batch(vec, centroids, self.dimension))
-                    .map(|(idx, _)| idx),
-                _ => {
-                    panic!(
-                        "KMeans::find_partitions: {} is not supported",
-                        self.distance_type
-                    );
-                }
+            .map(|vec| {
+                argmin_value(match self.distance_type {
+                    MetricType::L2 => l2_distance_batch(vec, centroids, self.dimension),
+                    MetricType::Dot => dot_distance_batch(vec, centroids, self.dimension),
+                    _ => {
+                        panic!(
+                            "KMeans::find_partitions: {} is not supported",
+                            self.distance_type
+                        );
+                    }
+                })
+                .map(|(idx, _)| idx)
             })
             .collect::<Vec<_>>()
     }
