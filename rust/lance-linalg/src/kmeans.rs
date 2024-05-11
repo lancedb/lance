@@ -3,7 +3,7 @@
 
 //! KMeans implementation for Apache Arrow Arrays.
 //!
-//! Support ``l2``, ``cosine`` and ``dot`` distances, see [MetricType].
+//! Support ``l2``, ``cosine`` and ``dot`` distances, see [DistanceType].
 //!
 //! ``Cosine`` distance are calculated by normalizing the vectors to unit length,
 //! and run ``l2`` distance on the unit vectors.
@@ -30,7 +30,7 @@ use crate::{
     clustering::Clustering,
     distance::{
         l2::{l2, l2_distance_batch, L2},
-        Dot, MetricType,
+        Dot,
     },
     kernels::argmin_value,
     matrix::MatrixView,
@@ -115,7 +115,7 @@ fn kmeans_random_init<T: ArrowFloatType>(
     dimension: usize,
     k: usize,
     mut rng: impl Rng,
-    metric_type: MetricType,
+    distance_type: DistanceType,
 ) -> Result<KMeans<T>>
 where
     T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
@@ -128,7 +128,7 @@ where
     for i in chosen {
         builder.extend(data.as_slice()[i * dimension..(i + 1) * dimension].iter());
     }
-    let mut kmeans = KMeans::empty(k, dimension, metric_type);
+    let mut kmeans = KMeans::empty(k, dimension, distance_type);
     kmeans.centroids = Arc::new(builder.into());
     Ok(kmeans)
 }
@@ -184,12 +184,12 @@ where
     /// Parameters
     /// - *data*: training data. provided to do samplings.
     /// - *k*: the number of clusters.
-    /// - *metric_type*: the metric type to calculate distance.
+    /// - *distance_type*: the distance type to calculate distance.
     /// - *rng*: random generator.
     pub fn init_random(
         data: &MatrixView<T>,
         k: usize,
-        metric_type: MetricType,
+        distance_type: DistanceType,
         rng: impl Rng,
     ) -> Result<Self> {
         kmeans_random_init(
@@ -197,7 +197,7 @@ where
             data.num_columns(),
             k,
             rng,
-            metric_type,
+            distance_type,
         )
     }
 
@@ -205,7 +205,7 @@ where
     pub async fn new(data: &FixedSizeListArray, k: usize, max_iters: u32) -> Result<Self> {
         let params = KMeansParams {
             max_iters,
-            distance_type: MetricType::L2,
+            distance_type: DistanceType::L2,
             ..Default::default()
         };
         Self::new_with_params(data, k, &params).await
@@ -213,7 +213,7 @@ where
 
     /// Train a [`KMeans`] model with full parameters.
     ///
-    /// If the MetricType is `Cosine`, the input vectors will be normalized with each iteration.
+    /// If the DistanceType is `Cosine`, the input vectors will be normalized with each iteration.
     pub async fn new_with_params(
         data: &FixedSizeListArray,
         k: usize,
@@ -305,8 +305,8 @@ where
             .par_chunks(self.dimension)
             .map(|vec| {
                 argmin_value(match self.distance_type {
-                    MetricType::L2 => l2_distance_batch(vec, centroids, self.dimension),
-                    MetricType::Dot => dot_distance_batch(vec, centroids, self.dimension),
+                    DistanceType::L2 => l2_distance_batch(vec, centroids, self.dimension),
+                    DistanceType::Dot => dot_distance_batch(vec, centroids, self.dimension),
                     _ => {
                         panic!(
                             "KMeans::find_partitions: {} is not supported",
@@ -408,10 +408,10 @@ where
         assert_eq!(query.len(), self.dimension);
 
         let dists: Vec<f32> = match self.distance_type {
-            MetricType::L2 => {
+            DistanceType::L2 => {
                 l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
             }
-            MetricType::Dot => {
+            DistanceType::Dot => {
                 dot_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
             }
             _ => {
@@ -439,8 +439,8 @@ where
         data.par_chunks(self.dimension)
             .map(|vec| {
                 argmin_value(match self.distance_type {
-                    MetricType::L2 => l2_distance_batch(vec, centroids, self.dimension),
-                    MetricType::Dot => dot_distance_batch(vec, centroids, self.dimension),
+                    DistanceType::L2 => l2_distance_batch(vec, centroids, self.dimension),
+                    DistanceType::Dot => dot_distance_batch(vec, centroids, self.dimension),
                     _ => {
                         panic!(
                             "KMeans::find_partitions: {} is not supported",
@@ -554,12 +554,12 @@ pub async fn compute_partitions<T: ArrowFloatType>(
     centroids: Arc<T::ArrayType>,
     vectors: Arc<T::ArrayType>,
     dimension: usize,
-    metric_type: MetricType,
+    distance_type: DistanceType,
 ) -> Vec<Option<u32>>
 where
     T::Native: L2 + Dot + Normalize,
 {
-    let kmeans = KMeans::<T>::with_centroids(centroids, dimension, metric_type);
+    let kmeans = KMeans::<T>::with_centroids(centroids, dimension, distance_type);
     kmeans.compute_membership(vectors.as_slice(), None)
 }
 
@@ -610,7 +610,7 @@ mod tests {
             Arc::new(centroids),
             Arc::new(data),
             DIM,
-            MetricType::L2,
+            DistanceType::L2,
         )
         .await;
         assert_eq!(expected, actual);
@@ -622,7 +622,7 @@ mod tests {
         let centroids = generate_random_array(DIM * 18);
         let data = generate_random_array(DIM * 20);
 
-        let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, MetricType::L2);
+        let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, DistanceType::L2);
         let (membership, loss) = kmeans.compute_membership_and_loss(data.values());
         assert!(loss > 0.0, "loss is not zero: {}", loss);
         membership.iter().for_each(|cd| {
@@ -651,7 +651,7 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = repeat(f32::NAN).take(DIM * K).collect::<Vec<_>>();
 
-        let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, MetricType::L2);
+        let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, DistanceType::L2);
         let (membership, _) = kmeans.compute_membership_and_loss(&values);
 
         membership.iter().for_each(|cd| assert!(cd.is_none()));
