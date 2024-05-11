@@ -22,12 +22,14 @@ use lance_arrow::{ArrowFloatType, FloatArray};
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
+use rayon::prelude::*;
 use tracing::instrument;
 
 use crate::distance::norm_l2::Normalize;
 use crate::distance::{dot_distance_batch, DistanceType};
 use crate::kernels::{argmax, argmin_value_float};
 use crate::{
+    clustering::Clustering,
     distance::{
         dot_distance,
         l2::{l2, l2_distance_batch, L2},
@@ -134,7 +136,7 @@ where
     Ok(kmeans)
 }
 
-pub struct KMeanMembership {
+struct KMeanMembership {
     dimension: usize,
 
     /// Cluster Id and distance for each vector.
@@ -434,7 +436,7 @@ where
     /// ```
     #[instrument(level = "debug", skip_all)]
     async fn train_once(&self, data: &MatrixView<T>) -> KMeanMembership {
-        self.compute_membership(data.data().clone()).await
+        self.compute_membership_and_loss(data.data().clone()).await
     }
 
     /// Recompute the membership of each vector.
@@ -443,7 +445,7 @@ where
     ///
     /// - *data*: a `N * dimension` floating array. Not necessarily normalized.
     ///
-    pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership {
+    async fn compute_membership_and_loss(&self, data: Arc<T::ArrayType>) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let distance_type = self.distance_type;
@@ -493,15 +495,22 @@ where
             distance_type: self.distance_type,
         }
     }
+}
 
-    pub fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
-        if query.len() != self.dimension {
-            return Err(Error::InvalidArgumentError(format!(
-                "KMeans::find_partitions: query dimension mismatch: {} != {}",
-                query.len(),
-                self.dimension
-            )));
-        };
+impl<T: ArrowFloatType> Clustering<T::Native> for KMeans<T>
+where
+    T::Native: L2 + Dot,
+{
+    fn deminsion(&self) -> u32 {
+        self.dimension as u32
+    }
+
+    fn num_clusters(&self) -> u32 {
+        self.k as u32
+    }
+
+    fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
+        assert_eq!(query.len(), self.dimension);
 
         let dists: Vec<f32> = match self.distance_type {
             MetricType::L2 => {
@@ -520,6 +529,25 @@ where
 
         let dists_arr = Float32Array::from(dists);
         sort_to_indices(&dists_arr, None, Some(nprobes))
+    }
+
+    fn compute_membership(&self, data: &[T::Native], _nprobes: Option<usize>) -> Vec<Option<u32>> {
+        assert!(_nprobes.is_none());
+        let centroids = self.centroids.as_ref().as_slice();
+        data.par_chunks(self.dimension)
+            .map(|vec| match self.distance_type {
+                MetricType::L2 => argmin_value(l2_distance_batch(vec, centroids, self.dimension))
+                    .map(|(idx, _)| idx),
+                MetricType::Dot => argmin_value(dot_distance_batch(vec, centroids, self.dimension))
+                    .map(|(idx, _)| idx),
+                _ => {
+                    panic!(
+                        "KMeans::find_partitions: {} is not supported",
+                        self.distance_type
+                    );
+                }
+            })
+            .collect::<Vec<_>>()
     }
 }
 
@@ -628,13 +656,8 @@ pub async fn compute_partitions<T: ArrowFloatType>(
 where
     T::Native: L2 + Dot + Normalize,
 {
-    let kmeans: KMeans<T> = KMeans::with_centroids(centroids, dimension, metric_type);
-    let membership = kmeans.compute_membership(vectors).await;
-    membership
-        .cluster_id_and_distances
-        .iter()
-        .map(|cluster_and_dist| cluster_and_dist.map(|(cluster, _)| cluster))
-        .collect()
+    let kmeans = KMeans::<T>::with_centroids(centroids, dimension, metric_type);
+    kmeans.compute_membership(vectors.as_slice(), None)
 }
 
 #[cfg(test)]
@@ -712,7 +735,7 @@ mod tests {
         let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
 
         let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, MetricType::L2);
-        let membership = kmeans.compute_membership(values.into()).await;
+        let membership = kmeans.compute_membership_and_loss(values.into()).await;
 
         membership
             .cluster_id_and_distances
