@@ -48,29 +48,29 @@ pub struct JavaError {
 
 impl JavaError {
     pub fn new(message: String, java_class: JavaExceptionClass) -> Self {
-        JavaError {
+        Self {
             message,
             java_class,
         }
     }
 
     pub fn runtime_error(message: String) -> Self {
-        JavaError {
-            message: message,
+        Self {
+            message,
             java_class: JavaExceptionClass::RuntimeException,
         }
     }
 
     pub fn io_error(message: String) -> Self {
-        JavaError::new(message, JavaExceptionClass::IOException)
+        Self::new(message, JavaExceptionClass::IOException)
     }
 
     pub fn input_error(message: String) -> Self {
-        JavaError::new(message, JavaExceptionClass::IllegalArgumentException)
+        Self::new(message, JavaExceptionClass::IllegalArgumentException)
     }
 
     pub fn unsupported_error(message: String) -> Self {
-        JavaError::new(message, JavaExceptionClass::UnsupportedOperationException)
+        Self::new(message, JavaExceptionClass::UnsupportedOperationException)
     }
 
     pub fn throw(&self, env: &mut JNIEnv) {
@@ -167,9 +167,7 @@ impl<T> JavaErrorExt<T> for std::result::Result<T, JniError> {
     fn infer_error(self) -> JavaResult<T> {
         match &self {
             Ok(_) => Ok(self.unwrap()),
-            Err(err) => match err {
-                _ => self.runtime_error(),
-            },
+            Err(_) => self.runtime_error(),
         }
     }
 }
@@ -178,9 +176,7 @@ impl<T> JavaErrorExt<T> for std::result::Result<T, Utf8Error> {
     fn infer_error(self) -> JavaResult<T> {
         match &self {
             Ok(_) => Ok(self.unwrap()),
-            Err(err) => match err {
-                _ => self.input_error(),
-            },
+            Err(_) => self.input_error(),
         }
     }
 }

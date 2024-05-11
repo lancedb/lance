@@ -65,11 +65,11 @@ impl BlockingDataset {
     }
 
     pub fn latest_version(&self) -> JavaResult<u64> {
-        Ok(RT.block_on(self.inner.latest_version_id()).infer_error()?)
+        RT.block_on(self.inner.latest_version_id()).infer_error()
     }
 
     pub fn count_rows(&self, filter: Option<String>) -> JavaResult<usize> {
-        Ok(RT.block_on(self.inner.count_rows(filter)).infer_error()?)
+        RT.block_on(self.inner.count_rows(filter)).infer_error()
     }
 
     pub fn close(&self) {}
@@ -223,9 +223,8 @@ fn attach_native_dataset<'local>(
 }
 
 fn create_java_dataset_object<'a>(env: &mut JNIEnv<'a>) -> JavaResult<JObject<'a>> {
-    Ok(env
-        .new_object("com/lancedb/lance/Dataset", "()V", &[])
-        .infer_error()?)
+    env.new_object("com/lancedb/lance/Dataset", "()V", &[])
+        .infer_error()
 }
 
 #[no_mangle]

@@ -44,15 +44,15 @@ impl BlockingScanner {
     }
 
     pub fn open_stream(&self) -> JavaResult<DatasetRecordBatchStream> {
-        Ok(RT.block_on(self.inner.try_into_stream()).infer_error()?)
+        RT.block_on(self.inner.try_into_stream()).infer_error()
     }
 
     pub fn schema(&self) -> JavaResult<SchemaRef> {
-        Ok(RT.block_on(self.inner.schema()).infer_error()?)
+        RT.block_on(self.inner.schema()).infer_error()
     }
 
     pub fn count_rows(&self) -> JavaResult<u64> {
-        Ok(RT.block_on(self.inner.count_rows()).infer_error()?)
+        RT.block_on(self.inner.count_rows()).infer_error()
     }
 }
 

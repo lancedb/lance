@@ -28,25 +28,25 @@ pub trait IntoJava {
 
 impl FromJObject<i32> for JObject<'_> {
     fn extract(&self) -> JavaResult<i32> {
-        Ok(JValue::from(self).i().infer_error()?)
+        JValue::from(self).i().infer_error()
     }
 }
 
 impl FromJObject<i64> for JObject<'_> {
     fn extract(&self) -> JavaResult<i64> {
-        Ok(JValue::from(self).j().infer_error()?)
+        JValue::from(self).j().infer_error()
     }
 }
 
 impl FromJObject<f32> for JObject<'_> {
     fn extract(&self) -> JavaResult<f32> {
-        Ok(JValue::from(self).f().infer_error()?)
+        JValue::from(self).f().infer_error()
     }
 }
 
 impl FromJObject<f64> for JObject<'_> {
     fn extract(&self) -> JavaResult<f64> {
-        Ok(JValue::from(self).d().infer_error()?)
+        JValue::from(self).d().infer_error()
     }
 }
 

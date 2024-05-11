@@ -101,6 +101,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'local
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_with_ffi_array<'local>(
     env: &mut JNIEnv<'local>,
     dataset_uri: JString,
@@ -165,8 +166,9 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
     )
 }
 
-fn inner_create_with_ffi_stream<'a>(
-    env: &mut JNIEnv<'a>,
+#[allow(clippy::too_many_arguments)]
+fn inner_create_with_ffi_stream<'local>(
+    env: &mut JNIEnv<'local>,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
     fragment_id: JObject,        // Optional<Integer>
@@ -174,7 +176,7 @@ fn inner_create_with_ffi_stream<'a>(
     max_rows_per_group: JObject, // Optional<Integer>
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
-) -> JavaResult<JString<'a>> {
+) -> JavaResult<JString<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }.infer_error()?;
 
@@ -221,5 +223,5 @@ fn create_fragment<'a>(
         ))
         .infer_error()?;
     let json_string = serde_json::to_string(&fragment).infer_error()?;
-    Ok(env.new_string(json_string).infer_error()?)
+    env.new_string(json_string).infer_error()
 }
