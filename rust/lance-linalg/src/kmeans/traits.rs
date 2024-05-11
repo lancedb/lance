@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_array::UInt32Array;
 use num_traits::Num;
 
 use crate::Result;
@@ -19,7 +20,7 @@ pub trait KMeans<T: Num>: Sized {
     /// ## Returns
     ///
     /// `n` of nearest partitions.
-    fn find_partitions(&self, query: &[T], nprobes: usize) -> Vec<u32>;
+    fn find_partitions(&self, query: &[T], nprobes: usize) -> Result<UInt32Array>;
 
     /// Get the n nearest partitions for an array of vectors.
     ///

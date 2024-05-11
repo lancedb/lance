@@ -3,7 +3,7 @@
 
 //! KMeans implementation for Apache Arrow Arrays.
 //!
-//! Support ``l2``, ``cosine`` and ``dot`` distances, see [MetricType].
+//! Support ``l2``, ``cosine`` and ``dot`` distances, see [DistanceType].
 //!
 //! ``Cosine`` distance are calculated by normalizing the vectors to unit length,
 //! and run ``l2`` distance on the unit vectors.
@@ -25,13 +25,12 @@ use rand::prelude::*;
 use tracing::instrument;
 
 use crate::distance::norm_l2::Normalize;
-use crate::distance::{dot_distance_batch, DistanceType};
 use crate::kernels::{argmax, argmin_value_float};
 use crate::{
     distance::{
-        dot_distance,
+        dot_distance, dot_distance_batch,
         l2::{l2, l2_distance_batch, L2},
-        Dot, MetricType,
+        DistanceType, Dot, MetricType,
     },
     kernels::argmin_value,
     matrix::MatrixView,
@@ -112,30 +111,21 @@ where
     pub distance_type: DistanceType,
 }
 
-/// Randomly initialize kmeans centroids.
-///
-///
-fn kmeans_random_init<T: ArrowFloatType>(
-    data: &T::ArrayType,
+/// Random initialize KMeans centroids.
+fn kmeans_centroids_random_init<T: Num + Clone>(
+    data: &[T],
     dimension: usize,
     k: usize,
     mut rng: impl Rng,
-    metric_type: MetricType,
-) -> Result<KMeansImpl<T>>
-where
-    T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
-{
-    assert!(data.len() >= k * dimension);
+) -> Vec<T> {
     let chosen = (0..data.len() / dimension)
         .choose_multiple(&mut rng, k)
         .to_vec();
-    let mut builder: Vec<T::Native> = Vec::with_capacity(k * dimension);
+    let mut builder: Vec<T> = Vec::with_capacity(k * dimension);
     for i in chosen {
-        builder.extend(data.as_slice()[i * dimension..(i + 1) * dimension].iter());
+        builder.extend_from_slice(&data[i * dimension..(i + 1) * dimension]);
     }
-    let mut kmeans = KMeansImpl::empty(k, dimension, metric_type);
-    kmeans.centroids = Arc::new(builder.into());
-    Ok(kmeans)
+    builder
 }
 
 pub struct KMeanMembership {
@@ -315,19 +305,20 @@ where
     /// - *k*: the number of clusters.
     /// - *metric_type*: the metric type to calculate distance.
     /// - *rng*: random generator.
-    pub fn init_random(
+    fn init_random(
         data: &MatrixView<T>,
         k: usize,
-        metric_type: MetricType,
+        metric_type: DistanceType,
         rng: impl Rng,
     ) -> Result<Self> {
-        kmeans_random_init(
-            data.data().as_ref(),
-            data.num_columns(),
+        let centorids =
+            kmeans_centroids_random_init(data.data().as_slice(), data.num_columns(), k, rng);
+        Ok(Self {
+            centroids: Arc::new(centorids.into()),
+            dimension: data.num_columns(),
             k,
-            rng,
-            metric_type,
-        )
+            distance_type: metric_type,
+        })
     }
 
     /// Train a KMeans model on data with `k` clusters.
@@ -497,8 +488,17 @@ where
             distance_type: self.distance_type,
         }
     }
+}
 
-    pub fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
+impl<T: ArrowFloatType> KMeans<T::Native> for KMeansImpl<T>
+where
+    T::Native: L2 + Dot + Normalize,
+{
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
         if query.len() != self.dimension {
             return Err(Error::InvalidArgumentError(format!(
                 "KMeans::find_partitions: query dimension mismatch: {} != {}",
@@ -524,6 +524,15 @@ where
 
         let dists_arr = Float32Array::from(dists);
         sort_to_indices(&dists_arr, None, Some(nprobes))
+    }
+
+    fn compute_membership(&self, data: &[T::Native], _nprobes: Option<usize>) -> Vec<u32> {
+        todo!()
+    }
+
+    /// Build a new KMeans model from the given data and their membership.
+    fn to_kmeans(&self, data: &[T::Native], _membership: &[u32]) -> Result<Self> {
+        todo!()
     }
 }
 
