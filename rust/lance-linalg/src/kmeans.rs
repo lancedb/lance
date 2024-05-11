@@ -91,7 +91,18 @@ impl KMeansParams {
     }
 }
 
-/// Standard KMeans implementation.
+pub async fn new_kmeans_with_params<T: ArrowFloatType>(
+    data: &FixedSizeListArray,
+    k: usize,
+    params: &KMeansParams,
+) -> Result<impl KMeans<T::Native>>
+where
+    T::Native: L2 + Dot + Normalize,
+{
+    KMeansImpl::<T>::new_with_params(data, k, params).await
+}
+
+/// Standard KMeans implementation for floating numbers.
 #[derive(Debug, Clone)]
 pub struct KMeansImpl<T: ArrowFloatType>
 where

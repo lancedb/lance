@@ -18,7 +18,7 @@ use snafu::{location, Location};
 pub use builder::IvfBuildParams;
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::kmeans::KMeansImpl;
+use lance_linalg::kmeans::{KMeans, KMeansImpl};
 use lance_linalg::{
     distance::{Dot, MetricType, L2},
     MatrixView,
