@@ -10,7 +10,7 @@ use snafu::{location, Location};
 use lance_core::{Error, Result};
 use lance_linalg::{
     distance::{DistanceType, Dot, Normalize, L2},
-    kmeans::{KMeans, KMeansParams},
+    kmeans::{KMeansImpl, KMeansParams},
 };
 
 /// Train KMeans model and returns the centroids of each cluster.
@@ -63,6 +63,6 @@ where
         ..Default::default()
     };
     let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
-    let model = KMeans::<T>::new_with_params(&data, k, &params).await?;
+    let model = KMeansImpl::<T>::new_with_params(&data, k, &params).await?;
     Ok(model.centroids.as_ref().clone())
 }

@@ -38,6 +38,10 @@ use crate::{
 };
 use crate::{Error, Result};
 
+mod traits;
+
+pub use traits::*;
+
 /// KMean initialization method.
 #[derive(Debug, PartialEq, Eq)]
 pub enum KMeanInit {
@@ -88,9 +92,9 @@ impl KMeansParams {
     }
 }
 
-/// KMeans implementation for Apache Arrow Arrays.
+/// Standard KMeans implementation.
 #[derive(Debug, Clone)]
-pub struct KMeans<T: ArrowFloatType>
+pub struct KMeansImpl<T: ArrowFloatType>
 where
     T::Native: L2 + Dot,
 {
@@ -117,7 +121,7 @@ fn kmeans_random_init<T: ArrowFloatType>(
     k: usize,
     mut rng: impl Rng,
     metric_type: MetricType,
-) -> Result<KMeans<T>>
+) -> Result<KMeansImpl<T>>
 where
     T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
 {
@@ -129,7 +133,7 @@ where
     for i in chosen {
         builder.extend(data.as_slice()[i * dimension..(i + 1) * dimension].iter());
     }
-    let mut kmeans = KMeans::empty(k, dimension, metric_type);
+    let mut kmeans = KMeansImpl::empty(k, dimension, metric_type);
     kmeans.centroids = Arc::new(builder.into());
     Ok(kmeans)
 }
@@ -168,7 +172,7 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
 
 impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
-    fn to_kmeans<T: ArrowFloatType>(&self, data: &[T::Native]) -> Result<KMeans<T>>
+    fn to_kmeans<T: ArrowFloatType>(&self, data: &[T::Native]) -> Result<KMeansImpl<T>>
     where
         T::Native: L2 + Dot + Normalize,
     {
@@ -224,7 +228,7 @@ impl KMeanMembership {
 
         split_clusters(&mut cluster_cnts, &mut new_centroids, dimension);
 
-        Ok(KMeans {
+        Ok(KMeansImpl {
             centroids: Arc::new(new_centroids.into()),
             dimension,
             k: self.k,
@@ -275,7 +279,7 @@ impl KMeanMembership {
     }
 }
 
-impl<T: ArrowFloatType> KMeans<T>
+impl<T: ArrowFloatType> KMeansImpl<T>
 where
     T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
 {
@@ -628,7 +632,7 @@ pub async fn compute_partitions<T: ArrowFloatType>(
 where
     T::Native: L2 + Dot + Normalize,
 {
-    let kmeans: KMeans<T> = KMeans::with_centroids(centroids, dimension, metric_type);
+    let kmeans: KMeansImpl<T> = KMeansImpl::with_centroids(centroids, dimension, metric_type);
     let membership = kmeans.compute_membership(vectors).await;
     membership
         .cluster_id_and_distances
@@ -654,7 +658,7 @@ mod tests {
     async fn test_train_with_small_dataset() {
         let data = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
         let data = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
-        match KMeans::<Float32Type>::new(&data, 128, 5).await {
+        match KMeansImpl::<Float32Type>::new(&data, 128, 5).await {
             Ok(_) => panic!("Should fail to train KMeans"),
             Err(e) => {
                 assert!(e.to_string().contains("smaller than"));
@@ -711,7 +715,8 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
 
-        let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, MetricType::L2);
+        let kmeans =
+            KMeansImpl::<Float32Type>::with_centroids(centroids.into(), DIM, MetricType::L2);
         let membership = kmeans.compute_membership(values.into()).await;
 
         membership
