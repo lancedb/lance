@@ -16,8 +16,8 @@ use jni::objects::JObject;
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 
-use crate::ffi::JNIEnvExt;
 use crate::error::JavaResult;
+use crate::ffi::JNIEnvExt;
 use crate::JavaErrorExt;
 
 pub fn extract_write_params(

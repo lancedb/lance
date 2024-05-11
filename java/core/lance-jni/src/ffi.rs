@@ -14,7 +14,7 @@
 
 use core::slice;
 
-use crate::error::{JavaResult, JavaErrorExt};
+use crate::error::{JavaErrorExt, JavaResult};
 use jni::objects::{JByteBuffer, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{objects::JObject, JNIEnv};
@@ -63,7 +63,9 @@ impl JNIEnvExt for JNIEnv<'_> {
         let mut iter = list.iter(self).infer_error()?;
         let mut results = Vec::with_capacity(list.size(self).infer_error()? as usize);
         while let Some(elem) = iter.next(self).infer_error()? {
-            let int_obj = self.call_method(elem, "intValue", "()I", &[]).infer_error()?;
+            let int_obj = self
+                .call_method(elem, "intValue", "()I", &[])
+                .infer_error()?;
             let int_value = int_obj.i().infer_error()?;
             results.push(int_value);
         }
@@ -87,7 +89,10 @@ impl JNIEnvExt for JNIEnv<'_> {
         let array_len = self.get_array_length(&jobject_array).infer_error()?;
         let mut res: Vec<String> = Vec::new();
         for i in 0..array_len {
-            let item: JString = self.get_object_array_element(&jobject_array, i).infer_error()?.into();
+            let item: JString = self
+                .get_object_array_element(&jobject_array, i)
+                .infer_error()?
+                .into();
             res.push(self.get_string(&item).infer_error()?.into());
         }
         Ok(res)
@@ -95,7 +100,9 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_string_opt(&mut self, obj: &JObject) -> JavaResult<Option<String>> {
         self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[]).infer_error()?;
+            let java_obj_gen = env
+                .call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])
+                .infer_error()?;
             let java_string_obj = java_obj_gen.l().infer_error()?;
             let jstr = JString::from(java_string_obj);
             let val = env.get_string(&jstr).infer_error()?;
@@ -105,7 +112,9 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_strings_opt(&mut self, obj: &JObject) -> JavaResult<Option<Vec<String>>> {
         self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[]).infer_error()?;
+            let java_obj_gen = env
+                .call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])
+                .infer_error()?;
             let java_list_obj = java_obj_gen.l().infer_error()?;
             env.get_strings(&java_list_obj)
         })
@@ -113,9 +122,13 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_int_opt(&mut self, obj: &JObject) -> JavaResult<Option<i32>> {
         self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[]).infer_error()?;
+            let java_obj_gen = env
+                .call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])
+                .infer_error()?;
             let java_int_obj = java_obj_gen.l().infer_error()?;
-            let int_obj = env.call_method(java_int_obj, "intValue", "()I", &[]).infer_error()?;
+            let int_obj = env
+                .call_method(java_int_obj, "intValue", "()I", &[])
+                .infer_error()?;
             let int_value = int_obj.i().infer_error()?;
             Ok(int_value)
         })
@@ -123,7 +136,9 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_ints_opt(&mut self, obj: &JObject) -> JavaResult<Option<Vec<i32>>> {
         self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[]).infer_error()?;
+            let java_obj_gen = env
+                .call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])
+                .infer_error()?;
             let java_list_obj = java_obj_gen.l().infer_error()?;
             env.get_integers(&java_list_obj)
         })
@@ -131,9 +146,13 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_long_opt(&mut self, obj: &JObject) -> JavaResult<Option<i64>> {
         self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[]).infer_error()?;
+            let java_obj_gen = env
+                .call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])
+                .infer_error()?;
             let java_long_obj = java_obj_gen.l().infer_error()?;
-            let long_obj = env.call_method(java_long_obj, "longValue", "()J", &[]).infer_error()?;
+            let long_obj = env
+                .call_method(java_long_obj, "longValue", "()J", &[])
+                .infer_error()?;
             let long_value = long_obj.j().infer_error()?;
             Ok(long_value)
         })
@@ -141,9 +160,13 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_u64_opt(&mut self, obj: &JObject) -> JavaResult<Option<u64>> {
         self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[]).infer_error()?;
+            let java_obj_gen = env
+                .call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])
+                .infer_error()?;
             let java_long_obj = java_obj_gen.l().infer_error()?;
-            let long_obj = env.call_method(java_long_obj, "longValue", "()J", &[]).infer_error()?;
+            let long_obj = env
+                .call_method(java_long_obj, "longValue", "()J", &[])
+                .infer_error()?;
             let long_value = long_obj.j().infer_error()?;
             Ok(long_value as u64)
         })
@@ -151,11 +174,17 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_bytes_opt(&mut self, obj: &JObject) -> JavaResult<Option<&[u8]>> {
         self.get_optional(obj, |env, inner_obj| {
-            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[]).infer_error()?;
+            let java_obj_gen = env
+                .call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])
+                .infer_error()?;
             let java_byte_buffer_obj = java_obj_gen.l().infer_error()?;
             let j_byte_buffer = JByteBuffer::from(java_byte_buffer_obj);
-            let raw_data = env.get_direct_buffer_address(&j_byte_buffer).infer_error()?;
-            let capacity = env.get_direct_buffer_capacity(&j_byte_buffer).infer_error()?;
+            let raw_data = env
+                .get_direct_buffer_address(&j_byte_buffer)
+                .infer_error()?;
+            let capacity = env
+                .get_direct_buffer_capacity(&j_byte_buffer)
+                .infer_error()?;
             let data = unsafe { slice::from_raw_parts(raw_data, capacity) };
             Ok(data)
         })

@@ -12,26 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::empty;
+use crate::error::{JavaErrorExt, JavaResult};
 use crate::ffi::JNIEnvExt;
-use crate::error::{JavaResult, JavaErrorExt};
-use crate::{traits::IntoJava, RT};
+use crate::traits::FromJString;
 use crate::utils::extract_write_params;
+use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
+use arrow::datatypes::Schema;
+use arrow::ffi::FFI_ArrowSchema;
+use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::record_batch::RecordBatchIterator;
+use jni::objects::JString;
+use jni::sys::jint;
 use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::transaction::Operation;
 use lance::dataset::{Dataset, WriteParams};
 use lance::table::format::Fragment;
-use jni::sys::jint;
-use jni::objects::JString;
-use arrow::ffi::FFI_ArrowSchema;
-use arrow::datatypes::Schema;
-use arrow::record_batch::RecordBatchIterator;
+use std::iter::empty;
 use std::sync::Arc;
-use arrow::ffi_stream::FFI_ArrowArrayStream;
-use arrow::ffi_stream::ArrowArrayStreamReader;
-use crate::traits::FromJString;
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
@@ -46,7 +46,9 @@ impl BlockingDataset {
         uri: &str,
         params: Option<WriteParams>,
     ) -> JavaResult<Self> {
-        let inner = RT.block_on(Dataset::write(reader, uri, params)).infer_error()?;
+        let inner = RT
+            .block_on(Dataset::write(reader, uri, params))
+            .infer_error()?;
         Ok(Self { inner })
     }
 
@@ -56,7 +58,9 @@ impl BlockingDataset {
     }
 
     pub fn commit(uri: &str, operation: Operation, read_version: Option<u64>) -> JavaResult<Self> {
-        let inner = RT.block_on(Dataset::commit(uri, operation, read_version, None, None)).infer_error()?;
+        let inner = RT
+            .block_on(Dataset::commit(uri, operation, read_version, None, None))
+            .infer_error()?;
         Ok(Self { inner })
     }
 
@@ -85,10 +89,21 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_create_with_ffi_schema(&mut env, arrow_schema_addr, path, max_rows_per_file, max_rows_per_group, max_bytes_per_file, mode))
+    ok_or_throw!(
+        env,
+        inner_create_with_ffi_schema(
+            &mut env,
+            arrow_schema_addr,
+            path,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode
+        )
+    )
 }
 
-fn inner_create_with_ffi_schema<'local> (
+fn inner_create_with_ffi_schema<'local>(
     env: &mut JNIEnv<'local>,
     arrow_schema_addr: jlong,
     path: JString,
@@ -103,14 +118,14 @@ fn inner_create_with_ffi_schema<'local> (
 
     let reader = RecordBatchIterator::new(empty(), Arc::new(schema));
     create_dataset(
-            env,
-            path,
-            max_rows_per_file,
-            max_rows_per_group,
-            max_bytes_per_file,
-            mode,
-            reader
-        )
+        env,
+        path,
+        max_rows_per_file,
+        max_rows_per_group,
+        max_bytes_per_file,
+        mode,
+        reader,
+    )
 }
 
 #[no_mangle]
@@ -124,7 +139,18 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_create_with_ffi_stream(&mut env, arrow_array_stream_addr, path, max_rows_per_file, max_rows_per_group, max_bytes_per_file, mode))
+    ok_or_throw!(
+        env,
+        inner_create_with_ffi_stream(
+            &mut env,
+            arrow_array_stream_addr,
+            path,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode
+        )
+    )
 }
 
 fn inner_create_with_ffi_stream<'local>(
@@ -145,7 +171,7 @@ fn inner_create_with_ffi_stream<'local>(
         max_rows_per_group,
         max_bytes_per_file,
         mode,
-        reader
+        reader,
     )
 }
 
@@ -192,12 +218,14 @@ fn attach_native_dataset<'local>(
     // 1. The Java object (`j_dataset`) should implement the `java.io.Closeable` interface.
     // 2. Users of this Java object should be instructed to always use it within a try-with-resources
     //    statement (or manually call the `close()` method) to ensure that `self.close()` is invoked.
-   unsafe { env.set_rust_field(&j_dataset, NATIVE_DATASET, dataset) }.infer_error()?;
-   Ok(j_dataset)
+    unsafe { env.set_rust_field(&j_dataset, NATIVE_DATASET, dataset) }.infer_error()?;
+    Ok(j_dataset)
 }
 
 fn create_java_dataset_object<'a>(env: &mut JNIEnv<'a>) -> JavaResult<JObject<'a>> {
-    Ok(env.new_object("com/lancedb/lance/Dataset", "()V", &[]).infer_error()?)
+    Ok(env
+        .new_object("com/lancedb/lance/Dataset", "()V", &[])
+        .infer_error()?)
 }
 
 #[no_mangle]
@@ -208,7 +236,10 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_commitAppend<'local>(
     read_version_obj: JObject, // Optional<Long>
     fragments_obj: JObject,    // List<String>, String is json serialized Fragment
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_commit_append(&mut env, path, read_version_obj, fragments_obj))
+    ok_or_throw!(
+        env,
+        inner_commit_append(&mut env, path, read_version_obj, fragments_obj)
+    )
 }
 
 pub fn inner_commit_append<'local>(
@@ -238,13 +269,9 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
     ok_or_throw_without_return!(env, inner_release_native_dataset(&mut env, obj))
 }
 
-fn inner_release_native_dataset(
-    env: &mut JNIEnv,
-    obj: JObject,
-) -> JavaResult<()> {
-    let dataset: BlockingDataset = unsafe {
-        env.take_rust_field(obj, NATIVE_DATASET).infer_error()?
-    };
+fn inner_release_native_dataset(env: &mut JNIEnv, obj: JObject) -> JavaResult<()> {
+    let dataset: BlockingDataset =
+        unsafe { env.take_rust_field(obj, NATIVE_DATASET).infer_error()? };
     dataset.close();
     Ok(())
 }
@@ -284,7 +311,8 @@ fn inner_get_json_fragments<'local>(
 ) -> JavaResult<JObject<'local>> {
     let fragments = {
         let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }.infer_error()?;
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .infer_error()?;
         dataset.inner.get_fragments()
     };
 
@@ -300,7 +328,8 @@ fn inner_get_json_fragments<'local>(
             "add",
             "(Ljava/lang/Object;)Z",
             &[(&jstring).into()],
-        ).infer_error()?;
+        )
+        .infer_error()?;
     }
     Ok(array_list)
 }
@@ -311,17 +340,21 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
     jdataset: JObject,
     arrow_schema_addr: jlong,
 ) {
-    ok_or_throw_without_return!(env, inner_import_ffi_schema(&mut env, jdataset, arrow_schema_addr))
+    ok_or_throw_without_return!(
+        env,
+        inner_import_ffi_schema(&mut env, jdataset, arrow_schema_addr)
+    )
 }
 
 fn inner_import_ffi_schema(
     env: &mut JNIEnv,
     jdataset: JObject,
     arrow_schema_addr: jlong,
-) -> JavaResult<()>{
+) -> JavaResult<()> {
     let dataset = {
         let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }.infer_error()?;
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .infer_error()?;
         dataset.clone()
     };
     let schema = Schema::from(dataset.inner.schema());
@@ -342,7 +375,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_version(
 
 fn inner_version(env: &mut JNIEnv, java_dataset: JObject) -> JavaResult<u64> {
     let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }.infer_error()?;
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }
+            .infer_error()?;
     Ok(dataset_guard.inner.version().version)
 }
 
@@ -356,7 +390,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_latestVersion(
 
 fn inner_latest_version(env: &mut JNIEnv, java_dataset: JObject) -> JavaResult<u64> {
     let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }.infer_error()?;
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }
+            .infer_error()?;
     dataset_guard.latest_version()
 }
 
@@ -370,6 +405,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_countRows(
 
 fn inner_count_rows(env: &mut JNIEnv, java_dataset: JObject) -> JavaResult<usize> {
     let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }.infer_error()?;
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }
+            .infer_error()?;
     dataset_guard.count_rows(None)
 }

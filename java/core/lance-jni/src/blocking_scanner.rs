@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use crate::error::{JavaErrorExt, JavaResult};
 use crate::ffi::JNIEnvExt;
 use crate::JavaError;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
@@ -21,11 +22,11 @@ use arrow_schema::SchemaRef;
 use jni::{objects::JObject, sys::jlong, JNIEnv};
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
 use lance_io::ffi::to_ffi_arrow_array_stream;
-use crate::error::{JavaResult, JavaErrorExt};
 
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
-    traits::IntoJava, RT,
+    traits::IntoJava,
+    RT,
 };
 
 pub const NATIVE_SCANNER: &str = "nativeScannerHandle";
@@ -69,7 +70,18 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
     filter_obj: JObject,           // Optional<String>
     batch_size_obj: JObject,       // Optional<Long>
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_create_scanner(&mut env, jdataset, fragment_ids_obj, columns_obj, substrait_filter_obj, filter_obj, batch_size_obj))
+    ok_or_throw!(
+        env,
+        inner_create_scanner(
+            &mut env,
+            jdataset,
+            fragment_ids_obj,
+            columns_obj,
+            substrait_filter_obj,
+            filter_obj,
+            batch_size_obj
+        )
+    )
 }
 
 fn inner_create_scanner<'local>(
@@ -83,7 +95,8 @@ fn inner_create_scanner<'local>(
 ) -> JavaResult<JObject<'local>> {
     let dataset = {
         let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }.infer_error()?;
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .infer_error()?;
         dataset.clone()
     };
     let mut scanner = dataset.inner.scan();
@@ -92,7 +105,9 @@ fn inner_create_scanner<'local>(
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
             let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
-                return Err(JavaError::input_error(format!("Fragment {fragment_id} not found")));
+                return Err(JavaError::input_error(format!(
+                    "Fragment {fragment_id} not found"
+                )));
             };
             fragments.push(fragment.metadata().clone());
         }
@@ -104,7 +119,8 @@ fn inner_create_scanner<'local>(
     };
     let substrait_opt = env.get_bytes_opt(&substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
-        RT.block_on(async { scanner.filter_substrait(substrait).await }).infer_error()?;
+        RT.block_on(async { scanner.filter_substrait(substrait).await })
+            .infer_error()?;
     }
     let filter_opt = env.get_string_opt(&filter_obj)?;
     if let Some(filter) = filter_opt {
@@ -126,10 +142,9 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_releaseNativeScan
     ok_or_throw_without_return!(env, inner_release_native_scanner(&mut env, j_scanner));
 }
 
-fn inner_release_native_scanner(env: &mut JNIEnv, j_scanner: JObject) -> JavaResult<()>{
-    let _: BlockingScanner = unsafe {
-        env.take_rust_field(j_scanner, NATIVE_SCANNER)
-    }.infer_error()?;
+fn inner_release_native_scanner(env: &mut JNIEnv, j_scanner: JObject) -> JavaResult<()> {
+    let _: BlockingScanner =
+        unsafe { env.take_rust_field(j_scanner, NATIVE_SCANNER) }.infer_error()?;
     Ok(())
 }
 
@@ -153,12 +168,13 @@ fn attach_native_scanner<'local>(
     // 1. The Java object (`j_scanner`) should implement the `java.io.Closeable` interface.
     // 2. Users of this Java object should be instructed to always use it within a try-with-resources
     //    statement (or manually call the `close()` method) to ensure that `self.close()` is invoked.
-    unsafe {env.set_rust_field(&j_scanner, NATIVE_SCANNER, scanner)}.infer_error()?;
+    unsafe { env.set_rust_field(&j_scanner, NATIVE_SCANNER, scanner) }.infer_error()?;
     Ok(j_scanner)
 }
 
 fn create_java_scanner_object<'a>(env: &mut JNIEnv<'a>) -> JavaResult<JObject<'a>> {
-    env.new_object("com/lancedb/lance/ipc/LanceScanner", "()V", &[]).infer_error()
+    env.new_object("com/lancedb/lance/ipc/LanceScanner", "()V", &[])
+        .infer_error()
 }
 
 //////////////////
@@ -176,11 +192,13 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_openStream(
 fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -> JavaResult<()> {
     let scanner = {
         let scanner_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }.infer_error()?;
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
+                .infer_error()?;
         scanner_guard.clone()
     };
     let record_batch_stream = scanner.open_stream()?;
-    let ffi_stream = to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone()).infer_error()?;
+    let ffi_stream =
+        to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone()).infer_error()?;
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
     Ok(())
 }
@@ -191,13 +209,21 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_importFfiSchema(
     j_scanner: JObject,
     schema_addr: jlong,
 ) {
-    ok_or_throw_without_return!(env, inner_import_ffi_schema(&mut env, j_scanner, schema_addr));
+    ok_or_throw_without_return!(
+        env,
+        inner_import_ffi_schema(&mut env, j_scanner, schema_addr)
+    );
 }
 
-fn inner_import_ffi_schema(env: &mut JNIEnv, j_scanner: JObject, schema_addr: jlong) -> JavaResult<()> {
+fn inner_import_ffi_schema(
+    env: &mut JNIEnv,
+    j_scanner: JObject,
+    schema_addr: jlong,
+) -> JavaResult<()> {
     let scanner = {
         let scanner_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }.infer_error()?;
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
+                .infer_error()?;
         scanner_guard.clone()
     };
     let schema = scanner.schema()?;
@@ -217,7 +243,8 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_countRows(
 fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> JavaResult<u64> {
     let scanner = {
         let scanner_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }.infer_error()?;
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
+                .infer_error()?;
         scanner_guard.clone()
     };
     scanner.count_rows()

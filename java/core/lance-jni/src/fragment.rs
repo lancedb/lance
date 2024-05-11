@@ -25,6 +25,7 @@ use std::iter::once;
 
 use lance::dataset::fragment::FileFragment;
 
+use crate::error::{JavaErrorExt, JavaResult};
 use crate::JavaError;
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -33,13 +34,10 @@ use crate::{
     utils::extract_write_params,
     RT,
 };
-use crate::error::{JavaResult, JavaErrorExt};
-
 
 ///////////////////
 // Write Methods //
 ///////////////////
-
 
 //////////////////
 // Read Methods //
@@ -51,7 +49,11 @@ pub extern "system" fn Java_com_lancedb_lance_DatasetFragment_countRowsNative(
     jdataset: JObject,
     fragment_id: jlong,
 ) -> jint {
-    ok_or_throw_with_return!(env, inner_count_rows_native(&mut env, jdataset, fragment_id), -1) as jint
+    ok_or_throw_with_return!(
+        env,
+        inner_count_rows_native(&mut env, jdataset, fragment_id),
+        -1
+    ) as jint
 }
 
 fn inner_count_rows_native(
@@ -59,9 +61,12 @@ fn inner_count_rows_native(
     jdataset: JObject,
     fragment_id: jlong,
 ) -> JavaResult<usize> {
-     let dataset =unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }.infer_error()?;
-     let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
-        return Err(JavaError::input_error(format!("Fragment not found: {fragment_id}")))
+    let dataset = unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+        .infer_error()?;
+    let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
+        return Err(JavaError::input_error(format!(
+            "Fragment not found: {fragment_id}"
+        )));
     };
     RT.block_on(fragment.count_rows()).infer_error()
 }
@@ -79,7 +84,21 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'local
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
 ) -> JString<'local> {
-    ok_or_throw_with_return!(env, inner_create_with_ffi_array(&mut env, dataset_uri, arrow_array_addr, arrow_schema_addr, fragment_id, max_rows_per_file, max_rows_per_group, max_bytes_per_file, mode), JString::default())
+    ok_or_throw_with_return!(
+        env,
+        inner_create_with_ffi_array(
+            &mut env,
+            dataset_uri,
+            arrow_array_addr,
+            arrow_schema_addr,
+            fragment_id,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode
+        ),
+        JString::default()
+    )
 }
 
 fn inner_create_with_ffi_array<'local>(
@@ -100,7 +119,7 @@ fn inner_create_with_ffi_array<'local>(
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
     let data_type = DataType::try_from(&c_schema).infer_error()?;
 
-    let array_data =  unsafe { from_ffi_and_data_type(c_array, data_type) }.infer_error()?;
+    let array_data = unsafe { from_ffi_and_data_type(c_array, data_type) }.infer_error()?;
 
     let record_batch = RecordBatch::from(StructArray::from(array_data));
     let batch_schema = record_batch.schema().clone();
@@ -114,7 +133,7 @@ fn inner_create_with_ffi_array<'local>(
         max_rows_per_group,
         max_bytes_per_file,
         mode,
-        reader
+        reader,
     )
 }
 
@@ -130,7 +149,20 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
 ) -> JString<'a> {
-    ok_or_throw_with_return!(env, inner_create_with_ffi_stream(&mut env, dataset_uri, arrow_array_stream_addr, fragment_id, max_rows_per_file, max_rows_per_group, max_bytes_per_file, mode), JString::default())
+    ok_or_throw_with_return!(
+        env,
+        inner_create_with_ffi_stream(
+            &mut env,
+            dataset_uri,
+            arrow_array_stream_addr,
+            fragment_id,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode
+        ),
+        JString::default()
+    )
 }
 
 fn inner_create_with_ffi_stream<'a>(
@@ -144,8 +176,7 @@ fn inner_create_with_ffi_stream<'a>(
     mode: JObject,               // Optional<String>
 ) -> JavaResult<JString<'a>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
-    let reader =
-        unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }.infer_error()?;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }.infer_error()?;
 
     create_fragment(
         env,
@@ -155,7 +186,7 @@ fn inner_create_with_ffi_stream<'a>(
         max_rows_per_group,
         max_bytes_per_file,
         mode,
-        reader
+        reader,
     )
 }
 
@@ -181,12 +212,14 @@ fn create_fragment<'a>(
         &max_bytes_per_file,
         &mode,
     )?;
-    let fragment = RT.block_on(FileFragment::create(
-        &path_str,
-        fragment_id_opts.unwrap_or(0) as usize,
-        reader,
-        Some(write_params),
-    )).infer_error()?;
+    let fragment = RT
+        .block_on(FileFragment::create(
+            &path_str,
+            fragment_id_opts.unwrap_or(0) as usize,
+            reader,
+            Some(write_params),
+        ))
+        .infer_error()?;
     let json_string = serde_json::to_string(&fragment).infer_error()?;
     Ok(env.new_string(json_string).infer_error()?)
 }
