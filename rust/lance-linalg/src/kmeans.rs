@@ -33,7 +33,6 @@ use crate::{
         Dot,
     },
     kernels::argmin_value,
-    matrix::MatrixView,
 };
 use crate::{Error, Result};
 
@@ -111,7 +110,7 @@ where
 ///
 ///
 fn kmeans_random_init<T: ArrowFloatType>(
-    data: &T::ArrayType,
+    data: &[T::Native],
     dimension: usize,
     k: usize,
     mut rng: impl Rng,
@@ -126,7 +125,7 @@ where
         .to_vec();
     let mut builder: Vec<T::Native> = Vec::with_capacity(k * dimension);
     for i in chosen {
-        builder.extend(data.as_slice()[i * dimension..(i + 1) * dimension].iter());
+        builder.extend(data[i * dimension..(i + 1) * dimension].iter());
     }
     let mut kmeans = KMeans::empty(k, dimension, distance_type);
     kmeans.centroids = Arc::new(builder.into());
@@ -187,18 +186,13 @@ where
     /// - *distance_type*: the distance type to calculate distance.
     /// - *rng*: random generator.
     pub fn init_random(
-        data: &MatrixView<T>,
+        data: &[T::Native],
+        dimension: usize,
         k: usize,
         distance_type: DistanceType,
         rng: impl Rng,
     ) -> Result<Self> {
-        kmeans_random_init(
-            data.data().as_ref(),
-            data.num_columns(),
-            k,
-            rng,
-            distance_type,
-        )
+        kmeans_random_init(data, dimension, k, rng, distance_type)
     }
 
     /// Train a KMeans model on data with `k` clusters.
@@ -246,15 +240,19 @@ where
                 data.value_type()
             )))?;
 
-        let mat = MatrixView::<T>::new(Arc::new(data.clone()), dimension);
-        // TODO: refactor kmeans to work with reference instead of Arc?
         let mut best_kmeans = Self::empty(k, dimension, params.distance_type);
 
         // TODO: use seed for Rng.
         let rng = SmallRng::from_entropy();
         for redo in 1..=params.redos {
             let kmeans = match params.init {
-                KMeanInit::Random => Self::init_random(&mat, k, params.distance_type, rng.clone())?,
+                KMeanInit::Random => Self::init_random(
+                    &data.as_slice(),
+                    dimension,
+                    k,
+                    params.distance_type,
+                    rng.clone(),
+                )?,
                 KMeanInit::KMeanPlusPlus => {
                     unimplemented!()
                 }
@@ -565,15 +563,13 @@ where
 
 #[cfg(test)]
 mod tests {
-
     use std::iter::repeat;
-
-    use super::*;
 
     use arrow_array::types::Float32Type;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
 
+    use super::*;
     use crate::kernels::argmin;
 
     #[tokio::test]
