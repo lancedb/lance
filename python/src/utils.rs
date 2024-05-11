@@ -31,8 +31,9 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::{
-    distance::MetricType,
+    distance::DistanceType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
+    Clustering,
 };
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -50,7 +51,7 @@ pub struct KMeans {
     k: usize,
 
     /// Metric type
-    metric_type: MetricType,
+    metric_type: DistanceType,
 
     max_iters: u32,
 
@@ -113,12 +114,7 @@ impl KMeans {
             return Err(PyValueError::new_err("Must be a FixedSizeList of Float32"));
         };
         let values: Arc<Float32Array> = fixed_size_arr.values().as_primitive().clone().into();
-        let membership = RT.block_on(Some(py), kmeans.compute_membership(values))?;
-        let cluster_ids: UInt32Array = membership
-            .cluster_id_and_distances
-            .iter()
-            .map(|cd| cd.map(|(c, _)| c))
-            .collect();
+        let cluster_ids = UInt32Array::from(kmeans.compute_membership(values.values(), None));
         cluster_ids.into_data().to_pyarrow(py)
     }
 
@@ -243,7 +239,7 @@ pub fn build_sq_storage(
     let upper_bound = bounds.get_item(1)?.extract::<f64>()?;
     let quantizer =
         lance_index::vector::sq::ScalarQuantizer::with_bounds(8, dim, lower_bound..upper_bound);
-    let storage = sq::build_sq_storage(MetricType::L2, row_ids, vectors, quantizer)
+    let storage = sq::build_sq_storage(DistanceType::L2, row_ids, vectors, quantizer)
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
     storage.batch().clone().to_pyarrow(py)
 }
