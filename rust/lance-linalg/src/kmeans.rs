@@ -196,19 +196,19 @@ where
     }
 
     /// Train a KMeans model on data with `k` clusters.
-    pub async fn new(data: &FixedSizeListArray, k: usize, max_iters: u32) -> Result<Self> {
+    pub fn new(data: &FixedSizeListArray, k: usize, max_iters: u32) -> Result<Self> {
         let params = KMeansParams {
             max_iters,
             distance_type: DistanceType::L2,
             ..Default::default()
         };
-        Self::new_with_params(data, k, &params).await
+        Self::new_with_params(data, k, &params)
     }
 
     /// Train a [`KMeans`] model with full parameters.
     ///
     /// If the DistanceType is `Cosine`, the input vectors will be normalized with each iteration.
-    pub async fn new_with_params(
+    pub fn new_with_params(
         data: &FixedSizeListArray,
         k: usize,
         params: &KMeansParams,
@@ -247,7 +247,7 @@ where
         for redo in 1..=params.redos {
             let kmeans = match params.init {
                 KMeanInit::Random => Self::init_random(
-                    &data.as_slice(),
+                    data.as_slice(),
                     dimension,
                     k,
                     params.distance_type,
@@ -332,12 +332,10 @@ where
         k: usize,
         membership: &[Option<u32>],
         distance_type: DistanceType,
-    ) -> Result<KMeans<T>>
+    ) -> Result<Self>
     where
         T::Native: L2 + Dot + Normalize,
     {
-        let dimension = dimension;
-
         let mut cluster_cnts = vec![0_u64; k];
         let mut new_centroids = vec![T::Native::zero(); k * dimension];
         data.chunks_exact(dimension)
@@ -381,7 +379,7 @@ where
 
         split_clusters(&mut cluster_cnts, &mut new_centroids, dimension);
 
-        Ok(KMeans {
+        Ok(Self {
             centroids: Arc::new(new_centroids.into()),
             dimension,
             k,
@@ -548,7 +546,7 @@ fn compute_partitions_l2<'a, T: L2>(
 /// Compute partition ID of each vector in the KMeans.
 ///
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.
-pub async fn compute_partitions<T: ArrowFloatType>(
+pub fn compute_partitions<T: ArrowFloatType>(
     centroids: Arc<T::ArrayType>,
     vectors: Arc<T::ArrayType>,
     dimension: usize,
@@ -572,11 +570,11 @@ mod tests {
     use super::*;
     use crate::kernels::argmin;
 
-    #[tokio::test]
-    async fn test_train_with_small_dataset() {
+    #[test]
+    fn test_train_with_small_dataset() {
         let data = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
         let data = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
-        match KMeans::<Float32Type>::new(&data, 128, 5).await {
+        match KMeans::<Float32Type>::new(&data, 128, 5) {
             Ok(_) => panic!("Should fail to train KMeans"),
             Err(e) => {
                 assert!(e.to_string().contains("smaller than"));
@@ -584,8 +582,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_compute_partitions() {
+    #[test]
+    fn test_compute_partitions() {
         const DIM: usize = 256;
         let centroids = generate_random_array(DIM * 18);
         let data = generate_random_array(DIM * 20);
@@ -607,8 +605,7 @@ mod tests {
             Arc::new(data),
             DIM,
             DistanceType::L2,
-        )
-        .await;
+        );
         assert_eq!(expected, actual);
     }
 

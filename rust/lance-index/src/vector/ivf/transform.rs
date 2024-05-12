@@ -10,10 +10,10 @@ use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::types::UInt32Type;
 use arrow_array::{cast::AsArray, Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use log::info;
 use snafu::{location, Location};
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use lance_arrow::{ArrowFloatType, RecordBatchExt};
 use lance_core::Result;
@@ -103,13 +103,15 @@ where
                         .clone(),
                 );
 
-                compute_partitions::<T>(centroids, data, dimension, metric_type)
-                    .in_current_span()
-                    .await
+                tokio::task::spawn_blocking(move || {
+                    compute_partitions::<T>(centroids, data, dimension, metric_type)
+                })
+                .await
             })
             .buffered(chunks)
-            .collect::<Vec<_>>()
-            .await;
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("failed to compute partitions");
 
         UInt32Array::from_iter(result.iter().flatten().copied())
     }

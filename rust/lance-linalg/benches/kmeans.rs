@@ -21,22 +21,7 @@ fn bench_train(c: &mut Criterion) {
 
     c.bench_function("train_128d_4k", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::<Float32Type>::new(&array, 25, 50)
-                .await
-                .ok()
-                .unwrap();
-        })
-    });
-
-    #[cfg(feature = "faiss")]
-    c.bench_function("train_128d_4k_faiss", |b| {
-        use arrow_array::{cast::as_primitive_array, Float32Array};
-        use faiss::cluster::kmeans_clustering;
-
-        let array = data.as_ref().values();
-        let f32array: &Float32Array = as_primitive_array(&array);
-        b.iter(|| {
-            kmeans_clustering(dimension as u32, 256, f32array.values()).unwrap();
+            KMeans::<Float32Type>::new(&array, 25, 50).ok().unwrap();
         })
     });
 
@@ -44,22 +29,7 @@ fn bench_train(c: &mut Criterion) {
     let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
     c.bench_function("train_128d_65535", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::<Float32Type>::new(&array, 25, 50)
-                .await
-                .ok()
-                .unwrap();
-        })
-    });
-
-    #[cfg(feature = "faiss")]
-    c.bench_function("train_128d_65535_faiss", |b| {
-        use arrow_array::{cast::as_primitive_array, Float32Array};
-        use faiss::cluster::kmeans_clustering;
-
-        let array = data.as_ref().values();
-        let f32array: &Float32Array = as_primitive_array(&array);
-        b.iter(|| {
-            kmeans_clustering(dimension as u32, 256, f32array.values()).unwrap();
+            KMeans::<Float32Type>::new(&array, 25, 50).ok().unwrap();
         })
     });
 
@@ -68,10 +38,7 @@ fn bench_train(c: &mut Criterion) {
     let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
     c.bench_function("train_8d_65535", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::<Float32Type>::new(&array, 25, 50)
-                .await
-                .ok()
-                .unwrap();
+            KMeans::<Float32Type>::new(&array, 25, 50).ok().unwrap();
         })
     });
 }
@@ -82,6 +49,7 @@ criterion_group!(
     config = Criterion::default().significance_level(0.1).sample_size(10)
     .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_train);
+
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(

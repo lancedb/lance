@@ -63,6 +63,6 @@ where
         ..Default::default()
     };
     let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
-    let model = KMeans::<T>::new_with_params(&data, k, &params).await?;
+    let model = KMeans::<T>::new_with_params(&data, k, &params)?;
     Ok(model.centroids.as_ref().clone())
 }
