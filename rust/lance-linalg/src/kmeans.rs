@@ -148,6 +148,29 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
     }
 }
 
+fn histogram(k: usize, membership: &[Option<u32>]) -> Vec<usize> {
+    let mut hist: Vec<usize> = vec![0; k];
+    membership.iter().for_each(|cd| {
+        if let Some(cluster_id) = cd {
+            hist[*cluster_id as usize] += 1;
+        }
+    });
+
+    hist
+}
+
+/// Std deviation of the histogram / cluster distribution.
+fn hist_stddev(k: usize, membership: &[Option<u32>]) -> f32 {
+    let mean: f32 = membership.len() as f32 * 1.0 / k as f32;
+    let len = membership.len();
+    (histogram(k, membership)
+        .par_iter()
+        .map(|c| (*c as f32 - mean).powi(2))
+        .sum::<f32>()
+        / len as f32)
+        .sqrt()
+}
+
 impl<T: ArrowFloatType> KMeans<T>
 where
     T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
@@ -240,6 +263,7 @@ where
             )))?;
 
         let mut best_kmeans = Self::empty(k, dimension, params.distance_type);
+        let mut best_stddev = f32::MAX;
 
         // TODO: use seed for Rng.
         let rng = SmallRng::from_entropy();
@@ -258,6 +282,7 @@ where
             };
 
             let mut loss = f64::MAX;
+            let mut last_membership: Option<Vec<Option<u32>>> = None;
             for i in 1..=params.max_iters {
                 if i % 10 == 0 {
                     info!(
@@ -265,13 +290,12 @@ where
                         i, params.max_iters, redo
                     );
                 };
-                let (last_membership, last_loss) =
-                    kmeans.compute_membership_and_loss(data.as_slice());
+                let (membership, last_loss) = kmeans.compute_membership_and_loss(data.as_slice());
                 kmeans = Self::to_kmeans(
                     data.as_slice(),
                     dimension,
                     k,
-                    &last_membership,
+                    &membership,
                     params.distance_type,
                 )
                 .unwrap();
@@ -283,8 +307,18 @@ where
                     break;
                 }
                 loss = last_loss;
+                last_membership = Some(membership);
             }
-            best_kmeans = kmeans;
+            let stddev = hist_stddev(
+                k,
+                last_membership
+                    .as_ref()
+                    .expect("Last membership should already set"),
+            );
+            if stddev < best_stddev {
+                best_stddev = stddev;
+                best_kmeans = kmeans;
+            }
         }
 
         Ok(best_kmeans)
@@ -315,11 +349,11 @@ where
             .collect::<Vec<_>>();
         (
             cluster_and_dists
-                .iter()
+                .par_iter()
                 .map(|cd| cd.map(|(c, _)| c))
                 .collect::<Vec<_>>(),
             cluster_and_dists
-                .iter()
+                .par_iter()
                 .map(|cd| cd.map(|(_, d)| d).unwrap_or_default() as f64)
                 .sum(),
         )
