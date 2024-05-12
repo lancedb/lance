@@ -73,7 +73,7 @@ impl KMeans {
     }
 
     /// Train the model
-    fn fit(&mut self, py: Python, arr: &PyAny) -> PyResult<()> {
+    fn fit(&mut self, _py: Python, arr: &PyAny) -> PyResult<()> {
         let data = ArrayData::from_pyarrow(arr)?;
         if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
@@ -84,11 +84,7 @@ impl KMeans {
             max_iters: self.max_iters,
             ..Default::default()
         };
-        let kmeans = RT
-            .block_on(
-                Some(py),
-                LanceKMeans::new_with_params(&fixed_size_arr, self.k, &params),
-            )?
+        let kmeans = LanceKMeans::new_with_params(&fixed_size_arr, self.k, &params)
             .map_err(|e| PyRuntimeError::new_err(format!("Error training KMeans: {}", e)))?;
         self.trained_kmeans = Some(kmeans);
         Ok(())

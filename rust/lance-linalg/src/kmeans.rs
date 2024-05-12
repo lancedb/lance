@@ -468,6 +468,7 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
+    use crate::distance::l2;
     use crate::kernels::argmin;
 
     #[test]
@@ -531,9 +532,11 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
 
-        compute_partitions_l2(centroids.values(), values.values(), DIM).for_each(|cd| {
-            assert!(cd.is_none());
-        });
+        compute_partitions::<Float32Type>(centroids.into(), values.into(), DIM, DistanceType::L2)
+            .iter()
+            .for_each(|cd| {
+                assert!(cd.is_none());
+            });
     }
 
     #[tokio::test]
