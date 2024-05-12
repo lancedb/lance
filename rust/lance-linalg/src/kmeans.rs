@@ -299,6 +299,7 @@ where
                     params.distance_type,
                 )
                 .unwrap();
+                last_membership = Some(membership);
                 if (loss - last_loss).abs() / last_loss < params.tolerance {
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}",
@@ -307,7 +308,6 @@ where
                     break;
                 }
                 loss = last_loss;
-                last_membership = Some(membership);
             }
             let stddev = hist_stddev(
                 k,
