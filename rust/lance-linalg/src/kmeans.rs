@@ -425,12 +425,6 @@ where
     fn compute_membership(&self, data: &[T::Native], _nprobes: Option<usize>) -> Vec<Option<u32>> {
         assert!(_nprobes.is_none());
 
-        if matches!(self.distance_type, DistanceType::L2) {
-            return compute_partitions_l2(self.centroids.as_slice(), data, self.dimension)
-                .map(|cd| cd.map(|(c, _)| c))
-                .collect::<Vec<_>>();
-        };
-
         let centroids = self.centroids.as_ref().as_slice();
         data.par_chunks(self.dimension)
             .map(|vec| {
@@ -448,99 +442,6 @@ where
             })
             .collect::<Vec<_>>()
     }
-}
-
-/// Return a slice of `data[x,y..y+strip]`.
-#[inline]
-fn get_slice<T: Num>(data: &[T], x: usize, y: usize, dim: usize, strip: usize) -> &[T] {
-    &data[x * dim + y..x * dim + y + strip]
-}
-
-/// Compute L2 kmeans partitions with small number of centroids, while the tiling overhead is big.
-fn compute_partitions_l2_small<'a, T: L2>(
-    centroids: &'a [T],
-    data: &'a [T],
-    dim: usize,
-) -> impl Iterator<Item = Option<(u32, f32)>> + 'a {
-    data.chunks(dim)
-        .map(move |row| argmin_value_float(l2_distance_batch(row, centroids, dim)))
-}
-
-/// Fast partition computation for L2 distance.
-///
-/// Parameters
-/// ----------
-/// *centroids*: the flat array of the centroids to run against to.
-/// *data*: the flat array of the vectors.
-/// *dim*: the dimension of centroids / vectors.
-///
-/// Returns
-/// -------
-/// An iterator of ``(partition_id, dist)`` pairs.
-///
-/// If the distance is not valid, returns ``None`` as placeholder.
-///
-fn compute_partitions_l2<'a, T: L2>(
-    centroids: &'a [T],
-    data: &'a [T],
-    dim: usize,
-) -> Box<dyn Iterator<Item = Option<(u32, f32)>> + 'a> {
-    if std::mem::size_of_val(centroids) <= 16 * 1024 {
-        return Box::new(compute_partitions_l2_small(centroids, data, dim));
-    }
-
-    const STRIPE_SIZE: usize = 128;
-    const TILE_SIZE: usize = 16;
-
-    // 128 * 4bytes * 16 = 8KB for centroid and data respectively, so both of them can
-    // stay in L1 cache.
-    let num_centroids = centroids.len() / dim;
-
-    // Read a tile of vectors, `data[idx..idx+TILE_SIZE]`
-    let stream = data.chunks(TILE_SIZE * dim).flat_map(move |data_tile| {
-        // Loop over each strip.
-        // s is the index of value in each vector.
-        let num_rows_in_tile = data_tile.len() / dim;
-        let mut min_dists = vec![f32::infinity(); num_rows_in_tile];
-        let mut partitions: Vec<Option<u32>> = vec![None; num_rows_in_tile];
-
-        for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
-            // 4B * 16 * 16 = 1 KB
-            let mut dists = [0.0; TILE_SIZE * TILE_SIZE];
-            let num_centroids_in_tile = min(TILE_SIZE, num_centroids - centroid_start);
-            for s in (0..dim).step_by(STRIPE_SIZE) {
-                // Calculate L2 within each TILE * STRIP
-                let slice_len = min(STRIPE_SIZE, dim - s);
-                for di in 0..num_rows_in_tile {
-                    let data_slice = get_slice(data_tile, di, s, dim, slice_len);
-                    for ci in centroid_start..centroid_start + num_centroids_in_tile {
-                        // Get a slice of `data[di][s..s+STRIP_SIZE]`.
-                        let cent_slice = get_slice(centroids, ci, s, dim, slice_len);
-                        let dist = l2(data_slice, cent_slice);
-                        dists[di * TILE_SIZE + (ci - centroid_start)] += dist;
-                    }
-                }
-            }
-
-            for i in 0..num_rows_in_tile {
-                if let Some((part_id, dist)) = argmin_value(
-                    dists[i * TILE_SIZE..(i * TILE_SIZE + num_centroids_in_tile)]
-                        .iter()
-                        .copied(),
-                ) {
-                    if dist < min_dists[i] {
-                        min_dists[i] = dist;
-                        partitions[i] = Some(centroid_start as u32 + part_id);
-                    }
-                }
-            }
-        }
-        partitions
-            .into_iter()
-            .zip(min_dists)
-            .map(|(p, d)| p.map(|p| (p, d)))
-    });
-    Box::new(stream)
 }
 
 /// Compute partition ID of each vector in the KMeans.
