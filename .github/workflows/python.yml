@@ -114,7 +114,7 @@ jobs:
     strategy:
       matrix:
         python-minor-version: [ "12" ]
-    runs-on: buildjet-4vcpu-ubuntu-2204-arm
+    runs-on: warp-ubuntu-latest-arm64-4x
     defaults:
       run:
         shell: bash
