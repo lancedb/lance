@@ -9,7 +9,6 @@
 //! and run ``l2`` distance on the unit vectors.
 //!
 
-use std::cmp::min;
 use std::ops::DivAssign;
 use std::sync::Arc;
 use std::vec;
@@ -19,17 +18,17 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::ArrowError;
 use lance_arrow::{ArrowFloatType, FloatArray};
 use log::{info, warn};
-use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
+use num_traits::{AsPrimitive, Float, FromPrimitive, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
 
 use crate::distance::norm_l2::Normalize;
 use crate::distance::{dot_distance_batch, DistanceType};
-use crate::kernels::{argmax, argmin_value_float};
+use crate::kernels::argmax;
 use crate::{
     clustering::Clustering,
     distance::{
-        l2::{l2, l2_distance_batch, L2},
+        l2::{l2_distance_batch, L2},
         Dot,
     },
     kernels::argmin_value,
