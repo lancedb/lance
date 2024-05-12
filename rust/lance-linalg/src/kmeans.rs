@@ -244,7 +244,7 @@ where
         // TODO: use seed for Rng.
         let rng = SmallRng::from_entropy();
         for redo in 1..=params.redos {
-            let kmeans = match params.init {
+            let mut kmeans: Self = match params.init {
                 KMeanInit::Random => Self::init_random(
                     data.as_slice(),
                     dimension,
@@ -267,7 +267,7 @@ where
                 };
                 let (last_membership, last_loss) =
                     kmeans.compute_membership_and_loss(data.as_slice());
-                let kmeans = Self::to_kmeans(
+                kmeans = Self::to_kmeans(
                     data.as_slice(),
                     dimension,
                     k,
@@ -283,8 +283,8 @@ where
                     break;
                 }
                 loss = last_loss;
-                best_kmeans = kmeans;
             }
+            best_kmeans = kmeans;
         }
 
         Ok(best_kmeans)
