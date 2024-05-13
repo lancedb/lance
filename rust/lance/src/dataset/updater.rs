@@ -128,14 +128,13 @@ impl Updater {
     pub async fn update(&mut self, batch: RecordBatch) -> Result<()> {
         let Some(last) = self.last_input.as_ref() else {
             return Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 "Fragment Updater: no input data is available before update".to_string(),
                 location!(),
             ));
         };
 
         if last.num_rows() != batch.num_rows() {
-            return Err(Error::io(       // TODO: Define more granular Error and wrap it in here.
+            return Err(Error::io(
                 format!(
                     "Fragment Updater: new batch has different size with the source batch: {} != {}",
                     last.num_rows(),

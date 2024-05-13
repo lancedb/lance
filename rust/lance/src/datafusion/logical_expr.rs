@@ -23,13 +23,12 @@ use snafu::{location, Location};
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     match expr {
         Expr::Literal(scalar_value) => {
-            Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type).ok_or_else(|| Error::io( // TODO: Define more granular Error types and wrap it in here.
+            Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type).ok_or_else(|| Error::io(
                 format!("Received literal {expr} and could not convert to literal of type '{data_type:?}'"),
                 location!(),
             ))?))
         }
         _ => Err(Error::io(
-            // TODO: Define more granular Error types and wrap it in here.
             format!("Expected a literal of type '{data_type:?}' but received: {expr}"),
             location!(),
         )),

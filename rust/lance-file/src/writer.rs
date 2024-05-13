@@ -610,7 +610,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                 if field.data_type().is_dictionary() {
                     let dict_info = field.dictionary.as_mut().ok_or_else(|| {
                         Error::io(
-                            format!("Lance field {} misses dictionary info", field.name), // TODO: Define lance-file::Error
+                            format!("Lance field {} misses dictionary info", field.name),
                             // and wrap it in here.
                             location!(),
                         )
@@ -619,8 +619,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                     let value_arr = dict_info.values.as_ref().ok_or_else(|| {
                         Error::io(
                             format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array", // TODO: Define lance-file::Error
-                                                                                                    // and wrap it in here.
+                        "Lance field {} is dictionary type, but misses the dictionary value array", 
                         field.name),
                             location!(),
                         )
@@ -637,7 +636,6 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                             encoder.encode(&[value_arr]).await?
                         }
                         _ => {
-                            // TODO: Define lance-file::Error and wrap it in here.
                             return Err(Error::io(
                                 format!(
                                     "Does not support {} as dictionary value type",

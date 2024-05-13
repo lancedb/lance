@@ -793,7 +793,6 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 .map(Uuid::try_from)
                 .ok_or_else(|| {
                     Error::io(
-                        // TODO: Define more granular Error and wrap it in here.
                         "required field (old_id) missing from message".to_string(),
                         location!(),
                     )
@@ -804,7 +803,6 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 .map(Uuid::try_from)
                 .ok_or_else(|| {
                     Error::io(
-                        // TODO: Define more granular Error and wrap it in here.
                         "required field (new_id) missing from message".to_string(),
                         location!(),
                     )

@@ -149,9 +149,7 @@ pub async fn shuffle_dataset(
             .buffer_unordered(num_cpus::get())
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
-                // TODO: Define lance-index::Error and wrap it in here.
                 Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
-                // TODO: Define lance-index::Error and wrap it in here.
                 Err(err) => Err(Error::io(err.to_string(), location!())),
             })
             .boxed();
@@ -231,24 +229,19 @@ impl IvfShuffler {
         let schema = match data.as_mut().peek().await {
             Some(Ok(batch)) => batch.schema(),
             Some(Err(err)) => {
-                // TODO: Define lance-index::Error and wrap it in here.
                 return Err(Error::io(err.to_string(), location!()));
             }
             None => {
-                // TODO: Define lance-index::Error and wrap it in here.
                 return Err(Error::io("empty stream".to_string(), location!()));
             }
         };
 
         // validate the schema,
         // we need to have row ID and partition ID column
-        schema.column_with_name(ROW_ID).ok_or(Error::io(
-            // TODO: Define lance-index::Error and wrap it in here.
-            "row ID column not found".to_owned(),
-            location!(),
-        ))?;
+        schema
+            .column_with_name(ROW_ID)
+            .ok_or(Error::io("row ID column not found".to_owned(), location!()))?;
         schema.column_with_name(PART_ID_COLUMN).ok_or(Error::io(
-            // TODO: Define lance-index::Error and wrap it in here.
             "partition ID column not found".to_owned(),
             location!(),
         ))?;
@@ -440,16 +433,11 @@ impl IvfShuffler {
 
                 // third, shuffle the data into each partition
                 let shuffled = self.shuffle_to_partitions(&input, size_counts).await?;
-                let schema =
-                    shuffled
-                        .iter()
-                        .find(|batches| !batches.is_empty())
-                        .ok_or(Error::io(
-                            // TODO: Define lance-index::Error and wrap it in here.
-                            "empty input to shuffle".to_owned(),
-                            location!(),
-                        ))?[0]
-                        .schema();
+                let schema = shuffled
+                    .iter()
+                    .find(|batches| !batches.is_empty())
+                    .ok_or(Error::io("empty input to shuffle".to_owned(), location!()))?[0]
+                    .schema();
 
                 // finally, write the shuffled data to disk
                 let object_store = ObjectStore::local();

@@ -242,7 +242,6 @@ impl Scanner {
     fn ensure_not_fragment_scan(&self) -> Result<()> {
         if self.is_fragment_scan() {
             Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 "This operation is not supported for fragment scan".to_string(),
                 location!(),
             ))
@@ -281,7 +280,6 @@ impl Scanner {
         for (output_name, raw_expr) in columns {
             if output.contains_key(output_name.as_ref()) {
                 return Err(Error::io(
-                    // TODO: Define more granular Error and wrap it in here.
                     format!("Duplicate column name: {}", output_name.as_ref()),
                     location!(),
                 ));
@@ -407,7 +405,6 @@ impl Scanner {
     pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
         if limit.unwrap_or_default() < 0 {
             return Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 "Limit must be non-negative".to_string(),
                 location!(),
             ));
@@ -430,15 +427,10 @@ impl Scanner {
         self.ensure_not_fragment_scan()?;
 
         if k == 0 {
-            return Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
-                "k must be positive".to_string(),
-                location!(),
-            ));
+            return Err(Error::io("k must be positive".to_string(), location!()));
         }
         if q.is_empty() {
             return Err(Error::io(
-                //TODO: Define more granular Error and wrap it in here.
                 "Query vector must have non-zero length".to_string(),
                 location!(),
             ));
@@ -454,7 +446,6 @@ impl Scanner {
                     coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
                 } else {
                     return Err(Error::io(
-                        // TODO: Define more granular Error and wrap it in here.
                         format!(
                             "Column {} is not a vector column (type: {})",
                             column,
@@ -466,7 +457,6 @@ impl Scanner {
             }
             _ => {
                 return Err(Error::io(
-                    // TODO: Define more granular Error and wrap it in here.
                     format!(
                         "Column {} is not a vector column (type: {})",
                         column,
@@ -588,7 +578,6 @@ impl Scanner {
 
         if let Some(q) = self.nearest.as_ref() {
             let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 format!("Column {} not found", q.column),
                 location!(),
             ))?;
@@ -1000,11 +989,7 @@ impl Scanner {
     // ANN/KNN search execution node with optional prefilter
     async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
-            return Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
-                "No nearest query".to_string(),
-                location!(),
-            ));
+            return Err(Error::io("No nearest query".to_string(), location!()));
         };
 
         // Santity check
@@ -1013,7 +998,7 @@ impl Scanner {
             match field.data_type() {
                 DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
                 _ => {
-                    return Err(Error::io(   // TODO: Define more granular Error and wrap it in here.
+                    return Err(Error::io(
                         format!(
                             "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
                             q.column, field.data_type(),
@@ -1024,7 +1009,6 @@ impl Scanner {
             }
         } else {
             return Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 format!("Vector search error: column {} not found", q.column),
                 location!(),
             ));
@@ -1042,7 +1026,6 @@ impl Scanner {
             // We will use the index.
             if matches!(q.refine_factor, Some(0)) {
                 return Err(Error::io(
-                    // TODO: Define more granular Error and wrap it in here.
                     "Refine factor can not be zero".to_string(),
                     location!(),
                 ));

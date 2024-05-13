@@ -166,7 +166,6 @@ impl Metadata {
     // TODO: pub(crate)
     pub fn range_to_batches(&self, range: Range<usize>) -> Result<Vec<(i32, Range<usize>)>> {
         if range.end > *(self.batch_offsets.last().unwrap()) as usize {
-            // TODO: Define lance-file::Error and wrap it in here.
             return Err(Error::io(
                 format!(
                     "Range {:?} is out of bounds {}",

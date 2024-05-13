@@ -46,7 +46,6 @@ pub async fn read_binary_array(
             reader, position, length, nullable,
         )),
         _ => {
-            // TODO: Define lance-io::Error and wrap it in here.
             return Err(Error::io(
                 format!("Unsupported binary type: {}", data_type),
                 location!(),
@@ -82,7 +81,6 @@ pub async fn read_fixed_stride_array(
 pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
     let file_size = reader.size().await?;
     if pos > file_size {
-        // TODO: Define lance-io::Error and wrap it in here.
         return Err(Error::io("file size is too small".to_string(), location!()));
     }
 
@@ -130,7 +128,6 @@ pub async fn read_last_block(reader: &dyn Reader) -> Result<Bytes> {
 pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let len = bytes.len();
     if len < 16 {
-        // TODO: Define lance-io::Error and wrap it in here.
         return Err(Error::io(
             format!(
                 "does not have sufficient data, len: {}, bytes: {:?}",
@@ -147,7 +144,6 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
 pub fn read_version(bytes: &Bytes) -> Result<(u16, u16)> {
     let len = bytes.len();
     if len < 8 {
-        // TODO: Define lance-io::Error and wrap it in here.
         return Err(Error::io(
             format!(
                 "does not have sufficient data, len: {}, bytes: {:?}",

@@ -52,7 +52,6 @@ impl HashJoiner {
         .await
         .unwrap()?;
         if batches.is_empty() {
-            // TODO: Define more granular error and wrap it in here.
             return Err(Error::io("HashJoiner: No data".to_string(), location!()));
         };
 
@@ -95,11 +94,7 @@ impl HashJoiner {
                     match task_result {
                         Ok(Ok(_)) => Ok(()),
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::io(
-                            // TODO: Define more granular error and wrap it in here.
-                            format!("HashJoiner: {}", err),
-                            location!(),
-                        )),
+                        Err(err) => Err(Error::io(format!("HashJoiner: {}", err), location!())),
                     }
                 }
             })
@@ -179,7 +174,7 @@ impl HashJoiner {
                     let task_result = task::spawn_blocking(move || {
                         let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
                         interleave(array_refs.as_ref(), indices.as_ref())
-                            .map_err(|err| Error::io(           // TODO: Define more granular error and wrap it in here.
+                            .map_err(|err| Error::io(
                                 format!("HashJoiner: {}", err),
                                 location!(),
                             ))

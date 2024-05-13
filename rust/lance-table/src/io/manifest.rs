@@ -38,14 +38,12 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     };
     let buf = object_store.inner.get_range(path, range).await?;
     if buf.len() < 16 {
-        // TODO: Define lance-table::Error and wrap it in here.
         return Err(Error::io(
             "Invalid format: file size is smaller than 16 bytes".to_string(),
             location!(),
         ));
     }
     if !buf.ends_with(MAGIC) {
-        // TODO: Define lance-table::Error and wrap it in here.
         return Err(Error::io(
             "Invalid format: magic number does not match".to_string(),
             location!(),
@@ -81,7 +79,6 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     let buf = buf.slice(4..buf.len() - 16);
 
     if buf.len() != recorded_length {
-        // TODO: Define lance-table::Error and wrap it in here.
         return Err(Error::io(
             format!(
                 "Invalid format: manifest length does not match. Expected {}, got {}",
@@ -144,7 +141,6 @@ pub async fn write_manifest(
     for field_id in 0..max_field_id + 1 {
         if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
             if field.data_type().is_dictionary() {
-                // TODO: Define lance-table::Error and wrap it in here.
                 let dict_info = field.dictionary.as_mut().ok_or_else(|| {
                     Error::io(
                         format!("Lance field {} misses dictionary info", field.name),
@@ -152,7 +148,6 @@ pub async fn write_manifest(
                     )
                 })?;
 
-                // TODO: Define lance-table::Error and wrap it in here.
                 let value_arr = dict_info.values.as_ref().ok_or_else(|| {
                     Error::io(
                         format!(

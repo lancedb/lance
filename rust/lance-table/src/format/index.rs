@@ -46,7 +46,7 @@ impl TryFrom<&pb::IndexMetadata> for Index {
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::io(
-                    "uuid field does not exist in Index metadata".to_string(), //TODO: Define lance-table::Error and wrap it in here
+                    "uuid field does not exist in Index metadata".to_string(),
                     location!(),
                 )
             })??,

@@ -539,12 +539,10 @@ pub async fn read_batch(
                 (r.start..r.start + num_rows).map(|v| v as i32).collect()
             }
         };
-        let batch_offset = reader.metadata.get_offset(batch_id).ok_or_else(|| {
-            Error::io(
-                format!("batch {} does not exist", batch_id), //TODO: Define lance-file::Error and wrap it in here.
-                location!(),
-            )
-        })?;
+        let batch_offset = reader
+            .metadata
+            .get_offset(batch_id)
+            .ok_or_else(|| Error::io(format!("batch {} does not exist", batch_id), location!()))?;
         let row_ids: Vec<u64> = ids_in_batch
             .iter()
             .map(|o| compute_row_id(reader.fragment_id, *o + batch_offset))
@@ -722,7 +720,6 @@ fn read_null_array(
             } else {
                 let idx_max = *indices.values().iter().max().unwrap() as u64;
                 if idx_max >= page_info.length.try_into().unwrap() {
-                    // TODO: Define lance-file::Error and wrap it in here.
                     return Err(Error::io(
                         format!(
                             "NullArray Reader: request([{}]) out of range: [0..{}]",
@@ -745,7 +742,7 @@ fn read_null_array(
             if idx_end > page_info.length {
                 return Err(Error::io(
                     format!(
-                        "NullArray Reader: request([{}..{}]) out of range: [0..{}]", // TODO: Define lance-file::Error
+                        "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
                         // and wrap it in here.
                         idx_start,
                         idx_end,

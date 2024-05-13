@@ -137,7 +137,6 @@ impl FileReader {
     fn decode_footer(footer_bytes: &Bytes) -> Result<Footer> {
         let len = footer_bytes.len();
         if len < FOOTER_LEN {
-            // TODO: Define lance-file::Error and wrap it in here.
             return Err(Error::io(
                 format!(
                     "does not have sufficient data, len: {}, bytes: {:?}",

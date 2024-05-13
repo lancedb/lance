@@ -692,7 +692,6 @@ impl VectorIndex for IVFIndex {
 
         let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| {
             Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 format!(
                     "_distance column does not exist in batch: {}",
                     batch.schema()
@@ -898,7 +897,6 @@ impl TryFrom<&Ivf> for pb::Ivf {
     fn try_from(ivf: &Ivf) -> Result<Self> {
         if ivf.offsets.len() != ivf.centroids.len() {
             return Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 "Ivf model has not been populated".to_string(),
                 location!(),
             ));

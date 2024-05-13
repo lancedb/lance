@@ -77,7 +77,6 @@ mod test {
             let mut store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
                 Some(_) => Err(Error::io(
-                    // TODO: Define more granular Error and wrap it in here.
                     format!(
                         "manifest already exists for uri: {}, version: {}",
                         uri, version
@@ -102,7 +101,6 @@ mod test {
                     Ok(())
                 }
                 None => Err(Error::io(
-                    // TODO: Define more granular Error and wrap it in here
                     format!(
                         "manifest already exists for uri: {}, version: {}",
                         uri, version

@@ -254,7 +254,6 @@ impl<'a> PlainDecoder<'a> {
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
         if end > self.length {
-            // TODO: Define lance-io::encodings::Error and wrap it in here
             return Err(Error::io(
                 format!(
                     "PlainDecoder: request([{}..{}]) out of range: [0..{}]",

@@ -33,7 +33,7 @@ impl ObjectWriter {
     pub async fn new(object_store: &dyn ObjectStore, path: &Path) -> Result<Self> {
         let (multipart_id, writer) = object_store.put_multipart(path).await.map_err(|e| {
             Error::io(
-                format!("failed to create object writer for {}: {}", path, e), // TODO: Define ObjectWriter::Error
+                format!("failed to create object writer for {}: {}", path, e),
                 // and wrap it in here.
                 location!(),
             )
@@ -50,7 +50,7 @@ impl ObjectWriter {
     pub async fn shutdown(&mut self) -> Result<()> {
         self.writer.as_mut().shutdown().await.map_err(|e| {
             Error::io(
-                format!("failed to shutdown object writer for {}: {}", self.path, e), // TODO: Define ObjectWriter::Error
+                format!("failed to shutdown object writer for {}: {}", self.path, e),
                 // and wrap it in here.
                 location!(),
             )

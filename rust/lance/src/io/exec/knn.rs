@@ -171,7 +171,7 @@ impl KNNFlatExec {
         match field.data_type() {
             DataType::FixedSizeList(list_field, _) if list_field.data_type().is_floating() => {}
             _ => {
-                return Err(Error::io(               // TODO: Define more granular Error and wrap it in here.
+                return Err(Error::io(
                     format!(
                         "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
                         query.column, field.data_type()
@@ -392,7 +392,6 @@ impl KNNIndexExec {
     ) -> Result<Self> {
         if indices.is_empty() {
             return Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 "KNNIndexExec node: no index found for query".to_string(),
                 location!(),
             ));
@@ -400,7 +399,6 @@ impl KNNIndexExec {
         let schema = dataset.schema();
         if schema.field(query.column.as_str()).is_none() {
             return Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 format!(
                     "KNNIndexExec node: query column {} does not exist in dataset.",
                     query.column

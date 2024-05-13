@@ -545,7 +545,6 @@ impl FileFragment {
                     read_deletion_file(object_store.base_path(), fragment, object_store)
                         .await?
                         .ok_or(Error::io(
-                            // TODO: Define more granular Error and wrap it in here.
                             format!(
                                 "Deletion file {:?} not found in fragment {}",
                                 deletion_file, fragment.id
@@ -566,7 +565,6 @@ impl FileFragment {
     /// fragment.
     pub async fn physical_rows(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
-            // TODO: Define Fragment::Error and wrap it in here.
             return Err(Error::io(
                 format!("Fragment {} does not contain any data", self.id()),
                 location!(),
@@ -1135,7 +1133,6 @@ impl std::fmt::Display for FragmentReader {
 fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     if batches.is_empty() {
         return Err(Error::io(
-            // TODO: Define more granular Error and wrap it in here.
             "Cannot merge empty batches".to_string(),
             location!(),
         ));
@@ -1168,7 +1165,7 @@ impl FragmentReader {
             for reader in readers.iter().skip(1) {
                 if let Some(other_legacy) = reader.0.as_legacy_opt() {
                     if other_legacy.num_batches() != num_batches {
-                        return Err(Error::io(    // TODO: Define more granular Error and wrap it in here.
+                        return Err(Error::io(
                                 "Cannot create FragmentReader from data files with different number of batches"
                                     .to_string(),
                             location!(),
@@ -1176,7 +1173,6 @@ impl FragmentReader {
                     }
                 } else {
                     return Err(Error::io(
-                        // TODO: Define more granular Error and wrap it in here.
                         "Cannot mix legacy and non-legacy readers".to_string(),
                         location!(),
                     ));

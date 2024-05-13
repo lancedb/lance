@@ -316,7 +316,6 @@ impl PrimitiveFieldDecodeTask {
                 TimeUnit::Second => Ok(Self::new_primitive_array::<Time32SecondType>(
                     buffers, num_rows, data_type,
                 )),
-                // TODO: Define lance-encoding::encodings::Error and wrap it in here
                 _ => Err(Error::io(
                     format!("invalid time unit {:?} for 32-bit time type", unit),
                     location!(),
@@ -329,7 +328,6 @@ impl PrimitiveFieldDecodeTask {
                 TimeUnit::Nanosecond => Ok(Self::new_primitive_array::<Time64NanosecondType>(
                     buffers, num_rows, data_type,
                 )),
-                // TODO: Define lance-encoding::encodings::Error and wrap it in here
                 _ => Err(Error::io(
                     format!("invalid time unit {:?} for 64-bit time type", unit),
                     location!(),
@@ -379,7 +377,6 @@ impl PrimitiveFieldDecodeTask {
                     fsl_nulls,
                 )))
             }
-            // TODO: Define lance-encoding::encodings::Error and wrap it in here
             _ => Err(Error::io(
                 format!(
                     "The data type {} cannot be decoded from a primitive encoding",

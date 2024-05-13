@@ -118,7 +118,6 @@ async fn merge_streams(
             }
             Some(Err(e)) => {
                 return Err(Error::io(
-                    // TODO: Define more granular Error and wrap it in here.
                     format!("IVF Shuffler::failed to read batch: {}", e),
                     location!(),
                 ));
@@ -276,14 +275,12 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                 }
                 Some(Err(e)) => {
                     return Err(Error::io(
-                        // TODO: Define more granular Error and wrap it in here.
                         format!("failed to read batch: {}", e),
                         location!(),
                     ));
                 }
                 None => {
                     return Err(Error::io(
-                        // TODO: Define more granular Error and wrap it in here.
                         "failed to read batch: end of stream".to_string(),
                         location!(),
                     ));

@@ -51,7 +51,6 @@ impl TryFrom<&str> for WriteMode {
             "append" => Ok(Self::Append),
             "overwrite" => Ok(Self::Overwrite),
             _ => Err(Error::io(
-                // TODO: Define more granular Error and wrap it in here.
                 format!("Invalid write mode: {}", value),
                 location!(),
             )),

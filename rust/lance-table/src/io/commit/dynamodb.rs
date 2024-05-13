@@ -20,9 +20,9 @@ use snafu::{location, Location};
 use tokio::sync::RwLock;
 
 use crate::io::commit::external_manifest::ExternalManifestStore;
+use lance_core::error::box_error;
 use lance_core::error::NotFoundSnafu;
 use lance_core::{Error, Result};
-use lance_core::error::box_error;
 
 #[derive(Debug)]
 struct WrappedSdkError<E>(SdkError<E>);
@@ -39,7 +39,7 @@ where
     }
 }
 
-impl<E> std::fmt::Display for WrappedSdkError<E> 
+impl<E> std::fmt::Display for WrappedSdkError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
@@ -48,7 +48,7 @@ where
     }
 }
 
-impl<E> std::error::Error for WrappedSdkError<E> 
+impl<E> std::error::Error for WrappedSdkError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
@@ -149,32 +149,42 @@ impl DynamoDBExternalManifestStore {
             .send()
             .await
             .wrap_err()?;
-        let table = describe_result.table.ok_or_else(|| Error::io(
-            format!("dynamodb table: {table_name} does not exist"),
-            location!(),
-        ))?;
-        let mut schema = table.key_schema.ok_or_else(|| Error::io(
-            format!("dynamodb table: {table_name} does not have a key schema"),
-            location!(),
-        ))?;
+        let table = describe_result.table.ok_or_else(|| {
+            Error::io(
+                format!("dynamodb table: {table_name} does not exist"),
+                location!(),
+            )
+        })?;
+        let mut schema = table.key_schema.ok_or_else(|| {
+            Error::io(
+                format!("dynamodb table: {table_name} does not have a key schema"),
+                location!(),
+            )
+        })?;
 
         let mut has_hask_key = false;
         let mut has_range_key = false;
 
         // there should be two keys, HASH(base_uri) and RANGE(version)
         for _ in 0..2 {
-            let key = schema.pop().ok_or_else(|| Error::io(
-                format!("dynamodb table: {table_name} must have HASH and RANGE keys"),
-                location!(),
-            ))?;
-            let key_type = key.key_type.ok_or_else(|| Error::io(
-                format!("dynamodb table: {table_name} key types must be defined"),
-                location!(),
-            ))?;
-            let name = key.attribute_name.ok_or_else(|| Error::io(
-                format!("dynamodb table: {table_name} key must have an attribute name"),
-                location!(),
-            ))?;
+            let key = schema.pop().ok_or_else(|| {
+                Error::io(
+                    format!("dynamodb table: {table_name} must have HASH and RANGE keys"),
+                    location!(),
+                )
+            })?;
+            let key_type = key.key_type.ok_or_else(|| {
+                Error::io(
+                    format!("dynamodb table: {table_name} key types must be defined"),
+                    location!(),
+                )
+            })?;
+            let name = key.attribute_name.ok_or_else(|| {
+                Error::io(
+                    format!("dynamodb table: {table_name} key must have an attribute name"),
+                    location!(),
+                )
+            })?;
             match (key_type, name.as_str()) {
                 (KeyType::Hash, base_uri!()) => {
                     has_hask_key = true;
@@ -249,10 +259,9 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             ),
         })?;
 
-        let path = item.get(path!()).ok_or_else(|| Error::io(
-            format!("key {} is not present", path!()),
-            location!(),
-        ))?;
+        let path = item
+            .get(path!())
+            .ok_or_else(|| Error::io(format!("key {} is not present", path!()), location!()))?;
 
         match path {
             AttributeValue::S(path) => Ok(path.clone()),
