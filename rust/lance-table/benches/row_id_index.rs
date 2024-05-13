@@ -16,7 +16,11 @@
 // How can I write out the file? Where should I put it?
 // How can I take a argument to set the size of the index?
 
-use std::{collections::{BTreeMap, HashMap}, io::Write, ops::Range};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Write,
+    ops::Range,
+};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
@@ -60,7 +64,9 @@ fn make_frag_sequences(
 // https://bheisler.github.io/criterion.rs/book/user_guide/benchmarking_with_inputs.html
 
 fn num_rows() -> u64 {
-    std::env::var("BENCH_NUM_ROWS").map(|s| s.parse().unwrap()).unwrap_or(1_000_000)
+    std::env::var("BENCH_NUM_ROWS")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(1_000_000)
 }
 
 struct SizeStats {
@@ -87,7 +93,12 @@ impl SizeStatsFile {
 
     fn write_row(&mut self, stats: SizeStats) {
         if let Some(file) = &mut self.file {
-            writeln!(file, "\"{}\",{},{}", stats.structure, stats.percent_deletions, stats.size).unwrap();
+            writeln!(
+                file,
+                "\"{}\",{},{}",
+                stats.structure, stats.percent_deletions, stats.size
+            )
+            .unwrap();
         }
     }
 }
@@ -123,7 +134,6 @@ fn bench_creation(c: &mut Criterion) {
             stats_file.write_row(stats);
         }
 
-
         // TODO: we should compare tombstoned vs compacted. We don't mind the
         // regression in the tombstoned case, but we want to see the improvement
         // in the compacted case.
@@ -145,7 +155,10 @@ fn bench_creation(c: &mut Criterion) {
             .collect::<Vec<_>>();
 
         // Size of flat data is just 16 bytes per row
-        let size = flat_data.iter().map(|(ids, _addresses)| ids.len() * 16).sum::<usize>() as u64;
+        let size = flat_data
+            .iter()
+            .map(|(ids, _addresses)| ids.len() * 16)
+            .sum::<usize>() as u64;
         let stats = SizeStats {
             structure: "FlatData".to_string(),
             percent_deletions,
@@ -220,13 +233,14 @@ fn bench_get_single(c: &mut Criterion) {
             })
             .collect::<Vec<_>>();
 
-        let index = {
-            let mut index = HashMap::new();
-            index.extend(flat_data.iter().flat_map(|(ids, addresses)| {
-                ids.iter().copied().zip(addresses.iter().copied())
-            }));
-            index
-        };
+        let index =
+            {
+                let mut index = HashMap::new();
+                index.extend(flat_data.iter().flat_map(|(ids, addresses)| {
+                    ids.iter().copied().zip(addresses.iter().copied())
+                }));
+                index
+            };
 
         group.bench_with_input(
             BenchmarkId::new("GetHashMap", percent_deletions),
@@ -240,11 +254,12 @@ fn bench_get_single(c: &mut Criterion) {
             },
         );
 
-        let index = {
-            BTreeMap::from_iter(flat_data.iter().flat_map(|(ids, addresses)| {
-                ids.iter().copied().zip(addresses.iter().copied())
-            }))
-        };
+        let index =
+            {
+                BTreeMap::from_iter(flat_data.iter().flat_map(|(ids, addresses)| {
+                    ids.iter().copied().zip(addresses.iter().copied())
+                }))
+            };
 
         group.bench_with_input(
             BenchmarkId::new("GetBTreeMap", percent_deletions),
@@ -260,7 +275,6 @@ fn bench_get_single(c: &mut Criterion) {
     }
 
     group.finish();
-
 }
 
 criterion_group!(benches, bench_creation, bench_get_single);

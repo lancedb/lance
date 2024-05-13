@@ -1,190 +1,228 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::io::{Read, Write};
+use crate::{format::pb, rowids::bitmap::Bitmap};
+use lance_core::{Error, Result};
+use snafu::{location, Location};
 
 use super::{encoded_array::EncodedU64Array, RowIdSequence, U64Segment};
+use prost::Message;
 
-/// Serialize a rowid sequence to a writer.
-pub fn write_row_ids<W: Write>(sequence: &RowIdSequence, writer: &mut W) -> std::io::Result<()> {
-    // First, write number of segmens
-    writer.write_all(&(sequence.0.len() as u64).to_le_bytes())?;
+impl TryFrom<pb::RowIdSequence> for RowIdSequence {
+    type Error = Error;
 
-    // Then write each segment
-    for segment in &sequence.0 {
-        match segment {
-            U64Segment::Tombstones(n) => {
-                writer.write_all(&0u8.to_le_bytes())?;
-                writer.write_all(&n.to_le_bytes())?;
-            }
-            U64Segment::Range(range) => {
-                writer.write_all(&1u8.to_le_bytes())?;
-                writer.write_all(&range.start.to_le_bytes())?;
-                writer.write_all(&range.end.to_le_bytes())?;
-            }
-            U64Segment::SortedArray(array) => {
-                writer.write_all(&2u8.to_le_bytes())?;
-                write_array(array, writer)?;
-            }
-            U64Segment::Array(array) => {
-                writer.write_all(&3u8.to_le_bytes())?;
-                write_array(array, writer)?;
-            }
-        }
+    fn try_from(pb: pb::RowIdSequence) -> Result<Self> {
+        Ok(RowIdSequence(
+            pb.segments
+                .into_iter()
+                .map(U64Segment::try_from)
+                .collect::<Result<Vec<_>>>()?,
+        ))
     }
-
-    Ok(())
 }
 
-fn write_array<W: Write>(array: &EncodedU64Array, writer: &mut W) -> std::io::Result<()> {
-    // length
-    writer.write_all(&array.len().to_le_bytes())?;
-    match array {
-        EncodedU64Array::U16 { offsets, base } => {
-            writer.write_all(&16u8.to_le_bytes())?;
-            writer.write_all(&base.to_le_bytes())?;
-            for &value in offsets {
-                writer.write_all(&value.to_le_bytes())?;
+impl TryFrom<pb::U64Segment> for U64Segment {
+    type Error = Error;
+
+    fn try_from(pb: pb::U64Segment) -> Result<Self> {
+        use pb::u64_segment as pb_seg;
+        use pb::u64_segment::Segment::*;
+        match pb.segment {
+            Some(Range(pb_seg::Range { start, end })) => Ok(U64Segment::Range(start..end)),
+            Some(RangeWithHoles(pb_seg::RangeWithHoles { start, end, holes })) => {
+                let holes = holes
+                    .ok_or_else(|| Error::invalid_input("missing hole", location!()))?
+                    .try_into()?;
+                Ok(U64Segment::RangeWithHoles {
+                    range: start..end,
+                    holes,
+                })
             }
-        }
-        EncodedU64Array::U32 { offsets, base } => {
-            writer.write_all(&32u8.to_le_bytes())?;
-            writer.write_all(&base.to_le_bytes())?;
-            for &value in offsets {
-                writer.write_all(&value.to_le_bytes())?;
+            Some(RangeWithBitmap(pb_seg::RangeWithBitmap { start, end, bitmap })) => {
+                Ok(U64Segment::RangeWithBitmap {
+                    range: start..end,
+                    bitmap: Bitmap {
+                        data: bitmap,
+                        len: (end - start) as usize,
+                    },
+                })
             }
-        }
-        EncodedU64Array::U64(offsets) => {
-            writer.write_all(&64u8.to_le_bytes())?;
-            for &value in offsets {
-                writer.write_all(&value.to_le_bytes())?;
+            Some(SortedArray(array)) => {
+                Ok(U64Segment::SortedArray(EncodedU64Array::try_from(array)?))
             }
+            Some(Array(array)) => Ok(U64Segment::Array(EncodedU64Array::try_from(array)?)),
+            // TODO: why non-exhaustive?
+            // Some(_) => Err(Error::invalid_input("unknown segment type", location!())),
+            None => Err(Error::invalid_input("missing segment type", location!())),
         }
     }
+}
 
-    Ok(())
+impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
+    type Error = Error;
+
+    fn try_from(pb: pb::EncodedU64Array) -> Result<Self> {
+        use pb::encoded_u64_array as pb_arr;
+        use pb::encoded_u64_array::Array::*;
+        match pb.array {
+            Some(U16Array(pb_arr::U16Array { base, offsets })) => {
+                assert!(
+                    offsets.len() % 2 == 0,
+                    "Must have even number of bytes to store u16 array"
+                );
+                let offsets = offsets
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+                Ok(EncodedU64Array::U16 { base, offsets })
+            }
+            Some(U32Array(pb_arr::U32Array { base, offsets })) => {
+                assert!(
+                    offsets.len() % 4 == 0,
+                    "Must have even number of bytes to store u32 array"
+                );
+                let offsets = offsets
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                Ok(EncodedU64Array::U32 { base, offsets })
+            }
+            Some(U64Array(pb_arr::U64Array { values })) => {
+                assert!(
+                    values.len() % 8 == 0,
+                    "Must have even number of bytes to store u64 array"
+                );
+                let values = values
+                    .chunks_exact(8)
+                    .map(|chunk| {
+                        u64::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                            chunk[7],
+                        ])
+                    })
+                    .collect();
+                Ok(EncodedU64Array::U64(values))
+            }
+            // TODO: shouldn't this enum be non-exhaustive?
+            // Some(_) => Err(Error::invalid_input("unknown array type", location!())),
+            None => Err(Error::invalid_input("missing array type", location!())),
+        }
+    }
+}
+
+impl From<RowIdSequence> for pb::RowIdSequence {
+    fn from(sequence: RowIdSequence) -> Self {
+        Self {
+            segments: sequence.0.into_iter().map(pb::U64Segment::from).collect(),
+        }
+    }
+}
+
+impl From<U64Segment> for pb::U64Segment {
+    fn from(segment: U64Segment) -> Self {
+        match segment {
+            U64Segment::Range(range) => pb::U64Segment {
+                segment: Some(pb::u64_segment::Segment::Range(pb::u64_segment::Range {
+                    start: range.start,
+                    end: range.end,
+                })),
+            },
+            U64Segment::RangeWithHoles { range, holes } => pb::U64Segment {
+                segment: Some(pb::u64_segment::Segment::RangeWithHoles(
+                    pb::u64_segment::RangeWithHoles {
+                        start: range.start,
+                        end: range.end,
+                        holes: Some(holes.into()),
+                    },
+                )),
+            },
+            U64Segment::RangeWithBitmap { range, bitmap } => pb::U64Segment {
+                segment: Some(pb::u64_segment::Segment::RangeWithBitmap(
+                    pb::u64_segment::RangeWithBitmap {
+                        start: range.start,
+                        end: range.end,
+                        bitmap: bitmap.data,
+                    },
+                )),
+            },
+            U64Segment::SortedArray(array) => pb::U64Segment {
+                segment: Some(pb::u64_segment::Segment::SortedArray(array.into())),
+            },
+            U64Segment::Array(array) => pb::U64Segment {
+                segment: Some(pb::u64_segment::Segment::Array(array.into())),
+            },
+        }
+    }
+}
+
+impl From<EncodedU64Array> for pb::EncodedU64Array {
+    fn from(array: EncodedU64Array) -> Self {
+        match array {
+            EncodedU64Array::U16 { base, offsets } => pb::EncodedU64Array {
+                array: Some(pb::encoded_u64_array::Array::U16Array(
+                    pb::encoded_u64_array::U16Array {
+                        base,
+                        offsets: offsets
+                            .iter()
+                            .flat_map(|&offset| offset.to_le_bytes().to_vec())
+                            .collect(),
+                    },
+                )),
+            },
+            EncodedU64Array::U32 { base, offsets } => pb::EncodedU64Array {
+                array: Some(pb::encoded_u64_array::Array::U32Array(
+                    pb::encoded_u64_array::U32Array {
+                        base,
+                        offsets: offsets
+                            .iter()
+                            .flat_map(|&offset| offset.to_le_bytes().to_vec())
+                            .collect(),
+                    },
+                )),
+            },
+            EncodedU64Array::U64(values) => pb::EncodedU64Array {
+                array: Some(pb::encoded_u64_array::Array::U64Array(
+                    pb::encoded_u64_array::U64Array {
+                        values: values
+                            .iter()
+                            .flat_map(|&value| value.to_le_bytes().to_vec())
+                            .collect(),
+                    },
+                )),
+            },
+        }
+    }
+}
+
+/// Serialize a rowid sequence to a writer.
+pub fn write_row_ids(sequence: &RowIdSequence) -> Vec<u8> {
+    let pb_sequence = pb::RowIdSequence::from(sequence.clone());
+    pb_sequence.encode_to_vec()
 }
 
 /// Deserialize a rowid sequence from a reader.
-pub fn read_row_ids<R: Read>(reader: &mut R) -> std::io::Result<RowIdSequence> {
-    let mut size_buf = [0u8; 8];
-    reader.read_exact(&mut size_buf)?;
-    let size = u64::from_le_bytes(size_buf);
-
-    let mut segments = Vec::with_capacity(size as usize);
-
-    for _ in 0..size {
-        let mut segment_type_buf = [0u8; 1];
-        reader.read_exact(&mut segment_type_buf)?;
-        let segment_type = segment_type_buf[0];
-
-        match segment_type {
-            0 => {
-                let mut n_buf = [0u8; 8];
-                reader.read_exact(&mut n_buf)?;
-                let n = u64::from_le_bytes(n_buf);
-                segments.push(U64Segment::Tombstones(n));
-            }
-            1 => {
-                let mut start_buf = [0u8; 8];
-                reader.read_exact(&mut start_buf)?;
-                let start = u64::from_le_bytes(start_buf);
-
-                let mut end_buf = [0u8; 8];
-                reader.read_exact(&mut end_buf)?;
-                let end = u64::from_le_bytes(end_buf);
-
-                segments.push(U64Segment::Range(start..end));
-            }
-            2 => {
-                let array = read_array(reader)?;
-                segments.push(U64Segment::SortedArray(array));
-            }
-            3 => {
-                let array = read_array(reader)?;
-                segments.push(U64Segment::Array(array));
-            }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid segment type",
-                ));
-            }
-        }
-    }
-
-    Ok(RowIdSequence(segments))
-}
-
-fn read_array<R: Read>(reader: &mut R) -> std::io::Result<EncodedU64Array> {
-    let mut size_buf = [0u8; 8];
-    reader.read_exact(&mut size_buf)?;
-    let size = u64::from_le_bytes(size_buf);
-
-    let mut array_buf = [0u8; 1];
-    reader.read_exact(&mut array_buf)?;
-    let array_type = array_buf[0];
-
-    match array_type {
-        16 => {
-            let mut base_buf = [0u8; 8];
-            reader.read_exact(&mut base_buf)?;
-            let base = u64::from_le_bytes(base_buf);
-
-            let mut offsets = Vec::with_capacity(size as usize);
-            for _ in 0..size {
-                let mut offset_buf = [0u8; 2];
-                reader.read_exact(&mut offset_buf)?;
-                let offset = u16::from_le_bytes(offset_buf);
-                offsets.push(offset);
-            }
-
-            Ok(EncodedU64Array::U16 { offsets, base })
-        }
-        32 => {
-            let mut base_buf = [0u8; 8];
-            reader.read_exact(&mut base_buf)?;
-            let base = u64::from_le_bytes(base_buf);
-
-            let mut offsets = Vec::with_capacity(size as usize);
-            for _ in 0..size {
-                let mut offset_buf = [0u8; 4];
-                reader.read_exact(&mut offset_buf)?;
-                let offset = u32::from_le_bytes(offset_buf);
-                offsets.push(offset);
-            }
-
-            Ok(EncodedU64Array::U32 { offsets, base })
-        }
-        64 => {
-            let mut offsets = Vec::with_capacity(size as usize);
-            for _ in 0..size {
-                let mut offset_buf = [0u8; 8];
-                reader.read_exact(&mut offset_buf)?;
-                let offset = u64::from_le_bytes(offset_buf);
-                offsets.push(offset);
-            }
-
-            Ok(EncodedU64Array::U64(offsets))
-        }
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Invalid array type",
-        )),
-    }
+pub fn read_row_ids(reader: &[u8]) -> Result<RowIdSequence> {
+    let pb_sequence = pb::RowIdSequence::decode(reader)?;
+    RowIdSequence::try_from(pb_sequence)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use pretty_assertions::assert_eq;
-    use std::io::Cursor;
 
     #[test]
     fn test_write_read_row_ids() {
         let mut sequence = RowIdSequence::from(0..20);
-        sequence.0.push(U64Segment::Tombstones(10));
         sequence.0.push(U64Segment::Range(30..100));
+        sequence.0.push(U64Segment::RangeWithHoles {
+            range: 100..200,
+            holes: EncodedU64Array::U64(vec![104, 108, 150]),
+        });
+        sequence.0.push(U64Segment::RangeWithBitmap {
+            range: 200..300,
+            bitmap: Bitmap::new(100),
+        });
         sequence
             .0
             .push(U64Segment::SortedArray(EncodedU64Array::U16 {
@@ -195,11 +233,9 @@ mod test {
             .0
             .push(U64Segment::Array(EncodedU64Array::U64(vec![1, 2, 3])));
 
-        let mut writer = Cursor::new(Vec::new());
-        write_row_ids(&sequence, &mut writer).unwrap();
+        let serialized = write_row_ids(&sequence);
 
-        let mut reader = Cursor::new(writer.into_inner());
-        let sequence2 = read_row_ids(&mut reader).unwrap();
+        let sequence2 = read_row_ids(&serialized).unwrap();
 
         assert_eq!(sequence.0, sequence2.0);
     }

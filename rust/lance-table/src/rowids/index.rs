@@ -78,51 +78,28 @@ mod tests {
     }
 
     #[test]
-    fn test_decompose_sequence() {
-        let fragment_id = 10;
-        let sequence = RowIdSequence(vec![
-            U64Segment::Range(0..10),
-            U64Segment::Tombstones(10),
-            U64Segment::SortedArray(vec![20, 25, 30].into()),
-            U64Segment::Array(vec![40, 50, 60].into()),
-        ]);
-
-        let pieces = decompose_sequence(fragment_id, &sequence);
-
-        // Row id ranges
-        assert_eq!(pieces.len(), 3);
-        assert_eq!(pieces[0].0, 0..=9);
-        // Tombstones are not included in the address range
-        assert_eq!(pieces[1].0, 20..=30);
-        assert_eq!(pieces[2].0, 40..=60);
-
-        // Sequences
-        assert_eq!(&pieces[0].1 .0, &sequence.0[0]);
-        assert_eq!(&pieces[1].1 .0, &sequence.0[2]);
-        assert_eq!(&pieces[2].1 .0, &sequence.0[3]);
-
-        // Row address ranges
-        assert_eq!(pieces[0].1 .1, address_range(fragment_id, 0, 9));
-        // Tombstones are not included in the index, but their addresses should
-        // be skipped.
-        assert_eq!(pieces[1].1 .1, address_range(fragment_id, 20, 22));
-        assert_eq!(pieces[2].1 .1, address_range(fragment_id, 23, 25));
-    }
-
-    #[test]
     fn test_new_index() {
         let fragment_indices = vec![
             (
                 10,
                 RowIdSequence(vec![
                     U64Segment::Range(0..10),
-                    U64Segment::Tombstones(10),
+                    U64Segment::RangeWithHoles {
+                        range: 10..17,
+                        holes: vec![12, 15].into(),
+                    },
                     U64Segment::SortedArray(vec![20, 25, 30].into()),
                 ]),
             ),
             (
                 20,
-                RowIdSequence(vec![U64Segment::Array(vec![40, 50, 60].into())]),
+                RowIdSequence(vec![
+                    U64Segment::RangeWithBitmap {
+                        range: 17..20,
+                        bitmap: [true, false, true].as_slice().into(),
+                    },
+                    U64Segment::Array(vec![40, 50, 60].into()),
+                ]),
             ),
         ];
 
@@ -131,9 +108,11 @@ mod tests {
         // Check various queries.
         assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
         assert_eq!(index.get(15), None);
-        assert_eq!(index.get(25), Some(RowAddress::new_from_parts(10, 21)));
-        assert_eq!(index.get(40), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(60), Some(RowAddress::new_from_parts(20, 2)));
+        assert_eq!(index.get(16), Some(RowAddress::new_from_parts(10, 14)));
+        assert_eq!(index.get(17), Some(RowAddress::new_from_parts(20, 0)));
+        assert_eq!(index.get(25), Some(RowAddress::new_from_parts(10, 16)));
+        assert_eq!(index.get(40), Some(RowAddress::new_from_parts(20, 2)));
+        assert_eq!(index.get(60), Some(RowAddress::new_from_parts(20, 4)));
         assert_eq!(index.get(61), None);
     }
 }
