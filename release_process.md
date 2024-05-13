@@ -68,7 +68,7 @@ When a PR makes a breaking change, the PR author should mark the PR using the
 conventional commit markers: either exclamation mark after the type
 (such as `feat!: change signature of func`) or have `BREAKING CHANGE` in the
 body of the PR. A CI job will add a `breaking-change` label to the PR, which is
-what will ultimately be used to CI to determine if the minor version should be
+what will ultimately be used by CI to determine if the minor version should be
 incremented.
 
 A CI job will validate that if a `breaking-change` label is added, the minor
