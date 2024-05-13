@@ -103,6 +103,7 @@ http = "0.2.9"
 itertools = "0.12"
 lazy_static = "1"
 log = "0.4"
+mockall = { version = "0.12.1" }
 mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = "0.11"
 num-traits = "0.2"

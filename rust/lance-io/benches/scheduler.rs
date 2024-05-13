@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use lance_core::Result;
-use lance_io::{object_store::ObjectStore, scheduler::StoreScheduler};
+use lance_io::{object_store::ObjectStore, scheduler::ScanScheduler};
 use object_store::path::Path;
 use rand::{seq::SliceRandom, RngCore};
 use std::{fmt::Display, process::Command, sync::Arc};
@@ -88,7 +88,7 @@ fn bench_full_read(c: &mut Criterion) {
                             .unwrap();
                     }
                     runtime.block_on(async {
-                        let scheduler = StoreScheduler::new(obj_store, params.io_parallelism);
+                        let scheduler = ScanScheduler::new(obj_store, params.io_parallelism);
                         let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
 
                         let (tx, rx) = mpsc::channel(1024);
@@ -97,7 +97,7 @@ fn bench_full_read(c: &mut Criterion) {
                         while offset < DATA_SIZE {
                             #[allow(clippy::single_range_in_vec_init)]
                             let req = vec![offset..(offset + params.page_size)];
-                            let req = file_scheduler.submit_request(req);
+                            let req = file_scheduler.submit_request(req, 0);
                             tx.send(req).await.unwrap();
                             offset += params.page_size;
                         }
@@ -174,7 +174,7 @@ fn bench_random_read(c: &mut Criterion) {
                                 .unwrap();
                         }
                         runtime.block_on(async {
-                            let scheduler = StoreScheduler::new(obj_store, params.io_parallelism);
+                            let scheduler = ScanScheduler::new(obj_store, params.io_parallelism);
                             let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
 
                             let (tx, rx) = mpsc::channel(1024);
@@ -189,7 +189,7 @@ fn bench_random_read(c: &mut Criterion) {
                                     })
                                     .collect::<Vec<_>>();
                                 idx += INDICES_PER_BATCH as usize;
-                                let req = file_scheduler.submit_request(iops);
+                                let req = file_scheduler.submit_request(iops, 0);
                                 tx.send(req).await.unwrap();
                             }
                             drop(tx);

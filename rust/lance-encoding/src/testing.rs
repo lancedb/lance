@@ -45,7 +45,11 @@ impl SimulatedScheduler {
 }
 
 impl EncodingsIo for SimulatedScheduler {
-    fn submit_request(&self, ranges: Vec<Range<u64>>) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+    fn submit_request(
+        &self,
+        ranges: Vec<Range<u64>>,
+        _priority: u64,
+    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
         std::future::ready(Ok(ranges
             .into_iter()
             .map(|range| self.satisfy_request(range))

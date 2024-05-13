@@ -23,7 +23,7 @@ use lance_file::v2::{
     reader::{BufferDescriptor, CachedFileMetadata, FileReader},
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_io::{scheduler::StoreScheduler, ReadBatchParams};
+use lance_io::{scheduler::ScanScheduler, ReadBatchParams};
 use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
@@ -267,7 +267,7 @@ impl LanceFileReader {
         let io_parallelism = std::env::var("IO_THREADS")
             .map(|val| val.parse::<u32>().unwrap_or(8))
             .unwrap_or(8);
-        let scheduler = StoreScheduler::new(Arc::new(object_store), io_parallelism);
+        let scheduler = ScanScheduler::new(Arc::new(object_store), io_parallelism);
         let file = scheduler.open_file(&path).await.infer_error()?;
         let inner = FileReader::try_open(file, None).await.infer_error()?;
         Ok(Self {

@@ -16,6 +16,8 @@ pub mod object_store;
 pub mod object_writer;
 pub mod scheduler;
 pub mod stream;
+#[cfg(test)]
+pub mod testing;
 pub mod traits;
 pub mod utils;
 

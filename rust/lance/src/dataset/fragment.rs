@@ -26,7 +26,7 @@ use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
 use lance_file::v2::reader::ReaderProjection;
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::StoreScheduler;
+use lance_io::scheduler::ScanScheduler;
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
@@ -457,7 +457,7 @@ impl FileFragment {
             Ok(None)
         } else {
             let path = self.dataset.data_dir().child(data_file.path.as_str());
-            let store_scheduler = StoreScheduler::new(self.dataset.object_store.clone(), 16);
+            let store_scheduler = ScanScheduler::new(self.dataset.object_store.clone(), 16);
             let file_scheduler = store_scheduler.open_file(&path).await?;
             let reader = Arc::new(v2::reader::FileReader::try_open(file_scheduler, None).await?);
             let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
