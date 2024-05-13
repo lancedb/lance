@@ -3074,7 +3074,7 @@ mod test {
 
             // COMPACT (this should materialize the deletion)
 
-            compact_files(&mut dataset, CompactionOptions::default(), None)
+            compact_files(&mut dataset, CompactionOptions::default(), None, None)
                 .await
                 .unwrap();
             let compact_version = dataset.version().version;

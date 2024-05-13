@@ -18,14 +18,19 @@ use lance_index::{
     },
     IndexType,
 };
+use lance_table::format::{Fragment, Index as IndexMetadata};
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_core::{Error, Result};
+use lance_core::{datatypes::Field, Error, Result};
+use uuid::Uuid;
 
-use crate::{dataset::scanner::ColumnOrdering, Dataset};
+use crate::{
+    dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream},
+    Dataset,
+};
 
-use super::IndexParams;
+use super::{DatasetIndexInternalExt, IndexParams};
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
@@ -110,4 +115,91 @@ pub async fn open_scalar_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn 
     // case, we may need to store a metadata file in the index directory with scalar index metadata
     let btree_index = BTreeIndex::load(index_store).await?;
     Ok(btree_index as Arc<dyn ScalarIndex>)
+}
+
+/// Optimize a scalar index.
+///
+/// Index the new data in `frags_to_index` and merge with all the indices in
+/// `indices_to_merge`. If `indices_to_merge` is empty, create a new index.
+pub async fn optimize_scalar_index(
+    dataset: &Dataset,
+    column: &Field,
+    indices_to_merge: &[&IndexMetadata],
+    mut frags_to_index: Vec<Fragment>,
+) -> Result<Uuid> {
+    let existing_index = if let Some(idx) = indices_to_merge.first() {
+        // We will extend the first index, and scan the data in all the other ones.
+        let other_covered_frags = indices_to_merge[1..]
+            .iter()
+            .flat_map(|idx| idx.fragment_bitmap.iter().flat_map(|bitmap| bitmap.iter()))
+            .collect::<Vec<u32>>();
+        let other_covered_frags = dataset
+            .get_fragments()
+            .into_iter()
+            .map(|f| f.metadata().clone())
+            .filter(|frag| other_covered_frags.contains(&(frag.id as u32)));
+        frags_to_index.extend(other_covered_frags);
+        Some(idx)
+    } else {
+        None
+    };
+
+    let new_data_stream = if frags_to_index.is_empty() {
+        None
+    } else {
+        let mut scanner = dataset.scan();
+        scanner
+            .with_fragments(frags_to_index)
+            .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                column.name.clone(),
+            )]))?
+            .project(&[&column.name])?;
+        Some(scanner.try_into_stream().await?)
+    };
+
+    let new_uuid = Uuid::new_v4();
+    let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+    let new_store = LanceIndexStore::new((*dataset.object_store).clone(), index_dir);
+
+    match (existing_index, new_data_stream) {
+        // Note: since we put other delta indexes into data stream, this
+        // is also the case where we merge indices.
+        (Some(existing_index), Some(new_data_stream)) => {
+            // TODO: how can I downcast `existing_index` and use that?
+            let index = dataset
+                .open_scalar_index(&column.name, &existing_index.uuid.to_string())
+                .await?;
+            index.update(new_data_stream.into(), &new_store).await?;
+            Ok(new_uuid)
+        }
+        (None, Some(new_data_stream)) => {
+            let training_source = StreamTrainingSource::new(new_data_stream);
+            let flat_index_trainer = FlatIndexMetadata::new(column.data_type());
+
+            train_btree_index(Box::new(training_source), &flat_index_trainer, &new_store).await?;
+            Ok(new_uuid)
+        }
+        _ => unreachable!(),
+    }
+}
+
+struct StreamTrainingSource {
+    stream: DatasetRecordBatchStream,
+}
+
+impl StreamTrainingSource {
+    pub fn new(stream: DatasetRecordBatchStream) -> Self {
+        Self { stream }
+    }
+}
+
+#[async_trait]
+impl BtreeTrainingSource for StreamTrainingSource {
+    async fn scan_ordered_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        Ok(chunk_concat_stream(self.stream.into(), chunk_size as usize))
+    }
 }
