@@ -426,6 +426,7 @@ def test_optimize_index(dataset, tmp_path):
     ds = lance.write_dataset(dataset.to_table(), dataset_uri)
     ds = ds.create_index(
         "vector",
+        name="vector_index",
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=2,
@@ -443,8 +444,45 @@ def test_optimize_index(dataset, tmp_path):
     indices_dir = dataset_uri / "_indices"
     assert len(list(indices_dir.iterdir())) == 1
 
-    ds = ds.optimize.optimize_indices()
+    # Default is to index new data and merge with the most recent index.
+    ds.optimize.optimize_indices()
     assert len(list(indices_dir.iterdir())) == 2
+    index_stats = ds.stats.index_stats("vector_index")
+    assert len(index_stats["indices"]) == 1
+
+    # New data / make a delta
+    tbl = create_table(nvec=200)
+    ds = lance.write_dataset(tbl, dataset_uri, mode="append")
+    ds.optimize.optimize_indices(merge_indices=False)
+    index_stats = ds.stats.index_stats("vector_index")
+    assert len(index_stats["indices"]) == 2
+    assert index_stats["num_indexed_fragments"] == 3
+
+    # Two new fragments, make a delta out of only one
+    tbl = create_table(nvec=200)
+    ds = lance.write_dataset(tbl, dataset_uri, mode="append", max_rows_per_file=100)
+    to_index = [ds.get_fragments()[-1].fragment_id]
+    ds.optimize.optimize_indices(merge_indices=False, index_new_data=to_index)
+    index_stats = ds.stats.index_stats("vector_index")
+    assert len(index_stats["indices"]) == 3
+    assert index_stats["num_unindexed_fragments"] == 1
+    assert index_stats["num_indexed_fragments"] == 4
+
+    # Merge two specific indices
+    all_uuids = [idx["uuid"] for idx in ds.list_indices()]
+    to_merge = all_uuids[:2]
+    ds.optimize.optimize_indices(merge_indices=to_merge, index_new_data=False)
+    index_stats = ds.stats.index_stats("vector_index")
+    assert len(index_stats["indices"]) == 2
+    all_uuids = [idx["uuid"] for idx in ds.list_indices()]
+    assert all([uuid not in all_uuids for uuid in to_merge])
+
+    # Merge all indices, don't index new data
+    ds.optimize.optimize_indices(merge_indices=True, index_new_data=False)
+    index_stats = ds.stats.index_stats("vector_index")
+    assert len(index_stats["indices"]) == 1
+    assert index_stats["num_indexed_fragments"] == 4
+    assert index_stats["num_unindexed_fragments"] == 1
 
 
 def create_uniform_table(min, max, nvec, offset, ndim=8):
