@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::fmt::{self, Display, Formatter};
 
 use async_trait::async_trait;

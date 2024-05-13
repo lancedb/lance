@@ -364,8 +364,7 @@ mod tests {
                 let location = location.clone();
                 async move {
                     semaphore.acquire().await.unwrap().forget();
-                    let res = base_store.get_opts(&location, options).await;
-                    res
+                    base_store.get_opts(&location, options).await
                 }
                 .boxed()
             });
