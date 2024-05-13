@@ -69,9 +69,24 @@ def test_create_ivf_pq_cuda(test_dataset, benchmark):
 
 
 @pytest.mark.benchmark(group="optimize_index")
-def test_optimize_index(test_large_dataset, benchmark):
+@pytest.mark.parametrize("num_partitions", [32, 256, 512, 1024])
+@pytest.mark.parametrize("ef_construction", [150, 300, 500])
+@pytest.mark.parametrize("m", [16, 24])
+def test_optimize_index(test_large_dataset, benchmark, num_partitions, ef_construction, m):
     # insert a smaller batch into the large dataset,
     # then benchmark the optimize_index method
+    m_max = m * 2
+    test_large_dataset = test_large_dataset.create_index(
+        column="vector",
+        index_type="IVF_HNSW_SQ",
+        metric_type="L2",
+        num_partitions=num_partitions,
+        ef_construction=ef_construction,
+        m=m,
+        m_max=m_max,
+        num_bits=8,
+        replace=True,
+    )
     small_table = gen_table(test_large_dataset.count_rows() * 30 // 100)
     lance.write_dataset(small_table, test_large_dataset.uri, mode="append")
 
