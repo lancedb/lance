@@ -1045,15 +1045,15 @@ impl Dataset {
                     let py_batch: PyArrowType<RecordBatch> = PyArrowType(batch.clone());
                     let result = udf_obj
                         .call_method1(py, "_call", (py_batch,))
-                        .map_err(|err| lance::Error::IO {
-                            message: format_python_error(err, py).unwrap(),
-                            location: location!(),
-                        })?;
+                        .map_err(|err| lance::Error::io(
+                            format_python_error(err, py).unwrap(),
+                            location!(),
+                        ))?;
                     let result_batch: PyArrowType<RecordBatch> =
-                        result.extract(py).map_err(|err| lance::Error::IO {
-                            message: err.to_string(),
-                            location: location!(),
-                        })?;
+                        result.extract(py).map_err(|err| lance::Error::io(
+                            err.to_string(),
+                            location!(),
+                        ))?;
                     Ok(result_batch.0)
                 })
             };
@@ -1363,10 +1363,10 @@ impl WriteFragmentProgress for PyWriteProgress {
                 .call_method(py, "_do_begin", (json_str,), Some(kwargs))?;
             Ok(())
         })
-        .map_err(|e| lance::Error::IO {
-            message: format!("Failed to call begin() on WriteFragmentProgress: {}", e),
-            location: location!(),
-        })?;
+        .map_err(|e| lance::Error::io(
+            format!("Failed to call begin() on WriteFragmentProgress: {}", e),
+            location!(),
+        ))?;
         Ok(())
     }
 
@@ -1378,10 +1378,10 @@ impl WriteFragmentProgress for PyWriteProgress {
                 .call_method(py, "_do_complete", (json_str,), None)?;
             Ok(())
         })
-        .map_err(|e| lance::Error::IO {
-            message: format!("Failed to call complete() on WriteFragmentProgress: {}", e),
-            location: location!(),
-        })?;
+        .map_err(|e| lance::Error::io(
+            format!("Failed to call complete() on WriteFragmentProgress: {}", e),
+            location!(),
+        ))?;
         Ok(())
     }
 }
@@ -1420,10 +1420,10 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             let batch: Option<PyArrowType<RecordBatch>> = batch.extract(py)?;
             Ok(batch.map(|b| b.0))
         })
-        .map_err(|err: PyErr| lance_core::Error::IO {
-            message: format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
-            location: location!(),
-        })
+        .map_err(|err: PyErr| lance_core::Error::io(
+            format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
+            location!(),
+        ))
     }
 
     fn get_fragment(&self, fragment_id: u32) -> lance::Result<Option<Fragment>> {
@@ -1434,15 +1434,15 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             let fragment: Option<String> = fragment.extract(py)?;
             Ok(fragment)
         })
-        .map_err(|err: PyErr| lance_core::Error::IO {
-            message: format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
-            location: location!(),
-        })?;
+        .map_err(|err: PyErr| lance_core::Error::io(
+            format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
+            location!(),
+        ))?;
         fragment_data
             .map(|data| {
-                serde_json::from_str(&data).map_err(|err| lance::Error::IO {
-                    message: format!("Failed to deserialize fragment data: {}", err),
-                    location: location!(),
+                serde_json::from_str(&data).map_err(|err| lance::Error::io(
+                    format!("Failed to deserialize fragment data: {}", err),
+                    location!(),
                 })
             })
             .transpose()
@@ -1455,28 +1455,28 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             self.inner.call_method1(py, "insert_batch", (info, batch))?;
             Ok(())
         })
-        .map_err(|err: PyErr| lance_core::Error::IO {
-            message: format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
-            location: location!(),
-        })
+        .map_err(|err: PyErr| lance_core::Error::io(
+            format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
+            location!(),
+        ))
     }
 
     fn insert_fragment(&self, fragment: Fragment) -> lance_core::Result<()> {
-        let data = serde_json::to_string(&fragment).map_err(|err| lance_core::Error::IO {
-            message: format!("Failed to serialize fragment data: {}", err),
-            location: location!(),
-        })?;
+        let data = serde_json::to_string(&fragment).map_err(|err| lance_core::Error::io(
+            format!("Failed to serialize fragment data: {}", err),
+            location!(),
+        ))?;
         Python::with_gil(|py| {
             self.inner
                 .call_method1(py, "insert_fragment", (fragment.id, data))?;
             Ok(())
         })
-        .map_err(|err: PyErr| lance_core::Error::IO {
-            message: format!(
+        .map_err(|err: PyErr| lance_core::Error::io(
+            format!(
                 "Failed to call insert_fragment() on UDFCheckpointer: {}",
                 err
             ),
-            location: location!(),
-        })
+            location!(),
+        ))
     }
 }

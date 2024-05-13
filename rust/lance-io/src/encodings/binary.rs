@@ -98,10 +98,11 @@ impl<'a> Encoder for BinaryEncoder<'a> {
             DataType::LargeUtf8 => self.encode_typed_arr::<LargeUtf8Type>(arrs).await,
             DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(arrs).await,
             _ => {
-                return Err(lance_core::Error::IO {
-                    message: format!("Binary encoder does not support {}", data_type),
-                    location: location!(),
-                })
+                // TODO: Define lance-io::encodings::Error and wrap it in here.
+                return Err(lance_core::Error::io(
+                    format!("Binary encoder does not support {}", data_type),
+                    location!(),
+                ));
             }
         }
     }

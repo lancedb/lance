@@ -176,9 +176,11 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
             let arrs = batches
                 .iter()
                 .map(|batch| {
-                    batch.column_by_name(&field.name).ok_or_else(|| Error::IO {
-                        message: format!("FileWriter::write: Field '{}' not found", field.name),
-                        location: location!(),
+                    batch.column_by_name(&field.name).ok_or_else(|| {
+                        Error::io(
+                            format!("FileWriter::write: Field '{}' not found", field.name),
+                            location!(),
+                        )
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -606,17 +608,22 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         for field_id in 0..max_field_id + 1 {
             if let Some(field) = schema.mut_field_by_id(field_id) {
                 if field.data_type().is_dictionary() {
-                    let dict_info = field.dictionary.as_mut().ok_or_else(|| Error::IO {
-                        message: format!("Lance field {} misses dictionary info", field.name),
-                        location: location!(),
+                    let dict_info = field.dictionary.as_mut().ok_or_else(|| {
+                        Error::io(
+                            format!("Lance field {} misses dictionary info", field.name), // TODO: Define lance-file::Error
+                            // and wrap it in here.
+                            location!(),
+                        )
                     })?;
 
-                    let value_arr = dict_info.values.as_ref().ok_or_else(|| Error::IO {
-                        message: format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array",
-                        field.name
-                    ),
-                        location: location!(),
+                    let value_arr = dict_info.values.as_ref().ok_or_else(|| {
+                        Error::io(
+                            format!(
+                        "Lance field {} is dictionary type, but misses the dictionary value array", // TODO: Define lance-file::Error
+                                                                                                    // and wrap it in here.
+                        field.name),
+                            location!(),
+                        )
                     })?;
 
                     let data_type = value_arr.data_type();
@@ -630,13 +637,14 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                             encoder.encode(&[value_arr]).await?
                         }
                         _ => {
-                            return Err(Error::IO {
-                                message: format!(
+                            // TODO: Define lance-file::Error and wrap it in here.
+                            return Err(Error::io(
+                                format!(
                                     "Does not support {} as dictionary value type",
                                     value_arr.data_type()
                                 ),
-                                location: location!(),
-                            });
+                                location!(),
+                            ));
                         }
                     };
                     dict_info.offset = pos;

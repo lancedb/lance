@@ -49,9 +49,12 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     } else {
         None
     };
-    let expr = selection.ok_or_else(|| Error::IO {
-        message: format!("Filter is not valid: {filter}"),
-        location: location!(),
+    let expr = selection.ok_or_else(|| {
+        Error::io(
+            //TODO: Define more granular Error and wrap it in here.
+            format!("Filter is not valid: {filter}"),
+            location!(),
+        )
     })?;
     Ok(expr.clone())
 }
@@ -75,9 +78,12 @@ pub(crate) fn parse_sql_expr(expr: &str) -> Result<Expr> {
     } else {
         None
     };
-    let expr = selection.ok_or_else(|| Error::IO {
-        message: format!("Expression is not valid: {expr}"),
-        location: location!(),
+    let expr = selection.ok_or_else(|| {
+        Error::io(
+            // TODO: Define more granular Error and wrap it in here.
+            format!("Expression is not valid: {expr}"),
+            location!(),
+        )
     })?;
     Ok(expr.clone())
 }

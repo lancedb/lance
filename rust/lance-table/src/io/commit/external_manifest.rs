@@ -220,10 +220,11 @@ impl CommitHandler for ExternalManifestCommitHandler {
             &staging_path,
             &path,
         ).await.map_err(|e| CommitError::OtherError(
-            Error::IO {
-                message: format!("commit to external store is successful, but could not copy manifest to object store, with error: {}.", e),
-                location: location!(),
-            }
+            //TODO: Define lance-table::Error and wrap it in here
+            Error::io(
+                format!("commit to external store is successful, but could not copy manifest to object store, with error: {}.", e),
+                location!(),
+            )
         ))?;
 
         // update the _latest.manifest pointer

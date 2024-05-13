@@ -254,13 +254,14 @@ impl<'a> PlainDecoder<'a> {
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
         if end > self.length {
-            return Err(Error::IO {
-                message: format!(
+            // TODO: Define lance-io::encodings::Error and wrap it in here
+            return Err(Error::io(
+                format!(
                     "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
                     start, end, self.length
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {

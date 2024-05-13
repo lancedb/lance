@@ -38,16 +38,18 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     };
     let buf = object_store.inner.get_range(path, range).await?;
     if buf.len() < 16 {
-        return Err(Error::IO {
-            message: "Invalid format: file size is smaller than 16 bytes".to_string(),
-            location: location!(),
-        });
+        // TODO: Define lance-table::Error and wrap it in here.
+        return Err(Error::io(
+            "Invalid format: file size is smaller than 16 bytes".to_string(),
+            location!(),
+        ));
     }
     if !buf.ends_with(MAGIC) {
-        return Err(Error::IO {
-            message: "Invalid format: magic number does not match".to_string(),
-            location: location!(),
-        });
+        // TODO: Define lance-table::Error and wrap it in here.
+        return Err(Error::io(
+            "Invalid format: magic number does not match".to_string(),
+            location!(),
+        ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
     let manifest_len = file_size - manifest_pos;
@@ -79,14 +81,15 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     let buf = buf.slice(4..buf.len() - 16);
 
     if buf.len() != recorded_length {
-        return Err(Error::IO {
-            message: format!(
+        // TODO: Define lance-table::Error and wrap it in here.
+        return Err(Error::io(
+            format!(
                 "Invalid format: manifest length does not match. Expected {}, got {}",
                 recorded_length,
                 buf.len()
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
 
     let proto = pb::Manifest::decode(buf)?;
@@ -141,17 +144,23 @@ pub async fn write_manifest(
     for field_id in 0..max_field_id + 1 {
         if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
             if field.data_type().is_dictionary() {
-                let dict_info = field.dictionary.as_mut().ok_or_else(|| Error::IO {
-                    message: format!("Lance field {} misses dictionary info", field.name),
-                    location: location!(),
+                // TODO: Define lance-table::Error and wrap it in here.
+                let dict_info = field.dictionary.as_mut().ok_or_else(|| {
+                    Error::io(
+                        format!("Lance field {} misses dictionary info", field.name),
+                        location!(),
+                    )
                 })?;
 
-                let value_arr = dict_info.values.as_ref().ok_or_else(|| Error::IO {
-                    message: format!(
+                // TODO: Define lance-table::Error and wrap it in here.
+                let value_arr = dict_info.values.as_ref().ok_or_else(|| {
+                    Error::io(
+                        format!(
                         "Lance field {} is dictionary type, but misses the dictionary value array",
                         field.name
                     ),
-                    location: location!(),
+                        location!(),
+                    )
                 })?;
 
                 let data_type = value_arr.data_type();
@@ -165,13 +174,13 @@ pub async fn write_manifest(
                         encoder.encode(&[value_arr]).await?
                     }
                     _ => {
-                        return Err(Error::IO {
-                            message: format!(
+                        return Err(Error::io(
+                            format!(
                                 "Does not support {} as dictionary value type",
                                 value_arr.data_type()
                             ),
-                            location: location!(),
-                        });
+                            location!(),
+                        ));
                     }
                 };
                 dict_info.offset = pos;

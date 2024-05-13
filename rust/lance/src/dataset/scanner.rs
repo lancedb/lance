@@ -241,10 +241,11 @@ impl Scanner {
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
         if self.is_fragment_scan() {
-            Err(Error::IO {
-                message: "This operation is not supported for fragment scan".to_string(),
-                location: location!(),
-            })
+            Err(Error::io(
+                // TODO: Define more granular Error and wrap it in here.
+                "This operation is not supported for fragment scan".to_string(),
+                location!(),
+            ))
         } else {
             Ok(())
         }
@@ -279,10 +280,11 @@ impl Scanner {
         let mut physical_cols = vec![];
         for (output_name, raw_expr) in columns {
             if output.contains_key(output_name.as_ref()) {
-                return Err(Error::IO {
-                    message: format!("Duplicate column name: {}", output_name.as_ref()),
-                    location: location!(),
-                });
+                return Err(Error::io(
+                    // TODO: Define more granular Error and wrap it in here.
+                    format!("Duplicate column name: {}", output_name.as_ref()),
+                    location!(),
+                ));
             }
             let expr = planner.parse_expr(raw_expr.as_ref())?;
             for col in Planner::column_names_in_expr(&expr) {
@@ -404,17 +406,18 @@ impl Scanner {
     /// skip the first 10 rows and return the rest of the rows in the dataset.
     pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
         if limit.unwrap_or_default() < 0 {
-            return Err(Error::IO {
-                message: "Limit must be non-negative".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                // TODO: Define more granular Error and wrap it in here.
+                "Limit must be non-negative".to_string(),
+                location!(),
+            ));
         }
         if let Some(off) = offset {
             if off < 0 {
-                return Err(Error::IO {
-                    message: "Offset must be non-negative".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::io(
+                    "Offset must be non-negative".to_string(),
+                    location!(),
+                ));
             }
         }
         self.limit = limit;
@@ -427,46 +430,50 @@ impl Scanner {
         self.ensure_not_fragment_scan()?;
 
         if k == 0 {
-            return Err(Error::IO {
-                message: "k must be positive".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                // TODO: Define more granular Error and wrap it in here.
+                "k must be positive".to_string(),
+                location!(),
+            ));
         }
         if q.is_empty() {
-            return Err(Error::IO {
-                message: "Query vector must have non-zero length".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                //TODO: Define more granular Error and wrap it in here.
+                "Query vector must have non-zero length".to_string(),
+                location!(),
+            ));
         }
         // make sure the field exists
-        let field = self.dataset.schema().field(column).ok_or(Error::IO {
-            message: format!("Column {} not found", column),
-            location: location!(),
-        })?;
+        let field = self.dataset.schema().field(column).ok_or(Error::io(
+            format!("Column {} not found", column),
+            location!(),
+        ))?;
         let key = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
                 if dt.data_type().is_floating() {
                     coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
                 } else {
-                    return Err(Error::IO {
-                        message: format!(
+                    return Err(Error::io(
+                        // TODO: Define more granular Error and wrap it in here.
+                        format!(
                             "Column {} is not a vector column (type: {})",
                             column,
                             field.data_type()
                         ),
-                        location: location!(),
-                    });
+                        location!(),
+                    ));
                 }
             }
             _ => {
-                return Err(Error::IO {
-                    message: format!(
+                return Err(Error::io(
+                    // TODO: Define more granular Error and wrap it in here.
+                    format!(
                         "Column {} is not a vector column (type: {})",
                         column,
                         field.data_type()
                     ),
-                    location: location!(),
-                })
+                    location!(),
+                ));
             }
         };
 
@@ -537,10 +544,10 @@ impl Scanner {
                 self.dataset
                     .schema()
                     .field(&column.column_name)
-                    .ok_or(Error::IO {
-                        message: format!("Column {} not found", &column.column_name),
-                        location: location!(),
-                    })?;
+                    .ok_or(Error::io(
+                        format!("Column {} not found", &column.column_name),
+                        location!(),
+                    ))?;
             }
         }
         self.ordering = ordering;
@@ -580,10 +587,11 @@ impl Scanner {
         let mut extra_columns = vec![];
 
         if let Some(q) = self.nearest.as_ref() {
-            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::IO {
-                message: format!("Column {} not found", q.column),
-                location: location!(),
-            })?;
+            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::io(
+                // TODO: Define more granular Error and wrap it in here.
+                format!("Column {} not found", q.column),
+                location!(),
+            ))?;
             let vector_field = ArrowField::from(vector_field);
             extra_columns.push(vector_field);
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
@@ -730,10 +738,10 @@ impl Scanner {
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or(Error::IO {
-                    message: "Count plan did not return a UInt64Array".to_string(),
-                    location: location!(),
-                })?;
+                .ok_or(Error::io(
+                    "Count plan did not return a UInt64Array".to_string(),
+                    location!(),
+                ))?;
             Ok(array.value(0) as u64)
         } else {
             Ok(0)
@@ -992,10 +1000,11 @@ impl Scanner {
     // ANN/KNN search execution node with optional prefilter
     async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
-            return Err(Error::IO {
-                message: "No nearest query".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                // TODO: Define more granular Error and wrap it in here.
+                "No nearest query".to_string(),
+                location!(),
+            ));
         };
 
         // Santity check
@@ -1004,20 +1013,21 @@ impl Scanner {
             match field.data_type() {
                 DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
                 _ => {
-                    return Err(Error::IO {
-                        message: format!(
+                    return Err(Error::io(   // TODO: Define more granular Error and wrap it in here.
+                        format!(
                             "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
                             q.column, field.data_type(),
                         ),
-                        location: location!(),
-                    });
+                        location!(),
+                    ));
                 }
             }
         } else {
-            return Err(Error::IO {
-                message: format!("Vector search error: column {} not found", q.column),
-                location: location!(),
-            });
+            return Err(Error::io(
+                // TODO: Define more granular Error and wrap it in here.
+                format!("Vector search error: column {} not found", q.column),
+                location!(),
+            ));
         }
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
@@ -1031,10 +1041,11 @@ impl Scanner {
             // There is an index built for the column.
             // We will use the index.
             if matches!(q.refine_factor, Some(0)) {
-                return Err(Error::IO {
-                    message: "Refine factor can not be zero".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::io(
+                    // TODO: Define more granular Error and wrap it in here.
+                    "Refine factor can not be zero".to_string(),
+                    location!(),
+                ));
             }
 
             // Find all deltas with the same index name.
@@ -1484,12 +1495,9 @@ impl Stream for DatasetRecordBatchStream {
         let mut this = self.project();
         let _guard = this.span.enter();
         match this.exec_node.poll_next_unpin(cx) {
-            Poll::Ready(result) => Poll::Ready(result.map(|r| {
-                r.map_err(|e| Error::IO {
-                    message: e.to_string(),
-                    location: location!(),
-                })
-            })),
+            Poll::Ready(result) => {
+                Poll::Ready(result.map(|r| r.map_err(|e| Error::io(e.to_string(), location!()))))
+            }
             Poll::Pending => Poll::Pending,
         }
     }

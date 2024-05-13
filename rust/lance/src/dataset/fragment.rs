@@ -389,14 +389,14 @@ impl FileFragment {
         let deletion_vec = deletion_vec?;
 
         if opened_files.is_empty() {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "Does not find any data file for schema: {}\nfragment_id={}",
                     projection,
                     self.id()
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
 
         let mut reader = FragmentReader::try_new(
@@ -544,13 +544,14 @@ impl FileFragment {
                 .get_or_insert(&path, |_| async {
                     read_deletion_file(object_store.base_path(), fragment, object_store)
                         .await?
-                        .ok_or(Error::IO {
-                            message: format!(
+                        .ok_or(Error::io(
+                            // TODO: Define more granular Error and wrap it in here.
+                            format!(
                                 "Deletion file {:?} not found in fragment {}",
                                 deletion_file, fragment.id
                             ),
-                            location: location!(),
-                        })
+                            location!(),
+                        ))
                 })
                 .await?;
             Ok(Some(deletion_vector))
@@ -565,10 +566,11 @@ impl FileFragment {
     /// fragment.
     pub async fn physical_rows(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
-            return Err(Error::IO {
-                message: format!("Fragment {} does not contain any data", self.id()),
-                location: location!(),
-            });
+            // TODO: Define Fragment::Error and wrap it in here.
+            return Err(Error::io(
+                format!("Fragment {} does not contain any data", self.id()),
+                location!(),
+            ));
         };
 
         // Early versions that did not write the writer version also could write
@@ -1132,10 +1134,11 @@ impl std::fmt::Display for FragmentReader {
 
 fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     if batches.is_empty() {
-        return Err(Error::IO {
-            message: "Cannot merge empty batches".to_string(),
-            location: location!(),
-        });
+        return Err(Error::io(
+            // TODO: Define more granular Error and wrap it in here.
+            "Cannot merge empty batches".to_string(),
+            location!(),
+        ));
     }
 
     let mut merged = batches[0].clone();
@@ -1154,10 +1157,10 @@ impl FragmentReader {
         num_rows: usize,
     ) -> Result<Self> {
         if readers.is_empty() {
-            return Err(Error::IO {
-                message: "Cannot create FragmentReader with zero readers".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                "Cannot create FragmentReader with zero readers".to_string(),
+                location!(),
+            ));
         }
 
         if let Some(legacy_reader) = readers[0].0.as_legacy_opt() {
@@ -1165,18 +1168,18 @@ impl FragmentReader {
             for reader in readers.iter().skip(1) {
                 if let Some(other_legacy) = reader.0.as_legacy_opt() {
                     if other_legacy.num_batches() != num_batches {
-                        return Err(Error::IO {
-                            message:
+                        return Err(Error::io(    // TODO: Define more granular Error and wrap it in here.
                                 "Cannot create FragmentReader from data files with different number of batches"
                                     .to_string(),
-                            location: location!(),
-                        });
+                            location!(),
+                        ));
                     }
                 } else {
-                    return Err(Error::IO {
-                        message: "Cannot mix legacy and non-legacy readers".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::io(
+                        // TODO: Define more granular Error and wrap it in here.
+                        "Cannot mix legacy and non-legacy readers".to_string(),
+                        location!(),
+                    ));
                 }
             }
         }

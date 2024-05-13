@@ -690,12 +690,15 @@ impl VectorIndex for IVFIndex {
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
-        let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| Error::IO {
-            message: format!(
-                "_distance column does not exist in batch: {}",
-                batch.schema()
-            ),
-            location: location!(),
+        let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| {
+            Error::io(
+                // TODO: Define more granular Error and wrap it in here.
+                format!(
+                    "_distance column does not exist in batch: {}",
+                    batch.schema()
+                ),
+                location!(),
+            )
         })?;
 
         // TODO: Use a heap sort to get the top-k.
@@ -894,10 +897,11 @@ impl TryFrom<&Ivf> for pb::Ivf {
 
     fn try_from(ivf: &Ivf) -> Result<Self> {
         if ivf.offsets.len() != ivf.centroids.len() {
-            return Err(Error::IO {
-                message: "Ivf model has not been populated".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                // TODO: Define more granular Error and wrap it in here.
+                "Ivf model has not been populated".to_string(),
+                location!(),
+            ));
         }
         Ok(Self {
             centroids: vec![],
@@ -947,13 +951,13 @@ impl TryFrom<&pb::Ivf> for Ivf {
 
 fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     let Some(field) = dataset.schema().field(column) else {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "Building index: column {} does not exist in dataset: {:?}",
                 column, dataset
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
         if !elem_type.data_type().is_floating() {
