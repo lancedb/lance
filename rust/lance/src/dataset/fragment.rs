@@ -641,6 +641,18 @@ impl FileFragment {
             }
         }
 
+        if self.metadata.files.iter().any(|f| f.is_legacy_file())
+            != self.metadata.files.iter().all(|f| f.is_legacy_file())
+        {
+            return Err(Error::corrupt_file(
+                self.dataset
+                    .data_dir()
+                    .child(self.metadata.files[0].path.as_str()),
+                "Fragment contains a mix of v1 and v2 data files".to_string(),
+                location!(),
+            ));
+        }
+
         for field in self.schema().fields_pre_order() {
             if !seen_fields.contains(&field.id) {
                 return Err(Error::corrupt_file(
@@ -926,7 +938,7 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default();
 
-        Ok(Updater::new(self.clone(), reader, deletion_vector, schemas))
+        Updater::try_new(self.clone(), reader, deletion_vector, schemas)
     }
 
     pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
@@ -1224,9 +1236,16 @@ impl FragmentReader {
         num_batches
     }
 
-    pub(crate) fn legacy_num_rows_in_batch(&self, batch_id: usize) -> usize {
-        let legacy_reader = self.readers[0].0.as_legacy();
-        legacy_reader.num_rows_in_batch(batch_id as i32)
+    pub(crate) fn legacy_num_rows_in_batch(&self, batch_id: u32) -> Option<u32> {
+        if let Some(legacy_reader) = self.readers[0].0.as_legacy_opt() {
+            if batch_id < legacy_reader.num_batches() as u32 {
+                Some(legacy_reader.num_rows_in_batch(batch_id as i32) as u32)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
     /// Read the page statistics of the fragment for the specified fields.
@@ -1269,6 +1288,7 @@ impl FragmentReader {
         Ok(merge_batches(&batches)?.project_by_schema(&self.output_schema)?)
     }
 
+    #[cfg(test)]
     pub(crate) async fn legacy_read_batch(
         &self,
         batch_id: usize,
@@ -1516,12 +1536,13 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use tempfile::tempdir;
 
     use super::*;
     use crate::dataset::transaction::Operation;
 
-    async fn create_dataset(test_uri: &str) -> Dataset {
+    async fn create_dataset(test_uri: &str, use_experimental_writer: bool) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
             ArrowField::new("s", DataType::Utf8, true),
@@ -1545,6 +1566,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
+            use_experimental_writer,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1590,7 +1612,7 @@ mod tests {
     async fn test_fragment_scan() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri).await;
+        let dataset = create_dataset(test_uri, false).await;
         let fragment = &dataset.get_fragments()[2];
         let mut scanner = fragment.scan();
         let batches = scanner
@@ -1671,7 +1693,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         // Creates 400 rows in 10 fragments
-        let mut dataset = create_dataset(test_uri).await;
+        let mut dataset = create_dataset(test_uri, false).await;
         // Delete last 20 rows in first fragment
         dataset.delete("i >= 20").await.unwrap();
         // Last fragment has 20 rows but 40 addressible rows
@@ -1699,7 +1721,7 @@ mod tests {
     async fn test_fragment_scan_deletions() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri).await;
+        let mut dataset = create_dataset(test_uri, false).await;
         dataset.delete("i >= 0 and i < 15").await.unwrap();
 
         let fragment = &dataset.get_fragments()[0];
@@ -1730,7 +1752,7 @@ mod tests {
     async fn test_fragment_take_indices() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri).await;
+        let mut dataset = create_dataset(test_uri, false).await;
         let fragment = dataset
             .get_fragments()
             .into_iter()
@@ -1778,7 +1800,7 @@ mod tests {
     async fn test_fragment_take_rows() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri).await;
+        let mut dataset = create_dataset(test_uri, false).await;
         let fragment = dataset
             .get_fragments()
             .into_iter()
@@ -1843,7 +1865,7 @@ mod tests {
     async fn test_recommit_from_file() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri).await;
+        let dataset = create_dataset(test_uri, false).await;
         let schema = dataset.schema();
         let dataset_rows = dataset.count_rows(None).await.unwrap();
 
@@ -1885,11 +1907,12 @@ mod tests {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_fragment_count() {
+    async fn test_fragment_count(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri).await;
+        let dataset = create_dataset(test_uri, use_experimental_writer).await;
         let fragment = dataset.get_fragments().pop().unwrap();
 
         assert_eq!(fragment.count_rows().await.unwrap(), 40);
@@ -1913,12 +1936,13 @@ mod tests {
         );
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_append_new_columns() {
+    async fn test_append_new_columns(#[values(false, true)] use_experimental_writer: bool) {
         for with_delete in [true, false] {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
-            let mut dataset = create_dataset(test_uri).await;
+            let mut dataset = create_dataset(test_uri, use_experimental_writer).await;
             dataset.validate().await.unwrap();
             assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 
@@ -1974,6 +1998,7 @@ mod tests {
 
             let stream = dataset
                 .scan()
+                .batch_size(10)
                 .project(&["i", "double_i"])
                 .unwrap()
                 .try_into_stream()
@@ -2000,11 +2025,12 @@ mod tests {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_merge_fragment() {
+    async fn test_merge_fragment(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri).await;
+        let mut dataset = create_dataset(test_uri, use_experimental_writer).await;
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 

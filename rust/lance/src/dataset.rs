@@ -2103,6 +2103,7 @@ mod tests {
     use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use tempfile::{tempdir, TempDir};
     use tests::scanner::test_dataset::TestVectorDataset;
 
@@ -2343,8 +2344,8 @@ mod tests {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment.open(dataset.schema(), false).await.unwrap();
             assert_eq!(reader.legacy_num_batches(), 10);
-            for i in 0..reader.legacy_num_batches() {
-                assert_eq!(reader.legacy_num_rows_in_batch(i), 10);
+            for i in 0..reader.legacy_num_batches() as u32 {
+                assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
             }
         }
     }
@@ -3383,8 +3384,9 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_merge() {
+    async fn test_merge(#[values(false, true)] use_experimental_writer: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
             Field::new("x", DataType::Float32, false),
@@ -3411,6 +3413,7 @@ mod tests {
 
         let write_params = WriteParams {
             mode: WriteMode::Append,
+            use_experimental_writer,
             ..Default::default()
         };
 

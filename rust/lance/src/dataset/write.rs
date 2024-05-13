@@ -270,7 +270,7 @@ pub async fn write_fragments_internal(
 }
 
 #[async_trait::async_trait]
-trait GenericWriter: Send {
+pub trait GenericWriter: Send {
     /// Get a unique id associated with the fragment being written
     ///
     /// This is used for progress reporting
@@ -342,6 +342,39 @@ impl GenericWriter for v2::writer::FileWriter {
     }
 }
 
+pub async fn open_writer(
+    object_store: &ObjectStore,
+    schema: &Schema,
+    base_dir: &Path,
+    use_v2: bool,
+) -> Result<Box<dyn GenericWriter>> {
+    let filename = format!("{}.lance", Uuid::new_v4());
+
+    let full_path = base_dir.child(DATA_DIR).child(filename.as_str());
+
+    let writer = if use_v2 {
+        let writer = object_store.create(&full_path).await?;
+        Box::new(v2::writer::FileWriter::try_new(
+            writer,
+            filename,
+            schema.clone(),
+            FileWriterOptions::default(),
+        )?) as Box<dyn GenericWriter>
+    } else {
+        Box::new((
+            FileWriter::<ManifestDescribing>::try_new(
+                object_store,
+                &full_path,
+                schema.clone(),
+                &Default::default(),
+            )
+            .await?,
+            filename,
+        ))
+    };
+    Ok(writer)
+}
+
 /// Creates new file writers for a given dataset.
 struct WriterGenerator {
     object_store: Arc<ObjectStore>,
@@ -366,34 +399,17 @@ impl WriterGenerator {
     }
 
     pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
-        let data_file_path = format!("{}.lance", Uuid::new_v4());
-
         // Use temporary ID 0; will assign ID later.
         let fragment = Fragment::new(0);
 
-        let full_path = self.base_dir.child(DATA_DIR).child(data_file_path.clone());
+        let writer = open_writer(
+            &self.object_store,
+            &self.schema,
+            &self.base_dir,
+            self.use_v2,
+        )
+        .await?;
 
-        let writer = if self.use_v2 {
-            let writer = self.object_store.create(&full_path).await?;
-            Box::new(v2::writer::FileWriter::try_new(
-                writer,
-                data_file_path,
-                self.schema.clone(),
-                FileWriterOptions::default(),
-            )?) as Box<dyn GenericWriter>
-        } else {
-            let path = data_file_path;
-            Box::new((
-                FileWriter::<ManifestDescribing>::try_new(
-                    self.object_store.as_ref(),
-                    &full_path,
-                    self.schema.clone(),
-                    &Default::default(),
-                )
-                .await?,
-                path,
-            ))
-        };
         Ok((writer, fragment))
     }
 }

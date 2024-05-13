@@ -18,6 +18,21 @@ jobs:
       - uses: srvaroa/labeler@master
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  breaking-change-checker:
+    name: Validate breaking change policy
+    runs-on: ubuntu-latest
+    # Make sure we add any labels to this PR first.
+    needs: labeler
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          pip install PyGithub
+          python ci/check_versions.py
   commitlint:
     permissions:
       pull-requests: write
