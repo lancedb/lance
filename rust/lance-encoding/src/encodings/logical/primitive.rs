@@ -533,7 +533,7 @@ impl PrimitiveFieldEncoder {
                 )))))
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(data_type)?,
+                ValueEncoder::try_new(data_type, true)?,
             )))),
         }
     }

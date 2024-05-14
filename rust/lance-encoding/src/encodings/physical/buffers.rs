@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::io::Write;
 use arrow_array::{cast::AsArray, ArrayRef};
 
-use arrow_buffer::BooleanBufferBuilder;
+use arrow_buffer::{BooleanBufferBuilder, Buffer};
 use arrow_schema::DataType;
 use lance_core::Result;
 
@@ -21,6 +22,36 @@ impl BufferEncoder for FlatBufferEncoder {
         Ok(EncodedBuffer { parts })
     }
 }
+
+// An encoder which uses lightweight compression, such as zstd/lz4 to encode buffers
+#[derive(Debug, Default)]
+pub struct CompressedBufferEncoder {}
+
+fn compress(input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+    let mut encoder = zstd::Encoder::new(output_buf, 0)?;
+    encoder.write_all(input_buf)?;
+    match encoder.finish() {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+impl BufferEncoder for CompressedBufferEncoder {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
+        let mut parts: Vec<Buffer> = vec![];
+        parts.reserve(arrays.len());
+        for arr in arrays {
+            let buffer = arr.to_data().buffers()[0].clone();
+            let buffer_len =buffer.len();
+            let buffer_data = buffer.as_slice();
+            let mut compressed = Vec::with_capacity(buffer_len);
+            compress(buffer_data, &mut compressed)?;
+            parts.push(Buffer::from(compressed));
+        }
+        Ok(EncodedBuffer { parts })
+    }
+}
+
 
 // Encoder for writing boolean arrays as dense bitmaps
 #[derive(Debug, Default)]

@@ -18,7 +18,7 @@ use crate::{
 
 use lance_core::{Error, Result};
 
-use super::buffers::{BitmapBufferEncoder, FlatBufferEncoder};
+use super::buffers::{BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder};
 
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
@@ -129,8 +129,16 @@ pub struct ValueEncoder {
 }
 
 impl ValueEncoder {
-    pub fn try_new(data_type: &DataType) -> Result<Self> {
-        if *data_type == DataType::Boolean {
+    pub fn try_new(data_type: &DataType, compressed: bool) -> Result<Self> {
+        if data_type.is_primitive() {
+            Ok(Self {
+                buffer_encoder: if compressed {
+                    Box::<CompressedBufferEncoder>::default()
+                } else {
+                    Box::<FlatBufferEncoder>::default()
+                },
+            })
+        } else if *data_type == DataType::Boolean {
             Ok(Self {
                 buffer_encoder: Box::<BitmapBufferEncoder>::default(),
             })
