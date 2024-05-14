@@ -74,7 +74,15 @@ def test_create_ivf_pq_cuda(test_dataset, benchmark):
 @pytest.mark.parametrize("m", [16])
 @pytest.mark.parametrize("num_small_indexes", [1, 5])
 @pytest.mark.parametrize("num_new_rows", [500])
-def test_optimize_index(test_large_dataset, benchmark, num_partitions, ef_construction, m, num_small_indexes, num_new_rows):
+def test_optimize_index(
+    test_large_dataset,
+    benchmark,
+    num_partitions,
+    ef_construction,
+    m,
+    num_small_indexes,
+    num_new_rows,
+):
     # insert smaller batch(es) into the large dataset,
     # then benchmark the optimize_index method
     m_max = m * 2
