@@ -127,18 +127,14 @@ impl PhysicalPageScheduler for BasicPageScheduler {
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let validity_future = match &self.mode {
             SchedulerNullStatus::None(_) | SchedulerNullStatus::All => None,
-            SchedulerNullStatus::Some(schedulers) => {
-                trace!("Scheduling ranges {:?} from validity", ranges);
-                Some(
-                    schedulers
-                        .validity
-                        .schedule_ranges(ranges, scheduler, top_level_row),
-                )
-            }
+            SchedulerNullStatus::Some(schedulers) => Some(schedulers.validity.schedule_ranges(
+                ranges,
+                scheduler,
+                top_level_row,
+            )),
         };
 
         let values_future = if let Some(values_scheduler) = self.mode.values_scheduler() {
-            trace!("Scheduling range {:?} from values", ranges);
             Some(
                 values_scheduler
                     .schedule_ranges(ranges, scheduler, top_level_row)

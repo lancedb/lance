@@ -14,15 +14,16 @@ use arrow_schema::{DataType, Field};
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 use snafu::{location, Location};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::task::JoinHandle;
 
 use lance_core::{Error, Result};
 
 use crate::{
-    decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
+    decoder::{
+        DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, SchedulerContext,
+    },
     encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
     format::pb,
-    EncodingsIo,
 };
 
 use super::primitive::{AccumulationQueue, PrimitiveFieldEncoder};
@@ -225,8 +226,7 @@ impl LogicalPageScheduler for ListPageScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[std::ops::Range<u32>],
-        scheduler: &Arc<dyn EncodingsIo>,
-        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()> {
         // TODO: Shortcut here if the request covers the entire range (can be determined by
@@ -257,13 +257,23 @@ impl LogicalPageScheduler for ListPageScheduler {
         trace!("Scheduling list offsets ranges: {:?}", offsets_ranges);
         // Create a channel for the internal schedule / decode loop that is unique
         // to this page.
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut temporary = context.temporary();
         self.offsets_scheduler
-            .schedule_ranges(&offsets_ranges, scheduler, &tx, top_level_row)?;
-        let mut scheduled_offsets = rx.try_recv().unwrap();
+            .schedule_ranges(&offsets_ranges, &mut temporary, top_level_row)?;
+        let offset_decoders = temporary.into_decoders();
+        let num_offset_decoders = offset_decoders.len();
+        let mut scheduled_offsets =
+            offset_decoders
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Internal {
+                    message: format!("scheduling offsets yielded {} pages", num_offset_decoders),
+                    location: location!(),
+                })?;
         let items_schedulers = self.items_schedulers.clone();
         let ranges = ranges.to_vec();
-        let scheduler = scheduler.clone();
+
+        let mut indirect_context = context.temporary();
 
         // First we schedule, as normal, the I/O for the offsets.  Then we immediately spawn
         // a task to decode those offsets and schedule the I/O for the items AND wait for
@@ -273,14 +283,12 @@ impl LogicalPageScheduler for ListPageScheduler {
         let indirect_fut = tokio::task::spawn(async move {
             // We know the offsets are a primitive array and thus will not need additional
             // pages.  We can use a dummy receiver to match the decoder API
-            let (_, mut dummy_rx) = mpsc::unbounded_channel();
-            scheduled_offsets.wait(num_rows, &mut dummy_rx).await?;
+            scheduled_offsets.wait(num_rows).await?;
             let decode_task = scheduled_offsets.drain(num_offsets)?;
             let offsets = decode_task.task.decode()?;
 
             let (mut item_ranges, offsets, validity) =
                 Self::decode_offsets(offsets.as_ref(), &ranges, null_offset_adjustment);
-            let (tx, mut rx) = mpsc::unbounded_channel();
 
             trace!(
                 "Indirectly scheduling items ranges {:?} from {} list items pages",
@@ -327,8 +335,7 @@ impl LogicalPageScheduler for ListPageScheduler {
                         // that way.  Still, this is probably good enough for a while
                         next_scheduler.schedule_ranges(
                             &next_item_ranges,
-                            &scheduler,
-                            &tx,
+                            &mut indirect_context,
                             top_level_row,
                         )?;
                         next_item_ranges.clear();
@@ -355,8 +362,7 @@ impl LogicalPageScheduler for ListPageScheduler {
                     if !next_item_ranges.is_empty() {
                         next_scheduler.schedule_ranges(
                             &next_item_ranges,
-                            &scheduler,
-                            &tx,
+                            &mut indirect_context,
                             top_level_row,
                         )?;
                         next_item_ranges.clear();
@@ -367,16 +373,13 @@ impl LogicalPageScheduler for ListPageScheduler {
             if !next_item_ranges.is_empty() {
                 next_scheduler.schedule_ranges(
                     &next_item_ranges,
-                    &scheduler,
-                    &tx,
+                    &mut indirect_context,
                     top_level_row,
                 )?;
             }
-            let mut item_decoders = Vec::new();
-            drop(tx);
-            while let Some(item_decoder) = rx.recv().await {
-                item_decoders.push(item_decoder);
-            }
+            // TODO: Should probably use into_messages here.  Can figure out once we add
+            // tests for List<Struct<...>>
+            let item_decoders = indirect_context.into_decoders();
 
             Ok(IndirectlyLoaded {
                 offsets,
@@ -384,7 +387,16 @@ impl LogicalPageScheduler for ListPageScheduler {
                 item_decoders,
             })
         });
-        sink.send(Box::new(ListPageDecoder {
+        let data_type = match &self.offset_type {
+            DataType::Int32 => {
+                DataType::List(Arc::new(Field::new("item", self.items_type.clone(), true)))
+            }
+            DataType::Int64 => {
+                DataType::LargeList(Arc::new(Field::new("item", self.items_type.clone(), true)))
+            }
+            _ => panic!("Unexpected offset type {}", self.offset_type),
+        };
+        context.emit(Box::new(ListPageDecoder {
             offsets: Vec::new(),
             validity: BooleanBuffer::new(Buffer::from_vec(Vec::<u8>::default()), 0, 0),
             unawaited_item_decoders: VecDeque::new(),
@@ -395,8 +407,8 @@ impl LogicalPageScheduler for ListPageScheduler {
             unloaded: Some(indirect_fut),
             items_type: self.items_type.clone(),
             offset_type: self.offset_type.clone(),
-        }))
-        .unwrap();
+            data_type,
+        }));
         Ok(())
     }
 
@@ -407,8 +419,7 @@ impl LogicalPageScheduler for ListPageScheduler {
     fn schedule_take(
         &self,
         indices: &[u32],
-        scheduler: &Arc<dyn EncodingsIo>,
-        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling list offsets for {} indices", indices.len());
@@ -417,8 +428,7 @@ impl LogicalPageScheduler for ListPageScheduler {
                 .iter()
                 .map(|&idx| idx..(idx + 1))
                 .collect::<Vec<_>>(),
-            scheduler,
-            sink,
+            context,
             top_level_row,
         )
     }
@@ -448,6 +458,7 @@ struct ListPageDecoder {
     rows_drained: u32,
     items_type: DataType,
     offset_type: DataType,
+    data_type: DataType,
 }
 
 struct ListDecodeTask {
@@ -517,11 +528,7 @@ impl DecodeArrayTask for ListDecodeTask {
 }
 
 impl LogicalPageDecoder for ListPageDecoder {
-    fn wait<'a>(
-        &'a mut self,
-        num_rows: u32,
-        source: &'a mut mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
-    ) -> BoxFuture<'a, Result<()>> {
+    fn wait<'a>(&'a mut self, num_rows: u32) -> BoxFuture<'a, Result<()>> {
         async move {
             // wait for the indirect I/O to finish, then wait for enough items to arrive
             if self.unloaded.is_some() {
@@ -574,7 +581,7 @@ impl LogicalPageDecoder for ListPageDecoder {
                     to_await
                 );
                 if to_await > 0 {
-                    last_decoder.wait(to_await, source).await?;
+                    last_decoder.wait(to_await).await?;
                     items_needed = items_needed.saturating_sub(last_decoder.avail() as u64);
                 }
             }
@@ -588,7 +595,7 @@ impl LogicalPageDecoder for ListPageDecoder {
                 );
                 let to_await = items_needed.min(unawaited) as u32;
                 // TODO: Seems like this will fail in List<Struct> case
-                next_item_decoder.wait(to_await, source).await?;
+                next_item_decoder.wait(to_await).await?;
                 // Might end up loading more items than needed so use saturating_sub
                 items_needed = items_needed.saturating_sub(next_item_decoder.avail() as u64);
                 self.awaited_item_decoders.push_back(next_item_decoder);
@@ -673,6 +680,10 @@ impl LogicalPageDecoder for ListPageDecoder {
 
     fn avail(&self) -> u32 {
         self.lists_available
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
     }
 }
 

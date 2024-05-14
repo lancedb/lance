@@ -11,12 +11,14 @@ use arrow_array::{
 
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field};
-use futures::{future::BoxFuture, FutureExt};
+use futures::future::BoxFuture;
 use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
+    decoder::{
+        DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, SchedulerContext,
+    },
     encoder::{EncodeTask, FieldEncoder},
 };
 
@@ -45,21 +47,20 @@ impl LogicalPageScheduler for BinaryPageScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[std::ops::Range<u32>],
-        scheduler: &Arc<dyn crate::EncodingsIo>,
-        sink: &tokio::sync::mpsc::UnboundedSender<Box<dyn crate::decoder::LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling binary for {} ranges", ranges.len());
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut temp_context = context.temporary();
         self.varbin_scheduler
-            .schedule_ranges(ranges, scheduler, &tx, top_level_row)?;
+            .schedule_ranges(ranges, &mut temp_context, top_level_row)?;
 
-        while let Some(decoder) = rx.recv().now_or_never() {
-            let wrapped = BinaryPageDecoder {
-                inner: decoder.unwrap(),
+        for decoder in temp_context.into_decoders() {
+            let decoder = Box::new(BinaryPageDecoder {
+                inner: decoder,
                 data_type: self.data_type.clone(),
-            };
-            sink.send(Box::new(wrapped)).unwrap();
+            });
+            context.emit(decoder);
         }
 
         Ok(())
@@ -68,8 +69,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
     fn schedule_take(
         &self,
         indices: &[u32],
-        scheduler: &Arc<dyn crate::EncodingsIo>,
-        sink: &tokio::sync::mpsc::UnboundedSender<Box<dyn crate::decoder::LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling binary for {} indices", indices.len());
@@ -78,8 +78,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
                 .iter()
                 .map(|&idx| idx..(idx + 1))
                 .collect::<Vec<_>>(),
-            scheduler,
-            sink,
+            context,
             top_level_row,
         )
     }
@@ -96,12 +95,8 @@ pub struct BinaryPageDecoder {
 }
 
 impl LogicalPageDecoder for BinaryPageDecoder {
-    fn wait<'a>(
-        &'a mut self,
-        num_rows: u32,
-        source: &'a mut tokio::sync::mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
-    ) -> BoxFuture<'a, Result<()>> {
-        self.inner.wait(num_rows, source)
+    fn wait<'a>(&'a mut self, num_rows: u32) -> BoxFuture<'a, Result<()>> {
+        self.inner.wait(num_rows)
     }
 
     fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
@@ -122,6 +117,10 @@ impl LogicalPageDecoder for BinaryPageDecoder {
 
     fn avail(&self) -> u32 {
         self.inner.avail()
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
     }
 }
 

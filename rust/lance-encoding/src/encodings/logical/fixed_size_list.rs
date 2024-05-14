@@ -4,14 +4,12 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::{ArrayRef, FixedSizeListArray};
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use futures::future::BoxFuture;
 use log::trace;
-use tokio::sync::mpsc;
 
-use crate::{
-    decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
-    EncodingsIo,
+use crate::decoder::{
+    DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, SchedulerContext,
 };
 use lance_core::Result;
 
@@ -51,8 +49,7 @@ impl LogicalPageScheduler for FslPageScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u32>],
-        scheduler: &Arc<dyn EncodingsIo>,
-        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()> {
         let expanded_ranges = ranges
@@ -63,23 +60,27 @@ impl LogicalPageScheduler for FslPageScheduler {
             "Scheduling expanded ranges {:?} from items scheduler",
             expanded_ranges
         );
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut temp_context = context.temporary();
         self.items_scheduler
-            .schedule_ranges(&expanded_ranges, scheduler, &tx, top_level_row)?;
-        let inner_page_decoder = rx.blocking_recv().unwrap();
-        sink.send(Box::new(FslPageDecoder {
-            inner: inner_page_decoder,
-            dimension: self.dimension,
-        }))
-        .unwrap();
+            .schedule_ranges(&expanded_ranges, &mut temp_context, top_level_row)?;
+        for decoder in temp_context.into_decoders() {
+            let data_type = DataType::FixedSizeList(
+                Arc::new(Field::new("item", decoder.data_type().clone(), true)),
+                self.dimension as i32,
+            );
+            context.emit(Box::new(FslPageDecoder {
+                inner: decoder,
+                dimension: self.dimension,
+                data_type,
+            }));
+        }
         Ok(())
     }
 
     fn schedule_take(
         &self,
         indices: &[u32],
-        scheduler: &Arc<dyn EncodingsIo>,
-        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()> {
         self.schedule_ranges(
@@ -87,8 +88,7 @@ impl LogicalPageScheduler for FslPageScheduler {
                 .iter()
                 .map(|&idx| idx..(idx + 1))
                 .collect::<Vec<_>>(),
-            scheduler,
-            sink,
+            context,
             top_level_row,
         )
     }
@@ -102,15 +102,12 @@ impl LogicalPageScheduler for FslPageScheduler {
 struct FslPageDecoder {
     inner: Box<dyn LogicalPageDecoder>,
     dimension: u32,
+    data_type: DataType,
 }
 
 impl LogicalPageDecoder for FslPageDecoder {
-    fn wait<'a>(
-        &'a mut self,
-        num_rows: u32,
-        source: &'a mut mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
-    ) -> BoxFuture<'a, Result<()>> {
-        self.inner.wait(num_rows * self.dimension, source)
+    fn wait<'a>(&'a mut self, num_rows: u32) -> BoxFuture<'a, Result<()>> {
+        self.inner.wait(num_rows * self.dimension)
     }
 
     fn unawaited(&self) -> u32 {
@@ -135,6 +132,10 @@ impl LogicalPageDecoder for FslPageDecoder {
 
     fn avail(&self) -> u32 {
         self.inner.avail() / self.dimension
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
     }
 }
 
