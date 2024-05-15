@@ -57,7 +57,7 @@ impl BenchmarkFixture {
         let test_path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path))
+        Arc::new(LanceIndexStore::new(object_store, test_path, None))
     }
 
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {
