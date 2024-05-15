@@ -230,12 +230,13 @@ class HNSW:
         vectors_array: Iterator[pa.Array],
         max_level=7,
         m=20,
-        m_max=40,
         ef_construction=100,
-        use_select_heuristic=True,
     ) -> HNSW:
         hnsw = _Hnsw.build(
-            vectors_array, max_level, m, m_max, ef_construction, use_select_heuristic
+            vectors_array,
+            max_level,
+            m,
+            ef_construction,
         )
         return HNSW(hnsw)
 
