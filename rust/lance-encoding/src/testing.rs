@@ -3,7 +3,7 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{Array, UInt32Array};
+use arrow_array::{Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
@@ -122,7 +122,7 @@ fn supports_nulls(data_type: &DataType) -> bool {
 #[derive(Clone, Default)]
 pub struct TestCases {
     ranges: Vec<Range<u64>>,
-    indices: Vec<Vec<u32>>,
+    indices: Vec<Vec<u64>>,
     skip_validation: bool,
 }
 
@@ -132,7 +132,7 @@ impl TestCases {
         self
     }
 
-    pub fn with_indices(mut self, indices: Vec<u32>) -> Self {
+    pub fn with_indices(mut self, indices: Vec<u64>) -> Self {
         self.indices.push(indices);
         self
     }
@@ -285,7 +285,7 @@ async fn check_round_trip_encoding_inner(
             );
         }
         let num_rows = indices.len() as u64;
-        let indices_arr = UInt32Array::from(indices.clone());
+        let indices_arr = UInt64Array::from(indices.clone());
         let expected = concat_data
             .as_ref()
             .map(|concat_data| arrow_select::take::take(&concat_data, &indices_arr, None).unwrap());
