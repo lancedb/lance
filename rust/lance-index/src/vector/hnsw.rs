@@ -588,9 +588,7 @@ mod tests {
         let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
         let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
         let hnsw = HNSWBuilder::with_params(
-            HnswBuildParams::default()
-                .max_num_edges(MAX_EDGES)
-                .ef_construction(50),
+            HnswBuildParams::default().ef_construction(50),
             store.clone(),
         )
         .build()
@@ -639,10 +637,7 @@ mod tests {
         let q = mat.row(0).unwrap();
 
         let hnsw = HNSWBuilder::with_params(
-            HnswBuildParams::default()
-                .max_num_edges(MAX_EDGES)
-                .ef_construction(100)
-                .max_level(4),
+            HnswBuildParams::default().ef_construction(100).max_level(4),
             vectors.clone(),
         )
         .build()
