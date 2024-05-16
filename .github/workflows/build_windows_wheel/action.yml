@@ -27,7 +27,7 @@ runs:
         command: build
         args: ${{ inputs.args }}
         working-directory: python
-    - uses: actions/upload-artifact@v3
+    - uses: actions/upload-artifact@v4
       with:
         name: windows-wheels
         path: python\target\wheels
