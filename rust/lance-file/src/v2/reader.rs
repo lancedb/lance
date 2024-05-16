@@ -596,6 +596,10 @@ impl FileReader {
             &vec![],
         );
 
+        let root_decoder = decode_scheduler
+            .root_scheduler
+            .new_root_decoder_ranges(&[range.clone()]);
+
         let (tx, rx) = mpsc::unbounded_channel();
 
         let num_rows_to_read = range.end - range.start;
@@ -605,7 +609,7 @@ impl FileReader {
             async move { decode_scheduler.schedule_range(range, tx, scheduler).await },
         );
 
-        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read).into_stream())
+        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream())
     }
 
     fn take_rows(
@@ -629,6 +633,10 @@ impl FileReader {
             &vec![],
         );
 
+        let root_decoder = decode_scheduler
+            .root_scheduler
+            .new_root_decoder_indices(&indices);
+
         let (tx, rx) = mpsc::unbounded_channel();
 
         let num_rows_to_read = indices.len() as u64;
@@ -640,7 +648,7 @@ impl FileReader {
                 .await
         });
 
-        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read).into_stream())
+        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream())
     }
 
     /// Creates a stream of "read tasks" to read the data from the file
