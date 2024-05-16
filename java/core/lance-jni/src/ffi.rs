@@ -30,6 +30,7 @@ pub trait JNIEnvExt {
 
     /// Get strings from Java String[] object.
     /// Note that get Option<Vec<String>> from Java Optional<String[]> just doesn't work.
+    #[allow(dead_code)]
     fn get_strings_array(&mut self, obj: jobjectArray) -> Result<Vec<String>>;
 
     /// Get Option<String> from Java Optional<String>.
