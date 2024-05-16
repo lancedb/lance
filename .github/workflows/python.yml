@@ -177,7 +177,7 @@ jobs:
         shell: powershell
         working-directory: python
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           lfs: true
