@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::fmt::{Display, Formatter};
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
+use lance_io::object_store::WrappingObjectStore;
 use lance_table::format::Fragment;
+use object_store::path::Path;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore, PutOptions, PutResult,
+    Result as OSResult,
+};
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
+use tokio::io::AsyncWrite;
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
@@ -37,6 +48,7 @@ impl TestDatasetGenerator {
     /// Set the seed for the random number generator.
     ///
     /// If not set, a random seed will be generated on each call to [`Self::make_hostile`].
+    #[allow(dead_code)]
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -228,6 +240,142 @@ fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
         .iter()
         .map(|file| file.fields.clone())
         .collect::<Vec<_>>()
+}
+
+#[derive(Debug, Default)]
+pub struct IoStats {
+    pub read_iops: u64,
+    pub read_bytes: u64,
+}
+
+impl Display for IoStats {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#?}", self)
+    }
+}
+
+#[derive(Debug)]
+pub struct IoTrackingStore {
+    target: Arc<dyn ObjectStore>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+impl Display for IoTrackingStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#?}", self)
+    }
+}
+
+#[derive(Debug)]
+struct StatsHolder(Arc<Mutex<IoStats>>);
+
+impl WrappingObjectStore for StatsHolder {
+    fn wrap(&self, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(IoTrackingStore {
+            target,
+            stats: self.0.clone(),
+        })
+    }
+}
+
+impl IoTrackingStore {
+    pub fn new_wrapper() -> (Arc<dyn WrappingObjectStore>, Arc<Mutex<IoStats>>) {
+        let stats = Arc::new(Mutex::new(IoStats::default()));
+        (Arc::new(StatsHolder(stats.clone())), stats)
+    }
+
+    fn record_read(&self, num_bytes: u64) {
+        let mut stats = self.stats.lock().unwrap();
+        stats.read_iops += 1;
+        stats.read_bytes += num_bytes;
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for IoTrackingStore {
+    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
+        self.target.put(location, bytes).await
+    }
+
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: Bytes,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart(
+        &self,
+        location: &Path,
+    ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+        self.target.put_multipart(location).await
+    }
+
+    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
+        self.target.abort_multipart(location, multipart_id).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        let result = self.target.get_opts(location, options).await;
+        if let Ok(result) = &result {
+            let num_bytes = result.range.end - result.range.start;
+            self.record_read(num_bytes as u64);
+        }
+        result
+    }
+
+    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+        let result = self.target.get_range(location, range).await;
+        if let Ok(result) = &result {
+            self.record_read(result.len() as u64);
+        }
+        result
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+        let result = self.target.get_ranges(location, ranges).await;
+        if let Ok(result) = &result {
+            self.record_read(result.iter().map(|b| b.len() as u64).sum());
+        }
+        result
+    }
+
+    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
+        self.target.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OSResult<()> {
+        self.target.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OSResult<Path>>,
+    ) -> BoxStream<'a, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.copy(from, to).await
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.rename(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.copy_if_not_exists(from, to).await
+    }
 }
 
 #[cfg(test)]

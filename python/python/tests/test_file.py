@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import pyarrow as pa
+import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
 
@@ -10,7 +11,7 @@ def test_file_writer(tmp_path):
     schema = pa.schema([pa.field("a", pa.int64())])
     with LanceFileWriter(str(path), schema) as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))
-    reader = LanceFileReader(str(path), schema)
+    reader = LanceFileReader(str(path))
     metadata = reader.metadata()
     assert metadata.num_rows == 3
 
@@ -33,13 +34,52 @@ def test_multiple_close(tmp_path):
     writer.close()
 
 
+def test_take(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    writer.write_batch(pa.table({"a": [i for i in range(100)]}))
+    writer.close()
+
+    reader = LanceFileReader(str(path))
+    # Can't read out of range
+    with pytest.raises(ValueError):
+        reader.take_rows([0, 100]).to_table()
+
+    table = reader.take_rows([0, 77, 83]).to_table()
+    assert table == pa.table({"a": [0, 77, 83]})
+
+
+def test_different_types(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema(
+        [
+            pa.field("large_string", pa.large_string()),
+            pa.field("large_binary", pa.large_binary()),
+        ]
+    )
+    writer = LanceFileWriter(str(path), schema)
+    data = pa.table(
+        {
+            "large_string": pa.array(["foo", "bar", "baz"], pa.large_string()),
+            "large_binary": pa.array([b"foo", b"bar", b"baz"], pa.large_binary()),
+        }
+    )
+    writer.write_batch(data)
+    writer.close()
+
+    reader = LanceFileReader(str(path))
+    result = reader.read_all().to_table()
+    assert result == data
+
+
 def test_round_trip(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
     data = pa.table({"a": [1, 2, 3]})
     with LanceFileWriter(str(path), schema) as writer:
         writer.write_batch(data)
-    reader = LanceFileReader(str(path), schema)
+    reader = LanceFileReader(str(path))
     result = reader.read_all().to_table()
     assert result == data
 
@@ -57,7 +97,7 @@ def test_metadata(tmp_path):
     data = pa.table({"a": [1, 2, 3]})
     with LanceFileWriter(str(path), schema) as writer:
         writer.write_batch(data)
-    reader = LanceFileReader(str(path), schema)
+    reader = LanceFileReader(str(path))
     metadata = reader.metadata()
 
     assert metadata.schema == schema

@@ -586,7 +586,7 @@ mod tests {
         .await
         .unwrap();
 
-        let idx_params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 50);
+        let idx_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 50);
         ds.create_index(&["vector"], IndexType::Vector, None, &idx_params, true)
             .await
             .unwrap();

@@ -15,7 +15,7 @@
 use std::{pin::Pin, sync::Arc};
 
 use arrow::pyarrow::PyArrowType;
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
@@ -23,7 +23,7 @@ use lance_file::v2::{
     reader::{BufferDescriptor, CachedFileMetadata, FileReader},
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_io::{scheduler::StoreScheduler, ReadBatchParams};
+use lance_io::{scheduler::ScanScheduler, ReadBatchParams};
 use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
@@ -131,7 +131,8 @@ pub struct LanceFileMetadata {
 
 impl LanceFileMetadata {
     fn new(inner: &CachedFileMetadata, py: Python) -> Self {
-        let schema = Some(PyArrowType(inner.file_schema.clone()).into_py(py));
+        let arrow_schema = arrow_schema::Schema::from(inner.file_schema.as_ref());
+        let schema = Some(PyArrowType(arrow_schema).into_py(py));
         Self {
             major_version: inner.major_version,
             minor_version: inner.minor_version,
@@ -261,13 +262,14 @@ pub struct LanceFileReader {
 }
 
 impl LanceFileReader {
-    async fn open(uri_or_path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
+    async fn open(uri_or_path: String) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
-        let scheduler = StoreScheduler::new(Arc::new(object_store), 8);
+        let io_parallelism = std::env::var("IO_THREADS")
+            .map(|val| val.parse::<u32>().unwrap_or(8))
+            .unwrap_or(8);
+        let scheduler = ScanScheduler::new(Arc::new(object_store), io_parallelism);
         let file = scheduler.open_file(&path).await.infer_error()?;
-        let inner = FileReader::try_open(file, schema.0.clone())
-            .await
-            .infer_error()?;
+        let inner = FileReader::try_open(file, None).await.infer_error()?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -312,8 +314,8 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    pub fn new(path: String, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        RT.runtime.block_on(Self::open(path, schema))
+    pub fn new(path: String) -> PyResult<Self> {
+        RT.runtime.block_on(Self::open(path))
     }
 
     pub fn read_all(
@@ -337,6 +339,24 @@ impl LanceFileReader {
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         self.read_stream(
             lance_io::ReadBatchParams::Range((offset as usize)..(offset + num_rows) as usize),
+            batch_size,
+            batch_readahead,
+        )
+    }
+
+    pub fn take_rows(
+        &mut self,
+        row_indices: Vec<u64>,
+        batch_size: u32,
+        batch_readahead: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let indices = row_indices
+            .into_iter()
+            .map(|idx| idx as u32)
+            .collect::<Vec<_>>();
+        let indices_arr = UInt32Array::from(indices);
+        self.read_stream(
+            lance_io::ReadBatchParams::Indices(indices_arr),
             batch_size,
             batch_readahead,
         )

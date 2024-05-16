@@ -12,7 +12,7 @@ use arrow_array::{ArrayRef, Float32Array};
 use async_trait::async_trait;
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
+use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, DistanceType, Dot, L2};
 use lance_linalg::kernels::{argmin, argmin_value_float};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
@@ -58,7 +58,10 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 //
 // TODO: move this to be pub(crate) once we have a better way to test it.
 #[derive(Debug, Clone)]
-pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
+pub struct ProductQuantizerImpl<T: ArrowFloatType>
+where
+    T::Native: Dot + L2,
+{
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -93,7 +96,10 @@ pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
     pub codebook: Arc<T::ArrayType>,
 }
 
-impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType> ProductQuantizerImpl<T>
+where
+    T::Native: Dot + L2,
+{
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
     pub fn new(
         m: usize,
@@ -167,7 +173,7 @@ impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
     pub(crate) async fn distortion(
         &self,
         data: &MatrixView<T>,
-        metric_type: MetricType,
+        distance_type: DistanceType,
     ) -> Result<f64> {
         let sub_vector_width = self.dimension / self.num_sub_vectors;
         let total_distortion = data
@@ -178,15 +184,18 @@ impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
                     .enumerate()
                     .map(|(sub_vector_idx, sub_vec)| {
                         let centroids = self.centroids(sub_vector_idx);
-                        let distances = match metric_type {
-                            lance_linalg::distance::DistanceType::L2 => {
+                        let distances = match distance_type {
+                            DistanceType::L2 => {
                                 l2_distance_batch(sub_vec, centroids, sub_vector_width)
                             }
-                            lance_linalg::distance::DistanceType::Dot => {
+                            DistanceType::Dot => {
                                 dot_distance_batch(sub_vec, centroids, sub_vector_width)
                             }
-                            lance_linalg::distance::DistanceType::Cosine => {
-                                panic!("There should not be cosine for PQ");
+                            _ => {
+                                panic!(
+                                    "ProductQuantization: distance type {} is not supported",
+                                    distance_type
+                                );
                             }
                         };
                         argmin_value_float(distances).map(|(_, v)| v).unwrap_or(0.0)
@@ -302,7 +311,10 @@ impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
 }
 
 #[async_trait]
-impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + 'static> ProductQuantizer for ProductQuantizerImpl<T>
+where
+    T::Native: Dot + L2,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -368,6 +380,10 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantiz
                             l2_distance_batch(sub_vector, centroids, sub_dim)
                         }
                         MetricType::Dot => dot_distance_batch(sub_vector, centroids, sub_dim),
+                        _ => panic!(
+                            "ProductQuantization: metric type {} not supported",
+                            metric_type
+                        ),
                     };
                     let code = argmin(dist_iter).ok_or(Error::Index {
                         message: format!(
@@ -400,6 +416,10 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantiz
                 Ok(l2_dists.values().iter().map(|v| *v / 2.0).collect())
             }
             MetricType::Dot => self.dot_distances(query, code),
+            _ => panic!(
+                "ProductQuantization: metric type {} not supported",
+                self.metric_type
+            ),
         }
     }
 

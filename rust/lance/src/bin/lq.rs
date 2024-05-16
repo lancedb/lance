@@ -70,9 +70,6 @@ enum Commands {
         /// Distance metric type. Only support 'l2' and 'cosine'.
         #[arg(short = 'm', long, value_name = "DISTANCE")]
         metric_type: Option<String>,
-
-        #[arg(long, default_value_t = false)]
-        use_opq: bool,
     },
 }
 
@@ -125,7 +122,6 @@ async fn main() -> Result<()> {
             num_partitions,
             num_sub_vectors,
             metric_type,
-            use_opq,
         } => {
             let mut dataset = Dataset::open(uri).await.unwrap();
             match action {
@@ -138,7 +134,6 @@ async fn main() -> Result<()> {
                         num_partitions,
                         num_sub_vectors,
                         metric_type,
-                        *use_opq,
                     )
                     .await
                 }
@@ -156,7 +151,6 @@ async fn create_index(
     num_partitions: &usize,
     num_sub_vectors: &usize,
     metric_type: &Option<String>,
-    use_opq: bool,
 ) -> Result<()> {
     let col = column.as_ref().ok_or_else(|| Error::Index {
         message: "Must specify column".to_string(),
@@ -179,22 +173,12 @@ async fn create_index(
             });
         }
     };
-    #[cfg(not(feature = "opq"))]
-    match use_opq {
-        false => (),
-        true => {
-            return Err(Error::Index {
-                message: "Feature 'opq' not installed.".to_string(),
-                location: location!(),
-            });
-        }
-    };
     dataset
         .create_index(
             &[col],
             lance_index::IndexType::Vector,
             name.clone(),
-            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, use_opq, mt, 100),
+            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, mt, 100),
             true,
         )
         .await

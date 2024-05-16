@@ -8,6 +8,8 @@ use super::OrderedFloat;
 use super::OrderedNode;
 
 /// GraphNode during build.
+///
+/// WARNING: Internal API,  API stability is not guaranteed
 #[derive(Debug)]
 pub struct GraphBuilderNode {
     /// Node ID
@@ -36,14 +38,17 @@ impl GraphBuilderNode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct GraphBuilderStats {
-    #[allow(dead_code)]
+    /// Sum of the number of nodes.
     pub num_nodes: usize,
-    #[allow(dead_code)]
-    pub max_edges: usize,
-    #[allow(dead_code)]
+
+    /// Sum of the number of edges.
+    pub num_edges: usize,
+
+    /// Mean number of edges per node.
     pub mean_edges: f32,
-    #[allow(dead_code)]
+
+    /// Mean distance between nodes.
     pub mean_distance: f32,
 }

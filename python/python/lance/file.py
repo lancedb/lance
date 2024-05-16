@@ -55,7 +55,7 @@ class LanceFileReader:
     """
 
     # TODO: make schema optional
-    def __init__(self, path: str, schema: pa.Schema):
+    def __init__(self, path: str):
         """
         Creates a new file reader to read the given file
 
@@ -65,10 +65,8 @@ class LanceFileReader:
         path: str
             The path to read, can be a pathname for local storage
             or a URI to read from cloud storage.
-        schema: pa.Schema
-            The desired projection schema
         """
-        self._reader = _LanceFileReader(path, schema)
+        self._reader = _LanceFileReader(path)
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
         """
@@ -106,6 +104,27 @@ class LanceFileReader:
         """
         return ReaderResults(
             self._reader.read_range(start, num_rows, batch_size, batch_readahead)
+        )
+
+    def take_rows(
+        self, indices, *, batch_size: int = 1024, batch_readahead=16
+    ) -> ReaderResults:
+        """
+        Read a specific set of rows from the file
+
+        Parameters
+        ----------
+        indices: List[int]
+            The indices of the rows to read from the file
+        batch_size: int, default 1024
+            The file will be read in batches.  This parameter controls
+            how many rows will be in each batch (except the final batch)
+
+            Smaller batches will use less memory but might be slightly
+            slower because there is more per-batch overhead
+        """
+        return ReaderResults(
+            self._reader.take_rows(indices, batch_size, batch_readahead)
         )
 
     def metadata(self) -> LanceFileMetadata:

@@ -2103,6 +2103,7 @@ mod tests {
     use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use tempfile::{tempdir, TempDir};
     use tests::scanner::test_dataset::TestVectorDataset;
 
@@ -2343,8 +2344,8 @@ mod tests {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment.open(dataset.schema(), false).await.unwrap();
             assert_eq!(reader.legacy_num_batches(), 10);
-            for i in 0..reader.legacy_num_batches() {
-                assert_eq!(reader.legacy_num_rows_in_batch(i), 10);
+            for i in 0..reader.legacy_num_batches() as u32 {
+                assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
             }
         }
     }
@@ -2885,7 +2886,7 @@ mod tests {
         let indices = &[(1 << 32) - 1];
         let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
         assert!(
-            err.to_string().contains("out of bound"),
+            err.to_string().contains("Invalid read params"),
             "{}",
             err.to_string()
         );
@@ -2894,7 +2895,7 @@ mod tests {
         let indices = &[(1 << 32) - 3, (1 << 32) - 1];
         let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
         assert!(
-            err.to_string().contains("out of bound"),
+            err.to_string().contains("out of bounds"),
             "{}",
             err.to_string()
         );
@@ -2903,7 +2904,7 @@ mod tests {
         let indices = &[(1 << 32) - 1, (1 << 32) - 3];
         let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
         assert!(
-            err.to_string().contains("out of bound"),
+            err.to_string().contains("out of bounds"),
             "{}",
             err.to_string()
         );
@@ -3064,7 +3065,7 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Make sure valid arguments should create index successfully
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
         dataset
             .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
             .await
@@ -3139,7 +3140,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen().col(Some("int".to_string()), array::step::<Int32Type>());
+        let data = gen().col("int", array::step::<Int32Type>());
         // Write 64Ki rows.  We should get 16 4Ki pages
         let mut dataset = Dataset::write(
             data.into_reader_rows(RowCount::from(16 * 1024), BatchCount::from(4)),
@@ -3383,8 +3384,9 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_merge() {
+    async fn test_merge(#[values(false, true)] use_experimental_writer: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
             Field::new("x", DataType::Float32, false),
@@ -3411,6 +3413,7 @@ mod tests {
 
         let write_params = WriteParams {
             mode: WriteMode::Append,
+            use_experimental_writer,
             ..Default::default()
         };
 
@@ -4827,7 +4830,7 @@ mod tests {
         )
         .await?;
 
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
         dataset
             .create_index(&["vec"], IndexType::Vector, None, &params, false)
             .await?;

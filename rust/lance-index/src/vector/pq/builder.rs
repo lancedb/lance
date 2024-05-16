@@ -16,7 +16,7 @@ use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_core::{Error, Result};
-use lance_linalg::distance::{Dot, L2};
+use lance_linalg::distance::{Dot, Normalize, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
 use snafu::{location, Location};
@@ -35,15 +35,8 @@ pub struct PQBuildParams {
     /// The number of bits to present one PQ centroid.
     pub num_bits: usize,
 
-    /// Train as optimized product quantization.
-    pub use_opq: bool,
-
     /// The max number of iterations for kmeans training.
     pub max_iters: usize,
-
-    /// Max number of iterations to train Optimized Product Quantization,
-    /// if `use_opq` is true.
-    pub max_opq_iters: usize,
 
     /// User provided codebook.
     pub codebook: Option<ArrayRef>,
@@ -57,9 +50,7 @@ impl Default for PQBuildParams {
         Self {
             num_sub_vectors: 16,
             num_bits: 8,
-            use_opq: false,
             max_iters: 50,
-            max_opq_iters: 50,
             codebook: None,
             sample_rate: 256,
         }
@@ -84,11 +75,14 @@ impl PQBuildParams {
         }
     }
 
-    pub async fn build_from_matrix<T: ArrowFloatType + Dot + L2 + 'static>(
+    pub async fn build_from_matrix<T: ArrowFloatType + 'static>(
         &self,
         data: &MatrixView<T>,
         metric_type: MetricType,
-    ) -> Result<Arc<dyn ProductQuantizer + 'static>> {
+    ) -> Result<Arc<dyn ProductQuantizer + 'static>>
+    where
+        T::Native: Dot + L2 + Normalize,
+    {
         assert_ne!(
             metric_type,
             MetricType::Cosine,
@@ -107,7 +101,6 @@ impl PQBuildParams {
                 let rng = rand::rngs::SmallRng::from_entropy();
                 train_kmeans::<T>(
                     sub_vec.as_ref(),
-                    None,
                     sub_vector_dimension,
                     num_centroids,
                     self.max_iters as u32,
@@ -175,13 +168,14 @@ impl PQBuildParams {
     }
 }
 
-fn create_typed_pq<
-    T: ArrowFloatType<ArrayType = PrimitiveArray<T>> + ArrowNumericType + L2 + Dot,
->(
+fn create_typed_pq<T: ArrowFloatType<ArrayType = PrimitiveArray<T>> + ArrowNumericType>(
     proto: &Pq,
     metric_type: MetricType,
     array: &dyn Array,
-) -> Arc<dyn ProductQuantizer> {
+) -> Arc<dyn ProductQuantizer>
+where
+    <T as ArrowFloatType>::Native: Dot + L2,
+{
     Arc::new(ProductQuantizerImpl::<T>::new(
         proto.num_sub_vectors as usize,
         proto.num_bits,

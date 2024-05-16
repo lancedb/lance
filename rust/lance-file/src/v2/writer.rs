@@ -161,6 +161,11 @@ impl FileWriter {
             let encoded_page = encoding_task?;
             self.write_page(encoded_page).await?;
         }
+        // It's important to flush here, we don't know when the next batch will arrive
+        // and the underlying cloud store could have writes in progress that won't advance
+        // until we interact with the writer again.  These in-progress writes will time out
+        // if we don't flush.
+        self.writer.flush().await?;
         Ok(())
     }
 
@@ -365,7 +370,7 @@ mod tests {
         let obj_store = Arc::new(ObjectStore::local());
 
         let reader = gen()
-            .col(Some("score".to_string()), array::rand::<Float64Type>())
+            .col("score", array::rand::<Float64Type>())
             .into_reader_rows(RowCount::from(1000), BatchCount::from(10));
 
         let writer = obj_store.create(&tmp_path).await.unwrap();

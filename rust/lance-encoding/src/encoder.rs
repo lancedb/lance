@@ -151,6 +151,9 @@ pub trait FieldEncoder: Send {
     /// It could also return an empty Vec if there is not enough data yet to encode any pages.
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
+    ///
+    /// This may be called intermittently throughout encoding but will always be called
+    /// once at the end of encoding.
     fn flush(&mut self) -> Result<Vec<EncodeTask>>;
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
@@ -244,7 +247,7 @@ impl BatchEncoder {
                     header_col_idx,
                 )))
             }
-            DataType::Utf8 | DataType::Binary => {
+            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
                 let my_col_idx = *col_idx;
                 field_col_mapping.push((field.id, my_col_idx as i32));
                 *col_idx += 2;
@@ -340,6 +343,7 @@ pub async fn encode_batch(
             }))
         }
         page_table.push(ColumnInfo {
+            index: 0,
             buffer_offsets: vec![],
             page_infos: pages,
         })

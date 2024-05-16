@@ -5,9 +5,8 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray,
-    types::{ByteArrayType, UInt8Type},
-    Array, ArrayRef, BinaryArray, GenericByteArray, GenericListArray, ListArray, StringArray,
-    UInt8Array,
+    types::{BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, UInt8Type, Utf8Type},
+    Array, ArrayRef, GenericByteArray, GenericListArray, LargeListArray, ListArray, UInt8Array,
 };
 
 use arrow_buffer::ScalarBuffer;
@@ -48,11 +47,12 @@ impl LogicalPageScheduler for BinaryPageScheduler {
         ranges: &[std::ops::Range<u32>],
         scheduler: &Arc<dyn crate::EncodingsIo>,
         sink: &tokio::sync::mpsc::UnboundedSender<Box<dyn crate::decoder::LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling binary for {} ranges", ranges.len());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         self.varbin_scheduler
-            .schedule_ranges(ranges, scheduler, &tx)?;
+            .schedule_ranges(ranges, scheduler, &tx, top_level_row)?;
 
         while let Some(decoder) = rx.recv().now_or_never() {
             let wrapped = BinaryPageDecoder {
@@ -70,6 +70,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
         indices: &[u32],
         scheduler: &Arc<dyn crate::EncodingsIo>,
         sink: &tokio::sync::mpsc::UnboundedSender<Box<dyn crate::decoder::LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling binary for {} indices", indices.len());
         self.schedule_ranges(
@@ -79,6 +80,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
                 .collect::<Vec<_>>(),
             scheduler,
             sink,
+            top_level_row,
         )
     }
 
@@ -87,6 +89,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
     }
 }
 
+#[derive(Debug)]
 pub struct BinaryPageDecoder {
     inner: Box<dyn LogicalPageDecoder>,
     data_type: DataType,
@@ -128,26 +131,19 @@ pub struct BinaryArrayDecoder {
 }
 
 impl BinaryArrayDecoder {
-    fn from_list_array(data_type: &DataType, array: &GenericListArray<i32>) -> ArrayRef {
+    fn from_list_array<T: ByteArrayType>(array: &GenericListArray<T::Offset>) -> ArrayRef {
         let values = array
             .values()
             .as_primitive::<UInt8Type>()
             .values()
             .inner()
             .clone();
-        match data_type {
-            DataType::Utf8 => Arc::new(StringArray::new(
-                array.offsets().clone(),
-                values,
-                array.nulls().cloned(),
-            )),
-            DataType::Binary => Arc::new(BinaryArray::new(
-                array.offsets().clone(),
-                values,
-                array.nulls().cloned(),
-            )),
-            _ => panic!("Binary decoder does not support data type {}", data_type),
-        }
+        let offsets = array.offsets().clone();
+        Arc::new(GenericByteArray::<T>::new(
+            offsets,
+            values,
+            array.nulls().cloned(),
+        ))
     }
 }
 
@@ -155,8 +151,15 @@ impl DecodeArrayTask for BinaryArrayDecoder {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
         let data_type = self.data_type;
         let arr = self.inner.decode()?;
-        let list_arr = arr.as_list::<i32>();
-        Ok(Self::from_list_array(&data_type, list_arr))
+        match data_type {
+            DataType::Binary => Ok(Self::from_list_array::<BinaryType>(arr.as_list::<i32>())),
+            DataType::LargeBinary => Ok(Self::from_list_array::<LargeBinaryType>(
+                arr.as_list::<i64>(),
+            )),
+            DataType::Utf8 => Ok(Self::from_list_array::<Utf8Type>(arr.as_list::<i32>())),
+            DataType::LargeUtf8 => Ok(Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>())),
+            _ => panic!("Binary decoder does not support this data type"),
+        }
     }
 }
 
@@ -202,10 +205,32 @@ impl BinaryFieldEncoder {
         )
     }
 
-    fn to_list_array(array: ArrayRef) -> ListArray {
+    fn byte_to_large_list_array<T: ByteArrayType<Offset = i64>>(
+        array: &GenericByteArray<T>,
+    ) -> LargeListArray {
+        let values = UInt8Array::new(
+            ScalarBuffer::<u8>::new(array.values().clone(), 0, array.values().len()),
+            None,
+        );
+        let list_field = Field::new("item", DataType::UInt8, true);
+        LargeListArray::new(
+            Arc::new(list_field),
+            array.offsets().clone(),
+            Arc::new(values),
+            array.nulls().cloned(),
+        )
+    }
+
+    fn to_list_array(array: ArrayRef) -> ArrayRef {
         match array.data_type() {
-            DataType::Utf8 => Self::byte_to_list_array(array.as_string::<i32>()),
-            DataType::Binary => Self::byte_to_list_array(array.as_binary::<i32>()),
+            DataType::Utf8 => Arc::new(Self::byte_to_list_array(array.as_string::<i32>())),
+            DataType::LargeUtf8 => {
+                Arc::new(Self::byte_to_large_list_array(array.as_string::<i64>()))
+            }
+            DataType::Binary => Arc::new(Self::byte_to_list_array(array.as_binary::<i32>())),
+            DataType::LargeBinary => {
+                Arc::new(Self::byte_to_large_list_array(array.as_binary::<i64>()))
+            }
             _ => panic!("Binary encoder does not support {}", array.data_type()),
         }
     }
@@ -241,6 +266,18 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_binary() {
         let field = Field::new("", DataType::Binary, false);
+        check_round_trip_encoding_random(field).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_large_binary() {
+        let field = Field::new("", DataType::LargeBinary, true);
+        check_round_trip_encoding_random(field).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_large_utf8() {
+        let field = Field::new("", DataType::LargeUtf8, true);
         check_round_trip_encoding_random(field).await;
     }
 }

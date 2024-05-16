@@ -10,6 +10,7 @@ use std::{
 
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use async_trait::async_trait;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_index::vector::quantizer::Quantizer;
@@ -31,8 +32,6 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
-#[cfg(feature = "opq")]
-use super::opq::train_opq;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::RESULT_SCHEMA;
@@ -46,7 +45,7 @@ pub(crate) struct HNSWIndexOptions {
 
 #[derive(Clone)]
 pub(crate) struct HNSWIndex<Q: Quantization> {
-    hnsw: HNSW,
+    hnsw: Arc<HNSW>,
 
     // TODO: move these into IVFIndex after the refactor is complete
     partition_storage: IvfQuantizationStorage<Q>,
@@ -80,7 +79,7 @@ impl<Q: Quantization> HNSWIndex<Q> {
 
         let ivf_store = IvfQuantizationStorage::open(aux_reader).await?;
         Ok(Self {
-            hnsw,
+            hnsw: Arc::new(hnsw),
             partition_storage: ivf_store,
             partition_metadata,
             options,
@@ -176,7 +175,9 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             });
         }
 
-        let results = self.hnsw.search(query.key.clone(), k, ef, bitmap)?;
+        let hnsw = self.hnsw.clone();
+        let key = query.key.clone();
+        let results = spawn_cpu(move || hnsw.search(key, k, ef, bitmap)).await?;
 
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.id as usize]));
         let distances = Arc::new(Float32Array::from_iter_values(
@@ -231,7 +232,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         .await?;
 
         Ok(Box::new(Self {
-            hnsw,
+            hnsw: Arc::new(hnsw),
             partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),
@@ -258,7 +259,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         .await?;
 
         Ok(Box::new(Self {
-            hnsw,
+            hnsw: Arc::new(hnsw),
             partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),

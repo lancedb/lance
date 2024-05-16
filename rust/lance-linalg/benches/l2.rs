@@ -30,7 +30,10 @@ fn l2_scalar<T: Float + AsPrimitive<f32>>(x: &[T], y: &[T]) -> T {
     sum.sqrt()
 }
 
-fn run_bench<T: ArrowFloatType + L2>(c: &mut Criterion) {
+fn run_bench<T: ArrowFloatType>(c: &mut Criterion)
+where
+    T::Native: L2,
+{
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
 

@@ -609,8 +609,7 @@ mod tests {
 
         async fn create_some_index(&self) -> Result<()> {
             let mut db = self.open().await?;
-            let index_params =
-                Box::new(VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 5));
+            let index_params = Box::new(VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 5));
             db.create_index(
                 &["indexable"],
                 IndexType::Vector,

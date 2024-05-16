@@ -994,6 +994,25 @@ def test_merge_insert(tmp_path: Path):
         dataset.merge_insert("a").execute(new_table)
 
 
+def test_flat_vector_search_with_delete(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "id": [i for i in range(10)],
+            "vector": pa.array(
+                [[1.0, 1.0] for _ in range(10)], pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path / "dataset", mode="create")
+    dataset.delete("id = 0")
+    assert (
+        dataset.scanner(nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]})
+        .to_table()
+        .num_rows
+        == 9
+    )
+
+
 def test_merge_insert_conditional_upsert_example(tmp_path: Path):
     table = pa.Table.from_pydict(
         {
@@ -1332,6 +1351,14 @@ def test_scan_no_columns(tmp_path: Path):
     # if with_row_id is not True then columns=[] is an error
     with pytest.raises(ValueError, match="no columns were selected"):
         dataset.scanner(columns=[]).to_table()
+
+    # also test with deleted data to make sure deleted ids not included
+    dataset.delete("a = 5")
+    num_rows = 0
+    for batch in dataset.scanner(columns=[], with_row_id=True).to_batches():
+        num_rows += batch.num_rows
+
+    assert num_rows == 99
 
 
 def test_scan_prefilter(tmp_path: Path):

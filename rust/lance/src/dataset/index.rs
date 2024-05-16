@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::Result;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
 use lance_table::format::Index;
 use serde::{Deserialize, Serialize};
@@ -66,5 +67,20 @@ impl IndexRemapper for DatasetIndexRemapper {
             }
         }
         Ok(remapped)
+    }
+}
+
+pub trait LanceIndexStoreExt {
+    fn from_dataset(dataset: &Dataset, uuid: &str) -> Self;
+}
+
+impl LanceIndexStoreExt for LanceIndexStore {
+    fn from_dataset(dataset: &Dataset, uuid: &str) -> Self {
+        let index_dir = dataset.indices_dir().child(uuid);
+        LanceIndexStore::new(
+            dataset.object_store.as_ref().clone(),
+            index_dir,
+            Some(dataset.session.file_metadata_cache.clone()),
+        )
     }
 }

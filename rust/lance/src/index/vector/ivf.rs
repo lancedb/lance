@@ -57,9 +57,12 @@ use lance_io::{
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
-use lance_linalg::kernels::{normalize_arrow, normalize_fsl};
 use lance_linalg::{
-    distance::{Cosine, DistanceType, Dot, MetricType, L2},
+    distance::Normalize,
+    kernels::{normalize_arrow, normalize_fsl},
+};
+use lance_linalg::{
+    distance::{DistanceType, Dot, MetricType, L2},
     MatrixView,
 };
 use log::{debug, info};
@@ -349,7 +352,6 @@ async fn optimize_ivf_pq_indices(
                 ivf,
                 None,
                 first_idx.ivf.num_partitions() as u32,
-                pq_index.pq.num_sub_vectors(),
                 10000,
                 2,
                 None,
@@ -431,7 +433,6 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
                 ivf,
                 None,
                 first_idx.ivf.num_partitions() as u32,
-                quantizer.code_dim(),
                 10000,
                 2,
                 None,
@@ -822,6 +823,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                     MetricType::L2 => pb::VectorMetricType::L2.into(),
                     MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
                     MetricType::Dot => pb::VectorMetricType::Dot.into(),
+                    MetricType::Hamming => pb::VectorMetricType::Hamming.into(),
                 },
             })),
         })
@@ -1093,11 +1095,8 @@ async fn build_ivf_model_and_pq(
     sanity_check_params(ivf_params, pq_params)?;
 
     info!(
-        "Building vector index: IVF{},{}PQ{}, metric={}",
-        ivf_params.num_partitions,
-        if pq_params.use_opq { "O" } else { "" },
-        pq_params.num_sub_vectors,
-        metric_type,
+        "Building vector index: IVF{},PQ{}, metric={}",
+        ivf_params.num_partitions, pq_params.num_sub_vectors, metric_type,
     );
 
     let field = sanity_check(dataset, column)?;
@@ -1616,17 +1615,19 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-async fn do_train_ivf_model<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+async fn do_train_ivf_model<T: ArrowFloatType + 'static>(
     data: &T::ArrayType,
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
-) -> Result<Ivf> {
+) -> Result<Ivf>
+where
+    T::Native: Dot + L2 + Normalize,
+{
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
     let centroids = lance_index::vector::kmeans::train_kmeans::<T>(
         data,
-        None,
         dimension,
         params.num_partitions,
         params.max_iters as u32,
@@ -2751,7 +2752,7 @@ mod tests {
         assert_eq!(1, results.len());
         assert_eq!(k, results[0].num_rows());
 
-        let results = results[0]
+        let row_ids = results[0]
             .column_by_name(ROW_ID)
             .unwrap()
             .as_any()
@@ -2759,17 +2760,29 @@ mod tests {
             .unwrap()
             .iter()
             .map(|v| v.unwrap() as u32)
-            .collect::<HashSet<_>>();
+            .collect::<Vec<_>>();
+        let dists = results[0]
+            .column_by_name("_distance")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
 
-        let gt = ground_truth(&mat, query.values(), k, distance_type);
+        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
+        let gt = ground_truth(&mat, query.values(), k, DistanceType::L2);
+
+        let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
-        let recall = results.intersection(&gt_set).count() as f32 / k as f32;
+
+        let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
             recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
-            results.iter().sorted().collect_vec(),
-            gt_set.iter().sorted().collect_vec()
+            results,
+            gt,
         );
     }
 
@@ -2794,7 +2807,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_pq(2, 8, 4, false, MetricType::Cosine, 50);
+        let params = VectorIndexParams::ivf_pq(2, 8, 4, MetricType::Cosine, 50);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await

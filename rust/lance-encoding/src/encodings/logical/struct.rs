@@ -110,6 +110,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
         ranges: &[Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         for range in ranges.iter().cloned() {
             let mut rows_to_read = range.end - range.start;
@@ -156,6 +157,8 @@ impl LogicalPageScheduler for SimpleStructScheduler {
             // The downside of the current algorithm is that many tiny I/O batches means less opportunity for in-batch coalescing.
             // Then again, if our outer batch coalescing is super good then maybe we don't bother
 
+            let mut current_top_level_row = top_level_row;
+
             while rows_to_read > 0 {
                 let mut min_rows_added = u32::MAX;
                 for (col_idx, field_scheduler) in self.children.iter().enumerate() {
@@ -183,7 +186,12 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                             page_range_start,
                             next_page
                         );
-                        next_page.schedule_ranges(&[page_range], scheduler, sink)?;
+                        next_page.schedule_ranges(
+                            &[page_range],
+                            scheduler,
+                            sink,
+                            current_top_level_row,
+                        )?;
 
                         status.rows_queued += rows_to_take;
                         status.rows_to_take -= rows_to_take;
@@ -191,12 +199,15 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                         status.rows_to_skip = 0;
 
                         min_rows_added = min_rows_added.min(rows_to_take);
+                    } else {
+                        min_rows_added = min_rows_added.min(status.rows_queued);
                     }
                 }
                 if min_rows_added == 0 {
                     panic!("Error in scheduling logic, panic to avoid infinite loop");
                 }
                 rows_to_read -= min_rows_added;
+                current_top_level_row += min_rows_added as u64;
                 for field_status in &mut field_status {
                     field_status.rows_queued -= min_rows_added;
                 }
@@ -214,6 +225,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
         indices: &[u32],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling struct decode of {} indices", indices.len());
 
@@ -234,8 +246,9 @@ impl LogicalPageScheduler for SimpleStructScheduler {
         let mut rows_to_read = indices.len() as u32;
 
         // NOTE: See schedule_range for a description of the scheduling algorithm
-
+        let mut current_top_level_row = top_level_row;
         while rows_to_read > 0 {
+            trace!("Beginning scheduler scan of columns");
             let mut min_rows_added = u32::MAX;
             for (col_idx, field_scheduler) in self.children.iter().enumerate() {
                 let status = &mut field_status[col_idx];
@@ -251,12 +264,15 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                             "{}",
                             if indices_in_page.is_empty() {
                                 format!(
-                                    "Skipping entire page of {} rows",
-                                    next_candidate_page.num_rows()
+                                    "Skipping entire page of {} rows for column {}",
+                                    next_candidate_page.num_rows(),
+                                    col_idx,
                                 )
                             } else {
                                 format!(
-                                    "Found page with {} overlapping indices",
+                                    "Found page for column {} with {} rows that had {} overlapping indices",
+                                    col_idx,
+                                    next_candidate_page.num_rows(),
                                     indices_in_page.len()
                                 )
                             }
@@ -267,18 +283,31 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                     // We should be guaranteed to get at least one page
                     let next_page = next_page.unwrap();
 
-                    next_page.schedule_take(&indices_in_page, scheduler, sink)?;
+                    next_page.schedule_take(
+                        &indices_in_page,
+                        scheduler,
+                        sink,
+                        current_top_level_row,
+                    )?;
 
                     let rows_scheduled = indices_in_page.len() as u32;
                     status.rows_queued += rows_scheduled;
 
                     min_rows_added = min_rows_added.min(rows_scheduled);
+                } else {
+                    // TODO: Unit tests are not covering this path right now
+                    min_rows_added = min_rows_added.min(status.rows_queued);
                 }
             }
             if min_rows_added == 0 {
                 panic!("Error in scheduling logic, panic to avoid infinite loop");
             }
+            trace!(
+                "One scheduling pass complete, {} rows added",
+                min_rows_added
+            );
             rows_to_read -= min_rows_added;
+            current_top_level_row += min_rows_added as u64;
             for field_status in &mut field_status {
                 field_status.rows_queued -= min_rows_added;
             }
@@ -287,6 +316,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
     }
 }
 
+#[derive(Debug)]
 struct ChildState {
     // As we decode a column we pull pages out of the channel source and into
     // a queue for that column.  Since we await as soon as we pull the page from
@@ -306,6 +336,8 @@ struct ChildState {
     // Rows that have been pulled out of the channel source, awaited, and are ready to
     // be drained
     rows_available: u32,
+    // The field index in the struct (used for debugging / logging)
+    field_index: u32,
 }
 
 struct CompositeDecodeTask {
@@ -334,11 +366,12 @@ impl CompositeDecodeTask {
 }
 
 impl ChildState {
-    fn new(num_rows: u32) -> Self {
+    fn new(num_rows: u32, field_index: u32) -> Self {
         Self {
             awaited: VecDeque::new(),
             rows_unawaited: num_rows,
             rows_available: 0,
+            field_index,
         }
     }
 
@@ -351,12 +384,18 @@ impl ChildState {
         source: &mut mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
     ) -> Result<bool> {
         trace!(
-            "Struct waiting for {} rows and {} are available already",
+            "Struct child {} waiting for {} rows and {} are available already",
+            self.field_index,
             num_rows,
             self.rows_available
         );
-        let remaining = num_rows.saturating_sub(self.rows_available);
+        let mut remaining = num_rows.saturating_sub(self.rows_available);
         if remaining > 0 {
+            trace!(
+                "Struct must await {} rows from {} unawaited rows",
+                remaining,
+                self.rows_unawaited
+            );
             if let Some(back) = self.awaited.back_mut() {
                 if back.unawaited() > 0 {
                     let rows_to_wait = remaining.min(back.unawaited());
@@ -371,8 +410,16 @@ impl ChildState {
                     let newly_avail = back.avail() - previously_avail;
                     trace!("The await loaded {} rows", newly_avail);
                     self.rows_available += newly_avail;
-                    self.rows_unawaited -= newly_avail;
-                    return Ok(remaining == rows_to_wait);
+                    // Need to use saturating_sub here because we might have asked for range
+                    // 0-1000 and this page we just loaded might cover 900-1100 and so newly_avail
+                    // is 200 but rows_unawaited is only 100
+                    //
+                    // TODO: Unit tests are not covering this branch right now
+                    self.rows_unawaited = self.rows_unawaited.saturating_sub(newly_avail);
+                    remaining -= rows_to_wait;
+                    if remaining == 0 {
+                        return Ok(true);
+                    }
                 }
             }
 
@@ -399,9 +446,9 @@ impl ChildState {
             // newly_avail this way (we do this above too)
             let newly_avail = decoder.avail() - previously_avail;
             self.awaited.push_back(decoder);
-            self.rows_available += newly_avail;
-            self.rows_unawaited -= newly_avail;
             trace!("The new await loaded {} rows", newly_avail);
+            self.rows_available += newly_avail;
+            self.rows_unawaited = self.rows_unawaited.saturating_sub(newly_avail);
             Ok(remaining == rows_to_wait)
         } else {
             Ok(true)
@@ -436,6 +483,7 @@ impl ChildState {
     }
 }
 
+#[derive(Debug)]
 struct SimpleStructDecoder {
     children: Vec<ChildState>,
     child_fields: Fields,
@@ -446,7 +494,8 @@ impl SimpleStructDecoder {
         Self {
             children: child_fields
                 .iter()
-                .map(|_| ChildState::new(num_rows))
+                .enumerate()
+                .map(|(idx, _)| ChildState::new(num_rows, idx as u32))
                 .collect(),
             child_fields,
         }
@@ -595,16 +644,28 @@ impl FieldEncoder for StructFieldEncoder {
     }
 
     fn num_columns(&self) -> u32 {
-        self.children.len() as u32 + 1
+        self.children
+            .iter()
+            .map(|child| child.num_columns())
+            .sum::<u32>()
+            + 1
     }
 }
 
 #[cfg(test)]
 mod tests {
 
+    use std::sync::Arc;
+
+    use arrow_array::{
+        builder::{Int32Builder, ListBuilder},
+        Array, ArrayRef, Int32Array, StructArray,
+    };
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::testing::check_round_trip_encoding_random;
+    use crate::testing::{
+        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+    };
 
     #[test_log::test(tokio::test)]
     async fn test_simple_struct() {
@@ -614,5 +675,34 @@ mod tests {
         ]));
         let field = Field::new("", data_type, false);
         check_round_trip_encoding_random(field).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ragged_scheduling() {
+        // This test covers scheduling when batches straddle page boundaries
+
+        // Create a list with 10k nulls
+        let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        for _ in 0..10000 {
+            list_builder.append_null();
+        }
+        let list_array = Arc::new(list_builder.finish());
+        let int_array = Arc::new(Int32Array::from_iter_values(0..10000));
+        let fields = vec![
+            Field::new("", list_array.data_type().clone(), true),
+            Field::new("", int_array.data_type().clone(), true),
+        ];
+        let struct_array = Arc::new(StructArray::new(
+            Fields::from(fields),
+            vec![list_array, int_array],
+            None,
+        )) as ArrayRef;
+        let struct_arrays = (0..10000)
+            // Intentionally skip in some randomish amount to create more ragged scheduling
+            .step_by(437)
+            .map(|offset| struct_array.slice(offset, 437.min(10000 - offset)))
+            .collect::<Vec<_>>();
+        check_round_trip_encoding_of_data(struct_arrays, &TestCases::default()).await;
     }
 }

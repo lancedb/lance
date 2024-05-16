@@ -1143,6 +1143,10 @@ class LanceDataset(pa.dataset.Dataset):
         combines is inspired by the btree data structure although only the first few
         layers of the btree are cached in memory.
 
+        Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
+        bypass spilling to disk. Setting this to true can avoid memory exhaustion
+        issues (see https://github.com/apache/datafusion/issues/10073 for more info).
+
         **Experimental API**
 
         Parameters
@@ -1242,7 +1246,8 @@ class LanceDataset(pa.dataset.Dataset):
         column : str
             The column to be indexed.
         index_type : str
-            The type of the index. Only ``"IVF_PQ"`` is supported now.
+            The type of the index.
+            ``"IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ"`` are supported now.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1286,21 +1291,28 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs :
             Parameters passed to the index building process.
 
-        If ``index_type`` is "IVF_PQ", then the following parameters are required:
-        - **num_partitions**
-        - **num_sub_vectors**
+        The SQ (Scalar Quantization) is available for only "IVF_HNSW_SQ" index type,
+        this quantization method is used to reduce the memory usage of the index,
+        it maps the float vectors to integer vectors, each integer is of ``num_bits``,
+        now only 8 bits are supported.
+
+        If ``index_type`` is "IVF_*", then the following parameters are required:
+            num_partitions
+
+        If ``index_type`` is with "PQ", then the following parameters are required:
+            num_sub_vectors
 
         Optional parameters for "IVF_PQ":
-        - **use_opq**: whether to use OPQ (Optimized Product Quantization).
-            Must have feature 'opq' enabled in Rust.
-        - **max_opq_iterations**: the maximum number of iterations for training OPQ.
-        - **ivf_centroids**: K-mean centroids for IVF clustering.
+            ivf_centroids :
+                K-mean centroids for IVF clustering.
 
         Optional parameters for "IVF_HNSW_*":
-        - **max_level**: the maximum number of levels in the graph.
-        - **m**: the number of edges per node in the graph.
-        - **m_max**: the maximum number of edges per node in the graph.
-        - **ef_construction**: the number of nodes to examine during the construction.
+            max_level : int
+                the maximum number of levels in the graph.
+            m : int
+                the number of edges per node in the graph.
+            ef_construction : int
+                the number of nodes to examine during the construction.
 
         Examples
         --------
@@ -1315,6 +1327,17 @@ class LanceDataset(pa.dataset.Dataset):
                 "IVF_PQ",
                 num_partitions=256,
                 num_sub_vectors=16
+            )
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_HNSW_SQ",
+                num_partitions=256,
             )
 
         Experimental Accelerator (GPU) support:

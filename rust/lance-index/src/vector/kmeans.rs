@@ -6,27 +6,28 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use log::info;
 use rand::{seq::IteratorRandom, Rng};
 use snafu::{location, Location};
-use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use lance_linalg::{
-    distance::{Dot, MetricType, L2},
+    distance::{DistanceType, Dot, Normalize, L2},
     kmeans::{KMeans, KMeansParams},
 };
 
 /// Train KMeans model and returns the centroids of each cluster.
 #[allow(clippy::too_many_arguments)]
-pub async fn train_kmeans<T: ArrowFloatType + Dot + L2>(
+pub async fn train_kmeans<T: ArrowFloatType>(
     array: &T::ArrayType,
-    centroids: Option<Arc<T::ArrayType>>,
     dimension: usize,
     k: usize,
     max_iterations: u32,
     redos: usize,
     mut rng: impl Rng,
-    metric_type: MetricType,
+    distance_type: DistanceType,
     sample_rate: usize,
-) -> Result<T::ArrayType> {
+) -> Result<T::ArrayType>
+where
+    T::Native: Dot + L2 + Normalize,
+{
     let num_rows = array.len() / dimension;
     if num_rows < k {
         return Err(Error::Index{message: format!(
@@ -57,12 +58,11 @@ pub async fn train_kmeans<T: ArrowFloatType + Dot + L2>(
 
     let params = KMeansParams {
         max_iters: max_iterations,
-        metric_type,
-        centroids,
+        distance_type,
         redos,
         ..Default::default()
     };
     let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
-    let model = KMeans::<T>::new_with_params(&data, k, &params).await?;
+    let model = KMeans::<T>::new_with_params(&data, k, &params)?;
     Ok(model.centroids.as_ref().clone())
 }

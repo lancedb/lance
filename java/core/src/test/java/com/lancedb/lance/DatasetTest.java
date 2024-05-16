@@ -19,8 +19,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
-import java.util.Optional;
-
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.AfterAll;
@@ -29,7 +27,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 public class DatasetTest {
-
   @TempDir static Path tempDir; // Temporary directory for the tests
   private static Dataset dataset;
 
@@ -72,7 +69,6 @@ public class DatasetTest {
           dataset = Dataset.open(validPath, new RootAllocator());
         });
   }
-
 
   @Test
   void testDatasetVersion() {

@@ -48,6 +48,21 @@ impl DeletionVector {
         }
     }
 
+    pub fn into_sorted_iter(self) -> Box<dyn Iterator<Item = u32> + Send + 'static> {
+        match self {
+            Self::NoDeletions => Box::new(std::iter::empty()),
+            Self::Set(set) => {
+                // If we're using a set we shouldn't have too many values
+                // and so this conversion should be affordable.
+                let mut values = Vec::from_iter(set);
+                values.sort();
+                Box::new(values.into_iter())
+            }
+            // Bitmaps always iterate in sorted order
+            Self::Bitmap(bitmap) => Box::new(bitmap.into_iter()),
+        }
+    }
+
     // Note: deletion vectors are based on 32-bit offsets.  However, this function works
     // even when given 64-bit row addresses.  That is because `id as u32` returns the lower
     // 32 bits (the row offset) and the upper 32 bits are ignored.
@@ -150,7 +165,7 @@ impl Extend<u32> for DeletionVector {
 /// impl BitAnd for DeletionVector { ... }
 
 impl IntoIterator for DeletionVector {
-    type IntoIter = Box<dyn Iterator<Item = Self::Item>>;
+    type IntoIter = Box<dyn Iterator<Item = Self::Item> + Send>;
     type Item = u32;
 
     fn into_iter(self) -> Self::IntoIter {

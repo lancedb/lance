@@ -139,7 +139,7 @@ pub struct Scanner {
     pub(crate) filter: Option<Expr>,
 
     /// The batch size controls the maximum size of rows to return for each read.
-    batch_size: usize,
+    batch_size: Option<usize>,
 
     /// Number of batches to prefetch
     batch_readahead: usize,
@@ -190,19 +190,13 @@ impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection = dataset.schema().clone();
 
-        // Default batch size to be large enough so that a i32 column can be
-        // read in a single range request. For the object store default of
-        // 64KB, this is 16K rows. For local file systems, the default block size
-        // is just 4K, which would mean only 1K rows, which might be a little small.
-        // So we use a default minimum of 8K rows.
-        let batch_size = std::cmp::max(dataset.object_store().block_size() / 4, DEFAULT_BATCH_SIZE);
         Self {
             dataset,
             phyical_columns: projection,
             requested_output_expr: None,
             prefilter: false,
             filter: None,
-            batch_size,
+            batch_size: None,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
             fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
@@ -229,6 +223,20 @@ impl Scanner {
     pub fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
         self.fragments = Some(fragments);
         self
+    }
+
+    fn get_batch_size(&self) -> usize {
+        // Default batch size to be large enough so that a i32 column can be
+        // read in a single range request. For the object store default of
+        // 64KB, this is 16K rows. For local file systems, the default block size
+        // is just 4K, which would mean only 1K rows, which might be a little small.
+        // So we use a default minimum of 8K rows.
+        self.batch_size.unwrap_or_else(|| {
+            std::cmp::max(
+                self.dataset.object_store().block_size() / 4,
+                DEFAULT_BATCH_SIZE,
+            )
+        })
     }
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
@@ -352,7 +360,7 @@ impl Scanner {
 
     /// Set the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
-        self.batch_size = batch_size;
+        self.batch_size = Some(batch_size);
         self
     }
 
@@ -807,8 +815,6 @@ impl Scanner {
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
 
-        // NOTE: we only support node that have one partition. So any nodes that
-        // produce multiple need to be repartitioned to 1.
         let mut filter_plan = if let Some(filter) = self.filter.as_ref() {
             let index_info = self.dataset.scalar_index_info().await?;
             let filter_plan =
@@ -855,6 +861,17 @@ impl Scanner {
                 self.knn(&FilterPlan::default()).await?
             }
         } else {
+            // Avoid pushdown scan node if using v2 files
+            let fragments = if let Some(fragments) = self.fragments.as_ref() {
+                fragments
+            } else {
+                self.dataset.fragments()
+            };
+            let use_stats = if fragments.iter().any(|f| !f.has_legacy_files()) {
+                false
+            } else {
+                self.use_stats
+            };
             match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
                 (Some(index_query), None) => {
                     self.scalar_indexed_scan(&self.phyical_columns, index_query)
@@ -869,13 +886,21 @@ impl Scanner {
                     self.scalar_indexed_scan(&filter_schema, index_query)
                         .await?
                 }
-                (None, Some(_)) if self.use_stats => {
+                (None, Some(_)) if use_stats && self.batch_size.is_none() => {
                     self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
                 }
                 (None, _) => {
                     // The source is a full scan of the table
                     let with_row_id = filter_plan.has_refine() || self.with_row_id;
-                    self.scan(with_row_id, false, self.phyical_columns.clone().into())
+                    let schema = if filter_plan.has_refine() {
+                        // If there is a filter then only load the filter columns in the
+                        // initial scan.  We will `take` the remaining columns later
+                        let columns = filter_plan.refine_columns();
+                        Arc::new(self.dataset.schema().project(&columns)?)
+                    } else {
+                        Arc::new(self.phyical_columns.clone())
+                    };
+                    self.scan(with_row_id, false, schema)
                 }
             }
         };
@@ -1293,7 +1318,7 @@ impl Scanner {
             self.dataset.clone(),
             fragments,
             projection,
-            self.batch_size,
+            self.get_batch_size(),
             self.batch_readahead,
             self.fragment_readahead,
             with_row_id,
@@ -1580,7 +1605,7 @@ pub mod test_dataset {
         }
 
         pub async fn make_vector_index(&mut self) -> Result<()> {
-            let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
+            let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2);
             self.dataset
                 .create_index(
                     &["vec"],
@@ -1647,6 +1672,7 @@ mod test {
     use half::f16;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_index::IndexType;
+    use lance_io::object_store::ObjectStoreParams;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use tempfile::{tempdir, TempDir};
 
@@ -1658,6 +1684,7 @@ mod test {
     use crate::dataset::WriteParams;
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::IoTrackingStore;
 
     #[tokio::test]
     async fn test_batch_size() {
@@ -1681,30 +1708,33 @@ mod test {
             })
             .collect();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let write_params = WriteParams {
-            max_rows_per_file: 40,
-            max_rows_per_group: 10,
-            ..Default::default()
-        };
-        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
-            .await
-            .unwrap();
+        for use_filter in [false, true] {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 40,
+                max_rows_per_group: 10,
+                ..Default::default()
+            };
+            let batches =
+                RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
+            Dataset::write(batches, test_uri, Some(write_params))
+                .await
+                .unwrap();
 
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        let mut stream = dataset
-            .scan()
-            .batch_size(8)
-            .try_into_stream()
-            .await
-            .unwrap();
-        for expected_len in [8, 2, 8, 2, 8, 2, 8, 2, 8, 2] {
-            assert_eq!(
-                stream.next().await.unwrap().unwrap().num_rows(),
-                expected_len as usize
-            );
+            let dataset = Dataset::open(test_uri).await.unwrap();
+            let mut builder = dataset.scan();
+            builder.batch_size(8);
+            if use_filter {
+                builder.filter("i IS NOT NULL").unwrap();
+            }
+            let mut stream = builder.try_into_stream().await.unwrap();
+            for expected_len in [8, 2, 8, 2, 8, 2, 8, 2, 8, 2] {
+                assert_eq!(
+                    stream.next().await.unwrap().unwrap().num_rows(),
+                    expected_len as usize
+                );
+            }
         }
     }
 
@@ -2232,34 +2262,25 @@ mod test {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let data = gen()
+            .col("int", array::cycle::<Int32Type>(vec![5, 4, 1, 2, 3]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![5, 4, 1, 2, 3]),
-            )
-            .col(
-                Some("str".to_string()),
+                "str",
                 array::cycle_utf8_literals(&["a", "b", "c", "e", "d"]),
             );
 
         let sorted_by_int = gen()
+            .col("int", array::cycle::<Int32Type>(vec![1, 2, 3, 4, 5]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![1, 2, 3, 4, 5]),
-            )
-            .col(
-                Some("str".to_string()),
+                "str",
                 array::cycle_utf8_literals(&["c", "e", "d", "b", "a"]),
             )
             .into_batch_rows(RowCount::from(5))
             .unwrap();
 
         let sorted_by_str = gen()
+            .col("int", array::cycle::<Int32Type>(vec![5, 4, 1, 3, 2]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![5, 4, 1, 3, 2]),
-            )
-            .col(
-                Some("str".to_string()),
+                "str",
                 array::cycle_utf8_literals(&["a", "b", "c", "d", "e"]),
             )
             .into_batch_rows(RowCount::from(5))
@@ -2324,22 +2345,16 @@ mod test {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let data = gen()
+            .col("int", array::cycle::<Int32Type>(vec![5, 5, 1, 1, 3]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![5, 5, 1, 1, 3]),
-            )
-            .col(
-                Some("float".to_string()),
+                "float",
                 array::cycle::<Float32Type>(vec![7.3, -f32::NAN, f32::NAN, 4.3, f32::INFINITY]),
             );
 
         let sorted_by_int_then_float = gen()
+            .col("int", array::cycle::<Int32Type>(vec![1, 1, 3, 5, 5]))
             .col(
-                Some("int".to_string()),
-                array::cycle::<Int32Type>(vec![1, 1, 3, 5, 5]),
-            )
-            .col(
-                Some("float".to_string()),
+                "float",
                 // floats should be sorted using total order so -NAN is before all and NAN is after all
                 array::cycle::<Float32Type>(vec![4.3, f32::NAN, f32::INFINITY, -f32::NAN, 7.3]),
             )
@@ -2405,7 +2420,7 @@ mod test {
                 &["vector"],
                 IndexType::Vector,
                 None,
-                &VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2),
+                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
                 false,
             )
             .await
@@ -2631,7 +2646,7 @@ mod test {
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
-            VectorIndexParams::ivf_pq(4, 8, 2, false, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
         ];
         for params in vec_params {
             let test_dir = tempdir().unwrap();
@@ -2964,11 +2979,11 @@ mod test {
             // The first row where indexed == 75 is our deleted row (and delete query)
             let data = gen()
                 .col(
-                    Some("vector".to_string()),
+                    "vector",
                     array::rand_vec::<Float32Type>(Dimension::from(32)),
                 )
-                .col(Some("indexed".to_string()), array::step::<Int32Type>())
-                .col(Some("not_indexed".to_string()), array::step::<Int32Type>())
+                .col("indexed", array::step::<Int32Type>())
+                .col("not_indexed", array::step::<Int32Type>())
                 .into_batch_rows(RowCount::from(1000))
                 .unwrap();
 
@@ -2989,7 +3004,7 @@ mod test {
                     &["vector"],
                     IndexType::Vector,
                     None,
-                    &VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2),
+                    &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
                     false,
                 )
                 .await
@@ -3431,6 +3446,106 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_late_materialization() {
+        // Create a large dataset with a scalar indexed column and a sorted but not scalar
+        // indexed column
+        let data = gen()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(32)),
+            )
+            .col("indexed", array::step::<Int32Type>())
+            .col("not_indexed", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(20));
+
+        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let mut dataset = Dataset::write(
+            data,
+            "memory://test",
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_stats_wrapper),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["indexed"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let get_bytes = || io_stats.lock().unwrap().read_bytes;
+
+        // First run a full scan to get a baseline
+        let start_bytes = get_bytes();
+        dataset.scan().try_into_batch().await.unwrap();
+        let full_scan_bytes = get_bytes() - start_bytes;
+
+        // Next do a scan without pushdown, we should still see a benefit from late materialization
+        let start_bytes = get_bytes();
+        dataset
+            .scan()
+            .use_stats(false)
+            .filter("not_indexed = 50")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let filtered_scan_bytes = get_bytes() - start_bytes;
+
+        assert!(filtered_scan_bytes < full_scan_bytes);
+
+        // Now do a scan with pushdown, the benefit should be even greater
+        let start_bytes = get_bytes();
+        dataset
+            .scan()
+            .filter("not_indexed = 50")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let pushdown_scan_bytes = get_bytes() - start_bytes;
+
+        assert!(pushdown_scan_bytes < filtered_scan_bytes);
+
+        // Now do a scalar index scan, this should be better than a
+        // full scan but since we have to load the index might be more
+        // expensive than late / pushdown scan
+        let start_bytes = get_bytes();
+        dataset
+            .scan()
+            .filter("indexed = 50")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let index_scan_bytes = get_bytes() - start_bytes;
+        assert!(index_scan_bytes < full_scan_bytes);
+
+        // A second scalar index scan should be cheaper than the first
+        // since we should have the index in cache
+        let start_bytes = get_bytes();
+        dataset
+            .scan()
+            .filter("indexed = 50")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let second_index_scan_bytes = get_bytes() - start_bytes;
+        assert!(second_index_scan_bytes < filtered_scan_bytes);
+    }
+
+    #[tokio::test]
     async fn test_project_nested() -> Result<()> {
         let struct_i_field = ArrowField::new("i", DataType::Int32, true);
         let struct_o_field = ArrowField::new("o", DataType::Utf8, true);
@@ -3516,9 +3631,9 @@ mod test {
                     .filter("i > 10 and i < 20")
             },
             "Projection: fields=[s]
-  FilterExec: i@2 > 10 AND i@2 < 20
-    Take: columns=\"s, _rowid, i\"
-      LanceScan: uri..., projection=[s], row_id=true, ordered=true",
+  Take: columns=\"i, _rowid, s\"
+    FilterExec: i@0 > 10 AND i@0 < 20
+      LanceScan: uri..., projection=[i], row_id=true, ordered=true",
         )
         .await?;
 

@@ -16,14 +16,19 @@ package com.lancedb.lance;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import java.io.IOException;
-import java.net.URISyntaxException;
+import com.lancedb.lance.ipc.ScanOptions;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
-import org.apache.arrow.dataset.scanner.ScanOptions;
+import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -31,46 +36,21 @@ public class FragmentTest {
   @TempDir private static Path tempDir; // Temporary directory for the tests
 
   @Test
-  void testFragmentScannerSchema() throws IOException, URISyntaxException {
-    String datasetPath = tempDir.resolve("fragment_scheme").toString();
-    try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.RandomAccessDataset testDataset = new TestUtils.RandomAccessDataset(allocator, datasetPath);
-      testDataset.createDatasetAndValidate();
-
-      try (var dataset = Dataset.open(datasetPath, allocator)) {
-        var fragment = dataset.getFragments().get(0);
-        var scanner = fragment.newScan(new ScanOptions(1024));
-        var schema = scanner.schema();
-        assertEquals(testDataset.getSchema(), schema);
-
-        try (var fragmentReader = scanner.scanBatches()) {
-          var batchCount = 0;
-          while (fragmentReader.loadNextBatch()) {
-            fragmentReader.getVectorSchemaRoot();
-            batchCount++;
-          }
-          assert (batchCount > 0);
-        }
-      }
-    }
-  }
-
-  @Test
   void testFragmentCreateFfiArray() {
     String datasetPath = tempDir.resolve("new_fragment_array").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset();
+      testDataset.createEmptyDataset().close();
       testDataset.createNewFragment(123, 20);
     }
   }
 
   @Test
-  void testFragmentCreate() {
+  void testFragmentCreate() throws Exception {
     String datasetPath = tempDir.resolve("new_fragment").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset();
+      testDataset.createEmptyDataset().close();
       int fragmentId = 312;
       int rowCount = 21;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(fragmentId, rowCount);
@@ -84,9 +64,10 @@ public class FragmentTest {
         var fragment = dataset.getFragments().get(0);
         assertEquals(fragmentId, fragment.getId());
   
-        var scanner = fragment.newScan(new ScanOptions(1024));
-        var schemaRes = scanner.schema();
-        assertEquals(testDataset.getSchema(), schemaRes);
+        try (var scanner = fragment.newScan()) {
+          var schemaRes = scanner.schema();
+          assertEquals(testDataset.getSchema(), schemaRes);
+        }
       }
     }
   }

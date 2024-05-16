@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::utils::import_ffi_schema;
 use crate::{traits::IntoJava, Error, Result, RT};
 use arrow::array::RecordBatchReader;
-use arrow::ffi::FFI_ArrowSchema;
-use arrow_schema::Schema;
 use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::fragment::FileFragment;
@@ -127,23 +126,11 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_getJsonFragments<'a>(
 
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
-    mut env: JNIEnv,
+    env: JNIEnv,
     jdataset: JObject,
     arrow_schema_addr: jlong,
 ) {
-    let schema = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-                .expect("Failed to get native dataset handle");
-        Schema::from(dataset.inner.schema())
-    };
-    let out_c_schema = arrow_schema_addr as *mut FFI_ArrowSchema;
-    let c_schema = ok_or_throw_without_return!(env, FFI_ArrowSchema::try_from(&schema));
-
-    unsafe {
-        std::ptr::copy(std::ptr::addr_of!(c_schema), out_c_schema, 1);
-        std::mem::forget(c_schema);
-    };
+    import_ffi_schema(env, jdataset, arrow_schema_addr, None)
 }
 
 fn create_json_fragment_list<'a>(

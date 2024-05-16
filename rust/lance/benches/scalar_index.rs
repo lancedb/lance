@@ -36,8 +36,8 @@ struct BenchmarkDataSource {}
 impl BenchmarkDataSource {
     fn test_data() -> impl RecordBatchReader {
         gen()
-            .col(Some("values".to_string()), array::step::<UInt32Type>())
-            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+            .col("values", array::step::<UInt32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(100 * 1024))
     }
 }
@@ -57,7 +57,7 @@ impl BenchmarkFixture {
         let test_path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path))
+        Arc::new(LanceIndexStore::new(object_store, test_path, None))
     }
 
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {

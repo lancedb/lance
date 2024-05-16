@@ -114,7 +114,7 @@ jobs:
     strategy:
       matrix:
         python-minor-version: [ "12" ]
-    runs-on: buildjet-4vcpu-ubuntu-2204-arm
+    runs-on: warp-ubuntu-latest-arm64-4x
     defaults:
       run:
         shell: bash
@@ -127,12 +127,11 @@ jobs:
     - name: Set up Python
       run: |
         sudo apt update
-        sudo apt install wget software-properties-common
+        sudo apt install -y -qq wget software-properties-common
         sudo add-apt-repository ppa:deadsnakes/ppa
-        sudo apt install python3.${{ matrix.python-minor-version }}
+        sudo apt install -y python3.${{ matrix.python-minor-version }}
         sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.${{ matrix.python-minor-version }} 1
-        sudo apt install python3-pip
-        sudo apt install python3.${{ matrix.python-minor-version }}-distutils
+        sudo apt install -y python3-pip python3.${{ matrix.python-minor-version }}-distutils
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: python

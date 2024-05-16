@@ -73,21 +73,20 @@ pub async fn shuffle_dataset(
     ivf: Arc<dyn crate::vector::ivf::Ivf>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
-    num_sub_vectors: usize,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
     // step 1: either use precomputed shuffle files or write shuffle data to a file
     let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
-        let mut shuffler = IvfShuffler::try_new(num_partitions, num_sub_vectors, Some(path))?;
+        let mut shuffler = IvfShuffler::try_new(num_partitions, Some(path))?;
         unsafe {
             shuffler.set_unsorted_buffers(&buffers);
         }
 
         shuffler
     } else {
-        let mut shuffler = IvfShuffler::try_new(num_partitions, num_sub_vectors, None)?;
+        let mut shuffler = IvfShuffler::try_new(num_partitions, None)?;
 
         let column = column.to_owned();
         let precomputed_partitions = precomputed_partitions.map(Arc::new);
@@ -188,9 +187,6 @@ pub struct IvfShuffler {
 
     num_partitions: u32,
 
-    #[allow(dead_code)]
-    pq_width: usize,
-
     output_dir: Path,
 }
 
@@ -205,7 +201,7 @@ struct ShuffleInput {
 }
 
 impl IvfShuffler {
-    pub fn try_new(num_partitions: u32, pq_width: usize, output_dir: Option<Path>) -> Result<Self> {
+    pub fn try_new(num_partitions: u32, output_dir: Option<Path>) -> Result<Self> {
         let output_dir = match output_dir {
             Some(output_dir) => output_dir,
             None => get_temp_dir()?,
@@ -213,7 +209,6 @@ impl IvfShuffler {
 
         Ok(Self {
             num_partitions,
-            pq_width,
             output_dir,
             unsorted_buffers: vec![],
         })
@@ -589,7 +584,7 @@ mod test {
 
         let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
 
-        let shuffler = IvfShuffler::try_new(100, 32, None).unwrap();
+        let shuffler = IvfShuffler::try_new(100, None).unwrap();
 
         (stream, shuffler)
     }

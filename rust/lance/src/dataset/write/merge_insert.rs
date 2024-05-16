@@ -1081,8 +1081,8 @@ mod tests {
 
         let data = lance_datagen::gen()
             .with_seed(Seed::from(1))
-            .col(Some("value".to_string()), array::step::<UInt32Type>())
-            .col(Some("key".to_string()), array::rand_pseduo_uuid_hex());
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseduo_uuid_hex());
         let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
         let schema = data.schema();
 
@@ -1096,8 +1096,8 @@ mod tests {
         // Create some new (unindexed) data
         let data = lance_datagen::gen()
             .with_seed(Seed::from(2))
-            .col(Some("value".to_string()), array::step::<UInt32Type>())
-            .col(Some("key".to_string()), array::rand_pseduo_uuid_hex());
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseduo_uuid_hex());
         let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(8));
         let ds = Dataset::write(
             data,
@@ -1121,7 +1121,7 @@ mod tests {
             .unwrap();
         let some_indices = some_indices.column(0).clone();
         let some_vals = lance_datagen::gen()
-            .col(None, array::fill::<UInt32Type>(9999999))
+            .anon_col(array::fill::<UInt32Type>(9999999))
             .into_batch_rows(RowCount::from(2048))
             .unwrap();
         let some_vals = some_vals.column(0).clone();

@@ -14,7 +14,7 @@ use lance_file::{
 };
 use snafu::{location, Location};
 
-use lance_core::{Error, Result};
+use lance_core::{cache::FileMetadataCache, Error, Result};
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
@@ -30,14 +30,20 @@ use super::{IndexReader, IndexStore, IndexWriter};
 pub struct LanceIndexStore {
     object_store: ObjectStore,
     index_dir: Path,
+    metadata_cache: Option<FileMetadataCache>,
 }
 
 impl LanceIndexStore {
     /// Create a new index store at the given directory
-    pub fn new(object_store: ObjectStore, index_dir: Path) -> Self {
+    pub fn new(
+        object_store: ObjectStore,
+        index_dir: Path,
+        metadata_cache: Option<FileMetadataCache>,
+    ) -> Self {
         Self {
             object_store,
             index_dir,
+            metadata_cache,
         }
     }
 }
@@ -97,9 +103,12 @@ impl IndexStore for LanceIndexStore {
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        // TODO: Should probably provide file metadata cache here
-        let file_reader =
-            FileReader::try_new_self_described(&self.object_store, &path, None).await?;
+        let file_reader = FileReader::try_new_self_described(
+            &self.object_store,
+            &path,
+            self.metadata_cache.as_ref(),
+        )
+        .await?;
         Ok(Arc::new(file_reader))
     }
 
@@ -167,7 +176,11 @@ mod tests {
         let test_path: &Path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path.to_owned()))
+        Arc::new(LanceIndexStore::new(
+            object_store,
+            test_path.to_owned(),
+            None,
+        ))
     }
 
     struct MockTrainingSource {
@@ -210,8 +223,8 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
         let data = gen()
-            .col(Some("values".to_string()), array::step::<Int32Type>())
-            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+            .col("values", array::step::<Int32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, DataType::Int32).await;
         let index = BTreeIndex::load(index_store).await.unwrap();
@@ -250,15 +263,15 @@ mod tests {
         let index_dir = tempdir().unwrap();
         let index_store = test_store(&index_dir);
         let data = gen()
-            .col(Some("values".to_string()), array::step::<Int32Type>())
-            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+            .col("values", array::step::<Int32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, DataType::Int32).await;
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         let data = gen()
-            .col(Some("values".to_string()), array::step::<Int32Type>())
-            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+            .col("values", array::step::<Int32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = tempdir().unwrap();
@@ -295,42 +308,24 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
         let batch_one = gen()
-            .col(
-                Some("values".to_string()),
-                array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
-            )
-            .col(
-                Some("row_ids".to_string()),
-                array::cycle::<UInt64Type>(vec![0, 1, 2, 3]),
-            )
+            .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
+            .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen()
-            .col(
-                Some("values".to_string()),
-                array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
-            )
-            .col(
-                Some("row_ids".to_string()),
-                array::cycle::<UInt64Type>(vec![40, 50, 60, 70]),
-            )
+            .col("values", array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
+            .col("row_ids", array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
         let batch_three = gen()
+            .col("values", array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
             .col(
-                Some("values".to_string()),
-                array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
-            )
-            .col(
-                Some("row_ids".to_string()),
+                "row_ids",
                 array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
             )
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen()
+            .col("values", array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
             .col(
-                Some("values".to_string()),
-                array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
-            )
-            .col(
-                Some("row_ids".to_string()),
+                "row_ids",
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
@@ -538,8 +533,8 @@ mod tests {
             let tempdir = tempdir().unwrap();
             let index_store = test_store(&tempdir);
             let data: RecordBatch = gen()
-                .col(Some("values".to_string()), array::rand_type(data_type))
-                .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+                .col("values", array::rand_type(data_type))
+                .col("row_ids", array::step::<UInt64Type>())
                 .into_batch_rows(RowCount::from(4096 * 3))
                 .unwrap();
 
@@ -596,14 +591,8 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
         let batch = gen()
-            .col(
-                Some("values".to_string()),
-                array::cycle::<Float32Type>(vec![0.0, f32::NAN]),
-            )
-            .col(
-                Some("row_ids".to_string()),
-                array::cycle::<UInt64Type>(vec![0, 1]),
-            )
+            .col("values", array::cycle::<Float32Type>(vec![0.0, f32::NAN]))
+            .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1]))
             .into_batch_rows(RowCount::from(2));
         let batches = vec![batch];
         let schema = Arc::new(Schema::new(vec![
@@ -629,13 +618,10 @@ mod tests {
         let index_store = test_store(&tempdir);
         let batch = gen()
             .col(
-                Some("values".to_string()),
-                array::rand_utf8(ByteCount::from(0)).with_nulls(&[true]),
+                "values",
+                array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
             )
-            .col(
-                Some("row_ids".to_string()),
-                array::cycle::<UInt64Type>(vec![0, 1]),
-            )
+            .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1]))
             .into_batch_rows(RowCount::from(4096));
         assert_eq!(batch.as_ref().unwrap()["values"].null_count(), 4096);
         let batches = vec![batch];

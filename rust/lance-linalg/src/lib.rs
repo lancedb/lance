@@ -3,8 +3,9 @@
 
 //! High-performance [Apache Arrow](https://docs.rs/arrow/latest/arrow/) native Linear Algebra algorithms.
 
-// #![cfg_attr(feature = "avx512", feature(stdsimd))]
+#![deny(clippy::unused_async)]
 
+mod clustering;
 pub mod distance;
 pub mod kernels;
 pub mod kmeans;
@@ -14,6 +15,7 @@ pub mod simd;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
+pub use clustering::Clustering;
 pub use matrix::MatrixView;
 
 use arrow_schema::ArrowError;

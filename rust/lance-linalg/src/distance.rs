@@ -22,7 +22,6 @@ pub mod norm_l2;
 pub use cosine::*;
 pub use dot::*;
 pub use l2::*;
-use lance_arrow::FloatToArrayType;
 pub use norm_l2::*;
 
 use crate::Result;
@@ -32,7 +31,10 @@ use crate::Result;
 pub enum DistanceType {
     L2,
     Cosine,
-    Dot, // Dot product
+    /// Dot Product
+    Dot,
+    /// Hamming Distance
+    Hamming,
 }
 
 /// For backwards compatibility.
@@ -51,18 +53,17 @@ impl DistanceType {
             Self::L2 => l2_distance_arrow_batch,
             Self::Cosine => cosine_distance_arrow_batch,
             Self::Dot => dot_distance_arrow_batch,
+            Self::Hamming => todo!(),
         }
     }
 
     /// Returns the distance function between two vectors.
-    pub fn func<T: FloatToArrayType>(&self) -> DistanceFunc<T>
-    where
-        T::ArrowType: L2 + Cosine + Dot,
-    {
+    pub fn func<T: L2 + Cosine + Dot>(&self) -> DistanceFunc<T> {
         match self {
             Self::L2 => l2,
             Self::Cosine => cosine_distance,
             Self::Dot => dot_distance,
+            Self::Hamming => todo!(),
         }
     }
 }
@@ -76,6 +77,7 @@ impl std::fmt::Display for DistanceType {
                 Self::L2 => "l2",
                 Self::Cosine => "cosine",
                 Self::Dot => "dot",
+                Self::Hamming => "hamming",
             }
         )
     }
@@ -89,6 +91,7 @@ impl TryFrom<&str> for DistanceType {
             "l2" | "euclidean" => Ok(Self::L2),
             "cosine" => Ok(Self::Cosine),
             "dot" => Ok(Self::Dot),
+            "hamming" => Ok(Self::Hamming),
             _ => Err(ArrowError::InvalidArgumentError(format!(
                 "Metric type '{s}' is not supported"
             ))),
