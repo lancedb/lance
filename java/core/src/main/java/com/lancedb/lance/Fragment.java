@@ -24,6 +24,10 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 
 /** Fragment operations. */
 public class Fragment {
+  static {
+    JniLoader.ensureLoaded();
+  }
+
   /** Create a fragment from the given data in vector schema root. */
   public static FragmentMetadata create(String datasetUri, BufferAllocator allocator,
       VectorSchemaRoot root, Optional<Integer> fragmentId, WriteParams params) {

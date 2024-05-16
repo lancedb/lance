@@ -38,7 +38,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
  */
 public class Dataset implements Closeable {
   static {
-    JarJniLoader.loadLib(Dataset.class, "/nativelib", "lance_jni");
+    JniLoader.ensureLoaded();
   }
 
   private long nativeDatasetHandle;
