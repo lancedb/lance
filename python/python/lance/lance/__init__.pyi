@@ -52,6 +52,9 @@ class LanceFileReader:
     def read_range(
         self, start: int, num_rows: int, batch_size: int, batch_readahead: int
     ) -> pa.RecordBatchReader: ...
+    def take_rows(
+        self, indices: List[int], batch_size: int, batch_readahead: int
+    ) -> pa.RecordBatchReader: ...
 
 class LanceBufferDescriptor:
     position: int

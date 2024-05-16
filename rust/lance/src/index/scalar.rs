@@ -23,7 +23,10 @@ use tracing::instrument;
 
 use lance_core::{Error, Result};
 
-use crate::{dataset::scanner::ColumnOrdering, Dataset};
+use crate::{
+    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
+    Dataset,
+};
 
 use super::IndexParams;
 
@@ -95,17 +98,12 @@ pub async fn build_scalar_index(dataset: &Dataset, column: &str, uuid: &str) -> 
         });
     }
     let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
-    let index_dir = dataset.indices_dir().child(uuid);
-    let index_store = LanceIndexStore::new((*dataset.object_store).clone(), index_dir);
+    let index_store = LanceIndexStore::from_dataset(dataset, uuid);
     train_btree_index(training_request, &flat_index_trainer, &index_store).await
 }
 
 pub async fn open_scalar_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn ScalarIndex>> {
-    let index_dir = dataset.indices_dir().child(uuid);
-    let index_store = Arc::new(LanceIndexStore::new(
-        (*dataset.object_store).clone(),
-        index_dir,
-    ));
+    let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, uuid));
     // Currently we assume all scalar indices are btree indices.  In the future, if this is not the
     // case, we may need to store a metadata file in the index directory with scalar index metadata
     let btree_index = BTreeIndex::load(index_store).await?;

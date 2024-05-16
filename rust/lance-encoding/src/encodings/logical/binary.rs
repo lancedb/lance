@@ -47,11 +47,12 @@ impl LogicalPageScheduler for BinaryPageScheduler {
         ranges: &[std::ops::Range<u32>],
         scheduler: &Arc<dyn crate::EncodingsIo>,
         sink: &tokio::sync::mpsc::UnboundedSender<Box<dyn crate::decoder::LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling binary for {} ranges", ranges.len());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         self.varbin_scheduler
-            .schedule_ranges(ranges, scheduler, &tx)?;
+            .schedule_ranges(ranges, scheduler, &tx, top_level_row)?;
 
         while let Some(decoder) = rx.recv().now_or_never() {
             let wrapped = BinaryPageDecoder {
@@ -69,6 +70,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
         indices: &[u32],
         scheduler: &Arc<dyn crate::EncodingsIo>,
         sink: &tokio::sync::mpsc::UnboundedSender<Box<dyn crate::decoder::LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling binary for {} indices", indices.len());
         self.schedule_ranges(
@@ -78,6 +80,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
                 .collect::<Vec<_>>(),
             scheduler,
             sink,
+            top_level_row,
         )
     }
 

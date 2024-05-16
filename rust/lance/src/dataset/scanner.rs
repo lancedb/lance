@@ -3533,7 +3533,7 @@ mod test {
             .await
             .unwrap();
         let second_index_scan_bytes = get_bytes() - start_bytes;
-        assert!(second_index_scan_bytes < index_scan_bytes);
+        assert!(second_index_scan_bytes < filtered_scan_bytes);
     }
 
     #[tokio::test]

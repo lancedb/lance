@@ -43,6 +43,7 @@ impl PhysicalPageScheduler for ValuePageScheduler {
         &self,
         ranges: &[std::ops::Range<u32>],
         scheduler: &dyn EncodingsIo,
+        top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let mut min = u64::MAX;
         let mut max = 0;
@@ -63,7 +64,7 @@ impl PhysicalPageScheduler for ValuePageScheduler {
             min,
             max
         );
-        let bytes = scheduler.submit_request(byte_ranges);
+        let bytes = scheduler.submit_request(byte_ranges, top_level_row);
         let bytes_per_value = self.bytes_per_value;
 
         async move {

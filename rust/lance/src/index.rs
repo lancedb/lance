@@ -38,6 +38,7 @@ pub(crate) mod prefilter;
 pub mod scalar;
 pub mod vector;
 
+use crate::dataset::index::LanceIndexStoreExt;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 
 use crate::dataset::transaction::{Operation, Transaction};
@@ -93,8 +94,7 @@ pub(crate) async fn remap_index(
 
     match generic.index_type() {
         IndexType::Scalar => {
-            let index_dir = dataset.indices_dir().child(new_id.to_string());
-            let new_store = LanceIndexStore::new((*dataset.object_store).clone(), index_dir);
+            let new_store = LanceIndexStore::from_dataset(dataset, &new_id.to_string());
 
             let scalar_index = dataset
                 .open_scalar_index(&field.name, &index_id.to_string())

@@ -3,11 +3,10 @@
 
 use std::{collections::BTreeSet, io::Cursor, ops::Range, pin::Pin, sync::Arc};
 
-use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
-use futures::{stream::BoxStream, Future, Stream, StreamExt};
+use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_encoding::{
     decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, PageInfo, ReadBatchTask},
@@ -128,7 +127,7 @@ impl FileReader {
         } else {
             file_size - scheduler.reader().block_size() as u64
         };
-        let tail_bytes = scheduler.submit_single(begin..file_size).await?;
+        let tail_bytes = scheduler.submit_single(begin..file_size, 0).await?;
         Ok((tail_bytes, file_size))
     }
 
@@ -198,7 +197,7 @@ impl FileReader {
         // We can't just grab col_meta_start..cmo_table_start because there may be padding
         // between the last column and the start of the cmo table.
         let column_metadata_range = column_metadata_start..footer.global_buff_start;
-        let column_metadata_bytes = scheduler.submit_single(column_metadata_range).await?;
+        let column_metadata_bytes = scheduler.submit_single(column_metadata_range, 0).await?;
 
         // cmo == column_metadata_offsets
         let cmo_table_size = 16 * footer.num_columns as usize;
@@ -232,6 +231,7 @@ impl FileReader {
             let missing_bytes = scheduler
                 .submit_single(
                     footer.column_meta_start..footer.column_meta_start + num_bytes_missing,
+                    0,
                 )
                 .await;
             let mut combined =
@@ -582,7 +582,7 @@ impl FileReader {
         range: Range<u64>,
         batch_size: u32,
         projection: &ReaderProjection,
-    ) -> Result<BoxStream<'static, ReadBatchTask<impl Future<Output = Result<RecordBatch>>>>> {
+    ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let column_infos = self.collect_columns_from_projection(projection)?;
         debug!(
             "Reading range {:?} with batch_size {} from columns {:?}",
@@ -598,12 +598,49 @@ impl FileReader {
 
         let (tx, rx) = mpsc::unbounded_channel();
 
+        let num_rows_to_read = range.end - range.start;
+
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
         tokio::task::spawn(
             async move { decode_scheduler.schedule_range(range, tx, &scheduler).await },
         );
 
-        Ok(BatchDecodeStream::new(rx, batch_size, self.num_rows).into_stream())
+        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read).into_stream())
+    }
+
+    fn take_rows(
+        &self,
+        indices: Vec<u64>,
+        batch_size: u32,
+        projection: &ReaderProjection,
+    ) -> Result<BoxStream<'static, ReadBatchTask>> {
+        let column_infos = self.collect_columns_from_projection(projection)?;
+        debug!(
+            "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
+            indices.len(),
+            indices[0],
+            indices[indices.len() - 1],
+            batch_size,
+            column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
+        );
+        let mut decode_scheduler = DecodeBatchScheduler::new(
+            &projection.schema,
+            column_infos.iter().map(|ci| ci.as_ref()),
+            &vec![],
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let num_rows_to_read = indices.len() as u64;
+
+        let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
+        tokio::task::spawn(async move {
+            decode_scheduler
+                .schedule_take(&indices, tx, &scheduler)
+                .await
+        });
+
+        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read).into_stream())
     }
 
     /// Creates a stream of "read tasks" to read the data from the file
@@ -621,14 +658,10 @@ impl FileReader {
         params: ReadBatchParams,
         batch_size: u32,
         projection: &ReaderProjection,
-    ) -> Result<
-        Pin<
-            Box<dyn Stream<Item = ReadBatchTask<impl Future<Output = Result<RecordBatch>>>> + Send>,
-        >,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         Self::validate_projection(projection, &self.metadata)?;
-        let verify_bound = |params: &ReadBatchParams, bound: usize| {
-            if bound > u32::MAX as usize {
+        let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
+            if bound > self.num_rows || bound == self.num_rows && inclusive {
                 Err(Error::invalid_input(
                     format!(
                         "cannot read {:?} from file with {} rows",
@@ -641,17 +674,33 @@ impl FileReader {
             }
         };
         match &params {
-            ReadBatchParams::Indices(_) => todo!(),
+            ReadBatchParams::Indices(indices) => {
+                for idx in indices {
+                    match idx {
+                        None => {
+                            return Err(Error::invalid_input(
+                                "Null value in indices array",
+                                location!(),
+                            ))
+                        }
+                        Some(idx) => {
+                            verify_bound(&params, idx as u64, true)?;
+                        }
+                    }
+                }
+                let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
+                self.take_rows(indices, batch_size, projection)
+            }
             ReadBatchParams::Range(range) => {
-                verify_bound(&params, range.end)?;
+                verify_bound(&params, range.end as u64, false)?;
                 self.read_range(range.start as u64..range.end as u64, batch_size, projection)
             }
             ReadBatchParams::RangeFrom(range) => {
-                verify_bound(&params, range.start)?;
+                verify_bound(&params, range.start as u64, true)?;
                 self.read_range(range.start as u64..self.num_rows, batch_size, projection)
             }
             ReadBatchParams::RangeTo(range) => {
-                verify_bound(&params, range.end)?;
+                verify_bound(&params, range.end as u64, false)?;
                 self.read_range(0..range.end as u64, batch_size, projection)
             }
             ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size, projection),
@@ -762,7 +811,7 @@ mod tests {
     use lance_core::datatypes::Schema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_io::{
-        object_store::ObjectStore, scheduler::StoreScheduler, stream::RecordBatchStream,
+        object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStream,
     };
     use log::debug;
     use object_store::path::Path;
@@ -777,7 +826,7 @@ mod tests {
         _tmp_dir: TempDir,
         tmp_path: Path,
         object_store: Arc<ObjectStore>,
-        scheduler: Arc<StoreScheduler>,
+        scheduler: Arc<ScanScheduler>,
     }
 
     impl Default for FsFixture {
@@ -787,7 +836,7 @@ mod tests {
             let tmp_path = Path::parse(tmp_path).unwrap();
             let tmp_path = tmp_path.child("some_file.lance");
             let object_store = Arc::new(ObjectStore::local());
-            let scheduler = StoreScheduler::new(object_store.clone(), 8);
+            let scheduler = ScanScheduler::new(object_store.clone(), 8);
             Self {
                 _tmp_dir: tmp_dir,
                 object_store,

@@ -227,6 +227,7 @@ impl LogicalPageScheduler for ListPageScheduler {
         ranges: &[std::ops::Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         // TODO: Shortcut here if the request covers the entire range (can be determined by
         // the first_invalid_offset).  If this is the case we don't need any indirect I/O.  We
@@ -258,7 +259,7 @@ impl LogicalPageScheduler for ListPageScheduler {
         // to this page.
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.offsets_scheduler
-            .schedule_ranges(&offsets_ranges, scheduler, &tx)?;
+            .schedule_ranges(&offsets_ranges, scheduler, &tx, top_level_row)?;
         let mut scheduled_offsets = rx.try_recv().unwrap();
         let items_schedulers = self.items_schedulers.clone();
         let ranges = ranges.to_vec();
@@ -319,7 +320,17 @@ impl LogicalPageScheduler for ListPageScheduler {
                     // All requested items are past this page, continue
                     row_offset += next_scheduler.num_rows() as u64;
                     if !next_item_ranges.is_empty() {
-                        next_scheduler.schedule_ranges(&next_item_ranges, &scheduler, &tx)?;
+                        // Note: we are providing the same top_level_row to ALL items pages referenced by
+                        // this offsets page.  This gives them higher priority.
+                        // TODO: Ideally we would ALSO have a guarantee from the scheduler that items with
+                        // the same top_level_row are scheduled in FCFS order but I don't think it works
+                        // that way.  Still, this is probably good enough for a while
+                        next_scheduler.schedule_ranges(
+                            &next_item_ranges,
+                            &scheduler,
+                            &tx,
+                            top_level_row,
+                        )?;
                         next_item_ranges.clear();
                     }
                     next_scheduler = item_schedulers.pop_front().unwrap();
@@ -342,14 +353,24 @@ impl LogicalPageScheduler for ListPageScheduler {
                     next_item_ranges.push(page_range);
                     row_offset += next_scheduler.num_rows() as u64;
                     if !next_item_ranges.is_empty() {
-                        next_scheduler.schedule_ranges(&next_item_ranges, &scheduler, &tx)?;
+                        next_scheduler.schedule_ranges(
+                            &next_item_ranges,
+                            &scheduler,
+                            &tx,
+                            top_level_row,
+                        )?;
                         next_item_ranges.clear();
                     }
                     next_scheduler = item_schedulers.pop_front().unwrap();
                 }
             }
             if !next_item_ranges.is_empty() {
-                next_scheduler.schedule_ranges(&next_item_ranges, &scheduler, &tx)?;
+                next_scheduler.schedule_ranges(
+                    &next_item_ranges,
+                    &scheduler,
+                    &tx,
+                    top_level_row,
+                )?;
             }
             let mut item_decoders = Vec::new();
             drop(tx);
@@ -388,6 +409,7 @@ impl LogicalPageScheduler for ListPageScheduler {
         indices: &[u32],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling list offsets for {} indices", indices.len());
         self.schedule_ranges(
@@ -397,6 +419,7 @@ impl LogicalPageScheduler for ListPageScheduler {
                 .collect::<Vec<_>>(),
             scheduler,
             sink,
+            top_level_row,
         )
     }
 }

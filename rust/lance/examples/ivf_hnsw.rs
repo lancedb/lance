@@ -79,8 +79,7 @@ async fn main() {
     ivf_params.sample_rate = 20480;
     let hnsw_params = HnswBuildParams::default()
         .ef_construction(100)
-        .num_edges(15)
-        .max_num_edges(30);
+        .num_edges(15);
     let pq_params = SQBuildParams::default();
     let params =
         VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf_params, hnsw_params, pq_params);

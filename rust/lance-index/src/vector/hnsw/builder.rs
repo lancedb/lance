@@ -14,7 +14,7 @@ use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
-use super::{select_neighbors, select_neighbors_heuristic, HNSW};
+use super::{select_neighbors_heuristic, HNSW};
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::storage::DistCalculator;
 use crate::vector::graph::{greedy_search, storage::VectorStorage};
@@ -25,20 +25,14 @@ pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswBuildParams {
-    /// max level ofm
+    /// max level of the graph
     pub max_level: u16,
 
     /// number of connections to establish while inserting new element
     pub m: usize,
 
-    /// max number of connections for each element per layers.
-    pub m_max: usize,
-
     /// size of the dynamic list for the candidates
     pub ef_construction: usize,
-
-    /// whether select neighbors heuristic
-    pub use_select_heuristic: bool,
 
     /// the max number of threads to use for building the graph
     pub parallel_limit: Option<usize>,
@@ -49,9 +43,7 @@ impl Default for HnswBuildParams {
         Self {
             max_level: 7,
             m: 20,
-            m_max: 40,
             ef_construction: 150,
-            use_select_heuristic: true,
             parallel_limit: None,
         }
     }
@@ -72,27 +64,12 @@ impl HnswBuildParams {
         self
     }
 
-    /// The maximum number of connections for each node per layer.
-    /// The default value is `64`.
-    pub fn max_num_edges(mut self, m_max: usize) -> Self {
-        self.m_max = m_max;
-        self
-    }
-
     /// Number of candidates to be considered when searching for the nearest neighbors
     /// during the construction of the graph.
     ///
     /// The default value is `100`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
-        self
-    }
-
-    /// Use select heuristic when searching for the nearest neighbors.
-    ///
-    /// See algorithm 4 in HNSW paper.
-    pub fn use_select_heuristic(mut self, flag: bool) -> Self {
-        self.use_select_heuristic = flag;
         self
     }
 
@@ -145,11 +122,11 @@ impl HNSWBuilder {
     /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
     pub async fn build(&mut self) -> Result<HNSW> {
         log::info!(
-            "Building HNSW graph: num={}, metric_type={}, max_levels={}, m_max={}, ef_construction={}",
+            "Building HNSW graph: num={}, metric_type={}, max_levels={}, m={}, ef_construction={}",
             self.inner.vectors.len(),
             self.inner.vectors.metric_type(),
             self.inner.params.max_level,
-            self.inner.params.m_max,
+            self.inner.params.m,
             self.inner.params.ef_construction
         );
 
@@ -313,14 +290,8 @@ impl HNSWBuilderInner {
         let cur_level = HnswLevelView::new(level, self);
         let candidates = beam_search(&cur_level, ep, self.params.ef_construction, dist_calc, None)?;
 
-        let neighbors = if self.params.use_select_heuristic {
-            select_neighbors_heuristic(&cur_level, &candidates, self.params.m).collect()
-        } else {
-            select_neighbors(&candidates, self.params.m)
-                .cloned()
-                .collect()
-        };
-
+        let neighbors =
+            select_neighbors_heuristic(&cur_level, &candidates, self.params.m).collect();
         Ok((candidates, neighbors))
     }
 
@@ -332,7 +303,7 @@ impl HNSWBuilderInner {
 
     fn prune(&self, id: u32, level: u16) {
         let m_max = match level {
-            0 => self.params.m_max,
+            0 => self.params.m * 2,
             _ => self.params.m,
         };
 

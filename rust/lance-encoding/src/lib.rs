@@ -31,7 +31,17 @@ pub trait EncodingsIo: Send + Sync {
     /// # Arguments
     ///
     /// * `ranges` - the byte ranges to request
-    fn submit_request(&self, range: Vec<Range<u64>>) -> BoxFuture<'static, Result<Vec<Bytes>>>;
+    /// * `priority` - the priority of the request
+    ///
+    /// Priority should be set to the lowest row number that this request is delivering data for.
+    /// This is important in cases where indirect I/O causes high priority requests to be submitted
+    /// after low priority requests.  We want to fulfill the indirect I/O more quickly so that we
+    /// can decode as quickly as possible.
+    fn submit_request(
+        &self,
+        range: Vec<Range<u64>>,
+        priority: u64,
+    ) -> BoxFuture<'static, Result<Vec<Bytes>>>;
 }
 
 /// An implementation of EncodingsIo that serves data from an in-memory buffer
@@ -50,7 +60,11 @@ impl BufferScheduler {
 }
 
 impl EncodingsIo for BufferScheduler {
-    fn submit_request(&self, ranges: Vec<Range<u64>>) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+    fn submit_request(
+        &self,
+        ranges: Vec<Range<u64>>,
+        _priority: u64,
+    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
         std::future::ready(Ok(ranges
             .into_iter()
             .map(|range| self.satisfy_request(range))
