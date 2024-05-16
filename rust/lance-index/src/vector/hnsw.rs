@@ -26,6 +26,7 @@ use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_table::io::manifest::ManifestDescribing;
+use log::log_enabled;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,7 @@ use snafu::{location, Location};
 
 use self::builder::{HnswBuildParams, HNSW_METADATA_KEY};
 
+use super::graph::builder::GraphBuilderStats;
 use super::graph::memory::InMemoryVectorStorage;
 use super::graph::OrderedNode;
 use super::graph::{
@@ -291,21 +293,38 @@ impl HNSW {
         let mut levels = Vec::with_capacity(builder.num_levels());
         for level in 0..builder.num_levels() {
             let vector_id_builder = UInt32Builder::with_capacity(builder.num_nodes(level));
-            let neighbours_builder =
+            let neighbors_builder =
                 ListBuilder::with_capacity(UInt32Builder::new(), builder.num_nodes(level));
-            levels.push((vector_id_builder, neighbours_builder));
+            levels.push((vector_id_builder, neighbors_builder));
         }
 
+        let mut level_stats = vec![GraphBuilderStats::default(); builder.num_levels()];
         for node in builder.nodes().read().unwrap().iter() {
             for (level, neighbors) in node.level_neighbors.iter().enumerate() {
-                let (vector_id_builder, neighbours_builder) = &mut levels[level];
+                let (vector_id_builder, neighbors_builder) = &mut levels[level];
+                let stats = &mut level_stats[level];
+
+                let neighbors = neighbors.read().unwrap();
+                stats.num_nodes += 1;
+                stats.num_edges += neighbors.len();
+                stats.mean_distance += neighbors.iter().map(|n| n.dist.0).sum::<f32>();
                 vector_id_builder.append_value(node.id);
-                neighbours_builder.append_value(
-                    neighbors
-                        .read()
-                        .unwrap()
-                        .iter()
-                        .map(|neighbors| Some(neighbors.id)),
+                neighbors_builder
+                    .append_value(neighbors.iter().map(|neighbors| Some(neighbors.id)));
+            }
+        }
+
+        if log_enabled!(log::Level::Debug) {
+            for (level, stats) in level_stats.iter_mut().enumerate() {
+                stats.mean_edges = stats.num_edges as f32 / stats.num_nodes as f32;
+                stats.mean_distance /= stats.num_edges as f32;
+                log::debug!(
+                    "Level {}: num_nodes={}, num_edges={}, mean_edges={}, mean_distance={}",
+                    level,
+                    stats.num_nodes,
+                    stats.num_edges,
+                    stats.mean_edges,
+                    stats.mean_distance,
                 );
             }
         }
