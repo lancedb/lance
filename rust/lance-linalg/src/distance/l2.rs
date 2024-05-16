@@ -49,11 +49,12 @@ pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
 
 /// Calculate L2 distance between two uint8 slices.
 #[inline]
-pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
+pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8], bounds_scale: &[f32]) -> f32 {
     key.iter()
         .zip(target.iter())
-        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
-        .sum::<u32>() as f32
+        .zip(bounds_scale)
+        .map(|((&x, &y), &len)| (x.abs_diff(y) as f32).powi(2) * len)
+        .sum()
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
@@ -446,17 +447,14 @@ mod tests {
     fn test_uint8_l2_edge_cases() {
         let q = vec![0_u8; 2048];
         let v = vec![0_u8; 2048];
-        assert_eq!(l2_distance_uint_scalar(&q, &v), 0.0);
+        let bounds = vec![1.0; 2048];
+        assert_eq!(l2_distance_uint_scalar(&q, &v, &bounds), 0.0);
 
         let q = vec![0_u8; 2048];
         let v = vec![255_u8; 2048];
-        assert_eq!(
-            l2_distance_uint_scalar(&q, &v),
-            (255_u32.pow(2) * 2048) as f32
-        );
-        assert_eq!(
-            l2_distance_uint_scalar(&v, &q),
-            (255_u32.pow(2) * 2048) as f32
-        );
+        let bounds = vec![1.0; 2048];
+        let dist = (0..2048).map(|_| 255_f32.powi(2)).sum::<f32>();
+        assert_eq!(l2_distance_uint_scalar(&q, &v, &bounds), dist);
+        assert_eq!(l2_distance_uint_scalar(&v, &q, &bounds), dist);
     }
 }

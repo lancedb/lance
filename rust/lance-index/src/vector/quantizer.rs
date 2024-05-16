@@ -162,7 +162,7 @@ impl Quantization for ScalarQuantizer {
         Ok(serde_json::to_value(ScalarQuantizationMetadata {
             dim: self.dim,
             num_bits: self.num_bits(),
-            bounds: self.bounds(),
+            bounds: self.bounds().to_vec(),
         })?)
     }
 

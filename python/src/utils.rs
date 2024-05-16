@@ -37,10 +37,11 @@ use lance_linalg::{
 };
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
+use pyo3::types::PyList;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::{PyIterator, PyTuple},
+    types::PyIterator,
 };
 
 use crate::RT;
@@ -209,7 +210,7 @@ pub fn build_sq_storage(
     row_ids_array: &PyIterator,
     vectors: &PyAny,
     dim: usize,
-    bounds: &PyTuple,
+    bounds: &PyList,
 ) -> PyResult<PyObject> {
     let mut row_ids_arr: Vec<Arc<dyn Array>> = Vec::new();
     for row_ids in row_ids_array {
@@ -225,10 +226,13 @@ pub fn build_sq_storage(
 
     let vectors = Arc::new(FixedSizeListArray::from(ArrayData::from_pyarrow(vectors)?));
 
-    let lower_bound = bounds.get_item(0)?.extract::<f64>()?;
-    let upper_bound = bounds.get_item(1)?.extract::<f64>()?;
-    let quantizer =
-        lance_index::vector::sq::ScalarQuantizer::with_bounds(8, dim, lower_bound..upper_bound);
+    let mut sq_bounds = Vec::with_capacity(bounds.len());
+    for bound in bounds.iter() {
+        let lower_bound = bound.get_item(0)?.extract::<f64>()?;
+        let upper_bound = bound.get_item(1)?.extract::<f64>()?;
+        sq_bounds.push(lower_bound..upper_bound);
+    }
+    let quantizer = lance_index::vector::sq::ScalarQuantizer::with_bounds(8, dim, sq_bounds);
     let storage = sq::build_sq_storage(DistanceType::L2, row_ids, vectors, quantizer)
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
     storage.batch().clone().to_pyarrow(py)
