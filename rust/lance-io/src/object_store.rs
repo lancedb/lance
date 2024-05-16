@@ -756,8 +756,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             block_size: 64 * 1024,
         }),
         unknow_scheme => {
-            let err = lance_core::Error::from(object_store::Error::Generic {
-                store: "",
+            let err = lance_core::Error::from(object_store::Error::NotSupported {
                 source: format!("Unsupported URI scheme: {}", unknow_scheme).into(),
             });
             Err(err)

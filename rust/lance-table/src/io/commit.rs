@@ -384,8 +384,7 @@ pub async fn commit_handler_from_url(
         "gs" | "az" | "file" | "memory" => Ok(Arc::new(RenameCommitHandler)),
 
         unknow_scheme => {
-            let err = lance_core::Error::from(object_store::Error::Generic {
-                store: "",
+            let err = lance_core::Error::from(object_store::Error::NotSupported {
                 source: format!("Unsupported URI scheme: {}", unknow_scheme).into(),
             });
             Err(err)
