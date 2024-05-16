@@ -110,10 +110,7 @@ jobs:
       run: sudo rm -rf target/wheels
   linux-arm:
     timeout-minutes: 45
-    name: Python Linux 3.${{ matrix.python-minor-version }} ARM
-    strategy:
-      matrix:
-        python-minor-version: [ "12" ]
+    name: Python Linux 3.12 ARM
     runs-on: warp-ubuntu-latest-arm64-4x
     defaults:
       run:
@@ -127,7 +124,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: 3.${{ matrix.python-minor-version }}
+        python-version: 3.12.3
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: python
@@ -213,7 +210,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.12.3"
+        python-version: "3.12"
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: python
