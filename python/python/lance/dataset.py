@@ -1311,8 +1311,6 @@ class LanceDataset(pa.dataset.Dataset):
                 the maximum number of levels in the graph.
             m : int
                 the number of edges per node in the graph.
-            m_max : int
-                the maximum number of edges per node in the graph.
             ef_construction : int
                 the number of nodes to examine during the construction.
 

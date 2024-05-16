@@ -1284,10 +1284,6 @@ fn prepare_vector_index_params(
             hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
         }
 
-        if let Some(m_max) = kwargs.get_item("m_max")? {
-            hnsw_params.m_max = PyAny::downcast::<PyInt>(m_max)?.extract()?;
-        }
-
         if let Some(ef_c) = kwargs.get_item("ef_construction")? {
             hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
         }
