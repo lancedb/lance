@@ -436,23 +436,12 @@ where
     fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
         assert_eq!(query.len(), self.dimension);
 
-        let dists: Vec<f32> = match self.distance_type {
-            DistanceType::L2 => {
-                l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
-            }
-            DistanceType::Dot => {
-                dot_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
-            }
-            _ => {
-                panic!(
-                    "KMeans::find_partitions: {} is not supported",
-                    self.distance_type
-                );
-            }
-        };
-
-        let dists_arr = Float32Array::from(dists);
-        sort_to_indices(&dists_arr, None, Some(nprobes))
+        kmeans_find_partitions(
+            self.centroids.as_slice(),
+            query,
+            nprobes,
+            self.distance_type,
+        )
     }
 
     fn compute_membership(&self, data: &[T::Native], _nprobes: Option<usize>) -> Vec<Option<u32>> {
@@ -475,6 +464,39 @@ where
             })
             .collect::<Vec<_>>()
     }
+}
+
+/// KMeans finds N nearest partitions.
+///
+/// Parameters:
+/// - *centroids*: a `k * dimension` floating array.
+/// - *query*: a `dimension` floating array.
+/// - *nprobes*: the number of partitions to find.
+/// - *distance_type*: the distance type to calculate distance.
+///
+/// This function allows to conduct kmeans search without constructing
+/// `Arrow Array` or `Vec<Float>` types.
+///
+pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
+    centroids: &[T],
+    query: &[T],
+    nprobes: usize,
+    distance_type: DistanceType,
+) -> Result<UInt32Array> {
+    let dists: Vec<f32> = match distance_type {
+        DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
+        DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
+        _ => {
+            panic!(
+                "KMeans::find_partitions: {} is not supported",
+                distance_type
+            );
+        }
+    };
+
+    // TODO: use heap to just keep nprobes smallest values.
+    let dists_arr = Float32Array::from(dists);
+    sort_to_indices(&dists_arr, None, Some(nprobes))
 }
 
 /// Compute partition ID of each vector in the KMeans.

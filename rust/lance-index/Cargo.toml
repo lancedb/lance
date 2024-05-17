@@ -42,6 +42,7 @@ object_store.workspace = true
 prost.workspace = true
 rand.workspace = true
 roaring.workspace = true
+rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
