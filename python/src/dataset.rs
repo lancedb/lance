@@ -1050,7 +1050,7 @@ impl Dataset {
                         })?;
                     let result_batch: PyArrowType<RecordBatch> = result
                         .extract(py)
-                        .map_err(|err| lance::Error::io(err.to_string(), location!()))?,
+                        .map_err(|err| lance::Error::io(err.to_string(), location!()))?;
                     Ok(result_batch.0)
                 })
             };
