@@ -534,7 +534,7 @@ mod tests {
         .unwrap();
 
         let residual_query = ivf2.compute_residual(&row, None).await.unwrap();
-        let pq_code = pq.transform(&residual_query).await.unwrap();
+        let pq_code = pq.transform(&residual_query).unwrap();
         let distances = pq
             .compute_distances(
                 &residual_query.value(0),
