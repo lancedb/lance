@@ -388,7 +388,7 @@ impl PrimitiveFieldDecodeTask {
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
-    fn wait<'a>(&'a mut self, _: u32) -> BoxFuture<'a, Result<()>> {
+    fn wait(&mut self, _: u32) -> BoxFuture<Result<()>> {
         async move {
             let physical_decoder = self.unloaded_physical_decoder.take().unwrap().await?;
             self.physical_decoder = Some(Arc::from(physical_decoder));

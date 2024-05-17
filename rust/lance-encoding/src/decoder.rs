@@ -658,9 +658,9 @@ impl BatchDecodeStream {
                 }
                 None => {
                     return Err(Error::Internal {
-                        message: format!(
+                        message:
                             "The scheduler finished while the decoder was still waiting for input"
-                        ),
+                                .to_string(),
                         location: location!(),
                     });
                 }
@@ -895,11 +895,18 @@ impl SchedulerContext {
             .unwrap();
     }
 
-    pub fn temporary(&self) -> SchedulerContext {
+    // Temporary might not be the best name for this.  We create a new context that
+    // shared the same I/O scheduler and has a different name.  This is used in two
+    // situations.
+    //
+    // 1. When we need to create a new indirect I/O phase.
+    // 2. When we need to wrap a set of decoders and so we want to intercept them
+    //    before they are emitted.
+    pub fn temporary(&self) -> Self {
         let (tx, rx) = unbounded_channel();
         let mut name = self.name.clone();
         name.push_str(&self.path_names.join("/"));
-        SchedulerContext {
+        Self {
             sink: tx,
             io: self.io.clone(),
             recv: Some(rx),
@@ -1069,7 +1076,7 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
         })
     }
     /// Waits for enough data to be loaded to decode `num_rows` of data
-    fn wait<'a>(&'a mut self, num_rows: u32) -> BoxFuture<'a, Result<()>>;
+    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>>;
     /// Creates a task to decode `num_rows` of data into an array
     fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask>;
     /// The number of rows that are in the page but haven't yet been "waited"

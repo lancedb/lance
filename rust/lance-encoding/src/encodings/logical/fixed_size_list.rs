@@ -106,7 +106,7 @@ struct FslPageDecoder {
 }
 
 impl LogicalPageDecoder for FslPageDecoder {
-    fn wait<'a>(&'a mut self, num_rows: u32) -> BoxFuture<'a, Result<()>> {
+    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
         self.inner.wait(num_rows * self.dimension)
     }
 

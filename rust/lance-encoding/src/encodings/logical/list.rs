@@ -528,7 +528,7 @@ impl DecodeArrayTask for ListDecodeTask {
 }
 
 impl LogicalPageDecoder for ListPageDecoder {
-    fn wait<'a>(&'a mut self, num_rows: u32) -> BoxFuture<'a, Result<()>> {
+    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
         async move {
             // wait for the indirect I/O to finish, then wait for enough items to arrive
             if self.unloaded.is_some() {

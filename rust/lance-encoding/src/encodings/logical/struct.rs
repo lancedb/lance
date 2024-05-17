@@ -543,7 +543,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
         Ok(())
     }
 
-    fn wait<'a>(&'a mut self, num_rows: u32) -> BoxFuture<'a, Result<()>> {
+    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
         async move {
             for child in self.children.iter_mut() {
                 child.wait(num_rows).await?;
