@@ -436,23 +436,13 @@ where
     fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
         assert_eq!(query.len(), self.dimension);
 
-        let dists: Vec<f32> = match self.distance_type {
-            DistanceType::L2 => {
-                l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
-            }
-            DistanceType::Dot => {
-                dot_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
-            }
-            _ => {
-                panic!(
-                    "KMeans::find_partitions: {} is not supported",
-                    self.distance_type
-                );
-            }
-        };
-
-        let dists_arr = Float32Array::from(dists);
-        sort_to_indices(&dists_arr, None, Some(nprobes))
+        find_partitions(
+            query,
+            self.centroids.as_slice(),
+            self.dimension,
+            nprobes,
+            self.distance_type,
+        )
     }
 
     fn compute_membership(&self, data: &[T::Native], _nprobes: Option<usize>) -> Vec<Option<u32>> {
@@ -477,7 +467,35 @@ where
     }
 }
 
-pub fn find_partitions(centroids)
+/// KMeans find n nearest partitions.
+///
+/// Parameters:
+/// - *query*: a `dimension` floating array.
+/// - *centroids*: a `k * dimension` floating array.
+/// - *dimension*: the vector dimension.
+/// - *nprobes*: the number of partitions to find.
+pub fn find_partitions<T: Float + L2 + Dot>(
+    query: &[T],
+    centroids: &[T],
+    dimension: usize,
+    nprobes: usize,
+    distance_type: DistanceType,
+) -> Result<UInt32Array> {
+    let dists: Vec<f32> = match distance_type {
+        DistanceType::L2 => l2_distance_batch(query, centroids, dimension).collect(),
+        DistanceType::Dot => dot_distance_batch(query, centroids, dimension).collect(),
+        _ => {
+            panic!(
+                "KMeans::find_partitions: {} is not supported",
+                distance_type
+            );
+        }
+    };
+
+    let dists_arr = Float32Array::from(dists);
+    sort_to_indices(&dists_arr, None, Some(nprobes))
+}
+
 /// Compute partition ID of each vector in the KMeans.
 ///
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.
