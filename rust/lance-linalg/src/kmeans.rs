@@ -437,9 +437,8 @@ where
         assert_eq!(query.len(), self.dimension);
 
         kmeans_find_partitions(
-            query,
             self.centroids.as_slice(),
-            self.dimension,
+            query,
             nprobes,
             self.distance_type,
         )
@@ -470,9 +469,8 @@ where
 /// KMeans finds N nearest partitions.
 ///
 /// Parameters:
-/// - *query*: a `dimension` floating array.
 /// - *centroids*: a `k * dimension` floating array.
-/// - *dimension*: the vector dimension.
+/// - *query*: a `dimension` floating array.
 /// - *nprobes*: the number of partitions to find.
 /// - *distance_type*: the distance type to calculate distance.
 ///
