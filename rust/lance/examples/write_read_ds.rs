@@ -38,7 +38,7 @@ async fn write_dataset(data_path: &str) {
     Dataset::write(batches, data_path, Some(write_params))
         .await
         .unwrap();
-}
+} // End write dataset
 
 // Reads dataset from the given path and prints batch size, schema for all record batches. Also extracts and prints a slice from the first batch
 async fn read_dataset(data_path: &str) {
@@ -50,8 +50,10 @@ async fn read_dataset(data_path: &str) {
     while let Some(batch) = batch_stream.next().await {
         println!("Batch size: {}, {}", batch.num_rows(), batch.num_columns()); // print size of batch
         println!("Schema: {:?}", batch.schema()); // print schema of recordbatch
+
+        println!("Batch: {:?}", batch); // print the entire recordbatch (schema and data)
     }
-}
+} // End read dataset
 
 #[tokio::main]
 async fn main() {
