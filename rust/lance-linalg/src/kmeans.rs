@@ -477,6 +477,7 @@ where
     }
 }
 
+pub fn find_partitions(centroids)
 /// Compute partition ID of each vector in the KMeans.
 ///
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.

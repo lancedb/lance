@@ -9,13 +9,17 @@ use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array};
-use async_trait::async_trait;
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, DistanceType, Dot, L2};
+use lance_linalg::distance::{
+    dot_distance_batch, l2_distance_batch, DistanceType, Dot, Normalize, L2,
+};
 use lance_linalg::kernels::{argmin, argmin_value_float};
 use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::{kmeans::KMeans, Clustering};
+use rayon::prelude::*;
 use snafu::{location, Location};
+
 pub mod builder;
 mod distance;
 pub mod storage;
@@ -29,7 +33,6 @@ pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
 /// Product Quantization
-#[async_trait::async_trait]
 pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 
@@ -37,7 +40,7 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     ///
     fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array>;
 
-    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
+    fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
 
     /// Number of sub-vectors
     fn num_sub_vectors(&self) -> usize;
@@ -60,7 +63,7 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Clone)]
 pub struct ProductQuantizerImpl<T: ArrowFloatType>
 where
-    T::Native: Dot + L2,
+    T::Native: Dot + L2 + Normalize,
 {
     /// Number of bits for the centroids.
     ///
@@ -98,7 +101,7 @@ where
 
 impl<T: ArrowFloatType> ProductQuantizerImpl<T>
 where
-    T::Native: Dot + L2,
+    T::Native: Dot + L2 + Normalize,
 {
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
     pub fn new(
@@ -310,16 +313,15 @@ where
     }
 }
 
-#[async_trait]
 impl<T: ArrowFloatType + 'static> ProductQuantizer for ProductQuantizerImpl<T>
 where
-    T::Native: Dot + L2,
+    T::Native: Dot + L2 + Normalize,
 {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
+    fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
             .ok_or(Error::Index {
@@ -333,74 +335,58 @@ where
 
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
-        let num_rows = fsl.len();
         let num_bits = self.num_bits;
         let codebook = self.codebook.clone();
 
         let metric_type = self.metric_type;
-        let values = tokio::task::spawn_blocking(move || {
-            let all_centroids = (0..num_sub_vectors)
-                .map(|idx| {
-                    get_sub_vector_centroids(
-                        codebook.as_slice(),
-                        dim,
-                        num_bits,
-                        num_sub_vectors,
-                        idx,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let flatten_data =
-                fsl.values()
-                    .as_any()
-                    .downcast_ref::<T::ArrayType>()
-                    .ok_or(Error::Index {
-                        message: format!(
-                            "Expect to be a float vector array, got: {:?}",
-                            fsl.value_type()
-                        ),
-                        location: location!(),
-                    })?;
 
-            let flatten_values = flatten_data.as_slice();
-            let capacity = num_sub_vectors * num_rows;
-            let mut builder: Vec<u8> = vec![0; capacity];
-            // Dimension of each sub-vector.
-            let sub_dim = dim / num_sub_vectors;
-            for i in 0..num_rows {
-                let row_offset = i * dim;
+        let kmeans = (0..num_sub_vectors)
+            .map(|idx| {
+                let centroids = get_sub_vector_centroids(
+                    codebook.as_slice(),
+                    dim,
+                    num_bits,
+                    num_sub_vectors,
+                    idx,
+                );
+                KMeans::with_centroids(
+                    Arc::new(T::ArrayType::from(centroids.to_vec())),
+                    dim / num_sub_vectors,
+                    metric_type,
+                )
+            })
+            .collect::<Vec<_>>();
+        let flatten_data =
+            fsl.values()
+                .as_any()
+                .downcast_ref::<T::ArrayType>()
+                .ok_or(Error::Index {
+                    message: format!(
+                        "Expect to be a float vector array, got: {:?}",
+                        fsl.value_type()
+                    ),
+                    location: location!(),
+                })?;
 
-                for sub_idx in 0..num_sub_vectors {
-                    let offset = row_offset + sub_idx * sub_dim;
-                    let sub_vector = &flatten_values[offset..offset + sub_dim];
-                    let centroids = all_centroids[sub_idx];
-
-                    let dist_iter = match metric_type {
-                        MetricType::L2 | MetricType::Cosine => {
-                            l2_distance_batch(sub_vector, centroids, sub_dim)
-                        }
-                        MetricType::Dot => dot_distance_batch(sub_vector, centroids, sub_dim),
-                        _ => panic!(
-                            "ProductQuantization: metric type {} not supported",
-                            metric_type
-                        ),
-                    };
-                    let code = argmin(dist_iter).ok_or(Error::Index {
-                        message: format!(
-                            "Failed to assign PQ code: {}, sub-vector={:#?}",
-                            "it is likely that distance is NaN or Inf", sub_vector
-                        ),
-                        location: location!(),
-                    })? as u8;
-                    builder[i * num_sub_vectors + sub_idx] = code as u8;
-                }
-            }
-            Ok::<UInt8Array, Error>(UInt8Array::from(builder))
-        })
-        .await??;
+        let values = flatten_data
+            .as_slice()
+            .par_chunks(dim)
+            .map(|sub_vec| {
+                sub_vec
+                    .chunks_exact(dim / num_sub_vectors)
+                    .enumerate()
+                    .flat_map(|(sub_idx, sub_vector)| {
+                        let kmean: &KMeans<T> = &kmeans[sub_idx];
+                        let code = kmean.find_partitions(sub_vector, 1).unwrap();
+                        code.values().iter().map(|&v| v as u8)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect::<Vec<_>>();
 
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
-            values,
+            UInt8Array::from(values),
             self.num_sub_vectors as i32,
         )?))
     }
