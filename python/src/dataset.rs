@@ -1045,16 +1045,12 @@ impl Dataset {
                     let py_batch: PyArrowType<RecordBatch> = PyArrowType(batch.clone());
                     let result = udf_obj
                         .call_method1(py, "_call", (py_batch,))
-                        .map_err(|err| lance::Error::io(
-                            format_python_error(err, py).unwrap(),
-                            location!(),
-                        ))?;
-                    let result_batch: PyArrowType<RecordBatch> =
-                        result.extract(py).map_err(|err|
-                            lance::Error::io(
-                                err.to_string(),
-                                location!(),
-                        ))?;
+                        .map_err(|err| {
+                            lance::Error::io(format_python_error(err, py).unwrap(), location!())
+                        })?;
+                    let result_batch: PyArrowType<RecordBatch> = result
+                        .extract(py)
+                        .map_err(|err| lance::Error::io(err.to_string(), location!()))?,
                     Ok(result_batch.0)
                 })
             };
@@ -1471,10 +1467,12 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
     }
 
     fn insert_fragment(&self, fragment: Fragment) -> lance_core::Result<()> {
-        let data = serde_json::to_string(&fragment).map_err(|err| lance_core::Error::io(
-            format!("Failed to serialize fragment data: {}", err),
-            location!(),
-        ))?;
+        let data = serde_json::to_string(&fragment).map_err(|err| {
+            lance_core::Error::io(
+                format!("Failed to serialize fragment data: {}", err),
+                location!(),
+            )
+        })?;
         Python::with_gil(|py| {
             self.inner
                 .call_method1(py, "insert_fragment", (fragment.id, data))?;
