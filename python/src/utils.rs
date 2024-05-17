@@ -145,24 +145,18 @@ impl Hnsw {
         vectors_array,
         max_level=7,
         m=20,
-        m_max=40,
         ef_construction=100,
-        use_select_heuristic=true,
     ))]
     fn build(
         vectors_array: &PyIterator,
         max_level: u16,
         m: usize,
-        m_max: usize,
         ef_construction: usize,
-        use_select_heuristic: bool,
     ) -> PyResult<Self> {
         let params = HnswBuildParams::default()
             .max_level(max_level)
             .num_edges(m)
-            .max_num_edges(m_max)
-            .ef_construction(ef_construction)
-            .use_select_heuristic(use_select_heuristic);
+            .ef_construction(ef_construction);
 
         let mut data: Vec<Arc<dyn Array>> = Vec::new();
         for vectors in vectors_array {

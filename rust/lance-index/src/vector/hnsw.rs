@@ -583,14 +583,11 @@ mod tests {
     async fn test_build_hnsw() {
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
-        const MAX_EDGES: usize = 32;
         let data = generate_random_array(TOTAL * DIM);
         let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
         let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
         let hnsw = HNSWBuilder::with_params(
-            HnswBuildParams::default()
-                .max_num_edges(MAX_EDGES)
-                .ef_construction(50),
+            HnswBuildParams::default().ef_construction(50),
             store.clone(),
         )
         .build()
@@ -602,16 +599,6 @@ mod tests {
         hnsw.levels.windows(2).for_each(|w| {
             let (prev, next) = (&w[0], &w[1]);
             assert!(prev.len() >= next.len());
-        });
-
-        hnsw.levels.iter().for_each(|layer| {
-            for &i in layer.id_to_node.keys() {
-                // If the node exist on this layer, check its out-degree.
-                if let Some(neighbors) = layer.neighbors(i) {
-                    let cnt = neighbors.count();
-                    assert!(cnt <= MAX_EDGES, "actual {}, max_edges: {}", cnt, MAX_EDGES);
-                }
-            }
         });
     }
 
@@ -630,7 +617,6 @@ mod tests {
     async fn test_search() {
         const DIM: usize = 32;
         const TOTAL: usize = 10_000;
-        const MAX_EDGES: usize = 30;
         const K: usize = 100;
 
         let data = generate_random_array(TOTAL * DIM);
@@ -639,10 +625,7 @@ mod tests {
         let q = mat.row(0).unwrap();
 
         let hnsw = HNSWBuilder::with_params(
-            HnswBuildParams::default()
-                .max_num_edges(MAX_EDGES)
-                .ef_construction(100)
-                .max_level(4),
+            HnswBuildParams::default().ef_construction(100).max_level(4),
             vectors.clone(),
         )
         .build()

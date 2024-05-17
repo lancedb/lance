@@ -248,6 +248,7 @@ impl LogicalPageScheduler for SimpleStructScheduler {
         // NOTE: See schedule_range for a description of the scheduling algorithm
         let mut current_top_level_row = top_level_row;
         while rows_to_read > 0 {
+            trace!("Beginning scheduler scan of columns");
             let mut min_rows_added = u32::MAX;
             for (col_idx, field_scheduler) in self.children.iter().enumerate() {
                 let status = &mut field_status[col_idx];
@@ -263,12 +264,15 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                             "{}",
                             if indices_in_page.is_empty() {
                                 format!(
-                                    "Skipping entire page of {} rows",
-                                    next_candidate_page.num_rows()
+                                    "Skipping entire page of {} rows for column {}",
+                                    next_candidate_page.num_rows(),
+                                    col_idx,
                                 )
                             } else {
                                 format!(
-                                    "Found page with {} overlapping indices",
+                                    "Found page for column {} with {} rows that had {} overlapping indices",
+                                    col_idx,
+                                    next_candidate_page.num_rows(),
                                     indices_in_page.len()
                                 )
                             }
@@ -290,11 +294,18 @@ impl LogicalPageScheduler for SimpleStructScheduler {
                     status.rows_queued += rows_scheduled;
 
                     min_rows_added = min_rows_added.min(rows_scheduled);
+                } else {
+                    // TODO: Unit tests are not covering this path right now
+                    min_rows_added = min_rows_added.min(status.rows_queued);
                 }
             }
             if min_rows_added == 0 {
                 panic!("Error in scheduling logic, panic to avoid infinite loop");
             }
+            trace!(
+                "One scheduling pass complete, {} rows added",
+                min_rows_added
+            );
             rows_to_read -= min_rows_added;
             current_top_level_row += min_rows_added as u64;
             for field_status in &mut field_status {
@@ -380,6 +391,11 @@ impl ChildState {
         );
         let mut remaining = num_rows.saturating_sub(self.rows_available);
         if remaining > 0 {
+            trace!(
+                "Struct must await {} rows from {} unawaited rows",
+                remaining,
+                self.rows_unawaited
+            );
             if let Some(back) = self.awaited.back_mut() {
                 if back.unawaited() > 0 {
                     let rows_to_wait = remaining.min(back.unawaited());
@@ -394,7 +410,12 @@ impl ChildState {
                     let newly_avail = back.avail() - previously_avail;
                     trace!("The await loaded {} rows", newly_avail);
                     self.rows_available += newly_avail;
-                    self.rows_unawaited -= newly_avail;
+                    // Need to use saturating_sub here because we might have asked for range
+                    // 0-1000 and this page we just loaded might cover 900-1100 and so newly_avail
+                    // is 200 but rows_unawaited is only 100
+                    //
+                    // TODO: Unit tests are not covering this branch right now
+                    self.rows_unawaited = self.rows_unawaited.saturating_sub(newly_avail);
                     remaining -= rows_to_wait;
                     if remaining == 0 {
                         return Ok(true);
@@ -425,9 +446,9 @@ impl ChildState {
             // newly_avail this way (we do this above too)
             let newly_avail = decoder.avail() - previously_avail;
             self.awaited.push_back(decoder);
-            self.rows_available += newly_avail;
-            self.rows_unawaited -= newly_avail;
             trace!("The new await loaded {} rows", newly_avail);
+            self.rows_available += newly_avail;
+            self.rows_unawaited = self.rows_unawaited.saturating_sub(newly_avail);
             Ok(remaining == rows_to_wait)
         } else {
             Ok(true)

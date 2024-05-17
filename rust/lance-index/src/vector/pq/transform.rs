@@ -67,7 +67,7 @@ impl Transformer for PQTransformer {
             ),
             location: location!(),
         })?;
-        let pq_code = self.quantizer.transform(&data).await?;
+        let pq_code = self.quantizer.transform(&data)?;
         let pq_field = Field::new(&self.output_column, pq_code.data_type().clone(), false);
         let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
         let batch = batch.drop_column(&self.input_column)?;

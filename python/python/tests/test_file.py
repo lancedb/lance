@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import pyarrow as pa
+import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
 
@@ -31,6 +32,22 @@ def test_multiple_close(tmp_path):
     writer.write_batch(pa.table({"a": [1, 2, 3]}))
     writer.close()
     writer.close()
+
+
+def test_take(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    writer.write_batch(pa.table({"a": [i for i in range(100)]}))
+    writer.close()
+
+    reader = LanceFileReader(str(path))
+    # Can't read out of range
+    with pytest.raises(ValueError):
+        reader.take_rows([0, 100]).to_table()
+
+    table = reader.take_rows([0, 77, 83]).to_table()
+    assert table == pa.table({"a": [0, 77, 83]})
 
 
 def test_different_types(tmp_path):

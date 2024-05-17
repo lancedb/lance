@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use super::vector::ivf::optimize_vector_indices;
 use super::DatasetIndexInternalExt;
+use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
 
@@ -95,8 +96,7 @@ pub async fn merge_indices<'a>(
 
             let new_uuid = Uuid::new_v4();
 
-            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
-            let new_store = LanceIndexStore::new((*dataset.object_store).clone(), index_dir);
+            let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
 
             index.update(new_data_stream.into(), &new_store).await?;
 

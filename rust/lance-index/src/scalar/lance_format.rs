@@ -14,7 +14,7 @@ use lance_file::{
 };
 use snafu::{location, Location};
 
-use lance_core::{Error, Result};
+use lance_core::{cache::FileMetadataCache, Error, Result};
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
@@ -30,14 +30,20 @@ use super::{IndexReader, IndexStore, IndexWriter};
 pub struct LanceIndexStore {
     object_store: ObjectStore,
     index_dir: Path,
+    metadata_cache: Option<FileMetadataCache>,
 }
 
 impl LanceIndexStore {
     /// Create a new index store at the given directory
-    pub fn new(object_store: ObjectStore, index_dir: Path) -> Self {
+    pub fn new(
+        object_store: ObjectStore,
+        index_dir: Path,
+        metadata_cache: Option<FileMetadataCache>,
+    ) -> Self {
         Self {
             object_store,
             index_dir,
+            metadata_cache,
         }
     }
 }
@@ -97,9 +103,12 @@ impl IndexStore for LanceIndexStore {
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        // TODO: Should probably provide file metadata cache here
-        let file_reader =
-            FileReader::try_new_self_described(&self.object_store, &path, None).await?;
+        let file_reader = FileReader::try_new_self_described(
+            &self.object_store,
+            &path,
+            self.metadata_cache.as_ref(),
+        )
+        .await?;
         Ok(Arc::new(file_reader))
     }
 
@@ -167,7 +176,11 @@ mod tests {
         let test_path: &Path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path.to_owned()))
+        Arc::new(LanceIndexStore::new(
+            object_store,
+            test_path.to_owned(),
+            None,
+        ))
     }
 
     struct MockTrainingSource {

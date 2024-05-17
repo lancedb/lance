@@ -88,7 +88,6 @@ async fn main() {
             HnswBuildParams::default()
                 .max_level(args.max_level)
                 .num_edges(15)
-                .max_num_edges(args.max_edges)
                 .ef_construction(ef_construction),
             vector_store.clone(),
         )

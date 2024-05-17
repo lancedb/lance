@@ -14,6 +14,7 @@
 
 package com.lancedb.lance.test;
 
+import com.lancedb.lance.JniLoader;
 import java.util.List;
 import java.util.Optional;
 
@@ -23,6 +24,10 @@ import java.util.Optional;
  * or all tests will show as UnsatisfiedLinkError.
  */
 public class JniTestHelper {
+  static {
+    JniLoader.ensureLoaded();
+  }
+
   /**
    * JNI parse ints test.
    *

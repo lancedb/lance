@@ -15,7 +15,7 @@
 use std::{pin::Pin, sync::Arc};
 
 use arrow::pyarrow::PyArrowType;
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
@@ -339,6 +339,24 @@ impl LanceFileReader {
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         self.read_stream(
             lance_io::ReadBatchParams::Range((offset as usize)..(offset + num_rows) as usize),
+            batch_size,
+            batch_readahead,
+        )
+    }
+
+    pub fn take_rows(
+        &mut self,
+        row_indices: Vec<u64>,
+        batch_size: u32,
+        batch_readahead: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let indices = row_indices
+            .into_iter()
+            .map(|idx| idx as u32)
+            .collect::<Vec<_>>();
+        let indices_arr = UInt32Array::from(indices);
+        self.read_stream(
+            lance_io::ReadBatchParams::Indices(indices_arr),
             batch_size,
             batch_readahead,
         )

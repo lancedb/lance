@@ -3,11 +3,10 @@
 
 use std::{collections::BTreeSet, io::Cursor, ops::Range, pin::Pin, sync::Arc};
 
-use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
-use futures::{stream::BoxStream, Future, Stream, StreamExt};
+use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_encoding::{
     decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, PageInfo, ReadBatchTask},
@@ -583,7 +582,7 @@ impl FileReader {
         range: Range<u64>,
         batch_size: u32,
         projection: &ReaderProjection,
-    ) -> Result<BoxStream<'static, ReadBatchTask<impl Future<Output = Result<RecordBatch>>>>> {
+    ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let column_infos = self.collect_columns_from_projection(projection)?;
         debug!(
             "Reading range {:?} with batch_size {} from columns {:?}",
@@ -599,12 +598,49 @@ impl FileReader {
 
         let (tx, rx) = mpsc::unbounded_channel();
 
+        let num_rows_to_read = range.end - range.start;
+
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
         tokio::task::spawn(
             async move { decode_scheduler.schedule_range(range, tx, &scheduler).await },
         );
 
-        Ok(BatchDecodeStream::new(rx, batch_size, self.num_rows).into_stream())
+        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read).into_stream())
+    }
+
+    fn take_rows(
+        &self,
+        indices: Vec<u64>,
+        batch_size: u32,
+        projection: &ReaderProjection,
+    ) -> Result<BoxStream<'static, ReadBatchTask>> {
+        let column_infos = self.collect_columns_from_projection(projection)?;
+        debug!(
+            "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
+            indices.len(),
+            indices[0],
+            indices[indices.len() - 1],
+            batch_size,
+            column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
+        );
+        let mut decode_scheduler = DecodeBatchScheduler::new(
+            &projection.schema,
+            column_infos.iter().map(|ci| ci.as_ref()),
+            &vec![],
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let num_rows_to_read = indices.len() as u64;
+
+        let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
+        tokio::task::spawn(async move {
+            decode_scheduler
+                .schedule_take(&indices, tx, &scheduler)
+                .await
+        });
+
+        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read).into_stream())
     }
 
     /// Creates a stream of "read tasks" to read the data from the file
@@ -622,14 +658,10 @@ impl FileReader {
         params: ReadBatchParams,
         batch_size: u32,
         projection: &ReaderProjection,
-    ) -> Result<
-        Pin<
-            Box<dyn Stream<Item = ReadBatchTask<impl Future<Output = Result<RecordBatch>>>> + Send>,
-        >,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         Self::validate_projection(projection, &self.metadata)?;
-        let verify_bound = |params: &ReadBatchParams, bound: usize| {
-            if bound > u32::MAX as usize {
+        let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
+            if bound > self.num_rows || bound == self.num_rows && inclusive {
                 Err(Error::invalid_input(
                     format!(
                         "cannot read {:?} from file with {} rows",
@@ -642,17 +674,33 @@ impl FileReader {
             }
         };
         match &params {
-            ReadBatchParams::Indices(_) => todo!(),
+            ReadBatchParams::Indices(indices) => {
+                for idx in indices {
+                    match idx {
+                        None => {
+                            return Err(Error::invalid_input(
+                                "Null value in indices array",
+                                location!(),
+                            ))
+                        }
+                        Some(idx) => {
+                            verify_bound(&params, idx as u64, true)?;
+                        }
+                    }
+                }
+                let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
+                self.take_rows(indices, batch_size, projection)
+            }
             ReadBatchParams::Range(range) => {
-                verify_bound(&params, range.end)?;
+                verify_bound(&params, range.end as u64, false)?;
                 self.read_range(range.start as u64..range.end as u64, batch_size, projection)
             }
             ReadBatchParams::RangeFrom(range) => {
-                verify_bound(&params, range.start)?;
+                verify_bound(&params, range.start as u64, true)?;
                 self.read_range(range.start as u64..self.num_rows, batch_size, projection)
             }
             ReadBatchParams::RangeTo(range) => {
-                verify_bound(&params, range.end)?;
+                verify_bound(&params, range.end as u64, false)?;
                 self.read_range(0..range.end as u64, batch_size, projection)
             }
             ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size, projection),
