@@ -12,7 +12,7 @@ import pyarrow as pa
 from ._arrow.bf16 import (
     BFloat16Array,
     BFloat16Type,  # noqa: F401
-    )
+)
 from .dependencies import numpy as np
 from .lance import bfloat16_array
 

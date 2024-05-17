@@ -1435,12 +1435,11 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             location!(),
         ))?;
         fragment_data
-            .map(|data| {
+            .map(|data| 
                 serde_json::from_str(&data).map_err(|err| lance::Error::io(
                     format!("Failed to deserialize fragment data: {}", err),
-                    location!(),
-                })
-            })
+                    location!())),
+                )
             .transpose()
     }
 
