@@ -6,14 +6,16 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 import pytest
-from lance.ray.sink import (
+
+ray = pytest.importorskip("ray")
+
+
+from lance.ray.sink import (  # noqa: E402
     LanceCommitter,
-    LanceDatasink,  # noqa: E402
+    LanceDatasink,
     LanceFragmentWriter,
     _register_hooks,
 )
-
-ray = pytest.importorskip("ray")
 
 # Use this hook until we have offical DataSink in Ray.
 _register_hooks()
