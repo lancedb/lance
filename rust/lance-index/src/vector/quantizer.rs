@@ -10,7 +10,7 @@ use lance_arrow::ArrowFloatType;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
-use lance_linalg::distance::{DistanceType, Dot, MetricType, Normalize, L2};
+use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_table::format::SelfDescribingFileReader;
 use snafu::{location, Location};
 
