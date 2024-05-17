@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use arrow::array::UInt32Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
