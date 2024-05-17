@@ -4,6 +4,8 @@
 use std::ops::Range;
 
 /// Encoded array of u64 values.
+///
+/// This is a internal data type used as part of row id indices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodedU64Array {
     /// u64 values represented as u16 offset from a base value.
@@ -144,16 +146,26 @@ impl EncodedU64Array {
 
     pub fn binary_search(&self, val: u64) -> std::result::Result<usize, usize> {
         match self {
-            Self::U16 { base, offsets } => {
-                let u16 = val as u16;
-                let base = *base as u16;
-                offsets.binary_search(&(u16 - base))
-            }
-            Self::U32 { base, offsets } => {
-                let u32 = val as u32;
-                let base = *base as u32;
-                offsets.binary_search(&(u32 - base))
-            }
+            Self::U16 { base, offsets } => match val.checked_sub(*base) {
+                None => return Err(0),
+                Some(val) => {
+                    if val > u16::MAX as u64 {
+                        return Err(offsets.len());
+                    }
+                    let u16 = val as u16;
+                    offsets.binary_search(&u16)
+                }
+            },
+            Self::U32 { base, offsets } => match val.checked_sub(*base) {
+                None => return Err(0),
+                Some(val) => {
+                    if val > u32::MAX as u64 {
+                        return Err(offsets.len());
+                    }
+                    let u32 = val as u32;
+                    offsets.binary_search(&u32)
+                }
+            },
             Self::U64(values) => values.binary_search(&val),
         }
     }
@@ -181,11 +193,13 @@ impl From<Vec<u64>> for EncodedU64Array {
         let min = values.iter().copied().min().unwrap_or(0);
         let max = values.iter().copied().max().unwrap_or(0);
         let range = max - min;
-        if range < u16::MAX as u64 {
+        if values.is_empty() {
+            Self::U64(Vec::new())
+        } else if range <= u16::MAX as u64 {
             let base = min;
             let offsets = values.iter().map(|v| (*v - base) as u16).collect();
             Self::U16 { base, offsets }
-        } else if range < u32::MAX as u64 {
+        } else if range <= u32::MAX as u64 {
             let base = min;
             let offsets = values.iter().map(|v| (*v - base) as u32).collect();
             Self::U32 { base, offsets }
@@ -217,20 +231,7 @@ impl From<Range<u64>> for EncodedU64Array {
 impl FromIterator<u64> for EncodedU64Array {
     fn from_iter<I: IntoIterator<Item = u64>>(iter: I) -> Self {
         let values: Vec<u64> = iter.into_iter().collect();
-        let min = values.iter().copied().min().unwrap_or(0);
-        let max = values.iter().copied().max().unwrap_or(0);
-        let range = max - min;
-        if range < u16::MAX as u64 {
-            let base = min;
-            let offsets = values.iter().map(|v| (*v - base) as u16).collect();
-            Self::U16 { base, offsets }
-        } else if range < u32::MAX as u64 {
-            let base = min;
-            let offsets = values.iter().map(|v| (*v - base) as u32).collect();
-            Self::U32 { base, offsets }
-        } else {
-            Self::U64(values)
-        }
+        Self::from(values)
     }
 }
 
@@ -256,51 +257,67 @@ mod test {
 
     #[test]
     fn test_encoded_array_from_vec() {
-        // u16 version
-        let values = [42, 43, 99, u16::MAX as u64]
-            .map(|v| v + 2 * u16::MAX as u64)
-            .to_vec();
-        let encoded = EncodedU64Array::from(values.clone());
-        let expected_base = 42 + 2 * u16::MAX as u64;
-        assert!(matches!(
-            encoded,
-            EncodedU64Array::U16 {
-                base,
-                ..
-            } if base == expected_base
-        ));
-        let roundtripped = encoded.into_iter().collect::<Vec<_>>();
-        assert_eq!(values, roundtripped);
+        fn roundtrip_array(values: Vec<u64>, expected: &EncodedU64Array) {
+            let encoded = EncodedU64Array::from(values.clone());
+            assert_eq!(&encoded, expected);
+
+            assert_eq!(values.len(), encoded.len());
+            assert_eq!(values.first(), encoded.first().as_ref());
+            assert_eq!(values.last(), encoded.last().as_ref());
+            assert_eq!(values.iter().min(), encoded.min().as_ref());
+            assert_eq!(values.iter().max(), encoded.max().as_ref());
+
+            let roundtripped = encoded.iter().collect::<Vec<_>>();
+            assert_eq!(values, roundtripped);
+
+            for (i, v) in values.iter().enumerate() {
+                assert_eq!(Some(*v), encoded.get(i));
+            }
+
+            let encoded2 = values.clone().into_iter().collect::<EncodedU64Array>();
+            assert_eq!(&encoded2, expected);
+        }
+
+        // Empty
+        roundtrip_array(vec![], &EncodedU64Array::U64(vec![]));
+
+        // Single value
+        roundtrip_array(
+            vec![42],
+            &EncodedU64Array::U16 {
+                base: 42,
+                offsets: vec![0],
+            },
+        );
+
+        // u16 version, it can start beyong the u16 range, but the
+        // relative values must be within u16 range.
+        let relative_values = [0, 42, 43, 99, u16::MAX as u64];
+        let values = relative_values.map(|v| v + 2 * u16::MAX as u64).to_vec();
+        let expected = EncodedU64Array::U16 {
+            base: 2 * u16::MAX as u64,
+            offsets: relative_values.iter().map(|v| *v as u16).collect(),
+        };
+        roundtrip_array(values, &expected);
 
         // u32 version
-        let values = [42, 43, 99, u32::MAX as u64]
-            .map(|v| v + 2 * u32::MAX as u64)
-            .to_vec();
-        let encoded = EncodedU64Array::from(values.clone());
-        let expected_base = 42 + 2 * u32::MAX as u64;
-        assert!(matches!(
-            encoded,
-            EncodedU64Array::U32 {
-                base,
-                ..
-            } if base == expected_base
-        ));
-        let roundtripped = encoded.into_iter().collect::<Vec<_>>();
-        assert_eq!(values, roundtripped);
+        let relative_values = [0, 42, 43, 99, u32::MAX as u64];
+        let values = relative_values.map(|v| v + 2 * u32::MAX as u64).to_vec();
+        let expected = EncodedU64Array::U32 {
+            base: 2 * u32::MAX as u64,
+            offsets: relative_values.iter().map(|v| *v as u32).collect(),
+        };
+        roundtrip_array(values, &expected);
 
         // u64 version
         let values = [42, 43, 99, u64::MAX].to_vec();
-        let encoded = EncodedU64Array::from(values.clone());
-        assert!(matches!(encoded, EncodedU64Array::U64(_)));
-        let roundtripped = encoded.into_iter().collect::<Vec<_>>();
-        assert_eq!(values, roundtripped);
+        let expected = EncodedU64Array::U64(values.clone());
+        roundtrip_array(values, &expected);
+    }
 
-        // empty one
-        let values = Vec::<u64>::new();
-        let encoded = EncodedU64Array::from(values.clone());
-        assert_eq!(encoded.len(), 0);
-        let roundtripped = encoded.into_iter().collect::<Vec<_>>();
-        assert_eq!(values, roundtripped);
+    #[test]
+    fn test_double_ended_iter() {
+        todo!("validate double ended iterator")
     }
 
     #[test]

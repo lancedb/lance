@@ -229,7 +229,7 @@ mod test {
     fn test_row_id_sequence_delete() {
         let mut sequence = RowIdSequence::from(0..10);
         sequence.delete(vec![1, 3, 5, 7, 9]);
-        let mut expected_bitmap = Bitmap::new(9);
+        let mut expected_bitmap = Bitmap::new_empty(9);
         for i in vec![0, 2, 4, 8] {
             expected_bitmap.set(i as usize);
         }

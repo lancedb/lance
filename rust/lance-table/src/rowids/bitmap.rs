@@ -18,8 +18,23 @@ impl std::fmt::Debug for Bitmap {
 }
 
 impl Bitmap {
-    pub fn new(len: usize) -> Self {
+    pub fn new_empty(len: usize) -> Self {
         let data = vec![0; (len + 7) / 8];
+        Self { data, len }
+    }
+
+    pub fn new_full(len: usize) -> Self {
+        let mut data = vec![0xff; (len + 7) / 8];
+        // Zero past the end of len
+        let remainder = len % 8;
+        if remainder != 0 {
+            let last_byte = data.last_mut().unwrap();
+            let bits_to_clear = 8 - remainder;
+            for offset_from_end in 0..bits_to_clear {
+                let i = 7 - offset_from_end;
+                *last_byte &= !(1 << i);
+            }
+        }
         Self { data, len }
     }
 
@@ -52,11 +67,15 @@ impl Bitmap {
     pub fn count_ones(&self) -> usize {
         self.data.iter().map(|&x| x.count_ones() as usize).sum()
     }
+
+    pub fn count_zeros(&self) -> usize {
+        self.len - self.count_ones()
+    }
 }
 
 impl From<&[bool]> for Bitmap {
     fn from(slice: &[bool]) -> Self {
-        let mut bitmap = Bitmap::new(slice.len());
+        let mut bitmap = Bitmap::new_empty(slice.len());
         for (i, &b) in slice.iter().enumerate() {
             if b {
                 bitmap.set(i);
@@ -72,7 +91,7 @@ mod tests {
 
     #[test]
     fn test_bitmap() {
-        let mut bitmap = Bitmap::new(10);
+        let mut bitmap = Bitmap::new_empty(10);
         assert_eq!(bitmap.len(), 10);
         assert_eq!(bitmap.count_ones(), 0);
 
@@ -98,5 +117,26 @@ mod tests {
         bitmap.slice(5, 5);
         assert_eq!(bitmap.count_ones(), 1);
         assert_eq!(format!("{:?}", bitmap), "Bitmap { data: 00010, len: 5 }");
+    }
+
+    #[test]
+    fn test_equality() {
+        for len in 48..56 {
+            let mut bitmap1 = Bitmap::new_empty(len);
+            for i in 0..len {
+                if i % 2 == 0 {
+                    bitmap1.set(i);
+                }
+            }
+
+            let mut bitmap2 = Bitmap::new_full(len);
+            for i in 0..len {
+                if i % 2 == 1 {
+                    bitmap2.clear(i);
+                }
+            }
+
+            assert_eq!(bitmap1, bitmap2);
+        }
     }
 }

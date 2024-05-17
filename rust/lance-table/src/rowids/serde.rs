@@ -221,7 +221,7 @@ mod test {
         });
         sequence.0.push(U64Segment::RangeWithBitmap {
             range: 200..300,
-            bitmap: Bitmap::new(100),
+            bitmap: Bitmap::new_empty(100),
         });
         sequence
             .0

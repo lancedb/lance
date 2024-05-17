@@ -71,12 +71,6 @@ fn decompose_sequence(
 mod tests {
     use super::*;
 
-    fn address_range(frag_id: u32, offset_start: u64, offset_end: u64) -> U64Segment {
-        let start = u64::from(RowAddress::first_row(frag_id)) + offset_start;
-        let end = start + (offset_end - offset_start) + 1;
-        U64Segment::Range(start..end)
-    }
-
     #[test]
     fn test_new_index() {
         let fragment_indices = vec![
