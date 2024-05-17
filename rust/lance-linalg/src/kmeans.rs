@@ -436,7 +436,7 @@ where
     fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
         assert_eq!(query.len(), self.dimension);
 
-        find_partitions(
+        kmeans_find_partitions(
             query,
             self.centroids.as_slice(),
             self.dimension,
@@ -467,14 +467,16 @@ where
     }
 }
 
-/// KMeans find n nearest partitions.
+/// KMeans finds N nearest partitions.
 ///
 /// Parameters:
 /// - *query*: a `dimension` floating array.
 /// - *centroids*: a `k * dimension` floating array.
 /// - *dimension*: the vector dimension.
 /// - *nprobes*: the number of partitions to find.
-pub fn find_partitions<T: Float + L2 + Dot>(
+/// - *distance_type*: the distance type to calculate distance.
+///
+pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
     query: &[T],
     centroids: &[T],
     dimension: usize,
