@@ -32,8 +32,6 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
-#[cfg(feature = "opq")]
-use super::opq::train_opq;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::RESULT_SCHEMA;

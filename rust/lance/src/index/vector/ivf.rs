@@ -57,9 +57,12 @@ use lance_io::{
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
-use lance_linalg::kernels::{normalize_arrow, normalize_fsl};
 use lance_linalg::{
-    distance::{Cosine, DistanceType, Dot, MetricType, L2},
+    distance::Normalize,
+    kernels::{normalize_arrow, normalize_fsl},
+};
+use lance_linalg::{
+    distance::{DistanceType, Dot, MetricType, L2},
     MatrixView,
 };
 use log::{debug, info};
@@ -1092,11 +1095,8 @@ async fn build_ivf_model_and_pq(
     sanity_check_params(ivf_params, pq_params)?;
 
     info!(
-        "Building vector index: IVF{},{}PQ{}, metric={}",
-        ivf_params.num_partitions,
-        if pq_params.use_opq { "O" } else { "" },
-        pq_params.num_sub_vectors,
-        metric_type,
+        "Building vector index: IVF{},PQ{}, metric={}",
+        ivf_params.num_partitions, pq_params.num_sub_vectors, metric_type,
     );
 
     let field = sanity_check(dataset, column)?;
@@ -1615,17 +1615,19 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-async fn do_train_ivf_model<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+async fn do_train_ivf_model<T: ArrowFloatType + 'static>(
     data: &T::ArrayType,
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
-) -> Result<Ivf> {
+) -> Result<Ivf>
+where
+    T::Native: Dot + L2 + Normalize,
+{
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
     let centroids = lance_index::vector::kmeans::train_kmeans::<T>(
         data,
-        None,
         dimension,
         params.num_partitions,
         params.max_iters as u32,
@@ -2805,7 +2807,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_pq(2, 8, 4, false, MetricType::Cosine, 50);
+        let params = VectorIndexParams::ivf_pq(2, 8, 4, MetricType::Cosine, 50);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await

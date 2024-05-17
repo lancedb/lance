@@ -6,17 +6,18 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::types::UInt32Type;
-use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
+use arrow_array::{cast::AsArray, Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use log::info;
 use snafu::{location, Location};
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use lance_arrow::{ArrowFloatType, RecordBatchExt};
 use lance_core::Result;
-use lance_linalg::distance::{Dot, MetricType, L2};
+use lance_linalg::distance::{Dot, MetricType, Normalize, L2};
 use lance_linalg::MatrixView;
 
 use crate::vector::transform::Transformer;
@@ -31,14 +32,20 @@ use super::PART_ID_COLUMN;
 /// this transform is a Noop.
 ///
 #[derive(Debug)]
-pub struct IvfTransformer<T: ArrowFloatType + L2 + Dot> {
+pub struct IvfTransformer<T: ArrowFloatType>
+where
+    T::Native: Dot + L2,
+{
     centroids: MatrixView<T>,
     metric_type: MetricType,
     input_column: String,
     output_column: String,
 }
 
-impl<T: ArrowFloatType + L2 + Dot> IvfTransformer<T> {
+impl<T: ArrowFloatType> IvfTransformer<T>
+where
+    T::Native: Dot + L2 + Normalize,
+{
     pub fn new(
         centroids: MatrixView<T>,
         metric_type: MetricType,
@@ -96,20 +103,25 @@ impl<T: ArrowFloatType + L2 + Dot> IvfTransformer<T> {
                         .clone(),
                 );
 
-                compute_partitions::<T>(centroids, data, dimension, metric_type)
-                    .in_current_span()
-                    .await
+                tokio::task::spawn_blocking(move || {
+                    compute_partitions::<T>(centroids, data, dimension, metric_type)
+                })
+                .await
             })
             .buffered(chunks)
-            .collect::<Vec<_>>()
-            .await;
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("failed to compute partitions");
 
         UInt32Array::from_iter(result.iter().flatten().copied())
     }
 }
 
 #[async_trait::async_trait]
-impl<T: ArrowFloatType + L2 + Dot + ArrowPrimitiveType> Transformer for IvfTransformer<T> {
+impl<T: ArrowFloatType + ArrowPrimitiveType> Transformer for IvfTransformer<T>
+where
+    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
+{
     async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {
             // If the partition ID column is already present, we don't need to compute it again.

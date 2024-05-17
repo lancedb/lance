@@ -3,24 +3,17 @@
 
 use std::{iter::Sum, ops::AddAssign};
 
-use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use half::{bf16, f16};
-use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatToArrayType};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 #[allow(unused_imports)]
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
-use num_traits::{AsPrimitive, Float};
-
-use crate::simd::{
-    f32::{f32x16, f32x8},
-    SIMD,
-};
+use num_traits::{AsPrimitive, Float, Num};
 
 /// L2 normalization
-pub trait Normalize: ArrowFloatType {
+pub trait Normalize: Num {
     /// L2 Normalization over a Vector.
-    fn norm_l2(vector: &[Self::Native]) -> f32;
+    fn norm_l2(vector: &[Self]) -> f32;
 }
 
 #[cfg(feature = "fp16kernels")]
@@ -39,9 +32,9 @@ mod kernel {
     }
 }
 
-impl Normalize for Float16Type {
+impl Normalize for f16 {
     #[inline]
-    fn norm_l2(vector: &[Self::Native]) -> f32 {
+    fn norm_l2(vector: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -59,47 +52,29 @@ impl Normalize for Float16Type {
             SimdSupport::Avx2 => unsafe {
                 kernel::norm_l2_f16_avx2(vector.as_ptr(), vector.len() as u32)
             },
-            _ => norm_l2_impl::<f16, f32, 32>(vector),
+            _ => norm_l2_impl::<Self, f32, 32>(vector),
         }
     }
 }
 
-impl Normalize for BFloat16Type {
+impl Normalize for bf16 {
     #[inline]
-    fn norm_l2(vector: &[Self::Native]) -> f32 {
-        norm_l2_impl::<bf16, f32, 32>(vector)
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, f32, 32>(vector)
     }
 }
 
-impl Normalize for Float32Type {
+impl Normalize for f32 {
     #[inline]
-    fn norm_l2(vector: &[Self::Native]) -> f32 {
-        let dim = vector.len();
-        if dim % 16 == 0 {
-            let mut sum = f32x16::zeros();
-            for i in (0..dim).step_by(16) {
-                let x = unsafe { f32x16::load_unaligned(vector.as_ptr().add(i)) };
-                sum += x * x;
-            }
-            sum.reduce_sum().sqrt()
-        } else if dim % 8 == 0 {
-            let mut sum = f32x8::zeros();
-            for i in (0..dim).step_by(8) {
-                let x = unsafe { f32x8::load_unaligned(vector.as_ptr().add(i)) };
-                sum += x * x;
-            }
-            sum.reduce_sum().sqrt()
-        } else {
-            // Fallback to scalar
-            norm_l2_impl::<f32, f32, 16>(vector)
-        }
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, Self, 16>(vector)
     }
 }
 
-impl Normalize for Float64Type {
+impl Normalize for f64 {
     #[inline]
-    fn norm_l2(vector: &[Self::Native]) -> f32 {
-        norm_l2_impl::<f64, f64, 8>(vector) as f32
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, Self, 8>(vector) as f32
     }
 }
 
@@ -136,17 +111,15 @@ pub fn norm_l2_impl<
 /// The parameters must be cache line aligned. For example, from
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
-pub fn norm_l2<T: FloatToArrayType>(vector: &[T]) -> f32
-where
-    T::ArrowType: Normalize,
-{
-    T::ArrowType::norm_l2(vector)
+pub fn norm_l2<T: Normalize>(vector: &[T]) -> f32 {
+    T::norm_l2(vector)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::{arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64};
+    use num_traits::ToPrimitive;
     use proptest::prelude::*;
 
     /// Reference implementation of L2 norm.
@@ -154,10 +127,9 @@ mod tests {
         data.iter().map(|v| (*v * *v)).sum::<f64>().sqrt() as f32
     }
 
-    fn do_norm_l2_test<T: FloatToArrayType>(data: &[T]) -> std::result::Result<(), TestCaseError>
-    where
-        T::ArrowType: Normalize,
-    {
+    fn do_norm_l2_test<T: Normalize + ToPrimitive>(
+        data: &[T],
+    ) -> std::result::Result<(), TestCaseError> {
         let f64_data = data
             .iter()
             .map(|v| v.to_f64().unwrap())

@@ -37,18 +37,19 @@ pin-project.workspace = true
 prost.workspace = true
 shellexpand.workspace = true
 snafu.workspace = true
-tokio-stream.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 path_abs.workspace = true
 rand.workspace = true
+async-priority-channel = "0.2.0"
 
 [dev-dependencies]
 criterion.workspace = true
 parquet.workspace = true
 pprof.workspace = true
 tempfile.workspace = true
+mockall.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

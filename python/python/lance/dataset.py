@@ -1303,12 +1303,6 @@ class LanceDataset(pa.dataset.Dataset):
             num_sub_vectors
 
         Optional parameters for "IVF_PQ":
-
-            use_opq : bool
-                whether to use OPQ (Optimized Product Quantization).
-                Must have feature 'opq' enabled in Rust.
-            max_opq_iterations : int
-                the maximum number of iterations for training OPQ.
             ivf_centroids :
                 K-mean centroids for IVF clustering.
 
@@ -1317,8 +1311,6 @@ class LanceDataset(pa.dataset.Dataset):
                 the maximum number of levels in the graph.
             m : int
                 the number of edges per node in the graph.
-            m_max : int
-                the maximum number of edges per node in the graph.
             ef_construction : int
                 the number of nodes to examine during the construction.
 

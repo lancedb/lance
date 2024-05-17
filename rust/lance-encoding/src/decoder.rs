@@ -196,7 +196,6 @@
 //!  * The "batch overhead" is very small in Lance compared to other formats because it has no
 //!    relation to the way the data is stored.
 
-use std::future::Future;
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -537,8 +536,12 @@ impl DecodeBatchScheduler {
 
         let range = range.start as u32..range.end as u32;
 
-        self.root_scheduler
-            .schedule_ranges(&[range.clone()], scheduler, &sink)?;
+        self.root_scheduler.schedule_ranges(
+            &[range.clone()],
+            scheduler,
+            &sink,
+            range.start as u64,
+        )?;
 
         trace!("Finished scheduling of range {:?}", range);
         Ok(())
@@ -553,11 +556,14 @@ impl DecodeBatchScheduler {
     /// * `scheduler` An I/O scheduler to issue I/O requests
     pub async fn schedule_take(
         &mut self,
-        indices: &[u32],
+        indices: &[u64],
         sink: mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
         scheduler: &Arc<dyn EncodingsIo>,
     ) -> Result<()> {
         debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
+        if indices.is_empty() {
+            return Ok(());
+        }
         trace!(
             "Scheduling take of {} rows [{}]",
             indices.len(),
@@ -567,15 +573,20 @@ impl DecodeBatchScheduler {
                 format!("{}, ..., {}", indices[0], indices[indices.len() - 1])
             }
         );
+        if indices.is_empty() {
+            return Ok(());
+        }
+        // TODO: Figure out how to handle u64 indices
+        let indices = indices.iter().map(|i| *i as u32).collect::<Vec<_>>();
         self.root_scheduler
-            .schedule_take(indices, scheduler, &sink)?;
+            .schedule_take(&indices, scheduler, &sink, indices[0] as u64)?;
         trace!("Finished scheduling take of {} rows", indices.len());
         Ok(())
     }
 }
 
-pub struct ReadBatchTask<Fut: Future<Output = Result<RecordBatch>>> {
-    pub task: Fut,
+pub struct ReadBatchTask {
+    pub task: BoxFuture<'static, Result<RecordBatch>>,
     pub num_rows: u32,
 }
 
@@ -613,7 +624,10 @@ impl BatchDecodeStream {
 
     #[instrument(level = "debug", skip_all)]
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
-        trace!("Draining batch task");
+        trace!(
+            "Draining batch task (rows_remaining={})",
+            self.rows_remaining
+        );
         if self.rows_remaining == 0 {
             return Ok(None);
         }
@@ -644,9 +658,7 @@ impl BatchDecodeStream {
         Ok(RecordBatch::from(struct_arr.as_struct()))
     }
 
-    pub fn into_stream(
-        self,
-    ) -> BoxStream<'static, ReadBatchTask<impl Future<Output = Result<RecordBatch>>>> {
+    pub fn into_stream(self) -> BoxStream<'static, ReadBatchTask> {
         let stream = futures::stream::unfold(self, |mut slf| async move {
             let next_task = slf.next_batch_task().await;
             let next_task = next_task.transpose().map(|next_task| {
@@ -658,10 +670,8 @@ impl BatchDecodeStream {
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
-                let next_task = ReadBatchTask {
-                    task: task.map(|join_wrapper| join_wrapper.unwrap()),
-                    num_rows,
-                };
+                let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
+                let next_task = ReadBatchTask { task, num_rows };
                 (next_task, slf)
             })
         });
@@ -740,10 +750,13 @@ pub trait PhysicalPageScheduler: Send + Sync + std::fmt::Debug {
     /// * `range` - the range of row offsets (relative to start of page) requested
     ///             these must be ordered and must not overlap
     /// * `scheduler` - a scheduler to submit the I/O request to
+    /// * `top_level_row` - the row offset of the top level field currently being
+    ///   scheduled.  This can be used to assign priority to I/O requests
     fn schedule_ranges(
         &self,
         ranges: &[Range<u32>],
         scheduler: &dyn EncodingsIo,
+        top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
 
@@ -780,6 +793,7 @@ pub trait LogicalPageScheduler: Send + Sync + std::fmt::Debug {
         ranges: &[Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()>;
     /// Schedules I/O for the requested rows (identified by row offsets from start of page)
     /// TODO: implement this using schedule_ranges
@@ -788,6 +802,7 @@ pub trait LogicalPageScheduler: Send + Sync + std::fmt::Debug {
         indices: &[u32],
         scheduler: &Arc<dyn EncodingsIo>,
         sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        top_level_row: u64,
     ) -> Result<()>;
     /// The number of rows covered by this page
     fn num_rows(&self) -> u32;

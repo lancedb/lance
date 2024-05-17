@@ -29,12 +29,14 @@ pub trait JNIEnvExt {
 
     /// Get strings from Java String[] object.
     /// Note that get Option<Vec<String>> from Java Optional<String[]> just doesn't work.
+    #[allow(dead_code)]
     fn get_strings_array(&mut self, obj: jobjectArray) -> JavaResult<Vec<String>>;
 
     /// Get Option<String> from Java Optional<String>.
     fn get_string_opt(&mut self, obj: &JObject) -> JavaResult<Option<String>>;
 
     /// Get Option<Vec<String>> from Java Optional<List<String>>.
+    #[allow(dead_code)]
     fn get_strings_opt(&mut self, obj: &JObject) -> JavaResult<Option<Vec<String>>>;
 
     /// Get Option<i32> from Java Optional<Integer>.

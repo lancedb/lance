@@ -861,6 +861,17 @@ impl Scanner {
                 self.knn(&FilterPlan::default()).await?
             }
         } else {
+            // Avoid pushdown scan node if using v2 files
+            let fragments = if let Some(fragments) = self.fragments.as_ref() {
+                fragments
+            } else {
+                self.dataset.fragments()
+            };
+            let use_stats = if fragments.iter().any(|f| !f.has_legacy_files()) {
+                false
+            } else {
+                self.use_stats
+            };
             match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
                 (Some(index_query), None) => {
                     self.scalar_indexed_scan(&self.phyical_columns, index_query)
@@ -875,7 +886,7 @@ impl Scanner {
                     self.scalar_indexed_scan(&filter_schema, index_query)
                         .await?
                 }
-                (None, Some(_)) if self.use_stats && self.batch_size.is_none() => {
+                (None, Some(_)) if use_stats && self.batch_size.is_none() => {
                     self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
                 }
                 (None, _) => {
@@ -1594,7 +1605,7 @@ pub mod test_dataset {
         }
 
         pub async fn make_vector_index(&mut self) -> Result<()> {
-            let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
+            let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2);
             self.dataset
                 .create_index(
                     &["vec"],
@@ -2409,7 +2420,7 @@ mod test {
                 &["vector"],
                 IndexType::Vector,
                 None,
-                &VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2),
+                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
                 false,
             )
             .await
@@ -2635,7 +2646,7 @@ mod test {
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
-            VectorIndexParams::ivf_pq(4, 8, 2, false, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
         ];
         for params in vec_params {
             let test_dir = tempdir().unwrap();
@@ -2993,7 +3004,7 @@ mod test {
                     &["vector"],
                     IndexType::Vector,
                     None,
-                    &VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2),
+                    &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
                     false,
                 )
                 .await
@@ -3531,7 +3542,7 @@ mod test {
             .await
             .unwrap();
         let second_index_scan_bytes = get_bytes() - start_bytes;
-        assert!(second_index_scan_bytes < index_scan_bytes);
+        assert!(second_index_scan_bytes < filtered_scan_bytes);
     }
 
     #[tokio::test]

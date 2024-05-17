@@ -9,13 +9,15 @@ use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array};
-use async_trait::async_trait;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, DistanceType, Dot, L2};
-use lance_linalg::kernels::{argmin, argmin_value_float};
+use lance_linalg::kernels::argmin_value_float;
+use lance_linalg::kmeans::kmeans_find_partitions;
 use lance_linalg::{distance::MetricType, MatrixView};
+use rayon::prelude::*;
 use snafu::{location, Location};
+
 pub mod builder;
 mod distance;
 pub mod storage;
@@ -29,7 +31,6 @@ pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
 /// Product Quantization
-#[async_trait::async_trait]
 pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 
@@ -37,7 +38,7 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     ///
     fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array>;
 
-    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
+    fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
 
     /// Number of sub-vectors
     fn num_sub_vectors(&self) -> usize;
@@ -58,7 +59,10 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 //
 // TODO: move this to be pub(crate) once we have a better way to test it.
 #[derive(Debug, Clone)]
-pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
+pub struct ProductQuantizerImpl<T: ArrowFloatType>
+where
+    T::Native: Dot + L2,
+{
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -93,7 +97,10 @@ pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
     pub codebook: Arc<T::ArrayType>,
 }
 
-impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType> ProductQuantizerImpl<T>
+where
+    T::Native: Dot + L2,
+{
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
     pub fn new(
         m: usize,
@@ -304,13 +311,15 @@ impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
     }
 }
 
-#[async_trait]
-impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + 'static> ProductQuantizer for ProductQuantizerImpl<T>
+where
+    T::Native: Dot + L2,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
+    fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
             .ok_or(Error::Index {
@@ -324,89 +333,64 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantiz
 
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
-        let num_rows = fsl.len();
         let num_bits = self.num_bits;
         let codebook = self.codebook.clone();
 
-        let metric_type = self.metric_type;
-        let values = tokio::task::spawn_blocking(move || {
-            let all_centroids = (0..num_sub_vectors)
-                .map(|idx| {
-                    get_sub_vector_centroids(
-                        codebook.as_slice(),
-                        dim,
-                        num_bits,
-                        num_sub_vectors,
-                        idx,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let flatten_data =
-                fsl.values()
-                    .as_any()
-                    .downcast_ref::<T::ArrayType>()
-                    .ok_or(Error::Index {
-                        message: format!(
-                            "Expect to be a float vector array, got: {:?}",
-                            fsl.value_type()
-                        ),
-                        location: location!(),
-                    })?;
+        let distance_type = self.metric_type;
 
-            let flatten_values = flatten_data.as_slice();
-            let capacity = num_sub_vectors * num_rows;
-            let mut builder: Vec<u8> = vec![0; capacity];
-            // Dimension of each sub-vector.
-            let sub_dim = dim / num_sub_vectors;
-            for i in 0..num_rows {
-                let row_offset = i * dim;
+        let flatten_data =
+            fsl.values()
+                .as_any()
+                .downcast_ref::<T::ArrayType>()
+                .ok_or(Error::Index {
+                    message: format!(
+                        "Expect to be a float vector array, got: {:?}",
+                        fsl.value_type()
+                    ),
+                    location: location!(),
+                })?;
 
-                for sub_idx in 0..num_sub_vectors {
-                    let offset = row_offset + sub_idx * sub_dim;
-                    let sub_vector = &flatten_values[offset..offset + sub_dim];
-                    let centroids = all_centroids[sub_idx];
-
-                    let dist_iter = match metric_type {
-                        MetricType::L2 | MetricType::Cosine => {
-                            l2_distance_batch(sub_vector, centroids, sub_dim)
-                        }
-                        MetricType::Dot => dot_distance_batch(sub_vector, centroids, sub_dim),
-                        _ => panic!(
-                            "ProductQuantization: metric type {} not supported",
-                            metric_type
-                        ),
-                    };
-                    let code = argmin(dist_iter).ok_or(Error::Index {
-                        message: format!(
-                            "Failed to assign PQ code: {}, sub-vector={:#?}",
-                            "it is likely that distance is NaN or Inf", sub_vector
-                        ),
-                        location: location!(),
-                    })? as u8;
-                    builder[i * num_sub_vectors + sub_idx] = code as u8;
-                }
-            }
-            Ok::<UInt8Array, Error>(UInt8Array::from(builder))
-        })
-        .await??;
+        let values = flatten_data
+            .as_slice()
+            .par_chunks(dim)
+            .map(|vector| {
+                vector
+                    .chunks_exact(dim / num_sub_vectors)
+                    .enumerate()
+                    .flat_map(|(sub_idx, sub_vector)| {
+                        let centroids = get_sub_vector_centroids(
+                            codebook.as_slice(),
+                            dim,
+                            num_bits,
+                            num_sub_vectors,
+                            sub_idx,
+                        );
+                        let parts = kmeans_find_partitions(centroids, sub_vector, 1, distance_type)
+                            .expect("kmeans_find_partitions failed");
+                        parts.values().iter().map(|v| *v as u8).collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect::<Vec<_>>();
 
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
-            values,
+            UInt8Array::from(values),
             self.num_sub_vectors as i32,
         )?))
     }
 
     fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
         match self.metric_type {
-            MetricType::L2 => self.l2_distances(query, code),
-            MetricType::Cosine => {
+            DistanceType::L2 => self.l2_distances(query, code),
+            DistanceType::Cosine => {
                 // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
                 // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
                 // Therefore, Cosine = L2 / 2
                 let l2_dists = self.l2_distances(query, code)?;
                 Ok(l2_dists.values().iter().map(|v| *v / 2.0).collect())
             }
-            MetricType::Dot => self.dot_distances(query, code),
+            DistanceType::Dot => self.dot_distances(query, code),
             _ => panic!(
                 "ProductQuantization: metric type {} not supported",
                 self.metric_type
@@ -435,7 +419,7 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantiz
     }
 
     fn use_residual(&self) -> bool {
-        matches!(self.metric_type, MetricType::L2 | MetricType::Cosine)
+        matches!(self.metric_type, DistanceType::L2 | DistanceType::Cosine)
     }
 }
 
@@ -463,11 +447,13 @@ mod tests {
     use std::iter::repeat;
 
     use approx::assert_relative_eq;
+    use arrow::datatypes::UInt8Type;
     use arrow_array::{
         types::{Float16Type, Float32Type},
         Float16Array,
     };
     use half::f16;
+    use lance_linalg::kernels::argmin;
     use lance_testing::datagen::generate_random_array;
     use num_traits::Zero;
 
@@ -480,7 +466,7 @@ mod tests {
             codebook: Arc::new(Float16Array::from_iter_values(
                 repeat(f16::zero()).take(256 * 16),
             )),
-            metric_type: MetricType::L2,
+            metric_type: DistanceType::L2,
         };
         let proto: pb::Pq = pb::Pq::try_from(&pq as &dyn ProductQuantizer).unwrap();
         assert_eq!(proto.num_bits, 8);
@@ -494,8 +480,8 @@ mod tests {
         assert_eq!(tensor.shape, vec![256, 16]);
     }
 
-    #[tokio::test]
-    async fn test_l2_distance() {
+    #[test]
+    fn test_l2_distance() {
         const DIM: usize = 512;
         const TOTAL: usize = 66; // 64 + 2 to make sure reminder is handled correctly.
         let codebook = Arc::new(generate_random_array(256 * DIM));
@@ -504,7 +490,7 @@ mod tests {
             num_sub_vectors: 16,
             dimension: DIM,
             codebook: codebook.clone(),
-            metric_type: MetricType::L2,
+            metric_type: DistanceType::L2,
         };
         let pq_code = UInt8Array::from_iter_values((0..16 * TOTAL).map(|v| v as u8));
         let query = generate_random_array(DIM);
@@ -539,5 +525,45 @@ mod tests {
             .for_each(|(v, e)| {
                 assert_relative_eq!(*v, *e, epsilon = 1e-4);
             });
+    }
+
+    #[test]
+    fn test_pq_transform() {
+        const DIM: usize = 16;
+        const TOTAL: usize = 64;
+        let codebook = generate_random_array(DIM * 256);
+        let pq = ProductQuantizerImpl::<Float32Type> {
+            num_bits: 8,
+            num_sub_vectors: 4,
+            dimension: DIM,
+            codebook: Arc::new(codebook),
+            metric_type: MetricType::L2,
+        };
+
+        let vectors = generate_random_array(DIM * TOTAL);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors.clone(), DIM as i32).unwrap();
+        let pq_code = pq.transform(&fsl).unwrap();
+
+        let mut expected = Vec::with_capacity(TOTAL * 4);
+        vectors.values().chunks_exact(DIM).for_each(|vec| {
+            vec.chunks_exact(DIM / 4)
+                .enumerate()
+                .for_each(|(sub_idx, sub_vec)| {
+                    let centroids = pq.centroids(sub_idx);
+                    let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
+                    let code = argmin(dists).unwrap() as u8;
+                    expected.push(code);
+                });
+        });
+
+        assert_eq!(pq_code.len(), TOTAL);
+        assert_eq!(
+            &expected,
+            pq_code
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<UInt8Type>()
+                .values()
+        );
     }
 }

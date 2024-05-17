@@ -169,7 +169,6 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let pq_params = PQBuildParams {
         num_bits: 8,
         num_sub_vectors: 16,
-        use_opq: false,
         ..Default::default()
     };
     let m_type = MetricType::L2;
