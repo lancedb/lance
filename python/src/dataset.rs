@@ -1050,9 +1050,10 @@ impl Dataset {
                             location!(),
                         ))?;
                     let result_batch: PyArrowType<RecordBatch> =
-                        result.extract(py).map_err(|err| lance::Error::io(
-                            err.to_string(),
-                            location!(),
+                        result.extract(py).map_err(|err|
+                            lance::Error::io(
+                                err.to_string(),
+                                location!(),
                         ))?;
                     Ok(result_batch.0)
                 })
@@ -1359,10 +1360,12 @@ impl WriteFragmentProgress for PyWriteProgress {
                 .call_method(py, "_do_begin", (json_str,), Some(kwargs))?;
             Ok(())
         })
-        .map_err(|e| lance::Error::io(
-            format!("Failed to call begin() on WriteFragmentProgress: {}", e),
-            location!(),
-        ))?;
+        .map_err(|e| {
+            lance::Error::io(
+                format!("Failed to call begin() on WriteFragmentProgress: {}", e),
+                location!(),
+            )
+        })?;
         Ok(())
     }
 
@@ -1374,10 +1377,12 @@ impl WriteFragmentProgress for PyWriteProgress {
                 .call_method(py, "_do_complete", (json_str,), None)?;
             Ok(())
         })
-        .map_err(|e| lance::Error::io(
-            format!("Failed to call complete() on WriteFragmentProgress: {}", e),
-            location!(),
-        ))?;
+        .map_err(|e| {
+            lance::Error::io(
+                format!("Failed to call complete() on WriteFragmentProgress: {}", e),
+                location!(),
+            )
+        })?;
         Ok(())
     }
 }
@@ -1416,10 +1421,12 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             let batch: Option<PyArrowType<RecordBatch>> = batch.extract(py)?;
             Ok(batch.map(|b| b.0))
         })
-        .map_err(|err: PyErr| lance_core::Error::io(
-            format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
-            location!(),
-        ))
+        .map_err(|err: PyErr| {
+            lance_core::Error::io(
+                format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
+                location!(),
+            )
+        })
     }
 
     fn get_fragment(&self, fragment_id: u32) -> lance::Result<Option<Fragment>> {
@@ -1430,16 +1437,21 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             let fragment: Option<String> = fragment.extract(py)?;
             Ok(fragment)
         })
-        .map_err(|err: PyErr| lance_core::Error::io(
-            format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
-            location!(),
-        ))?;
+        .map_err(|err: PyErr| {
+            lance_core::Error::io(
+                format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
+                location!(),
+            )
+        })?;
         fragment_data
-            .map(|data| 
-                serde_json::from_str(&data).map_err(|err| lance::Error::io(
-                    format!("Failed to deserialize fragment data: {}", err),
-                    location!())),
-                )
+            .map(|data| {
+                serde_json::from_str(&data).map_err(|err| {
+                    lance::Error::io(
+                        format!("Failed to deserialize fragment data: {}", err),
+                        location!(),
+                    )
+                })
+            })
             .transpose()
     }
 
@@ -1450,10 +1462,12 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             self.inner.call_method1(py, "insert_batch", (info, batch))?;
             Ok(())
         })
-        .map_err(|err: PyErr| lance_core::Error::io(
-            format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
-            location!(),
-        ))
+        .map_err(|err: PyErr| {
+            lance_core::Error::io(
+                format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
+                location!(),
+            )
+        })
     }
 
     fn insert_fragment(&self, fragment: Fragment) -> lance_core::Result<()> {
@@ -1466,12 +1480,14 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
                 .call_method1(py, "insert_fragment", (fragment.id, data))?;
             Ok(())
         })
-        .map_err(|err: PyErr| lance_core::Error::io(
-            format!(
-                "Failed to call insert_fragment() on UDFCheckpointer: {}",
-                err
-            ),
-            location!(),
-        ))
+        .map_err(|err: PyErr| {
+            lance_core::Error::io(
+                format!(
+                    "Failed to call insert_fragment() on UDFCheckpointer: {}",
+                    err
+                ),
+                location!(),
+            )
+        })
     }
 }
