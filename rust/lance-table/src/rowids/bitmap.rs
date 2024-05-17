@@ -75,7 +75,7 @@ impl Bitmap {
 
 impl From<&[bool]> for Bitmap {
     fn from(slice: &[bool]) -> Self {
-        let mut bitmap = Bitmap::new_empty(slice.len());
+        let mut bitmap = Self::new_empty(slice.len());
         for (i, &b) in slice.iter().enumerate() {
             if b {
                 bitmap.set(i);

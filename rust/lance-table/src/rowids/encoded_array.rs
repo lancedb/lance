@@ -147,7 +147,7 @@ impl EncodedU64Array {
     pub fn binary_search(&self, val: u64) -> std::result::Result<usize, usize> {
         match self {
             Self::U16 { base, offsets } => match val.checked_sub(*base) {
-                None => return Err(0),
+                None => Err(0),
                 Some(val) => {
                     if val > u16::MAX as u64 {
                         return Err(offsets.len());
@@ -157,7 +157,7 @@ impl EncodedU64Array {
                 }
             },
             Self::U32 { base, offsets } => match val.checked_sub(*base) {
-                None => return Err(0),
+                None => Err(0),
                 Some(val) => {
                     if val > u32::MAX as u64 {
                         return Err(offsets.len());
@@ -317,7 +317,41 @@ mod test {
 
     #[test]
     fn test_double_ended_iter() {
-        todo!("validate double ended iterator")
+        let arrays = vec![
+            EncodedU64Array::U16 {
+                base: 42,
+                offsets: vec![0, 1, 2, 3, 4],
+            },
+            EncodedU64Array::U32 {
+                base: 42,
+                offsets: vec![0, 1, 2, 3, 4],
+            },
+            EncodedU64Array::U64(vec![42, 43, 44, 45, 46]),
+        ];
+        for array in arrays {
+            // Should be able to iterate forwards and backwards, and get the same thing.
+            let forwards = array.iter().collect::<Vec<_>>();
+            let mut backwards = array.iter().rev().collect::<Vec<_>>();
+            backwards.reverse();
+            assert_eq!(forwards, backwards);
+
+            // Should be able to pull from both sides in lockstep.
+            let mut expected = Vec::with_capacity(array.len());
+            let mut actual = Vec::with_capacity(array.len());
+            let mut iter = array.iter();
+            // Alternating forwards and backwards
+            for i in 0..array.len() {
+                if i % 2 == 0 {
+                    actual.push(iter.next().unwrap());
+                    expected.push(array.get(i / 2).unwrap());
+                } else {
+                    let i = array.len() - 1 - i / 2;
+                    actual.push(iter.next_back().unwrap());
+                    expected.push(array.get(i).unwrap());
+                };
+            }
+            assert_eq!(expected, actual);
+        }
     }
 
     #[test]

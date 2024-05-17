@@ -12,7 +12,7 @@ impl TryFrom<pb::RowIdSequence> for RowIdSequence {
     type Error = Error;
 
     fn try_from(pb: pb::RowIdSequence) -> Result<Self> {
-        Ok(RowIdSequence(
+        Ok(Self(
             pb.segments
                 .into_iter()
                 .map(U64Segment::try_from)
@@ -28,18 +28,18 @@ impl TryFrom<pb::U64Segment> for U64Segment {
         use pb::u64_segment as pb_seg;
         use pb::u64_segment::Segment::*;
         match pb.segment {
-            Some(Range(pb_seg::Range { start, end })) => Ok(U64Segment::Range(start..end)),
+            Some(Range(pb_seg::Range { start, end })) => Ok(Self::Range(start..end)),
             Some(RangeWithHoles(pb_seg::RangeWithHoles { start, end, holes })) => {
                 let holes = holes
                     .ok_or_else(|| Error::invalid_input("missing hole", location!()))?
                     .try_into()?;
-                Ok(U64Segment::RangeWithHoles {
+                Ok(Self::RangeWithHoles {
                     range: start..end,
                     holes,
                 })
             }
             Some(RangeWithBitmap(pb_seg::RangeWithBitmap { start, end, bitmap })) => {
-                Ok(U64Segment::RangeWithBitmap {
+                Ok(Self::RangeWithBitmap {
                     range: start..end,
                     bitmap: Bitmap {
                         data: bitmap,
@@ -47,10 +47,8 @@ impl TryFrom<pb::U64Segment> for U64Segment {
                     },
                 })
             }
-            Some(SortedArray(array)) => {
-                Ok(U64Segment::SortedArray(EncodedU64Array::try_from(array)?))
-            }
-            Some(Array(array)) => Ok(U64Segment::Array(EncodedU64Array::try_from(array)?)),
+            Some(SortedArray(array)) => Ok(Self::SortedArray(EncodedU64Array::try_from(array)?)),
+            Some(Array(array)) => Ok(Self::Array(EncodedU64Array::try_from(array)?)),
             // TODO: why non-exhaustive?
             // Some(_) => Err(Error::invalid_input("unknown segment type", location!())),
             None => Err(Error::invalid_input("missing segment type", location!())),
@@ -74,7 +72,7 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
                     .chunks_exact(2)
                     .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect();
-                Ok(EncodedU64Array::U16 { base, offsets })
+                Ok(Self::U16 { base, offsets })
             }
             Some(U32Array(pb_arr::U32Array { base, offsets })) => {
                 assert!(
@@ -85,7 +83,7 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
                     .chunks_exact(4)
                     .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect();
-                Ok(EncodedU64Array::U32 { base, offsets })
+                Ok(Self::U32 { base, offsets })
             }
             Some(U64Array(pb_arr::U64Array { values })) => {
                 assert!(
@@ -101,7 +99,7 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
                         ])
                     })
                     .collect();
-                Ok(EncodedU64Array::U64(values))
+                Ok(Self::U64(values))
             }
             // TODO: shouldn't this enum be non-exhaustive?
             // Some(_) => Err(Error::invalid_input("unknown array type", location!())),
@@ -121,13 +119,13 @@ impl From<RowIdSequence> for pb::RowIdSequence {
 impl From<U64Segment> for pb::U64Segment {
     fn from(segment: U64Segment) -> Self {
         match segment {
-            U64Segment::Range(range) => pb::U64Segment {
+            U64Segment::Range(range) => Self {
                 segment: Some(pb::u64_segment::Segment::Range(pb::u64_segment::Range {
                     start: range.start,
                     end: range.end,
                 })),
             },
-            U64Segment::RangeWithHoles { range, holes } => pb::U64Segment {
+            U64Segment::RangeWithHoles { range, holes } => Self {
                 segment: Some(pb::u64_segment::Segment::RangeWithHoles(
                     pb::u64_segment::RangeWithHoles {
                         start: range.start,
@@ -136,7 +134,7 @@ impl From<U64Segment> for pb::U64Segment {
                     },
                 )),
             },
-            U64Segment::RangeWithBitmap { range, bitmap } => pb::U64Segment {
+            U64Segment::RangeWithBitmap { range, bitmap } => Self {
                 segment: Some(pb::u64_segment::Segment::RangeWithBitmap(
                     pb::u64_segment::RangeWithBitmap {
                         start: range.start,
@@ -145,10 +143,10 @@ impl From<U64Segment> for pb::U64Segment {
                     },
                 )),
             },
-            U64Segment::SortedArray(array) => pb::U64Segment {
+            U64Segment::SortedArray(array) => Self {
                 segment: Some(pb::u64_segment::Segment::SortedArray(array.into())),
             },
-            U64Segment::Array(array) => pb::U64Segment {
+            U64Segment::Array(array) => Self {
                 segment: Some(pb::u64_segment::Segment::Array(array.into())),
             },
         }
@@ -158,7 +156,7 @@ impl From<U64Segment> for pb::U64Segment {
 impl From<EncodedU64Array> for pb::EncodedU64Array {
     fn from(array: EncodedU64Array) -> Self {
         match array {
-            EncodedU64Array::U16 { base, offsets } => pb::EncodedU64Array {
+            EncodedU64Array::U16 { base, offsets } => Self {
                 array: Some(pb::encoded_u64_array::Array::U16Array(
                     pb::encoded_u64_array::U16Array {
                         base,
@@ -169,7 +167,7 @@ impl From<EncodedU64Array> for pb::EncodedU64Array {
                     },
                 )),
             },
-            EncodedU64Array::U32 { base, offsets } => pb::EncodedU64Array {
+            EncodedU64Array::U32 { base, offsets } => Self {
                 array: Some(pb::encoded_u64_array::Array::U32Array(
                     pb::encoded_u64_array::U32Array {
                         base,
@@ -180,7 +178,7 @@ impl From<EncodedU64Array> for pb::EncodedU64Array {
                     },
                 )),
             },
-            EncodedU64Array::U64(values) => pb::EncodedU64Array {
+            EncodedU64Array::U64(values) => Self {
                 array: Some(pb::encoded_u64_array::Array::U64Array(
                     pb::encoded_u64_array::U64Array {
                         values: values

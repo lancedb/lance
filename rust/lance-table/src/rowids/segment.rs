@@ -77,7 +77,6 @@ struct SegmentStats {
 impl SegmentStats {
     fn n_holes(&self) -> u64 {
         debug_assert!(self.sorted);
-        dbg!(&self);
         if self.count == 0 {
             0
         } else {
@@ -210,13 +209,9 @@ impl U64Segment {
                 }))
             }
             Self::RangeWithBitmap { range, bitmap } => {
-                Box::new((range.start..range.end).filter_map(|val| {
+                Box::new((range.start..range.end).filter(|val| {
                     let offset = (val - range.start) as usize;
-                    if bitmap.get(offset) {
-                        Some(val)
-                    } else {
-                        None
-                    }
+                    bitmap.get(offset)
                 }))
             }
             Self::SortedArray(array) => Box::new(array.iter()),
@@ -233,7 +228,7 @@ impl U64Segment {
             }
             Self::RangeWithBitmap { range, bitmap } => {
                 let holes = bitmap.count_zeros();
-                (range.end - range.start) as usize - holes as usize
+                (range.end - range.start) as usize - holes
             }
             Self::SortedArray(array) => array.len(),
             Self::Array(array) => array.len(),
@@ -393,7 +388,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_segment_creation() {
+    fn test_segments() {
         fn check_segment(values: &[u64], expected: &U64Segment) {
             let segment = U64Segment::from_slice(values);
             assert_eq!(segment, *expected);
@@ -415,10 +410,37 @@ mod test {
                 }
             }
 
-            for i in 0..values.len() {
-                assert_eq!(segment.get(i), Some(values[i]), "i = {}", i);
-                assert_eq!(segment.position(values[i]), Some(i), "i = {}", i);
+            for (i, value) in values.iter().enumerate() {
+                assert_eq!(segment.get(i), Some(*value), "i = {}", i);
+                assert_eq!(segment.position(*value), Some(i), "i = {}", i);
             }
+
+            check_segment_iter(&segment);
+        }
+
+        fn check_segment_iter(segment: &U64Segment) {
+            // Should be able to iterate forwards and backwards, and get the same thing.
+            let forwards = segment.iter().collect::<Vec<_>>();
+            let mut backwards = segment.iter().rev().collect::<Vec<_>>();
+            backwards.reverse();
+            assert_eq!(forwards, backwards);
+
+            // Should be able to pull from both sides in lockstep.
+            let mut expected = Vec::with_capacity(segment.len());
+            let mut actual = Vec::with_capacity(segment.len());
+            let mut iter = segment.iter();
+            // Alternating forwards and backwards
+            for i in 0..segment.len() {
+                if i % 2 == 0 {
+                    actual.push(iter.next().unwrap());
+                    expected.push(segment.get(i / 2).unwrap());
+                } else {
+                    let i = segment.len() - 1 - i / 2;
+                    actual.push(iter.next_back().unwrap());
+                    expected.push(segment.get(i).unwrap());
+                };
+            }
+            assert_eq!(expected, actual);
         }
 
         // Empty
@@ -464,10 +486,5 @@ mod test {
             &[7000, 1, 24000],
             &U64Segment::Array(vec![7000, 1, 24000].into()),
         );
-    }
-
-    #[test]
-    fn test_segment_iterator() {
-        todo!("validate double ended iterator");
     }
 }
