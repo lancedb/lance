@@ -1,7 +1,9 @@
 name: PR Checks
 
 on:
-  pull_request:
+  # This needs to be a pull_request_target event to allow the workflow to 
+  # modify labels on the PR.
+  pull_request_target:
     types: [opened, edited, synchronize, reopened]
 
 concurrency:
@@ -18,21 +20,33 @@ jobs:
       - uses: srvaroa/labeler@master
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          fail_on_error: true
   breaking-change-checker:
     name: Validate breaking change policy
     runs-on: ubuntu-latest
     # Make sure we add any labels to this PR first.
     needs: labeler
     steps:
-      - uses: actions/checkout@v2
+      # For security reasons, we check out the base branch to use it's CI scripts.
+      - uses: actions/checkout@v4
+        with:
+          path: base
+      - uses: actions/checkout@v4
+        with:
+          # pull_request_target checks out the base branch by default, not
+          # the PR branch.
+          ref: "${{ github.event.pull_request.merge_commit_sha }}"
+          path: pr
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+        working-directory: pr
         run: |
           pip install PyGithub
-          python ci/check_versions.py
+          python ../base/ci/check_versions.py
   commitlint:
     permissions:
       pull-requests: write
