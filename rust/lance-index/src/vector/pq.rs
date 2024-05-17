@@ -472,6 +472,7 @@ mod tests {
     use std::iter::repeat;
 
     use approx::assert_relative_eq;
+    use arrow::datatypes::UInt8Type;
     use arrow_array::{
         types::{Float16Type, Float32Type},
         Float16Array,
@@ -548,5 +549,45 @@ mod tests {
             .for_each(|(v, e)| {
                 assert_relative_eq!(*v, *e, epsilon = 1e-4);
             });
+    }
+
+    #[tokio::test]
+    async fn test_pq_transform() {
+        const DIM: usize = 16;
+        const TOTAL: usize = 64;
+        let codebook = generate_random_array(DIM * 256);
+        let pq = ProductQuantizerImpl::<Float32Type> {
+            num_bits: 8,
+            num_sub_vectors: 4,
+            dimension: DIM,
+            codebook: Arc::new(codebook),
+            metric_type: MetricType::L2,
+        };
+
+        let vectors = generate_random_array(DIM * TOTAL);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors.clone(), DIM as i32).unwrap();
+        let pq_code = pq.transform(&fsl).await.unwrap();
+
+        let mut expected = Vec::with_capacity(TOTAL * 4);
+        vectors.values().chunks_exact(DIM).for_each(|vec| {
+            vec.chunks_exact(DIM / 4)
+                .enumerate()
+                .for_each(|(sub_idx, sub_vec)| {
+                    let centroids = pq.centroids(sub_idx);
+                    let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
+                    let code = argmin(dists).unwrap() as u8;
+                    expected.push(code);
+                });
+        });
+
+        assert_eq!(pq_code.len(), TOTAL);
+        assert_eq!(
+            &expected,
+            pq_code
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<UInt8Type>()
+                .values()
+        );
     }
 }
