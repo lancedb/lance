@@ -476,16 +476,18 @@ where
 /// - *nprobes*: the number of partitions to find.
 /// - *distance_type*: the distance type to calculate distance.
 ///
+/// This function allows to conduct kmeans search without constructing
+/// `Arrow Array` or `Vec<Float>` types.
+///
 pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
-    query: &[T],
     centroids: &[T],
-    dimension: usize,
+    query: &[T],
     nprobes: usize,
     distance_type: DistanceType,
 ) -> Result<UInt32Array> {
     let dists: Vec<f32> = match distance_type {
-        DistanceType::L2 => l2_distance_batch(query, centroids, dimension).collect(),
-        DistanceType::Dot => dot_distance_batch(query, centroids, dimension).collect(),
+        DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
+        DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
         _ => {
             panic!(
                 "KMeans::find_partitions: {} is not supported",
@@ -494,6 +496,7 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
         }
     };
 
+    // TODO: use heap to just keep nprobes smallest values.
     let dists_arr = Float32Array::from(dists);
     sort_to_indices(&dists_arr, None, Some(nprobes))
 }
