@@ -86,6 +86,7 @@ mod tests {
 
     use crate::vector::pq::PQBuildParams;
 
+    #[tokio::test]
     async fn test_pq_transform() {
         let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
         let dim = 16;
