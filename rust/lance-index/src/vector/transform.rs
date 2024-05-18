@@ -192,7 +192,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
         let transformer = NormalizeTransformer::new("v");
-        let output = transformer.transform(&batch).await.unwrap();
+        let output = transformer.transform(&batch).unwrap();
         let actual = output.column_by_name("v").unwrap();
         let act_fsl = actual.as_fixed_size_list();
         assert_eq!(act_fsl.len(), 2);
