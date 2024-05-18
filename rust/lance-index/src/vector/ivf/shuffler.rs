@@ -141,9 +141,9 @@ pub async fn shuffle_dataset(
                     }
 
                     // Filter out NaNs/Infs
-                    batch = nan_filter.transform(&batch).await?;
+                    batch = nan_filter.transform(&batch)?;
 
-                    ivf.transform(&batch).await
+                    ivf.transform(&batch)
                 })
             })
             .buffer_unordered(num_cpus::get())

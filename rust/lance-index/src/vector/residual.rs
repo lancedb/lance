@@ -4,7 +4,6 @@
 use arrow_array::types::UInt32Type;
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, RecordBatch};
 use arrow_schema::Field;
-use async_trait::async_trait;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::MatrixView;
@@ -46,12 +45,11 @@ impl<T: ArrowFloatType> ResidualTransform<T> {
     }
 }
 
-#[async_trait]
 impl<T: ArrowFloatType> Transformer for ResidualTransform<T> {
     /// Replace the original vector in the [`RecordBatch`] to residual vectors.
     ///
     /// The new [`RecordBatch`] will have a new column named [`RESIDUAL_COLUMN`].
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let part_ids = batch.column_by_name(&self.part_col).ok_or(Error::Index {
             message: format!(
                 "Compute residual vector: partition id column not found: {}",

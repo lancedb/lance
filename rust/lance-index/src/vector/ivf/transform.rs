@@ -78,12 +78,11 @@ where
     }
 }
 
-#[async_trait::async_trait]
 impl<T: ArrowFloatType + ArrowPrimitiveType> Transformer for IvfTransformer<T>
 where
     <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {
             // If the partition ID column is already present, we don't need to compute it again.
             return Ok(batch.clone());
@@ -146,9 +145,8 @@ impl PartitionFilter {
     }
 }
 
-#[async_trait::async_trait]
 impl Transformer for PartitionFilter {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         // TODO: use datafusion execute?
         let arr = batch
             .column_by_name(&self.column)

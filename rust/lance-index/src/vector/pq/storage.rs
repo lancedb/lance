@@ -235,7 +235,7 @@ impl ProductQuantizationStorage {
         let num_sub_vectors = quantizer.num_sub_vectors;
         let metric_type = quantizer.metric_type;
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
-        let batch = transform.transform(batch).await?;
+        let batch = transform.transform(batch)?;
 
         Self::new(
             codebook,

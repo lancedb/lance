@@ -10,7 +10,6 @@ use std::sync::Arc;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field};
-use async_trait::async_trait;
 use lance_arrow::RecordBatchExt;
 use num_traits::Float;
 use snafu::{location, Location};
@@ -21,11 +20,10 @@ use lance_linalg::kernels::normalize_fsl;
 /// Transform of a Vector Matrix.
 ///
 ///
-#[async_trait]
-pub trait Transformer: Debug + Sync + Send {
+pub trait Transformer: Debug + Send + Sync {
     /// Transform a [`RecordBatch`] of vectors
     ///
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch>;
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch>;
 }
 
 /// Normalize Transformer
@@ -55,9 +53,8 @@ impl NormalizeTransformer {
     }
 }
 
-#[async_trait]
 impl Transformer for NormalizeTransformer {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let arr = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::Index {
@@ -109,9 +106,8 @@ where
         .any(|&v| !v.is_finite())
 }
 
-#[async_trait]
 impl Transformer for KeepFiniteVectors {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let arr = batch.column_by_name(&self.column).ok_or(Error::Index {
             message: format!(
                 "KeepFiniteVectors: column {} not found in RecordBatch",
@@ -169,9 +165,8 @@ impl DropColumn {
     }
 }
 
-#[async_trait]
 impl Transformer for DropColumn {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         Ok(batch.drop_column(&self.column)?)
     }
 }

@@ -494,15 +494,14 @@ where
     }
 }
 
-#[async_trait]
 impl<T: ArrowFloatType> Transformer for IvfImpl<T>
 where
     T::Native: Dot + L2,
 {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut batch = batch.clone();
         for transform in self.transforms.as_slice() {
-            batch = transform.transform(&batch).await?;
+            batch = transform.transform(&batch)?;
         }
         Ok(batch)
     }
