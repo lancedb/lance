@@ -11,7 +11,6 @@ use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::Field;
-use log::info;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -110,7 +109,7 @@ where
                 location: location!(),
             })?;
 
-        let part_ids = self.compute_partitions(&fsl);
+        let part_ids = self.compute_partitions(fsl);
         let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
         Ok(batch.try_with_column(field, Arc::new(part_ids))?)
     }

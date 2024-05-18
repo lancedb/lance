@@ -431,7 +431,7 @@ where
     <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
     fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
-        Ok(self.ivf_transform.compute_partitions(&data))
+        Ok(self.ivf_transform.compute_partitions(data))
     }
 
     fn compute_residual(

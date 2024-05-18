@@ -17,7 +17,7 @@ pub struct BinaryQuantization {}
 
 impl BinaryQuantization {
     /// Transform an array of float vectors to binary vectors.
-    pub async fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
+    pub fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
             .ok_or(Error::Index {

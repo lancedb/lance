@@ -373,8 +373,7 @@ pub(super) async fn build_pq_model(
             None,
         )?;
         span!(Level::INFO, "compute residual for PQ training")
-            .in_scope(|| ivf2.compute_residual(&training_data, None))
-            .await?
+            .in_scope(|| ivf2.compute_residual(&training_data, None))?
     } else {
         training_data
     };
