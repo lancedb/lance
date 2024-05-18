@@ -70,7 +70,7 @@ fn get_temp_dir() -> Result<Path> {
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
-    ivf: Arc<dyn crate::vector::ivf::Ivf>,
+    ivf: Arc<crate::vector::ivf::Ivf>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
     shuffle_partition_batches: usize,

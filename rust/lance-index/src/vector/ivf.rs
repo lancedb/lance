@@ -7,12 +7,14 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::ArrayRef;
 use arrow_array::{
     cast::AsArray, Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use lance_linalg::distance::Normalize;
+use lance_linalg::distance::{DistanceType, Normalize};
+use lance_linalg::kmeans;
 use snafu::{location, Location};
 
 pub use builder::IvfBuildParams;
@@ -46,7 +48,7 @@ fn new_ivf_impl<T: ArrowFloatType + ArrowPrimitiveType>(
     metric_type: MetricType,
     transforms: Vec<Arc<dyn Transformer>>,
     range: Option<Range<u32>>,
-) -> Arc<dyn Ivf>
+) -> Arc<Ivf>
 where
     <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
@@ -69,7 +71,7 @@ pub fn new_ivf(
     metric_type: MetricType,
     transforms: Vec<Arc<dyn Transformer>>,
     range: Option<Range<u32>>,
-) -> Result<Arc<dyn Ivf>> {
+) -> Result<Arc<Ivf>> {
     match centroids.data_type() {
         DataType::Float16 => Ok(new_ivf_impl::<Float16Type>(
             centroids.as_primitive(),
@@ -109,13 +111,14 @@ fn new_ivf_with_pq_impl<T: ArrowFloatType + ArrowPrimitiveType>(
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
-) -> Arc<dyn Ivf>
+) -> Arc<Ivf>
 where
     <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
-    Arc::new(IvfImpl::<T>::new_with_pq(
-        mat,
+    Arc::new(Ivf::new_with_pq(
+        centroids,
+        dimension,
         metric_type,
         vector_column,
         pq,
@@ -130,7 +133,7 @@ pub fn new_ivf_with_pq(
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
-) -> Result<Arc<dyn Ivf>> {
+) -> Result<Arc<Ivf>> {
     match centroids.data_type() {
         DataType::Float16 => Ok(new_ivf_with_pq_impl::<Float16Type>(
             centroids.as_primitive(),
@@ -172,7 +175,7 @@ pub fn new_ivf_with_sq(
     metric_type: MetricType,
     vector_column: &str,
     range: Option<Range<u32>>,
-) -> Result<Arc<dyn Ivf>> {
+) -> Result<Arc<Ivf>> {
     let ivf = match centroids.data_type() {
         DataType::Float16 => new_ivf_with_sq_impl::<Float16Type>(
             centroids.as_primitive(),
@@ -215,17 +218,12 @@ fn new_ivf_with_sq_impl<T: ArrowFloatType + ArrowPrimitiveType>(
     metric_type: MetricType,
     vector_column: &str,
     range: Option<Range<u32>>,
-) -> Arc<dyn Ivf>
+) -> Arc<Ivf>
 where
     <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
-    Arc::new(IvfImpl::<T>::new_with_sq(
-        mat,
-        metric_type,
-        vector_column,
-        range,
-    ))
+    Arc::new(Ivf::new_with_sq(mat, metric_type, vector_column, range))
 }
 
 pub fn new_ivf_with_quantizer(
@@ -235,7 +233,7 @@ pub fn new_ivf_with_quantizer(
     vector_column: &str,
     quantizer: Quantizer,
     range: Option<Range<u32>>,
-) -> Result<Arc<dyn Ivf>> {
+) -> Result<Arc<Ivf>> {
     match quantizer {
         Quantizer::Product(pq) => {
             new_ivf_with_pq(centroids, dimension, metric_type, vector_column, pq, range)
@@ -246,14 +244,94 @@ pub fn new_ivf_with_quantizer(
     }
 }
 
-/// IVF - IVF file partition
-///
-pub trait Ivf: Send + Sync + std::fmt::Debug + Transformer {
+/// IVF file partition
+pub struct Ivf {
+    /// Flattened clustering centroids of the IVF modal.
+    centroids: ArrayRef,
+
+    /// Dimension of the vector.
+    dimension: usize,
+
+    ///
+    distance_type: DistanceType,
+
+    transforms: Vec<Box<dyn Transformer>>,
+}
+
+impl Ivf {
+    pub fn new(
+        centroids: ArrayRef,
+        dimension: usize,
+        distance_type: DistanceType,
+        transforms: Vec<Box<dyn Transformer>>,
+    ) -> Self {
+        Self {
+            centroids,
+            dimension,
+            distance_type,
+            transforms,
+        }
+    }
+
+    /// Create IVF_PQ index.
+    fn new_with_pq(
+        centroids: ArrayRef,
+        dimension: usize,
+        distance_type: DistanceType,
+        vector_column: &str,
+        pq: Arc<dyn ProductQuantizer>,
+        range: Option<Range<u32>>,
+    ) -> Self {
+        let mut transforms: Vec<Box<dyn Transformer>> = vec![];
+
+        let mt = if distance_type == MetricType::Cosine {
+            transforms.push(Box::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
+        } else {
+            distance_type
+        };
+
+        if let Some(range) = range {
+            transforms.push(Box::new(transform::PartitionFilter::new(
+                PART_ID_COLUMN,
+                range,
+            )));
+        }
+
+        if pq.use_residual() {
+            transforms.push(Box::new(ResidualTransform::new(
+                centroids.clone(),
+                PART_ID_COLUMN,
+                vector_column,
+            )));
+            transforms.push(Box::new(PQTransformer::new(
+                pq.clone(),
+                RESIDUAL_COLUMN,
+                PQ_CODE_COLUMN,
+            )));
+        } else {
+            transforms.push(Box::new(PQTransformer::new(
+                pq.clone(),
+                vector_column,
+                PQ_CODE_COLUMN,
+            )));
+        };
+        Self {
+            centroids,
+            dimension,
+            distance_type,
+            transforms,
+        }
+    }
+
     /// Compute the partitions for each vector in the input data.
     ///
     /// Parameters
     /// ----------
-    /// *data*: a matrix of vectors.
+    /// *data*: A 2-D array of vectors.
+    /// *nprobes*: number of probes to find the closest partitions. Default is 1.
     ///
     /// Returns
     /// -------
@@ -261,26 +339,45 @@ pub trait Ivf: Send + Sync + std::fmt::Debug + Transformer {
     ///
     /// Raises [Error] if the input data type does not match with the IVF model.
     ///
-    fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array>;
-
-    /// Compute residual vector.
-    ///
-    /// A residual vector is `original vector - centroids`.
-    ///
-    /// Parameters:
-    ///  - *original*: original vector.
-    ///  - *partitions*: partition ID of each original vector. If not provided, it will be computed
-    ///   on the flight.
-    ///
-    fn compute_residual(
+    pub fn compute_partitions(
         &self,
-        original: &FixedSizeListArray,
-        partitions: Option<&UInt32Array>,
-    ) -> Result<FixedSizeListArray>;
-
-    /// Find the closest partitions for the query vector.
-    fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array>;
+        data: &FixedSizeListArray,
+        nprobes: Option<usize>,
+    ) -> Result<UInt32Array> {
+        if *self.centroids.data_type() != data.value_type() {
+            return Err(Error::Index {
+                message: format!(
+                    "Ivf::compute_partitions: data is not expected type: {} got {}",
+                    self.centroids.data_type(),
+                    data.values().data_type()
+                ),
+                location: Default::default(),
+            });
+        }
+        if self.centroids.data_type().is_floating() {
+            // KMeans based partition
+            Ok(kmeans::compute_partitions(
+                self.centroids.clone(),
+                data.values().clone(),
+                self.dimension,
+                self.distance_type,
+            )
+            .into())
+        } else if matches!(self.centroids.data_type(), DataType::UInt8) {
+            // KMode based partitions
+            todo!()
+        } else {
+            return Err(Error::Index {
+                message: format!(
+                    "Ivf::compute_partitions: unexpected type: {}",
+                    self.centroids.data_type()
+                ),
+                location: Default::default(),
+            });
+        }
+    }
 }
+
 
 /// IVF - IVF file partition
 ///
@@ -470,29 +567,88 @@ where
         let arr = T::ArrayType::from(residual_arr);
         Ok(FixedSizeListArray::try_new_from_values(arr, dim as i32)?)
     }
-
-    fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
-        let query = query
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Ivf::find_partition: query is not expected type: {} got {}",
-                    T::FLOAT_TYPE,
-                    query.data_type()
-                ),
-                location: Default::default(),
-            })?;
-        let mt = if self.metric_type == MetricType::Cosine {
-            MetricType::L2
-        } else {
-            self.metric_type
-        };
-        let kmeans =
-            KMeans::<T>::with_centroids(self.centroids.data().clone(), self.dimension(), mt);
-        Ok(kmeans.find_partitions(query.as_slice(), nprobes)?)
-    }
 }
+// #[async_trait]
+// impl<T: ArrowFloatType + ArrowPrimitiveType> Ivf for IvfImpl<T>
+// where
+//     <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
+// {
+//     async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
+//         let array = data
+//             .values()
+//             .as_any()
+//             .downcast_ref::<T::ArrayType>()
+//             .ok_or(Error::Index {
+//                 message: format!(
+//                     "Ivf::compute_partitions: data is not expected type: {} got {}",
+//                     T::FLOAT_TYPE,
+//                     data.values().data_type()
+//                 ),
+//                 location: Default::default(),
+//             })?;
+//         let mat = MatrixView::<T>::new(Arc::new(array.clone()), data.value_length());
+//         Ok(self.ivf_transform.compute_partitions(&mat).await)
+//     }
+
+//     async fn compute_residual(
+//         &self,
+//         original: &FixedSizeListArray,
+//         partitions: Option<&UInt32Array>,
+//     ) -> Result<FixedSizeListArray> {
+//         let flatten_arr = original
+//             .values()
+//             .as_any()
+//             .downcast_ref::<T::ArrayType>()
+//             .ok_or(Error::Index {
+//                 message: format!(
+//                     "Ivf::compute_residual: original is not expected type: {} got {}",
+//                     T::FLOAT_TYPE,
+//                     original.values().data_type()
+//                 ),
+//                 location: Default::default(),
+//             })?;
+
+//         let part_ids = if let Some(part_ids) = partitions {
+//             part_ids.clone()
+//         } else {
+//             self.compute_partitions(original).await?
+//         };
+//         let dim = original.value_length() as usize;
+//         let residual_arr = flatten_arr
+//             .as_slice()
+//             .chunks_exact(dim)
+//             .zip(part_ids.values())
+//             .flat_map(|(vector, &part_id)| {
+//                 let centroid = self.centroids.row_ref(part_id as usize).unwrap();
+//                 vector.iter().zip(centroid.iter()).map(|(&v, &c)| v - c)
+//             })
+//             .collect::<Vec<_>>();
+//         let arr = T::ArrayType::from(residual_arr);
+//         Ok(FixedSizeListArray::try_new_from_values(arr, dim as i32)?)
+//     }
+
+//     fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
+//         let query = query
+//             .as_any()
+//             .downcast_ref::<T::ArrayType>()
+//             .ok_or(Error::Index {
+//                 message: format!(
+//                     "Ivf::find_partition: query is not expected type: {} got {}",
+//                     T::FLOAT_TYPE,
+//                     query.data_type()
+//                 ),
+//                 location: Default::default(),
+//             })?;
+//         let mt = if self.metric_type == MetricType::Cosine {
+//             MetricType::L2
+//         } else {
+//             self.metric_type
+//         };
+//         let kmeans =
+//             KMeans::<T>::with_centroids(self.centroids.data().clone(), self.dimension(), mt);
+//         Ok(kmeans.find_partitions(query.as_slice(), nprobes)?)
+//     }
+// }
 
 impl<T: ArrowFloatType> Transformer for IvfImpl<T>
 where
