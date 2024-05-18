@@ -248,7 +248,6 @@ pub fn new_ivf_with_quantizer(
 
 /// IVF - IVF file partition
 ///
-#[async_trait]
 pub trait Ivf: Send + Sync + std::fmt::Debug + Transformer {
     /// Compute the partitions for each vector in the input data.
     ///
@@ -262,7 +261,7 @@ pub trait Ivf: Send + Sync + std::fmt::Debug + Transformer {
     ///
     /// Raises [Error] if the input data type does not match with the IVF model.
     ///
-    async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array>;
+    fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array>;
 
     /// Compute residual vector.
     ///
@@ -273,7 +272,7 @@ pub trait Ivf: Send + Sync + std::fmt::Debug + Transformer {
     ///  - *partitions*: partition ID of each original vector. If not provided, it will be computed
     ///   on the flight.
     ///
-    async fn compute_residual(
+    fn compute_residual(
         &self,
         original: &FixedSizeListArray,
         partitions: Option<&UInt32Array>,
@@ -431,24 +430,11 @@ impl<T: ArrowFloatType + ArrowPrimitiveType> Ivf for IvfImpl<T>
 where
     <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
-    async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
-        let array = data
-            .values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Ivf::compute_partitions: data is not expected type: {} got {}",
-                    T::FLOAT_TYPE,
-                    data.values().data_type()
-                ),
-                location: Default::default(),
-            })?;
-        let mat = MatrixView::<T>::new(Arc::new(array.clone()), data.value_length());
-        Ok(self.ivf_transform.compute_partitions(&mat).await)
+    fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
+        Ok(self.ivf_transform.compute_partitions(data))
     }
 
-    async fn compute_residual(
+    fn compute_residual(
         &self,
         original: &FixedSizeListArray,
         partitions: Option<&UInt32Array>,
@@ -469,7 +455,7 @@ where
         let part_ids = if let Some(part_ids) = partitions {
             part_ids.clone()
         } else {
-            self.compute_partitions(original).await?
+            self.compute_partitions(original)?
         };
         let dim = original.value_length() as usize;
         let residual_arr = flatten_arr

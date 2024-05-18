@@ -504,7 +504,7 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.
 pub fn compute_partitions<T: ArrowFloatType>(
     centroids: Arc<T::ArrayType>,
-    vectors: Arc<T::ArrayType>,
+    vectors: &[T::Native],
     dimension: usize,
     distance_type: DistanceType,
 ) -> Vec<Option<u32>>
@@ -512,7 +512,7 @@ where
     T::Native: L2 + Dot + Normalize,
 {
     let kmeans = KMeans::<T>::with_centroids(centroids, dimension, distance_type);
-    kmeans.compute_membership(vectors.as_slice(), None)
+    kmeans.compute_membership(vectors, None)
 }
 
 #[cfg(test)]
@@ -559,7 +559,7 @@ mod tests {
             .collect::<Vec<_>>();
         let actual = compute_partitions::<Float32Type>(
             Arc::new(centroids),
-            Arc::new(data),
+            data.values(),
             DIM,
             DistanceType::L2,
         );
@@ -588,7 +588,7 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
 
-        compute_partitions::<Float32Type>(centroids.into(), values.into(), DIM, DistanceType::L2)
+        compute_partitions::<Float32Type>(centroids.into(), values.values(), DIM, DistanceType::L2)
             .iter()
             .for_each(|cd| {
                 assert!(cd.is_none());

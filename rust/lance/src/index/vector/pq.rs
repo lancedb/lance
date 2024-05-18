@@ -373,8 +373,7 @@ pub(super) async fn build_pq_model(
             None,
         )?;
         span!(Level::INFO, "compute residual for PQ training")
-            .in_scope(|| ivf2.compute_residual(&training_data, None))
-            .await?
+            .in_scope(|| ivf2.compute_residual(&training_data, None))?
     } else {
         training_data
     };
@@ -533,7 +532,7 @@ mod tests {
         )
         .unwrap();
 
-        let residual_query = ivf2.compute_residual(&row, None).await.unwrap();
+        let residual_query = ivf2.compute_residual(&row, None).unwrap();
         let pq_code = pq.transform(&residual_query).unwrap();
         let distances = pq
             .compute_distances(
