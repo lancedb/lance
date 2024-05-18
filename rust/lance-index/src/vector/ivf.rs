@@ -6,11 +6,10 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::ArrayRef;
-use arrow_array::{
-    cast::AsArray, Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, UInt32Array,
-};
+use arrow_array::{cast::AsArray, Array, FixedSizeListArray, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, Float16Array, Float32Array, Float64Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_linalg::distance::{DistanceType, Normalize};
@@ -53,7 +52,7 @@ where
     <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
-    Arc::new(IvfImpl::<T>::new(mat, metric_type, "", transforms, range))
+    Arc::new(Ivf::new(mat, metric_type, "", transforms, range))
 }
 
 /// Create an IVF from the flatten centroids.
@@ -252,7 +251,7 @@ pub struct Ivf {
     /// Dimension of the vector.
     dimension: usize,
 
-    ///
+    /// The distance type to calculate pair-wise vector distance.
     distance_type: DistanceType,
 
     transforms: Vec<Box<dyn Transformer>>,
@@ -326,6 +325,59 @@ impl Ivf {
         }
     }
 
+    /// Compute partitions using KMeans
+    fn kmeans_compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
+        // type check is already done in [Ivf::compute_partitions]
+        match data.value_type() {
+            DataType::Float16 => Ok(kmeans::compute_partitions::<Float16Type>(
+                Arc::new(
+                    self.centroids
+                        .as_any()
+                        .downcast_ref::<Float16Array>()
+                        .expect("downcast f16 centroids")
+                        .clone(),
+                ),
+                data.values().as_primitive::<Float16Type>().values(),
+                self.dimension,
+                self.distance_type,
+            )
+            .into()),
+            DataType::Float32 => Ok(kmeans::compute_partitions::<Float32Type>(
+                Arc::new(
+                    self.centroids
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .expect("downcast f32 centroids")
+                        .clone(),
+                ),
+                data.values().as_primitive::<Float32Type>().values(),
+                self.dimension,
+                self.distance_type,
+            )
+            .into()),
+            DataType::Float64 => Ok(kmeans::compute_partitions::<Float64Type>(
+                Arc::new(
+                    self.centroids
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .expect("downcast f64 centroids")
+                        .clone(),
+                ),
+                data.values().as_primitive::<Float64Type>().values(),
+                self.dimension,
+                self.distance_type,
+            )
+            .into()),
+            _ => Err(Error::Index {
+                message: format!(
+                    "Ivf::kmeans_compute_partitions: not expected type: {}",
+                    data.values().data_type()
+                ),
+                location: Default::default(),
+            }),
+        }
+    }
+
     /// Compute the partitions for each vector in the input data.
     ///
     /// Parameters
@@ -339,11 +391,7 @@ impl Ivf {
     ///
     /// Raises [Error] if the input data type does not match with the IVF model.
     ///
-    pub fn compute_partitions(
-        &self,
-        data: &FixedSizeListArray,
-        nprobes: Option<usize>,
-    ) -> Result<UInt32Array> {
+    pub fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
         if *self.centroids.data_type() != data.value_type() {
             return Err(Error::Index {
                 message: format!(
@@ -356,16 +404,10 @@ impl Ivf {
         }
         if self.centroids.data_type().is_floating() {
             // KMeans based partition
-            Ok(kmeans::compute_partitions(
-                self.centroids.clone(),
-                data.values().clone(),
-                self.dimension,
-                self.distance_type,
-            )
-            .into())
+            Ok(self.kmeans_compute_partitions(data)?)
         } else if matches!(self.centroids.data_type(), DataType::UInt8) {
             // KMode based partitions
-            todo!()
+            todo!("kmode_compute_partitions")
         } else {
             return Err(Error::Index {
                 message: format!(
@@ -377,7 +419,6 @@ impl Ivf {
         }
     }
 }
-
 
 /// IVF - IVF file partition
 ///
@@ -522,52 +563,6 @@ where
     }
 }
 
-#[async_trait]
-impl<T: ArrowFloatType + ArrowPrimitiveType> Ivf for IvfImpl<T>
-where
-    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
-{
-    fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
-        Ok(self.ivf_transform.compute_partitions(data))
-    }
-
-    fn compute_residual(
-        &self,
-        original: &FixedSizeListArray,
-        partitions: Option<&UInt32Array>,
-    ) -> Result<FixedSizeListArray> {
-        let flatten_arr = original
-            .values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Ivf::compute_residual: original is not expected type: {} got {}",
-                    T::FLOAT_TYPE,
-                    original.values().data_type()
-                ),
-                location: Default::default(),
-            })?;
-
-        let part_ids = if let Some(part_ids) = partitions {
-            part_ids.clone()
-        } else {
-            self.compute_partitions(original)?
-        };
-        let dim = original.value_length() as usize;
-        let residual_arr = flatten_arr
-            .as_slice()
-            .chunks_exact(dim)
-            .zip(part_ids.values())
-            .flat_map(|(vector, &part_id)| {
-                let centroid = self.centroids.row_ref(part_id as usize).unwrap();
-                vector.iter().zip(centroid.iter()).map(|(&v, &c)| v - c)
-            })
-            .collect::<Vec<_>>();
-        let arr = T::ArrayType::from(residual_arr);
-        Ok(FixedSizeListArray::try_new_from_values(arr, dim as i32)?)
-    }
-}
 // #[async_trait]
 // impl<T: ArrowFloatType + ArrowPrimitiveType> Ivf for IvfImpl<T>
 // where
