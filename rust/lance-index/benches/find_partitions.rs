@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::types::Float32Type;
 use arrow_array::Float32Array;
+use arrow_array::{types::Float32Type, FixedSizeListArray};
+use lance_arrow::FixedSizeListArrayExt;
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -28,7 +29,6 @@ fn bench_partitions(c: &mut Criterion) {
 
         for k in &[1, 10, 50] {
             let ivf = IvfImpl::new(matrix.clone(), MetricType::L2, "vector", vec![], None);
-
             c.bench_function(format!("IVF{},k={},L2", num_centroids, k).as_str(), |b| {
                 b.iter(|| {
                     let _ = ivf.find_partitions(&query, *k);
@@ -45,6 +45,14 @@ fn bench_partitions(c: &mut Criterion) {
                 },
             );
         }
+
+        let ivf = IvfImpl::new(matrix.clone(), MetricType::L2, "vector", vec![], None);
+        let batch = generate_random_array_with_seed::<Float32Type>(DIMENSION * 4096, SEED);
+        let fsl = FixedSizeListArray::try_new_from_values(batch, DIMENSION as i32).unwrap();
+        c.bench_function(
+            format!("compute_partitions: IVF{},L2,n={}", num_centroids, 4096).as_str(),
+            |b| b.iter(|| ivf.compute_partitions(&fsl)),
+        );
     }
 }
 

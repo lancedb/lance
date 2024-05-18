@@ -7,15 +7,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::datatypes::ArrowPrimitiveType;
-use arrow_array::types::UInt32Type;
-use arrow_array::{cast::AsArray, Array, RecordBatch, UInt32Array};
+use arrow_array::{
+    cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+};
 use arrow_schema::Field;
-use futures::{stream, StreamExt, TryStreamExt};
 use log::info;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_arrow::{ArrowFloatType, RecordBatchExt};
+use lance_arrow::{ArrowFloatType, FloatArray, RecordBatchExt};
 use lance_core::Result;
 use lance_linalg::distance::{Dot, MetricType, Normalize, L2};
 use lance_linalg::MatrixView;
@@ -62,58 +62,20 @@ where
     /// Compute the partition for each row in the input Matrix.
     ///
     #[instrument(level = "debug", skip(data))]
-    pub(super) async fn compute_partitions(&self, data: &MatrixView<T>) -> UInt32Array {
+    pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
         use lance_linalg::kmeans::compute_partitions;
 
-        let dimension = data.ndim();
-        let centroids = self.centroids.data();
-        let data = data.data();
-        let metric_type = self.metric_type;
-
-        let num_centroids = centroids.len() / dimension;
-        let num_rows = data.len() / dimension;
-
-        let chunks = std::cmp::min(num_cpus::get(), num_rows);
-
-        info!(
-            "computing partition on {} chunks, out of {} centroids, and {} vectors",
-            chunks, num_centroids, num_rows,
-        );
-        // TODO: when usize::div_ceil() comes to stable Rust, we can use it here.
-        let chunk_size = num_rows / chunks + if num_rows % chunks > 0 { 1 } else { 0 };
-        let stride = chunk_size * dimension;
-
-        let result: Vec<Vec<Option<u32>>> = stream::iter(0..chunks)
-            .map(|chunk_id| stride * chunk_id..std::cmp::min(stride * (chunk_id + 1), data.len()))
-            // When there are a large number of CPUs and a small number of rows,
-            // it's possible there isn't an split of rows that there isn't
-            // an even split of rows that both covers all CPUs and all rows.
-            // For example, for 400 rows and 32 CPUs, 12-element chunks (12 * 32 = 384)
-            // wouldn't cover all rows but 13-element chunks (13 * 32 = 416) would
-            // have one empty chunk at the end. This filter removes those empty chunks.
-            .filter(|range| futures::future::ready(range.start < range.end))
-            .map(|range| async {
-                let range: Range<usize> = range;
-                let centroids = centroids.clone();
-                let data = Arc::new(
-                    data.slice(range.start, range.end - range.start)
-                        .as_any()
-                        .downcast_ref::<T::ArrayType>()
-                        .unwrap()
-                        .clone(),
-                );
-
-                tokio::task::spawn_blocking(move || {
-                    compute_partitions::<T>(centroids, data, dimension, metric_type)
-                })
-                .await
-            })
-            .buffered(chunks)
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("failed to compute partitions");
-
-        UInt32Array::from_iter(result.iter().flatten().copied())
+        compute_partitions::<T>(
+            self.centroids.data(),
+            data.values()
+                .as_any()
+                .downcast_ref::<T::ArrayType>()
+                .unwrap()
+                .as_slice(),
+            data.value_length() as usize,
+            self.metric_type,
+        )
+        .into()
     }
 }
 
@@ -148,8 +110,7 @@ where
                 location: location!(),
             })?;
 
-        let mat = MatrixView::<T>::try_from(fsl)?;
-        let part_ids = self.compute_partitions(&mat).await;
+        let part_ids = self.compute_partitions(&fsl);
         let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
         Ok(batch.try_with_column(field, Arc::new(part_ids))?)
     }
