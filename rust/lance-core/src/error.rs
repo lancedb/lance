@@ -148,10 +148,35 @@ impl From<std::io::Error> for Error {
 
 impl From<object_store::Error> for Error {
     #[track_caller]
-    fn from(e: object_store::Error) -> Self {
-        Self::IO {
-            message: (e.to_string()),
-            location: std::panic::Location::caller().to_snafu_location(),
+    fn from(err: object_store::Error) -> Self {
+        match err {
+            object_store::Error::NotFound { path, source } => Self::DatasetNotFound {
+                path,
+                source, // Directly use the source as it already is a BoxedError
+                location: std::panic::Location::caller().to_snafu_location(),
+            },
+            object_store::Error::InvalidPath { source } => Self::InvalidInput {
+                source: Box::new(source),
+                location: std::panic::Location::caller().to_snafu_location(),
+            },
+            object_store::Error::JoinError { source } => Self::Internal {
+                message: format!("Join error: {}", source),
+                location: std::panic::Location::caller().to_snafu_location(),
+            },
+            object_store::Error::NotSupported { source } => Self::NotSupported {
+                source,
+                location: std::panic::Location::caller().to_snafu_location(),
+            },
+            object_store::Error::AlreadyExists { path, .. } => Self::DatasetAlreadyExists {
+                uri: path,
+                location: std::panic::Location::caller().to_snafu_location(),
+            },
+
+            // Map other `object_store::Error` variants as needed.
+            _ => Self::IO {
+                message: (err.to_string()),
+                location: std::panic::Location::caller().to_snafu_location(),
+            },
         }
     }
 }
@@ -338,8 +363,12 @@ mod test {
             Ok(())
         });
         match f().unwrap_err() {
-            Error::IO { location, .. } => {
-                // +4 is the beginning of object_store::Error::Generic...
+            Error::DatasetNotFound { location, .. }
+            | Error::InvalidInput { location, .. }
+            | Error::Internal { location, .. }
+            | Error::NotSupported { location, .. }
+            | Error::DatasetAlreadyExists { location, .. }
+            | Error::IO { location, .. } => {
                 assert_eq!(location.line, current_fn.line() + 4, "{}", location)
             }
             #[allow(unreachable_patterns)]
