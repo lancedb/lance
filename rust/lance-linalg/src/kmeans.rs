@@ -559,7 +559,7 @@ mod tests {
             .collect::<Vec<_>>();
         let actual = compute_partitions::<Float32Type>(
             Arc::new(centroids),
-            Arc::new(data),
+            data.values(),
             DIM,
             DistanceType::L2,
         );
@@ -588,7 +588,7 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
 
-        compute_partitions::<Float32Type>(centroids.into(), values.into(), DIM, DistanceType::L2)
+        compute_partitions::<Float32Type>(centroids.into(), values.values(), DIM, DistanceType::L2)
             .iter()
             .for_each(|cd| {
                 assert!(cd.is_none());
