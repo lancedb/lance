@@ -10,7 +10,6 @@ use std::sync::Arc;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field};
-use async_trait::async_trait;
 use lance_arrow::RecordBatchExt;
 use num_traits::Float;
 use snafu::{location, Location};
@@ -21,11 +20,10 @@ use lance_linalg::kernels::normalize_fsl;
 /// Transform of a Vector Matrix.
 ///
 ///
-#[async_trait]
-pub trait Transformer: Debug + Sync + Send {
+pub trait Transformer: Debug + Send + Sync {
     /// Transform a [`RecordBatch`] of vectors
     ///
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch>;
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch>;
 }
 
 /// Normalize Transformer
@@ -55,9 +53,8 @@ impl NormalizeTransformer {
     }
 }
 
-#[async_trait]
 impl Transformer for NormalizeTransformer {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let arr = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::Index {
@@ -78,9 +75,9 @@ impl Transformer for NormalizeTransformer {
         let norm = normalize_fsl(data)?;
         if let Some(output_column) = &self.output_column {
             let field = Field::new(output_column, norm.data_type().clone(), true);
-            return Ok(batch.try_with_column(field, Arc::new(norm))?);
+            Ok(batch.try_with_column(field, Arc::new(norm))?)
         } else {
-            return Ok(batch.replace_column_by_name(&self.input_column, Arc::new(norm))?);
+            Ok(batch.replace_column_by_name(&self.input_column, Arc::new(norm))?)
         }
     }
 }
@@ -109,9 +106,8 @@ where
         .any(|&v| !v.is_finite())
 }
 
-#[async_trait]
 impl Transformer for KeepFiniteVectors {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let arr = batch.column_by_name(&self.column).ok_or(Error::Index {
             message: format!(
                 "KeepFiniteVectors: column {} not found in RecordBatch",
@@ -169,9 +165,8 @@ impl DropColumn {
     }
 }
 
-#[async_trait]
 impl Transformer for DropColumn {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         Ok(batch.drop_column(&self.column)?)
     }
 }
@@ -197,7 +192,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
         let transformer = NormalizeTransformer::new("v");
-        let output = transformer.transform(&batch).await.unwrap();
+        let output = transformer.transform(&batch).unwrap();
         let actual = output.column_by_name("v").unwrap();
         let act_fsl = actual.as_fixed_size_list();
         assert_eq!(act_fsl.len(), 2);
@@ -223,7 +218,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
         let transformer = NormalizeTransformer::new("v");
-        let output = transformer.transform(&batch).await.unwrap();
+        let output = transformer.transform(&batch).unwrap();
         let actual = output.column_by_name("v").unwrap();
         let act_fsl = actual.as_fixed_size_list();
         assert_eq!(act_fsl.len(), 2);
@@ -257,7 +252,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl.clone())]).unwrap();
         let transformer = NormalizeTransformer::new_with_output("v", "o");
-        let output = transformer.transform(&batch).await.unwrap();
+        let output = transformer.transform(&batch).unwrap();
         let input = output.column_by_name("v").unwrap();
         assert_eq!(input.as_ref(), &fsl);
         let actual = output.column_by_name("o").unwrap();
@@ -289,10 +284,10 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(i32_array), Arc::new(fsl)]).unwrap();
         let transformer = DropColumn::new("v");
-        let output = transformer.transform(&batch).await.unwrap();
+        let output = transformer.transform(&batch).unwrap();
         assert!(output.column_by_name("v").is_none());
 
-        let dup_drop_result = transformer.transform(&output).await;
+        let dup_drop_result = transformer.transform(&output);
         assert!(dup_drop_result.is_ok());
     }
 }
