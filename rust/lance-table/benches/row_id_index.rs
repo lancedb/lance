@@ -25,7 +25,7 @@ use std::{
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use lance_core::utils::address::RowAddress;
-use lance_table::rowids::{serde::write_row_ids, RowIdIndex, RowIdSequence};
+use lance_table::rowids::{write_row_ids, RowIdIndex, RowIdSequence};
 
 fn make_sequence(row_id_range: Range<u64>, deletions: usize) -> RowIdSequence {
     let mut sequence = RowIdSequence::from(row_id_range);
@@ -121,11 +121,10 @@ fn bench_creation(c: &mut Criterion) {
 
         // Measure size of index
         {
-            let mut serialized = Vec::new();
+            let mut size = 0;
             for (_frag_id, sequence) in &sequences {
-                write_row_ids(sequence, &mut serialized).unwrap();
+                size += write_row_ids(sequence).len() as u64;
             }
-            let size = serialized.len() as u64;
             let stats = SizeStats {
                 structure: "RowIdIndex".to_string(),
                 percent_deletions,
