@@ -75,9 +75,9 @@ impl Transformer for NormalizeTransformer {
         let norm = normalize_fsl(data)?;
         if let Some(output_column) = &self.output_column {
             let field = Field::new(output_column, norm.data_type().clone(), true);
-            return Ok(batch.try_with_column(field, Arc::new(norm))?);
+            Ok(batch.try_with_column(field, Arc::new(norm))?)
         } else {
-            return Ok(batch.replace_column_by_name(&self.input_column, Arc::new(norm))?);
+            Ok(batch.replace_column_by_name(&self.input_column, Arc::new(norm))?)
         }
     }
 }
