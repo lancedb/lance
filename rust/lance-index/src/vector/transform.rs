@@ -218,7 +218,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
         let transformer = NormalizeTransformer::new("v");
-        let output = transformer.transform(&batch).await.unwrap();
+        let output = transformer.transform(&batch).unwrap();
         let actual = output.column_by_name("v").unwrap();
         let act_fsl = actual.as_fixed_size_list();
         assert_eq!(act_fsl.len(), 2);
@@ -252,7 +252,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl.clone())]).unwrap();
         let transformer = NormalizeTransformer::new_with_output("v", "o");
-        let output = transformer.transform(&batch).await.unwrap();
+        let output = transformer.transform(&batch).unwrap();
         let input = output.column_by_name("v").unwrap();
         assert_eq!(input.as_ref(), &fsl);
         let actual = output.column_by_name("o").unwrap();
@@ -284,10 +284,10 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(i32_array), Arc::new(fsl)]).unwrap();
         let transformer = DropColumn::new("v");
-        let output = transformer.transform(&batch).await.unwrap();
+        let output = transformer.transform(&batch).unwrap();
         assert!(output.column_by_name("v").is_none());
 
-        let dup_drop_result = transformer.transform(&output).await;
+        let dup_drop_result = transformer.transform(&output);
         assert!(dup_drop_result.is_ok());
     }
 }
