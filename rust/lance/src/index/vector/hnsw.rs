@@ -283,7 +283,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     }
 
     fn storage(&self) -> &dyn VectorStorage {
-        panic!("TODO figure out how to implement this safely.")
+        self.storage.as_ref().unwrap().as_ref()
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
