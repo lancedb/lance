@@ -3,7 +3,10 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow::{array::AsArray, datatypes::Float32Type};
+use arrow::{
+    array::AsArray,
+    datatypes::{Float32Type, UInt8Type},
+};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
 use async_trait::async_trait;
 use lance_core::{Error, Result, ROW_ID};
@@ -225,13 +228,7 @@ impl VectorStorage for ScalarQuantizationStorage {
         let dim = self.sq_codes.value_length() as usize;
         Box::new(SQDistCalculator {
             query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
-            sq_codes: self
-                .sq_codes
-                .values()
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .unwrap()
-                .values(),
+            sq_codes: self.sq_codes.values().as_primitive::<UInt8Type>().values(),
             dim,
         })
     }
@@ -254,18 +251,11 @@ impl<'a> SQDistCalculator<'a> {
     fn new(query: ArrayRef, sq_codes: &'a FixedSizeListArray, bounds: Range<f64>) -> Self {
         let query_sq_code =
             scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), bounds);
-        let sq_codes_values = sq_codes
-            .values()
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .unwrap()
-            .values();
+        let sq_codes_values = sq_codes.values().as_primitive::<UInt8Type>();
         let dim = sq_codes.value_length() as usize;
         Self {
             query_sq_code,
-            // TODO this should be replaced with
-            // sq_codes.values().as_any().downcast_ref::<UInt8Array>().unwrap().values();
-            sq_codes: sq_codes_values,
+            sq_codes: sq_codes_values.values(),
             dim,
         }
     }
