@@ -213,18 +213,26 @@ impl VectorStorage for ScalarQuantizationStorage {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator> {
+    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Box<dyn DistCalculator<'a> + 'a> {
         Box::new(SQDistCalculator::new(
             query,
-            self.sq_codes.clone(),
+            self.sq_codes.as_ref(),
             self.bounds.clone(),
         ))
     }
 
-    fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator> {
+    fn dist_calculator_from_id<'a>(&'a self, id: u32) -> Box<dyn DistCalculator<'a> + 'a> {
+        let dim = self.sq_codes.value_length() as usize;
         Box::new(SQDistCalculator {
             query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
-            sq_codes: self.sq_codes.clone(),
+            sq_codes: self
+                .sq_codes
+                .values()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .values(),
+            dim,
         })
     }
 
@@ -236,26 +244,60 @@ impl VectorStorage for ScalarQuantizationStorage {
     }
 }
 
-struct SQDistCalculator {
+struct SQDistCalculator<'a> {
     query_sq_code: Vec<u8>,
-    sq_codes: Arc<FixedSizeListArray>,
+    sq_codes: &'a [u8],
+    dim: usize,
 }
 
-impl SQDistCalculator {
-    fn new(query: ArrayRef, sq_codes: Arc<FixedSizeListArray>, bounds: Range<f64>) -> Self {
+impl<'a> SQDistCalculator<'a> {
+    fn new(query: ArrayRef, sq_codes: &'a FixedSizeListArray, bounds: Range<f64>) -> Self {
         let query_sq_code =
             scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), bounds);
+        let sq_codes_values = sq_codes
+            .values()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap()
+            .values();
+        let dim = sq_codes.value_length() as usize;
         Self {
             query_sq_code,
-            sq_codes,
+            // TODO this should be replaced with
+            // sq_codes.values().as_any().downcast_ref::<UInt8Array>().unwrap().values();
+            sq_codes: sq_codes_values,
+            dim,
         }
     }
 }
 
-impl DistCalculator for SQDistCalculator {
+impl<'a> DistCalculator<'a> for SQDistCalculator<'a> {
     fn distance(&self, id: u32) -> f32 {
-        let sq_code = get_sq_code(&self.sq_codes, id);
+        let sq_code = &self.sq_codes[id as usize * self.dim..(id as usize + 1) * self.dim];
         l2_distance_uint_scalar(sq_code, &self.query_sq_code)
+    }
+    #[allow(unused_variables)]
+    fn prefetch(&self, _id: u32) {
+        const CACHE_LINE_SIZE: usize = 64;
+        unsafe {
+            use std::process::id;
+            let base_ptr = self.sq_codes.as_ptr().add(id as usize * self.dim);
+
+            // Loop over the sq_code to prefetch each cache line
+            for offset in (0..self.dim).step_by(CACHE_LINE_SIZE) {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    use core::arch::x86_64::_mm_prefetch;
+                    const _MM_HINT_T0: i32 = 1;
+                    _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
+                }
+                // #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                // {
+                //     use core::arch::aarch64::__pld;
+                //     __pld(base_ptr.add(offset));
+                // }
+            }
+        }
     }
 }
 

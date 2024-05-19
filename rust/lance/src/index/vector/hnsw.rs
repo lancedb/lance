@@ -10,14 +10,13 @@ use std::{
 
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use async_trait::async_trait;
-use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
-use lance_index::vector::quantizer::Quantizer;
+use lance_index::vector::{hnsw::HNSW, quantizer::Quantizer};
 use lance_index::{
     vector::{
         graph::{VectorStorage, NEIGHBORS_FIELD},
-        hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
+        hnsw::{HnswMetadata, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization},
         Query,
@@ -45,7 +44,11 @@ pub(crate) struct HNSWIndexOptions {
 
 #[derive(Clone)]
 pub(crate) struct HNSWIndex<Q: Quantization> {
-    hnsw: Arc<HNSW>,
+    distance_type: DistanceType,
+
+    // Some(T) if the index is loaded, None otherwise
+    hnsw: Option<HNSW>,
+    storage: Option<Arc<dyn VectorStorage>>,
 
     // TODO: move these into IVFIndex after the refactor is complete
     partition_storage: IvfQuantizationStorage<Q>,
@@ -62,7 +65,7 @@ impl<Q: Quantization> Debug for HNSWIndex<Q> {
 
 impl<Q: Quantization> HNSWIndex<Q> {
     pub async fn try_new(
-        hnsw: HNSW,
+        distance_type: DistanceType,
         reader: Arc<dyn Reader>,
         aux_reader: Arc<dyn Reader>,
         options: HNSWIndexOptions,
@@ -79,7 +82,9 @@ impl<Q: Quantization> HNSWIndex<Q> {
 
         let ivf_store = IvfQuantizationStorage::open(aux_reader).await?;
         Ok(Self {
-            hnsw: Arc::new(hnsw),
+            distance_type,
+            hnsw: None,
+            storage: None,
             partition_storage: ivf_store,
             partition_metadata,
             options,
@@ -145,10 +150,21 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let schema = RESULT_SCHEMA.clone();
 
-        if self.hnsw.is_empty() {
+        let hnsw = self.hnsw.as_ref().ok_or(Error::Index {
+            message: "HNSW index not loaded".to_string(),
+            location: location!(),
+        })?;
+
+        let storage = self.storage.as_ref().ok_or(Error::Index {
+            message: "vector storage not loaded".to_string(),
+            location: location!(),
+        })?;
+
+        if hnsw.is_empty() {
             return Ok(RecordBatch::new_empty(schema));
         }
-        let row_ids = self.hnsw.storage().row_ids();
+
+        let row_ids = storage.row_ids();
         let bitmap = if pre_filter.is_empty() {
             None
         } else {
@@ -175,9 +191,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             });
         }
 
-        let hnsw = self.hnsw.clone();
-        let key = query.key.clone();
-        let results = spawn_cpu(move || hnsw.search(key, k, ef, bitmap)).await?;
+        let results = hnsw.search_basic(query.key.clone(), k, ef, bitmap, storage.as_ref())?;
 
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.id as usize]));
         let distances = Arc::new(Float32Array::from_iter_values(
@@ -225,14 +239,13 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         )
         .await?;
 
-        let hnsw = HNSW::load(
-            &reader,
-            Arc::new(self.partition_storage.load_partition(0).await?),
-        )
-        .await?;
+        let storage = Arc::new(self.partition_storage.load_partition(0).await?);
+        let hnsw = HNSW::load(&reader, storage.clone()).await?;
 
         Ok(Box::new(Self {
-            hnsw: Arc::new(hnsw),
+            distance_type: self.distance_type,
+            hnsw: Some(hnsw),
+            storage: Some(storage),
             partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),
@@ -249,17 +262,20 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         let reader = FileReader::try_new_self_described_from_reader(reader, None).await?;
 
         let metadata = self.get_partition_metadata(partition_id)?;
+        let storage = Arc::new(self.partition_storage.load_partition(partition_id).await?);
         let hnsw = HNSW::load_partition(
             &reader,
             offset..offset + length,
             self.metric_type(),
-            Arc::new(self.partition_storage.load_partition(partition_id).await?),
+            storage.clone(),
             metadata,
         )
         .await?;
 
         Ok(Box::new(Self {
-            hnsw: Arc::new(hnsw),
+            distance_type: self.distance_type,
+            hnsw: Some(hnsw),
+            storage: Some(storage),
             partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),
@@ -267,7 +283,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     }
 
     fn storage(&self) -> &dyn VectorStorage {
-        self.hnsw.storage()
+        panic!("TODO figure out how to implement this safely.")
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
@@ -278,6 +294,6 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     }
 
     fn metric_type(&self) -> DistanceType {
-        self.hnsw.distance_type()
+        self.distance_type
     }
 }

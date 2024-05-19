@@ -468,7 +468,7 @@ impl PQDistCalculator {
     }
 }
 
-impl DistCalculator for PQDistCalculator {
+impl DistCalculator<'_> for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let pq_code = self.get_pq_code(id);
         pq_code
