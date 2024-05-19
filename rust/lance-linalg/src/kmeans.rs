@@ -545,19 +545,19 @@ pub fn compute_partitions_arrow_array(
         (DataType::Float16, DataType::Float16) => Ok(compute_partitions(
             centroids.values().as_primitive::<Float16Type>().values(),
             vectors.values().as_primitive::<Float16Type>().values(),
-            centroids.len(),
+            centroids.value_length(),
             distance_type,
         )),
         (DataType::Float32, DataType::Float32) => Ok(compute_partitions(
             centroids.values().as_primitive::<Float32Type>().values(),
             vectors.values().as_primitive::<Float32Type>().values(),
-            centroids.len(),
+            centroids.value_length(),
             distance_type,
         )),
         (DataType::Float64, DataType::Float64) => Ok(compute_partitions(
             centroids.values().as_primitive::<Float64Type>().values(),
             vectors.values().as_primitive::<Float64Type>().values(),
-            centroids.len(),
+            centroids.value_length(),
             distance_type,
         )),
         _ => Err(ArrowError::InvalidArgumentError(

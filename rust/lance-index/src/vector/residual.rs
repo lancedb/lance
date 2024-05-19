@@ -51,10 +51,6 @@ impl ResidualTransform {
             vec_col: column.to_owned(),
         }
     }
-
-    fn dimension(&self) -> usize {
-        self.centroids.value_length() as usize
-    }
 }
 
 fn do_compute_residual<T: ArrowPrimitiveType>(
