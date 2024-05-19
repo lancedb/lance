@@ -20,7 +20,7 @@ use arrow_schema::Field;
 use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::datatypes::Schema;
+use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
@@ -28,14 +28,14 @@ use lance_io::stream::RecordBatchStream;
 use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
-
-use crate::vector::transform::{KeepFiniteVectors, Transformer};
-use crate::vector::PART_ID_COLUMN;
-use lance_core::{Error, Result, ROW_ID};
 use log::info;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
+
+use crate::vector::ivf::Ivf;
+use crate::vector::transform::{KeepFiniteVectors, Transformer};
+use crate::vector::PART_ID_COLUMN;
 
 const UNSORTED_BUFFER: &str = "unsorted.lance";
 
@@ -70,7 +70,7 @@ fn get_temp_dir() -> Result<Path> {
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
-    ivf: Arc<dyn crate::vector::ivf::Ivf>,
+    ivf: Arc<Ivf>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
     shuffle_partition_batches: usize,

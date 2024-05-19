@@ -60,19 +60,18 @@ pub(super) async fn build_partitions(
         });
     }
 
-    let ivf_model = lance_index::vector::ivf::new_ivf_with_pq(
-        ivf.centroids.values(),
-        ivf.centroids.value_length() as usize,
+    let ivf_model = lance_index::vector::ivf::Ivf::with_pq(
+        ivf.centroids.clone(),
         metric_type,
         column,
         pq.clone(),
         Some(part_range),
-    )?;
+    );
 
     let stream = shuffle_dataset(
         data,
         column,
-        ivf_model,
+        ivf_model.into(),
         precomputed_partitons,
         ivf.num_partitions() as u32,
         shuffle_partition_batches,
@@ -107,8 +106,6 @@ pub(super) async fn build_hnsw_partitions(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<(Vec<HnswMetadata>, IvfData)> {
-    let dim = ivf.dimension();
-
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
         return Err(Error::Schema {
@@ -131,8 +128,7 @@ pub(super) async fn build_hnsw_partitions(
     }
 
     let ivf_model = lance_index::vector::ivf::new_ivf_with_quantizer(
-        ivf.centroids.values(),
-        dim,
+        ivf.centroids.clone(),
         metric_type,
         column,
         quantizer.clone(),
@@ -142,7 +138,7 @@ pub(super) async fn build_hnsw_partitions(
     let stream = shuffle_dataset(
         data,
         column,
-        ivf_model,
+        ivf_model.into(),
         precomputed_partitons,
         ivf.num_partitions() as u32,
         shuffle_partition_batches,

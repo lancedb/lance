@@ -6,7 +6,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
@@ -14,10 +13,10 @@ use arrow_schema::Field;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_arrow::{ArrowFloatType, FloatArray, RecordBatchExt};
+use lance_arrow::RecordBatchExt;
 use lance_core::Result;
-use lance_linalg::distance::{Dot, MetricType, Normalize, L2};
-use lance_linalg::MatrixView;
+use lance_linalg::distance::DistanceType;
+use lance_linalg::kmeans::compute_partitions_arrow_array;
 
 use crate::vector::transform::Transformer;
 
@@ -31,28 +30,22 @@ use super::PART_ID_COLUMN;
 /// this transform is a Noop.
 ///
 #[derive(Debug)]
-pub struct IvfTransformer<T: ArrowFloatType>
-where
-    T::Native: Dot + L2,
-{
-    centroids: MatrixView<T>,
-    metric_type: MetricType,
+pub struct IvfTransformer {
+    centroids: FixedSizeListArray,
+    distance_type: DistanceType,
     input_column: String,
     output_column: String,
 }
 
-impl<T: ArrowFloatType> IvfTransformer<T>
-where
-    T::Native: Dot + L2 + Normalize,
-{
+impl IvfTransformer {
     pub fn new(
-        centroids: MatrixView<T>,
-        metric_type: MetricType,
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
         input_column: impl AsRef<str>,
     ) -> Self {
         Self {
             centroids,
-            metric_type,
+            distance_type,
             input_column: input_column.as_ref().to_owned(),
             output_column: PART_ID_COLUMN.to_owned(),
         }
@@ -62,26 +55,12 @@ where
     ///
     #[instrument(level = "debug", skip(data))]
     pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
-        use lance_linalg::kmeans::compute_partitions;
-
-        compute_partitions::<T>(
-            self.centroids.data(),
-            data.values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .unwrap()
-                .as_slice(),
-            data.value_length() as usize,
-            self.metric_type,
-        )
-        .into()
+        compute_partitions_arrow_array(&self.centroids, data, self.distance_type)
+            .expect("failed to compute partitions")
+            .into()
     }
 }
-
-impl<T: ArrowFloatType + ArrowPrimitiveType> Transformer for IvfTransformer<T>
-where
-    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
-{
+impl Transformer for IvfTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {
             // If the partition ID column is already present, we don't need to compute it again.

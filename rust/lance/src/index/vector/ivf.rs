@@ -334,14 +334,13 @@ async fn optimize_ivf_pq_indices(
     let dim = first_idx.ivf.dimension();
 
     // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
-    let ivf = lance_index::vector::ivf::new_ivf_with_pq(
-        first_idx.ivf.centroids.values(),
-        first_idx.ivf.dimension(),
+    let ivf = lance_index::vector::ivf::Ivf::with_pq(
+        first_idx.ivf.centroids.clone(),
         metric_type,
         vector_column,
         pq_index.pq.clone(),
         None,
-    )?;
+    );
 
     // Shuffled un-indexed data with partition.
     let shuffled = if let Some(stream) = unindexed {
@@ -349,7 +348,7 @@ async fn optimize_ivf_pq_indices(
             shuffle_dataset(
                 stream,
                 vector_column,
-                ivf,
+                ivf.into(),
                 None,
                 first_idx.ivf.num_partitions() as u32,
                 10000,
@@ -416,8 +415,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
     let ivf = lance_index::vector::ivf::new_ivf_with_quantizer(
-        first_idx.ivf.centroids.values(),
-        first_idx.ivf.dimension(),
+        first_idx.ivf.centroids.clone(),
         distance_type,
         vector_column,
         quantizer.clone(),
@@ -430,7 +428,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
             shuffle_dataset(
                 stream,
                 vector_column,
-                ivf,
+                Arc::new(ivf),
                 None,
                 first_idx.ivf.num_partitions() as u32,
                 10000,
@@ -555,7 +553,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::with_centroids(ivf_mut.centroids.clone());
+    let mut ivf_data = IvfData::with_centroids(Arc::new(ivf_mut.centroids.clone()));
     for length in ivf_mut.lengths {
         ivf_data.add_partition(length);
     }
@@ -836,7 +834,7 @@ pub(crate) struct Ivf {
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
     /// memory allocator.
-    pub(crate) centroids: Arc<FixedSizeListArray>,
+    pub(crate) centroids: FixedSizeListArray,
 
     /// Offset of each partition in the file.
     offsets: Vec<usize>,
@@ -846,7 +844,7 @@ pub(crate) struct Ivf {
 }
 
 impl Ivf {
-    pub(super) fn new(centroids: Arc<FixedSizeListArray>) -> Self {
+    pub(super) fn new(centroids: FixedSizeListArray) -> Self {
         Self {
             centroids,
             offsets: vec![],
@@ -871,13 +869,8 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        let internal = lance_index::vector::ivf::new_ivf(
-            self.centroids.values(),
-            self.dimension(),
-            metric_type,
-            vec![],
-            None,
-        )?;
+        let internal =
+            lance_index::vector::ivf::new_ivf(self.centroids.clone(), metric_type, vec![]);
         internal.find_partitions(query, nprobes)
     }
 
@@ -903,7 +896,7 @@ impl TryFrom<&Ivf> for pb::Ivf {
             centroids: vec![],
             offsets: ivf.offsets.iter().map(|o| *o as u64).collect(),
             lengths: ivf.lengths.clone(),
-            centroids_tensor: Some(ivf.centroids.as_ref().try_into()?),
+            centroids_tensor: Some((&ivf.centroids).try_into()?),
         })
     }
 }
@@ -915,16 +908,13 @@ impl TryFrom<&pb::Ivf> for Ivf {
     fn try_from(proto: &pb::Ivf) -> Result<Self> {
         let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
             debug!("Ivf: loading IVF centroids from index format v2");
-            Arc::new(FixedSizeListArray::try_from(tensor)?)
+            FixedSizeListArray::try_from(tensor)?
         } else {
             debug!("Ivf: loading IVF centroids from index format v1");
             // For backward-compatibility
             let f32_centroids = Float32Array::from(proto.centroids.clone());
             let dimension = f32_centroids.len() / proto.lengths.len();
-            Arc::new(FixedSizeListArray::try_new_from_values(
-                f32_centroids,
-                dimension as i32,
-            )?)
+            FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?
         };
 
         let mut ivf = Self {
@@ -1051,7 +1041,7 @@ pub(super) async fn build_ivf_model(
                 location: location!(),
             });
         }
-        return Ok(Ivf::new(centroids.clone()));
+        return Ok(Ivf::new(centroids.as_ref().clone()));
     }
     let sample_size_hint = params.num_partitions * params.sample_rate;
 
@@ -1602,7 +1592,7 @@ async fn write_ivf_hnsw_file(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::with_centroids(ivf.centroids.clone());
+    let mut ivf_data = IvfData::with_centroids(Arc::new(ivf.centroids.clone()));
     for length in ivf.lengths {
         ivf_data.add_partition(length);
     }
@@ -1637,10 +1627,10 @@ where
         params.sample_rate,
     )
     .await?;
-    Ok(Ivf::new(Arc::new(FixedSizeListArray::try_new_from_values(
+    Ok(Ivf::new(FixedSizeListArray::try_new_from_values(
         centroids,
         dimension as i32,
-    )?)))
+    )?))
 }
 
 /// Train IVF partitions using kmeans.
