@@ -24,8 +24,8 @@ fn bench_compute_partitions(c: &mut Criterion) {
 
     c.bench_function("compute_centroids(L2)", |b| {
         b.iter(|| {
-            compute_partitions::<Float32Type>(
-                centroids.clone(),
+            compute_partitions(
+                centroids.values(),
                 input.values(),
                 DIMENSION,
                 MetricType::L2,
@@ -35,8 +35,8 @@ fn bench_compute_partitions(c: &mut Criterion) {
 
     c.bench_function("compute_centroids(Cosine)", |b| {
         b.iter(|| {
-            compute_partitions::<Float32Type>(
-                centroids.clone(),
+            compute_partitions(
+                centroids.values(),
                 input.values(),
                 DIMENSION,
                 MetricType::Cosine,

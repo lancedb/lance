@@ -456,6 +456,47 @@ where
     }
 }
 
+pub fn kmeans_find_partitions_arrow_array(
+    centroids: &FixedSizeListArray,
+    query: &dyn Array,
+    nprobes: usize,
+    distance_type: DistanceType,
+) -> Result<UInt32Array> {
+    if centroids.value_length() as usize != query.len() {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Centroids and vectors have different dimensions: {} != {}",
+            centroids.value_length(),
+            query.len()
+        )));
+    }
+
+    match (centroids.value_type(), query.data_type()) {
+        (DataType::Float16, DataType::Float16) => Ok(kmeans_find_partitions(
+            centroids.values().as_primitive::<Float16Type>().values(),
+            query.as_primitive::<Float16Type>().values(),
+            nprobes,
+            distance_type,
+        )?),
+        (DataType::Float32, DataType::Float32) => Ok(kmeans_find_partitions(
+            centroids.values().as_primitive::<Float32Type>().values(),
+            query.as_primitive::<Float32Type>().values(),
+            nprobes,
+            distance_type,
+        )?),
+        (DataType::Float64, DataType::Float64) => Ok(kmeans_find_partitions(
+            centroids.values().as_primitive::<Float64Type>().values(),
+            query.as_primitive::<Float64Type>().values(),
+            nprobes,
+            distance_type,
+        )?),
+        _ => Err(ArrowError::InvalidArgumentError(format!(
+            "Centroids and vectors have different types: {} != {}",
+            centroids.value_type(),
+            query.data_type()
+        ))),
+    }
+}
+
 /// KMeans finds N nearest partitions.
 ///
 /// Parameters:
