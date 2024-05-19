@@ -24,6 +24,7 @@ use tokio::io::AsyncWrite;
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
+use crate::dataset::WriteParams;
 use crate::Dataset;
 
 /// A dataset generator that can generate random layouts. This is used to test
@@ -34,15 +35,20 @@ use crate::Dataset;
 pub struct TestDatasetGenerator {
     seed: Option<u64>,
     data: Vec<RecordBatch>,
+    use_experimental_writer: bool,
 }
 
 impl TestDatasetGenerator {
     /// Create a new dataset generator with the given data.
     ///
     /// Each batch will become a separate fragment in the dataset.
-    pub fn new(data: Vec<RecordBatch>) -> Self {
+    pub fn new(data: Vec<RecordBatch>, use_experimental_writer: bool) -> Self {
         assert!(!data.is_empty());
-        Self { data, seed: None }
+        Self {
+            data,
+            seed: None,
+            use_experimental_writer,
+        }
     }
 
     /// Set the seed for the random number generator.
@@ -188,6 +194,10 @@ impl TestDatasetGenerator {
             let reader = RecordBatchIterator::new(vec![Ok(data)], file_arrow_schema.clone());
             let sub_frag = FragmentCreateBuilder::new(uri)
                 .schema(&file_schema)
+                .write_params(&WriteParams {
+                    use_experimental_writer: self.use_experimental_writer,
+                    ..Default::default()
+                })
                 .write(reader, None)
                 .await
                 .unwrap();
@@ -385,9 +395,11 @@ mod tests {
     use super::*;
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields};
+    use rstest::rstest;
 
+    #[rstest]
     #[test]
-    fn test_make_schema() {
+    fn test_make_schema(#[values(false, true)] use_experimental_writer: bool) {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new(
@@ -405,7 +417,7 @@ mod tests {
         ]));
         let data = vec![RecordBatch::new_empty(arrow_schema.clone())];
 
-        let generator = TestDatasetGenerator::new(data);
+        let generator = TestDatasetGenerator::new(data, use_experimental_writer);
         let schema = generator.make_schema(&mut rand::thread_rng());
 
         let roundtripped_schema = ArrowSchema::from(&schema);
@@ -427,8 +439,9 @@ mod tests {
         assert!(num_holes > 0, "Expected at least one hole in the field ids");
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_make_fragment() {
+    async fn test_make_fragment(#[values(false, true)] use_experimental_writer: bool) {
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let struct_fields: ArrowFields = vec![
@@ -458,7 +471,7 @@ mod tests {
         )
         .unwrap();
 
-        let generator = TestDatasetGenerator::new(vec![data.clone()]);
+        let generator = TestDatasetGenerator::new(vec![data.clone()], use_experimental_writer);
         let mut rng = rand::thread_rng();
         for _ in 1..50 {
             let schema = generator.make_schema(&mut rng);
@@ -488,8 +501,9 @@ mod tests {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_make_hostile() {
+    async fn test_make_hostile(#[values(false, true)] use_experimental_writer: bool) {
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -519,7 +533,7 @@ mod tests {
         ];
 
         let seed = 42;
-        let generator = TestDatasetGenerator::new(data.clone()).seed(seed);
+        let generator = TestDatasetGenerator::new(data.clone(), use_experimental_writer).seed(seed);
 
         let path = tmp_dir.path().join("ds1");
         let dataset = generator.make_hostile(path.to_str().unwrap()).await;
@@ -541,7 +555,7 @@ mod tests {
                 .map(|rb| rb.project(&projection).unwrap())
                 .collect::<Vec<RecordBatch>>();
 
-            let generator = TestDatasetGenerator::new(data.clone());
+            let generator = TestDatasetGenerator::new(data.clone(), use_experimental_writer);
             // Sample a few
             for i in 1..20 {
                 let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));

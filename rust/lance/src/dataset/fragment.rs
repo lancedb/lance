@@ -17,7 +17,7 @@ use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
-use futures::{join, stream, Future, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::ROW_ID_FIELD;
@@ -72,6 +72,13 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     /// Reads all rows from the file, returning as a stream of tasks
     fn read_all_tasks(
         &self,
+        batch_size: u32,
+        projection: Arc<lance_core::datatypes::Schema>,
+    ) -> Result<ReadBatchTaskStream>;
+    /// Take specific rows from the file, returning as a stream of tasks
+    fn take_all_tasks(
+        &self,
+        indices: &[u32],
         batch_size: u32,
         projection: Arc<lance_core::datatypes::Schema>,
     ) -> Result<ReadBatchTaskStream>;
@@ -186,6 +193,26 @@ impl GenericFileReader for FileReader {
         Ok(ranges_to_tasks(self, ranges, projection))
     }
 
+    fn take_all_tasks(
+        &self,
+        indices: &[u32],
+        _batch_size: u32,
+        projection: Arc<Schema>,
+    ) -> Result<ReadBatchTaskStream> {
+        let indices_vec = indices.to_vec();
+        let mut reader = self.clone();
+        // In the new path the row id is added by the fragment and not the file
+        reader.with_row_id(false);
+        let task_fut =
+            async move { reader.take(&indices_vec, projection.as_ref(), None).await }.boxed();
+        let task = std::future::ready(ReadBatchTask {
+            task: task_fut,
+            num_rows: indices.len() as u32,
+        })
+        .boxed();
+        Ok(futures::stream::once(task).boxed())
+    }
+
     /// Return the number of rows in the file
     fn len(&self) -> u32 {
         self.len() as u32
@@ -282,6 +309,24 @@ mod v2_adapter {
             Ok(self
                 .reader
                 .read_tasks(ReadBatchParams::RangeFull, batch_size, &projection)?
+                .map(|v2_task| ReadBatchTask {
+                    task: v2_task.task.map_err(Error::from).boxed(),
+                    num_rows: v2_task.num_rows,
+                })
+                .boxed())
+        }
+
+        fn take_all_tasks(
+            &self,
+            indices: &[u32],
+            batch_size: u32,
+            projection: Arc<Schema>,
+        ) -> Result<ReadBatchTaskStream> {
+            let indices = UInt32Array::from(indices.to_vec());
+            let projection = self.projection_from_lance(projection.as_ref());
+            Ok(self
+                .reader
+                .read_tasks(ReadBatchParams::Indices(indices), batch_size, &projection)?
                 .map(|v2_task| ReadBatchTask {
                     task: v2_task.task.map_err(Error::from).boxed(),
                     num_rows: v2_task.num_rows,
@@ -879,7 +924,8 @@ impl FileFragment {
             let range = (row_ids[0] as usize)..(row_ids[row_ids.len() - 1] as usize + 1);
             reader.legacy_read_range_as_batch(range).await
         } else {
-            reader.take(row_ids).await
+            // FIXME, change this method to streams
+            reader.take_as_batch(row_ids).await
         }
     }
 
@@ -1224,6 +1270,9 @@ impl FragmentReader {
         self
     }
 
+    /// TODO: This method is relied upon by the v1 pushdown mechanism and will need to stay
+    /// in place until v1 is removed.  v2 uses a different mechanism for pushdown and so there
+    /// is little benefit in updating the v1 pushdown node.
     pub(crate) fn legacy_num_batches(&self) -> usize {
         let legacy_reader = self.readers[0].0.as_legacy();
         let num_batches = legacy_reader.num_batches();
@@ -1236,6 +1285,13 @@ impl FragmentReader {
         num_batches
     }
 
+    /// TODO: This method is relied upon by the v1 pushdown mechanism and will need to stay
+    /// in place until v1 is removed.  v2 uses a different mechanism for pushdown and so there
+    /// is little benefit in updating the v1 pushdown node.
+    ///
+    /// This method is also used by the updater.  Even though the updater has been updated to
+    /// use streams, the updater still needs to know the batch size in v1 so that it can create
+    /// files with the same batch size.
     pub(crate) fn legacy_num_rows_in_batch(&self, batch_id: u32) -> Option<u32> {
         if let Some(legacy_reader) = self.readers[0].0.as_legacy_opt() {
             if batch_id < legacy_reader.num_batches() as u32 {
@@ -1249,6 +1305,10 @@ impl FragmentReader {
     }
 
     /// Read the page statistics of the fragment for the specified fields.
+    ///
+    /// TODO: This method is relied upon by the v1 pushdown mechanism and will need to stay
+    /// in place until v1 is removed.  v2 uses a different mechanism for pushdown and so there
+    /// is little benefit in updating the v1 pushdown node.
     pub(crate) async fn legacy_read_page_stats(
         &self,
         projection: Option<&Schema>,
@@ -1272,12 +1332,13 @@ impl FragmentReader {
         }
     }
 
+    #[cfg(test)]
     async fn read_impl<'a, Fut>(
         &'a self,
         read_fn: impl Fn(&'a dyn GenericFileReader, &'a Schema) -> Fut,
     ) -> Result<RecordBatch>
     where
-        Fut: Future<Output = Result<RecordBatch>> + 'a,
+        Fut: std::future::Future<Output = Result<RecordBatch>> + 'a,
     {
         let futures = self
             .readers
@@ -1309,6 +1370,10 @@ impl FragmentReader {
     ///
     /// Note: the projection must be a subset of the schema the reader was created with.
     /// Otherwise incorrect data will be returned.
+    ///
+    /// TODO: This method is relied upon by the v1 pushdown mechanism and will need to stay
+    /// in place until v1 is removed.  v2 uses a different mechanism for pushdown and so there
+    /// is little benefit in updating the v1 pushdown node.
     pub(crate) async fn legacy_read_batch_projected(
         &self,
         batch_id: usize,
@@ -1379,7 +1444,7 @@ impl FragmentReader {
         if !params.valid_given_len(total_num_rows as usize) {
             return Err(Error::invalid_input(
                 format!(
-                    "Invalid read params {:?} for fragment with {} addressible rows",
+                    "Invalid read params {} for fragment with {} addressible rows",
                     params, total_num_rows
                 ),
                 location!(),
@@ -1517,15 +1582,25 @@ impl FragmentReader {
     }
 
     /// Take rows from this fragment.
-    pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
-        self.read_impl(move |reader, schema| {
-            reader.as_legacy().take(
-                indices,
-                schema,
-                self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
-            )
-        })
-        .await
+    pub async fn take(&self, indices: &[u32], batch_size: u32) -> Result<ReadBatchFutStream> {
+        let indices_arr = UInt32Array::from(indices.to_vec());
+        self.new_read_impl(
+            ReadBatchParams::Indices(indices_arr),
+            batch_size,
+            move |reader, schema| reader.take_all_tasks(indices, batch_size, schema.clone()),
+        )
+    }
+
+    /// Take rows from this fragment, will perform a copy if the underlying reader returns multiple
+    /// batches.  May return an error if the taken rows do not fit into a single batch.
+    pub async fn take_as_batch(&self, indices: &[u32]) -> Result<RecordBatch> {
+        let batches = self
+            .take(indices, u32::MAX)
+            .await?
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+        concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
     }
 }
 
@@ -2217,7 +2292,7 @@ mod tests {
             .unwrap()
             .open(dataset.schema(), false)
             .await?;
-        let actual_data = reader.take(&[0, 1, 2]).await?;
+        let actual_data = reader.take_as_batch(&[0, 1, 2]).await?;
         assert_eq!(expected_data.slice(0, 3), actual_data);
 
         let actual_data = reader.legacy_read_range_as_batch(0..3).await?;

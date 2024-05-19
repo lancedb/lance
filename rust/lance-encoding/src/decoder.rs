@@ -292,7 +292,7 @@ impl DecodeBatchScheduler {
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean | DataType::Null => true,
+                DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
                 DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
                 _ => false,
             }
