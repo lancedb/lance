@@ -289,6 +289,14 @@ impl HNSW {
         }
     }
 
+    pub fn schema() -> arrow_schema::Schema {
+        arrow_schema::Schema::new(vec![
+            VECTOR_ID_FIELD.clone(),
+            NEIGHBORS_FIELD.clone(),
+            DIST_FIELD.clone(),
+        ])
+    }
+
     /// Write the HNSW graph to a Lance file.
     pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
         let offsets = self.write_levels(writer).await?;
