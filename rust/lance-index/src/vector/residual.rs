@@ -66,7 +66,7 @@ where
     let centroids_slice = centroids.values().as_primitive::<T>().values();
     let vectors_slice = vectors.values().as_primitive::<T>().values();
 
-    let part_ids = partitions.map(|p| p.clone()).unwrap_or_else(|| {
+    let part_ids = partitions.cloned().unwrap_or_else(|| {
         compute_partitions(
             centroids_slice,
             vectors_slice,
@@ -88,7 +88,7 @@ where
                 .map(|(v, cent)| *v - *cent)
         })
         .collect::<Vec<_>>();
-    let residual_arr = PrimitiveArray::<T>::from_iter_values(residuals.into_iter());
+    let residual_arr = PrimitiveArray::<T>::from_iter_values(residuals);
     Ok(FixedSizeListArray::try_new_from_values(
         residual_arr,
         dimension as i32,
