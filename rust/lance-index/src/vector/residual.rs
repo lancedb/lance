@@ -123,7 +123,7 @@ pub(crate) fn compute_residual(
         });
     }
     // TODO: Bf16 is not supported yet.
-    match (centroids.data_type(), vectors.value_type()) {
+    match (centroids.value_type(), vectors.value_type()) {
         (DataType::Float16, DataType::Float16) => {
             do_compute_residual::<Float16Type>(centroids, vectors, distance_type, partitions)
         }
@@ -136,7 +136,7 @@ pub(crate) fn compute_residual(
         _ => Err(Error::Index {
             message: format!(
                 "Compute residual vector: centroids and vector type mismatch: centroid: {}, vector: {}",
-                centroids.data_type(),
+                centroids.value_type(),
                 vectors.value_type(),
             ),
             location: location!(),
