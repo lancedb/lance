@@ -106,8 +106,6 @@ pub(super) async fn build_hnsw_partitions(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<(Vec<HnswMetadata>, IvfData)> {
-    let dim = ivf.dimension();
-
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
         return Err(Error::Schema {

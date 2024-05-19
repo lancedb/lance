@@ -517,16 +517,9 @@ mod tests {
         let vectors = normalize_fsl(&vectors).unwrap();
         let row = vectors.slice(0, 1);
 
-        let ivf2 = lance_index::vector::ivf::new_ivf(
-            ivf.centroids.values(),
-            ivf.dimension(),
-            MetricType::L2,
-            vec![],
-            None,
-        )
-        .unwrap();
+        let ivf2 = lance_index::vector::ivf::new_ivf(ivf.centroids.clone(), MetricType::L2, vec![]);
 
-        let residual_query = ivf2.compute_residual(&row, None).unwrap();
+        let residual_query = ivf2.compute_residual(&row).unwrap();
         let pq_code = pq.transform(&residual_query).unwrap();
         let distances = pq
             .compute_distances(

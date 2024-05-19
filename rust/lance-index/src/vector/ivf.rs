@@ -6,14 +6,13 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, Array, FixedSizeListArray, RecordBatch, UInt32Array};
+use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array};
 
 pub use builder::IvfBuildParams;
-use lance_core::{Error, Result};
+use lance_core::Result;
 use lance_linalg::{
-    distance::{DistanceType, MetricType, Normalize},
-    kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array, KMeans},
-    Clustering,
+    distance::{DistanceType, MetricType},
+    kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array},
 };
 
 use crate::vector::ivf::transform::IvfTransformer;
@@ -187,10 +186,6 @@ impl Ivf {
             distance_type: metric_type,
             transforms,
         }
-    }
-
-    fn dimension(&self) -> usize {
-        self.centroids.value_length() as usize
     }
 
     #[inline]
