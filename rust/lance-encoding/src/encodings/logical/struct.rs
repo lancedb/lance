@@ -485,7 +485,7 @@ impl ChildState {
             num_rows,
             self.rows_available
         );
-        let mut remaining = num_rows.saturating_sub(self.rows_available as u64);
+        let mut remaining = num_rows.saturating_sub(self.rows_available);
         for next_decoder in &mut self.scheduled {
             if next_decoder.unawaited() > 0 {
                 let rows_to_wait = remaining.min(next_decoder.unawaited() as u64) as u32;
@@ -590,7 +590,7 @@ impl SimpleStructDecoder {
             .unwrap()
     }
 
-    pub fn wait_u64<'a>(&'a mut self, num_rows: u64) -> BoxFuture<'a, Result<()>> {
+    pub fn wait_u64(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
         async move {
             for child in self.children.iter_mut() {
                 child.wait(num_rows).await?;

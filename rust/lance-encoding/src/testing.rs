@@ -244,6 +244,7 @@ async fn check_round_trip_encoding_inner(
         &column_infos,
         concat_data.clone(),
         |mut decode_scheduler, tx| {
+            #[allow(clippy::single_range_in_vec_init)]
             let root_decoder = decode_scheduler
                 .root_scheduler
                 .new_root_decoder_ranges(&[0..num_rows]);
@@ -275,6 +276,7 @@ async fn check_round_trip_encoding_inner(
             &column_infos,
             expected,
             |mut decode_scheduler, tx| {
+                #[allow(clippy::single_range_in_vec_init)]
                 let root_decoder = decode_scheduler
                     .root_scheduler
                     .new_root_decoder_ranges(&[0..num_rows]);

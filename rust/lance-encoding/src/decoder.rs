@@ -547,11 +547,8 @@ impl DecodeBatchScheduler {
         trace!("Scheduling range {:?} ({} rows)", range, rows_to_read);
 
         let mut context = SchedulerContext::new(sink, scheduler);
-        self.root_scheduler.schedule_ranges_u64(
-            &[range.clone()],
-            &mut context,
-            range.start as u64,
-        )?;
+        self.root_scheduler
+            .schedule_ranges_u64(&[range.clone()], &mut context, range.start)?;
 
         trace!("Finished scheduling of range {:?}", range);
         Ok(())
@@ -589,7 +586,7 @@ impl DecodeBatchScheduler {
         let mut context = SchedulerContext::new(sink, scheduler);
 
         self.root_scheduler
-            .schedule_take_u64(&indices, &mut context, indices[0] as u64)?;
+            .schedule_take_u64(indices, &mut context, indices[0])?;
         trace!("Finished scheduling take of {} rows", indices.len());
         Ok(())
     }
@@ -1086,6 +1083,7 @@ pub async fn decode_batch(batch: &EncodedBatch) -> Result<RecordBatch> {
     decode_scheduler
         .schedule_range(0..batch.num_rows, tx, io_scheduler)
         .await?;
+    #[allow(clippy::single_range_in_vec_init)]
     let root_decoder = decode_scheduler
         .root_scheduler
         .new_root_decoder_ranges(&[0..batch.num_rows]);
