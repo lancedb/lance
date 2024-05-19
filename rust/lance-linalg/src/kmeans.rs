@@ -448,21 +448,7 @@ where
         assert!(_nprobes.is_none());
 
         let centroids = self.centroids.as_ref().as_slice();
-        data.par_chunks(self.dimension)
-            .map(|vec| {
-                argmin_value(match self.distance_type {
-                    DistanceType::L2 => l2_distance_batch(vec, centroids, self.dimension),
-                    DistanceType::Dot => dot_distance_batch(vec, centroids, self.dimension),
-                    _ => {
-                        panic!(
-                            "KMeans::find_partitions: {} is not supported",
-                            self.distance_type
-                        );
-                    }
-                })
-                .map(|(idx, _)| idx)
-            })
-            .collect::<Vec<_>>()
+        compute_partitions(centroids, data, self.dimension, self.distance_type)
     }
 }
 
@@ -502,17 +488,28 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
 /// Compute partition ID of each vector in the KMeans.
 ///
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.
-pub fn compute_partitions<T: ArrowFloatType>(
-    centroids: Arc<T::ArrayType>,
-    vectors: &[T::Native],
+pub fn compute_partitions<T: Float + L2 + Dot + Sync>(
+    centroids: &[T],
+    vectors: &[T],
     dimension: usize,
     distance_type: DistanceType,
-) -> Vec<Option<u32>>
-where
-    T::Native: L2 + Dot + Normalize,
-{
-    let kmeans = KMeans::<T>::with_centroids(centroids, dimension, distance_type);
-    kmeans.compute_membership(vectors, None)
+) -> Vec<Option<u32>> {
+    vectors
+        .par_chunks(dimension)
+        .map(|vec| {
+            argmin_value(match distance_type {
+                DistanceType::L2 => l2_distance_batch(vec, centroids, dimension),
+                DistanceType::Dot => dot_distance_batch(vec, centroids, dimension),
+                _ => {
+                    panic!(
+                        "KMeans::find_partitions: {} is not supported",
+                        distance_type
+                    );
+                }
+            })
+            .map(|(idx, _)| idx)
+        })
+        .collect::<Vec<_>>()
 }
 
 #[cfg(test)]
@@ -557,12 +554,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let actual = compute_partitions::<Float32Type>(
-            Arc::new(centroids),
-            data.values(),
-            DIM,
-            DistanceType::L2,
-        );
+        let actual = compute_partitions(centroids.values(), data.values(), DIM, DistanceType::L2);
         assert_eq!(expected, actual);
     }
 
@@ -588,7 +580,7 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
 
-        compute_partitions::<Float32Type>(centroids.into(), values.values(), DIM, DistanceType::L2)
+        compute_partitions::<f32>(centroids.values(), values.values(), DIM, DistanceType::L2)
             .iter()
             .for_each(|cd| {
                 assert!(cd.is_none());

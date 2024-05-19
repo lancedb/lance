@@ -11,6 +11,7 @@ use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::Field;
+use lance_linalg::kmeans::compute_partitions;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -62,10 +63,8 @@ where
     ///
     #[instrument(level = "debug", skip(data))]
     pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
-        use lance_linalg::kmeans::compute_partitions;
-
-        compute_partitions::<T>(
-            self.centroids.data(),
+        compute_partitions::<T::Native>(
+            self.centroids.data().as_slice(),
             data.values()
                 .as_any()
                 .downcast_ref::<T::ArrayType>()

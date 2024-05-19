@@ -2,11 +2,15 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::types::UInt32Type;
+use arrow_array::UInt32Array;
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, RecordBatch};
 use arrow_schema::Field;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result};
+use lance_linalg::distance::DistanceType;
+use lance_linalg::kmeans::compute_partitions;
 use lance_linalg::MatrixView;
+use num_traits::Float;
 use snafu::{location, Location};
 use std::sync::Arc;
 
@@ -43,6 +47,46 @@ impl<T: ArrowFloatType> ResidualTransform<T> {
             vec_col: column.to_owned(),
         }
     }
+}
+
+/// Compute residual vectors from the original vectors and centroids.
+///
+/// ## Parameter
+/// - `centroids`: The KMeans centroids.
+/// - `vectors`: The original vectors to compute residual vectors.
+/// - `distance_type`: The distance type to compute the residual vector.
+/// - `partitions`: The partition ID for each vector, if present.
+pub(crate) fn compute_residual(
+    centroids: &FixedSizeListArray,
+    vectors: &FixedSizeListArray,
+    distance_type: DistanceType,
+    partitions: Option<&UInt32Array>,
+) -> Result<FixedSizeListArray> {
+    if centroids.value_length() != vectors.value_length() {
+        return Err(Error::Index {
+            message: format!(
+                "Compute residual vector: centroid and vector length mismatch: centroid: {}, vector: {}",
+                centroids.value_length(),
+                vectors.value_length(),
+            ),
+            location: location!(),
+        });
+    }
+    if centroids.value_type() != vectors.value_type() {
+        return Err(Error::Index {
+            message: format!(
+                "Compute residual vector: centroids and vector type mismatch: centroid: {}, vector: {}",
+                centroids.value_type(),
+                vectors.value_type(),
+            ),
+            location: location!(),
+        });
+    }
+    let part_id = partitions
+        .map(|p| p.clone())
+        .unwrap_or_else(|| UInt32Array::from(vec![0; vectors.len() as usize]));
+
+    todo!()
 }
 
 impl<T: ArrowFloatType> Transformer for ResidualTransform<T> {
