@@ -28,7 +28,7 @@ pub const RESIDUAL_COLUMN: &str = "__residual_vector";
 #[derive(Clone)]
 pub struct ResidualTransform {
     /// Flattend centroids.
-    centroids: Arc<FixedSizeListArray>,
+    centroids: FixedSizeListArray,
 
     /// Partition Column
     part_col: String,
@@ -44,7 +44,7 @@ impl std::fmt::Debug for ResidualTransform {
 }
 
 impl ResidualTransform {
-    pub fn new(centroids: Arc<FixedSizeListArray>, part_col: &str, column: &str) -> Self {
+    pub fn new(centroids: FixedSizeListArray, part_col: &str, column: &str) -> Self {
         Self {
             centroids,
             part_col: part_col.to_owned(),
@@ -169,12 +169,8 @@ impl Transformer for ResidualTransform {
         })?;
 
         let part_ids_ref = part_ids.as_primitive::<UInt32Type>();
-        let residual_arr = compute_residual(
-            self.centroids.as_ref(),
-            original_vectors,
-            None,
-            Some(part_ids_ref),
-        )?;
+        let residual_arr =
+            compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
 
         // Replace original column with residual column.
         let batch = batch.drop_column(&self.vec_col)?;

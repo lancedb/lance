@@ -61,7 +61,7 @@ pub(super) async fn build_partitions(
     }
 
     let ivf_model = lance_index::vector::ivf::Ivf::with_pq(
-        ivf.centroids.clone(),
+        ivf.centroids.as_ref().clone(),
         metric_type,
         column,
         pq.clone(),
@@ -128,7 +128,7 @@ pub(super) async fn build_hnsw_partitions(
     }
 
     let ivf_model = lance_index::vector::ivf::new_ivf_with_quantizer(
-        ivf.centroids.clone(),
+        ivf.centroids.as_ref().clone(),
         metric_type,
         column,
         quantizer.clone(),

@@ -31,7 +31,7 @@ use super::PART_ID_COLUMN;
 ///
 #[derive(Debug)]
 pub struct IvfTransformer {
-    centroids: Arc<FixedSizeListArray>,
+    centroids: FixedSizeListArray,
     distance_type: DistanceType,
     input_column: String,
     output_column: String,
@@ -39,7 +39,7 @@ pub struct IvfTransformer {
 
 impl IvfTransformer {
     pub fn new(
-        centroids: Arc<FixedSizeListArray>,
+        centroids: FixedSizeListArray,
         distance_type: DistanceType,
         input_column: impl AsRef<str>,
     ) -> Self {
@@ -55,7 +55,7 @@ impl IvfTransformer {
     ///
     #[instrument(level = "debug", skip(data))]
     pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
-        compute_partitions_arrow_array(self.centroids.as_ref(), data, self.distance_type)
+        compute_partitions_arrow_array(&self.centroids, data, self.distance_type)
             .expect("failed to compute partitions")
             .into()
     }

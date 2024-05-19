@@ -23,8 +23,7 @@ fn bench_partitions(c: &mut Criterion) {
     for num_centroids in &[10240, 65536] {
         let centroids =
             generate_random_array_with_seed::<Float32Type>(num_centroids * DIMENSION, SEED);
-        let fsl =
-            Arc::new(FixedSizeListArray::try_new_from_values(centroids, DIMENSION as i32).unwrap());
+        let fsl = FixedSizeListArray::try_new_from_values(centroids, DIMENSION as i32).unwrap();
 
         for k in &[1, 10, 50] {
             let ivf = Ivf::new(fsl.clone(), DistanceType::L2, vec![]);

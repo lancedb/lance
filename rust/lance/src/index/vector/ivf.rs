@@ -335,7 +335,7 @@ async fn optimize_ivf_pq_indices(
 
     // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
     let ivf = lance_index::vector::ivf::Ivf::with_pq(
-        first_idx.ivf.centroids.clone(),
+        first_idx.ivf.centroids.as_ref().clone(),
         metric_type,
         vector_column,
         pq_index.pq.clone(),
@@ -415,7 +415,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
     let ivf = lance_index::vector::ivf::new_ivf_with_quantizer(
-        first_idx.ivf.centroids.clone(),
+        first_idx.ivf.centroids.as_ref().clone(),
         distance_type,
         vector_column,
         quantizer.clone(),
@@ -870,7 +870,7 @@ impl Ivf {
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
         let internal =
-            lance_index::vector::ivf::new_ivf(self.centroids.clone(), metric_type, vec![]);
+            lance_index::vector::ivf::new_ivf(self.centroids.as_ref().clone(), metric_type, vec![]);
         internal.find_partitions(query, nprobes)
     }
 

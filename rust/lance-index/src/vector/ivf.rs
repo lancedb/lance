@@ -41,7 +41,7 @@ mod transform;
 /// - *transforms*: a list of transforms to apply to the vector column.
 /// - *range*: only covers a range of partitions. Default is None
 pub fn new_ivf(
-    centroids: Arc<FixedSizeListArray>,
+    centroids: FixedSizeListArray,
     metric_type: DistanceType,
     transforms: Vec<Arc<dyn Transformer>>,
 ) -> Ivf {
@@ -49,7 +49,7 @@ pub fn new_ivf(
 }
 
 pub fn new_ivf_with_quantizer(
-    centroids: Arc<FixedSizeListArray>,
+    centroids: FixedSizeListArray,
     metric_type: MetricType,
     vector_column: &str,
     quantizer: Quantizer,
@@ -74,7 +74,7 @@ pub struct Ivf {
     /// Centroids of a cluster algorithm, to run IVF.
     ///
     /// It is a 2-D `(num_partitions * dimension)` of floating array.
-    centroids: Arc<FixedSizeListArray>,
+    centroids: FixedSizeListArray,
 
     /// Transform applied to each partition.
     transforms: Vec<Arc<dyn Transformer>>,
@@ -86,7 +86,7 @@ pub struct Ivf {
 impl Ivf {
     /// Create a new Ivf model.
     pub fn new(
-        centroids: Arc<FixedSizeListArray>,
+        centroids: FixedSizeListArray,
         metric_type: MetricType,
         transforms: Vec<Arc<dyn Transformer>>,
     ) -> Self {
@@ -99,7 +99,7 @@ impl Ivf {
 
     /// Create a IVF_PQ struct.
     pub fn with_pq(
-        centroids: Arc<FixedSizeListArray>,
+        centroids: FixedSizeListArray,
         distance_type: DistanceType,
         vector_column: &str,
         pq: Arc<dyn ProductQuantizer>,
@@ -145,14 +145,14 @@ impl Ivf {
             )));
         };
         Self {
-            centroids: centroids.clone(),
+            centroids,
             distance_type,
             transforms,
         }
     }
 
     fn with_sq(
-        centroids: Arc<FixedSizeListArray>,
+        centroids: FixedSizeListArray,
         metric_type: MetricType,
         vector_column: &str,
         range: Option<Range<u32>>,
