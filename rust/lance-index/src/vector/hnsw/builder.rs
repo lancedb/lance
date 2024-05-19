@@ -49,14 +49,8 @@ pub struct HnswBuildParams {
     /// number of connections to establish while inserting new element
     pub m: usize,
 
-    /// max number of connections for each element per layers.
-    pub m_max: usize,
-
     /// size of the dynamic list for the candidates
     pub ef_construction: usize,
-
-    /// whether select neighbors heuristic
-    pub use_select_heuristic: bool,
 
     /// the max number of threads to use for building the graph
     pub parallel_limit: Option<usize>,
@@ -70,9 +64,7 @@ impl Default for HnswBuildParams {
         Self {
             max_level: 7,
             m: 20,
-            m_max: 40,
             ef_construction: 150,
-            use_select_heuristic: true,
             parallel_limit: None,
             prefetch_distance: Some(2),
         }
@@ -94,27 +86,12 @@ impl HnswBuildParams {
         self
     }
 
-    /// The maximum number of connections for each node per layer.
-    /// The default value is `64`.
-    pub fn max_num_edges(mut self, m_max: usize) -> Self {
-        self.m_max = m_max;
-        self
-    }
-
     /// Number of candidates to be considered when searching for the nearest neighbors
     /// during the construction of the graph.
     ///
     /// The default value is `100`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
-        self
-    }
-
-    /// Use select heuristic when searching for the nearest neighbors.
-    ///
-    /// See algorithm 4 in HNSW paper.
-    pub fn use_select_heuristic(mut self, flag: bool) -> Self {
-        self.use_select_heuristic = flag;
         self
     }
 
@@ -204,11 +181,11 @@ impl HNSW {
         };
 
         log::info!(
-            "Building HNSW graph: num={}, metric_type={}, max_levels={}, m_max={}, ef_construction={}",
+            "Building HNSW graph: num={}, metric_type={}, max_levels={}, m={}, ef_construction={}",
             storage.len(),
             hnsw.inner.distance_type,
             hnsw.inner.params.max_level,
-            hnsw.inner.params.m_max,
+            hnsw.inner.params.m,
             hnsw.inner.params.ef_construction
         );
         if storage.len() <= 1 {
@@ -657,7 +634,7 @@ impl HNSWBuilderInner {
                 .map(|unpruned_edge| {
                     let level = level as u16;
                     let m_max = match level {
-                        0 => self.params.m_max,
+                        0 => self.params.m * 2,
                         _ => self.params.m,
                     };
                     if unpruned_edge.dist
@@ -699,7 +676,7 @@ impl HNSWBuilderInner {
 
     fn prune(&self, storage: &dyn VectorStorage, builder_node: &mut GraphBuilderNode, level: u16) {
         let m_max = match level {
-            0 => self.params.m_max,
+            0 => self.params.m * 2,
             _ => self.params.m,
         };
 

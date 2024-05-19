@@ -30,7 +30,7 @@ use lance_file::{
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_index::vector::{
-    graph::VectorStorage,
+    graph::{VectorStorage, DISTS_FIELD},
     quantizer::{Quantization, QuantizationMetadata, Quantizer},
 };
 use lance_index::{
@@ -1498,7 +1498,11 @@ async fn write_ivf_hnsw_file(
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let writer = object_store.create(&path).await?;
 
-    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
+    let schema = Schema::new(vec![
+        VECTOR_ID_FIELD.clone(),
+        NEIGHBORS_FIELD.clone(),
+        DISTS_FIELD.clone(),
+    ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
