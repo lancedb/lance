@@ -29,12 +29,12 @@ use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
-use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL};
+use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
 use crate::scalar::IndexWriter;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::storage::DistCalculator;
 use crate::vector::graph::{greedy_search, storage::VectorStorage};
-use crate::vector::graph::{Graph, OrderedFloat, OrderedNode, VisitedGenerator, NEIGHBORS_COL};
+use crate::vector::graph::{Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD};
 use crate::vector::DIST_COL;
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
@@ -293,7 +293,7 @@ impl HNSW {
         arrow_schema::Schema::new(vec![
             VECTOR_ID_FIELD.clone(),
             NEIGHBORS_FIELD.clone(),
-            DIST_FIELD.clone(),
+            DISTS_FIELD.clone(),
         ])
     }
 

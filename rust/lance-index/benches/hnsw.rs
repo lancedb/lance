@@ -14,9 +14,9 @@ use pprof::criterion::{Output, PProfProfiler};
 
 use lance_index::vector::{
     graph::memory::InMemoryVectorStorage,
-    hnsw::builder::{HNSWBuilder, HnswBuildParams},
+    hnsw::builder::{HnswBuildParams, HNSW},
 };
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::{distance::DistanceType, MatrixView};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 fn bench_hnsw(c: &mut Criterion) {
@@ -29,14 +29,15 @@ fn bench_hnsw(c: &mut Criterion) {
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
     let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
-    let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
+    let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
 
     let query = mat.row(0).unwrap();
     c.bench_function(
         format!("create_hnsw({TOTAL}x1024,levels=6)").as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
-                let hnsw = HNSWBuilder::with_params(
+                let hnsw = HNSW::build_with_storage(
+                    DistanceType::L2,
                     HnswBuildParams::default().max_level(6),
                     vectors.clone(),
                 )
