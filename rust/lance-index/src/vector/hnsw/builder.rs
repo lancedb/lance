@@ -34,7 +34,9 @@ use crate::scalar::IndexWriter;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::storage::DistCalculator;
 use crate::vector::graph::{greedy_search, storage::VectorStorage};
-use crate::vector::graph::{Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD};
+use crate::vector::graph::{
+    Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
+};
 use crate::vector::DIST_COL;
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
