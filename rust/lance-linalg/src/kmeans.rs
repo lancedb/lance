@@ -13,9 +13,13 @@ use std::ops::DivAssign;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt32Array};
+use arrow_array::{
+    cast::AsArray,
+    types::{Float16Type, Float32Type, Float64Type},
+    Array, FixedSizeListArray, Float32Array, UInt32Array,
+};
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType};
 use lance_arrow::{ArrowFloatType, FloatArray};
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive, Zero};
@@ -485,15 +489,52 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
     sort_to_indices(&dists_arr, None, Some(nprobes))
 }
 
+/// Compute partitions from Arrow FixedSizeListArray.
+pub fn compute_partitions_arrow_array(
+    centroids: &FixedSizeListArray,
+    vectors: &FixedSizeListArray,
+    distance_type: DistanceType,
+) -> Result<Vec<Option<u32>>> {
+    if centroids.value_length() != vectors.value_length() {
+        return Err(ArrowError::InvalidArgumentError(
+            "Centroids and vectors have different dimensions".to_string(),
+        ));
+    }
+    match (centroids.value_type(), vectors.value_type()) {
+        (DataType::Float16, DataType::Float16) => Ok(compute_partitions(
+            centroids.values().as_primitive::<Float16Type>().values(),
+            vectors.values().as_primitive::<Float16Type>().values(),
+            centroids.len(),
+            distance_type,
+        )),
+        (DataType::Float32, DataType::Float32) => Ok(compute_partitions(
+            centroids.values().as_primitive::<Float32Type>().values(),
+            vectors.values().as_primitive::<Float32Type>().values(),
+            centroids.len(),
+            distance_type,
+        )),
+        (DataType::Float64, DataType::Float64) => Ok(compute_partitions(
+            centroids.values().as_primitive::<Float64Type>().values(),
+            vectors.values().as_primitive::<Float64Type>().values(),
+            centroids.len(),
+            distance_type,
+        )),
+        _ => Err(ArrowError::InvalidArgumentError(
+            "Centroids and vectors have different types".to_string(),
+        )),
+    }
+}
+
 /// Compute partition ID of each vector in the KMeans.
 ///
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.
 pub fn compute_partitions<T: Float + L2 + Dot + Sync>(
     centroids: &[T],
     vectors: &[T],
-    dimension: usize,
+    dimension: impl AsPrimitive<usize>,
     distance_type: DistanceType,
 ) -> Vec<Option<u32>> {
+    let dimension = dimension.as_();
     vectors
         .par_chunks(dimension)
         .map(|vec| {

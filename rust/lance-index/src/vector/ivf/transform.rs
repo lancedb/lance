@@ -11,7 +11,7 @@ use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::Field;
-use lance_linalg::kmeans::compute_partitions;
+use lance_linalg::kmeans::{compute_partitions, compute_partitions_arrow_array};
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -32,22 +32,16 @@ use super::PART_ID_COLUMN;
 /// this transform is a Noop.
 ///
 #[derive(Debug)]
-pub struct IvfTransformer<T: ArrowFloatType>
-where
-    T::Native: Dot + L2,
-{
-    centroids: MatrixView<T>,
+pub struct IvfTransformer {
+    centroids: Arc<FixedSizeListArray>,
     metric_type: MetricType,
     input_column: String,
     output_column: String,
 }
 
-impl<T: ArrowFloatType> IvfTransformer<T>
-where
-    T::Native: Dot + L2 + Normalize,
-{
+impl IvfTransformer {
     pub fn new(
-        centroids: MatrixView<T>,
+        centroids: Arc<FixedSizeListArray>,
         metric_type: MetricType,
         input_column: impl AsRef<str>,
     ) -> Self {
@@ -63,24 +57,12 @@ where
     ///
     #[instrument(level = "debug", skip(data))]
     pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
-        compute_partitions::<T::Native>(
-            self.centroids.data().as_slice(),
-            data.values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .unwrap()
-                .as_slice(),
-            data.value_length() as usize,
-            self.metric_type,
-        )
-        .into()
+        compute_partitions_arrow_array(self.centroids.as_ref(), data, self.metric_type)
+            .expect("failed to compute partitions")
+            .into()
     }
 }
-
-impl<T: ArrowFloatType + ArrowPrimitiveType> Transformer for IvfTransformer<T>
-where
-    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
-{
+impl Transformer for IvfTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {
             // If the partition ID column is already present, we don't need to compute it again.

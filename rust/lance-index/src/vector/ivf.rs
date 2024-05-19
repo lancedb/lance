@@ -11,15 +11,13 @@ use arrow_array::{
     cast::AsArray, Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::DataType;
-use async_trait::async_trait;
-use lance_linalg::distance::Normalize;
 use snafu::{location, Location};
 
 pub use builder::IvfBuildParams;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::{
-    distance::{Dot, MetricType, L2},
+    distance::{DistanceType, Dot, MetricType, Normalize, L2},
     kmeans::KMeans,
     Clustering, MatrixView,
 };
@@ -32,6 +30,7 @@ use crate::vector::{
 };
 
 use super::quantizer::Quantizer;
+use super::residual::compute_residual;
 use super::transform::DropColumn;
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
@@ -39,20 +38,6 @@ pub mod builder;
 pub mod shuffler;
 pub mod storage;
 mod transform;
-
-fn new_ivf_impl<T: ArrowFloatType + ArrowPrimitiveType>(
-    centroids: &T::ArrayType,
-    dimension: usize,
-    metric_type: MetricType,
-    transforms: Vec<Arc<dyn Transformer>>,
-    range: Option<Range<u32>>,
-) -> Arc<dyn Ivf>
-where
-    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
-{
-    let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
-    Arc::new(IvfImpl::<T>::new(mat, metric_type, "", transforms, range))
-}
 
 /// Create an IVF from the flatten centroids.
 ///
@@ -64,115 +49,38 @@ where
 /// - *transforms*: a list of transforms to apply to the vector column.
 /// - *range*: only covers a range of partitions. Default is None
 pub fn new_ivf(
-    centroids: &dyn Array,
+    centroids: Arc<FixedSizeListArray>,
     dimension: usize,
-    metric_type: MetricType,
+    metric_type: DistanceType,
     transforms: Vec<Arc<dyn Transformer>>,
     range: Option<Range<u32>>,
-) -> Result<Arc<dyn Ivf>> {
-    match centroids.data_type() {
-        DataType::Float16 => Ok(new_ivf_impl::<Float16Type>(
-            centroids.as_primitive(),
-            dimension,
-            metric_type,
-            transforms,
-            range,
-        )),
-        DataType::Float32 => Ok(new_ivf_impl::<Float32Type>(
-            centroids.as_primitive(),
-            dimension,
-            metric_type,
-            transforms,
-            range,
-        )),
-        DataType::Float64 => Ok(new_ivf_impl::<Float64Type>(
-            centroids.as_primitive(),
-            dimension,
-            metric_type,
-            transforms,
-            range,
-        )),
-        _ => Err(Error::Index {
-            message: format!(
-                "new_ivf: centroids is not expected type: {}",
-                centroids.data_type()
-            ),
-            location: location!(),
-        }),
-    }
+) -> Ivf {
+    Ivf::new(centroids, metric_type, "", transforms, range)
 }
 
-fn new_ivf_with_pq_impl<T: ArrowFloatType + ArrowPrimitiveType>(
-    centroids: &T::ArrayType,
-    dimension: usize,
-    metric_type: MetricType,
+pub fn new_ivf_with_pq(
+    centroids: Arc<FixedSizeListArray>,
+    distance_type: MetricType,
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
-) -> Arc<dyn Ivf>
-where
-    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
-{
-    let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
-    Arc::new(IvfImpl::<T>::new_with_pq(
-        mat,
-        metric_type,
+) -> Result<Ivf> {
+    Ok(Ivf::new_with_pq(
+        centroids,
+        distance_type,
         vector_column,
         pq,
         range,
     ))
 }
 
-pub fn new_ivf_with_pq(
-    centroids: &dyn Array,
-    dimension: usize,
-    metric_type: MetricType,
-    vector_column: &str,
-    pq: Arc<dyn ProductQuantizer>,
-    range: Option<Range<u32>>,
-) -> Result<Arc<dyn Ivf>> {
-    match centroids.data_type() {
-        DataType::Float16 => Ok(new_ivf_with_pq_impl::<Float16Type>(
-            centroids.as_primitive(),
-            dimension,
-            metric_type,
-            vector_column,
-            pq,
-            range,
-        )),
-        DataType::Float32 => Ok(new_ivf_with_pq_impl::<Float32Type>(
-            centroids.as_primitive(),
-            dimension,
-            metric_type,
-            vector_column,
-            pq,
-            range,
-        )),
-        DataType::Float64 => Ok(new_ivf_with_pq_impl::<Float64Type>(
-            centroids.as_primitive(),
-            dimension,
-            metric_type,
-            vector_column,
-            pq,
-            range,
-        )),
-        _ => Err(Error::Index {
-            message: format!(
-                "new_ivf_with_pq: centroids is not expected type: {}",
-                centroids.data_type()
-            ),
-            location: location!(),
-        }),
-    }
-}
-
 pub fn new_ivf_with_sq(
-    centroids: &dyn Array,
+    centroids: Arc<FixedSizeListArray>,
     dimension: usize,
     metric_type: MetricType,
     vector_column: &str,
     range: Option<Range<u32>>,
-) -> Result<Arc<dyn Ivf>> {
+) -> Result<Arc<Ivf>> {
     let ivf = match centroids.data_type() {
         DataType::Float16 => new_ivf_with_sq_impl::<Float16Type>(
             centroids.as_primitive(),
@@ -215,27 +123,22 @@ fn new_ivf_with_sq_impl<T: ArrowFloatType + ArrowPrimitiveType>(
     metric_type: MetricType,
     vector_column: &str,
     range: Option<Range<u32>>,
-) -> Arc<dyn Ivf>
+) -> Arc<Ivf>
 where
     <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
 {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
-    Arc::new(IvfImpl::<T>::new_with_sq(
-        mat,
-        metric_type,
-        vector_column,
-        range,
-    ))
+    Arc::new(Ivf::new_with_sq(mat, metric_type, vector_column, range))
 }
 
 pub fn new_ivf_with_quantizer(
-    centroids: &dyn Array,
+    centroids: Arc<FixedSizeListArray>,
     dimension: usize,
     metric_type: MetricType,
     vector_column: &str,
     quantizer: Quantizer,
     range: Option<Range<u32>>,
-) -> Result<Arc<dyn Ivf>> {
+) -> Result<Ivf> {
     match quantizer {
         Quantizer::Product(pq) => {
             new_ivf_with_pq(centroids, dimension, metric_type, vector_column, pq, range)
@@ -248,68 +151,25 @@ pub fn new_ivf_with_quantizer(
 
 /// IVF - IVF file partition
 ///
-pub trait Ivf: Send + Sync + std::fmt::Debug + Transformer {
-    /// Compute the partitions for each vector in the input data.
-    ///
-    /// Parameters
-    /// ----------
-    /// *data*: a matrix of vectors.
-    ///
-    /// Returns
-    /// -------
-    /// A 1-D array of partition id for each vector.
-    ///
-    /// Raises [Error] if the input data type does not match with the IVF model.
-    ///
-    fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array>;
-
-    /// Compute residual vector.
-    ///
-    /// A residual vector is `original vector - centroids`.
-    ///
-    /// Parameters:
-    ///  - *original*: original vector.
-    ///  - *partitions*: partition ID of each original vector. If not provided, it will be computed
-    ///   on the flight.
-    ///
-    fn compute_residual(
-        &self,
-        original: &FixedSizeListArray,
-        partitions: Option<&UInt32Array>,
-    ) -> Result<FixedSizeListArray>;
-
-    /// Find the closest partitions for the query vector.
-    fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array>;
-}
-
-/// IVF - IVF file partition
-///
-#[derive(Debug, Clone)]
-pub struct IvfImpl<T: ArrowFloatType>
-where
-    T::Native: Dot + L2,
-{
+#[derive(Debug)]
+pub struct Ivf {
     /// KMean model of the IVF
     ///
-    /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
-    /// memory allocator.
-    centroids: MatrixView<T>,
+    /// It is a 2-D `(num_partitions * dimension)` of floating array.
+    centroids: Arc<FixedSizeListArray>,
 
     /// Transform applied to each partition.
     transforms: Vec<Arc<dyn Transformer>>,
 
-    ivf_transform: Arc<IvfTransformer<T>>,
+    ivf_transform: Arc<IvfTransformer>,
 
     /// Metric type to compute pair-wise vector distance.
-    metric_type: MetricType,
+    distance_type: DistanceType,
 }
 
-impl<T: ArrowFloatType + ArrowPrimitiveType> IvfImpl<T>
-where
-    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
-{
+impl Ivf {
     pub fn new(
-        centroids: MatrixView<T>,
+        centroids: Arc<FixedSizeListArray>,
         metric_type: MetricType,
         vector_column: &str,
         transforms: Vec<Arc<dyn Transformer>>,
@@ -322,28 +182,29 @@ where
         ));
         Self {
             centroids,
-            metric_type,
+            distance_type: metric_type,
             transforms,
             ivf_transform,
         }
     }
 
-    fn new_with_pq(
-        centroids: MatrixView<T>,
-        metric_type: MetricType,
+    /// Create a IVF_PQ struct.
+    pub fn with_pq(
+        centroids: Arc<FixedSizeListArray>,
+        distance_type: DistanceType,
         vector_column: &str,
         pq: Arc<dyn ProductQuantizer>,
         range: Option<Range<u32>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
-        let mt = if metric_type == MetricType::Cosine {
+        let mt = if distance_type == MetricType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
                 vector_column,
             )));
             MetricType::L2
         } else {
-            metric_type
+            distance_type
         };
 
         let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), mt, vector_column));
@@ -376,14 +237,14 @@ where
         };
         Self {
             centroids: centroids.clone(),
-            metric_type,
+            distance_type,
             transforms,
             ivf_transform,
         }
     }
 
     fn new_with_sq(
-        centroids: MatrixView<T>,
+        centroids: Arc<FixedSizeListArray>,
         metric_type: MetricType,
         vector_column: &str,
         range: Option<Range<u32>>,
@@ -413,8 +274,8 @@ where
         // so simply drop the vector column now.
         transforms.push(Arc::new(DropColumn::new(vector_column)));
         Self {
-            centroids: centroids.clone(),
-            metric_type,
+            centroids,
+            distance_type: metric_type,
             transforms,
             ivf_transform,
         }
@@ -423,52 +284,9 @@ where
     fn dimension(&self) -> usize {
         self.centroids.ndim()
     }
-}
 
-#[async_trait]
-impl<T: ArrowFloatType + ArrowPrimitiveType> Ivf for IvfImpl<T>
-where
-    <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
-{
     fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
         Ok(self.ivf_transform.compute_partitions(data))
-    }
-
-    fn compute_residual(
-        &self,
-        original: &FixedSizeListArray,
-        partitions: Option<&UInt32Array>,
-    ) -> Result<FixedSizeListArray> {
-        let flatten_arr = original
-            .values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Ivf::compute_residual: original is not expected type: {} got {}",
-                    T::FLOAT_TYPE,
-                    original.values().data_type()
-                ),
-                location: Default::default(),
-            })?;
-
-        let part_ids = if let Some(part_ids) = partitions {
-            part_ids.clone()
-        } else {
-            self.compute_partitions(original)?
-        };
-        let dim = original.value_length() as usize;
-        let residual_arr = flatten_arr
-            .as_slice()
-            .chunks_exact(dim)
-            .zip(part_ids.values())
-            .flat_map(|(vector, &part_id)| {
-                let centroid = self.centroids.row_ref(part_id as usize).unwrap();
-                vector.iter().zip(centroid.iter()).map(|(&v, &c)| v - c)
-            })
-            .collect::<Vec<_>>();
-        let arr = T::ArrayType::from(residual_arr);
-        Ok(FixedSizeListArray::try_new_from_values(arr, dim as i32)?)
     }
 
     fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
@@ -483,10 +301,10 @@ where
                 ),
                 location: Default::default(),
             })?;
-        let mt = if self.metric_type == MetricType::Cosine {
+        let mt = if self.distance_type == MetricType::Cosine {
             MetricType::L2
         } else {
-            self.metric_type
+            self.distance_type
         };
         let kmeans =
             KMeans::<T>::with_centroids(self.centroids.data().clone(), self.dimension(), mt);
@@ -494,10 +312,7 @@ where
     }
 }
 
-impl<T: ArrowFloatType> Transformer for IvfImpl<T>
-where
-    T::Native: Dot + L2,
-{
+impl Transformer for Ivf {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut batch = batch.clone();
         for transform in self.transforms.as_slice() {

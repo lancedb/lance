@@ -334,9 +334,8 @@ async fn optimize_ivf_pq_indices(
     let dim = first_idx.ivf.dimension();
 
     // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
-    let ivf = lance_index::vector::ivf::new_ivf_with_pq(
-        first_idx.ivf.centroids.values(),
-        first_idx.ivf.dimension(),
+    let ivf = lance_index::vector::ivf::Ivf::with_pq(
+        first_idx.ivf.centroids.clone(),
         metric_type,
         vector_column,
         pq_index.pq.clone(),

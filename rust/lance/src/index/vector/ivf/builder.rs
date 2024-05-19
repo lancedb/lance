@@ -60,9 +60,8 @@ pub(super) async fn build_partitions(
         });
     }
 
-    let ivf_model = lance_index::vector::ivf::new_ivf_with_pq(
-        ivf.centroids.values(),
-        ivf.centroids.value_length() as usize,
+    let ivf_model = lance_index::vector::ivf::Ivf::with_pq(
+        ivf.centroids.clone(),
         metric_type,
         column,
         pq.clone(),
