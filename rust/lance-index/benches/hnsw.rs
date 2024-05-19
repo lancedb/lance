@@ -41,11 +41,10 @@ fn bench_hnsw(c: &mut Criterion) {
                     HnswBuildParams::default().max_level(6),
                     vectors.clone(),
                 )
-                .build()
                 .await
                 .unwrap();
                 let uids: HashSet<u32> = hnsw
-                    .search(query.clone(), K, 300, None)
+                    .search_basic(query.clone(), K, 300, None, vectors.as_ref())
                     .unwrap()
                     .iter()
                     .map(|node| node.id)

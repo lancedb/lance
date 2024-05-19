@@ -772,14 +772,14 @@ mod tests {
     async fn test_builder_write_load() {
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
-        const MAX_EDGES: usize = 32;
+        const NUM_EDGES: usize = 20;
         let data = generate_random_array(TOTAL * DIM);
         let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
         let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
         let builder = HNSW::build_with_storage(
             DistanceType::L2,
             HnswBuildParams::default()
-                .max_num_edges(MAX_EDGES)
+                .num_edges(NUM_EDGES)
                 .ef_construction(50),
             store.clone(),
         )
