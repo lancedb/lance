@@ -340,7 +340,7 @@ async fn optimize_ivf_pq_indices(
         vector_column,
         pq_index.pq.clone(),
         None,
-    )?;
+    );
 
     // Shuffled un-indexed data with partition.
     let shuffled = if let Some(stream) = unindexed {
@@ -348,7 +348,7 @@ async fn optimize_ivf_pq_indices(
             shuffle_dataset(
                 stream,
                 vector_column,
-                ivf,
+                ivf.into(),
                 None,
                 first_idx.ivf.num_partitions() as u32,
                 10000,
@@ -415,8 +415,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
     let ivf = lance_index::vector::ivf::new_ivf_with_quantizer(
-        first_idx.ivf.centroids.values(),
-        first_idx.ivf.dimension(),
+        first_idx.ivf.centroids.clone(),
         distance_type,
         vector_column,
         quantizer.clone(),
@@ -429,7 +428,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
             shuffle_dataset(
                 stream,
                 vector_column,
-                ivf,
+                Arc::new(ivf),
                 None,
                 first_idx.ivf.num_partitions() as u32,
                 10000,
@@ -870,13 +869,8 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        let internal = lance_index::vector::ivf::new_ivf(
-            self.centroids.values(),
-            self.dimension(),
-            metric_type,
-            vec![],
-            None,
-        )?;
+        let internal =
+            lance_index::vector::ivf::new_ivf(self.centroids.clone(), metric_type, vec![]);
         internal.find_partitions(query, nprobes)
     }
 

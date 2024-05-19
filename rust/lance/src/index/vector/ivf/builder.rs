@@ -66,12 +66,12 @@ pub(super) async fn build_partitions(
         column,
         pq.clone(),
         Some(part_range),
-    )?;
+    );
 
     let stream = shuffle_dataset(
         data,
         column,
-        ivf_model,
+        ivf_model.into(),
         precomputed_partitons,
         ivf.num_partitions() as u32,
         shuffle_partition_batches,
@@ -130,8 +130,7 @@ pub(super) async fn build_hnsw_partitions(
     }
 
     let ivf_model = lance_index::vector::ivf::new_ivf_with_quantizer(
-        ivf.centroids.values(),
-        dim,
+        ivf.centroids.clone(),
         metric_type,
         column,
         quantizer.clone(),
@@ -141,7 +140,7 @@ pub(super) async fn build_hnsw_partitions(
     let stream = shuffle_dataset(
         data,
         column,
-        ivf_model,
+        ivf_model.into(),
         precomputed_partitons,
         ivf.num_partitions() as u32,
         shuffle_partition_batches,

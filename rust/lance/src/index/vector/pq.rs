@@ -365,15 +365,9 @@ pub(super) async fn build_pq_model(
         // Compute residual for PQ training.
         //
         // TODO: consolidate IVF models to `lance_index`.
-        let ivf2 = lance_index::vector::ivf::new_ivf(
-            ivf.centroids.values(),
-            ivf.dimension(),
-            MetricType::L2,
-            vec![],
-            None,
-        )?;
+        let ivf2 = lance_index::vector::ivf::new_ivf(ivf.centroids.clone(), MetricType::L2, vec![]);
         span!(Level::INFO, "compute residual for PQ training")
-            .in_scope(|| ivf2.compute_residual(&training_data, None))?
+            .in_scope(|| ivf2.compute_residual(&training_data))?
     } else {
         training_data
     };

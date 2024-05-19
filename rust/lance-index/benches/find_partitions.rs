@@ -10,7 +10,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_index::vector::ivf::{Ivf, IvfImpl};
+use lance_index::vector::ivf::Ivf;
 use lance_linalg::{distance::MetricType, MatrixView};
 use lance_testing::datagen::generate_random_array_with_seed;
 
@@ -28,14 +28,14 @@ fn bench_partitions(c: &mut Criterion) {
         let matrix = MatrixView::<Float32Type>::new(centroids.clone(), DIMENSION);
 
         for k in &[1, 10, 50] {
-            let ivf = IvfImpl::new(matrix.clone(), MetricType::L2, "vector", vec![], None);
+            let ivf = Ivf::new(matrix.clone(), MetricType::L2, vec![]);
             c.bench_function(format!("IVF{},k={},L2", num_centroids, k).as_str(), |b| {
                 b.iter(|| {
                     let _ = ivf.find_partitions(&query, *k);
                 })
             });
 
-            let ivf = IvfImpl::new(matrix.clone(), MetricType::Cosine, "vector", vec![], None);
+            let ivf = Ivf::new(matrix.clone(), MetricType::Cosine, vec![]);
             c.bench_function(
                 format!("IVF{},k={},Cosine", num_centroids, k).as_str(),
                 |b| {
@@ -46,7 +46,7 @@ fn bench_partitions(c: &mut Criterion) {
             );
         }
 
-        let ivf = IvfImpl::new(matrix.clone(), MetricType::L2, "vector", vec![], None);
+        let ivf = Ivf::new(matrix.clone(), MetricType::L2, vec![]);
         let batch = generate_random_array_with_seed::<Float32Type>(DIMENSION * 4096, SEED);
         let fsl = FixedSizeListArray::try_new_from_values(batch, DIMENSION as i32).unwrap();
         c.bench_function(

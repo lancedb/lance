@@ -23,8 +23,8 @@ use crate::vector::{
     transform::Transformer,
 };
 
-use super::quantizer::Quantizer;
 use super::transform::DropColumn;
+use super::{quantizer::Quantizer, residual::compute_residual};
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
 pub mod builder;
@@ -45,9 +45,8 @@ pub fn new_ivf(
     centroids: Arc<FixedSizeListArray>,
     metric_type: DistanceType,
     transforms: Vec<Arc<dyn Transformer>>,
-    range: Option<Range<u32>>,
 ) -> Ivf {
-    Ivf::new(centroids, metric_type, transforms, range)
+    Ivf::new(centroids, metric_type, transforms)
 }
 
 pub fn new_ivf_with_quantizer(
@@ -86,11 +85,11 @@ pub struct Ivf {
 }
 
 impl Ivf {
+    /// Create a new Ivf model.
     pub fn new(
         centroids: Arc<FixedSizeListArray>,
         metric_type: MetricType,
         transforms: Vec<Arc<dyn Transformer>>,
-        _range: Option<Range<u32>>,
     ) -> Self {
         Self {
             centroids,
@@ -194,11 +193,17 @@ impl Ivf {
         self.centroids.value_length() as usize
     }
 
-    fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
+    #[inline]
+    pub fn compute_residual(&self, data: &FixedSizeListArray) -> Result<FixedSizeListArray> {
+        compute_residual(&self.centroids, data, Some(self.distance_type), None)
+    }
+
+    #[inline]
+    pub fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
         Ok(compute_partitions_arrow_array(&self.centroids, data, self.distance_type)?.into())
     }
 
-    fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
+    pub fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
         Ok(kmeans_find_partitions_arrow_array(
             &self.centroids,
             query,
