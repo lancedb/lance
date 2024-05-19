@@ -88,7 +88,6 @@ impl Transformer for IvfTransformer {
             })?;
 
         let part_ids = self.compute_partitions(fsl);
-        println!("Vec size: {}, part size: {}", fsl.len(), part_ids.len());
         let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
         Ok(batch.try_with_column(field, Arc::new(part_ids))?)
     }
