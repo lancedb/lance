@@ -454,7 +454,7 @@ mod tests {
 
         let centroids = generate_random_array_with_range(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf = Ivf::new(fsl.into());
+        let ivf = Ivf::new(fsl);
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
             .await

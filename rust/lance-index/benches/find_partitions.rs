@@ -4,7 +4,6 @@
 use arrow_array::Float32Array;
 use arrow_array::{types::Float32Type, FixedSizeListArray};
 use lance_arrow::FixedSizeListArrayExt;
-use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(target_os = "linux")]
