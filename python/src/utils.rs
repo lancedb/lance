@@ -30,6 +30,7 @@ use lance::{
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::hnsw::HNSW;
 use lance_linalg::{
     distance::DistanceType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
