@@ -188,7 +188,7 @@ impl Hnsw {
                 FileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     &path,
-                    Schema::try_from(HNSW::schema().as_ref())
+                    Schema::try_from(&HNSW::schema())
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                     &Default::default(),
                 ),
