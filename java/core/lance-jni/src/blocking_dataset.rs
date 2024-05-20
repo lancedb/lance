@@ -350,13 +350,12 @@ fn inner_import_ffi_schema(
     jdataset: JObject,
     arrow_schema_addr: jlong,
 ) -> JavaResult<()> {
-    let dataset = {
+    let schema = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
                 .infer_error()?;
-        dataset.clone()
+        Schema::from(dataset.inner.schema())
     };
-    let schema = Schema::from(dataset.inner.schema());
 
     let c_schema = FFI_ArrowSchema::try_from(&schema).infer_error()?;
     let out_c_schema = unsafe { &mut *(arrow_schema_addr as *mut FFI_ArrowSchema) };
@@ -365,7 +364,7 @@ fn inner_import_ffi_schema(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_version(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeVersion(
     mut env: JNIEnv,
     java_dataset: JObject,
 ) -> jlong {
@@ -380,7 +379,7 @@ fn inner_version(env: &mut JNIEnv, java_dataset: JObject) -> JavaResult<u64> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_latestVersion(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeLatestVersion(
     mut env: JNIEnv,
     java_dataset: JObject,
 ) -> jlong {
@@ -395,7 +394,7 @@ fn inner_latest_version(env: &mut JNIEnv, java_dataset: JObject) -> JavaResult<u
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_countRows(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCountRows(
     mut env: JNIEnv,
     java_dataset: JObject,
 ) -> jint {

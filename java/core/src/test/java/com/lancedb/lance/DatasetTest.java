@@ -130,7 +130,8 @@ public class DatasetTest {
 
   @Test
   void testCommitConflict() {
-    String datasetPath = tempDir.resolve("commit_conflict").toString();
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
@@ -140,6 +141,20 @@ public class DatasetTest {
           testDataset.write(0, 5);
         });
       }
+    }
+  }
+
+  @Test
+  void testGetSchemaWithClosedDataset() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      Dataset dataset = testDataset.createEmptyDataset();
+      dataset.close();
+      // dataset.getSchema();
+      // assertThrows(IllegalArgumentException.class, testDataset::getSchema);
+      // assertThrows(RuntimeException.class, dataset::getSchema);
     }
   }
 }

@@ -20,7 +20,10 @@ import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
+import javax.annotation.concurrent.NotThreadSafe;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
@@ -45,6 +48,8 @@ public class Dataset implements Closeable {
   private long nativeDatasetHandle;
 
   BufferAllocator allocator;
+
+  private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
   private Dataset() {
   }
@@ -179,25 +184,49 @@ public class Dataset implements Closeable {
    */
   public LanceScanner newScan(ScanOptions options) {
     Preconditions.checkNotNull(options);
-    return LanceScanner.create(this, options, allocator);
+    try (ReadLock readLock = new ReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return LanceScanner.create(this, options, allocator);
+    }
   }
 
   /**
    * Gets the currently checked out version of the dataset.
    */
-  public native long version();
+  public long version() {
+    try (ReadLock readLock = new ReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeVersion();
+    }
+  }
+
+  private native long nativeVersion();
 
   /**
    * Gets the latest version of the dataset.
    */
-  public native long latestVersion();
+  public long latestVersion() {
+    try (ReadLock readLock = new ReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeLatestVersion();
+    }
+  }
+
+  private native long nativeLatestVersion();
 
   /**
    * Count the number of rows in the dataset.
    *
    * @return num of rows.
    */
-  public native int countRows();
+  public int countRows() {
+    try (ReadLock readLock = new ReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCountRows();
+    }
+  }
+
+  private native int nativeCountRows();
 
   /**
    * Get all fragments in this dataset.
@@ -205,13 +234,16 @@ public class Dataset implements Closeable {
    * @return A list of {@link DatasetFragment}.
    */
   public List<DatasetFragment> getFragments() {
-    // Set a pointer in Fragment to dataset, to make it is easier to issue IOs
-    // later.
-    //
-    // We do not need to close Fragments.
-    return this.getJsonFragments().stream()
-        .map(jsonFragment -> new DatasetFragment(this, FragmentMetadata.fromJson(jsonFragment)))
-        .collect(Collectors.toList());
+    try (ReadLock readLock = new ReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      // Set a pointer in Fragment to dataset, to make it is easier to issue IOs
+      // later.
+      //
+      // We do not need to close Fragments.
+      return this.getJsonFragments().stream()
+          .map(jsonFragment -> new DatasetFragment(this, FragmentMetadata.fromJson(jsonFragment)))
+          .collect(Collectors.toList());
+    }
   }
 
   private native List<String> getJsonFragments();
@@ -222,9 +254,12 @@ public class Dataset implements Closeable {
    * @return the arrow schema
    */
   public Schema getSchema() {
-    try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
-      importFfiSchema(ffiArrowSchema.memoryAddress());
-      return Data.importSchema(allocator, ffiArrowSchema, null);
+    try (ReadLock readLock = new ReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+        importFfiSchema(ffiArrowSchema.memoryAddress());
+        return Data.importSchema(allocator, ffiArrowSchema, null);
+      }
     }
   }
 
@@ -237,9 +272,14 @@ public class Dataset implements Closeable {
    */
   @Override
   public void close() {
-    if (nativeDatasetHandle != 0) {
-      releaseNativeDataset(nativeDatasetHandle);
-      nativeDatasetHandle = 0;
+    lock.writeLock().lock();
+    try {
+      if (nativeDatasetHandle != 0) {
+        releaseNativeDataset(nativeDatasetHandle);
+        nativeDatasetHandle = 0;
+      }
+    } finally {
+      lock.writeLock().unlock();
     }
   }
 
@@ -250,4 +290,16 @@ public class Dataset implements Closeable {
    * @param handle The native handle to the dataset resource.
    */
   private native void releaseNativeDataset(long handle);
+
+  private class ReadLock implements AutoCloseable {
+    /** Read lock. */
+    public ReadLock() {
+      lock.readLock().lock();
+    }
+
+    @Override
+    public void close() {
+      lock.readLock().unlock();
+    }
+  }
 }
