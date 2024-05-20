@@ -99,8 +99,7 @@ impl DistCalculator<'_> for InMemoryDistanceCal {
                 const CACHE_LINE_SIZE: usize = 64;
                 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 {
-                    use core::arch::x86_64::_mm_prefetch;
-                    const _MM_HINT_T0: i32 = 1;
+                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
                     _mm_prefetch(current_ptr, _MM_HINT_T0);
                 }
                 current_ptr = current_ptr.add(CACHE_LINE_SIZE);

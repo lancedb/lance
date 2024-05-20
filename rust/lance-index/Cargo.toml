@@ -49,7 +49,7 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
-crossbeam-queue = "0.3"
+crossbeam-queue.workspace = true
 
 [dev-dependencies]
 approx.workspace = true

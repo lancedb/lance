@@ -7,8 +7,6 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::MutexGuard;
 
 use arrow_schema::{DataType, Field};
 use lance_core::Result;
@@ -152,7 +150,7 @@ pub trait Graph {
 
 /// Array-based visited list (faster than HashSet)
 pub struct Visited<'a> {
-    visited: MutexGuard<'a, Vec<bool>>,
+    visited: &'a mut [bool],
     recently_visited: Vec<u32>,
 }
 
@@ -173,54 +171,36 @@ impl<'a> Visited<'a> {
 
 impl<'a> Drop for Visited<'a> {
     fn drop(&mut self) {
-        for node_id in &self.recently_visited {
-            let node_id_usize = *node_id as usize;
-            self.visited[node_id_usize] = false;
+        for node_id in self.recently_visited.iter() {
+            self.visited[*node_id as usize] = false;
         }
         self.recently_visited.clear();
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VisitedGenerator {
-    // TODO make this multithread-able
-    visited: Mutex<Vec<bool>>,
-    capacity: Mutex<usize>,
+    visited: Vec<bool>,
+    capacity: usize,
 }
 
 impl VisitedGenerator {
     pub fn new(capacity: usize) -> Self {
         Self {
-            visited: Mutex::new(vec![false; capacity]),
-            capacity: Mutex::new(capacity),
+            visited: vec![false; capacity],
+            capacity: capacity,
         }
     }
 
-    //pub fn generate<'a>(&'a mut self, node_count: usize) -> Visited<'a> {
-    pub fn generate(&self, node_count: usize) -> Visited<'_> {
-        let mut capacity_guard = self.capacity.lock().unwrap();
-        let mut visited_guard = self.visited.lock().unwrap();
-
-        if node_count > *capacity_guard {
-            let new_capacity = capacity_guard.max(node_count).next_power_of_two();
-            visited_guard.resize(new_capacity, false);
-            *capacity_guard = new_capacity;
+    pub fn generate(&mut self, node_count: usize) -> Visited<'_> {
+        if node_count > self.capacity {
+            let new_capacity = self.capacity.max(node_count).next_power_of_two();
+            self.visited.resize(new_capacity, false);
+            self.capacity = new_capacity;
         }
         Visited {
-            visited: visited_guard,
+            visited: &mut self.visited,
             recently_visited: Vec::new(),
-        }
-    }
-}
-
-impl Clone for VisitedGenerator {
-    fn clone(&self) -> Self {
-        let visited_guard = self.visited.lock().unwrap();
-        let capacity_guard = self.capacity.lock().unwrap();
-
-        Self {
-            visited: Mutex::new(visited_guard.clone()),
-            capacity: Mutex::new(*capacity_guard),
         }
     }
 }
@@ -256,7 +236,7 @@ pub fn beam_search(
     dist_calc: &dyn DistCalculator,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
     prefetch_distance: Option<usize>,
-    visited_generator: &VisitedGenerator,
+    visited_generator: &mut VisitedGenerator,
 ) -> Result<Vec<OrderedNode>> {
     let mut visited = visited_generator.generate(graph.len());
     //let mut visited: HashSet<_> = HashSet::with_capacity(k);

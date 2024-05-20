@@ -157,20 +157,6 @@ impl HNSW {
         self.inner.distance_type
     }
 
-    /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
-    // pub fn with_params(
-    //     distance_type: DistanceType,
-    //     params: HnswBuildParams,
-    //     vectors: Option<Arc<dyn VectorStorage>>,
-    // ) -> Self {
-    //     let inner = Arc::new(HNSWBuilderInner::with_params(
-    //         distance_type,
-    //         params,
-    //         vectors,
-    //     ));
-    //     Self { inner }
-    // }
-
     /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
     pub async fn build_with_storage(
         distance_type: DistanceType,
@@ -208,10 +194,10 @@ impl HNSW {
             let chunk = chunk.collect_vec();
             let inner = hnsw.inner.clone();
             let storage = storage.clone();
-            let visited_generator = VisitedGenerator::new(len);
+            let mut visited_generator = VisitedGenerator::new(len);
             tasks.push(spawn_cpu(move || {
                 for node in chunk.into_iter() {
-                    inner.insert(node as u32, &visited_generator, storage.as_ref())?;
+                    inner.insert(node as u32, &mut visited_generator, storage.as_ref())?;
                 }
                 Result::Ok(())
             }));
@@ -229,7 +215,7 @@ impl HNSW {
         k: usize,
         ef: usize,
         bitset: Option<RoaringBitmap>,
-        visited_generator: &VisitedGenerator,
+        visited_generator: &mut VisitedGenerator,
         storage: &dyn VectorStorage,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
@@ -265,12 +251,20 @@ impl HNSW {
         bitset: Option<RoaringBitmap>,
         storage: &dyn VectorStorage,
     ) -> Result<Vec<OrderedNode>> {
-        let visited_generator = self
+        let mut visited_generator = self
             .inner
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let result = self.search(query, k, ef, bitset, &visited_generator, storage, Some(2));
+        let result = self.search(
+            query,
+            k,
+            ef,
+            bitset,
+            &mut visited_generator,
+            storage,
+            Some(2),
+        );
 
         match self.inner.visited_generator_queue.push(visited_generator) {
             Ok(_) => {}
@@ -595,7 +589,7 @@ impl HNSWBuilderInner {
     fn insert(
         &self,
         node: u32,
-        visited_generator: &VisitedGenerator,
+        visited_generator: &mut VisitedGenerator,
         storage: &dyn VectorStorage,
     ) -> Result<()> {
         let nodes = &self.nodes;
@@ -670,7 +664,7 @@ impl HNSWBuilderInner {
         level: u16,
         dist_calc: &dyn DistCalculator,
         nodes: &Vec<RwLock<GraphBuilderNode>>,
-        visited_generator: &VisitedGenerator,
+        visited_generator: &mut VisitedGenerator,
     ) -> Result<Vec<OrderedNode>> {
         let cur_level = HnswLevelView::new(level, nodes);
         beam_search(
