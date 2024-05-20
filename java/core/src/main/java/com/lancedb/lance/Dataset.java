@@ -49,7 +49,7 @@ public class Dataset implements Closeable {
 
   BufferAllocator allocator;
 
-  private final ReadWriteLock lock = new ReentrantReadWriteLock();
+  private final LockManager lockManager = new LockManager();
 
   private Dataset() {
   }
@@ -184,7 +184,7 @@ public class Dataset implements Closeable {
    */
   public LanceScanner newScan(ScanOptions options) {
     Preconditions.checkNotNull(options);
-    try (ReadLock readLock = new ReadLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return LanceScanner.create(this, options, allocator);
     }
@@ -194,7 +194,7 @@ public class Dataset implements Closeable {
    * Gets the currently checked out version of the dataset.
    */
   public long version() {
-    try (ReadLock readLock = new ReadLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeVersion();
     }
@@ -206,7 +206,7 @@ public class Dataset implements Closeable {
    * Gets the latest version of the dataset.
    */
   public long latestVersion() {
-    try (ReadLock readLock = new ReadLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeLatestVersion();
     }
@@ -220,7 +220,7 @@ public class Dataset implements Closeable {
    * @return num of rows.
    */
   public int countRows() {
-    try (ReadLock readLock = new ReadLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeCountRows();
     }
@@ -234,7 +234,7 @@ public class Dataset implements Closeable {
    * @return A list of {@link DatasetFragment}.
    */
   public List<DatasetFragment> getFragments() {
-    try (ReadLock readLock = new ReadLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       // Set a pointer in Fragment to dataset, to make it is easier to issue IOs
       // later.
@@ -254,7 +254,7 @@ public class Dataset implements Closeable {
    * @return the arrow schema
    */
   public Schema getSchema() {
-    try (ReadLock readLock = new ReadLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
         importFfiSchema(ffiArrowSchema.memoryAddress());
@@ -272,14 +272,11 @@ public class Dataset implements Closeable {
    */
   @Override
   public void close() {
-    lock.writeLock().lock();
-    try {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       if (nativeDatasetHandle != 0) {
         releaseNativeDataset(nativeDatasetHandle);
         nativeDatasetHandle = 0;
       }
-    } finally {
-      lock.writeLock().unlock();
     }
   }
 
@@ -291,15 +288,14 @@ public class Dataset implements Closeable {
    */
   private native void releaseNativeDataset(long handle);
 
-  private class ReadLock implements AutoCloseable {
-    /** Read lock. */
-    public ReadLock() {
-      lock.readLock().lock();
-    }
-
-    @Override
-    public void close() {
-      lock.readLock().unlock();
+  /**
+   * Checks if the dataset is closed.
+   *
+   * @return true if the dataset is closed, false otherwise.
+   */
+  public boolean closed() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      return nativeDatasetHandle == 0;
     }
   }
 }

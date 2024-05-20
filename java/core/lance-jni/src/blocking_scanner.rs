@@ -93,18 +93,15 @@ fn inner_create_scanner<'local>(
     filter_obj: JObject,
     batch_size_obj: JObject,
 ) -> JavaResult<JObject<'local>> {
-    let dataset = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-                .infer_error()?;
-        dataset.clone()
-    };
-    let mut scanner = dataset.inner.scan();
     let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+            .infer_error()?;
+    let mut scanner = dataset_guard.inner.scan();
     if let Some(fragment_ids) = fragment_ids_opt {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
-            let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
+            let Some(fragment) = dataset_guard.inner.get_fragment(fragment_id as usize) else {
                 return Err(JavaError::input_error(format!(
                     "Fragment {fragment_id} not found"
                 )));
@@ -113,6 +110,7 @@ fn inner_create_scanner<'local>(
         }
         scanner.with_fragments(fragments);
     }
+    drop(dataset_guard);
     let columns_opt = env.get_strings_opt(&columns_obj)?;
     if let Some(columns) = columns_opt {
         scanner.project(&columns).infer_error()?;
@@ -190,13 +188,12 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_openStream(
 }
 
 fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -> JavaResult<()> {
-    let scanner = {
+    let record_batch_stream = {
         let scanner_guard =
             unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
                 .infer_error()?;
-        scanner_guard.clone()
+        scanner_guard.open_stream()?
     };
-    let record_batch_stream = scanner.open_stream()?;
     let ffi_stream =
         to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone()).infer_error()?;
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
@@ -220,20 +217,19 @@ fn inner_import_ffi_schema(
     j_scanner: JObject,
     schema_addr: jlong,
 ) -> JavaResult<()> {
-    let scanner = {
+    let schema = {
         let scanner_guard =
             unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
                 .infer_error()?;
-        scanner_guard.clone()
+        scanner_guard.schema()?
     };
-    let schema = scanner.schema()?;
     let ffi_schema = FFI_ArrowSchema::try_from(&*schema).infer_error()?;
     unsafe { std::ptr::write_unaligned(schema_addr as *mut FFI_ArrowSchema, ffi_schema) }
     Ok(())
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_countRows(
+pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_nativeCountRows(
     mut env: JNIEnv,
     j_scanner: JObject,
 ) -> jlong {
@@ -241,11 +237,8 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_countRows(
 }
 
 fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> JavaResult<u64> {
-    let scanner = {
-        let scanner_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
-                .infer_error()?;
-        scanner_guard.clone()
-    };
-    scanner.count_rows()
+    let scanner_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
+            .infer_error()?;
+    scanner_guard.count_rows()
 }
