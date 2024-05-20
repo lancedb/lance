@@ -25,19 +25,17 @@ use log::{debug, trace};
 use snafu::{location, Location};
 
 use lance_core::{Error, Result};
-use tokio::sync::mpsc;
 
 use crate::{
     decoder::{
         DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo,
-        PhysicalPageDecoder, PhysicalPageScheduler,
+        PhysicalPageDecoder, PhysicalPageScheduler, SchedulerContext,
     },
     encoder::{ArrayEncoder, EncodeTask, EncodedPage, FieldEncoder},
     encodings::physical::{
         basic::BasicEncoder, decoder_from_array_encoding, fixed_size_list::FslEncoder,
         value::ValueEncoder, ColumnBuffers, PageBuffers,
     },
-    EncodingsIo,
 };
 
 /// A page scheduler for primitive fields
@@ -78,15 +76,13 @@ impl LogicalPageScheduler for PrimitivePageScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[std::ops::Range<u32>],
-        scheduler: &Arc<dyn EncodingsIo>,
-        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
-        trace!("Scheduling ranges {:?} from physical page", ranges);
         let physical_decoder =
             self.physical_decoder
-                .schedule_ranges(ranges, scheduler.as_ref(), top_level_row);
+                .schedule_ranges(ranges, context.io(), top_level_row);
 
         let logical_decoder = PrimitiveFieldDecoder {
             data_type: self.data_type.clone(),
@@ -96,15 +92,14 @@ impl LogicalPageScheduler for PrimitivePageScheduler {
             num_rows,
         };
 
-        sink.send(Box::new(logical_decoder)).unwrap();
+        context.emit(Box::new(logical_decoder));
         Ok(())
     }
 
     fn schedule_take(
         &self,
         indices: &[u32],
-        scheduler: &Arc<dyn EncodingsIo>,
-        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()> {
         trace!(
@@ -116,8 +111,7 @@ impl LogicalPageScheduler for PrimitivePageScheduler {
                 .iter()
                 .map(|&idx| idx..(idx + 1))
                 .collect::<Vec<_>>(),
-            scheduler,
-            sink,
+            context,
             top_level_row,
         )
     }
@@ -392,11 +386,9 @@ impl PrimitiveFieldDecodeTask {
 }
 
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
-    fn wait<'a>(
-        &'a mut self,
-        _: u32,
-        _: &'a mut mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
-    ) -> BoxFuture<'a, Result<()>> {
+    // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
+    // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
+    fn wait(&mut self, _: u32) -> BoxFuture<Result<()>> {
         async move {
             let physical_decoder = self.unloaded_physical_decoder.take().unwrap().await?;
             self.physical_decoder = Some(Arc::from(physical_decoder));
@@ -439,6 +431,10 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         } else {
             self.num_rows - self.rows_drained
         }
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
     }
 }
 

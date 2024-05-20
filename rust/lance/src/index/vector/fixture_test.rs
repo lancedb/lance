@@ -124,7 +124,7 @@ mod test {
     async fn test_ivf_residual_handling() {
         let centroids = Float32Array::from_iter(vec![1.0, 1.0, -1.0, -1.0, -1.0, 1.0, 1.0, -1.0]);
         let centroids = FixedSizeListArray::try_new_from_values(centroids, 2).unwrap();
-        let mut ivf = Ivf::new(Arc::new(centroids));
+        let mut ivf = Ivf::new(centroids);
         // Add 4 partitions
         for _ in 0..4 {
             ivf.add_partition(0, 0);

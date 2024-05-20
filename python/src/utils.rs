@@ -30,6 +30,7 @@ use lance::{
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::hnsw::HNSW;
 use lance_linalg::{
     distance::DistanceType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
@@ -187,7 +188,7 @@ impl Hnsw {
                 FileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     &path,
-                    Schema::try_from(self.hnsw.schema().as_ref())
+                    Schema::try_from(&HNSW::schema())
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                     &Default::default(),
                 ),

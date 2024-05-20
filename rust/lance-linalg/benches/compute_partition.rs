@@ -20,16 +20,13 @@ fn bench_compute_partitions(c: &mut Criterion) {
         K * DIMENSION,
         SEED,
     ));
-    let input = Arc::new(generate_random_array_with_seed::<Float32Type>(
-        INPUT_SIZE * DIMENSION,
-        SEED,
-    ));
+    let input = generate_random_array_with_seed::<Float32Type>(INPUT_SIZE * DIMENSION, SEED);
 
     c.bench_function("compute_centroids(L2)", |b| {
         b.iter(|| {
-            compute_partitions::<Float32Type>(
-                centroids.clone(),
-                input.clone(),
+            compute_partitions(
+                centroids.values(),
+                input.values(),
                 DIMENSION,
                 MetricType::L2,
             )
@@ -38,9 +35,9 @@ fn bench_compute_partitions(c: &mut Criterion) {
 
     c.bench_function("compute_centroids(Cosine)", |b| {
         b.iter(|| {
-            compute_partitions::<Float32Type>(
-                centroids.clone(),
-                input.clone(),
+            compute_partitions(
+                centroids.values(),
+                input.values(),
                 DIMENSION,
                 MetricType::Cosine,
             )

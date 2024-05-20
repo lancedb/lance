@@ -8,9 +8,9 @@ use arrow_array::Array;
 use lance_core::Result;
 use lance_index::vector::{
     graph::memory::InMemoryVectorStorage,
-    hnsw::{builder::HnswBuildParams, HNSWBuilder, HNSW},
+    hnsw::{builder::HnswBuildParams, builder::HNSW},
 };
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::{distance::DistanceType, MatrixView};
 
 pub async fn build_hnsw_model(
     hnsw_params: HnswBuildParams,
@@ -21,9 +21,6 @@ pub async fn build_hnsw_model(
     )?);
 
     // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
-    let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
-    let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params, vec_store);
-    let hnsw = hnsw_builder.build().await?;
-
-    Ok(hnsw)
+    let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
+    HNSW::build_with_storage(DistanceType::L2, hnsw_params, vec_store).await
 }

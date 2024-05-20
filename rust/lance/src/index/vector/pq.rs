@@ -365,16 +365,9 @@ pub(super) async fn build_pq_model(
         // Compute residual for PQ training.
         //
         // TODO: consolidate IVF models to `lance_index`.
-        let ivf2 = lance_index::vector::ivf::new_ivf(
-            ivf.centroids.values(),
-            ivf.dimension(),
-            MetricType::L2,
-            vec![],
-            None,
-        )?;
+        let ivf2 = lance_index::vector::ivf::new_ivf(ivf.centroids.clone(), MetricType::L2, vec![]);
         span!(Level::INFO, "compute residual for PQ training")
-            .in_scope(|| ivf2.compute_residual(&training_data, None))
-            .await?
+            .in_scope(|| ivf2.compute_residual(&training_data))?
     } else {
         training_data
     };
@@ -461,7 +454,7 @@ mod tests {
 
         let centroids = generate_random_array_with_range(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf = Ivf::new(fsl.into());
+        let ivf = Ivf::new(fsl);
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
             .await
@@ -524,16 +517,9 @@ mod tests {
         let vectors = normalize_fsl(&vectors).unwrap();
         let row = vectors.slice(0, 1);
 
-        let ivf2 = lance_index::vector::ivf::new_ivf(
-            ivf.centroids.values(),
-            ivf.dimension(),
-            MetricType::L2,
-            vec![],
-            None,
-        )
-        .unwrap();
+        let ivf2 = lance_index::vector::ivf::new_ivf(ivf.centroids.clone(), MetricType::L2, vec![]);
 
-        let residual_query = ivf2.compute_residual(&row, None).await.unwrap();
+        let residual_query = ivf2.compute_residual(&row).unwrap();
         let pq_code = pq.transform(&residual_query).unwrap();
         let distances = pq
             .compute_distances(

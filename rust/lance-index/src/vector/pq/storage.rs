@@ -235,7 +235,7 @@ impl ProductQuantizationStorage {
         let num_sub_vectors = quantizer.num_sub_vectors;
         let metric_type = quantizer.metric_type;
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
-        let batch = transform.transform(batch).await?;
+        let batch = transform.transform(batch)?;
 
         Self::new(
             codebook,
@@ -468,7 +468,7 @@ impl PQDistCalculator {
     }
 }
 
-impl DistCalculator for PQDistCalculator {
+impl DistCalculator<'_> for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let pq_code = self.get_pq_code(id);
         pq_code

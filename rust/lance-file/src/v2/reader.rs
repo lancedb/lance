@@ -602,7 +602,7 @@ impl FileReader {
 
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
         tokio::task::spawn(
-            async move { decode_scheduler.schedule_range(range, tx, &scheduler).await },
+            async move { decode_scheduler.schedule_range(range, tx, scheduler).await },
         );
 
         Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read).into_stream())
@@ -636,7 +636,7 @@ impl FileReader {
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
         tokio::task::spawn(async move {
             decode_scheduler
-                .schedule_take(&indices, tx, &scheduler)
+                .schedule_take(&indices, tx, scheduler)
                 .await
         });
 

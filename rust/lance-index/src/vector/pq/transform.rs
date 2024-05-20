@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, RecordBatch};
 use arrow_schema::Field;
-use async_trait::async_trait;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use snafu::{location, Location};
@@ -47,9 +46,8 @@ impl Debug for PQTransformer {
     }
 }
 
-#[async_trait]
 impl Transformer for PQTransformer {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let input_arr = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::Index {
@@ -109,7 +107,7 @@ mod tests {
         .unwrap();
 
         let transformer = PQTransformer::new(pq, "vec", "pq_code");
-        let batch = transformer.transform(&batch).await.unwrap();
+        let batch = transformer.transform(&batch).unwrap();
         assert!(batch.column_by_name("vec").is_none());
         assert!(batch.column_by_name("pq_code").is_some());
         assert!(batch.column_by_name("other").is_some());

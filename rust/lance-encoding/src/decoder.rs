@@ -196,6 +196,7 @@
 //!  * The "batch overhead" is very small in Lance compared to other formats because it has no
 //!    relation to the way the data is stored.
 
+use std::collections::VecDeque;
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -513,7 +514,8 @@ impl DecodeBatchScheduler {
                 Self::create_field_scheduler(field.data_type(), &mut col_info_iter, buffers)
             })
             .collect::<Vec<_>>();
-        let root_scheduler = SimpleStructScheduler::new(field_schedulers, schema.fields.clone());
+        let root_scheduler =
+            SimpleStructScheduler::new_root(field_schedulers, schema.fields.clone());
         Self { root_scheduler }
     }
 
@@ -528,20 +530,17 @@ impl DecodeBatchScheduler {
     pub async fn schedule_range(
         &mut self,
         range: Range<u64>,
-        sink: mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
-        scheduler: &Arc<dyn EncodingsIo>,
+        sink: mpsc::UnboundedSender<DecoderMessage>,
+        scheduler: Arc<dyn EncodingsIo>,
     ) -> Result<()> {
         let rows_to_read = range.end - range.start;
         trace!("Scheduling range {:?} ({} rows)", range, rows_to_read);
 
         let range = range.start as u32..range.end as u32;
 
-        self.root_scheduler.schedule_ranges(
-            &[range.clone()],
-            scheduler,
-            &sink,
-            range.start as u64,
-        )?;
+        let mut context = SchedulerContext::new(sink, scheduler);
+        self.root_scheduler
+            .schedule_ranges(&[range.clone()], &mut context, range.start as u64)?;
 
         trace!("Finished scheduling of range {:?}", range);
         Ok(())
@@ -557,8 +556,8 @@ impl DecodeBatchScheduler {
     pub async fn schedule_take(
         &mut self,
         indices: &[u64],
-        sink: mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
-        scheduler: &Arc<dyn EncodingsIo>,
+        sink: mpsc::UnboundedSender<DecoderMessage>,
+        scheduler: Arc<dyn EncodingsIo>,
     ) -> Result<()> {
         debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
         if indices.is_empty() {
@@ -578,8 +577,10 @@ impl DecodeBatchScheduler {
         }
         // TODO: Figure out how to handle u64 indices
         let indices = indices.iter().map(|i| *i as u32).collect::<Vec<_>>();
+        let mut context = SchedulerContext::new(sink, scheduler);
+
         self.root_scheduler
-            .schedule_take(&indices, scheduler, &sink, indices[0] as u64)?;
+            .schedule_take(&indices, &mut context, indices[0] as u64)?;
         trace!("Finished scheduling take of {} rows", indices.len());
         Ok(())
     }
@@ -592,10 +593,12 @@ pub struct ReadBatchTask {
 
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct BatchDecodeStream {
-    scheduled: mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
-    current: Option<Box<dyn LogicalPageDecoder>>,
+    context: DecoderContext,
+    root_decoders: VecDeque<Box<dyn LogicalPageDecoder>>,
     rows_remaining: u64,
     rows_per_batch: u32,
+    rows_scheduled: u64,
+    rows_drained: u64,
 }
 
 impl BatchDecodeStream {
@@ -610,23 +613,69 @@ impl BatchDecodeStream {
     /// * `num_rows` the total number of rows scheduled
     /// * `num_columns` the total number of columns in the file
     pub fn new(
-        scheduled: mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
+        scheduled: mpsc::UnboundedReceiver<DecoderMessage>,
         rows_per_batch: u32,
         num_rows: u64,
     ) -> Self {
         Self {
-            scheduled,
-            current: None,
+            context: DecoderContext::new(scheduled),
+            root_decoders: VecDeque::new(),
             rows_remaining: num_rows,
             rows_per_batch,
+            rows_scheduled: 0,
+            rows_drained: 0,
         }
+    }
+
+    fn accept_decoder(&mut self, decoder: DecoderReady) -> Result<()> {
+        if decoder.path.is_empty() {
+            self.root_decoders.push_back(decoder.decoder);
+        } else {
+            let root = self
+                .root_decoders
+                .front_mut()
+                .ok_or_else(|| Error::Internal {
+                    message: format!(
+                        "A child decoder with path {:?} arrived before any root decoder",
+                        decoder.path
+                    ),
+                    location: location!(),
+                })?;
+            root.accept_child(decoder)?;
+        }
+        Ok(())
+    }
+
+    async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<()> {
+        while self.rows_scheduled < scheduled_need {
+            let next_message = self.context.source.recv().await;
+            match next_message {
+                Some(DecoderMessage::ScanLine(rows_scheduled)) => {
+                    self.rows_scheduled = rows_scheduled;
+                }
+                Some(DecoderMessage::Decoder(decoder)) => {
+                    self.accept_decoder(decoder)?;
+                }
+                None => {
+                    return Err(Error::Internal {
+                        message:
+                            "The scheduler finished while the decoder was still waiting for input"
+                                .to_string(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     #[instrument(level = "debug", skip_all)]
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
         trace!(
-            "Draining batch task (rows_remaining={})",
-            self.rows_remaining
+            "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
+            self.rows_remaining,
+            self.rows_drained,
+            self.rows_scheduled,
         );
         if self.rows_remaining == 0 {
             return Ok(None);
@@ -635,20 +684,34 @@ impl BatchDecodeStream {
         let to_take = self.rows_remaining.min(self.rows_per_batch as u64) as u32;
         self.rows_remaining -= to_take as u64;
 
-        if self.current.is_none() {
-            trace!("Loading new top-level page");
-            self.current = Some(self.scheduled.recv().await.unwrap());
+        let scheduled_need =
+            (self.rows_drained + to_take as u64).saturating_sub(self.rows_scheduled);
+        if scheduled_need > 0 {
+            let desired_scheduled = scheduled_need + self.rows_scheduled;
+            trace!(
+                "Draining from scheduler (desire at least {} scheduled rows)",
+                desired_scheduled
+            );
+            self.wait_for_scheduled(desired_scheduled).await?;
         }
-        let current = self.current.as_mut().unwrap();
+
+        let current = self
+            .root_decoders
+            .front_mut()
+            .ok_or_else(|| Error::Internal {
+                message: "the scheduler never emitted a top-level decoder".into(),
+                location: location!(),
+            })?;
         let avail = current.avail();
         trace!("Top level page has {} rows already available", avail);
         if avail < to_take {
-            current.wait(to_take, &mut self.scheduled).await?;
+            current.wait(to_take).await?;
         }
         let next_task = current.drain(to_take)?;
         if !next_task.has_more {
-            self.current = None;
+            self.root_decoders.pop_front();
         }
+        self.rows_drained += to_take as u64;
         Ok(Some(next_task))
     }
 
@@ -760,6 +823,132 @@ pub trait PhysicalPageScheduler: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
 
+/// Contains the context for a scheduler
+pub struct SchedulerContext {
+    /// The sink that sends decodeable tasks to the decode stage
+    pub(crate) sink: mpsc::UnboundedSender<DecoderMessage>,
+    recv: Option<mpsc::UnboundedReceiver<DecoderMessage>>,
+    io: Arc<dyn EncodingsIo>,
+    name: String,
+    path: Vec<u32>,
+    path_names: Vec<String>,
+}
+
+pub struct ScopedSchedulerContext<'a> {
+    pub context: &'a mut SchedulerContext,
+}
+
+impl<'a> ScopedSchedulerContext<'a> {
+    pub fn pop(self) -> &'a mut SchedulerContext {
+        self.context.pop();
+        self.context
+    }
+}
+
+impl SchedulerContext {
+    pub fn new(sink: mpsc::UnboundedSender<DecoderMessage>, io: Arc<dyn EncodingsIo>) -> Self {
+        Self {
+            sink,
+            io,
+            recv: None,
+            name: "".to_string(),
+            path: Vec::new(),
+            path_names: Vec::new(),
+        }
+    }
+
+    pub fn io(&self) -> &dyn EncodingsIo {
+        self.io.as_ref()
+    }
+
+    pub fn push(&mut self, name: &str, index: u32) -> ScopedSchedulerContext {
+        self.path.push(index);
+        self.path_names.push(name.to_string());
+        ScopedSchedulerContext { context: self }
+    }
+
+    pub fn pop(&mut self) {
+        self.path.pop();
+        self.path_names.pop();
+    }
+
+    pub fn path_name(&self) -> String {
+        let path = self.path_names.join("/");
+        if self.recv.is_some() {
+            format!("TEMP({}){}", self.name, path)
+        } else {
+            format!("ROOT{}", path)
+        }
+    }
+
+    pub fn emit(&mut self, decoder: Box<dyn LogicalPageDecoder>) {
+        trace!(
+            "Scheduling decoder of type {:?} for {:?}",
+            decoder.data_type(),
+            self.path,
+        );
+        self.sink
+            .send(DecoderMessage::Decoder(DecoderReady {
+                decoder,
+                path: VecDeque::from_iter(self.path.iter().copied()),
+            }))
+            .unwrap();
+    }
+
+    // Temporary might not be the best name for this.  We create a new context that
+    // shared the same I/O scheduler and has a different name.  This is used in two
+    // situations.
+    //
+    // 1. When we need to create a new indirect I/O phase.
+    // 2. When we need to wrap a set of decoders and so we want to intercept them
+    //    before they are emitted.
+    pub fn temporary(&self) -> Self {
+        let (tx, rx) = unbounded_channel();
+        let mut name = self.name.clone();
+        name.push_str(&self.path_names.join("/"));
+        Self {
+            sink: tx,
+            io: self.io.clone(),
+            recv: Some(rx),
+            name,
+            path: Vec::new(),
+            path_names: Vec::new(),
+        }
+    }
+
+    // Consumes the temporary context returning the decoder messages
+    //
+    // Used when the temporary context is used to create a new indirect I/O phase
+    // where all the messages need to be replayed
+    pub fn into_messages(self) -> Vec<DecoderMessage> {
+        let mut recv = self
+            .recv
+            .expect("Call to `finish` on a non-temporary scheduler context");
+        let mut decoders = Vec::new();
+        while let Ok(decoder) = recv.try_recv() {
+            decoders.push(decoder);
+        }
+        decoders
+    }
+
+    // Consumes the temporary context returning only the decoders
+    //
+    // Used when the temporary context is used to wrap a set of decoders
+    pub fn into_decoders(self) -> Vec<Box<dyn LogicalPageDecoder>> {
+        self.into_messages()
+            .into_iter()
+            .filter_map(|msg| {
+                match msg {
+                    DecoderMessage::ScanLine(_) => None,
+                    // Should we ignore path here?  Currently, all "wrapping" layers should not have
+                    // children and so there should be no path.  We could maybe debug_assert this.
+                    DecoderMessage::Decoder(decoder_ready) => Some(decoder_ready.decoder),
+                }
+            })
+            .collect::<Vec<_>>()
+    }
+}
+
 /// A scheduler for a field's worth of data
 ///
 /// Each page of incoming data maps to one `LogicalPageScheduler` instance.  However, this
@@ -791,8 +980,7 @@ pub trait LogicalPageScheduler: Send + Sync + std::fmt::Debug {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u32>],
-        scheduler: &Arc<dyn EncodingsIo>,
-        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()>;
     /// Schedules I/O for the requested rows (identified by row offsets from start of page)
@@ -800,8 +988,7 @@ pub trait LogicalPageScheduler: Send + Sync + std::fmt::Debug {
     fn schedule_take(
         &self,
         indices: &[u32],
-        scheduler: &Arc<dyn EncodingsIo>,
-        sink: &mpsc::UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        context: &mut SchedulerContext,
         top_level_row: u64,
     ) -> Result<()>;
     /// The number of rows covered by this page
@@ -824,6 +1011,48 @@ pub struct NextDecodeTask {
     pub has_more: bool,
 }
 
+pub struct DecoderReady {
+    // The decoder that is ready to be decoded
+    pub decoder: Box<dyn LogicalPageDecoder>,
+    // The path to the decoder, the first value is the column index
+    // following values, if present, are nested child indices
+    //
+    // For example, a path of [1, 1, 0] would mean to grab the second
+    // column, then the second child, and then the first child.
+    //
+    // It could represent x in the following schema:
+    //
+    // score: float64
+    // points: struct
+    //   color: string
+    //   location: struct
+    //     x: float64
+    //
+    // Currently, only struct decoders have "children" although other
+    // decoders may at some point as well.  List children are only
+    // handled through indirect I/O at the moment and so they don't
+    // need to be represented (yet)
+    pub path: VecDeque<u32>,
+}
+
+pub enum DecoderMessage {
+    // Emitted whenever the scheduler has made another pass through the columns.
+    // Contains the number of rows that have been scheduled so far.
+    ScanLine(u64),
+    // Emitted whenever a decoder has been emitted
+    Decoder(DecoderReady),
+}
+
+pub struct DecoderContext {
+    source: mpsc::UnboundedReceiver<DecoderMessage>,
+}
+
+impl DecoderContext {
+    pub fn new(source: mpsc::UnboundedReceiver<DecoderMessage>) -> Self {
+        Self { source }
+    }
+}
+
 /// A decoder for a field's worth of data
 ///
 /// The decoder is initially "unloaded" (doesn't have all its data).  The [`Self::wait`]
@@ -833,18 +1062,29 @@ pub struct NextDecodeTask {
 /// Unlike the other decoder types it is assumed that `LogicalPageDecoder` is stateful
 /// and only `Send`.  This is why we don't need a `rows_to_skip` argument in [`Self::drain`]
 pub trait LogicalPageDecoder: std::fmt::Debug + Send {
+    /// Add a newly scheduled child decoder
+    ///
+    /// The default implementation does not expect children and returns
+    /// an error.
+    fn accept_child(&mut self, _child: DecoderReady) -> Result<()> {
+        Err(Error::Internal {
+            message: format!(
+                "The decoder {:?} does not expect children but received a child",
+                self
+            ),
+            location: location!(),
+        })
+    }
     /// Waits for enough data to be loaded to decode `num_rows` of data
-    fn wait<'a>(
-        &'a mut self,
-        num_rows: u32,
-        source: &'a mut mpsc::UnboundedReceiver<Box<dyn LogicalPageDecoder>>,
-    ) -> BoxFuture<'a, Result<()>>;
+    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>>;
     /// Creates a task to decode `num_rows` of data into an array
     fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask>;
     /// The number of rows that are in the page but haven't yet been "waited"
     fn unawaited(&self) -> u32;
     /// The number of rows that have been "waited" but not yet decoded
     fn avail(&self) -> u32;
+    /// The data type of the decoded data
+    fn data_type(&self) -> &DataType;
 }
 
 /// Decodes a batch of data from an in-memory structure created by [`crate::encoder::encode_batch`]
@@ -854,7 +1094,7 @@ pub async fn decode_batch(batch: &EncodedBatch) -> Result<RecordBatch> {
     let (tx, rx) = unbounded_channel();
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
     decode_scheduler
-        .schedule_range(0..batch.num_rows, tx, &io_scheduler)
+        .schedule_range(0..batch.num_rows, tx, io_scheduler)
         .await?;
     let stream = BatchDecodeStream::new(rx, batch.num_rows as u32, batch.num_rows);
     stream.into_stream().next().await.unwrap().task.await
