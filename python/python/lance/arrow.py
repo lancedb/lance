@@ -9,12 +9,10 @@ from typing import Callable, Iterable, Optional, Union
 
 import pyarrow as pa
 
-from ._arrow.bf16 import (  # noqa: F401
-    BFloat16,
+from ._arrow.bf16 import (
     BFloat16Array,
-    BFloat16Type,
-    PandasBFloat16Array,
-)
+    BFloat16Type,  # noqa: F401
+    )
 from .dependencies import numpy as np
 from .lance import bfloat16_array
 
