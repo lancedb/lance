@@ -188,7 +188,7 @@ impl VisitedGenerator {
     pub fn new(capacity: usize) -> Self {
         Self {
             visited: vec![false; capacity],
-            capacity: capacity,
+            capacity,
         }
     }
 
