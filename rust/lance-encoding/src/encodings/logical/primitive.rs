@@ -313,10 +313,10 @@ impl PrimitiveFieldDecodeTask {
                 TimeUnit::Second => Ok(Self::new_primitive_array::<Time32SecondType>(
                     buffers, num_rows, data_type,
                 )),
-                _ => Err(Error::IO {
-                    message: format!("invalid time unit {:?} for 32-bit time type", unit),
-                    location: location!(),
-                }),
+                _ => Err(Error::io(
+                    format!("invalid time unit {:?} for 32-bit time type", unit),
+                    location!(),
+                )),
             },
             DataType::Time64(unit) => match unit {
                 TimeUnit::Microsecond => Ok(Self::new_primitive_array::<Time64MicrosecondType>(
@@ -325,10 +325,10 @@ impl PrimitiveFieldDecodeTask {
                 TimeUnit::Nanosecond => Ok(Self::new_primitive_array::<Time64NanosecondType>(
                     buffers, num_rows, data_type,
                 )),
-                _ => Err(Error::IO {
-                    message: format!("invalid time unit {:?} for 64-bit time type", unit),
-                    location: location!(),
-                }),
+                _ => Err(Error::io(
+                    format!("invalid time unit {:?} for 64-bit time type", unit),
+                    location!(),
+                )),
             },
             DataType::Timestamp(unit, _) => Ok(match unit {
                 TimeUnit::Microsecond => Self::new_primitive_array::<TimestampMicrosecondType>(
@@ -374,13 +374,13 @@ impl PrimitiveFieldDecodeTask {
                     fsl_nulls,
                 )))
             }
-            _ => Err(Error::IO {
-                message: format!(
+            _ => Err(Error::io(
+                format!(
                     "The data type {} cannot be decoded from a primitive encoding",
                     data_type
                 ),
-                location: location!(),
-            }),
+                location!(),
+            )),
         }
     }
 }

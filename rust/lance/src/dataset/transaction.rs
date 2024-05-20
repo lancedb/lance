@@ -791,17 +791,21 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 .old_id
                 .as_ref()
                 .map(Uuid::try_from)
-                .ok_or_else(|| Error::IO {
-                    message: "required field (old_id) missing from message".to_string(),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::io(
+                        "required field (old_id) missing from message".to_string(),
+                        location!(),
+                    )
                 })??,
             new_id: message
                 .new_id
                 .as_ref()
                 .map(Uuid::try_from)
-                .ok_or_else(|| Error::IO {
-                    message: "required field (new_id) missing from message".to_string(),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::io(
+                        "required field (new_id) missing from message".to_string(),
+                        location!(),
+                    )
                 })??,
         })
     }

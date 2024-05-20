@@ -284,10 +284,10 @@ impl Planner {
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
             _ => {
-                return Err(Error::IO {
-                    message: format!("Operator {op} is not supported"),
-                    location: location!(),
-                })
+                return Err(Error::io(
+                    format!("Operator {op} is not supported"),
+                    location!(),
+                ));
             }
         })
     }
@@ -314,10 +314,10 @@ impl Planner {
                         Err(_) => lit(-n
                             .parse::<f64>()
                             .map_err(|_e| {
-                                Error::IO{
-                                    message: format!("negative operator can be only applied to integer and float operands, got: {n}"),
-                                    location: location!(),
-                                }
+                                Error::io(
+                                    format!("negative operator can be only applied to integer and float operands, got: {n}"),
+                                    location!(),
+                                )
                             })?),
                     },
                     _ => {
@@ -327,10 +327,10 @@ impl Planner {
             }
 
             _ => {
-                return Err(Error::IO {
-                    message: format!("Unary operator '{:?}' is not supported", op),
-                    location: location!(),
-                })
+                return Err(Error::io(
+                    format!("Unary operator '{:?}' is not supported", op),
+                    location!(),
+                ));
             }
         })
     }
@@ -341,9 +341,11 @@ impl Planner {
         if let Ok(n) = value.parse::<i64>() {
             Ok(lit(n))
         } else {
-            value.parse::<f64>().map(lit).map_err(|_| Error::IO {
-                message: format!("'{value}' is not supported number value."),
-                location: location!(),
+            value.parse::<f64>().map(lit).map_err(|_| {
+                Error::io(
+                    format!("'{value}' is not supported number value."),
+                    location!(),
+                )
             })
         }
     }
@@ -370,10 +372,10 @@ impl Planner {
     fn parse_function_args(&self, func_args: &FunctionArg) -> Result<Expr> {
         match func_args {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
-            _ => Err(Error::IO {
-                message: format!("Unsupported function args: {:?}", func_args),
-                location: location!(),
-            }),
+            _ => Err(Error::io(
+                format!("Unsupported function args: {:?}", func_args),
+                location!(),
+            )),
         }
     }
 
@@ -385,10 +387,10 @@ impl Planner {
     // but rather an AST node (Expr::IsNotNull) and so we need to handle this case specially.
     fn legacy_parse_function(&self, func: &Function) -> Result<Expr> {
         if func.args.len() != 1 {
-            return Err(Error::IO {
-                message: format!("is_valid only support 1 args, got {}", func.args.len()),
-                location: location!(),
-            });
+            return Err(Error::io(
+                format!("is_valid only support 1 args, got {}", func.args.len()),
+                location!(),
+            ));
         }
         Ok(Expr::IsNotNull(Box::new(
             self.parse_function_args(&func.args[0])?,
@@ -451,10 +453,10 @@ impl Planner {
                 match tz {
                     TimezoneInfo::None => {}
                     _ => {
-                        return Err(Error::IO {
-                            message: "Timezone not supported in timestamp".to_string(),
-                            location: location!(),
-                        })
+                        return Err(Error::io(
+                            "Timezone not supported in timestamp".to_string(),
+                            location!(),
+                        ));
                     }
                 };
                 let time_unit = match resolution {
@@ -465,10 +467,10 @@ impl Planner {
                     Some(6) => TimeUnit::Microsecond,
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
-                        return Err(Error::IO {
-                            message: format!("Unsupported datetime resolution: {:?}", resolution),
-                            location: location!(),
-                        })
+                        return Err(Error::io(
+                            format!("Unsupported datetime resolution: {:?}", resolution),
+                            location!(),
+                        ));
                     }
                 };
                 Ok(ArrowDataType::Timestamp(time_unit, None))
@@ -481,10 +483,10 @@ impl Planner {
                     Some(6) => TimeUnit::Microsecond,
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
-                        return Err(Error::IO {
-                            message: format!("Unsupported datetime resolution: {:?}", resolution),
-                            location: location!(),
-                        })
+                        return Err(Error::io(
+                            format!("Unsupported datetime resolution: {:?}", resolution),
+                            location!(),
+                        ));
                     }
                 };
                 Ok(ArrowDataType::Timestamp(time_unit, None))
@@ -493,21 +495,21 @@ impl Planner {
                 ExactNumberInfo::PrecisionAndScale(precision, scale) => {
                     Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
                 }
-                _ => Err(Error::IO {
-                    message: format!(
+                _ => Err(Error::io(
+                    format!(
                         "Must provide precision and scale for decimal: {:?}",
                         number_info
                     ),
-                    location: location!(),
-                }),
+                    location!(),
+                )),
             },
-            _ => Err(Error::IO {
-                message: format!(
+            _ => Err(Error::io(
+                format!(
                     "Unsupported data type: {:?}. Supported types: {:?}",
                     data_type, SUPPORTED_TYPES
                 ),
-                location: location!(),
-            }),
+                location!(),
+            )),
         }
     }
 
@@ -544,10 +546,10 @@ impl Planner {
                             });
                         }
                     } else {
-                        return Err(Error::IO {
-                            message: "Only arrays of literals are supported in lance.".into(),
-                            location: location!(),
-                        });
+                        return Err(Error::io(
+                            "Only arrays of literals are supported in lance.",
+                            location!(),
+                        ));
                     }
                 }
 
@@ -556,10 +558,10 @@ impl Planner {
 
                     for value in &mut values {
                         if value.data_type() != data_type {
-                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::IO {
-                                message: format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type()),
-                                location: location!()
-                            })?;
+                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::io(
+                                format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type()),
+                                location!()
+                            ))?;
                         }
                     }
                     Field::new("item", data_type.clone(), true)
@@ -639,10 +641,10 @@ impl Planner {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
-            _ => Err(Error::IO {
-                message: format!("Expression '{expr}' is not supported SQL in lance"),
-                location: location!(),
-            }),
+            _ => Err(Error::io(
+                format!("Expression '{expr}' is not supported SQL in lance"),
+                location!(),
+            )),
         }
     }
 

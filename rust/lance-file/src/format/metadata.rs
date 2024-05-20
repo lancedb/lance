@@ -166,14 +166,14 @@ impl Metadata {
     // TODO: pub(crate)
     pub fn range_to_batches(&self, range: Range<usize>) -> Result<Vec<(i32, Range<usize>)>> {
         if range.end > *(self.batch_offsets.last().unwrap()) as usize {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "Range {:?} is out of bounds {}",
                     range,
                     self.batch_offsets.last().unwrap()
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         let offsets = self.batch_offsets.as_slice();
         let mut batch_id = offsets

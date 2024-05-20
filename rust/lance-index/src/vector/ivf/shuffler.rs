@@ -42,7 +42,7 @@ const UNSORTED_BUFFER: &str = "unsorted.lance";
 fn get_temp_dir() -> Result<Path> {
     let dir = TempDir::new()?;
     let tmp_dir_path = Path::from_filesystem_path(dir.path()).map_err(|e| Error::IO {
-        message: format!("failed to get buffer path in shuffler: {}", e),
+        source: Box::new(e),
         location: location!(),
     })?;
     Ok(tmp_dir_path)
@@ -149,14 +149,8 @@ pub async fn shuffle_dataset(
             .buffer_unordered(num_cpus::get())
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
-                Ok(Err(err)) => Err(Error::IO {
-                    message: err.to_string(),
-                    location: location!(),
-                }),
-                Err(err) => Err(Error::IO {
-                    message: err.to_string(),
-                    location: location!(),
-                }),
+                Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
+                Err(err) => Err(Error::io(err.to_string(), location!())),
             })
             .boxed();
 
@@ -235,29 +229,22 @@ impl IvfShuffler {
         let schema = match data.as_mut().peek().await {
             Some(Ok(batch)) => batch.schema(),
             Some(Err(err)) => {
-                return Err(Error::IO {
-                    message: err.to_string(),
-                    location: location!(),
-                })
+                return Err(Error::io(err.to_string(), location!()));
             }
             None => {
-                return Err(Error::IO {
-                    message: "empty stream".to_string(),
-                    location: location!(),
-                })
+                return Err(Error::io("empty stream".to_string(), location!()));
             }
         };
 
         // validate the schema,
         // we need to have row ID and partition ID column
-        schema.column_with_name(ROW_ID).ok_or(Error::IO {
-            message: "row ID column not found".to_owned(),
-            location: location!(),
-        })?;
-        schema.column_with_name(PART_ID_COLUMN).ok_or(Error::IO {
-            message: "partition ID column not found".to_owned(),
-            location: location!(),
-        })?;
+        schema
+            .column_with_name(ROW_ID)
+            .ok_or(Error::io("row ID column not found".to_owned(), location!()))?;
+        schema.column_with_name(PART_ID_COLUMN).ok_or(Error::io(
+            "partition ID column not found".to_owned(),
+            location!(),
+        ))?;
 
         let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
@@ -446,15 +433,11 @@ impl IvfShuffler {
 
                 // third, shuffle the data into each partition
                 let shuffled = self.shuffle_to_partitions(&input, size_counts).await?;
-                let schema =
-                    shuffled
-                        .iter()
-                        .find(|batches| !batches.is_empty())
-                        .ok_or(Error::IO {
-                            message: "empty input to shuffle".to_owned(),
-                            location: location!(),
-                        })?[0]
-                        .schema();
+                let schema = shuffled
+                    .iter()
+                    .find(|batches| !batches.is_empty())
+                    .ok_or(Error::io("empty input to shuffle".to_owned(), location!()))?[0]
+                    .schema();
 
                 // finally, write the shuffled data to disk
                 let object_store = ObjectStore::local();

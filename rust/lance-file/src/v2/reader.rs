@@ -136,13 +136,13 @@ impl FileReader {
     fn decode_footer(footer_bytes: &Bytes) -> Result<Footer> {
         let len = footer_bytes.len();
         if len < FOOTER_LEN {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "does not have sufficient data, len: {}, bytes: {:?}",
                     len, footer_bytes
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         let mut cursor = Cursor::new(footer_bytes.slice(len - FOOTER_LEN..));
 
@@ -156,24 +156,24 @@ impl FileReader {
         let minor_version = cursor.read_u16::<LittleEndian>()?;
 
         if major_version != MAJOR_VERSION as u16 || minor_version != MINOR_VERSION_NEXT {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "Attempt to use the lance v0.2 reader to read a file with version {}.{}",
                     major_version, minor_version
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
 
         let magic_bytes = footer_bytes.slice(len - 4..);
         if magic_bytes.as_ref() != MAGIC {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "file does not appear to be a Lance file (invalid magic: {:?})",
                     MAGIC
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         Ok(Footer {
             column_meta_start,

@@ -147,7 +147,10 @@ impl From<lance::Error> for Error {
             lance::Error::DatasetAlreadyExists { uri, location } => {
                 Self::DatasetAlreadyExists { uri, location }
             }
-            lance::Error::IO { message, location } => Self::IO { message, location },
+            lance::Error::IO { source, location } => Self::IO {
+                message: source.to_string(),
+                location,
+            },
             lance::Error::Arrow { message, location } => Self::Arrow { message, location },
             lance::Error::Index { message, location } => Self::Index { message, location },
             lance::Error::InvalidInput { source, location } => Self::InvalidArgument {
