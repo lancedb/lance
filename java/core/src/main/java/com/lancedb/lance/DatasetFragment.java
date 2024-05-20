@@ -42,7 +42,6 @@ public class DatasetFragment {
    * @return a dataset scanner
    */
   public LanceScanner newScan() {
-    Preconditions.checkState(!dataset.closed(), "Dataset is closed");
     return LanceScanner.create(dataset, new ScanOptions.Builder()
         .fragmentIds(List.of(metadata.getId())).build(), dataset.allocator);
   }
