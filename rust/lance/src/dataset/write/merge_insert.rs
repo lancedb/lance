@@ -635,7 +635,7 @@ struct MergeStats {
     num_updated_rows: u64,
     // Number of deleted rows (for user statistics)
     // Note: This is different from internal references to 'deleted_rows', since we technically "delete" updated rows during processing.
-    // However those rows are not shared with the user. 
+    // However those rows are not shared with the user.
     num_deleted_rows: u64,
 }
 
