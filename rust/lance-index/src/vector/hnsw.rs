@@ -54,7 +54,7 @@ pub fn select_neighbors(
 ///
 /// WARNING: Internal API,  API stability is not guaranteed
 pub fn select_neighbors_heuristic(
-    storage: &dyn VectorStore,
+    storage: &impl VectorStore,
     candidates: &[OrderedNode],
     k: usize,
 ) -> Vec<OrderedNode> {

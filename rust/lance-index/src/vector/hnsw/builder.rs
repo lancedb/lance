@@ -211,7 +211,7 @@ impl HNSW {
         ef: usize,
         bitset: Option<RoaringBitmap>,
         visited_generator: &mut VisitedGenerator,
-        storage: &dyn VectorStorage,
+        storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
         let dist_calc = storage.dist_calculator(query);
@@ -588,7 +588,7 @@ impl HNSWBuilderInner {
         &self,
         node: u32,
         visited_generator: &mut VisitedGenerator,
-        storage: &dyn VectorStorage,
+        storage: &impl VectorStore,
     ) -> Result<()> {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
@@ -676,7 +676,7 @@ impl HNSWBuilderInner {
         )
     }
 
-    fn prune(&self, storage: &dyn VectorStore, builder_node: &mut GraphBuilderNode, level: u16) {
+    fn prune(&self, storage: &impl VectorStore, builder_node: &mut GraphBuilderNode, level: u16) {
         let m_max = match level {
             0 => self.params.m * 2,
             _ => self.params.m,
