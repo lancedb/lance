@@ -355,6 +355,22 @@ fn visit_is_bool(
     }
 }
 
+// A column can be a valid indexed expression if the column is boolean (e.g. 'WHERE on_sale')
+fn visit_column(
+    col: &Expr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    let (column, col_type) = maybe_indexed_column(col, index_info)?;
+    if *col_type != DataType::Boolean {
+        None
+    } else {
+        Some(IndexedExpression::index_query(
+            column.to_string(),
+            ScalarQuery::Equals(ScalarValue::Boolean(Some(true))),
+        ))
+    }
+}
+
 fn visit_is_null(
     expr: &Expr,
     index_info: &dyn IndexInformationProvider,
@@ -458,8 +474,10 @@ fn visit_binary_expr(
 }
 
 fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
+    dbg!(expr);
     match expr {
         Expr::Between(between) => visit_between(between, index_info),
+        Expr::Column(_) => visit_column(expr, index_info),
         Expr::InList(in_list) => visit_in_list(in_list, index_info),
         Expr::IsFalse(expr) => visit_is_bool(expr.as_ref(), index_info, false),
         Expr::IsTrue(expr) => visit_is_bool(expr.as_ref(), index_info, true),
@@ -647,6 +665,30 @@ mod tests {
                 Bound::Included(ScalarValue::UInt32(Some(5))),
                 Bound::Included(ScalarValue::UInt32(Some(10))),
             ),
+        );
+        check_simple(
+            &index_info,
+            "on_sale IS TRUE",
+            "on_sale",
+            ScalarQuery::Equals(ScalarValue::Boolean(Some(true))),
+        );
+        check_simple(
+            &index_info,
+            "on_sale",
+            "on_sale",
+            ScalarQuery::Equals(ScalarValue::Boolean(Some(true))),
+        );
+        check_simple_negated(
+            &index_info,
+            "NOT on_sale",
+            "on_sale",
+            ScalarQuery::Equals(ScalarValue::Boolean(Some(true))),
+        );
+        check_simple(
+            &index_info,
+            "on_sale IS FALSE",
+            "on_sale",
+            ScalarQuery::Equals(ScalarValue::Boolean(Some(false))),
         );
         check_simple_negated(
             &index_info,
