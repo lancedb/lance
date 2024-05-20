@@ -474,7 +474,6 @@ fn visit_binary_expr(
 }
 
 fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
-    dbg!(expr);
     match expr {
         Expr::Between(between) => visit_between(between, index_info),
         Expr::Column(_) => visit_column(expr, index_info),
