@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 //! Indices for mapping row ids to their corresponding addresses.
-//! 
+//!
 //! Each fragment in a table has a [RowIdSequence] that contains the row ids
 //! in the order they appear in the fragment. The [RowIdIndex] aggregates these
 //! sequences and maps row ids to their corresponding addresses across the
 //! whole dataset.
-//! 
+//!
 //! [RowIdSequence]s are serialized individually and stored in the fragment
 //! metadata. Use [read_row_ids] and [write_row_ids] to read and write these
 //! sequences. The on-disk format is designed to align well with the in-memory

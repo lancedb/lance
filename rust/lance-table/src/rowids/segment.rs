@@ -163,8 +163,7 @@ impl U64Segment {
                 if min_size == &sizes[0] {
                     let range = stats.min..(stats.max + 1);
                     let mut holes =
-                        Self::holes_in_slice(stats.min..=stats.max, sequence.into_iter())
-                            .collect::<Vec<_>>();
+                        Self::holes_in_slice(stats.min..=stats.max, sequence).collect::<Vec<_>>();
                     holes.sort_unstable();
                     let holes = EncodedU64Array::from(holes);
 
@@ -173,7 +172,7 @@ impl U64Segment {
                     let range = stats.min..(stats.max + 1);
                     let mut bitmap = Bitmap::new_full((stats.max - stats.min) as usize + 1);
 
-                    for hole in Self::holes_in_slice(stats.min..=stats.max, sequence.into_iter()) {
+                    for hole in Self::holes_in_slice(stats.min..=stats.max, sequence) {
                         let offset = (hole - stats.min) as usize;
                         bitmap.clear(offset);
                     }
