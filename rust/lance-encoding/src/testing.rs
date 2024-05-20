@@ -17,6 +17,7 @@ use lance_datagen::{array, gen, RowCount, Seed};
 use crate::{
     decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, PageInfo},
     encoder::{BatchEncoder, EncodedPage, FieldEncoder},
+    encodings::logical::r#struct::SimpleStructDecoder,
     EncodingsIo,
 };
 
@@ -66,16 +67,18 @@ async fn test_decode(
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<DecoderMessage>,
-    ) -> BoxFuture<'static, Result<()>>,
+    ) -> (SimpleStructDecoder, BoxFuture<'static, Result<()>>),
 ) {
     let decode_scheduler = DecodeBatchScheduler::new(schema, column_infos, &Vec::new());
 
     let (tx, rx) = mpsc::unbounded_channel();
 
-    schedule_fn(decode_scheduler, tx).await.unwrap();
+    let (decoder, scheduler_fut) = schedule_fn(decode_scheduler, tx);
+
+    scheduler_fut.await.unwrap();
 
     const BATCH_SIZE: u32 = 100;
-    let mut decode_stream = BatchDecodeStream::new(rx, BATCH_SIZE, num_rows).into_stream();
+    let mut decode_stream = BatchDecodeStream::new(rx, BATCH_SIZE, num_rows, decoder).into_stream();
 
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
@@ -241,12 +244,19 @@ async fn check_round_trip_encoding_inner(
         &column_infos,
         concat_data.clone(),
         |mut decode_scheduler, tx| {
-            async move {
-                decode_scheduler
-                    .schedule_range(0..num_rows, tx, scheduler_copy)
-                    .await
-            }
-            .boxed()
+            #[allow(clippy::single_range_in_vec_init)]
+            let root_decoder = decode_scheduler
+                .root_scheduler
+                .new_root_decoder_ranges(&[0..num_rows]);
+            (
+                root_decoder,
+                async move {
+                    decode_scheduler
+                        .schedule_range(0..num_rows, tx, scheduler_copy)
+                        .await
+                }
+                .boxed(),
+            )
         },
     )
     .await;
@@ -266,7 +276,15 @@ async fn check_round_trip_encoding_inner(
             &column_infos,
             expected,
             |mut decode_scheduler, tx| {
-                async move { decode_scheduler.schedule_range(range, tx, scheduler).await }.boxed()
+                #[allow(clippy::single_range_in_vec_init)]
+                let root_decoder = decode_scheduler
+                    .root_scheduler
+                    .new_root_decoder_ranges(&[0..num_rows]);
+                (
+                    root_decoder,
+                    async move { decode_scheduler.schedule_range(range, tx, scheduler).await }
+                        .boxed(),
+                )
             },
         )
         .await;
@@ -297,12 +315,18 @@ async fn check_round_trip_encoding_inner(
             &column_infos,
             expected,
             |mut decode_scheduler, tx| {
-                async move {
-                    decode_scheduler
-                        .schedule_take(&indices, tx, scheduler)
-                        .await
-                }
-                .boxed()
+                let root_decoder = decode_scheduler
+                    .root_scheduler
+                    .new_root_decoder_indices(&indices);
+                (
+                    root_decoder,
+                    async move {
+                        decode_scheduler
+                            .schedule_take(&indices, tx, scheduler)
+                            .await
+                    }
+                    .boxed(),
+                )
             },
         )
         .await;
