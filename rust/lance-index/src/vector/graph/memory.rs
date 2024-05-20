@@ -80,10 +80,30 @@ struct InMemoryDistanceCal {
     metric_type: MetricType,
 }
 
-impl DistCalculator for InMemoryDistanceCal {
+impl DistCalculator<'_> for InMemoryDistanceCal {
     #[inline]
     fn distance(&self, id: u32) -> f32 {
         let vector = self.vectors.row_ref(id as usize).unwrap();
         self.metric_type.func()(self.query.as_primitive::<Float32Type>().values(), vector)
+    }
+    fn prefetch(&self, id: u32) {
+        // TODO use rust intrinsics instead of x86 intrinsics
+        // TODO finish this
+        unsafe {
+            let vector = self.vectors.row_ref(id as usize).unwrap();
+            let ptr = vector.as_ptr() as *const i8;
+            let end_ptr = vector.as_ptr().add(vector.len()) as *const i8;
+
+            let mut current_ptr = ptr;
+            while current_ptr < end_ptr {
+                const CACHE_LINE_SIZE: usize = 64;
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    _mm_prefetch(current_ptr, _MM_HINT_T0);
+                }
+                current_ptr = current_ptr.add(CACHE_LINE_SIZE);
+            }
+        }
     }
 }
