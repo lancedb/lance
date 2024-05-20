@@ -1555,7 +1555,7 @@ def test_scan_with_row_ids(tmp_path: Path):
     tbl = ds.scanner(filter="a % 10 == 0 AND a < 500", with_row_id=True).to_table()
     assert "_rowid" in tbl.column_names
     row_ids = tbl["_rowid"].to_pylist()
-    assert row_ids == list(range(0, 250, 10)) + list(range(2 ** 32, 2 ** 32 + 250, 10))
+    assert row_ids == list(range(0, 250, 10)) + list(range(2**32, 2**32 + 250, 10))
 
     tbl2 = ds._take_rows(row_ids)
     assert tbl2["a"] == tbl["a"]

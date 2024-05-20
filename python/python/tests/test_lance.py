@@ -74,7 +74,7 @@ def test_nearest(tmp_path):
 
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 32), False)])
     npvals = np.random.rand(100, 32)
-    npvals /= np.sqrt((npvals ** 2).sum(axis=1))[:, None]
+    npvals /= np.sqrt((npvals**2).sum(axis=1))[:, None]
     values = pa.array(npvals.ravel(), type=pa.float32())
     arr = pa.FixedSizeListArray.from_arrays(values, 32)
     tbl = pa.Table.from_arrays([arr], schema=schema)
@@ -158,7 +158,7 @@ def test_create_index_shuffle_params(tmp_path):
 def _create_dataset(uri, num_batches=1):
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 32), False)])
     npvals = np.random.rand(1000, 32)
-    npvals /= np.sqrt((npvals ** 2).sum(axis=1))[:, None]
+    npvals /= np.sqrt((npvals**2).sum(axis=1))[:, None]
     values = pa.array(npvals.ravel(), type=pa.float32())
     arr = pa.FixedSizeListArray.from_arrays(values, 32)
     tbl = pa.Table.from_arrays([arr], schema=schema)
