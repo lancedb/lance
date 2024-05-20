@@ -77,7 +77,7 @@ struct SizeStatsFile {
 
 impl SizeStatsFile {
     fn new() -> Self {
-        if let Some(path) = std::env::var("BENCH_SIZE_STATS_FILE").ok() {
+        if let Ok(path) = std::env::var("BENCH_SIZE_STATS_FILE") {
             let mut file = std::fs::File::create(path).unwrap();
             // Header row
             writeln!(file, "structure,percent_deletions,size").unwrap();
@@ -110,7 +110,7 @@ fn bench_creation(c: &mut Criterion) {
             &percent_deletions,
             |b, _| {
                 b.iter(|| {
-                    let index = RowIdIndex::new(&sequences).unwrap();
+                    let _index = RowIdIndex::new(&sequences).unwrap();
                 });
             },
         );
