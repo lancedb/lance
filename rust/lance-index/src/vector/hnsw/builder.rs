@@ -210,7 +210,7 @@ impl HNSW {
             let storage = storage.clone();
             let visited_generator = VisitedGenerator::new(len);
             tasks.push(spawn_cpu(move || {
-                for node in kdam::tqdm!(chunk.into_iter()) {
+                for node in chunk.into_iter() {
                     inner.insert(node as u32, &visited_generator, storage.as_ref())?;
                 }
                 Result::Ok(())

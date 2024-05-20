@@ -281,11 +281,6 @@ impl<'a> DistCalculator<'a> for SQDistCalculator<'a> {
                     const _MM_HINT_T0: i32 = 1;
                     _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
                 }
-                // #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                // {
-                //     use core::arch::aarch64::__pld;
-                //     __pld(base_ptr.add(offset));
-                // }
             }
         }
     }
