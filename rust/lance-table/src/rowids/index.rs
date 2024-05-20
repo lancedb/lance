@@ -12,10 +12,16 @@ use super::{RowIdSequence, U64Segment};
 
 /// An index of row ids
 ///
-/// This index is used to map row ids to their corresponding addresses.
+/// This index is used to map row ids to their corresponding addresses. These
+/// addresses correspond to physical positions in the dataset. See [RowAddress].
 ///
-/// This is structured as a B tree, where the keys and values can either
-/// be a single value or a range.
+/// This structure only contains rows that physically exist. However, it may
+/// map to addresses that have been tombstoned. A separate tombstone index is
+/// used to track tombstoned rows.
+// (Implementation)
+// Disjoint ranges of row ids are stored as the keys of the map. The values are
+// a pair of segments. The first segment is the row ids, and the second segment
+// is the addresses.
 pub struct RowIdIndex(RangeInclusiveMap<u64, (U64Segment, U64Segment)>);
 
 impl RowIdIndex {
@@ -28,7 +34,8 @@ impl RowIdIndex {
         pieces.sort_by_key(|(range, _)| *range.start());
 
         // Check for overlapping ranges and if found, return a NotImplementedError.
-        // We don't expect this pattern yet.
+        // We don't expect this pattern yet until we make row ids stable after
+        // updates.
         if pieces.windows(2).any(|w| w[0].0.end() >= w[1].0.start()) {
             return Err(Error::NotSupported {
                 source: "Overlapping ranges are not yet supported".into(),
@@ -39,6 +46,9 @@ impl RowIdIndex {
         Ok(Self(RangeInclusiveMap::from_iter(pieces)))
     }
 
+    /// Get the address for a given row id.
+    ///
+    /// Will return None if the row id does not exist in the index.
     pub fn get(&self, row_id: u64) -> Option<RowAddress> {
         let (row_id_segment, address_segment) = self.0.get(&row_id)?;
         let pos = row_id_segment.position(row_id)?;

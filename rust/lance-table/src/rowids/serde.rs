@@ -192,13 +192,13 @@ impl From<EncodedU64Array> for pb::EncodedU64Array {
     }
 }
 
-/// Serialize a rowid sequence to a writer.
+/// Serialize a rowid sequence to a buffer.
 pub fn write_row_ids(sequence: &RowIdSequence) -> Vec<u8> {
     let pb_sequence = pb::RowIdSequence::from(sequence.clone());
     pb_sequence.encode_to_vec()
 }
 
-/// Deserialize a rowid sequence from a reader.
+/// Deserialize a rowid sequence from some bytes.
 pub fn read_row_ids(reader: &[u8]) -> Result<RowIdSequence> {
     let pb_sequence = pb::RowIdSequence::decode(reader)?;
     RowIdSequence::try_from(pb_sequence)
