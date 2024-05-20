@@ -25,6 +25,7 @@ import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
@@ -59,6 +60,10 @@ public class Dataset implements Closeable {
    */
   public static Dataset create(BufferAllocator allocator, String path, Schema schema,
       WriteParams params) {
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(path);
+    Preconditions.checkNotNull(schema);
+    Preconditions.checkNotNull(params);
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
       Data.exportSchema(allocator, schema, null, arrowSchema);
       var dataset = createWithFfiSchema(arrowSchema.memoryAddress(),
@@ -80,6 +85,10 @@ public class Dataset implements Closeable {
    */
   public static Dataset create(BufferAllocator allocator, ArrowArrayStream stream,
       String path, WriteParams params) {
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(stream); 
+    Preconditions.checkNotNull(path);
+    Preconditions.checkNotNull(params);
     var dataset = createWithFfiStream(stream.memoryAddress(), path,
         params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
         params.getMaxBytesPerFile(), params.getMode());
@@ -103,6 +112,8 @@ public class Dataset implements Closeable {
    * @return Dataset
    */
   public static Dataset open(String path, BufferAllocator allocator) {
+    Preconditions.checkNotNull(path);
+    Preconditions.checkNotNull(allocator);
     var dataset = openNative(path);
     dataset.allocator = allocator;
     return dataset;
@@ -129,6 +140,10 @@ public class Dataset implements Closeable {
    */
   public static Dataset commit(BufferAllocator allocator, String path,
       FragmentOperation operation, Optional<Long> readVersion) {
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(path);
+    Preconditions.checkNotNull(operation);
+    Preconditions.checkNotNull(readVersion);
     var dataset = operation.commit(allocator, path, readVersion);
     dataset.allocator = allocator;
     return dataset;
@@ -163,6 +178,7 @@ public class Dataset implements Closeable {
    * @return a dataset scanner
    */
   public LanceScanner newScan(ScanOptions options) {
+    Preconditions.checkNotNull(options);
     return LanceScanner.create(this, options, allocator);
   }
 

@@ -17,11 +17,12 @@ package com.lancedb.lance;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import java.util.List;
+import org.apache.arrow.util.Preconditions;
 
 /**
  * Dataset format.
  * Matching to Lance Rust FileFragment.
- * */
+ */
 public class DatasetFragment {
   /** Pointer to the {@link Dataset} instance in Java. */
   private final Dataset dataset;
@@ -29,6 +30,8 @@ public class DatasetFragment {
 
   /** Private constructor, calling from JNI. */
   DatasetFragment(Dataset dataset, FragmentMetadata metadata) {
+    Preconditions.checkNotNull(dataset);
+    Preconditions.checkNotNull(metadata);
     this.dataset = dataset;
     this.metadata = metadata;
   }
@@ -52,7 +55,7 @@ public class DatasetFragment {
   public LanceScanner newScan(long batchSize) {
     return LanceScanner.create(dataset,
         new ScanOptions.Builder()
-            .fragmentIds(List.of(metadata.getId())).batchSize(batchSize).build(), 
+            .fragmentIds(List.of(metadata.getId())).batchSize(batchSize).build(),
         dataset.allocator);
   }
 
@@ -63,6 +66,7 @@ public class DatasetFragment {
    * @return a dataset scanner
    */
   public LanceScanner newScan(ScanOptions options) {
+    Preconditions.checkNotNull(options);
     return LanceScanner.create(dataset,
         new ScanOptions.Builder(options).fragmentIds(List.of(metadata.getId())).build(),
         dataset.allocator);

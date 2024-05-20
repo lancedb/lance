@@ -61,6 +61,16 @@ public class DatasetTest {
   }
 
   @Test
+  void testCreateDirNotExist() throws IOException, URISyntaxException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+    }
+  }
+
+  @Test
   void testOpenInvalidPath() {
     String validPath = tempDir.resolve("Invalid_dataset").toString();
     assertThrows(
@@ -92,6 +102,43 @@ public class DatasetTest {
             assertEquals(3, dataset3.latestVersion());
           }
         }
+      }
+    }
+  }
+
+  @Test
+  void testOpenNonExist() throws IOException, URISyntaxException {
+    String datasetPath = tempDir.resolve("non_exist").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      assertThrows(IllegalArgumentException.class, () -> {
+        Dataset.open(datasetPath, allocator);
+      });
+    }
+  }
+
+  @Test
+  void testCreateExist() throws IOException, URISyntaxException {
+    String datasetPath = tempDir.resolve("create_exist").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      assertThrows(IllegalArgumentException.class, () -> {
+        testDataset.createEmptyDataset();
+      });
+    }
+  }
+
+  @Test
+  void testCommitConflict() {
+    String datasetPath = tempDir.resolve("commit_conflict").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
+        assertThrows(IllegalArgumentException.class, () -> {
+          testDataset.write(0, 5);
+        });
       }
     }
   }

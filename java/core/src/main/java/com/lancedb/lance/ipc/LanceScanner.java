@@ -24,6 +24,7 @@ import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.ScanTask;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -49,6 +50,9 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    */
   public static LanceScanner create(Dataset dataset, ScanOptions options,
       BufferAllocator allocator) {
+    Preconditions.checkNotNull(dataset);
+    Preconditions.checkNotNull(options);
+    Preconditions.checkNotNull(allocator);
     LanceScanner scanner = createScanner(dataset, options.getFragmentIds(), options.getColumns(),
         options.getSubstraitFilter(), options.getFilter(), options.getBatchSize());
     scanner.allocator = allocator;

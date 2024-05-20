@@ -131,7 +131,10 @@ impl<T> JavaErrorExt<T> for std::result::Result<T, LanceError> {
         match &self {
             Ok(_) => Ok(self.unwrap()),
             Err(err) => match err {
-                LanceError::InvalidInput { .. } => self.input_error(),
+                LanceError::DatasetNotFound { .. }
+                | LanceError::DatasetAlreadyExists { .. }
+                | LanceError::CommitConflict { .. }
+                | LanceError::InvalidInput { .. } => self.input_error(),
                 LanceError::IO { .. } => self.io_error(),
                 LanceError::NotSupported { .. } => self.unsupported_error(),
                 _ => self.runtime_error(),
