@@ -16,7 +16,7 @@ pub mod memory;
 pub mod storage;
 
 /// Vector storage to back a graph.
-pub use storage::VectorStorage;
+pub use storage::VectorStore;
 
 use crate::vector::DIST_COL;
 

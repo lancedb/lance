@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use super::storage::{DistCalculator, VectorStorage};
+use super::storage::{DistCalculator, VectorStore};
 use arrow::array::AsArray;
 use arrow_array::types::Float32Type;
 use arrow_array::ArrayRef;
@@ -33,7 +33,7 @@ impl InMemoryVectorStorage {
     }
 }
 
-impl VectorStorage for InMemoryVectorStorage {
+impl VectorStore for InMemoryVectorStorage {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

@@ -20,7 +20,7 @@ use snafu::{location, Location};
 
 use crate::{
     vector::{
-        graph::{storage::DistCalculator, VectorStorage},
+        graph::{storage::DistCalculator, VectorStore},
         quantizer::{QuantizerMetadata, QuantizerStorage},
         SQ_CODE_COLUMN,
     },
@@ -194,7 +194,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
     }
 }
 
-impl VectorStorage for ScalarQuantizationStorage {
+impl VectorStore for ScalarQuantizationStorage {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

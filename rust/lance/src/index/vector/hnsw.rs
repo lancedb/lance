@@ -15,7 +15,7 @@ use lance_file::reader::FileReader;
 use lance_index::vector::{hnsw::HNSW, quantizer::Quantizer};
 use lance_index::{
     vector::{
-        graph::{VectorStorage, NEIGHBORS_FIELD},
+        graph::{VectorStore, NEIGHBORS_FIELD},
         hnsw::{HnswMetadata, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization},
@@ -48,7 +48,7 @@ pub(crate) struct HNSWIndex<Q: Quantization> {
 
     // Some(T) if the index is loaded, None otherwise
     hnsw: Option<HNSW>,
-    storage: Option<Arc<dyn VectorStorage>>,
+    storage: Option<Arc<Q::Storage>>,
 
     // TODO: move these into IVFIndex after the refactor is complete
     partition_storage: IvfQuantizationStorage<Q>,
@@ -282,7 +282,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         }))
     }
 
-    fn storage(&self) -> &dyn VectorStorage {
+    fn storage(&self) -> &dyn VectorStore {
         self.storage.as_ref().unwrap().as_ref()
     }
 

@@ -32,7 +32,7 @@ use super::{distance::build_distance_table_l2, num_centroids, ProductQuantizerIm
 use crate::{
     pb,
     vector::{
-        graph::storage::{DistCalculator, VectorStorage},
+        graph::storage::{DistCalculator, VectorStore},
         ivf::storage::IvfData,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
@@ -394,7 +394,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
     }
 }
 
-impl VectorStorage for ProductQuantizationStorage {
+impl VectorStore for ProductQuantizationStorage {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

@@ -21,7 +21,7 @@ pub trait DistCalculator<'a> {
 /// TODO: should we rename this to "VectorDistance"?;
 ///
 /// WARNING: Internal API,  API stability is not guaranteed
-pub trait VectorStorage: Send + Sync {
+pub trait VectorStore: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     fn len(&self) -> usize;

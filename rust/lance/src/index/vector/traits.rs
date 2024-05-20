@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 use lance_core::Result;
 use lance_index::{
-    vector::{graph::VectorStorage, Query},
+    vector::{graph::VectorStore, Query},
     Index,
 };
 use lance_io::{object_writer::ObjectWriter, traits::Reader};
@@ -73,7 +73,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         self.load(reader, offset, length).await
     }
 
-    fn storage(&self) -> &dyn VectorStorage;
+    fn storage(&self) -> &dyn VectorStore;
 
     /// Remap the index according to mapping
     ///

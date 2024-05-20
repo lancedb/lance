@@ -19,7 +19,7 @@ mod test {
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::{
-        vector::{graph::VectorStorage, Query},
+        vector::{graph::VectorStore, Query},
         Index, IndexType,
     };
     use lance_io::{local::LocalObjectReader, traits::Reader};
@@ -106,7 +106,7 @@ mod test {
             Ok(Box::new(self.clone()))
         }
 
-        fn storage(&self) -> &dyn VectorStorage {
+        fn storage(&self) -> &dyn VectorStore {
             todo!("this method is for only IVF_HNSW_* index");
         }
 

@@ -33,7 +33,7 @@ use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, 
 use crate::scalar::IndexWriter;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::storage::DistCalculator;
-use crate::vector::graph::{greedy_search, storage::VectorStorage};
+use crate::vector::graph::{greedy_search, storage::VectorStore};
 use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
@@ -128,11 +128,6 @@ impl Debug for HNSW {
 }
 
 impl HNSW {
-    /// Create a new [`HNSWBuilder`] with in memory vector storage.
-    // pub fn new(distance_type: DistanceType, vectors: Option<Arc<dyn VectorStorage>>) -> Self {
-    //     Self::with_params(distance_type, HnswBuildParams::default(), vectors)
-    // }
-
     pub fn len(&self) -> usize {
         self.inner.nodes.len()
     }
@@ -161,7 +156,7 @@ impl HNSW {
     pub async fn build_with_storage(
         distance_type: DistanceType,
         params: HnswBuildParams,
-        storage: Arc<dyn VectorStorage>,
+        storage: Arc<impl VectorStore + 'static>,
     ) -> Result<Self> {
         let inner = HNSWBuilderInner::with_params(distance_type, params, storage.as_ref());
         let hnsw = Self {
@@ -249,7 +244,7 @@ impl HNSW {
         k: usize,
         ef: usize,
         bitset: Option<RoaringBitmap>,
-        storage: &dyn VectorStorage,
+        storage: &impl VectorStore,
     ) -> Result<Vec<OrderedNode>> {
         let mut visited_generator = self
             .inner
@@ -370,7 +365,10 @@ impl HNSW {
     /// ----------
     /// - *reader*: the file reader to read the graph from.
     /// - *vector_storage*: A preloaded [VectorStorage] storage.
-    pub async fn load(reader: &FileReader, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
+    pub async fn load(
+        reader: &FileReader,
+        vector_storage: Arc<impl VectorStore + 'static>,
+    ) -> Result<Self> {
         let schema = reader.schema();
         let mt = if let Some(index_metadata) = schema.metadata.get(INDEX_METADATA_SCHEMA_KEY) {
             let index_metadata: IndexMetadata = serde_json::from_str(index_metadata)?;
@@ -411,7 +409,7 @@ impl HNSW {
         reader: &FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
-        vector_storage: Arc<dyn VectorStorage>,
+        vector_storage: Arc<impl VectorStore + 'static>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
         if range.is_empty() {
@@ -529,7 +527,7 @@ impl HNSWBuilderInner {
     pub fn with_params(
         distance_type: DistanceType,
         params: HnswBuildParams,
-        storage: &dyn VectorStorage,
+        storage: &impl VectorStore,
     ) -> Self {
         let len = storage.len();
         let max_level = params.max_level;
@@ -678,7 +676,7 @@ impl HNSWBuilderInner {
         )
     }
 
-    fn prune(&self, storage: &dyn VectorStorage, builder_node: &mut GraphBuilderNode, level: u16) {
+    fn prune(&self, storage: &dyn VectorStore, builder_node: &mut GraphBuilderNode, level: u16) {
         let m_max = match level {
             0 => self.params.m * 2,
             _ => self.params.m,
