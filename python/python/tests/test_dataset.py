@@ -939,60 +939,66 @@ def test_merge_insert(tmp_path: Path):
 
     is_new = pc.field("b") == 2
 
-    dataset.merge_insert("a").when_not_matched_insert_all().execute(new_table)
+    inserted, updated, deleted = dataset.merge_insert("a").when_not_matched_insert_all().execute(new_table)
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
+    assert (inserted, updated, deleted) == (300, 0, 0)
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+    inserted, updated, deleted = dataset.merge_insert("a").when_matched_update_all().execute(new_table)
     table = dataset.to_table()
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 700
+    assert (inserted, updated, deleted) == (0, 700, 0)
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert(
+    inserted, updated, deleted = dataset.merge_insert(
         "a"
     ).when_not_matched_insert_all().when_matched_update_all().execute(new_table)
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 1000
+    assert (inserted, updated, deleted) == (300, 700, 0)
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert("a").when_not_matched_insert_all().when_matched_update_all(
+    inserted, updated, deleted = dataset.merge_insert("a").when_not_matched_insert_all().when_matched_update_all(
         "target.c == source.c"
     ).execute(new_table)
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 650
+    assert (inserted, updated, deleted) == (300, 350, 0)
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert("a").when_not_matched_by_source_delete().execute(new_table)
+    inserted, updated, deleted = dataset.merge_insert("a").when_not_matched_by_source_delete().execute(new_table)
     table = dataset.to_table()
     assert table.num_rows == 700
     assert table.filter(is_new).num_rows == 0
+    assert (inserted, updated, deleted) == (0, 0, 300)
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert("a").when_not_matched_by_source_delete(
+    inserted, updated, deleted = dataset.merge_insert("a").when_not_matched_by_source_delete(
         "a < 100"
     ).when_not_matched_insert_all().execute(new_table)
 
     table = dataset.to_table()
     assert table.num_rows == 1200
     assert table.filter(is_new).num_rows == 300
+    assert (inserted, updated, deleted) == (300, 0, 100)
 
     # If the user doesn't specify anything then the merge_insert is
     # a no-op and the operation fails
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
     with pytest.raises(ValueError):
-        dataset.merge_insert("a").execute(new_table)
-
+        inserted, updated, deleted = dataset.merge_insert("a").execute(new_table)
+        assert (inserted, updated, deleted) == (None, None, None)
 
 def test_flat_vector_search_with_delete(tmp_path: Path):
     table = pa.Table.from_pydict(
@@ -1031,7 +1037,7 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
         }
     )
 
-    dataset.merge_insert("id").when_matched_update_all(
+    inserted, updated, deleted = dataset.merge_insert("id").when_matched_update_all(
         "target.txNumber < source.txNumber"
     ).execute(new_table)
 
@@ -1049,6 +1055,7 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
     )
 
     assert table.sort_by("id") == expected
+    assert (inserted, updated, deleted) == (0, 2, 0)
 
     # No matches
 
@@ -1060,9 +1067,10 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
         }
     )
 
-    dataset.merge_insert("id").when_matched_update_all(
+    inserted, updated, deleted = dataset.merge_insert("id").when_matched_update_all(
         "target.txNumber < source.txNumber"
     ).execute(new_table)
+    assert (inserted, updated, deleted) == (0, 0, 0)
 
 
 def test_merge_insert_source_is_dataset(tmp_path: Path):
@@ -1085,22 +1093,24 @@ def test_merge_insert_source_is_dataset(tmp_path: Path):
 
     is_new = pc.field("b") == 2
 
-    dataset.merge_insert("a").when_not_matched_insert_all().execute(new_dataset)
+    inserted, updated, deleted = dataset.merge_insert("a").when_not_matched_insert_all().execute(new_dataset)
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
+    assert (inserted, updated, deleted) == (300, 0, 0)
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
 
     reader = new_dataset.to_batches()
 
-    dataset.merge_insert("a").when_not_matched_insert_all().execute(
+    inserted, updated, deleted = dataset.merge_insert("a").when_not_matched_insert_all().execute(
         reader, schema=new_dataset.schema
     )
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
+    assert (inserted, updated, deleted) == (300, 0, 0)
 
 
 def test_merge_insert_multiple_keys(tmp_path: Path):
@@ -1132,10 +1142,11 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
 
     is_new = pc.field("b") == 2
 
-    dataset.merge_insert(["a", "c"]).when_matched_update_all().execute(new_table)
+    inserted, updated, deleted = dataset.merge_insert(["a", "c"]).when_matched_update_all().execute(new_table)
     table = dataset.to_table()
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 350
+    assert (inserted, updated, deleted) == (0, 350, 0)
 
 
 def test_merge_insert_incompatible_schema(tmp_path: Path):
@@ -1157,7 +1168,9 @@ def test_merge_insert_incompatible_schema(tmp_path: Path):
     )
 
     with pytest.raises(OSError):
-        dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+        inserted, updated, deleted = dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+        assert (inserted, updated, deleted) == (None, None, None)
+
 
 
 def test_merge_insert_vector_column(tmp_path: Path):
@@ -1179,10 +1192,9 @@ def test_merge_insert_vector_column(tmp_path: Path):
         table, tmp_path / "dataset", mode="create", max_rows_per_file=100
     )
 
-    dataset.merge_insert(
+    inserted, updated, deleted = dataset.merge_insert(
         ["key"]
     ).when_not_matched_insert_all().when_matched_update_all().execute(new_table)
-
     expected = pa.Table.from_pydict(
         {
             "vec": pa.array(
@@ -1193,6 +1205,7 @@ def test_merge_insert_vector_column(tmp_path: Path):
     )
 
     assert dataset.to_table().sort_by("key") == expected
+    assert (inserted, updated, deleted) == (1, 1, 0)
 
 
 def test_update_dataset(tmp_path: Path):
