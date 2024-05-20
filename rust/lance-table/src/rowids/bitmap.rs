@@ -54,14 +54,12 @@ impl Bitmap {
         self.len
     }
 
-    pub fn slice(&self, start: usize, len: usize) -> Self {
-        let mut data = vec![0; (len + 7) / 8];
-        for i in 0..len {
-            if self.get(start + i) {
-                data[i / 8] |= 1 << (i % 8);
-            }
+    pub fn slice(&self, start: usize, len: usize) -> BitmapSlice {
+        BitmapSlice {
+            bitmap: self,
+            start,
+            len,
         }
-        Self { data, len }
     }
 
     pub fn count_ones(&self) -> usize {
@@ -85,9 +83,75 @@ impl From<&[bool]> for Bitmap {
     }
 }
 
+// Make a slice of bitmap
+pub struct BitmapSlice<'a> {
+    bitmap: &'a Bitmap,
+    start: usize,
+    len: usize,
+}
+
+impl<'a> BitmapSlice<'a> {
+    pub fn count_ones(&self) -> usize {
+        if self.len == 0 {
+            return 0;
+        }
+        let first_byte = self.start / 8;
+        let last_byte = (self.start + self.len - 1) / 8;
+        if first_byte == last_byte {
+            let byte = self.bitmap.data[first_byte];
+            let mut count = 0;
+            for i in self.start % 8..((self.start + self.len - 1) % 8 + 1) {
+                if byte & (1 << i) != 0 {
+                    count += 1;
+                }
+            }
+            count
+        } else {
+            let mut count = 0;
+            // Handle first byte
+            for i in self.start % 8..8 {
+                if self.bitmap.data[first_byte] & (1 << i) != 0 {
+                    count += 1;
+                }
+            }
+
+            // Handle last bytes
+            for i in 0..((self.start + self.len - 1) % 8 + 1) {
+                if self.bitmap.data[last_byte] & (1 << i) != 0 {
+                    count += 1;
+                }
+            }
+
+            // Middle bytes can just use count_ones
+            count += self.bitmap.data[first_byte + 1..last_byte]
+                .iter()
+                .map(|&x| x.count_ones() as usize)
+                .sum::<usize>();
+            count
+        }
+    }
+
+    pub fn count_zeros(&self) -> usize {
+        self.len - self.count_ones()
+    }
+}
+
+impl<'a> From<BitmapSlice<'a>> for Bitmap {
+    fn from(slice: BitmapSlice) -> Self {
+        let mut bitmap = Self::new_empty(slice.len);
+        for i in 0..slice.len {
+            if slice.bitmap.get(slice.start + i) {
+                bitmap.set(i);
+            }
+        }
+        bitmap
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prop_assert_eq;
 
     #[test]
     fn test_bitmap() {
@@ -103,7 +167,7 @@ mod tests {
         assert_eq!(bitmap.count_ones(), 5);
         assert_eq!(
             format!("{:?}", bitmap),
-            "Bitmap { data: 1100100010, len: 10 }"
+            "Bitmap { data: 1100110001, len: 10 }"
         );
 
         bitmap.clear(1);
@@ -111,12 +175,11 @@ mod tests {
         assert_eq!(bitmap.count_ones(), 3);
         assert_eq!(
             format!("{:?}", bitmap),
-            "Bitmap { data: 1000000010, len: 10 }"
+            "Bitmap { data: 1000010001, len: 10 }"
         );
 
-        bitmap.slice(5, 5);
-        assert_eq!(bitmap.count_ones(), 1);
-        assert_eq!(format!("{:?}", bitmap), "Bitmap { data: 00010, len: 5 }");
+        let bitmap_slice = bitmap.slice(5, 5);
+        assert_eq!(bitmap_slice.count_ones(), 2);
     }
 
     #[test]
@@ -137,6 +200,28 @@ mod tests {
             }
 
             assert_eq!(bitmap1, bitmap2);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_bitmap_slice(
+            values in proptest::collection::vec(proptest::bool::ANY, 0..100),
+            mut start in 0..100usize,
+            mut len in 0..100usize,
+        ) {
+            if start > values.len() {
+                start = values.len();
+            }
+            if len > values.len() - start {
+                len = values.len() - start;
+            }
+
+            let bitmap = Bitmap::from(values.as_slice());
+            let slice = bitmap.slice(start, len);
+            let values_slice = values[start..(start + len)].to_vec();
+
+            prop_assert_eq!(slice.count_ones(), values_slice.iter().filter(|&&x| x).count());
         }
     }
 }

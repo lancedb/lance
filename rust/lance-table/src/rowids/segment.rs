@@ -292,7 +292,7 @@ impl U64Segment {
                 } else {
                     Self::RangeWithBitmap {
                         range: start..end,
-                        bitmap,
+                        bitmap: bitmap.into(),
                     }
                 }
             }

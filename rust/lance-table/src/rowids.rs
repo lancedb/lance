@@ -230,7 +230,7 @@ mod test {
         let mut sequence = RowIdSequence::from(0..10);
         sequence.delete(vec![1, 3, 5, 7, 9]);
         let mut expected_bitmap = Bitmap::new_empty(9);
-        for i in [0, 2, 4, 8] {
+        for i in [0, 2, 4, 6, 8] {
             expected_bitmap.set(i as usize);
         }
         assert_eq!(
@@ -251,6 +251,6 @@ mod test {
 
         let mut sequence = RowIdSequence::from(0..10);
         sequence.delete(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(sequence.0, vec![]);
+        assert_eq!(sequence.0, vec![U64Segment::Range(0..0)]);
     }
 }

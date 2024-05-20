@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 // TODO:
-// - [x] Create base cases with BTreeMap and HashMap
+// - [x] Create base cases with HashMap
 // - [x] Create on-disk size measurement
 // - [x] Create different cases for the index. Ideal, 25% deletions, 80% deletions + compaction.
 // - [ ] Create a benchmark for the get method
@@ -16,11 +16,7 @@
 // How can I write out the file? Where should I put it?
 // How can I take a argument to set the size of the index?
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    io::Write,
-    ops::Range,
-};
+use std::{collections::HashMap, io::Write, ops::Range};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
@@ -177,18 +173,6 @@ fn bench_creation(c: &mut Criterion) {
                 });
             },
         );
-
-        group.bench_with_input(
-            BenchmarkId::new("BuildBTreeMap", percent_deletions),
-            &percent_deletions,
-            |b, _| {
-                b.iter(|| {
-                    BTreeMap::from_iter(flat_data.iter().flat_map(|(ids, addresses)| {
-                        ids.iter().copied().zip(addresses.iter().copied())
-                    }));
-                });
-            },
-        );
     }
 
     group.finish();
@@ -197,7 +181,7 @@ fn bench_creation(c: &mut Criterion) {
 fn bench_get_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("row_id_index_get_single");
 
-    for percent_deletions in [0.0, 0.25, 0.5] {
+    for percent_deletions in [0.0, 0.02, 0.25, 0.5, 0.8] {
         let sequences = make_frag_sequences(num_rows(), 100, percent_deletions);
         let index = RowIdIndex::new(&sequences).unwrap();
 
@@ -252,29 +236,16 @@ fn bench_get_single(c: &mut Criterion) {
                 });
             },
         );
-
-        let index =
-            {
-                BTreeMap::from_iter(flat_data.iter().flat_map(|(ids, addresses)| {
-                    ids.iter().copied().zip(addresses.iter().copied())
-                }))
-            };
-
-        group.bench_with_input(
-            BenchmarkId::new("GetBTreeMap", percent_deletions),
-            &percent_deletions,
-            |b, _| {
-                b.iter(|| {
-                    for i in 0..num_rows() {
-                        let _ = index.get(&i);
-                    }
-                });
-            },
-        );
     }
 
     group.finish();
 }
 
+#[cfg(target_os = "linux")]
+criterion_group!(
+    name = benches;
+    config=Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
+    targets=bench_creation, bench_get_single);
+#[cfg(not(target_os = "linux"))]
 criterion_group!(benches, bench_creation, bench_get_single);
 criterion_main!(benches);
