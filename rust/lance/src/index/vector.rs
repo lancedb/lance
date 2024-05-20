@@ -19,7 +19,6 @@ mod fixture_test;
 
 use arrow::datatypes::Float32Type;
 use lance_file::reader::FileReader;
-use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizerImpl;
 use lance_index::vector::sq::builder::SQBuildParams;
@@ -433,7 +432,7 @@ pub(crate) async fn open_vector_index_v2(
             let ivf_data = IvfData::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizerImpl<Float32Type>>::try_new(
-                HNSW::empty(),
+                distance_type,
                 reader.object_reader.clone(),
                 aux_reader.into(),
                 options,
@@ -464,7 +463,7 @@ pub(crate) async fn open_vector_index_v2(
                 use_residual: false,
             };
             let hnsw = HNSWIndex::<ScalarQuantizer>::try_new(
-                HNSW::empty(),
+                distance_type,
                 reader.object_reader.clone(),
                 aux_reader.into(),
                 options,

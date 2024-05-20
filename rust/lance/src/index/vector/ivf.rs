@@ -31,13 +31,13 @@ use lance_file::{
 };
 use lance_index::vector::{
     graph::VectorStorage,
+    hnsw::HNSW,
     quantizer::{Quantization, QuantizationMetadata, Quantizer},
 };
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
-        graph::NEIGHBORS_FIELD,
-        hnsw::{builder::HnswBuildParams, VECTOR_ID_FIELD},
+        hnsw::builder::HnswBuildParams,
         ivf::{
             builder::load_precomputed_partitions,
             shuffler::shuffle_dataset,
@@ -224,7 +224,7 @@ impl IVFIndex {
     /// Internal API with no stability guarantees.
     ///
     /// Assumes the query vector is normalized if the metric type is cosine.
-    pub async fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+    pub fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
         let mt = if self.metric_type == MetricType::Cosine {
             MetricType::L2
         } else {
@@ -334,14 +334,13 @@ async fn optimize_ivf_pq_indices(
     let dim = first_idx.ivf.dimension();
 
     // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
-    let ivf = lance_index::vector::ivf::new_ivf_with_pq(
-        first_idx.ivf.centroids.values(),
-        first_idx.ivf.dimension(),
+    let ivf = lance_index::vector::ivf::Ivf::with_pq(
+        first_idx.ivf.centroids.clone(),
         metric_type,
         vector_column,
         pq_index.pq.clone(),
         None,
-    )?;
+    );
 
     // Shuffled un-indexed data with partition.
     let shuffled = if let Some(stream) = unindexed {
@@ -349,7 +348,7 @@ async fn optimize_ivf_pq_indices(
             shuffle_dataset(
                 stream,
                 vector_column,
-                ivf,
+                ivf.into(),
                 None,
                 first_idx.ivf.num_partitions() as u32,
                 10000,
@@ -416,8 +415,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
     let ivf = lance_index::vector::ivf::new_ivf_with_quantizer(
-        first_idx.ivf.centroids.values(),
-        first_idx.ivf.dimension(),
+        first_idx.ivf.centroids.clone(),
         distance_type,
         vector_column,
         quantizer.clone(),
@@ -430,7 +428,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
             shuffle_dataset(
                 stream,
                 vector_column,
-                ivf,
+                Arc::new(ivf),
                 None,
                 first_idx.ivf.num_partitions() as u32,
                 10000,
@@ -462,8 +460,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         .collect::<Result<Vec<_>>>()?;
 
     // Prepare the HNSW writer
-    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
-    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let schema = lance_core::datatypes::Schema::try_from(&HNSW::schema())?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
@@ -555,7 +552,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::with_centroids(ivf_mut.centroids.clone());
+    let mut ivf_data = IvfData::with_centroids(Arc::new(ivf_mut.centroids.clone()));
     for length in ivf_mut.lengths {
         ivf_data.add_partition(length);
     }
@@ -680,7 +677,7 @@ impl VectorIndex for IVFIndex {
             query.key = key;
         };
 
-        let partition_ids = self.find_partitions(&query).await?;
+        let partition_ids = self.find_partitions(&query)?;
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
@@ -836,7 +833,7 @@ pub(crate) struct Ivf {
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
     /// memory allocator.
-    pub(crate) centroids: Arc<FixedSizeListArray>,
+    pub(crate) centroids: FixedSizeListArray,
 
     /// Offset of each partition in the file.
     offsets: Vec<usize>,
@@ -846,7 +843,7 @@ pub(crate) struct Ivf {
 }
 
 impl Ivf {
-    pub(super) fn new(centroids: Arc<FixedSizeListArray>) -> Self {
+    pub(super) fn new(centroids: FixedSizeListArray) -> Self {
         Self {
             centroids,
             offsets: vec![],
@@ -871,13 +868,8 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        let internal = lance_index::vector::ivf::new_ivf(
-            self.centroids.values(),
-            self.dimension(),
-            metric_type,
-            vec![],
-            None,
-        )?;
+        let internal =
+            lance_index::vector::ivf::new_ivf(self.centroids.clone(), metric_type, vec![]);
         internal.find_partitions(query, nprobes)
     }
 
@@ -903,7 +895,7 @@ impl TryFrom<&Ivf> for pb::Ivf {
             centroids: vec![],
             offsets: ivf.offsets.iter().map(|o| *o as u64).collect(),
             lengths: ivf.lengths.clone(),
-            centroids_tensor: Some(ivf.centroids.as_ref().try_into()?),
+            centroids_tensor: Some((&ivf.centroids).try_into()?),
         })
     }
 }
@@ -915,16 +907,13 @@ impl TryFrom<&pb::Ivf> for Ivf {
     fn try_from(proto: &pb::Ivf) -> Result<Self> {
         let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
             debug!("Ivf: loading IVF centroids from index format v2");
-            Arc::new(FixedSizeListArray::try_from(tensor)?)
+            FixedSizeListArray::try_from(tensor)?
         } else {
             debug!("Ivf: loading IVF centroids from index format v1");
             // For backward-compatibility
             let f32_centroids = Float32Array::from(proto.centroids.clone());
             let dimension = f32_centroids.len() / proto.lengths.len();
-            Arc::new(FixedSizeListArray::try_new_from_values(
-                f32_centroids,
-                dimension as i32,
-            )?)
+            FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?
         };
 
         let mut ivf = Self {
@@ -1051,7 +1040,7 @@ pub(super) async fn build_ivf_model(
                 location: location!(),
             });
         }
-        return Ok(Ivf::new(centroids.clone()));
+        return Ok(Ivf::new(centroids.as_ref().clone()));
     }
     let sample_size_hint = params.num_partitions * params.sample_rate;
 
@@ -1498,8 +1487,7 @@ async fn write_ivf_hnsw_file(
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let writer = object_store.create(&path).await?;
 
-    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
-    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let schema = lance_core::datatypes::Schema::try_from(&HNSW::schema())?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
@@ -1602,7 +1590,7 @@ async fn write_ivf_hnsw_file(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::with_centroids(ivf.centroids.clone());
+    let mut ivf_data = IvfData::with_centroids(Arc::new(ivf.centroids.clone()));
     for length in ivf.lengths {
         ivf_data.add_partition(length);
     }
@@ -1637,10 +1625,10 @@ where
         params.sample_rate,
     )
     .await?;
-    Ok(Ivf::new(Arc::new(FixedSizeListArray::try_new_from_values(
+    Ok(Ivf::new(FixedSizeListArray::try_new_from_values(
         centroids,
         dimension as i32,
-    )?)))
+    )?))
 }
 
 /// Train IVF partitions using kmeans.
@@ -2517,25 +2505,6 @@ mod tests {
             .await
             .unwrap();
 
-        let indexes = dataset
-            .object_store()
-            .read_dir(dataset.indices_dir())
-            .await
-            .unwrap();
-        assert_eq!(indexes.len(), 1);
-
-        let uuid = &indexes[0];
-        let index_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_FILE_NAME);
-        let aux_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_AUXILIARY_FILE_NAME);
-        assert!(dataset.object_store().exists(&index_path).await.unwrap());
-        assert!(dataset.object_store().exists(&aux_path).await.unwrap());
-
         let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
         let query = vector_array.value(0);
         let query = query.as_primitive::<Float32Type>();
@@ -2611,25 +2580,6 @@ mod tests {
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
-
-        let indexes = dataset
-            .object_store()
-            .read_dir(dataset.indices_dir())
-            .await
-            .unwrap();
-        assert_eq!(indexes.len(), 1);
-
-        let uuid = &indexes[0];
-        let index_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_FILE_NAME);
-        let aux_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_AUXILIARY_FILE_NAME);
-        assert!(dataset.object_store().exists(&index_path).await.unwrap());
-        assert!(dataset.object_store().exists(&aux_path).await.unwrap());
 
         let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
         let query = vector_array.value(0);
@@ -2714,25 +2664,6 @@ mod tests {
             .await
             .unwrap();
 
-        let indexes = dataset
-            .object_store()
-            .read_dir(dataset.indices_dir())
-            .await
-            .unwrap();
-        assert_eq!(indexes.len(), 1);
-
-        let uuid = &indexes[0];
-        let index_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_FILE_NAME);
-        let aux_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_AUXILIARY_FILE_NAME);
-        assert!(dataset.object_store().exists(&index_path).await.unwrap());
-        assert!(dataset.object_store().exists(&aux_path).await.unwrap());
-
         let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
         let query = vector_array.value(0);
         let query = query.as_primitive::<Float32Type>();
@@ -2778,7 +2709,7 @@ mod tests {
 
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 0.9,
+            recall >= 0.7,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,

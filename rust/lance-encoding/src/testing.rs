@@ -15,7 +15,7 @@ use lance_core::Result;
 use lance_datagen::{array, gen, RowCount, Seed};
 
 use crate::{
-    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, LogicalPageDecoder, PageInfo},
+    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, PageInfo},
     encoder::{BatchEncoder, EncodedPage, FieldEncoder},
     EncodingsIo,
 };
@@ -65,7 +65,7 @@ async fn test_decode(
     expected: Option<Arc<dyn Array>>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
-        UnboundedSender<Box<dyn LogicalPageDecoder>>,
+        UnboundedSender<DecoderMessage>,
     ) -> BoxFuture<'static, Result<()>>,
 ) {
     let decode_scheduler = DecodeBatchScheduler::new(schema, column_infos, &Vec::new());
@@ -243,7 +243,7 @@ async fn check_round_trip_encoding_inner(
         |mut decode_scheduler, tx| {
             async move {
                 decode_scheduler
-                    .schedule_range(0..num_rows, tx, &scheduler_copy)
+                    .schedule_range(0..num_rows, tx, scheduler_copy)
                     .await
             }
             .boxed()
@@ -266,7 +266,7 @@ async fn check_round_trip_encoding_inner(
             &column_infos,
             expected,
             |mut decode_scheduler, tx| {
-                async move { decode_scheduler.schedule_range(range, tx, &scheduler).await }.boxed()
+                async move { decode_scheduler.schedule_range(range, tx, scheduler).await }.boxed()
             },
         )
         .await;
@@ -299,7 +299,7 @@ async fn check_round_trip_encoding_inner(
             |mut decode_scheduler, tx| {
                 async move {
                     decode_scheduler
-                        .schedule_take(&indices, tx, &scheduler)
+                        .schedule_take(&indices, tx, scheduler)
                         .await
                 }
                 .boxed()

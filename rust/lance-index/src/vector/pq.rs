@@ -171,7 +171,7 @@ where
     ///
     /// This method is just for debugging purpose.
     #[allow(dead_code)]
-    pub(crate) async fn distortion(
+    pub(crate) fn distortion(
         &self,
         data: &MatrixView<T>,
         distance_type: DistanceType,

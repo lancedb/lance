@@ -16,9 +16,9 @@ use futures::StreamExt;
 use lance::Dataset;
 use lance_index::vector::{
     graph::memory::InMemoryVectorStorage,
-    hnsw::{builder::HnswBuildParams, HNSWBuilder},
+    hnsw::{builder::HnswBuildParams, HNSW},
 };
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::{distance::DistanceType, MatrixView};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -76,7 +76,7 @@ async fn main() {
     let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
     println!("Loaded {:?} batches", mat.num_rows());
 
-    let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
+    let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
 
     let q = mat.row(0).unwrap();
     let k = 10;
@@ -84,20 +84,20 @@ async fn main() {
 
     for ef_construction in [15, 30, 50] {
         let now = std::time::Instant::now();
-        let hnsw = HNSWBuilder::with_params(
+        let hnsw = HNSW::build_with_storage(
+            DistanceType::L2,
             HnswBuildParams::default()
                 .max_level(args.max_level)
                 .num_edges(15)
                 .ef_construction(ef_construction),
             vector_store.clone(),
         )
-        .build()
         .await
         .unwrap();
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();
         let results: HashSet<u32> = hnsw
-            .search(q.clone(), k, args.ef, None)
+            .search_basic(q.clone(), k, args.ef, None, vector_store.as_ref())
             .unwrap()
             .iter()
             .map(|node| node.id)

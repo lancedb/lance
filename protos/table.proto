@@ -167,9 +167,9 @@ message DataFragment {
   // File that indicates which rows, if any, should be considered deleted.
   DeletionFile deletion_file = 3;
 
-  // Number of original rows in the fragment, not counting deletions. To compute
-  // the current number of rows, subtract `deletion_file.num_deleted_rows` from
-  // this value.
+  // Number of original rows in the fragment, this includes rows that are 
+  // now marked with deletion tombstones. To compute the current number of rows, 
+  // subtract `deletion_file.num_deleted_rows` from this value.
   uint64 physical_rows = 4;
 }
 

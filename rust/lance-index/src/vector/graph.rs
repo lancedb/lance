@@ -5,12 +5,11 @@
 //!
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
-use lance_core::{Error, Result};
-use snafu::{location, Location};
+use lance_core::Result;
 
 pub mod builder;
 pub mod memory;
@@ -18,6 +17,8 @@ pub mod storage;
 
 /// Vector storage to back a graph.
 pub use storage::VectorStorage;
+
+use crate::vector::DIST_COL;
 
 use self::storage::DistCalculator;
 
@@ -27,6 +28,8 @@ lazy_static::lazy_static! {
     /// NEIGHBORS field.
     pub static ref NEIGHBORS_FIELD: Field =
         Field::new(NEIGHBORS_COL, DataType::List(Field::new_list_field(DataType::UInt32, true).into()), true);
+        pub static ref DISTS_FIELD: Field =
+        Field::new(DIST_COL, DataType::List(Field::new_list_field(DataType::Float32, true).into()), true);
 }
 
 pub struct GraphNode<I = u32> {
@@ -142,10 +145,64 @@ pub trait Graph {
     }
 
     /// Get the neighbors of a graph node, identifyied by the index.
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>>;
+    fn neighbors(&self, key: u32) -> Arc<Vec<u32>>;
+}
 
-    /// Access to underline storage
-    fn storage(&self) -> Arc<dyn VectorStorage>;
+/// Array-based visited list (faster than HashSet)
+pub struct Visited<'a> {
+    visited: &'a mut [bool],
+    recently_visited: Vec<u32>,
+}
+
+impl<'a> Visited<'a> {
+    pub fn insert(&mut self, node_id: u32) {
+        let node_id_usize = node_id as usize;
+        if !self.visited[node_id_usize] {
+            self.visited[node_id_usize] = true;
+            self.recently_visited.push(node_id);
+        }
+    }
+
+    pub fn contains(&self, node_id: u32) -> bool {
+        let node_id_usize = node_id as usize;
+        self.visited[node_id_usize]
+    }
+}
+
+impl<'a> Drop for Visited<'a> {
+    fn drop(&mut self) {
+        for node_id in self.recently_visited.iter() {
+            self.visited[*node_id as usize] = false;
+        }
+        self.recently_visited.clear();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VisitedGenerator {
+    visited: Vec<bool>,
+    capacity: usize,
+}
+
+impl VisitedGenerator {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            visited: vec![false; capacity],
+            capacity,
+        }
+    }
+
+    pub fn generate(&mut self, node_count: usize) -> Visited<'_> {
+        if node_count > self.capacity {
+            let new_capacity = self.capacity.max(node_count).next_power_of_two();
+            self.visited.resize(new_capacity, false);
+            self.capacity = new_capacity;
+        }
+        Visited {
+            visited: &mut self.visited,
+            recently_visited: Vec::new(),
+        }
+    }
 }
 
 /// Beam search over a graph
@@ -170,14 +227,19 @@ pub trait Graph {
 /// A descending sorted list of ``(dist, node_id)`` pairs.
 ///
 /// WARNING: Internal API,  API stability is not guaranteed
+///
+/// TODO: This isn't actually beam search, function should probably be renamed
 pub fn beam_search(
     graph: &dyn Graph,
     ep: &OrderedNode,
     k: usize,
     dist_calc: &dyn DistCalculator,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
+    prefetch_distance: Option<usize>,
+    visited_generator: &mut VisitedGenerator,
 ) -> Result<Vec<OrderedNode>> {
-    let mut visited: HashSet<_> = HashSet::with_capacity(k);
+    let mut visited = visited_generator.generate(graph.len());
+    //let mut visited: HashSet<_> = HashSet::with_capacity(k);
     let mut candidates = BinaryHeap::with_capacity(k);
     visited.insert(ep.id);
     candidates.push(Reverse(ep.clone()));
@@ -198,20 +260,21 @@ pub fn beam_search(
         if current.dist > furthest && results.len() == k {
             break;
         }
-        let neighbors = graph.neighbors(current.id).ok_or_else(|| Error::Index {
-            message: format!("Node {} does not exist in the graph", current.id),
-            location: location!(),
-        })?;
+        let neighbors = graph.neighbors(current.id);
 
-        for neighbor in neighbors {
-            if visited.contains(&neighbor) {
-                continue;
-            }
+        let furthest = results
+            .peek()
+            .map(|node| node.dist)
+            .unwrap_or(OrderedFloat(f32::INFINITY));
+
+        let unvisited_neighbors: Vec<_> = neighbors
+            .iter()
+            .filter(|&&neighbor| !visited.contains(neighbor))
+            .copied()
+            .collect();
+
+        let mut process_neighbor = |neighbor: u32| {
             visited.insert(neighbor);
-            let furthest = results
-                .peek()
-                .map(|node| node.dist)
-                .unwrap_or(OrderedFloat(f32::INFINITY));
             let dist = dist_calc.distance(neighbor).into();
             if dist <= furthest || results.len() < k {
                 if bitset
@@ -227,7 +290,26 @@ pub fn beam_search(
                 }
                 candidates.push(Reverse((dist, neighbor).into()));
             }
-        }
+        };
+
+        match prefetch_distance {
+            Some(look_ahead) => {
+                for i in 0..unvisited_neighbors.len().saturating_sub(look_ahead) {
+                    dist_calc.prefetch(unvisited_neighbors[i + look_ahead]);
+                    process_neighbor(unvisited_neighbors[i]);
+                }
+                for neighbor in
+                    &unvisited_neighbors[unvisited_neighbors.len().saturating_sub(look_ahead)..]
+                {
+                    process_neighbor(*neighbor);
+                }
+            }
+            None => {
+                for neighbor in unvisited_neighbors {
+                    process_neighbor(neighbor);
+                }
+            }
+        };
     }
 
     Ok(results.into_sorted_vec())
@@ -259,13 +341,7 @@ pub fn greedy_search(
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
     loop {
-        let neighbors: Vec<_> = graph
-            .neighbors(current)
-            .ok_or_else(|| Error::Index {
-                message: format!("Node {} does not exist in the graph", current),
-                location: location!(),
-            })?
-            .collect();
+        let neighbors = graph.neighbors(current);
         let distances = neighbors
             .iter()
             .map(|neighbor| dist_calc.distance(*neighbor));
