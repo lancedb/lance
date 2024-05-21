@@ -15,74 +15,78 @@
 use jni::objects::{JMap, JObject, JString, JValue};
 use jni::JNIEnv;
 
-use crate::error::{JavaErrorExt, JavaResult};
+use crate::error::Result;
 
 pub trait FromJObject<T> {
-    fn extract(&self) -> JavaResult<T>;
+    fn extract(&self) -> Result<T>;
 }
 
 /// Convert a Rust type into a Java Object.
 pub trait IntoJava {
-    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> JavaResult<JObject<'a>>;
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>>;
 }
 
 impl FromJObject<i32> for JObject<'_> {
-    fn extract(&self) -> JavaResult<i32> {
-        JValue::from(self).i().infer_error()
+    fn extract(&self) -> Result<i32> {
+        let res = JValue::from(self).i()?;
+        Ok(res)
     }
 }
 
 impl FromJObject<i64> for JObject<'_> {
-    fn extract(&self) -> JavaResult<i64> {
-        JValue::from(self).j().infer_error()
+    fn extract(&self) -> Result<i64> {
+        let res = JValue::from(self).j()?;
+        Ok(res)
     }
 }
 
 impl FromJObject<f32> for JObject<'_> {
-    fn extract(&self) -> JavaResult<f32> {
-        JValue::from(self).f().infer_error()
+    fn extract(&self) -> Result<f32> {
+        let res = JValue::from(self).f()?;
+        Ok(res)
     }
 }
 
 impl FromJObject<f64> for JObject<'_> {
-    fn extract(&self) -> JavaResult<f64> {
-        JValue::from(self).d().infer_error()
+    fn extract(&self) -> Result<f64> {
+        let res = JValue::from(self).d()?;
+        Ok(res)
     }
 }
 
 pub trait FromJString {
-    fn extract(&self, env: &mut JNIEnv) -> JavaResult<String>;
+    fn extract(&self, env: &mut JNIEnv) -> Result<String>;
 }
 
 impl FromJString for JString<'_> {
-    fn extract(&self, env: &mut JNIEnv) -> JavaResult<String> {
-        Ok(env.get_string(self).infer_error()?.into())
+    fn extract(&self, env: &mut JNIEnv) -> Result<String> {
+        Ok(env.get_string(self)?.into())
     }
 }
 
 pub trait JMapExt {
     #[allow(dead_code)]
-    fn get_string(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<String>>;
+    fn get_string(&self, env: &mut JNIEnv, key: &str) -> Result<Option<String>>;
 
     #[allow(dead_code)]
-    fn get_i32(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<i32>>;
+    fn get_i32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i32>>;
 
     #[allow(dead_code)]
-    fn get_i64(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<i64>>;
+    fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>>;
 
     #[allow(dead_code)]
-    fn get_f32(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<f32>>;
+    fn get_f32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f32>>;
 
     #[allow(dead_code)]
-    fn get_f64(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<f64>>;
+    fn get_f64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f64>>;
 }
 
-fn get_map_value<T>(env: &mut JNIEnv, map: &JMap, key: &str) -> JavaResult<Option<T>>
+fn get_map_value<T>(env: &mut JNIEnv, map: &JMap, key: &str) -> Result<Option<T>>
 where
     for<'a> JObject<'a>: FromJObject<T>,
 {
-    let key_obj: JObject = env.new_string(key).infer_error()?.into();
-    if let Some(value) = map.get(env, &key_obj).infer_error()? {
+    let key_obj: JObject = env.new_string(key)?.into();
+    if let Some(value) = map.get(env, &key_obj)? {
         if value.is_null() {
             Ok(None)
         } else {
@@ -94,9 +98,9 @@ where
 }
 
 impl JMapExt for JMap<'_, '_, '_> {
-    fn get_string(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<String>> {
-        let key_obj: JObject = env.new_string(key).infer_error()?.into();
-        if let Some(value) = self.get(env, &key_obj).infer_error()? {
+    fn get_string(&self, env: &mut JNIEnv, key: &str) -> Result<Option<String>> {
+        let key_obj: JObject = env.new_string(key)?.into();
+        if let Some(value) = self.get(env, &key_obj)? {
             let value_str: JString = value.into();
             Ok(Some(value_str.extract(env)?))
         } else {
@@ -104,19 +108,19 @@ impl JMapExt for JMap<'_, '_, '_> {
         }
     }
 
-    fn get_i32(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<i32>> {
+    fn get_i32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i32>> {
         get_map_value(env, self, key)
     }
 
-    fn get_i64(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<i64>> {
+    fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>> {
         get_map_value(env, self, key)
     }
 
-    fn get_f32(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<f32>> {
+    fn get_f32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f32>> {
         get_map_value(env, self, key)
     }
 
-    fn get_f64(&self, env: &mut JNIEnv, key: &str) -> JavaResult<Option<f64>> {
+    fn get_f64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f64>> {
         get_map_value(env, self, key)
     }
 }

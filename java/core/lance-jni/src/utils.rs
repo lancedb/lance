@@ -16,9 +16,8 @@ use jni::objects::JObject;
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 
-use crate::error::JavaResult;
+use crate::error::Result;
 use crate::ffi::JNIEnvExt;
-use crate::JavaErrorExt;
 
 pub fn extract_write_params(
     env: &mut JNIEnv,
@@ -26,7 +25,7 @@ pub fn extract_write_params(
     max_rows_per_group: &JObject,
     max_bytes_per_file: &JObject,
     mode: &JObject,
-) -> JavaResult<WriteParams> {
+) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
     if let Some(max_rows_per_file_val) = env.get_int_opt(max_rows_per_file)? {
@@ -39,7 +38,7 @@ pub fn extract_write_params(
         write_params.max_bytes_per_file = max_bytes_per_file_val as usize;
     }
     if let Some(mode_val) = env.get_string_opt(mode)? {
-        write_params.mode = WriteMode::try_from(mode_val.as_str()).infer_error()?;
+        write_params.mode = WriteMode::try_from(mode_val.as_str())?;
     }
     Ok(write_params)
 }

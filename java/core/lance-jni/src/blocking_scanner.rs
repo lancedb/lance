@@ -14,9 +14,8 @@
 
 use std::sync::Arc;
 
-use crate::error::{JavaErrorExt, JavaResult};
+use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::JavaError;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
 use jni::{objects::JObject, sys::jlong, JNIEnv};
@@ -43,16 +42,19 @@ impl BlockingScanner {
         }
     }
 
-    pub fn open_stream(&self) -> JavaResult<DatasetRecordBatchStream> {
-        RT.block_on(self.inner.try_into_stream()).infer_error()
+    pub fn open_stream(&self) -> Result<DatasetRecordBatchStream> {
+        let res = RT.block_on(self.inner.try_into_stream())?;
+        Ok(res)
     }
 
-    pub fn schema(&self) -> JavaResult<SchemaRef> {
-        RT.block_on(self.inner.schema()).infer_error()
+    pub fn schema(&self) -> Result<SchemaRef> {
+        let res = RT.block_on(self.inner.schema())?;
+        Ok(res)
     }
 
-    pub fn count_rows(&self) -> JavaResult<u64> {
-        RT.block_on(self.inner.count_rows()).infer_error()
+    pub fn count_rows(&self) -> Result<u64> {
+        let res = RT.block_on(self.inner.count_rows())?;
+        Ok(res)
     }
 }
 
@@ -92,17 +94,16 @@ fn inner_create_scanner<'local>(
     substrait_filter_obj: JObject,
     filter_obj: JObject,
     batch_size_obj: JObject,
-) -> JavaResult<JObject<'local>> {
+) -> Result<JObject<'local>> {
     let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
     let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-            .infer_error()?;
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
     let mut scanner = dataset_guard.inner.scan();
     if let Some(fragment_ids) = fragment_ids_opt {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
             let Some(fragment) = dataset_guard.inner.get_fragment(fragment_id as usize) else {
-                return Err(JavaError::input_error(format!(
+                return Err(Error::input_error(format!(
                     "Fragment {fragment_id} not found"
                 )));
             };
@@ -113,16 +114,15 @@ fn inner_create_scanner<'local>(
     drop(dataset_guard);
     let columns_opt = env.get_strings_opt(&columns_obj)?;
     if let Some(columns) = columns_opt {
-        scanner.project(&columns).infer_error()?;
+        scanner.project(&columns)?;
     };
     let substrait_opt = env.get_bytes_opt(&substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
-        RT.block_on(async { scanner.filter_substrait(substrait).await })
-            .infer_error()?;
+        RT.block_on(async { scanner.filter_substrait(substrait).await })?;
     }
     let filter_opt = env.get_string_opt(&filter_obj)?;
     if let Some(filter) = filter_opt {
-        scanner.filter(filter.as_str()).infer_error()?;
+        scanner.filter(filter.as_str())?;
     }
     let batch_size_opt = env.get_long_opt(&batch_size_obj)?;
     if let Some(batch_size) = batch_size_opt {
@@ -140,14 +140,13 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_releaseNativeScan
     ok_or_throw_without_return!(env, inner_release_native_scanner(&mut env, j_scanner));
 }
 
-fn inner_release_native_scanner(env: &mut JNIEnv, j_scanner: JObject) -> JavaResult<()> {
-    let _: BlockingScanner =
-        unsafe { env.take_rust_field(j_scanner, NATIVE_SCANNER) }.infer_error()?;
+fn inner_release_native_scanner(env: &mut JNIEnv, j_scanner: JObject) -> Result<()> {
+    let _: BlockingScanner = unsafe { env.take_rust_field(j_scanner, NATIVE_SCANNER) }?;
     Ok(())
 }
 
 impl IntoJava for BlockingScanner {
-    fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> JavaResult<JObject<'local>> {
+    fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
         attach_native_scanner(env, self)
     }
 }
@@ -155,7 +154,7 @@ impl IntoJava for BlockingScanner {
 fn attach_native_scanner<'local>(
     env: &mut JNIEnv<'local>,
     scanner: BlockingScanner,
-) -> JavaResult<JObject<'local>> {
+) -> Result<JObject<'local>> {
     let j_scanner = create_java_scanner_object(env)?;
     // This block sets a native Rust object (scanner) as a field in the Java object (j_scanner).
     // Caution: This creates a potential for memory leaks. The Rust object (scanner) is not
@@ -166,13 +165,13 @@ fn attach_native_scanner<'local>(
     // 1. The Java object (`j_scanner`) should implement the `java.io.Closeable` interface.
     // 2. Users of this Java object should be instructed to always use it within a try-with-resources
     //    statement (or manually call the `close()` method) to ensure that `self.close()` is invoked.
-    unsafe { env.set_rust_field(&j_scanner, NATIVE_SCANNER, scanner) }.infer_error()?;
+    unsafe { env.set_rust_field(&j_scanner, NATIVE_SCANNER, scanner) }?;
     Ok(j_scanner)
 }
 
-fn create_java_scanner_object<'a>(env: &mut JNIEnv<'a>) -> JavaResult<JObject<'a>> {
-    env.new_object("com/lancedb/lance/ipc/LanceScanner", "()V", &[])
-        .infer_error()
+fn create_java_scanner_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+    let res = env.new_object("com/lancedb/lance/ipc/LanceScanner", "()V", &[])?;
+    Ok(res)
 }
 
 //////////////////
@@ -187,15 +186,13 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_openStream(
     ok_or_throw_without_return!(env, inner_open_stream(&mut env, j_scanner, stream_addr));
 }
 
-fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -> JavaResult<()> {
+fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -> Result<()> {
     let record_batch_stream = {
         let scanner_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
-                .infer_error()?;
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
         scanner_guard.open_stream()?
     };
-    let ffi_stream =
-        to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone()).infer_error()?;
+    let ffi_stream = to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone())?;
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
     Ok(())
 }
@@ -212,18 +209,13 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_importFfiSchema(
     );
 }
 
-fn inner_import_ffi_schema(
-    env: &mut JNIEnv,
-    j_scanner: JObject,
-    schema_addr: jlong,
-) -> JavaResult<()> {
+fn inner_import_ffi_schema(env: &mut JNIEnv, j_scanner: JObject, schema_addr: jlong) -> Result<()> {
     let schema = {
         let scanner_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
-                .infer_error()?;
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
         scanner_guard.schema()?
     };
-    let ffi_schema = FFI_ArrowSchema::try_from(&*schema).infer_error()?;
+    let ffi_schema = FFI_ArrowSchema::try_from(&*schema)?;
     unsafe { std::ptr::write_unaligned(schema_addr as *mut FFI_ArrowSchema, ffi_schema) }
     Ok(())
 }
@@ -236,9 +228,8 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_nativeCountRows(
     ok_or_throw_with_return!(env, inner_count_rows(&mut env, j_scanner), -1) as jlong
 }
 
-fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> JavaResult<u64> {
+fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> Result<u64> {
     let scanner_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }
-            .infer_error()?;
+        unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
     scanner_guard.count_rows()
 }

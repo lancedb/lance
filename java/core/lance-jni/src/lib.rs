@@ -57,7 +57,7 @@ mod ffi;
 mod fragment;
 mod traits;
 mod utils;
-pub use error::{JavaError, JavaErrorExt, JavaResult};
+pub use error::Result;
 
 use lazy_static::lazy_static;
 

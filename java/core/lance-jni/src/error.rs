@@ -19,8 +19,6 @@ use jni::{errors::Error as JniError, JNIEnv};
 use lance::error::Error as LanceError;
 use serde_json::Error as JsonError;
 
-pub type JavaResult<T> = std::result::Result<T, JavaError>;
-
 #[derive(Debug)]
 pub enum JavaExceptionClass {
     IllegalArgumentException,
@@ -41,12 +39,12 @@ impl JavaExceptionClass {
 }
 
 #[derive(Debug)]
-pub struct JavaError {
+pub struct Error {
     message: String,
     java_class: JavaExceptionClass,
 }
 
-impl JavaError {
+impl Error {
     pub fn new(message: String, java_class: JavaExceptionClass) -> Self {
         Self {
             message,
@@ -79,107 +77,53 @@ impl JavaError {
     }
 }
 
-impl std::fmt::Display for JavaError {
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.java_class.as_str(), self.message)
     }
 }
 
-impl std::error::Error for JavaError {}
-
-/// Trait for converting errors to Java exceptions.
-pub trait JavaErrorConversion<T> {
-    /// Convert to `JavaError` as I/O exception.
-    fn io_error(self) -> JavaResult<T>;
-
-    /// Convert to `JavaError` as runtime exception.
-    fn runtime_error(self) -> JavaResult<T>;
-
-    /// Convert to `JavaError` as value (input) exception.
-    fn input_error(self) -> JavaResult<T>;
-
-    /// Convert to `JavaError` as unsupported operation exception.
-    fn unsupported_error(self) -> JavaResult<T>;
-}
-
-impl<T, E: std::fmt::Display> JavaErrorConversion<T> for std::result::Result<T, E> {
-    fn io_error(self) -> JavaResult<T> {
-        self.map_err(|err| JavaError::io_error(err.to_string()))
-    }
-
-    fn runtime_error(self) -> JavaResult<T> {
-        self.map_err(|err| JavaError::runtime_error(err.to_string()))
-    }
-
-    fn input_error(self) -> JavaResult<T> {
-        self.map_err(|err| JavaError::input_error(err.to_string()))
-    }
-
-    fn unsupported_error(self) -> JavaResult<T> {
-        self.map_err(|err| JavaError::unsupported_error(err.to_string()))
-    }
-}
-
-/// JavaErrorExt trait that converts specific error types to Java exceptions
-pub trait JavaErrorExt<T> {
-    /// Convert to a Java error based on the specific error type
-    fn infer_error(self) -> JavaResult<T>;
-}
-
-impl<T> JavaErrorExt<T> for std::result::Result<T, LanceError> {
-    fn infer_error(self) -> JavaResult<T> {
-        match &self {
-            Ok(_) => Ok(self.unwrap()),
-            Err(err) => match err {
-                LanceError::DatasetNotFound { .. }
-                | LanceError::DatasetAlreadyExists { .. }
-                | LanceError::CommitConflict { .. }
-                | LanceError::InvalidInput { .. } => self.input_error(),
-                LanceError::IO { .. } => self.io_error(),
-                LanceError::NotSupported { .. } => self.unsupported_error(),
-                _ => self.runtime_error(),
-            },
+impl From<LanceError> for Error {
+    fn from(err: LanceError) -> Self {
+        match err {
+            LanceError::DatasetNotFound { .. }
+            | LanceError::DatasetAlreadyExists { .. }
+            | LanceError::CommitConflict { .. }
+            | LanceError::InvalidInput { .. } => Self::input_error(err.to_string()),
+            LanceError::IO { .. } => Self::io_error(err.to_string()),
+            LanceError::NotSupported { .. } => Self::unsupported_error(err.to_string()),
+            _ => Self::runtime_error(err.to_string()),
         }
     }
 }
 
-impl<T> JavaErrorExt<T> for std::result::Result<T, ArrowError> {
-    fn infer_error(self) -> JavaResult<T> {
-        match &self {
-            Ok(_) => Ok(self.unwrap()),
-            Err(err) => match err {
-                ArrowError::InvalidArgumentError { .. } => self.input_error(),
-                ArrowError::IoError { .. } => self.io_error(),
-                ArrowError::NotYetImplemented(_) => self.unsupported_error(),
-                _ => self.runtime_error(),
-            },
+impl From<ArrowError> for Error {
+    fn from(err: ArrowError) -> Self {
+        match err {
+            ArrowError::InvalidArgumentError { .. } => Self::input_error(err.to_string()),
+            ArrowError::IoError { .. } => Self::io_error(err.to_string()),
+            ArrowError::NotYetImplemented(_) => Self::unsupported_error(err.to_string()),
+            _ => Self::runtime_error(err.to_string()),
         }
     }
 }
 
-impl<T> JavaErrorExt<T> for std::result::Result<T, JsonError> {
-    fn infer_error(self) -> JavaResult<T> {
-        match &self {
-            Ok(_) => Ok(self.unwrap()),
-            Err(_) => self.io_error(),
-        }
+impl From<JsonError> for Error {
+    fn from(err: JsonError) -> Self {
+        Self::io_error(err.to_string())
     }
 }
 
-impl<T> JavaErrorExt<T> for std::result::Result<T, JniError> {
-    fn infer_error(self) -> JavaResult<T> {
-        match &self {
-            Ok(_) => Ok(self.unwrap()),
-            Err(_) => self.runtime_error(),
-        }
+impl From<JniError> for Error {
+    fn from(err: JniError) -> Self {
+        Self::runtime_error(err.to_string())
     }
 }
 
-impl<T> JavaErrorExt<T> for std::result::Result<T, Utf8Error> {
-    fn infer_error(self) -> JavaResult<T> {
-        match &self {
-            Ok(_) => Ok(self.unwrap()),
-            Err(_) => self.input_error(),
-        }
+impl From<Utf8Error> for Error {
+    fn from(err: Utf8Error) -> Self {
+        Self::input_error(err.to_string())
     }
 }

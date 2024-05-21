@@ -25,8 +25,7 @@ use std::iter::once;
 
 use lance::dataset::fragment::FileFragment;
 
-use crate::error::{JavaErrorExt, JavaResult};
-use crate::JavaError;
+use crate::error::{Error, Result};
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     ffi::JNIEnvExt,
@@ -60,15 +59,15 @@ fn inner_count_rows_native(
     env: &mut JNIEnv,
     jdataset: JObject,
     fragment_id: jlong,
-) -> JavaResult<usize> {
-    let dataset = unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-        .infer_error()?;
+) -> Result<usize> {
+    let dataset = unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
     let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
-        return Err(JavaError::input_error(format!(
+        return Err(Error::input_error(format!(
             "Fragment not found: {fragment_id}"
         )));
     };
-    RT.block_on(fragment.count_rows()).infer_error()
+    let res = RT.block_on(fragment.count_rows())?;
+    Ok(res)
 }
 
 #[no_mangle]
@@ -112,15 +111,15 @@ fn inner_create_with_ffi_array<'local>(
     max_rows_per_group: JObject, // Optional<Integer>
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
-) -> JavaResult<JString<'local>> {
+) -> Result<JString<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
 
     let c_array = unsafe { FFI_ArrowArray::from_raw(c_array_ptr) };
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-    let data_type = DataType::try_from(&c_schema).infer_error()?;
+    let data_type = DataType::try_from(&c_schema)?;
 
-    let array_data = unsafe { from_ffi_and_data_type(c_array, data_type) }.infer_error()?;
+    let array_data = unsafe { from_ffi_and_data_type(c_array, data_type) }?;
 
     let record_batch = RecordBatch::from(StructArray::from(array_data));
     let batch_schema = record_batch.schema().clone();
@@ -176,9 +175,9 @@ fn inner_create_with_ffi_stream<'local>(
     max_rows_per_group: JObject, // Optional<Integer>
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
-) -> JavaResult<JString<'local>> {
+) -> Result<JString<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }.infer_error()?;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
 
     create_fragment(
         env,
@@ -202,7 +201,7 @@ fn create_fragment<'a>(
     max_bytes_per_file: JObject, // Optional<Long>
     mode: JObject,               // Optional<String>
     reader: impl RecordBatchReader + Send + 'static,
-) -> JavaResult<JString<'a>> {
+) -> Result<JString<'a>> {
     let path_str = dataset_uri.extract(env)?;
 
     let fragment_id_opts = env.get_int_opt(&fragment_id)?;
@@ -214,14 +213,13 @@ fn create_fragment<'a>(
         &max_bytes_per_file,
         &mode,
     )?;
-    let fragment = RT
-        .block_on(FileFragment::create(
-            &path_str,
-            fragment_id_opts.unwrap_or(0) as usize,
-            reader,
-            Some(write_params),
-        ))
-        .infer_error()?;
-    let json_string = serde_json::to_string(&fragment).infer_error()?;
-    env.new_string(json_string).infer_error()
+    let fragment = RT.block_on(FileFragment::create(
+        &path_str,
+        fragment_id_opts.unwrap_or(0) as usize,
+        reader,
+        Some(write_params),
+    ))?;
+    let json_string = serde_json::to_string(&fragment)?;
+    let res = env.new_string(json_string)?;
+    Ok(res)
 }
