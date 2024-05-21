@@ -46,10 +46,10 @@ pub async fn read_binary_array(
             reader, position, length, nullable,
         )),
         _ => {
-            return Err(Error::IO {
-                message: format!("Unsupported binary type: {data_type}",),
-                location: location!(),
-            })
+            return Err(Error::io(
+                format!("Unsupported binary type: {}", data_type),
+                location!(),
+            ));
         }
     };
     let fut = decoder.as_ref().get(params.into());
@@ -81,10 +81,7 @@ pub async fn read_fixed_stride_array(
 pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
     let file_size = reader.size().await?;
     if pos > file_size {
-        return Err(Error::IO {
-            message: "file size is too small".to_string(),
-            location: location!(),
-        });
+        return Err(Error::io("file size is too small".to_string(), location!()));
     }
 
     let range = pos..min(pos + 4096, file_size);
@@ -131,13 +128,13 @@ pub async fn read_last_block(reader: &dyn Reader) -> Result<Bytes> {
 pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let len = bytes.len();
     if len < 16 {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "does not have sufficient data, len: {}, bytes: {:?}",
                 len, bytes
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
     let offset_bytes = bytes.slice(len - 16..len - 8);
     Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
@@ -147,13 +144,13 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
 pub fn read_version(bytes: &Bytes) -> Result<(u16, u16)> {
     let len = bytes.len();
     if len < 8 {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "does not have sufficient data, len: {}, bytes: {:?}",
                 len, bytes
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
 
     let major_version = LittleEndian::read_u16(bytes.slice(len - 8..len - 6).as_ref());

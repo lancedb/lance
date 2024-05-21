@@ -7,8 +7,9 @@ use arrow_array::ArrayRef;
 use lance_linalg::distance::MetricType;
 
 /// WARNING: Internal API,  API stability is not guaranteed
-pub trait DistCalculator {
+pub trait DistCalculator<'a> {
     fn distance(&self, id: u32) -> f32;
+    fn prefetch(&self, _id: u32) {}
 }
 
 /// Vector Storage is the abstraction to store the vectors.
@@ -39,9 +40,9 @@ pub trait VectorStorage: Send + Sync {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator>;
+    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Box<dyn DistCalculator<'a> + 'a>;
 
-    fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator>;
+    fn dist_calculator_from_id<'a>(&'a self, id: u32) -> Box<dyn DistCalculator<'a> + 'a>;
 
     fn distance_between(&self, a: u32, b: u32) -> f32;
 }

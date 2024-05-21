@@ -14,11 +14,10 @@
 
 use core::slice;
 
+use crate::error::Result;
 use jni::objects::{JByteBuffer, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{objects::JObject, JNIEnv};
-
-use crate::error::{Error, Result};
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {

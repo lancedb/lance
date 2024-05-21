@@ -14,7 +14,7 @@ use arrow_array::{
         TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
         TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    ArrayRef, BooleanArray, FixedSizeListArray, PrimitiveArray,
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray,
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
@@ -313,10 +313,10 @@ impl PrimitiveFieldDecodeTask {
                 TimeUnit::Second => Ok(Self::new_primitive_array::<Time32SecondType>(
                     buffers, num_rows, data_type,
                 )),
-                _ => Err(Error::IO {
-                    message: format!("invalid time unit {:?} for 32-bit time type", unit),
-                    location: location!(),
-                }),
+                _ => Err(Error::io(
+                    format!("invalid time unit {:?} for 32-bit time type", unit),
+                    location!(),
+                )),
             },
             DataType::Time64(unit) => match unit {
                 TimeUnit::Microsecond => Ok(Self::new_primitive_array::<Time64MicrosecondType>(
@@ -325,10 +325,10 @@ impl PrimitiveFieldDecodeTask {
                 TimeUnit::Nanosecond => Ok(Self::new_primitive_array::<Time64NanosecondType>(
                     buffers, num_rows, data_type,
                 )),
-                _ => Err(Error::IO {
-                    message: format!("invalid time unit {:?} for 64-bit time type", unit),
-                    location: location!(),
-                }),
+                _ => Err(Error::io(
+                    format!("invalid time unit {:?} for 64-bit time type", unit),
+                    location!(),
+                )),
             },
             DataType::Timestamp(unit, _) => Ok(match unit {
                 TimeUnit::Microsecond => Self::new_primitive_array::<TimestampMicrosecondType>(
@@ -356,6 +356,17 @@ impl PrimitiveFieldDecodeTask {
             DataType::UInt8 => Ok(Self::new_primitive_array::<UInt8Type>(
                 buffers, num_rows, data_type,
             )),
+            DataType::FixedSizeBinary(dimension) => {
+                let mut buffers_iter = buffers.into_iter();
+                let fsb_validity = buffers_iter.next().unwrap();
+                let fsb_nulls = Self::bytes_to_validity(fsb_validity, num_rows);
+
+                let fsb_values = buffers_iter.next().unwrap();
+                let fsb_values = Buffer::from_bytes(fsb_values.freeze().into());
+                Ok(Arc::new(FixedSizeBinaryArray::new(
+                    *dimension, fsb_values, fsb_nulls,
+                )))
+            }
             DataType::FixedSizeList(items, dimension) => {
                 let mut buffers_iter = buffers.into_iter();
                 let fsl_validity = buffers_iter.next().unwrap();
@@ -374,13 +385,13 @@ impl PrimitiveFieldDecodeTask {
                     fsl_nulls,
                 )))
             }
-            _ => Err(Error::IO {
-                message: format!(
+            _ => Err(Error::io(
+                format!(
                     "The data type {} cannot be decoded from a primitive encoding",
                     data_type
                 ),
-                location: location!(),
-            }),
+                location!(),
+            )),
         }
     }
 }

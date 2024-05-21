@@ -88,10 +88,7 @@ impl LocalObjectReader {
                     uri: path.to_string(),
                     location: location!(),
                 },
-                _ => Error::IO {
-                    message: e.to_string(),
-                    location: location!(),
-                },
+                _ => e.into(),
             })?;
             Ok(Box::new(Self {
                 file: Arc::new(file),

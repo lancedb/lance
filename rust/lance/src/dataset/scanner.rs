@@ -241,10 +241,10 @@ impl Scanner {
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
         if self.is_fragment_scan() {
-            Err(Error::IO {
-                message: "This operation is not supported for fragment scan".to_string(),
-                location: location!(),
-            })
+            Err(Error::io(
+                "This operation is not supported for fragment scan".to_string(),
+                location!(),
+            ))
         } else {
             Ok(())
         }
@@ -279,10 +279,10 @@ impl Scanner {
         let mut physical_cols = vec![];
         for (output_name, raw_expr) in columns {
             if output.contains_key(output_name.as_ref()) {
-                return Err(Error::IO {
-                    message: format!("Duplicate column name: {}", output_name.as_ref()),
-                    location: location!(),
-                });
+                return Err(Error::io(
+                    format!("Duplicate column name: {}", output_name.as_ref()),
+                    location!(),
+                ));
             }
             let expr = planner.parse_expr(raw_expr.as_ref())?;
             for col in Planner::column_names_in_expr(&expr) {
@@ -404,17 +404,17 @@ impl Scanner {
     /// skip the first 10 rows and return the rest of the rows in the dataset.
     pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
         if limit.unwrap_or_default() < 0 {
-            return Err(Error::IO {
-                message: "Limit must be non-negative".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                "Limit must be non-negative".to_string(),
+                location!(),
+            ));
         }
         if let Some(off) = offset {
             if off < 0 {
-                return Err(Error::IO {
-                    message: "Offset must be non-negative".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::io(
+                    "Offset must be non-negative".to_string(),
+                    location!(),
+                ));
             }
         }
         self.limit = limit;
@@ -427,46 +427,43 @@ impl Scanner {
         self.ensure_not_fragment_scan()?;
 
         if k == 0 {
-            return Err(Error::IO {
-                message: "k must be positive".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io("k must be positive".to_string(), location!()));
         }
         if q.is_empty() {
-            return Err(Error::IO {
-                message: "Query vector must have non-zero length".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                "Query vector must have non-zero length".to_string(),
+                location!(),
+            ));
         }
         // make sure the field exists
-        let field = self.dataset.schema().field(column).ok_or(Error::IO {
-            message: format!("Column {} not found", column),
-            location: location!(),
-        })?;
+        let field = self.dataset.schema().field(column).ok_or(Error::io(
+            format!("Column {} not found", column),
+            location!(),
+        ))?;
         let key = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
                 if dt.data_type().is_floating() {
                     coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
                 } else {
-                    return Err(Error::IO {
-                        message: format!(
+                    return Err(Error::io(
+                        format!(
                             "Column {} is not a vector column (type: {})",
                             column,
                             field.data_type()
                         ),
-                        location: location!(),
-                    });
+                        location!(),
+                    ));
                 }
             }
             _ => {
-                return Err(Error::IO {
-                    message: format!(
+                return Err(Error::io(
+                    format!(
                         "Column {} is not a vector column (type: {})",
                         column,
                         field.data_type()
                     ),
-                    location: location!(),
-                })
+                    location!(),
+                ));
             }
         };
 
@@ -537,10 +534,10 @@ impl Scanner {
                 self.dataset
                     .schema()
                     .field(&column.column_name)
-                    .ok_or(Error::IO {
-                        message: format!("Column {} not found", &column.column_name),
-                        location: location!(),
-                    })?;
+                    .ok_or(Error::io(
+                        format!("Column {} not found", &column.column_name),
+                        location!(),
+                    ))?;
             }
         }
         self.ordering = ordering;
@@ -580,10 +577,10 @@ impl Scanner {
         let mut extra_columns = vec![];
 
         if let Some(q) = self.nearest.as_ref() {
-            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::IO {
-                message: format!("Column {} not found", q.column),
-                location: location!(),
-            })?;
+            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::io(
+                format!("Column {} not found", q.column),
+                location!(),
+            ))?;
             let vector_field = ArrowField::from(vector_field);
             extra_columns.push(vector_field);
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
@@ -730,10 +727,10 @@ impl Scanner {
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or(Error::IO {
-                    message: "Count plan did not return a UInt64Array".to_string(),
-                    location: location!(),
-                })?;
+                .ok_or(Error::io(
+                    "Count plan did not return a UInt64Array".to_string(),
+                    location!(),
+                ))?;
             Ok(array.value(0) as u64)
         } else {
             Ok(0)
@@ -1003,10 +1000,7 @@ impl Scanner {
     // ANN/KNN search execution node with optional prefilter
     async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
-            return Err(Error::IO {
-                message: "No nearest query".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io("No nearest query".to_string(), location!()));
         };
 
         // Santity check
@@ -1015,20 +1009,20 @@ impl Scanner {
             match field.data_type() {
                 DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
                 _ => {
-                    return Err(Error::IO {
-                        message: format!(
+                    return Err(Error::io(
+                        format!(
                             "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
                             q.column, field.data_type(),
                         ),
-                        location: location!(),
-                    });
+                        location!(),
+                    ));
                 }
             }
         } else {
-            return Err(Error::IO {
-                message: format!("Vector search error: column {} not found", q.column),
-                location: location!(),
-            });
+            return Err(Error::io(
+                format!("Vector search error: column {} not found", q.column),
+                location!(),
+            ));
         }
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
@@ -1042,10 +1036,10 @@ impl Scanner {
             // There is an index built for the column.
             // We will use the index.
             if matches!(q.refine_factor, Some(0)) {
-                return Err(Error::IO {
-                    message: "Refine factor can not be zero".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::io(
+                    "Refine factor can not be zero".to_string(),
+                    location!(),
+                ));
             }
 
             // Find all deltas with the same index name.
@@ -1495,12 +1489,9 @@ impl Stream for DatasetRecordBatchStream {
         let mut this = self.project();
         let _guard = this.span.enter();
         match this.exec_node.poll_next_unpin(cx) {
-            Poll::Ready(result) => Poll::Ready(result.map(|r| {
-                r.map_err(|e| Error::IO {
-                    message: e.to_string(),
-                    location: location!(),
-                })
-            })),
+            Poll::Ready(result) => {
+                Poll::Ready(result.map(|r| r.map_err(|e| Error::io(e.to_string(), location!()))))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1545,7 +1536,7 @@ pub mod test_dataset {
     }
 
     impl TestVectorDataset {
-        pub async fn new() -> Result<Self> {
+        pub async fn new(use_experimental_writer: bool) -> Result<Self> {
             let tmp_dir = tempdir()?;
             let path = tmp_dir.path().to_str().unwrap();
 
@@ -1591,6 +1582,7 @@ pub mod test_dataset {
 
             let params = WriteParams {
                 max_rows_per_group: 10,
+                use_experimental_writer,
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1674,6 +1666,7 @@ mod test {
     use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
+    use rstest::rstest;
     use tempfile::{tempdir, TempDir};
 
     use super::*;
@@ -1740,7 +1733,7 @@ mod test {
 
     #[tokio::test]
     async fn test_filter_parsing() -> Result<()> {
-        let test_ds = TestVectorDataset::new().await?;
+        let test_ds = TestVectorDataset::new(false).await?;
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -1771,9 +1764,10 @@ mod test {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_limit() -> Result<()> {
-        let test_ds = TestVectorDataset::new().await?;
+    async fn test_limit(#[values(false, true)] use_experimental_writer: bool) -> Result<()> {
+        let test_ds = TestVectorDataset::new(use_experimental_writer).await?;
         let dataset = &test_ds.dataset;
 
         let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
@@ -1788,10 +1782,13 @@ mod test {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_knn_nodes() {
+    async fn test_knn_nodes(#[values(false, true)] use_experimental_writer: bool) {
         for build_index in &[true, false] {
-            let mut test_ds = TestVectorDataset::new().await.unwrap();
+            let mut test_ds = TestVectorDataset::new(use_experimental_writer)
+                .await
+                .unwrap();
             if *build_index {
                 test_ds.make_vector_index().await.unwrap();
             }
@@ -1842,9 +1839,12 @@ mod test {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_knn_with_new_data() {
-        let mut test_ds = TestVectorDataset::new().await.unwrap();
+    async fn test_knn_with_new_data(#[values(false, true)] use_experimental_writer: bool) {
+        let mut test_ds = TestVectorDataset::new(use_experimental_writer)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -1921,9 +1921,12 @@ mod test {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_knn_with_prefilter() {
-        let mut test_ds = TestVectorDataset::new().await.unwrap();
+    async fn test_knn_with_prefilter(#[values(false, true)] use_experimental_writer: bool) {
+        let mut test_ds = TestVectorDataset::new(use_experimental_writer)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         let dataset = &test_ds.dataset;
 
@@ -1977,12 +1980,15 @@ mod test {
         assert!(actual_i.is_subset(&close_i));
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_knn_filter_new_data() {
+    async fn test_knn_filter_new_data(#[values(false, true)] use_experimental_writer: bool) {
         // This test verifies that a filter (prefilter or postfilter) gets applied to the flat KNN results
         // in a combined KNN scan (a scan that combines results from an indexed ANN with an unindexed flat
         // search of new data)
-        let mut test_ds = TestVectorDataset::new().await.unwrap();
+        let mut test_ds = TestVectorDataset::new(use_experimental_writer)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -2040,9 +2046,12 @@ mod test {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_knn_with_filter() {
-        let test_ds = TestVectorDataset::new().await.unwrap();
+    async fn test_knn_with_filter(#[values(false, true)] use_experimental_writer: bool) {
+        let test_ds = TestVectorDataset::new(use_experimental_writer)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2090,9 +2099,12 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_refine_factor() {
-        let test_ds = TestVectorDataset::new().await.unwrap();
+    async fn test_refine_factor(#[values(false, true)] use_experimental_writer: bool) {
+        let test_ds = TestVectorDataset::new(use_experimental_writer)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2141,7 +2153,10 @@ mod test {
 
     #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
-        let test_ds = TestVectorDataset::new().await.unwrap();
+        // This test doesn't make sense for v2 files, there is no way to get an out-of-order scan
+        let test_ds = TestVectorDataset::new(/*use_experimental_writer=*/ false)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2187,8 +2202,9 @@ mod test {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_scan_order() {
+    async fn test_scan_order(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2212,6 +2228,7 @@ mod test {
 
         let params = WriteParams {
             mode: WriteMode::Append,
+            use_experimental_writer,
             ..Default::default()
         };
 
@@ -2256,8 +2273,9 @@ mod test {
         assert_eq!(output[1], batch1);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_scan_sort() {
+    async fn test_scan_sort(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2289,7 +2307,10 @@ mod test {
         Dataset::write(
             data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
             test_uri,
-            None,
+            Some(WriteParams {
+                use_experimental_writer,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -2339,8 +2360,9 @@ mod test {
             .unwrap();
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_sort_multi_columns() {
+    async fn test_sort_multi_columns(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2364,7 +2386,10 @@ mod test {
         Dataset::write(
             data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
             test_uri,
-            None,
+            Some(WriteParams {
+                use_experimental_writer,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -2388,8 +2413,9 @@ mod test {
         assert_eq!(batches_by_int_then_float[0], sorted_by_int_then_float);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_ann_prefilter() {
+    async fn test_ann_prefilter(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2409,7 +2435,10 @@ mod test {
         )
         .unwrap()];
 
-        let write_params = WriteParams::default();
+        let write_params = WriteParams {
+            use_experimental_writer,
+            ..Default::default()
+        };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
             .await
@@ -2456,8 +2485,9 @@ mod test {
         assert_eq!(6, first_match);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_filter_on_large_utf8() {
+    async fn test_filter_on_large_utf8(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2475,7 +2505,10 @@ mod test {
         )
         .unwrap()];
 
-        let write_params = WriteParams::default();
+        let write_params = WriteParams {
+            use_experimental_writer,
+            ..Default::default()
+        };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         Dataset::write(batches, test_uri, Some(write_params))
             .await
@@ -2505,8 +2538,9 @@ mod test {
         assert_eq!(batch, &expected);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_filter_with_regex() {
+    async fn test_filter_with_regex(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2524,7 +2558,10 @@ mod test {
         )
         .unwrap()];
 
-        let write_params = WriteParams::default();
+        let write_params = WriteParams {
+            use_experimental_writer,
+            ..Default::default()
+        };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         Dataset::write(batches, test_uri, Some(write_params))
             .await
@@ -2591,6 +2628,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
+            use_experimental_writer: false,
             ..Default::default()
         };
         Dataset::write(batches, test_uri, Some(write_params))
@@ -2641,8 +2679,9 @@ mod test {
         concat_batches(&batches[0].schema(), &batches).unwrap();
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_ann_with_deletion() {
+    async fn test_ann_with_deletion(#[values(false, true)] use_experimental_writer: bool) {
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
@@ -2680,7 +2719,16 @@ mod test {
             .unwrap()];
 
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-            let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+            let mut dataset = Dataset::write(
+                reader,
+                test_uri,
+                Some(WriteParams {
+                    use_experimental_writer,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
             assert_eq!(dataset.index_cache_entry_count(), 0);
             dataset
@@ -2775,6 +2823,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     mode: WriteMode::Append,
+                    use_experimental_writer,
                     ..Default::default()
                 }),
             )
@@ -2821,16 +2870,24 @@ mod test {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_count_rows_with_filter() {
+    async fn test_count_rows_with_filter(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen = BatchGenerator::new().col(Box::new(
             IncrementingInt32::new().named("Filter_me".to_owned()),
         ));
-        Dataset::write(data_gen.batch(32), test_uri, None)
-            .await
-            .unwrap();
+        Dataset::write(
+            data_gen.batch(32),
+            test_uri,
+            Some(WriteParams {
+                use_experimental_writer,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(32, dataset.scan().count_rows().await.unwrap());
@@ -2846,15 +2903,23 @@ mod test {
         );
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_dynamic_projection() {
+    async fn test_dynamic_projection(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-        Dataset::write(data_gen.batch(32), test_uri, None)
-            .await
-            .unwrap();
+        Dataset::write(
+            data_gen.batch(32),
+            test_uri,
+            Some(WriteParams {
+                use_experimental_writer,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(32, dataset.scan().count_rows().await.unwrap());
@@ -2883,15 +2948,23 @@ mod test {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_column_casting_function() {
+    async fn test_column_casting_function(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen =
             BatchGenerator::new().col(Box::new(RandomVector::new().named("vec".to_owned())));
-        Dataset::write(data_gen.batch(32), test_uri, None)
-            .await
-            .unwrap();
+        Dataset::write(
+            data_gen.batch(32),
+            test_uri,
+            Some(WriteParams {
+                use_experimental_writer,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(32, dataset.scan().count_rows().await.unwrap());
@@ -2968,7 +3041,7 @@ mod test {
     }
 
     impl ScalarIndexTestFixture {
-        async fn new() -> Self {
+        async fn new(use_experimental_writer: bool) -> Self {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2993,6 +3066,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     max_rows_per_file: 500,
+                    use_experimental_writer,
                     ..Default::default()
                 }),
             )
@@ -3042,7 +3116,10 @@ mod test {
             dataset
                 .append(
                     RecordBatchIterator::new(vec![Ok(append_data)], data.schema()),
-                    None,
+                    Some(WriteParams {
+                        use_experimental_writer,
+                        ..Default::default()
+                    }),
                 )
                 .await
                 .unwrap();
@@ -3360,9 +3437,10 @@ mod test {
     // There are many different ways that a query can be run and they all have slightly different
     // effects on the plan that gets built.  This test attempts to run the same queries in various
     // different configurations to ensure that we get consistent results
+    #[rstest]
     #[tokio::test]
-    async fn test_secondary_index_scans() {
-        let fixture = ScalarIndexTestFixture::new().await;
+    async fn test_secondary_index_scans(#[values(false, true)] use_experimental_writer: bool) {
+        let fixture = ScalarIndexTestFixture::new(use_experimental_writer).await;
 
         for use_index in [false, true] {
             for use_projection in [false, true] {
@@ -3445,8 +3523,9 @@ mod test {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_late_materialization() {
+    async fn test_late_materialization(#[values(false, true)] use_experimental_writer: bool) {
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
         let data = gen()
@@ -3467,6 +3546,7 @@ mod test {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
+                use_experimental_writer,
                 ..Default::default()
             }),
         )
@@ -3545,8 +3625,11 @@ mod test {
         assert!(second_index_scan_bytes < filtered_scan_bytes);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_project_nested() -> Result<()> {
+    async fn test_project_nested(
+        #[values(false, true)] use_experimental_writer: bool,
+    ) -> Result<()> {
         let struct_i_field = ArrowField::new("i", DataType::Int32, true);
         let struct_o_field = ArrowField::new("o", DataType::Utf8, true);
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -3587,6 +3670,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
+            use_experimental_writer,
             ..Default::default()
         };
         Dataset::write(batches, test_uri, Some(write_params))
@@ -3610,18 +3694,22 @@ mod test {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_plans() -> Result<()> {
+    async fn test_plans(#[values(false, true)] use_experimental_writer: bool) -> Result<()> {
         // Create a vector dataset
-        let mut dataset = TestVectorDataset::new().await?;
+        let mut dataset = TestVectorDataset::new(use_experimental_writer).await?;
 
         // Scans
         // ---------------------------------------------------------------------
-        assert_plan_equals(
-            &dataset.dataset,
-            |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
-            "LancePushdownScan: uri=..., projection=[s], predicate=i > Int32(10) AND i < Int32(20), row_id=false, ordered=true"
-        ).await?;
+        // Experimental writer does not use LancePushdownScan
+        if !use_experimental_writer {
+            assert_plan_equals(
+                &dataset.dataset,
+                |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
+                "LancePushdownScan: uri=..., projection=[s], predicate=i > Int32(10) AND i < Int32(20), row_id=false, ordered=true"
+            ).await?;
+        }
 
         assert_plan_equals(
             &dataset.dataset,

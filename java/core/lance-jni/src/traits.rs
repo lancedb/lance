@@ -15,7 +15,7 @@
 use jni::objects::{JMap, JObject, JString, JValue};
 use jni::JNIEnv;
 
-use crate::Result;
+use crate::error::Result;
 
 pub trait FromJObject<T> {
     fn extract(&self) -> Result<T>;
@@ -23,30 +23,34 @@ pub trait FromJObject<T> {
 
 /// Convert a Rust type into a Java Object.
 pub trait IntoJava {
-    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> JObject<'a>;
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>>;
 }
 
 impl FromJObject<i32> for JObject<'_> {
     fn extract(&self) -> Result<i32> {
-        Ok(JValue::from(self).i()?)
+        let res = JValue::from(self).i()?;
+        Ok(res)
     }
 }
 
 impl FromJObject<i64> for JObject<'_> {
     fn extract(&self) -> Result<i64> {
-        Ok(JValue::from(self).j()?)
+        let res = JValue::from(self).j()?;
+        Ok(res)
     }
 }
 
 impl FromJObject<f32> for JObject<'_> {
     fn extract(&self) -> Result<f32> {
-        Ok(JValue::from(self).f()?)
+        let res = JValue::from(self).f()?;
+        Ok(res)
     }
 }
 
 impl FromJObject<f64> for JObject<'_> {
     fn extract(&self) -> Result<f64> {
-        Ok(JValue::from(self).d()?)
+        let res = JValue::from(self).d()?;
+        Ok(res)
     }
 }
 

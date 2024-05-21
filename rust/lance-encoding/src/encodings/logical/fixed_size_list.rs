@@ -31,12 +31,12 @@ use lance_core::Result;
 
 #[derive(Debug)]
 pub struct FslPageScheduler {
-    items_scheduler: Box<dyn LogicalPageScheduler>,
+    items_scheduler: Arc<dyn LogicalPageScheduler>,
     dimension: u32,
 }
 
 impl FslPageScheduler {
-    pub fn new(items_scheduler: Box<dyn LogicalPageScheduler>, dimension: u32) -> Self {
+    pub fn new(items_scheduler: Arc<dyn LogicalPageScheduler>, dimension: u32) -> Self {
         debug_assert_eq!(items_scheduler.num_rows() % dimension, 0);
         Self {
             items_scheduler,
@@ -60,7 +60,7 @@ impl LogicalPageScheduler for FslPageScheduler {
             "Scheduling expanded ranges {:?} from items scheduler",
             expanded_ranges
         );
-        let mut temp_context = context.temporary();
+        let mut temp_context = context.temporary(None);
         self.items_scheduler
             .schedule_ranges(&expanded_ranges, &mut temp_context, top_level_row)?;
         for decoder in temp_context.into_decoders() {
