@@ -175,7 +175,7 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
-    pub fn execute(&mut self, new_data: &PyAny) -> PyResult<(u64, u64, u64)> {
+    pub fn execute(&mut self, new_data: &PyAny) -> PyResult<PyObject> {
         let py = new_data.py();
 
         let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
@@ -200,11 +200,14 @@ impl MergeInsertBuilder {
         let dataset = self.dataset.as_ref(py);
 
         dataset.borrow_mut().ds = new_self.0;
-        let inserted = new_self.1;
-        let updated = new_self.2;
-        let deleted = new_self.3;
+        let merge_stats = new_self.1;
+        println!("{:?}", merge_stats);
+        let merge_dict = PyDict::new(py);
+        merge_dict.set_item("num_inserted_rows", merge_stats.num_inserted_rows)?;
+        merge_dict.set_item("num_updated_rows", merge_stats.num_updated_rows)?;
+        merge_dict.set_item("num_deleted_rows", merge_stats.num_deleted_rows)?;
 
-        Ok((inserted, updated, deleted))
+        Ok(merge_dict.into())
     }
 }
 

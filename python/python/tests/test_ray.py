@@ -10,9 +10,9 @@ import pytest
 ray = pytest.importorskip("ray")
 
 
-from lance.ray.sink import (
+from lance.ray.sink import (  # noqa: E402
     LanceCommitter,
-    LanceDatasink,  # noqa: E402
+    LanceDatasink,
     LanceFragmentWriter,
     _register_hooks,
 )

@@ -33,11 +33,13 @@ class RewriteResult:
 class CompactionTask:
     read_version: int
     fragments: List["FragmentMetadata"]
+
     def execute(self, dataset: "Dataset") -> RewriteResult: ...
 
 class CompactionPlan:
     read_version: int
     tasks: List[CompactionTask]
+
     def num_tasks(self) -> int: ...
 
 class Compaction:

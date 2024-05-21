@@ -11,8 +11,12 @@ from .lance import (
     LanceFileMetadata,
     LancePageMetadata,
 )
-from .lance import LanceFileReader as _LanceFileReader
-from .lance import LanceFileWriter as _LanceFileWriter
+from .lance import (
+    LanceFileReader as _LanceFileReader,
+)
+from .lance import (
+    LanceFileWriter as _LanceFileWriter,
+)
 
 
 class ReaderResults:
