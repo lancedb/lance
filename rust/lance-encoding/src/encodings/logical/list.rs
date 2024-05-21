@@ -257,9 +257,8 @@ impl LogicalPageScheduler for ListPageScheduler {
             .sum();
         let null_offset_adjustment = self.null_offset_adjustment;
         trace!("Scheduling list offsets ranges: {:?}", offsets_ranges);
-        // Create a channel for the internal schedule / decode loop that is unique
-        // to this page.
-        let mut temporary = context.temporary();
+        // Create a channel for the offsets
+        let mut temporary = context.temporary(None);
         self.offsets_scheduler
             .schedule_ranges(&offsets_ranges, &mut temporary, top_level_row)?;
         let offset_decoders = temporary.into_decoders();
@@ -277,7 +276,7 @@ impl LogicalPageScheduler for ListPageScheduler {
         let ranges = ranges.to_vec();
         let items_type = self.items_type.clone();
         let first_items_page_offset = self.first_items_page_offset;
-        let mut indirect_context = context.temporary();
+        let mut indirect_context = context.temporary(Some(top_level_row));
 
         // First we schedule, as normal, the I/O for the offsets.  Then we immediately spawn
         // a task to decode those offsets and schedule the I/O for the items AND wait for
@@ -582,11 +581,14 @@ impl LogicalPageDecoder for ListPageDecoder {
         let end = offsets[offsets.len() - 1];
         let num_items_to_drain = end - start;
 
-        let item_decode = self
-            .item_decoder
-            .as_mut()
-            .map(|item_decoder| Result::Ok(item_decoder.drain_u64(num_items_to_drain)?.task))
-            .transpose()?;
+        let item_decode = if num_items_to_drain == 0 {
+            None
+        } else {
+            self.item_decoder
+                .as_mut()
+                .map(|item_decoder| Result::Ok(item_decoder.drain_u64(num_items_to_drain)?.task))
+                .transpose()?
+        };
 
         self.rows_drained += num_rows;
         Ok(NextDecodeTask {
@@ -1082,12 +1084,14 @@ mod tests {
             for idx in order {
                 list_builder.append_value(values[idx].clone());
             }
-            let list_array = list_builder.finish();
+            let list_array = Arc::new(list_builder.finish());
             let test_cases = TestCases::default()
                 .with_indices(vec![1])
                 .with_indices(vec![0])
                 .with_indices(vec![2]);
-            check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
+            check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+            let test_cases = test_cases.with_batch_size(1);
+            check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
         }
 
         // Scenario 2: All lists are empty
@@ -1099,10 +1103,12 @@ mod tests {
         list_builder.append(true);
         list_builder.append_null();
         list_builder.append(true);
-        let list_array = list_builder.finish();
+        let list_array = Arc::new(list_builder.finish());
 
         let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
     }
 
     #[test_log::test(tokio::test)]

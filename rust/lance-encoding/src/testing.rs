@@ -61,6 +61,7 @@ impl EncodingsIo for SimulatedScheduler {
 
 async fn test_decode(
     num_rows: u64,
+    batch_size: u32,
     schema: &Schema,
     column_infos: &[ColumnInfo],
     expected: Option<Arc<dyn Array>>,
@@ -77,20 +78,19 @@ async fn test_decode(
 
     scheduler_fut.await.unwrap();
 
-    const BATCH_SIZE: u32 = 100;
-    let mut decode_stream = BatchDecodeStream::new(rx, BATCH_SIZE, num_rows, decoder).into_stream();
+    let mut decode_stream = BatchDecodeStream::new(rx, batch_size, num_rows, decoder).into_stream();
 
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
         let batch = batch.task.await.unwrap();
         if let Some(expected) = expected.as_ref() {
             let actual = batch.column(0);
-            let expected_size = (BATCH_SIZE as usize).min(expected.len() - offset);
+            let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
             assert_eq!(&expected, actual);
         }
-        offset += BATCH_SIZE as usize;
+        offset += batch_size as usize;
     }
 }
 
@@ -122,11 +122,23 @@ fn supports_nulls(data_type: &DataType) -> bool {
 }
 
 // The default will just test the full read
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TestCases {
     ranges: Vec<Range<u64>>,
     indices: Vec<Vec<u64>>,
+    batch_size: u32,
     skip_validation: bool,
+}
+
+impl Default for TestCases {
+    fn default() -> Self {
+        Self {
+            batch_size: 100,
+            ranges: Vec::new(),
+            indices: Vec::new(),
+            skip_validation: false,
+        }
+    }
 }
 
 impl TestCases {
@@ -137,6 +149,11 @@ impl TestCases {
 
     pub fn with_indices(mut self, indices: Vec<u64>) -> Self {
         self.indices.push(indices);
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: u32) -> Self {
+        self.batch_size = batch_size;
         self
     }
 
@@ -240,6 +257,7 @@ async fn check_round_trip_encoding_inner(
     let scheduler_copy = scheduler.clone();
     test_decode(
         num_rows,
+        test_cases.batch_size,
         &schema,
         &column_infos,
         concat_data.clone(),
@@ -272,6 +290,7 @@ async fn check_round_trip_encoding_inner(
         let range = range.clone();
         test_decode(
             num_rows,
+            test_cases.batch_size,
             &schema,
             &column_infos,
             expected,
@@ -311,6 +330,7 @@ async fn check_round_trip_encoding_inner(
         let indices = indices.clone();
         test_decode(
             num_rows,
+            test_cases.batch_size,
             &schema,
             &column_infos,
             expected,

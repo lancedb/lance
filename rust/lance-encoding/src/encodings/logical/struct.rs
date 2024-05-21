@@ -527,7 +527,7 @@ impl ChildState {
     fn drain(&mut self, num_rows: u64) -> Result<CompositeDecodeTask> {
         trace!("Struct draining {} rows", num_rows);
         debug_assert!(self.rows_available >= num_rows);
-        debug_assert!(num_rows > 0);
+
         self.rows_available -= num_rows;
         let mut remaining = num_rows;
         let mut composite = CompositeDecodeTask {
