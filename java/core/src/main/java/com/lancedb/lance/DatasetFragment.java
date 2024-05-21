@@ -16,6 +16,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.arrow.util.Preconditions;
 
@@ -43,7 +44,7 @@ public class DatasetFragment {
    */
   public LanceScanner newScan() {
     return LanceScanner.create(dataset, new ScanOptions.Builder()
-        .fragmentIds(List.of(metadata.getId())).build(), dataset.allocator);
+        .fragmentIds(Arrays.asList(metadata.getId())).build(), dataset.allocator);
   }
 
   /**
@@ -55,7 +56,7 @@ public class DatasetFragment {
   public LanceScanner newScan(long batchSize) {
     return LanceScanner.create(dataset,
         new ScanOptions.Builder()
-            .fragmentIds(List.of(metadata.getId())).batchSize(batchSize).build(),
+            .fragmentIds(Arrays.asList(metadata.getId())).batchSize(batchSize).build(),
         dataset.allocator);
   }
 
@@ -68,7 +69,7 @@ public class DatasetFragment {
   public LanceScanner newScan(ScanOptions options) {
     Preconditions.checkNotNull(options);
     return LanceScanner.create(dataset,
-        new ScanOptions.Builder(options).fragmentIds(List.of(metadata.getId())).build(),
+        new ScanOptions.Builder(options).fragmentIds(Arrays.asList(metadata.getId())).build(),
         dataset.allocator);
   }
 
