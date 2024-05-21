@@ -15,9 +15,11 @@
 package com.lancedb.lance;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.lancedb.lance.ipc.ScanOptions;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import org.apache.arrow.dataset.scanner.Scanner;
@@ -69,6 +71,46 @@ public class FragmentTest {
           assertEquals(testDataset.getSchema(), schemaRes);
         }
       }
+    }
+  }
+
+  @Test
+  void commitWithoutVersion() {
+    String datasetPath = tempDir.resolve("commit_without_version").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata meta = testDataset.createNewFragment(123, 20);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(meta));
+      assertThrows(IllegalArgumentException.class, () -> {
+        Dataset.commit(allocator, datasetPath, appendOp, Optional.empty());
+      });
+    }
+  }
+
+  @Test
+  void commitOldVersion() {
+    String datasetPath = tempDir.resolve("commit_old_version").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata meta = testDataset.createNewFragment(123, 20);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(meta));
+      assertThrows(IllegalArgumentException.class, () -> {
+        Dataset.commit(allocator, datasetPath, appendOp, Optional.of(0L));
+      });
+    }
+  }
+
+  @Test
+  void appendWithoutFragment() {
+    String datasetPath = tempDir.resolve("append_without_fragment").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      assertThrows(IllegalArgumentException.class, () -> {
+        new FragmentOperation.Append(new ArrayList<>());
+      });
     }
   }
 }

@@ -139,7 +139,7 @@ public class TestUtils {
                    allocator);
            ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
         Data.exportArrayStream(allocator, reader, arrowStream);
-        try (Dataset dataset = Dataset.write(
+        try (Dataset dataset = Dataset.create(
             allocator,
             arrowStream,
             datasetPath,

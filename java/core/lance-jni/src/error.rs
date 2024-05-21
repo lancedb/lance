@@ -15,152 +15,115 @@
 use std::str::Utf8Error;
 
 use arrow_schema::ArrowError;
-use jni::errors::Error as JniError;
+use jni::{errors::Error as JniError, JNIEnv};
+use lance::error::Error as LanceError;
 use serde_json::Error as JsonError;
-use snafu::{Location, Snafu};
 
-/// Java Exception types
-pub enum JavaException {
+#[derive(Debug)]
+pub enum JavaExceptionClass {
     IllegalArgumentException,
     IOException,
     RuntimeException,
+    UnsupportedOperationException,
 }
 
-impl JavaException {
+impl JavaExceptionClass {
     pub fn as_str(&self) -> &str {
         match self {
             Self::IllegalArgumentException => "java/lang/IllegalArgumentException",
             Self::IOException => "java/io/IOException",
             Self::RuntimeException => "java/lang/RuntimeException",
+            Self::UnsupportedOperationException => "java/lang/UnsupportedOperationException",
         }
     }
 }
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
-pub enum Error {
-    #[snafu(display("JNI error: {message}, {location}"))]
-    Jni { message: String, location: Location },
-    #[snafu(display("Invalid argument: {message}, {location}"))]
-    InvalidArgument { message: String, location: Location },
-    #[snafu(display("IO error: {message}, {location}"))]
-    IO { message: String, location: Location },
-    #[snafu(display("Arrow error: {message}, {location}"))]
-    Arrow { message: String, location: Location },
-    #[snafu(display("Index error: {message}, {location}"))]
-    Index { message: String, location: Location },
-    #[snafu(display("JSON error: {message}, {location}"))]
-    JSON { message: String, location: Location },
-    #[snafu(display("Dataset at path {path} was not found, {location}"))]
-    DatasetNotFound { path: String, location: Location },
-    #[snafu(display("Dataset already exists: {uri}, {location}"))]
-    DatasetAlreadyExists { uri: String, location: Location },
-    #[snafu(display("Unknown error: {message}, {location}"))]
-    Other { message: String, location: Location },
+#[derive(Debug)]
+pub struct Error {
+    message: String,
+    java_class: JavaExceptionClass,
 }
 
 impl Error {
-    /// Throw as Java Exception
-    pub fn throw(&self, env: &mut jni::JNIEnv) {
-        match self {
-            Self::InvalidArgument { .. } => {
-                self.throw_as(env, JavaException::IllegalArgumentException)
-            }
-            Self::IO { .. } | Self::Index { .. } => self.throw_as(env, JavaException::IOException),
-            Self::Arrow { .. }
-            | Self::DatasetNotFound { .. }
-            | Self::DatasetAlreadyExists { .. }
-            | Self::JSON { .. }
-            | Self::Other { .. }
-            | Self::Jni { .. } => self.throw_as(env, JavaException::RuntimeException),
+    pub fn new(message: String, java_class: JavaExceptionClass) -> Self {
+        Self {
+            message,
+            java_class,
         }
     }
 
-    /// Throw as an concrete Java Exception
-    pub fn throw_as(&self, env: &mut jni::JNIEnv, exception: JavaException) {
-        env.throw_new(exception.as_str(), self.to_string())
+    pub fn runtime_error(message: String) -> Self {
+        Self {
+            message,
+            java_class: JavaExceptionClass::RuntimeException,
+        }
+    }
+
+    pub fn io_error(message: String) -> Self {
+        Self::new(message, JavaExceptionClass::IOException)
+    }
+
+    pub fn input_error(message: String) -> Self {
+        Self::new(message, JavaExceptionClass::IllegalArgumentException)
+    }
+
+    pub fn unsupported_error(message: String) -> Self {
+        Self::new(message, JavaExceptionClass::UnsupportedOperationException)
+    }
+
+    pub fn throw(&self, env: &mut JNIEnv) {
+        env.throw_new(self.java_class.as_str(), &self.message)
             .expect("Error when throwing Java exception");
     }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-trait ToSnafuLocation {
-    fn to_snafu_location(&'static self) -> snafu::Location;
-}
-
-impl ToSnafuLocation for std::panic::Location<'static> {
-    fn to_snafu_location(&'static self) -> snafu::Location {
-        snafu::Location::new(self.file(), self.line(), self.column())
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.java_class.as_str(), self.message)
     }
 }
 
-impl From<JniError> for Error {
-    #[track_caller]
-    fn from(source: JniError) -> Self {
-        Self::Jni {
-            message: source.to_string(),
-            location: std::panic::Location::caller().to_snafu_location(),
-        }
-    }
-}
-
-impl From<Utf8Error> for Error {
-    #[track_caller]
-    fn from(source: Utf8Error) -> Self {
-        Self::InvalidArgument {
-            message: source.to_string(),
-            location: std::panic::Location::caller().to_snafu_location(),
+impl From<LanceError> for Error {
+    fn from(err: LanceError) -> Self {
+        match err {
+            LanceError::DatasetNotFound { .. }
+            | LanceError::DatasetAlreadyExists { .. }
+            | LanceError::CommitConflict { .. }
+            | LanceError::InvalidInput { .. } => Self::input_error(err.to_string()),
+            LanceError::IO { .. } => Self::io_error(err.to_string()),
+            LanceError::NotSupported { .. } => Self::unsupported_error(err.to_string()),
+            _ => Self::runtime_error(err.to_string()),
         }
     }
 }
 
 impl From<ArrowError> for Error {
-    #[track_caller]
-    fn from(source: ArrowError) -> Self {
-        Self::Arrow {
-            message: source.to_string(),
-            location: std::panic::Location::caller().to_snafu_location(),
+    fn from(err: ArrowError) -> Self {
+        match err {
+            ArrowError::InvalidArgumentError { .. } => Self::input_error(err.to_string()),
+            ArrowError::IoError { .. } => Self::io_error(err.to_string()),
+            ArrowError::NotYetImplemented(_) => Self::unsupported_error(err.to_string()),
+            _ => Self::runtime_error(err.to_string()),
         }
     }
 }
 
 impl From<JsonError> for Error {
-    #[track_caller]
-    fn from(source: JsonError) -> Self {
-        Self::JSON {
-            message: source.to_string(),
-            location: std::panic::Location::caller().to_snafu_location(),
-        }
+    fn from(err: JsonError) -> Self {
+        Self::io_error(err.to_string())
     }
 }
 
-impl From<lance::Error> for Error {
-    #[track_caller]
-    fn from(source: lance::Error) -> Self {
-        match source {
-            lance::Error::DatasetNotFound {
-                path,
-                source: _,
-                location,
-            } => Self::DatasetNotFound { path, location },
-            lance::Error::DatasetAlreadyExists { uri, location } => {
-                Self::DatasetAlreadyExists { uri, location }
-            }
-            lance::Error::IO { source, location } => Self::IO {
-                message: source.to_string(),
-                location,
-            },
-            lance::Error::Arrow { message, location } => Self::Arrow { message, location },
-            lance::Error::Index { message, location } => Self::Index { message, location },
-            lance::Error::InvalidInput { source, location } => Self::InvalidArgument {
-                message: source.to_string(),
-                location,
-            },
-            _ => Self::Other {
-                message: source.to_string(),
-                location: std::panic::Location::caller().to_snafu_location(),
-            },
-        }
+impl From<JniError> for Error {
+    fn from(err: JniError) -> Self {
+        Self::runtime_error(err.to_string())
+    }
+}
+
+impl From<Utf8Error> for Error {
+    fn from(err: Utf8Error) -> Self {
+        Self::input_error(err.to_string())
     }
 }
