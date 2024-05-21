@@ -50,10 +50,10 @@ impl TryFrom<&str> for WriteMode {
             "create" => Ok(Self::Create),
             "append" => Ok(Self::Append),
             "overwrite" => Ok(Self::Overwrite),
-            _ => Err(Error::IO {
-                message: format!("Invalid write mode: {}", value),
-                location: location!(),
-            }),
+            _ => Err(Error::io(
+                format!("Invalid write mode: {}", value),
+                location!(),
+            )),
         }
     }
 }

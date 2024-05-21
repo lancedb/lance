@@ -31,12 +31,12 @@ use lance_core::Result;
 
 #[derive(Debug)]
 pub struct FslPageScheduler {
-    items_scheduler: Box<dyn LogicalPageScheduler>,
+    items_scheduler: Arc<dyn LogicalPageScheduler>,
     dimension: u32,
 }
 
 impl FslPageScheduler {
-    pub fn new(items_scheduler: Box<dyn LogicalPageScheduler>, dimension: u32) -> Self {
+    pub fn new(items_scheduler: Arc<dyn LogicalPageScheduler>, dimension: u32) -> Self {
         debug_assert_eq!(items_scheduler.num_rows() % dimension, 0);
         Self {
             items_scheduler,

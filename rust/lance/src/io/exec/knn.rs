@@ -159,25 +159,25 @@ impl KNNFlatExec {
     /// Returns an error if the preconditions are not met.
     pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
         let schema = input.schema();
-        let field = schema
-            .field_with_name(&query.column)
-            .map_err(|_| Error::IO {
-                message: format!(
+        let field = schema.field_with_name(&query.column).map_err(|_| {
+            Error::io(
+                format!(
                     "KNNFlatExec node: query column {} not found in input schema",
                     query.column
                 ),
-                location: location!(),
-            })?;
+                location!(),
+            )
+        })?;
         match field.data_type() {
             DataType::FixedSizeList(list_field, _) if list_field.data_type().is_floating() => {}
             _ => {
-                return Err(Error::IO {
-                    message: format!(
+                return Err(Error::io(
+                    format!(
                         "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
                         query.column, field.data_type()
                     ),
-                    location: location!(),
-                });
+                    location!(),
+                ));
             }
         }
 
@@ -391,20 +391,20 @@ impl KNNIndexExec {
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
         if indices.is_empty() {
-            return Err(Error::IO {
-                message: "KNNIndexExec node: no index found for query".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                "KNNIndexExec node: no index found for query".to_string(),
+                location!(),
+            ));
         }
         let schema = dataset.schema();
         if schema.field(query.column.as_str()).is_none() {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "KNNIndexExec node: query column {} does not exist in dataset.",
                     query.column
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         };
 
         let properties = PlanProperties::new(

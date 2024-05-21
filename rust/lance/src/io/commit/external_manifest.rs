@@ -76,13 +76,13 @@ mod test {
 
             let mut store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
-                Some(_) => Err(Error::IO {
-                    message: format!(
+                Some(_) => Err(Error::io(
+                    format!(
                         "manifest already exists for uri: {}, version: {}",
                         uri, version
                     ),
-                    location: location!(),
-                }),
+                    location!(),
+                )),
                 None => {
                     store.insert((uri.to_string(), version), path.to_string());
                     Ok(())
@@ -100,13 +100,13 @@ mod test {
                     store.insert((uri.to_string(), version), path.to_string());
                     Ok(())
                 }
-                None => Err(Error::IO {
-                    message: format!(
+                None => Err(Error::io(
+                    format!(
                         "manifest already exists for uri: {}, version: {}",
                         uri, version
                     ),
-                    location: location!(),
-                }),
+                    location!(),
+                )),
             }
         }
     }

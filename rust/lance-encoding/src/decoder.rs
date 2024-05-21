@@ -218,7 +218,7 @@ use crate::encodings::logical::binary::BinaryPageScheduler;
 use crate::encodings::logical::fixed_size_list::FslPageScheduler;
 use crate::encodings::logical::list::ListPageScheduler;
 use crate::encodings::logical::primitive::PrimitivePageScheduler;
-use crate::encodings::logical::r#struct::SimpleStructScheduler;
+use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
 use crate::{BufferScheduler, EncodingsIo};
@@ -282,7 +282,7 @@ impl ColumnInfo {
 ///
 /// TODO: Implement backpressure
 pub struct DecodeBatchScheduler {
-    root_scheduler: SimpleStructScheduler,
+    pub root_scheduler: SimpleStructScheduler,
 }
 
 impl DecodeBatchScheduler {
@@ -303,7 +303,7 @@ impl DecodeBatchScheduler {
         data_type: &DataType,
         column: &ColumnInfo,
         buffers: FileBuffers,
-    ) -> Vec<Box<dyn LogicalPageScheduler>> {
+    ) -> Vec<Arc<dyn LogicalPageScheduler>> {
         // Primitive fields map to a single column
         let column_buffers = ColumnBuffers {
             file_buffers: buffers,
@@ -314,11 +314,11 @@ impl DecodeBatchScheduler {
             .iter()
             .cloned()
             .map(|page_info| {
-                Box::new(PrimitivePageScheduler::new(
+                Arc::new(PrimitivePageScheduler::new(
                     data_type.clone(),
                     page_info,
                     column_buffers,
-                )) as Box<dyn LogicalPageScheduler>
+                )) as Arc<dyn LogicalPageScheduler>
             })
             .collect::<Vec<_>>()
     }
@@ -386,7 +386,7 @@ impl DecodeBatchScheduler {
         data_type: &DataType,
         column_infos: &mut impl Iterator<Item = &'a ColumnInfo>,
         buffers: FileBuffers,
-    ) -> Vec<Box<dyn LogicalPageScheduler>> {
+    ) -> Vec<Arc<dyn LogicalPageScheduler>> {
         if Self::is_primitive(data_type) {
             let primitive_col = column_infos.next().unwrap();
             return Self::create_primitive_scheduler(data_type, primitive_col, buffers);
@@ -404,8 +404,8 @@ impl DecodeBatchScheduler {
                     inner_schedulers
                         .into_iter()
                         .map(|inner| {
-                            Box::new(FslPageScheduler::new(inner, *dimension as u32))
-                                as Box<dyn LogicalPageScheduler>
+                            Arc::new(FslPageScheduler::new(inner, *dimension as u32))
+                                as Arc<dyn LogicalPageScheduler>
                         })
                         .collect::<Vec<_>>()
                 }
@@ -418,7 +418,8 @@ impl DecodeBatchScheduler {
                 };
                 let items =
                     Self::create_field_scheduler(items_field.data_type(), column_infos, buffers);
-                let mut items = items.into_iter();
+                let mut items = items.into_iter().peekable();
+                let mut cur_items_page_offset = 0;
                 offsets_column
                     .page_infos
                     .iter()
@@ -426,17 +427,25 @@ impl DecodeBatchScheduler {
                         if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
                             &offsets_page.encoding.array_encoding
                         {
-                            let inner = Box::new(PrimitivePageScheduler::new(
+                            let inner = Arc::new(PrimitivePageScheduler::new(
                                 DataType::UInt64,
                                 offsets_page.clone(),
                                 offsets_column_buffers,
                             ))
-                                as Box<dyn LogicalPageScheduler>;
+                                as Arc<dyn LogicalPageScheduler>;
                             let mut items_schedulers = Vec::new();
                             let mut num_items = list_encoding.num_items;
+                            let first_items_page_offset = cur_items_page_offset;
                             while num_items > 0 {
-                                let next_items_page = items.next().unwrap();
-                                num_items -= next_items_page.num_rows() as u64;
+                                let next_items_page = items.peek().unwrap().clone();
+                                if next_items_page.num_rows() as u64 <= num_items {
+                                    num_items -= next_items_page.num_rows() as u64;
+                                    cur_items_page_offset = 0;
+                                    items.next().unwrap();
+                                } else {
+                                    cur_items_page_offset += num_items as u32;
+                                    num_items = 0;
+                                }
                                 items_schedulers.push(next_items_page);
                             }
                             let offset_type = if matches!(data_type, DataType::List(_)) {
@@ -444,13 +453,14 @@ impl DecodeBatchScheduler {
                             } else {
                                 DataType::Int64
                             };
-                            Box::new(ListPageScheduler::new(
+                            Arc::new(ListPageScheduler::new(
                                 inner,
                                 items_schedulers,
                                 items_field.data_type().clone(),
                                 offset_type,
                                 list_encoding.null_offset_adjustment,
-                            )) as Box<dyn LogicalPageScheduler>
+                                first_items_page_offset,
+                            )) as Arc<dyn LogicalPageScheduler>
                         } else {
                             // TODO: Should probably return Err here
                             panic!("Expected a list column");
@@ -468,8 +478,8 @@ impl DecodeBatchScheduler {
                 list_decoders
                     .into_iter()
                     .map(|list_decoder| {
-                        Box::new(BinaryPageScheduler::new(list_decoder, data_type.clone()))
-                            as Box<dyn LogicalPageScheduler>
+                        Arc::new(BinaryPageScheduler::new(list_decoder, data_type.clone()))
+                            as Arc<dyn LogicalPageScheduler>
                     })
                     .collect::<Vec<_>>()
             }
@@ -486,7 +496,7 @@ impl DecodeBatchScheduler {
                 // only one "page" of struct data.  In the future, this will change.  A null-aware
                 // struct scheduler will need to first calculate how many rows are in the struct page
                 // and then find the child pages that overlap.  This should be doable.
-                vec![Box::new(SimpleStructScheduler::new(
+                vec![Arc::new(SimpleStructScheduler::new(
                     child_schedulers,
                     fields.clone(),
                 ))]
@@ -536,11 +546,9 @@ impl DecodeBatchScheduler {
         let rows_to_read = range.end - range.start;
         trace!("Scheduling range {:?} ({} rows)", range, rows_to_read);
 
-        let range = range.start as u32..range.end as u32;
-
         let mut context = SchedulerContext::new(sink, scheduler);
         self.root_scheduler
-            .schedule_ranges(&[range.clone()], &mut context, range.start as u64)?;
+            .schedule_ranges_u64(&[range.clone()], &mut context, range.start)?;
 
         trace!("Finished scheduling of range {:?}", range);
         Ok(())
@@ -575,12 +583,10 @@ impl DecodeBatchScheduler {
         if indices.is_empty() {
             return Ok(());
         }
-        // TODO: Figure out how to handle u64 indices
-        let indices = indices.iter().map(|i| *i as u32).collect::<Vec<_>>();
         let mut context = SchedulerContext::new(sink, scheduler);
 
         self.root_scheduler
-            .schedule_take(&indices, &mut context, indices[0] as u64)?;
+            .schedule_take_u64(indices, &mut context, indices[0])?;
         trace!("Finished scheduling take of {} rows", indices.len());
         Ok(())
     }
@@ -594,7 +600,7 @@ pub struct ReadBatchTask {
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct BatchDecodeStream {
     context: DecoderContext,
-    root_decoders: VecDeque<Box<dyn LogicalPageDecoder>>,
+    root_decoder: SimpleStructDecoder,
     rows_remaining: u64,
     rows_per_batch: u32,
     rows_scheduled: u64,
@@ -616,10 +622,11 @@ impl BatchDecodeStream {
         scheduled: mpsc::UnboundedReceiver<DecoderMessage>,
         rows_per_batch: u32,
         num_rows: u64,
+        root_decoder: SimpleStructDecoder,
     ) -> Self {
         Self {
             context: DecoderContext::new(scheduled),
-            root_decoders: VecDeque::new(),
+            root_decoder,
             rows_remaining: num_rows,
             rows_per_batch,
             rows_scheduled: 0,
@@ -628,22 +635,8 @@ impl BatchDecodeStream {
     }
 
     fn accept_decoder(&mut self, decoder: DecoderReady) -> Result<()> {
-        if decoder.path.is_empty() {
-            self.root_decoders.push_back(decoder.decoder);
-        } else {
-            let root = self
-                .root_decoders
-                .front_mut()
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
-                        "A child decoder with path {:?} arrived before any root decoder",
-                        decoder.path
-                    ),
-                    location: location!(),
-                })?;
-            root.accept_child(decoder)?;
-        }
-        Ok(())
+        debug_assert!(!decoder.path.is_empty());
+        self.root_decoder.accept_child(decoder)
     }
 
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<()> {
@@ -695,22 +688,16 @@ impl BatchDecodeStream {
             self.wait_for_scheduled(desired_scheduled).await?;
         }
 
-        let current = self
-            .root_decoders
-            .front_mut()
-            .ok_or_else(|| Error::Internal {
-                message: "the scheduler never emitted a top-level decoder".into(),
-                location: location!(),
-            })?;
-        let avail = current.avail();
+        let avail = self.root_decoder.avail_u64();
         trace!("Top level page has {} rows already available", avail);
-        if avail < to_take {
-            current.wait(to_take).await?;
+        if avail < to_take as u64 {
+            trace!(
+                "Top level page waiting for an additional {} rows",
+                to_take as u64 - avail
+            );
+            self.root_decoder.wait(to_take).await?;
         }
-        let next_task = current.drain(to_take)?;
-        if !next_task.has_more {
-            self.root_decoders.pop_front();
-        }
+        let next_task = self.root_decoder.drain(to_take)?;
         self.rows_drained += to_take as u64;
         Ok(Some(next_task))
     }
@@ -1096,6 +1083,10 @@ pub async fn decode_batch(batch: &EncodedBatch) -> Result<RecordBatch> {
     decode_scheduler
         .schedule_range(0..batch.num_rows, tx, io_scheduler)
         .await?;
-    let stream = BatchDecodeStream::new(rx, batch.num_rows as u32, batch.num_rows);
+    #[allow(clippy::single_range_in_vec_init)]
+    let root_decoder = decode_scheduler
+        .root_scheduler
+        .new_root_decoder_ranges(&[0..batch.num_rows]);
+    let stream = BatchDecodeStream::new(rx, batch.num_rows as u32, batch.num_rows, root_decoder);
     stream.into_stream().next().await.unwrap().task.await
 }
