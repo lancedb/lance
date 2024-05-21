@@ -412,7 +412,7 @@ impl VectorStore for ProductQuantizationStorage {
         self.metric_type
     }
 
-    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Self::DistanceCalculator<'a> {
+    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
         PQDistCalculator::new(
             self.codebook.values(),
             self.num_bits,
@@ -423,7 +423,7 @@ impl VectorStore for ProductQuantizationStorage {
         )
     }
 
-    fn dist_calculator_from_id<'a>(&'a self, _: u32) -> Self::DistanceCalculator<'a> {
+    fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
         todo!("distance_between not implemented for PQ storage")
     }
 

@@ -44,9 +44,9 @@ pub trait VectorStore: Send + Sync {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Self::DistanceCalculator<'a>;
+    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
 
-    fn dist_calculator_from_id<'a>(&'a self, id: u32) -> Self::DistanceCalculator<'a>;
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
 
     fn distance_between(&self, a: u32, b: u32) -> f32;
 }

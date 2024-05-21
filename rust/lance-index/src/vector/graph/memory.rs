@@ -51,7 +51,7 @@ impl VectorStore for InMemoryVectorStorage {
         self.metric_type
     }
 
-    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Self::DistanceCalculator<'a> {
+    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
         InMemoryDistanceCal {
             vectors: self.vectors.clone(),
             query,
@@ -59,7 +59,7 @@ impl VectorStore for InMemoryVectorStorage {
         }
     }
 
-    fn dist_calculator_from_id<'a>(&'a self, id: u32) -> Self::DistanceCalculator<'a> {
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         InMemoryDistanceCal {
             vectors: self.vectors.clone(),
             query: self.vectors.row(id as usize).unwrap(),

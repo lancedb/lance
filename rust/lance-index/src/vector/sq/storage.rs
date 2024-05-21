@@ -217,11 +217,11 @@ impl VectorStore for ScalarQuantizationStorage {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Self::DistanceCalculator<'a> {
+    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
         SQDistCalculator::new(query, self.sq_codes.as_ref(), self.bounds.clone())
     }
 
-    fn dist_calculator_from_id<'a>(&'a self, id: u32) -> Self::DistanceCalculator<'a> {
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let dim = self.sq_codes.value_length() as usize;
         SQDistCalculator {
             query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
