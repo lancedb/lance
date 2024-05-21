@@ -660,7 +660,7 @@ impl HNSWBuilderInner {
         &self,
         ep: &OrderedNode,
         level: u16,
-        dist_calc: &dyn DistCalculator,
+        dist_calc: &impl DistCalculator,
         nodes: &Vec<RwLock<GraphBuilderNode>>,
         visited_generator: &mut VisitedGenerator,
     ) -> Result<Vec<OrderedNode>> {

@@ -233,7 +233,7 @@ pub fn beam_search(
     graph: &dyn Graph,
     ep: &OrderedNode,
     k: usize,
-    dist_calc: &dyn DistCalculator,
+    dist_calc: &impl DistCalculator,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
     prefetch_distance: Option<usize>,
     visited_generator: &mut VisitedGenerator,
