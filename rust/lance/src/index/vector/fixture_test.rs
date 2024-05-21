@@ -18,10 +18,7 @@ mod test {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::{
-        vector::{graph::VectorStore, Query},
-        Index, IndexType,
-    };
+    use lance_index::{vector::Query, Index, IndexType};
     use lance_io::{local::LocalObjectReader, traits::Reader};
     use lance_linalg::distance::MetricType;
     use roaring::RoaringBitmap;
@@ -106,7 +103,7 @@ mod test {
             Ok(Box::new(self.clone()))
         }
 
-        fn storage(&self) -> &dyn VectorStore {
+        fn row_ids(&self) -> &[u64] {
             todo!("this method is for only IVF_HNSW_* index");
         }
 

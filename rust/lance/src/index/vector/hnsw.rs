@@ -282,8 +282,8 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         }))
     }
 
-    fn storage(&self) -> &dyn VectorStore {
-        self.storage.as_ref().unwrap().as_ref()
+    fn row_ids(&self) -> &[u64] {
+        self.storage.as_ref().unwrap().row_ids()
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

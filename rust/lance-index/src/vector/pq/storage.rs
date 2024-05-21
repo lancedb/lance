@@ -395,6 +395,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
 }
 
 impl VectorStore for ProductQuantizationStorage {
+    type DistanceCalculator<'a> = PQDistCalculator;
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -411,18 +412,18 @@ impl VectorStore for ProductQuantizationStorage {
         self.metric_type
     }
 
-    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator> {
-        Box::new(PQDistCalculator::new(
+    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Self::DistanceCalculator<'a> {
+        PQDistCalculator::new(
             self.codebook.values(),
             self.num_bits,
             self.num_sub_vectors,
             self.pq_code.clone(),
             query.as_primitive::<Float32Type>().values(),
             self.metric_type(),
-        ))
+        )
     }
 
-    fn dist_calculator_from_id(&self, _: u32) -> Box<dyn DistCalculator> {
+    fn dist_calculator_from_id<'a>(&'a self, _: u32) -> Self::DistanceCalculator<'a> {
         todo!("distance_between not implemented for PQ storage")
     }
 
@@ -432,7 +433,7 @@ impl VectorStore for ProductQuantizationStorage {
 }
 
 /// Distance calculator backed by PQ code.
-struct PQDistCalculator {
+pub struct PQDistCalculator {
     distance_table: Vec<f32>,
     pq_code: Arc<UInt8Array>,
     num_sub_vectors: usize,
@@ -468,7 +469,7 @@ impl PQDistCalculator {
     }
 }
 
-impl DistCalculator<'_> for PQDistCalculator {
+impl DistCalculator for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let pq_code = self.get_pq_code(id);
         pq_code

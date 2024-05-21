@@ -336,7 +336,7 @@ pub fn beam_search(
 pub fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
-    dist_calc: &dyn DistCalculator,
+    dist_calc: &impl DistCalculator,
 ) -> Result<OrderedNode> {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;

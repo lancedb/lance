@@ -30,7 +30,6 @@ use lance_file::{
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_index::vector::{
-    graph::VectorStore,
     hnsw::HNSW,
     quantizer::{Quantization, QuantizationMetadata, Quantizer},
 };
@@ -727,7 +726,7 @@ impl VectorIndex for IVFIndex {
         })
     }
 
-    fn storage(&self) -> &dyn VectorStore {
+    fn row_ids(&self) -> &[u64] {
         todo!("this method is for only IVF_HNSW_* index");
     }
 

@@ -195,6 +195,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
 }
 
 impl VectorStore for ScalarQuantizationStorage {
+    type DistanceCalculator<'a> = SQDistCalculator<'a>;
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -216,21 +217,17 @@ impl VectorStore for ScalarQuantizationStorage {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Box<dyn DistCalculator<'a> + 'a> {
-        Box::new(SQDistCalculator::new(
-            query,
-            self.sq_codes.as_ref(),
-            self.bounds.clone(),
-        ))
+    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Self::DistanceCalculator<'a> {
+        SQDistCalculator::new(query, self.sq_codes.as_ref(), self.bounds.clone())
     }
 
-    fn dist_calculator_from_id<'a>(&'a self, id: u32) -> Box<dyn DistCalculator<'a> + 'a> {
+    fn dist_calculator_from_id<'a>(&'a self, id: u32) -> Self::DistanceCalculator<'a> {
         let dim = self.sq_codes.value_length() as usize;
-        Box::new(SQDistCalculator {
+        SQDistCalculator {
             query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
             sq_codes: self.sq_codes.values().as_primitive::<UInt8Type>().values(),
             dim,
-        })
+        }
     }
 
     fn distance_between(&self, a: u32, b: u32) -> f32 {
@@ -241,7 +238,7 @@ impl VectorStore for ScalarQuantizationStorage {
     }
 }
 
-struct SQDistCalculator<'a> {
+pub struct SQDistCalculator<'a> {
     query_sq_code: Vec<u8>,
     sq_codes: &'a [u8],
     dim: usize,
@@ -261,7 +258,7 @@ impl<'a> SQDistCalculator<'a> {
     }
 }
 
-impl<'a> DistCalculator<'a> for SQDistCalculator<'a> {
+impl<'a> DistCalculator for SQDistCalculator<'a> {
     fn distance(&self, id: u32) -> f32 {
         let sq_code = &self.sq_codes[id as usize * self.dim..(id as usize + 1) * self.dim];
         l2_distance_uint_scalar(sq_code, &self.query_sq_code)

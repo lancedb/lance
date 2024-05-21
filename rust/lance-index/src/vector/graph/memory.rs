@@ -34,6 +34,7 @@ impl InMemoryVectorStorage {
 }
 
 impl VectorStore for InMemoryVectorStorage {
+    type DistanceCalculator<'a> = InMemoryDistanceCal;
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -50,20 +51,20 @@ impl VectorStore for InMemoryVectorStorage {
         self.metric_type
     }
 
-    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator> {
-        Box::new(InMemoryDistanceCal {
+    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Self::DistanceCalculator<'a> {
+        InMemoryDistanceCal {
             vectors: self.vectors.clone(),
             query,
             metric_type: self.metric_type,
-        })
+        }
     }
 
-    fn dist_calculator_from_id(&self, id: u32) -> Box<dyn DistCalculator> {
-        Box::new(InMemoryDistanceCal {
+    fn dist_calculator_from_id<'a>(&'a self, id: u32) -> Self::DistanceCalculator<'a> {
+        InMemoryDistanceCal {
             vectors: self.vectors.clone(),
             query: self.vectors.row(id as usize).unwrap(),
             metric_type: self.metric_type,
-        })
+        }
     }
 
     /// Distance between two vectors.
@@ -74,13 +75,13 @@ impl VectorStore for InMemoryVectorStorage {
     }
 }
 
-struct InMemoryDistanceCal {
+pub struct InMemoryDistanceCal {
     vectors: Arc<MatrixView<Float32Type>>,
     query: ArrayRef,
     metric_type: MetricType,
 }
 
-impl DistCalculator<'_> for InMemoryDistanceCal {
+impl DistCalculator for InMemoryDistanceCal {
     #[inline]
     fn distance(&self, id: u32) -> f32 {
         let vector = self.vectors.row_ref(id as usize).unwrap();
