@@ -202,7 +202,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
@@ -704,8 +704,17 @@ impl BatchDecodeStream {
 
     #[instrument(level = "debug", skip_all)]
     fn task_to_batch(task: NextDecodeTask) -> Result<RecordBatch> {
-        let struct_arr = task.task.decode()?;
-        Ok(RecordBatch::from(struct_arr.as_struct()))
+        let struct_arr = task.task.decode();
+        match struct_arr {
+            Ok(struct_arr) => Ok(RecordBatch::from(struct_arr.as_struct())),
+            Err(e) => {
+                let e = Error::Internal {
+                    message: format!("Error decoding batch: {}", e),
+                    location: location!(),
+                };
+                Err(e)
+            }
+        }
     }
 
     pub fn into_stream(self) -> BoxStream<'static, ReadBatchTask> {
@@ -810,6 +819,21 @@ pub trait PhysicalPageScheduler: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
 
+struct FixedPriorityIo {
+    io: Arc<dyn EncodingsIo>,
+    priority: u64,
+}
+
+impl EncodingsIo for FixedPriorityIo {
+    fn submit_request(
+        &self,
+        range: Vec<Range<u64>>,
+        _priority: u64,
+    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+        self.io.submit_request(range, self.priority)
+    }
+}
+
 /// Contains the context for a scheduler
 pub struct SchedulerContext {
     /// The sink that sends decodeable tasks to the decode stage
@@ -889,13 +913,21 @@ impl SchedulerContext {
     // 1. When we need to create a new indirect I/O phase.
     // 2. When we need to wrap a set of decoders and so we want to intercept them
     //    before they are emitted.
-    pub fn temporary(&self) -> Self {
+    pub fn temporary(&self, fixed_priority: Option<u64>) -> Self {
+        let inner_io = if let Some(priority) = fixed_priority {
+            Arc::new(FixedPriorityIo {
+                io: self.io.clone(),
+                priority,
+            }) as Arc<dyn EncodingsIo>
+        } else {
+            self.io.clone()
+        };
         let (tx, rx) = unbounded_channel();
         let mut name = self.name.clone();
         name.push_str(&self.path_names.join("/"));
         Self {
             sink: tx,
-            io: self.io.clone(),
+            io: inner_io,
             recv: Some(rx),
             name,
             path: Vec::new(),

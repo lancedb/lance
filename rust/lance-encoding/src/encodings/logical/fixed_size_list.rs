@@ -60,7 +60,7 @@ impl LogicalPageScheduler for FslPageScheduler {
             "Scheduling expanded ranges {:?} from items scheduler",
             expanded_ranges
         );
-        let mut temp_context = context.temporary();
+        let mut temp_context = context.temporary(None);
         self.items_scheduler
             .schedule_ranges(&expanded_ranges, &mut temp_context, top_level_row)?;
         for decoder in temp_context.into_decoders() {

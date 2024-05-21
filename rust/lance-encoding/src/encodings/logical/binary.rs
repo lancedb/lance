@@ -51,7 +51,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
         top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling binary for {} ranges", ranges.len());
-        let mut temp_context = context.temporary();
+        let mut temp_context = context.temporary(None);
         self.varbin_scheduler
             .schedule_ranges(ranges, &mut temp_context, top_level_row)?;
 
