@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use log::info;
 use rand::{seq::IteratorRandom, Rng};
@@ -24,7 +24,7 @@ pub async fn train_kmeans<T: ArrowFloatType>(
     mut rng: impl Rng,
     distance_type: DistanceType,
     sample_rate: usize,
-) -> Result<T::ArrayType>
+) -> Result<ArrayRef>
 where
     T::Native: Dot + L2 + Normalize,
 {
@@ -64,5 +64,5 @@ where
     };
     let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
     let model = KMeans::new_with_params(&data, k, &params)?;
-    Ok(model.centroids.as_ref().clone())
+    Ok(model.centroids.clone())
 }

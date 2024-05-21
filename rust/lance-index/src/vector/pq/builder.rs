@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::pb;
+use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{
     cast::AsArray, types::Float32Type, Array, ArrayRef, Float32Array, PrimitiveArray,
@@ -75,13 +76,13 @@ impl PQBuildParams {
         }
     }
 
-    pub async fn build_from_matrix<T: ArrowFloatType + 'static>(
+    pub async fn build_from_matrix<T: ArrowFloatType + 'static + ArrowPrimitiveType>(
         &self,
         data: &MatrixView<T>,
         metric_type: MetricType,
     ) -> Result<Arc<dyn ProductQuantizer + 'static>>
     where
-        T::Native: Dot + L2 + Normalize,
+        <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
     {
         assert_ne!(
             metric_type,
@@ -116,7 +117,8 @@ impl PQBuildParams {
             .await?;
         let mut codebook_builder = Vec::with_capacity(num_centroids * dimension);
         for centroid in d.iter() {
-            codebook_builder.extend_from_slice(centroid.as_slice());
+            let c = centroid.as_any().downcast_ref::<T::ArrayType>().unwrap();
+            codebook_builder.extend_from_slice(c.as_slice());
         }
 
         let pd_centroids = T::ArrayType::from(codebook_builder);
