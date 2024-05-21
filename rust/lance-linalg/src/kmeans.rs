@@ -94,6 +94,12 @@ pub struct KMeans {
     ///
     /// k * dimension.
     pub centroids: ArrayRef,
+
+    /// The dimension of each vector.
+    pub dimension: usize,
+
+    /// How to calculate distance between two vectors.
+    pub distance_type: DistanceType,
 }
 
 /// Randomly initialize kmeans centroids.
@@ -104,6 +110,7 @@ fn kmeans_random_init<T: ArrowPrimitiveType>(
     dimension: usize,
     k: usize,
     mut rng: impl Rng,
+    distance_type: DistanceType,
 ) -> KMeans {
     assert!(data.len() >= k * dimension);
     let chosen = (0..data.len() / dimension).choose_multiple(&mut rng, k);
@@ -115,6 +122,8 @@ fn kmeans_random_init<T: ArrowPrimitiveType>(
     );
     KMeans {
         centroids: Arc::new(centroids),
+        dimension,
+        distance_type,
     }
 }
 
@@ -159,20 +168,30 @@ fn hist_stddev(k: usize, membership: &[Option<u32>]) -> f32 {
 }
 
 impl KMeans {
-    fn empty() -> Self {
+    fn empty(dimension: usize, distance_type: DistanceType) -> Self {
         Self {
             centroids: arrow_array::array::new_empty_array(&DataType::Float32),
+            dimension,
+            distance_type,
         }
     }
 
     /// Create a [`KMeans`] with existing centroids.
     /// It is useful for continuing training.
-    pub fn with_centroids(centroids: ArrayRef) -> Self {
+    pub fn with_centroids(
+        centroids: ArrayRef,
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> Self {
         assert!(matches!(
             centroids.data_type(),
             DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::UInt8
         ));
-        Self { centroids }
+        Self {
+            centroids,
+            dimension,
+            distance_type,
+        }
     }
 
     /// Initialize a [`KMeans`] with random centroids.
@@ -187,8 +206,9 @@ impl KMeans {
         dimension: usize,
         k: usize,
         rng: impl Rng,
+        distance_type: DistanceType,
     ) -> Self {
-        kmeans_random_init::<T>(data, dimension, k, rng)
+        kmeans_random_init::<T>(data, dimension, k, rng, distance_type)
     }
 
     /// Train a KMeans model on data with `k` clusters.
@@ -219,16 +239,20 @@ impl KMeans {
                 data.value_type()
             )))?;
 
-        let mut best_kmeans = Self::empty();
+        let mut best_kmeans = Self::empty(dimension, params.distance_type);
         let mut best_stddev = f32::MAX;
 
         // TODO: use seed for Rng.
         let rng = SmallRng::from_entropy();
         for redo in 1..=params.redos {
             let mut kmeans: Self = match params.init {
-                KMeanInit::Random => {
-                    Self::init_random::<T>(data.values(), dimension, k, rng.clone())
-                }
+                KMeanInit::Random => Self::init_random::<T>(
+                    data.values(),
+                    dimension,
+                    k,
+                    rng.clone(),
+                    params.distance_type,
+                ),
                 KMeanInit::KMeanPlusPlus => {
                     unimplemented!()
                 }
@@ -249,7 +273,14 @@ impl KMeans {
                     dimension,
                     params.distance_type,
                 );
-                kmeans = Self::to_kmeans::<T>(data.values(), dimension, k, &membership).unwrap();
+                kmeans = Self::to_kmeans::<T>(
+                    data.values(),
+                    dimension,
+                    k,
+                    &membership,
+                    params.distance_type,
+                )
+                .unwrap();
                 last_membership = Some(membership);
                 if (loss - last_loss).abs() / last_loss < params.tolerance {
                     info!(
@@ -349,6 +380,7 @@ impl KMeans {
         dimension: usize,
         k: usize,
         membership: &[Option<u32>],
+        distance_type: DistanceType,
     ) -> Result<Self>
     where
         T::Native: Float + AddAssign + DivAssign + FromPrimitive,
@@ -398,6 +430,8 @@ impl KMeans {
 
         Ok(Self {
             centroids: Arc::new(PrimitiveArray::<T>::from_iter_values(new_centroids)),
+            dimension,
+            distance_type,
         })
     }
 }
