@@ -97,9 +97,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             source is some kind of generator.
         """
         reader = _coerce_reader(data_obj, schema)
-        inserted, updated, deleted = super(MergeInsertBuilder, self).execute(reader)
+        merge_dict = super(MergeInsertBuilder, self).execute(reader)
 
-        return inserted, updated, deleted
+        return merge_dict
 
     # These next three overrides exist only to document the methods
 
