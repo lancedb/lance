@@ -116,20 +116,16 @@ fn kmeans_random_init<T: ArrowFloatType>(
     k: usize,
     mut rng: impl Rng,
     distance_type: DistanceType,
-) -> KMeans<T>
-where
-    T::Native: AsPrimitive<f32>,
-{
+) -> KMeans<T> {
     assert!(data.len() >= k * dimension);
-    let chosen = (0..data.len() / dimension)
-        .choose_multiple(&mut rng, k)
-        .to_vec();
-    let mut builder: Vec<T::Native> = Vec::with_capacity(k * dimension);
-    for i in chosen {
-        builder.extend(data[i * dimension..(i + 1) * dimension].iter());
-    }
+    let chosen = (0..data.len() / dimension).choose_multiple(&mut rng, k);
+    let centroids = chosen
+        .iter()
+        .flat_map(|&i| data[i * dimension..(i + 1) * dimension].iter())
+        .copied()
+        .collect::<Vec<_>>();
     KMeans {
-        centroids: Arc::new(builder.into()),
+        centroids: Arc::new(centroids.into()),
         dimension,
         k,
         distance_type,
