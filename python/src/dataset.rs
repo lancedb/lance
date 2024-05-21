@@ -201,7 +201,6 @@ impl MergeInsertBuilder {
 
         dataset.borrow_mut().ds = new_self.0;
         let merge_stats = new_self.1;
-        println!("{:?}", merge_stats);
         let merge_dict = PyDict::new(py);
         merge_dict.set_item("num_inserted_rows", merge_stats.num_inserted_rows)?;
         merge_dict.set_item("num_updated_rows", merge_stats.num_updated_rows)?;
