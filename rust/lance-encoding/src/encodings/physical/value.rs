@@ -130,17 +130,17 @@ pub struct ValueEncoder {
 
 impl ValueEncoder {
     pub fn try_new(data_type: &DataType) -> Result<Self> {
-        if data_type.is_primitive() {
-            Ok(Self {
-                buffer_encoder: Box::<FlatBufferEncoder>::default(),
-            })
-        } else if *data_type == DataType::Boolean {
+        if *data_type == DataType::Boolean {
             Ok(Self {
                 buffer_encoder: Box::<BitmapBufferEncoder>::default(),
             })
+        } else if data_type.is_fixed_stride() {
+            Ok(Self {
+                buffer_encoder: Box::<FlatBufferEncoder>::default(),
+            })
         } else {
             Err(Error::invalid_input(
-                format!("Cannot use value encoded to encode {}", data_type),
+                format!("Cannot use ValueEncoder to encode {}", data_type),
                 location!(),
             ))
         }
@@ -189,6 +189,7 @@ pub(crate) mod tests {
     use crate::testing::check_round_trip_encoding_random;
 
     const PRIMITIVE_TYPES: &[DataType] = &[
+        DataType::FixedSizeBinary(2),
         DataType::Date32,
         DataType::Date64,
         DataType::Int8,

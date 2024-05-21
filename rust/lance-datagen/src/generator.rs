@@ -555,6 +555,47 @@ impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerato
     }
 }
 
+// This is pretty much the same thing as RandomBinaryGenerator but we can't use that
+// because there is no ArrowPrimitiveType for FixedSizeBinary
+pub struct RandomFixedSizeBinaryGenerator {
+    data_type: DataType,
+    size: i32,
+}
+
+impl RandomFixedSizeBinaryGenerator {
+    fn new(size: i32) -> Self {
+        Self {
+            size,
+            data_type: DataType::FixedSizeBinary(size),
+        }
+    }
+}
+
+impl ArrayGenerator for RandomFixedSizeBinaryGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let num_bytes = length.0 * self.size as u64;
+        let mut bytes = vec![0; num_bytes as usize];
+        rng.fill_bytes(&mut bytes);
+        Ok(Arc::new(FixedSizeBinaryArray::new(
+            self.size,
+            Buffer::from(bytes),
+            None,
+        )))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        Some(ByteCount::from(self.size as u64))
+    }
+}
+
 pub struct RandomBinaryGenerator {
     bytes_per_element: ByteCount,
     scale_to_utf8: bool,
@@ -1416,6 +1457,10 @@ pub mod array {
         Box::new(RandomBytesGenerator::<T>::new(data_type))
     }
 
+    pub fn rand_fsb(size: i32) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomFixedSizeBinaryGenerator::new(size))
+    }
+
     /// Create a generator of randomly sampled date32 values
     ///
     /// Instead of sampling the entire range, all values will be drawn from the last year as this
@@ -1610,6 +1655,7 @@ pub mod array {
                 rand_type(child.data_type()),
                 Dimension::from(*dimension as u32),
             ),
+            DataType::FixedSizeBinary(size) => rand_fsb(*size),
             DataType::List(child) => rand_list(child.data_type()),
             DataType::Duration(unit) => match unit {
                 TimeUnit::Second => rand::<DurationSecondType>(),

@@ -36,6 +36,28 @@ pub enum ReadBatchParams {
     Indices(UInt32Array),
 }
 
+impl std::fmt::Display for ReadBatchParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Range(r) => write!(f, "Range({}..{})", r.start, r.end),
+            Self::RangeFull => write!(f, "RangeFull"),
+            Self::RangeTo(r) => write!(f, "RangeTo({})", r.end),
+            Self::RangeFrom(r) => write!(f, "RangeFrom({})", r.start),
+            Self::Indices(indices) => {
+                let mut indices_str = indices.values().iter().fold(String::new(), |mut acc, v| {
+                    acc.push_str(&v.to_string());
+                    acc.push(',');
+                    acc
+                });
+                if !indices_str.is_empty() {
+                    indices_str.pop();
+                }
+                write!(f, "Indices({})", indices_str)
+            }
+        }
+    }
+}
+
 impl Default for ReadBatchParams {
     fn default() -> Self {
         // Default of ReadBatchParams is reading the full batch.

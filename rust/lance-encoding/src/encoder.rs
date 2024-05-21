@@ -196,6 +196,7 @@ impl BatchEncoder {
             | DataType::UInt32
             | DataType::UInt64
             | DataType::UInt8
+            | DataType::FixedSizeBinary(_)
             | DataType::FixedSizeList(_, _) => {
                 let my_col_idx = *col_idx;
                 *col_idx += 1;

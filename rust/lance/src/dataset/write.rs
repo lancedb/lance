@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::chunk_stream;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
@@ -208,12 +208,10 @@ pub async fn write_fragments_internal(
         schema
     };
 
-    // TODO: When writing v2 we could consider skipping this chunking step.  However, leaving in
-    // for now as it doesn't hurt anything
     let mut buffered_reader = if params.use_experimental_writer {
-        data.and_then(|batch| std::future::ready(Ok(vec![batch])))
-            .map_err(Error::from)
-            .boxed()
+        // In v2 we don't care about group size but we do want to chunk
+        // by max_rows_per_file
+        chunk_stream(data, params.max_rows_per_file)
     } else {
         chunk_stream(data, params.max_rows_per_group)
     };
