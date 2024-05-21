@@ -91,22 +91,20 @@ impl KMeansParams {
 
 /// KMeans implementation for Apache Arrow Arrays.
 #[derive(Debug, Clone)]
-pub struct KMeans<T: ArrowFloatType>
-where
-    T::Native: L2 + Dot,
-{
-    /// Centroids for each of the k clusters.
+pub struct KMeans<T: ArrowFloatType> {
+    /// Flattend array of centroids.
     ///
     /// k * dimension.
     pub centroids: Arc<T::ArrayType>,
 
     /// Vector dimension.
-    pub dimension: usize,
+    dimension: usize,
 
     /// The number of clusters
-    pub k: usize,
+    k: usize,
 
-    pub distance_type: DistanceType,
+    /// How to calcualte distance between vectors.
+    distance_type: DistanceType,
 }
 
 /// Randomly initialize kmeans centroids.
@@ -118,9 +116,9 @@ fn kmeans_random_init<T: ArrowFloatType>(
     k: usize,
     mut rng: impl Rng,
     distance_type: DistanceType,
-) -> Result<KMeans<T>>
+) -> KMeans<T>
 where
-    T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
+    T::Native: AsPrimitive<f32>,
 {
     assert!(data.len() >= k * dimension);
     let chosen = (0..data.len() / dimension)
@@ -130,9 +128,12 @@ where
     for i in chosen {
         builder.extend(data[i * dimension..(i + 1) * dimension].iter());
     }
-    let mut kmeans = KMeans::empty(k, dimension, distance_type);
-    kmeans.centroids = Arc::new(builder.into());
-    Ok(kmeans)
+    KMeans {
+        centroids: Arc::new(builder.into()),
+        dimension,
+        k,
+        distance_type,
+    }
 }
 
 /// Split one big cluster into two smaller clusters. After split, each
@@ -217,7 +218,7 @@ where
         k: usize,
         distance_type: DistanceType,
         rng: impl Rng,
-    ) -> Result<Self> {
+    ) -> Self {
         kmeans_random_init(data, dimension, k, rng, distance_type)
     }
 
@@ -279,7 +280,7 @@ where
                     k,
                     params.distance_type,
                     rng.clone(),
-                )?,
+                ),
                 KMeanInit::KMeanPlusPlus => {
                     unimplemented!()
                 }
