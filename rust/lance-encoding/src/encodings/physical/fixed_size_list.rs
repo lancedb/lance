@@ -84,11 +84,17 @@ impl PhysicalPageDecoder for FixedListDecoder {
             .update_capacity(rows_to_skip, num_rows, buffers, all_null);
     }
 
-    fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [bytes::BytesMut]) {
+    fn decode_into(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        dest_buffers: &mut [bytes::BytesMut],
+    ) -> Result<()> {
         let rows_to_skip = rows_to_skip * self.dimension;
         let num_rows = num_rows * self.dimension;
         self.items_decoder
-            .decode_into(rows_to_skip, num_rows, dest_buffers);
+            .decode_into(rows_to_skip, num_rows, dest_buffers)?;
+        Ok(())
     }
 
     fn num_buffers(&self) -> u32 {

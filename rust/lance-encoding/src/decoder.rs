@@ -234,6 +234,8 @@ pub struct PageInfo {
     pub encoding: pb::ArrayEncoding,
     /// The offsets of the buffers in the file
     pub buffer_offsets: Arc<Vec<u64>>,
+    /// Sizes (in bytes) of the buffers in the page
+    pub buffer_sizes: Arc<Vec<u64>>,
 }
 
 /// Metadata describing a column in a file
@@ -247,15 +249,23 @@ pub struct ColumnInfo {
     pub page_infos: Vec<Arc<PageInfo>>,
     /// File positions of the column-level buffers
     pub buffer_offsets: Vec<u64>,
+    /// Sizes (in bytes) of the column-level buffers
+    pub buffer_sizes: Vec<u64>,
 }
 
 impl ColumnInfo {
     /// Create a new instance
-    pub fn new(index: u32, page_infos: Vec<Arc<PageInfo>>, buffer_offsets: Vec<u64>) -> Self {
+    pub fn new(
+        index: u32,
+        page_infos: Vec<Arc<PageInfo>>,
+        buffer_offsets: Vec<u64>,
+        buffer_sizes: Vec<u64>,
+    ) -> Self {
         Self {
             index,
             page_infos,
             buffer_offsets,
+            buffer_sizes,
         }
     }
 }
@@ -308,6 +318,7 @@ impl DecodeBatchScheduler {
         let column_buffers = ColumnBuffers {
             file_buffers: buffers,
             positions: &column.buffer_offsets,
+            sizes: &column.buffer_sizes,
         };
         column
             .page_infos
@@ -415,6 +426,7 @@ impl DecodeBatchScheduler {
                 let offsets_column_buffers = ColumnBuffers {
                     file_buffers: buffers,
                     positions: &offsets_column.buffer_offsets,
+                    sizes: &offsets_column.buffer_sizes,
                 };
                 let items =
                     Self::create_field_scheduler(items_field.data_type(), column_infos, buffers);
@@ -512,10 +524,12 @@ impl DecodeBatchScheduler {
         schema: &'a Schema,
         column_infos: impl IntoIterator<Item = &'a ColumnInfo>,
         file_buffer_positions: &'a Vec<u64>,
+        file_buffer_sizes: &'a Vec<u64>,
     ) -> Self {
         let mut col_info_iter = column_infos.into_iter();
         let buffers = FileBuffers {
             positions: file_buffer_positions,
+            sizes: file_buffer_sizes,
         };
         let field_schedulers = schema
             .fields
@@ -787,7 +801,12 @@ pub trait PhysicalPageDecoder: Send + Sync {
     /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
     /// * `num_rows` - how many rows to decode
     /// * `dest_buffers` - the output buffers to decode into
-    fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [BytesMut]);
+    fn decode_into(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        dest_buffers: &mut [BytesMut],
+    ) -> Result<()>;
     fn num_buffers(&self) -> u32;
 }
 
@@ -1109,7 +1128,7 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
 /// Decodes a batch of data from an in-memory structure created by [`crate::encoder::encode_batch`]
 pub async fn decode_batch(batch: &EncodedBatch) -> Result<RecordBatch> {
     let mut decode_scheduler =
-        DecodeBatchScheduler::new(batch.schema.as_ref(), &batch.page_table, &vec![]);
+        DecodeBatchScheduler::new(batch.schema.as_ref(), &batch.page_table, &vec![], &vec![]);
     let (tx, rx) = unbounded_channel();
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
     decode_scheduler

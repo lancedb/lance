@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::io::Write;
 use arrow_array::{cast::AsArray, ArrayRef};
+use std::io::{Cursor, Write};
 
 use arrow_buffer::{BooleanBufferBuilder, Buffer};
 use arrow_schema::DataType;
@@ -23,16 +23,61 @@ impl BufferEncoder for FlatBufferEncoder {
     }
 }
 
-// An encoder which uses lightweight compression, such as zstd/lz4 to encode buffers
-#[derive(Debug, Default)]
-pub struct CompressedBufferEncoder {}
+pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
+    fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
+    fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
+}
 
-fn compress(input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-    let mut encoder = zstd::Encoder::new(output_buf, 0)?;
-    encoder.write_all(input_buf)?;
-    match encoder.finish() {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.into()),
+#[derive(Debug, Default)]
+pub struct ZstdBufferCompressor {}
+
+impl BufferCompressor for ZstdBufferCompressor {
+    fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        let mut encoder = zstd::Encoder::new(output_buf, 0)?;
+        encoder.write_all(input_buf)?;
+        match encoder.finish() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        let source = Cursor::new(input_buf);
+        zstd::stream::copy_decode(source, output_buf)?;
+        Ok(())
+    }
+}
+
+pub struct GeneralBufferCompressor {}
+
+impl GeneralBufferCompressor {
+    pub fn get_compressor(compression_type: &str) -> Box<dyn BufferCompressor> {
+        match compression_type {
+            "" => Box::new(ZstdBufferCompressor::default()),
+            "zstd" => Box::new(ZstdBufferCompressor::default()),
+            _ => panic!("Unsupported compression type: {}", compression_type),
+        }
+    }
+}
+
+// An encoder which uses lightweight compression, such as zstd/lz4 to encode buffers
+#[derive(Debug)]
+pub struct CompressedBufferEncoder {
+    compressor: Box<dyn BufferCompressor>,
+}
+
+impl Default for CompressedBufferEncoder {
+    fn default() -> Self {
+        Self {
+            compressor: GeneralBufferCompressor::get_compressor("zstd"),
+        }
+    }
+}
+
+impl CompressedBufferEncoder {
+    pub fn new(compression_type: &str) -> Self {
+        let compressor = GeneralBufferCompressor::get_compressor(compression_type);
+        Self { compressor }
     }
 }
 
@@ -42,16 +87,15 @@ impl BufferEncoder for CompressedBufferEncoder {
         parts.reserve(arrays.len());
         for arr in arrays {
             let buffer = arr.to_data().buffers()[0].clone();
-            let buffer_len =buffer.len();
+            let buffer_len = buffer.len();
             let buffer_data = buffer.as_slice();
             let mut compressed = Vec::with_capacity(buffer_len);
-            compress(buffer_data, &mut compressed)?;
+            self.compressor.compress(buffer_data, &mut compressed)?;
             parts.push(Buffer::from(compressed));
         }
         Ok(EncodedBuffer { parts })
     }
 }
-
 
 // Encoder for writing boolean arrays as dense bitmaps
 #[derive(Debug, Default)]

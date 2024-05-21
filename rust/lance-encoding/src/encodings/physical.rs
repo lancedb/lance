@@ -18,6 +18,7 @@ pub mod value;
 #[derive(Clone, Copy, Debug)]
 pub struct FileBuffers<'a> {
     pub positions: &'a Vec<u64>,
+    pub sizes: &'a Vec<u64>,
 }
 
 /// These contain the file buffers and also buffers specific to a column
@@ -25,25 +26,42 @@ pub struct FileBuffers<'a> {
 pub struct ColumnBuffers<'a, 'b> {
     pub file_buffers: FileBuffers<'a>,
     pub positions: &'b Vec<u64>,
+    pub sizes: &'b Vec<u64>,
 }
+
 /// These contain the file & column buffers and also buffers specific to a page
 #[derive(Clone, Copy, Debug)]
 pub struct PageBuffers<'a, 'b, 'c> {
     pub column_buffers: ColumnBuffers<'a, 'b>,
     pub positions: &'c Vec<u64>,
+    pub sizes: &'c Vec<u64>,
 }
 
 // Translate a protobuf buffer description into a position in the file.  This could be a page
 // buffer, a column buffer, or a file buffer.
-fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> u64 {
+fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> (u64, u64) {
+    fn get_from_buffers<'a>(
+        positions: &'a Vec<u64>,
+        sizes: &'a Vec<u64>,
+        index: usize,
+    ) -> (u64, u64) {
+        (positions[index], sizes[index])
+    }
+
+    let index = buffer_desc.buffer_index as usize;
+
     match pb::buffer::BufferType::try_from(buffer_desc.buffer_type).unwrap() {
-        pb::buffer::BufferType::Page => buffers.positions[buffer_desc.buffer_index as usize],
-        pb::buffer::BufferType::Column => {
-            buffers.column_buffers.positions[buffer_desc.buffer_index as usize]
-        }
-        pb::buffer::BufferType::File => {
-            buffers.column_buffers.file_buffers.positions[buffer_desc.buffer_index as usize]
-        }
+        pb::buffer::BufferType::Page => get_from_buffers(buffers.positions, buffers.sizes, index),
+        pb::buffer::BufferType::Column => get_from_buffers(
+            buffers.column_buffers.positions,
+            buffers.column_buffers.sizes,
+            index,
+        ),
+        pb::buffer::BufferType::File => get_from_buffers(
+            buffers.column_buffers.file_buffers.positions,
+            buffers.column_buffers.file_buffers.sizes,
+            index,
+        ),
     }
 }
 
@@ -52,18 +70,17 @@ fn get_buffer_decoder(
     encoding: &pb::Flat,
     buffers: &PageBuffers,
 ) -> Box<dyn PhysicalPageScheduler> {
+    let (buffer_offset, buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
     match encoding.bits_per_value {
-        1 => Box::new(DenseBitmapScheduler::new(get_buffer(
-            encoding.buffer.as_ref().unwrap(),
-            buffers,
-        ))),
+        1 => Box::new(DenseBitmapScheduler::new(buffer_offset)),
         bits_per_value => {
             if bits_per_value % 8 != 0 {
                 todo!("bits_per_value that are not multiples of 8");
             }
             Box::new(ValuePageScheduler::new(
                 bits_per_value / 8,
-                get_buffer(encoding.buffer.as_ref().unwrap(), buffers),
+                buffer_offset,
+                buffer_size,
             ))
         }
     }

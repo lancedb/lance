@@ -8,6 +8,7 @@ use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::DataTypeExt;
 use log::trace;
 use snafu::{location, Location};
+use std::ops::Range;
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
@@ -18,7 +19,9 @@ use crate::{
 
 use lance_core::{Error, Result};
 
-use super::buffers::{BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder};
+use super::buffers::{
+    BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder, GeneralBufferCompressor,
+};
 
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
@@ -27,13 +30,15 @@ pub struct ValuePageScheduler {
     // I think we want to, in theory, but will need to test this case.
     bytes_per_value: u64,
     buffer_offset: u64,
+    buffer_size: u64,
 }
 
 impl ValuePageScheduler {
-    pub fn new(bytes_per_value: u64, buffer_offset: u64) -> Self {
+    pub fn new(bytes_per_value: u64, buffer_offset: u64, buffer_size: u64) -> Self {
         Self {
             bytes_per_value,
             buffer_offset,
+            buffer_size,
         }
     }
 }
@@ -47,16 +52,10 @@ impl PhysicalPageScheduler for ValuePageScheduler {
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let mut min = u64::MAX;
         let mut max = 0;
-        let byte_ranges = ranges
-            .iter()
-            .map(|range| {
-                let start = self.buffer_offset + (range.start as u64 * self.bytes_per_value);
-                let end = self.buffer_offset + (range.end as u64 * self.bytes_per_value);
-                min = min.min(start);
-                max = max.max(end);
-                start..end
-            })
-            .collect::<Vec<_>>();
+        let byte_ranges = vec![Range {
+            start: self.buffer_offset,
+            end: self.buffer_offset + self.buffer_size,
+        }];
 
         trace!(
             "Scheduling I/O for {} ranges spread across byte range {}..{}",
@@ -67,11 +66,22 @@ impl PhysicalPageScheduler for ValuePageScheduler {
         let bytes = scheduler.submit_request(byte_ranges, top_level_row);
         let bytes_per_value = self.bytes_per_value;
 
+        let range_offsets = ranges
+            .iter()
+            .map(|range| {
+                let start = (range.start as u64 * bytes_per_value) as usize;
+                let end = (range.end as u64 * bytes_per_value) as usize;
+                start..end
+            })
+            .collect::<Vec<_>>();
+
         async move {
             let bytes = bytes.await?;
+
             Ok(Box::new(ValuePageDecoder {
                 bytes_per_value,
                 data: bytes,
+                range_offsets,
             }) as Box<dyn PhysicalPageDecoder>)
         }
         .boxed()
@@ -81,6 +91,28 @@ impl PhysicalPageScheduler for ValuePageScheduler {
 struct ValuePageDecoder {
     bytes_per_value: u64,
     data: Vec<Bytes>,
+    range_offsets: Vec<std::ops::Range<usize>>,
+}
+
+fn decompress_with_ranges(
+    bytes: &Vec<Bytes>,
+    range_offsets: &Vec<std::ops::Range<usize>>,
+) -> Result<Vec<Bytes>> {
+    // TODO: extract the method, add environment controlled by a flag
+    // decompress the bytes and cut the range of bytes
+    // zstd decompress the bytes
+    let bytes_u8: Vec<u8> = bytes.into_iter().flat_map(|b| b.to_vec()).collect();
+    let buffer_compressor = GeneralBufferCompressor::get_compressor("");
+    let mut decompressed_bytes: Vec<u8> = Vec::new();
+    buffer_compressor.decompress(&bytes_u8, &mut decompressed_bytes)?;
+
+    let mut bytes_in_ranges: Vec<Bytes> = Vec::new();
+    for range in range_offsets {
+        let start = range.start;
+        let end = range.end;
+        bytes_in_ranges.push(Bytes::from(decompressed_bytes[start..end].to_vec()));
+    }
+    Ok(bytes_in_ranges)
 }
 
 impl PhysicalPageDecoder for ValuePageDecoder {
@@ -95,7 +127,13 @@ impl PhysicalPageDecoder for ValuePageDecoder {
         buffers[0].1 = true;
     }
 
-    fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [bytes::BytesMut]) {
+    fn decode_into(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        dest_buffers: &mut [bytes::BytesMut],
+    ) -> Result<()> {
+        let data = decompress_with_ranges(&self.data, &self.range_offsets)?;
         let mut bytes_to_skip = rows_to_skip as u64 * self.bytes_per_value;
         let mut bytes_to_take = num_rows as u64 * self.bytes_per_value;
 
@@ -103,7 +141,7 @@ impl PhysicalPageDecoder for ValuePageDecoder {
 
         debug_assert!(dest.capacity() as u64 >= bytes_to_take);
 
-        for buf in &self.data {
+        for buf in &data {
             let buf_len = buf.len() as u64;
             if bytes_to_skip > buf_len {
                 bytes_to_skip -= buf_len;
@@ -116,6 +154,7 @@ impl PhysicalPageDecoder for ValuePageDecoder {
                 bytes_to_skip = 0;
             }
         }
+        Ok(())
     }
 
     fn num_buffers(&self) -> u32 {
@@ -191,7 +230,6 @@ impl ArrayEncoder for ValueEncoder {
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 pub(crate) mod tests {
-
     use arrow_schema::{DataType, Field, TimeUnit};
 
     use crate::testing::check_round_trip_encoding_random;

@@ -59,6 +59,7 @@ impl PrimitivePageScheduler {
         let page_buffers = PageBuffers {
             column_buffers: buffers,
             positions: &page.buffer_offsets,
+            sizes: &page.buffer_sizes,
         };
         Self {
             data_type,
@@ -176,7 +177,7 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 
         // Go ahead and fill the validity / values buffers
         self.physical_decoder
-            .decode_into(self.rows_to_skip, self.rows_to_take, &mut bufs);
+            .decode_into(self.rows_to_skip, self.rows_to_take, &mut bufs)?;
 
         // Convert the two buffers into an Arrow array
         Self::primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)

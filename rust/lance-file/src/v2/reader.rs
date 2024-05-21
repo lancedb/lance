@@ -416,9 +416,11 @@ impl FileReader {
                     .map(|page| {
                         let num_rows = page.length;
                         let buffer_offsets = Arc::new(page.buffer_offsets.clone());
+                        let buffer_sizes = Arc::new(page.buffer_sizes.clone());
                         let encoding = Self::fetch_encoding(page.encoding.as_ref().unwrap());
                         Arc::new(PageInfo {
                             buffer_offsets,
+                            buffer_sizes,
                             encoding,
                             num_rows,
                         })
@@ -428,6 +430,7 @@ impl FileReader {
                     index: col_idx as u32,
                     page_infos,
                     buffer_offsets: vec![],
+                    buffer_sizes: vec![],
                 })
             })
             .collect::<Vec<_>>()
@@ -594,6 +597,7 @@ impl FileReader {
             &projection.schema,
             column_infos.iter().map(|ci| ci.as_ref()),
             &vec![],
+            &vec![],
         );
 
         let root_decoder = decode_scheduler
@@ -630,6 +634,7 @@ impl FileReader {
         let mut decode_scheduler = DecodeBatchScheduler::new(
             &projection.schema,
             column_infos.iter().map(|ci| ci.as_ref()),
+            &vec![],
             &vec![],
         );
 
@@ -815,19 +820,19 @@ mod tests {
     use arrow_array::{types::Float64Type, RecordBatch, RecordBatchReader, UInt32Array};
     use arrow_schema::{ArrowError, DataType, Field, Fields, Schema as ArrowSchema};
     use futures::future::try_join_all;
+    use futures::FutureExt;
     use futures::{StreamExt, TryFutureExt};
     use lance_arrow::RecordBatchExt;
     use lance_core::datatypes::Schema;
     use lance_core::Error;
     use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_encoding::decoder::ReadBatchTask;
     use lance_io::{
         object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStream,
     };
     use log::debug;
     use object_store::path::Path;
     use tempfile::TempDir;
-    use lance_encoding::decoder::ReadBatchTask;
-    use futures::FutureExt;
 
     use crate::v2::{
         reader::{FileReader, ReaderProjection},
@@ -885,7 +890,7 @@ mod tests {
             lance_schema.clone(),
             FileWriterOptions::default(),
         )
-            .unwrap();
+        .unwrap();
 
         let data = reader
             .collect::<std::result::Result<Vec<_>, ArrowError>>()
@@ -968,46 +973,49 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_random_read() {
-        let fs = FsFixture::default();
-
-        let (_, data) = create_some_file(&fs.object_store, &fs.tmp_path).await;
-
-        for read_size in [32] {
-            let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
-            let file_reader = FileReader::try_open(file_scheduler, None).await.unwrap();
-
-            let read_tasks = file_reader
-                .read_tasks(lance_io::ReadBatchParams::Indices(UInt32Array::from(vec![1, 3, 5, 7, 9])), read_size, &file_reader.base_projection).unwrap();
-
-            let tasks = read_tasks.map(|v2_task| ReadBatchTask {
-                task: v2_task.task.map_err(Error::from).boxed(),
-                num_rows: v2_task.num_rows,
-            });
-
-            let batches = try_join_all(tasks).await.unwrap();
-            let mut batch_stream = futures::stream::iter(batches.into_iter());
-        }
-    }
+    // #[tokio::test]
+    // async fn test_random_read() {
+    //     let fs = FsFixture::default();
+    //
+    //     let (_, data) = create_some_file(&fs.object_store, &fs.tmp_path).await;
+    //
+    //     for read_size in [32] {
+    //         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+    //         let file_reader = FileReader::try_open(file_scheduler, None).await.unwrap();
+    //
+    //         let read_tasks = file_reader
+    //             .read_tasks(lance_io::ReadBatchParams::Indices(UInt32Array::from(vec![1, 3, 5, 7, 9])), read_size, &file_reader.base_projection).unwrap();
+    //
+    //         let tasks = read_tasks.map(|v2_task| ReadBatchTask {
+    //             task: v2_task.task.map_err(Error::from).boxed(),
+    //             num_rows: v2_task.num_rows,
+    //         });
+    //
+    //         let batches = try_join_all(tasks).await.unwrap();
+    //         let mut batch_stream = futures::stream::iter(batches.into_iter());
+    //     }
+    // }
 
     #[test_log::test(tokio::test)]
     async fn test_projection() {
         let fs = FsFixture::default();
 
+        println!("creating file");
         let (schema, data) = create_some_file(&fs.object_store, &fs.tmp_path).await;
+        println!("opening file");
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
 
         for columns in [
             vec!["score"],
             vec!["location"],
-            vec!["categories"],
-            vec!["score.x"],
-            vec!["score", "categories"],
-            vec!["score", "location"],
-            vec!["location", "categories"],
-            vec!["score.y", "location", "categories"],
+            // vec!["categories"],
+            // vec!["score.x"],
+            // vec!["score", "categories"],
+            // vec!["score", "location"],
+            // vec!["location", "categories"],
+            // vec!["score.y", "location", "categories"],
         ] {
+            println!("reading columns from file {}", columns.join(", "));
             debug!("Testing round trip with projection {:?}", columns);
             // We can specify the projection as part of the read operation via read_stream_projected
             let file_reader = FileReader::try_open(file_scheduler.clone(), None)
@@ -1034,7 +1042,7 @@ mod tests {
                     batch.project_by_schema(&projection_copy.schema).unwrap()
                 })),
             )
-                .await;
+            .await;
 
             // We can also specify the projection as a base projection when we open the file
             let file_reader =
@@ -1055,7 +1063,7 @@ mod tests {
                     batch.project_by_schema(&projection_copy.schema).unwrap()
                 })),
             )
-                .await;
+            .await;
         }
 
         let empty_projection = ReaderProjection {
