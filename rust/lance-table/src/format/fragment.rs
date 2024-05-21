@@ -170,6 +170,38 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
     }
 }
 
+/// A reference to a part of a file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFile {
+    path: String,
+    offset: u64,
+    size: u64,
+}
+
+/// Metadata about location of the row id sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RowIdMeta {
+    Inline(Vec<u8>),
+    External(ExternalFile),
+}
+
+impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
+    type Error = Error;
+
+    fn try_from(value: pb::data_fragment::RowIdSequence) -> Result<Self> {
+        match value {
+            pb::data_fragment::RowIdSequence::InlineRowIds(data) => Ok(Self::Inline(data)),
+            pb::data_fragment::RowIdSequence::ExternalRowIds(file) => {
+                Ok(Self::External(ExternalFile {
+                    path: file.path.clone(),
+                    offset: file.offset,
+                    size: file.size,
+                }))
+            }
+        }
+    }
+}
+
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -186,6 +218,10 @@ pub struct Fragment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletion_file: Option<DeletionFile>,
 
+    /// RowIndex
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_id_meta: Option<RowIdMeta>,
+
     /// Original number of rows in the fragment. If this is None, then it is
     /// unknown. This is only optional for legacy reasons. All new tables should
     /// have this set.
@@ -198,6 +234,7 @@ impl Fragment {
             id,
             files: vec![],
             deletion_file: None,
+            row_id_meta: None,
             physical_rows: None,
         }
     }
@@ -235,6 +272,7 @@ impl Fragment {
             files: vec![DataFile::new_legacy(path, schema)],
             deletion_file: None,
             physical_rows,
+            row_id_meta: None,
         }
     }
 
@@ -280,8 +318,9 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .files
                 .into_iter()
                 .map(DataFile::try_from)
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<Result<_>>()?,
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
+            row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
         })
     }
@@ -301,10 +340,23 @@ impl From<&Fragment> for pb::DataFragment {
                 num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
             }
         });
+
+        let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
+            RowIdMeta::Inline(data) => pb::data_fragment::RowIdSequence::InlineRowIds(data.clone()),
+            RowIdMeta::External(file) => {
+                pb::data_fragment::RowIdSequence::ExternalRowIds(pb::ExternalFile {
+                    path: file.path.clone(),
+                    offset: file.offset,
+                    size: file.size,
+                })
+            }
+        });
+
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
+            row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
         }
     }

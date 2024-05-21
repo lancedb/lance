@@ -17,7 +17,9 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_metadata_offset, read_struct};
-use lance_table::format::{Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use lance_table::format::{
+    Fragment, Index, Manifest, RowIdMeta, MAGIC, MAJOR_VERSION, MINOR_VERSION,
+};
 use lance_table::io::commit::{commit_handler_from_url, CommitError, CommitHandler, CommitLock};
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
@@ -1246,7 +1248,7 @@ pub(crate) async fn write_manifest_file(
     config: &ManifestWriteConfig,
 ) -> std::result::Result<(), CommitError> {
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest);
+        apply_feature_flags(manifest)?;
     }
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -1282,6 +1284,31 @@ fn write_manifest_file_to_path<'a>(
     })
 }
 
+/// Some private methods for row ids
+impl Dataset {
+    async fn load_row_id_index(&self) -> Result<Arc<lance_table::rowids::RowIdIndex>> {
+        let mut num_external = 0;
+        for fragment in self.manifest.fragments.iter() {
+            match fragment.row_id_meta {
+                Some(RowIdMeta::External(_)) => num_external += 1,
+                None => {
+                    return Err(Error::Internal {
+                        message: "Missing row id meta".into(),
+                        location: location!(),
+                    })
+                }
+                _ => {}
+            }
+        }
+
+        todo!("Create task to stream and decode from external files");
+        todo!("Create task to decode inline ones");
+        todo!("Join the two tasks");
+        todo!("Put it in the cache");
+        todo!("Return the result");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::vec;
@@ -1296,18 +1323,13 @@ mod tests {
 
     use arrow::array::as_struct_array;
     use arrow::compute::concat_batches;
+    use arrow_array::types::Int64Type;
     use arrow_array::{
         builder::StringDictionaryBuilder, cast::as_string_array, types::Int32Type, ArrayRef,
         DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
         RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
     use arrow_array::{FixedSizeListArray, StructArray};
-    use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{
-        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
-    };
-    use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
-    use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_table::format::WriterVersion;

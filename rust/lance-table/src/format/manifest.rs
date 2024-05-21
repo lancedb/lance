@@ -68,6 +68,9 @@ pub struct Manifest {
     /// Precomputed logic offset of each fragment
     /// accelerating the fragment search using offset ranges.
     fragment_offsets: Vec<usize>,
+
+    /// The max row id used so far.
+    pub next_row_id: u64,
 }
 
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
@@ -100,6 +103,7 @@ impl Manifest {
             max_fragment_id: 0,
             transaction_file: None,
             fragment_offsets,
+            next_row_id: 0,
         }
     }
 
@@ -124,6 +128,7 @@ impl Manifest {
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             fragment_offsets,
+            next_row_id: previous.next_row_id, // How is this updated?
         }
     }
 
@@ -330,6 +335,7 @@ impl ProtoStruct for Manifest {
 
 impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
+
     fn try_from(p: pb::Manifest) -> Result<Self> {
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
@@ -354,6 +360,10 @@ impl TryFrom<pb::Manifest> for Manifest {
             fields: Fields(p.fields),
             metadata: p.metadata,
         };
+
+        // TODO: if "row_id" feature flag is set, then return an error if fragments
+        // don't all have row_id metadata.
+
         Ok(Self {
             schema: Schema::from(fields_with_meta),
             version: p.version,
@@ -372,6 +382,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 Some(p.transaction_file)
             },
             fragment_offsets,
+            next_row_id: p.next_row_id,
         })
     }
 }
@@ -409,6 +420,7 @@ impl From<&Manifest> for pb::Manifest {
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
+            next_row_id: m.next_row_id,
         }
     }
 }
@@ -569,6 +581,7 @@ mod tests {
                 id: 0,
                 files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
                 deletion_file: None,
+                row_id_meta: None,
                 physical_rows: None,
             },
             Fragment {
@@ -578,6 +591,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path3", vec![2]),
                 ],
                 deletion_file: None,
+                row_id_meta: None,
                 physical_rows: None,
             },
         ];

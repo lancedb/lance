@@ -521,7 +521,7 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest);
+            apply_feature_flags(&mut manifest)?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
