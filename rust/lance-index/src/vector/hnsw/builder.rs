@@ -766,7 +766,7 @@ mod tests {
         const TOTAL: usize = 2048;
         const NUM_EDGES: usize = 20;
         let data = generate_random_array(TOTAL * DIM);
-        let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
+        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
         let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
         let builder = HNSW::build_with_storage(
             DistanceType::L2,

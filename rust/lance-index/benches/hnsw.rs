@@ -28,7 +28,7 @@ fn bench_hnsw(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
-    let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
+    let mat = MatrixView::<Float32Type>::new(data.into(), DIMENSION);
     let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
 
     let query = mat.row(0).unwrap();
