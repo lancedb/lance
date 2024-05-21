@@ -325,7 +325,7 @@ impl MergeInsertJob {
     pub async fn execute_reader(
         self,
         source: Box<dyn RecordBatchReader + Send>,
-    ) -> Result<(Arc<Dataset>, u64, u64, u64)> {
+    ) -> Result<(Arc<Dataset>, MergeStats)> {
         let stream = reader_to_stream(source);
         self.execute(stream).await
     }
@@ -498,7 +498,7 @@ impl MergeInsertJob {
     pub async fn execute(
         self,
         source: SendableRecordBatchStream,
-    ) -> Result<(Arc<Dataset>, u64, u64, u64)> {
+    ) -> Result<(Arc<Dataset>, MergeStats)> {
         let schema = source.schema();
 
         let joined = self.create_joined_stream(source).await?;
@@ -540,12 +540,7 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        Ok((
-            committed_ds,
-            stats.num_inserted_rows,
-            stats.num_updated_rows,
-            stats.num_deleted_rows,
-        ))
+        Ok((committed_ds, stats))
     }
 
     // Delete a batch of rows by id, returns the fragments modified and the fragments removed
@@ -628,15 +623,15 @@ impl MergeInsertJob {
 
 // Merger will store these statistics as it runs (for each batch)
 #[derive(Debug, Default, Clone)]
-struct MergeStats {
+pub struct MergeStats {
     // Number of inserted rows (for user statistics)
-    num_inserted_rows: u64,
+    pub num_inserted_rows: u64,
     // Number of updated rows (for user statistics)
-    num_updated_rows: u64,
+    pub num_updated_rows: u64,
     // Number of deleted rows (for user statistics)
     // Note: This is different from internal references to 'deleted_rows', since we technically "delete" updated rows during processing.
     // However those rows are not shared with the user.
-    num_deleted_rows: u64,
+    pub num_deleted_rows: u64,
 }
 
 // A sync-safe structure that is shared by all of the "process batch" tasks.
@@ -903,7 +898,7 @@ mod tests {
         let new_reader = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
         let new_stream = reader_to_stream(new_reader);
 
-        let (merged_dataset, inserted, updated, deleted) = job.execute(new_stream).await.unwrap();
+        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
 
         let batches = merged_dataset
             .scan()
@@ -944,9 +939,9 @@ mod tests {
         right_keys.sort();
         assert_eq!(left_keys, keys_from_left);
         assert_eq!(right_keys, keys_from_right);
-        assert_eq!(inserted, stats[0]);
-        assert_eq!(updated, stats[1]);
-        assert_eq!(deleted, stats[2]);
+        assert_eq!(merge_stats.num_inserted_rows, stats[0]);
+        assert_eq!(merge_stats.num_updated_rows, stats[1]);
+        assert_eq!(merge_stats.num_deleted_rows, stats[2]);
     }
 
     #[tokio::test]
@@ -1227,7 +1222,7 @@ mod tests {
         ));
 
         // Run merge_insert
-        let (ds, _, _, _) = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        let (ds, _) = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
             .when_matched(WhenMatched::UpdateAll)
@@ -1253,7 +1248,7 @@ mod tests {
             schema.clone(),
         ));
         // Run merge_insert
-        let (ds, _, _, _) = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        let (ds, _) = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
             .when_matched(WhenMatched::UpdateAll)
@@ -1273,7 +1268,7 @@ mod tests {
         ));
         // Run merge_insert one last time.  The index is now completely out of date.  Every
         // row it points to is a deleted row.  Make sure that doesn't break.
-        let (ds, _, _, _) = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        let (ds, _) = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
             .when_matched(WhenMatched::UpdateAll)
