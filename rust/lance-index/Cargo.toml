@@ -77,7 +77,3 @@ harness = false
 [[bench]]
 name = "hnsw"
 harness = false
-
-[[bench]]
-name = "bitvec"
-harness = false
