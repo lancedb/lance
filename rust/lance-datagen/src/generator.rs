@@ -559,14 +559,14 @@ impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerato
 // because there is no ArrowPrimitiveType for FixedSizeBinary
 pub struct RandomFixedSizeBinaryGenerator {
     data_type: DataType,
-    dimension: i32,
+    size: i32,
 }
 
 impl RandomFixedSizeBinaryGenerator {
-    fn new(dimension: i32) -> Self {
+    fn new(size: i32) -> Self {
         Self {
-            dimension,
-            data_type: DataType::FixedSizeBinary(dimension),
+            size,
+            data_type: DataType::FixedSizeBinary(size),
         }
     }
 }
@@ -577,11 +577,11 @@ impl ArrayGenerator for RandomFixedSizeBinaryGenerator {
         length: RowCount,
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
-        let num_bytes = length.0 * self.dimension as u64;
+        let num_bytes = length.0 * self.size as u64;
         let mut bytes = vec![0; num_bytes as usize];
         rng.fill_bytes(&mut bytes);
         Ok(Arc::new(FixedSizeBinaryArray::new(
-            self.dimension,
+            self.size,
             Buffer::from(bytes),
             None,
         )))
@@ -592,7 +592,7 @@ impl ArrayGenerator for RandomFixedSizeBinaryGenerator {
     }
 
     fn element_size_bytes(&self) -> Option<ByteCount> {
-        Some(ByteCount::from(self.dimension as u64))
+        Some(ByteCount::from(self.size as u64))
     }
 }
 
@@ -1457,8 +1457,8 @@ pub mod array {
         Box::new(RandomBytesGenerator::<T>::new(data_type))
     }
 
-    pub fn rand_fsb(dimension: i32) -> Box<dyn ArrayGenerator> {
-        Box::new(RandomFixedSizeBinaryGenerator::new(dimension))
+    pub fn rand_fsb(size: i32) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomFixedSizeBinaryGenerator::new(size))
     }
 
     /// Create a generator of randomly sampled date32 values
@@ -1655,7 +1655,7 @@ pub mod array {
                 rand_type(child.data_type()),
                 Dimension::from(*dimension as u32),
             ),
-            DataType::FixedSizeBinary(dimension) => rand_fsb(*dimension),
+            DataType::FixedSizeBinary(size) => rand_fsb(*size),
             DataType::List(child) => rand_list(child.data_type()),
             DataType::Duration(unit) => match unit {
                 TimeUnit::Second => rand::<DurationSecondType>(),
