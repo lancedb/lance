@@ -21,7 +21,7 @@ fn bench_train(c: &mut Criterion) {
 
     c.bench_function("train_128d_4k", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::<Float32Type>::new(&array, 25, 50).ok().unwrap();
+            KMeans::new(&array, 25, 50).ok().unwrap();
         })
     });
 
@@ -29,14 +29,14 @@ fn bench_train(c: &mut Criterion) {
     let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
     c.bench_function("train_128d_65535", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::<Float32Type>::new(&array, 25, 50).ok().unwrap();
+            KMeans::new(&array, 25, 50).ok().unwrap();
         })
     });
 
     let values = generate_random_array(1024 * 64 * dimension as usize);
     let array = FixedSizeListArray::try_new_from_values(values.clone(), dimension).unwrap();
     c.bench_function("compute_membership_128d_65535", |b| {
-        let kmeans = KMeans::<Float32Type>::new(&array, 25, 50).ok().unwrap();
+        let kmeans = KMeans::new(&array, 25, 50).ok().unwrap();
 
         b.to_async(&rt)
             .iter(|| async { kmeans.compute_membership(values.as_slice(), None) })
