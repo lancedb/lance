@@ -4,11 +4,14 @@
 use arrow_array::FixedSizeListArray;
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use lance_arrow::{FixedSizeListArrayExt, FloatArray};
+use lance_arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_linalg::kmeans::KMeans;
+use lance_linalg::{
+    distance::DistanceType,
+    kmeans::{compute_partitions_arrow_array, KMeans},
+};
 use lance_testing::datagen::generate_random_array;
 
 fn bench_train(c: &mut Criterion) {
@@ -34,12 +37,10 @@ fn bench_train(c: &mut Criterion) {
     });
 
     let values = generate_random_array(1024 * 64 * dimension as usize);
-    let array = FixedSizeListArray::try_new_from_values(values.clone(), dimension).unwrap();
+    let query = FixedSizeListArray::try_new_from_values(values.clone(), dimension).unwrap();
     c.bench_function("compute_membership_128d_65535", |b| {
-        let kmeans = KMeans::new(&array, 25, 50).ok().unwrap();
-
         b.to_async(&rt)
-            .iter(|| async { kmeans.compute_membership(values.as_slice(), None) })
+            .iter(|| async { compute_partitions_arrow_array(&array, &query, DistanceType::L2) })
     });
 
     let dimension = 8;
