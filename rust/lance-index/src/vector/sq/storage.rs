@@ -277,8 +277,7 @@ impl<'a> DistCalculator<'a> for SQDistCalculator<'a> {
             for offset in (0..self.dim).step_by(CACHE_LINE_SIZE) {
                 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 {
-                    use core::arch::x86_64::_mm_prefetch;
-                    const _MM_HINT_T0: i32 = 1;
+                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
                     _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
                 }
             }
