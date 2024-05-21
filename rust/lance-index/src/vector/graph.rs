@@ -9,6 +9,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
+use bitvec::vec::BitVec;
 use lance_core::Result;
 
 pub mod builder;
@@ -150,7 +151,7 @@ pub trait Graph {
 
 /// Array-based visited list (faster than HashSet)
 pub struct Visited<'a> {
-    visited: &'a mut [bool],
+    visited: &'a mut BitVec,
     recently_visited: Vec<u32>,
 }
 
@@ -158,7 +159,7 @@ impl<'a> Visited<'a> {
     pub fn insert(&mut self, node_id: u32) {
         let node_id_usize = node_id as usize;
         if !self.visited[node_id_usize] {
-            self.visited[node_id_usize] = true;
+            self.visited.set(node_id_usize, true);
             self.recently_visited.push(node_id);
         }
     }
@@ -172,7 +173,7 @@ impl<'a> Visited<'a> {
 impl<'a> Drop for Visited<'a> {
     fn drop(&mut self) {
         for node_id in self.recently_visited.iter() {
-            self.visited[*node_id as usize] = false;
+            self.visited.set(*node_id as usize, false);
         }
         self.recently_visited.clear();
     }
@@ -180,14 +181,14 @@ impl<'a> Drop for Visited<'a> {
 
 #[derive(Debug, Clone)]
 pub struct VisitedGenerator {
-    visited: Vec<bool>,
+    visited: BitVec,
     capacity: usize,
 }
 
 impl VisitedGenerator {
     pub fn new(capacity: usize) -> Self {
         Self {
-            visited: vec![false; capacity],
+            visited: BitVec::repeat(false, capacity),
             capacity,
         }
     }
