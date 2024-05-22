@@ -43,6 +43,27 @@ impl ValuePageScheduler {
     }
 }
 
+fn decompress_with_ranges(
+    bytes: &Vec<Bytes>,
+    range_offsets: &Vec<std::ops::Range<usize>>,
+) -> Result<Vec<Bytes>> {
+    // TODO: extract the method, add environment controlled by a flag
+    // decompress the bytes and cut the range of bytes
+    // zstd decompress the bytes
+    let bytes_u8: Vec<u8> = bytes.into_iter().flat_map(|b| b.to_vec()).collect();
+    let buffer_compressor = GeneralBufferCompressor::get_compressor("");
+    let mut decompressed_bytes: Vec<u8> = Vec::new();
+    buffer_compressor.decompress(&bytes_u8, &mut decompressed_bytes)?;
+
+    let mut bytes_in_ranges: Vec<Bytes> = Vec::new();
+    for range in range_offsets {
+        let start = range.start;
+        let end = range.end;
+        bytes_in_ranges.push(Bytes::from(decompressed_bytes[start..end].to_vec()));
+    }
+    Ok(bytes_in_ranges)
+}
+
 impl PhysicalPageScheduler for ValuePageScheduler {
     fn schedule_ranges(
         &self,
@@ -77,10 +98,11 @@ impl PhysicalPageScheduler for ValuePageScheduler {
 
         async move {
             let bytes = bytes.await?;
+            let decompressed_bytes = decompress_with_ranges(&bytes, &range_offsets)?;
 
             Ok(Box::new(ValuePageDecoder {
                 bytes_per_value,
-                data: bytes,
+                data: decompressed_bytes,
                 range_offsets,
             }) as Box<dyn PhysicalPageDecoder>)
         }
@@ -92,27 +114,6 @@ struct ValuePageDecoder {
     bytes_per_value: u64,
     data: Vec<Bytes>,
     range_offsets: Vec<std::ops::Range<usize>>,
-}
-
-fn decompress_with_ranges(
-    bytes: &Vec<Bytes>,
-    range_offsets: &Vec<std::ops::Range<usize>>,
-) -> Result<Vec<Bytes>> {
-    // TODO: extract the method, add environment controlled by a flag
-    // decompress the bytes and cut the range of bytes
-    // zstd decompress the bytes
-    let bytes_u8: Vec<u8> = bytes.into_iter().flat_map(|b| b.to_vec()).collect();
-    let buffer_compressor = GeneralBufferCompressor::get_compressor("");
-    let mut decompressed_bytes: Vec<u8> = Vec::new();
-    buffer_compressor.decompress(&bytes_u8, &mut decompressed_bytes)?;
-
-    let mut bytes_in_ranges: Vec<Bytes> = Vec::new();
-    for range in range_offsets {
-        let start = range.start;
-        let end = range.end;
-        bytes_in_ranges.push(Bytes::from(decompressed_bytes[start..end].to_vec()));
-    }
-    Ok(bytes_in_ranges)
 }
 
 impl PhysicalPageDecoder for ValuePageDecoder {
@@ -133,7 +134,6 @@ impl PhysicalPageDecoder for ValuePageDecoder {
         num_rows: u32,
         dest_buffers: &mut [bytes::BytesMut],
     ) -> Result<()> {
-        let data = decompress_with_ranges(&self.data, &self.range_offsets)?;
         let mut bytes_to_skip = rows_to_skip as u64 * self.bytes_per_value;
         let mut bytes_to_take = num_rows as u64 * self.bytes_per_value;
 
@@ -141,7 +141,7 @@ impl PhysicalPageDecoder for ValuePageDecoder {
 
         debug_assert!(dest.capacity() as u64 >= bytes_to_take);
 
-        for buf in &data {
+        for buf in &self.data {
             let buf_len = buf.len() as u64;
             if bytes_to_skip > buf_len {
                 bytes_to_skip -= buf_len;
