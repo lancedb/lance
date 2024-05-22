@@ -17,7 +17,7 @@ pub mod memory;
 pub mod storage;
 
 /// Vector storage to back a graph.
-pub use storage::VectorStorage;
+pub use storage::VectorStore;
 
 use crate::vector::DIST_COL;
 
@@ -234,7 +234,7 @@ pub fn beam_search(
     graph: &dyn Graph,
     ep: &OrderedNode,
     k: usize,
-    dist_calc: &dyn DistCalculator,
+    dist_calc: &impl DistCalculator,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
     prefetch_distance: Option<usize>,
     visited_generator: &mut VisitedGenerator,
@@ -337,7 +337,7 @@ pub fn beam_search(
 pub fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
-    dist_calc: &dyn DistCalculator,
+    dist_calc: &impl DistCalculator,
 ) -> Result<OrderedNode> {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
