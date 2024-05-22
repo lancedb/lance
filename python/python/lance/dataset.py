@@ -97,9 +97,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             source is some kind of generator.
         """
         reader = _coerce_reader(data_obj, schema)
-        merge_dict = super(MergeInsertBuilder, self).execute(reader)
 
-        return merge_dict
+        return super(MergeInsertBuilder, self).execute(reader)
 
     # These next three overrides exist only to document the methods
 
@@ -947,10 +946,11 @@ class LanceDataset(pa.dataset.Dataset):
         >>> dataset = lance.write_dataset(table, "example")
         >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
         >>> # Perform a "upsert" operation
-        >>> dataset.merge_insert("a")             \\
-        ...        .when_matched_update_all()     \\
-        ...        .when_not_matched_insert_all() \\
-        ...        .execute(new_table)
+        >>> dataset.merge_insert("a")     \\
+        ...             .when_matched_update_all()     \\
+        ...             .when_not_matched_insert_all() \\
+        ...             .execute(new_table)
+        {'num_inserted_rows': 1, 'num_updated_rows': 2, 'num_deleted_rows': 0}
         >>> dataset.to_table().sort_by("a").to_pandas()
            a  b
         0  1  b

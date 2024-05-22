@@ -915,6 +915,14 @@ def test_delete_data(tmp_path: Path):
     assert dataset.count_rows() == 0
 
 
+def check_merge_stats(merge_dict, expected):
+    assert (
+        merge_dict["num_inserted_rows"],
+        merge_dict["num_updated_rows"],
+        merge_dict["num_deleted_rows"],
+    ) == expected
+
+
 def test_merge_insert(tmp_path: Path):
     nrows = 1000
     table = pa.Table.from_pydict(
@@ -945,11 +953,7 @@ def test_merge_insert(tmp_path: Path):
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (300, 0, 0)
+    check_merge_stats(merge_dict, (300, 0, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
@@ -957,11 +961,7 @@ def test_merge_insert(tmp_path: Path):
     table = dataset.to_table()
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 700
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (0, 700, 0)
+    check_merge_stats(merge_dict, (0, 700, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
@@ -974,11 +974,7 @@ def test_merge_insert(tmp_path: Path):
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 1000
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (300, 700, 0)
+    check_merge_stats(merge_dict, (300, 700, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
@@ -991,11 +987,7 @@ def test_merge_insert(tmp_path: Path):
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 650
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (300, 350, 0)
+    check_merge_stats(merge_dict, (300, 350, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
@@ -1005,11 +997,7 @@ def test_merge_insert(tmp_path: Path):
     table = dataset.to_table()
     assert table.num_rows == 700
     assert table.filter(is_new).num_rows == 0
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (0, 0, 300)
+    check_merge_stats(merge_dict, (0, 0, 300))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
@@ -1023,11 +1011,7 @@ def test_merge_insert(tmp_path: Path):
     table = dataset.to_table()
     assert table.num_rows == 1200
     assert table.filter(is_new).num_rows == 300
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (300, 0, 100)
+    check_merge_stats(merge_dict, (300, 0, 100))
 
     # If the user doesn't specify anything then the merge_insert is
     # a no-op and the operation fails
@@ -1035,11 +1019,7 @@ def test_merge_insert(tmp_path: Path):
     dataset.restore()
     with pytest.raises(ValueError):
         merge_dict = dataset.merge_insert("a").execute(new_table)
-        assert (
-            merge_dict["num_inserted_rows"],
-            merge_dict["num_updated_rows"],
-            merge_dict["num_deleted_rows"],
-        ) == (None, None, None)
+        check_merge_stats(merge_dict, (None, None, None))
 
 
 def test_flat_vector_search_with_delete(tmp_path: Path):
@@ -1099,11 +1079,7 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
     )
 
     assert table.sort_by("id") == expected
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (0, 2, 0)
+    check_merge_stats(merge_dict, (0, 2, 0))
 
     # No matches
 
@@ -1120,11 +1096,8 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
         .when_matched_update_all("target.txNumber < source.txNumber")
         .execute(new_table)
     )
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (0, 0, 0)
+
+    check_merge_stats(merge_dict, (0, 0, 0))
 
 
 def test_merge_insert_source_is_dataset(tmp_path: Path):
@@ -1153,11 +1126,7 @@ def test_merge_insert_source_is_dataset(tmp_path: Path):
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (300, 0, 0)
+    check_merge_stats(merge_dict, (300, 0, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
@@ -1172,11 +1141,7 @@ def test_merge_insert_source_is_dataset(tmp_path: Path):
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (300, 0, 0)
+    check_merge_stats(merge_dict, (300, 0, 0))
 
 
 def test_merge_insert_multiple_keys(tmp_path: Path):
@@ -1214,11 +1179,7 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
     table = dataset.to_table()
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 350
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (0, 350, 0)
+    check_merge_stats(merge_dict, (0, 350, 0))
 
 
 def test_merge_insert_incompatible_schema(tmp_path: Path):
@@ -1243,11 +1204,7 @@ def test_merge_insert_incompatible_schema(tmp_path: Path):
         merge_dict = (
             dataset.merge_insert("a").when_matched_update_all().execute(new_table)
         )
-        assert (
-            merge_dict["num_inserted_rows"],
-            merge_dict["num_updated_rows"],
-            merge_dict["num_deleted_rows"],
-        ) == (None, None, None)
+        check_merge_stats(merge_dict, (None, None, None))
 
 
 def test_merge_insert_vector_column(tmp_path: Path):
@@ -1285,11 +1242,7 @@ def test_merge_insert_vector_column(tmp_path: Path):
     )
 
     assert dataset.to_table().sort_by("key") == expected
-    assert (
-        merge_dict["num_inserted_rows"],
-        merge_dict["num_updated_rows"],
-        merge_dict["num_deleted_rows"],
-    ) == (1, 1, 0)
+    check_merge_stats(merge_dict, (1, 1, 0))
 
 
 def test_update_dataset(tmp_path: Path):
