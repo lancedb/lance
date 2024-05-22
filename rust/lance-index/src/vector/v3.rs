@@ -3,3 +3,4 @@
 
 pub mod shuffler;
 pub mod storage;
+pub mod subindex;
