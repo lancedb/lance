@@ -27,6 +27,7 @@ use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
 
+use crate::distance::hamming::hamming;
 use crate::distance::{dot_distance_batch, DistanceType};
 use crate::kernels::argmax;
 use crate::{
@@ -295,6 +296,52 @@ where
     }
 }
 
+struct KModeAlgo {}
+
+impl KMeansAlgo<u8> for KModeAlgo {
+    fn compute_membership_and_loss(
+        centroids: &[u8],
+        data: &[u8],
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> (Vec<Option<u32>>, f64) {
+        assert_eq!(distance_type, DistanceType::Hamming);
+        let cluster_and_dists = data
+            .par_chunks(dimension)
+            .map(|vec| {
+                argmin_value(
+                    centroids
+                        .par_chunks(dimension)
+                        .map(|c| hamming(vec, c))
+                        .collect::<Vec<f32>>()
+                        .into_iter(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (
+            cluster_and_dists
+                .par_iter()
+                .map(|cd| cd.map(|(c, _)| c))
+                .collect::<Vec<_>>(),
+            cluster_and_dists
+                .par_iter()
+                .map(|cd| cd.map(|(_, d)| d).unwrap_or_default() as f64)
+                .sum(),
+        )
+    }
+
+    fn to_kmeans(
+        data: &[u8],
+        dimension: usize,
+        k: usize,
+        membership: &[Option<u32>],
+        distance_type: DistanceType,
+    ) -> KMeans {
+        assert_eq!(distance_type, DistanceType::Hamming);
+        unimplemented!()
+    }
+}
+
 impl KMeans {
     fn empty(dimension: usize, distance_type: DistanceType) -> Self {
         Self {
@@ -355,7 +402,7 @@ impl KMeans {
         params: &KMeansParams,
     ) -> Result<Self>
     where
-        T::Native: Float + L2 + Dot + Sync + AddAssign + DivAssign + FromPrimitive,
+        T::Native: Num,
     {
         let dimension = data.value_length() as usize;
 
@@ -463,8 +510,7 @@ impl KMeans {
                 Self::train_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(data, k, params)
             }
             (DataType::UInt8, DistanceType::Hamming) => {
-                // Self::train_kmeans::<UInt8Type>(data, k, params)
-                todo!()
+                Self::train_kmeans::<UInt8Type, KModeAlgo>(data, k, params)
             }
             _ => Err(ArrowError::InvalidArgumentError(format!(
                 "KMeans: data must be floating number, got: {}",
@@ -663,7 +709,7 @@ mod tests {
         let centroids = generate_random_array(DIM * 18);
         let data = generate_random_array(DIM * 20);
 
-        let (membership, loss) = KMeans::compute_membership_and_loss(
+        let (membership, loss) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(
             centroids.as_slice(),
             data.values(),
             DIM,
@@ -698,7 +744,7 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = repeat(f32::NAN).take(DIM * K).collect::<Vec<_>>();
 
-        let (membership, _) = KMeans::compute_membership_and_loss(
+        let (membership, _) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(
             centroids.as_slice(),
             &values,
             DIM,
