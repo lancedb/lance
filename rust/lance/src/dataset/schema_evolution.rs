@@ -797,6 +797,7 @@ mod test {
                         files: vec![],
                         id: 0,
                         deletion_file: None,
+                        row_id_meta: None,
                         physical_rows: Some(50),
                     }))
                 } else {

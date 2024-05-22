@@ -101,6 +101,9 @@ pub struct WriteParams {
     /// Unless you are intentionally testing the v2 writer, you should leave this as false
     /// as the v2 writer is still experimental and not fully implemented.
     pub use_experimental_writer: bool,
+
+    /// Enable experimental stable row ids.
+    pub enable_experimental_stable_row_ids: bool,
 }
 
 impl Default for WriteParams {
@@ -116,6 +119,7 @@ impl Default for WriteParams {
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
             use_experimental_writer: false,
+            enable_experimental_stable_row_ids: false,
         }
     }
 }

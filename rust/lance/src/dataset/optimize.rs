@@ -929,12 +929,14 @@ mod tests {
                 id: 0,
                 files: Vec::new(),
                 deletion_file: None,
+                row_id_meta: None,
                 physical_rows: Some(5),
             },
             Fragment {
                 id: 3,
                 files: Vec::new(),
                 deletion_file: None,
+                row_id_meta: None,
                 physical_rows: Some(3),
             },
         ];
@@ -1060,6 +1062,7 @@ mod tests {
             id: 0,
             files: vec![],
             deletion_file: None,
+            row_id_meta: None,
             physical_rows: Some(0),
         };
         let single_bin = CandidateBin {
@@ -1566,18 +1569,21 @@ mod tests {
                 id: 0,
                 files: Vec::new(),
                 deletion_file: None,
+                row_id_meta: None,
                 physical_rows: Some(5),
             },
             Fragment {
                 id: 3,
                 files: Vec::new(),
                 deletion_file: None,
+                row_id_meta: None,
                 physical_rows: Some(3),
             },
             Fragment {
                 id: 1,
                 files: Vec::new(),
                 deletion_file: None,
+                row_id_meta: None,
                 physical_rows: Some(3),
             },
         ];

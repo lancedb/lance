@@ -74,7 +74,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_write_check() {
         assert!(can_write_dataset(0));
         assert!(can_write_dataset(super::FLAG_DELETION_FILES));

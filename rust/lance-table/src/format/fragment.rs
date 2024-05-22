@@ -173,9 +173,9 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
 /// A reference to a part of a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalFile {
-    path: String,
-    offset: u64,
-    size: u64,
+    pub path: String,
+    pub offset: u64,
+    pub size: u64,
 }
 
 /// Metadata about location of the row id sequence.
