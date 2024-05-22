@@ -646,7 +646,7 @@ impl Dataset {
         };
         let data = self.object_store.inner.get(&path).await?.bytes().await?;
         let transaction = lance_table::format::pb::Transaction::decode(data)?;
-        Transaction::try_from(&transaction).map(Some)
+        Transaction::try_from(transaction).map(Some)
     }
 
     /// Restore the currently checked out version of the dataset as the latest version.

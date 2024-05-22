@@ -665,14 +665,17 @@ impl Transaction {
     }
 }
 
-impl TryFrom<&pb::Transaction> for Transaction {
+impl TryFrom<pb::Transaction> for Transaction {
     type Error = Error;
 
-    fn try_from(message: &pb::Transaction) -> Result<Self> {
-        let operation = match &message.operation {
+    fn try_from(message: pb::Transaction) -> Result<Self> {
+        let operation = match message.operation {
             Some(pb::transaction::Operation::Append(pb::transaction::Append { fragments })) => {
                 Operation::Append {
-                    fragments: fragments.iter().map(Fragment::from).collect(),
+                    fragments: fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
                 }
             }
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
@@ -680,7 +683,10 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 deleted_fragment_ids,
                 predicate,
             })) => Operation::Delete {
-                updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
+                updated_fragments: updated_fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
                 deleted_fragment_ids: deleted_fragment_ids.clone(),
                 predicate: predicate.clone(),
             },
@@ -689,14 +695,15 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Overwrite {
-                fragments: fragments.iter().map(Fragment::from).collect(),
+                fragments: fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
                 schema: Schema::from(&Fields(schema.clone())),
             },
             Some(pb::transaction::Operation::ReserveFragments(
                 pb::transaction::ReserveFragments { num_fragments },
-            )) => Operation::ReserveFragments {
-                num_fragments: *num_fragments,
-            },
+            )) => Operation::ReserveFragments { num_fragments },
             Some(pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 old_fragments,
                 new_fragments,
@@ -705,13 +712,19 @@ impl TryFrom<&pb::Transaction> for Transaction {
             })) => {
                 let groups = if !groups.is_empty() {
                     groups
-                        .iter()
+                        .into_iter()
                         .map(RewriteGroup::try_from)
                         .collect::<Result<_>>()?
                 } else {
                     vec![RewriteGroup {
-                        old_fragments: old_fragments.iter().map(Fragment::from).collect(),
-                        new_fragments: new_fragments.iter().map(Fragment::from).collect(),
+                        old_fragments: old_fragments
+                            .into_iter()
+                            .map(Fragment::try_from)
+                            .collect::<Result<Vec<_>>>()?,
+                        new_fragments: new_fragments
+                            .into_iter()
+                            .map(Fragment::try_from)
+                            .collect::<Result<Vec<_>>>()?,
                     }]
                 };
                 let rewritten_indices = rewritten_indices
@@ -729,11 +742,11 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 removed_indices,
             })) => Operation::CreateIndex {
                 new_indices: new_indices
-                    .iter()
+                    .into_iter()
                     .map(Index::try_from)
                     .collect::<Result<_>>()?,
                 removed_indices: removed_indices
-                    .iter()
+                    .into_iter()
                     .map(Index::try_from)
                     .collect::<Result<_>>()?,
             },
@@ -742,11 +755,14 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Merge {
-                fragments: fragments.iter().map(Fragment::from).collect(),
+                fragments: fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
                 schema: Schema::from(&Fields(schema.clone())),
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
-                Operation::Restore { version: *version }
+                Operation::Restore { version }
             }
             Some(pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids,
@@ -754,8 +770,14 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 new_fragments,
             })) => Operation::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
-                updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
-                new_fragments: new_fragments.iter().map(Fragment::from).collect(),
+                updated_fragments: updated_fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
+                new_fragments: new_fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -811,13 +833,21 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
     }
 }
 
-impl TryFrom<&pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
+impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     type Error = Error;
 
-    fn try_from(message: &pb::transaction::rewrite::RewriteGroup) -> Result<Self> {
+    fn try_from(message: pb::transaction::rewrite::RewriteGroup) -> Result<Self> {
         Ok(Self {
-            old_fragments: message.old_fragments.iter().map(Fragment::from).collect(),
-            new_fragments: message.new_fragments.iter().map(Fragment::from).collect(),
+            old_fragments: message
+                .old_fragments
+                .into_iter()
+                .map(Fragment::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            new_fragments: message
+                .new_fragments
+                .into_iter()
+                .map(Fragment::try_from)
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 }
