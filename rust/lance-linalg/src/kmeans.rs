@@ -229,11 +229,11 @@ where
         };
         (
             cluster_and_dists
-                .par_iter()
+                .iter()
                 .map(|cd| cd.map(|(c, _)| c))
                 .collect::<Vec<_>>(),
             cluster_and_dists
-                .par_iter()
+                .iter()
                 .map(|cd| cd.map(|(_, d)| d).unwrap_or_default() as f64)
                 .sum(),
         )
@@ -321,11 +321,11 @@ impl KMeansAlgo<u8> for KModeAlgo {
             .collect::<Vec<_>>();
         (
             cluster_and_dists
-                .par_iter()
+                .iter()
                 .map(|cd| cd.map(|(c, _)| c))
                 .collect::<Vec<_>>(),
             cluster_and_dists
-                .par_iter()
+                .iter()
                 .map(|cd| cd.map(|(_, d)| d).unwrap_or_default() as f64)
                 .sum(),
         )
