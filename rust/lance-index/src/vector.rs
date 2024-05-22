@@ -8,6 +8,7 @@ use arrow_array::ArrayRef;
 use lance_linalg::distance::DistanceType;
 
 pub mod bq;
+pub mod builder;
 pub mod flat;
 pub mod graph;
 pub mod hnsw;
