@@ -621,16 +621,16 @@ impl MergeInsertJob {
     }
 }
 
-// Merger will store these statistics as it runs (for each batch)
+/// Merger will store these statistics as it runs (for each batch)
 #[derive(Debug, Default, Clone)]
 pub struct MergeStats {
-    // Number of inserted rows (for user statistics)
+    /// Number of inserted rows (for user statistics)
     pub num_inserted_rows: u64,
-    // Number of updated rows (for user statistics)
+    /// Number of updated rows (for user statistics)
     pub num_updated_rows: u64,
-    // Number of deleted rows (for user statistics)
-    // Note: This is different from internal references to 'deleted_rows', since we technically "delete" updated rows during processing.
-    // However those rows are not shared with the user.
+    /// Number of deleted rows (for user statistics)
+    /// Note: This is different from internal references to 'deleted_rows', since we technically "delete" updated rows during processing.
+    /// However those rows are not shared with the user.
     pub num_deleted_rows: u64,
 }
 

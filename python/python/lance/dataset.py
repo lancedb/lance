@@ -83,7 +83,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
     def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
         """Executes the merge insert operation
 
-        There is no return value but the original dataset will be updated.
+        This function updates the original dataset and returns a dictionary with
+        information about merge statistics - i.e. the number of inserted, updated,
+        and deleted rows.
 
         Parameters
         ----------
