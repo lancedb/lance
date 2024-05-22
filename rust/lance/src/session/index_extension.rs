@@ -67,7 +67,6 @@ mod test {
     use arrow_array::RecordBatch;
     use arrow_schema::Schema;
     use lance_file::writer::{FileWriter, FileWriterOptions};
-    use lance_index::vector::graph::VectorStorage;
     use lance_index::{
         vector::{hnsw::VECTOR_ID_FIELD, Query},
         DatasetIndexExt, Index, IndexMetadata, IndexType, INDEX_FILE_NAME,
@@ -133,7 +132,7 @@ mod test {
             todo!("panic")
         }
 
-        fn storage(&self) -> &dyn VectorStorage {
+        fn row_ids(&self) -> &[u64] {
             todo!("panic")
         }
 

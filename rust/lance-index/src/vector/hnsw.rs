@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
 
-use super::graph::{OrderedFloat, OrderedNode, VectorStorage};
+use super::graph::{OrderedFloat, OrderedNode, VectorStore};
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
@@ -54,7 +54,7 @@ pub fn select_neighbors(
 ///
 /// WARNING: Internal API,  API stability is not guaranteed
 pub fn select_neighbors_heuristic(
-    storage: &dyn VectorStorage,
+    storage: &impl VectorStore,
     candidates: &[OrderedNode],
     k: usize,
 ) -> Vec<OrderedNode> {
