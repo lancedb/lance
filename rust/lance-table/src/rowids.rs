@@ -13,6 +13,8 @@
 //! representation, to avoid unnecessary deserialization.
 use std::ops::Range;
 
+// TODO: replace this with Arrow BooleanBuffer.
+
 // These are all internal data structures, and are private.
 mod bitmap;
 mod encoded_array;
