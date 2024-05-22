@@ -17,8 +17,7 @@ use std::sync::Arc;
 use arrow::compute::concat;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, UInt32Array,
-    UInt64Array,
+    cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array, UInt64Array,
 };
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
@@ -31,10 +30,10 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::hnsw::HNSW;
+use lance_linalg::kmeans::compute_partitions;
 use lance_linalg::{
     distance::DistanceType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
-    Clustering,
 };
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -57,7 +56,7 @@ pub struct KMeans {
     max_iters: u32,
 
     /// A trained KMean model. This is set after calling `fit`.
-    trained_kmeans: Option<LanceKMeans<Float32Type>>,
+    trained_kmeans: Option<LanceKMeans>,
 }
 
 #[pymethods]
@@ -111,13 +110,19 @@ impl KMeans {
             return Err(PyValueError::new_err("Must be a FixedSizeList of Float32"));
         };
         let values: Arc<Float32Array> = fixed_size_arr.values().as_primitive().clone().into();
-        let cluster_ids = UInt32Array::from(kmeans.compute_membership(values.values(), None));
+        let centroids: &Float32Array = kmeans.centroids.as_primitive();
+        let cluster_ids = UInt32Array::from(compute_partitions(
+            centroids.values(),
+            values.values(),
+            kmeans.dimension,
+            kmeans.distance_type,
+        ));
         cluster_ids.into_data().to_pyarrow(py)
     }
 
     fn centroids(&self, py: Python) -> PyResult<PyObject> {
         if let Some(kmeans) = self.trained_kmeans.as_ref() {
-            let centroids: Float32Array = kmeans.centroids.as_ref().clone();
+            let centroids: Float32Array = kmeans.centroids.as_primitive().clone();
             let fixed_size_arr =
                 FixedSizeListArray::try_new_from_values(centroids, kmeans.dimension as i32)
                     .map_err(|e| {
