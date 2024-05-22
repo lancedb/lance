@@ -38,7 +38,7 @@ pub mod index;
 pub mod optimize;
 pub mod progress;
 pub mod scanner;
-pub mod schema_evolution;
+mod schema_evolution;
 mod take;
 pub mod transaction;
 pub mod updater;
@@ -50,7 +50,6 @@ use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
-use self::schema_evolution::{ColumnAlteration, NewColumnTransform};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
@@ -61,6 +60,9 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
+pub use schema_evolution::{
+    BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
+};
 pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
