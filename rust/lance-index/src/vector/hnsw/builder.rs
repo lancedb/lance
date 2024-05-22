@@ -7,6 +7,7 @@ use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt32Type};
 use arrow_array::{ArrayRef, RecordBatch};
 use crossbeam_queue::ArrayQueue;
+use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::tokio::spawn_cpu;
@@ -43,7 +44,7 @@ use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
 /// Parameters of building HNSW index
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
     /// max level ofm
     pub max_level: u16,
@@ -111,7 +112,7 @@ impl HnswBuildParams {
 /// During the build, the graph is built layer by layer.
 ///
 /// Each node in the graph has a global ID which is the index on the base layer.
-#[derive(Clone)]
+#[derive(Clone, DeepSizeOf)]
 pub struct HNSW {
     inner: Arc<HNSWBuilderInner>,
 }
@@ -508,6 +509,16 @@ struct HNSWBuilderInner {
     entry_point: u32,
 
     visited_generator_queue: Arc<ArrayQueue<VisitedGenerator>>,
+}
+
+impl DeepSizeOf for HNSWBuilderInner {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.distance_type.deep_size_of_children(context)
+            + self.params.deep_size_of_children(context)
+            + self.nodes.deep_size_of_children(context)
+            + self.level_count.deep_size_of_children(context)
+        // Skipping the visited_generator_queue
+    }
 }
 
 impl HNSWBuilderInner {

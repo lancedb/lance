@@ -3,13 +3,14 @@
 
 use std::sync::Arc;
 
+use deepsize::DeepSizeOf;
 use lance_core::Result;
 use lance_file::reader::FileReader;
 use lance_index::{IndexParams, IndexType};
 
 use crate::{index::vector::VectorIndex, Dataset};
 
-pub trait IndexExtension: Send + Sync {
+pub trait IndexExtension: Send + Sync + DeepSizeOf {
     fn index_type(&self) -> IndexType;
 
     // TODO: this shouldn't exist, as upcasting should be well defined
@@ -66,6 +67,7 @@ mod test {
 
     use arrow_array::RecordBatch;
     use arrow_schema::Schema;
+    use deepsize::DeepSizeOf;
     use lance_file::writer::{FileWriter, FileWriterOptions};
     use lance_index::{
         vector::{hnsw::VECTOR_ID_FIELD, Query},
@@ -81,6 +83,12 @@ mod test {
 
     #[derive(Debug)]
     struct MockIndex;
+
+    impl DeepSizeOf for MockIndex {
+        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+            todo!()
+        }
+    }
 
     #[async_trait::async_trait]
     impl Index for MockIndex {
@@ -156,6 +164,12 @@ mod test {
                 create_index_called: AtomicBool::new(false),
                 load_index_called: AtomicBool::new(false),
             }
+        }
+    }
+
+    impl DeepSizeOf for MockIndexExtension {
+        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+            todo!()
         }
     }
 

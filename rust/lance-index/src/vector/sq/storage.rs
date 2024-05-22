@@ -9,6 +9,7 @@ use arrow::{
 };
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_io::object_store::ObjectStore;
@@ -36,6 +37,12 @@ pub struct ScalarQuantizationMetadata {
     pub dim: usize,
     pub num_bits: u16,
     pub bounds: Range<f64>,
+}
+
+impl DeepSizeOf for ScalarQuantizationMetadata {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        0
+    }
 }
 
 #[async_trait]
@@ -73,6 +80,14 @@ pub struct ScalarQuantizationStorage {
     // Helper fields, references to the batch
     row_ids: Arc<UInt64Array>,
     sq_codes: Arc<FixedSizeListArray>,
+}
+
+impl DeepSizeOf for ScalarQuantizationStorage {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.batch.get_array_memory_size()
+            + self.row_ids.get_array_memory_size()
+            + self.sq_codes.get_array_memory_size()
+    }
 }
 
 impl ScalarQuantizationStorage {

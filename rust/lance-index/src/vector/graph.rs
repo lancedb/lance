@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
 use bitvec::vec::BitVec;
+use deepsize::DeepSizeOf;
 use lance_core::Result;
 
 pub mod builder;
@@ -55,7 +56,7 @@ impl<I> From<I> for GraphNode<I> {
 
 /// A wrapper for f32 to make it ordered, so that we can put it into
 /// a BTree or Heap
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, DeepSizeOf)]
 pub struct OrderedFloat(pub f32);
 
 impl PartialOrd for OrderedFloat {
@@ -84,7 +85,7 @@ impl From<OrderedFloat> for f32 {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone, DeepSizeOf)]
 pub struct OrderedNode {
     pub id: u32,
     pub dist: OrderedFloat,

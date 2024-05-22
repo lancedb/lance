@@ -9,6 +9,7 @@
 pub mod builder;
 use arrow_schema::{DataType, Field};
 pub use builder::HNSW;
+use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +30,7 @@ lazy_static::lazy_static! {
     pub static ref VECTOR_ID_FIELD: Field = Field::new(VECTOR_ID_COL, DataType::UInt32, true);
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswMetadata {
     pub entry_point: u32,
     pub params: HnswBuildParams,

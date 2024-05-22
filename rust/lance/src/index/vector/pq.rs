@@ -14,6 +14,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
@@ -57,6 +58,22 @@ pub struct PQIndex {
 
     /// Metric type.
     metric_type: MetricType,
+}
+
+impl DeepSizeOf for PQIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.pq.deep_size_of_children(context)
+            + self
+                .code
+                .as_ref()
+                .map(|code| code.get_array_memory_size())
+                .unwrap_or(0)
+            + self
+                .row_ids
+                .as_ref()
+                .map(|row_ids| row_ids.get_array_memory_size())
+                .unwrap_or(0)
+    }
 }
 
 impl std::fmt::Debug for PQIndex {

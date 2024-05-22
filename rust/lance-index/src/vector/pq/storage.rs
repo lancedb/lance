@@ -7,14 +7,15 @@
 
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
-use arrow_array::ArrayRef;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
     FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
@@ -53,6 +54,15 @@ pub struct ProductQuantizationMetadata {
 
     #[serde(skip)]
     pub codebook: Option<FixedSizeListArray>,
+}
+
+impl DeepSizeOf for ProductQuantizationMetadata {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.codebook
+            .as_ref()
+            .map(|codebook| codebook.get_array_memory_size())
+            .unwrap_or(0)
+    }
 }
 
 #[async_trait]
@@ -134,6 +144,15 @@ pub struct ProductQuantizationStorage {
     // For easy access
     pq_code: Arc<UInt8Array>,
     row_ids: Arc<UInt64Array>,
+}
+
+impl DeepSizeOf for ProductQuantizationStorage {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.codebook.get_array_memory_size()
+            + self.batch.get_array_memory_size()
+            + self.pq_code.get_array_memory_size()
+            + self.row_ids.get_array_memory_size()
+    }
 }
 
 impl PartialEq for ProductQuantizationStorage {

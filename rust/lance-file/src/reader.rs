@@ -21,6 +21,7 @@ use arrow_schema::{DataType, FieldRef, Schema as ArrowSchema};
 use arrow_select::concat::{self, concat_batches};
 use arrow_select::filter::filter_record_batch;
 use async_recursion::async_recursion;
+use deepsize::DeepSizeOf;
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::cache::FileMetadataCache;
@@ -51,7 +52,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
-#[derive(Clone)]
+#[derive(Clone, DeepSizeOf)]
 pub struct FileReader {
     pub object_reader: Arc<dyn Reader>,
     metadata: Arc<Metadata>,
@@ -229,7 +230,7 @@ impl FileReader {
     }
 
     /// Load some metadata about the fragment from the cache, if there is one.
-    async fn load_from_cache<T: Send + Sync + 'static, F, Fut>(
+    async fn load_from_cache<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
         cache: Option<&FileMetadataCache>,
         path: &Path,
         loader: F,

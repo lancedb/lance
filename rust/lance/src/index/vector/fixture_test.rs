@@ -17,6 +17,7 @@ mod test {
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::{vector::Query, Index, IndexType};
     use lance_io::{local::LocalObjectReader, traits::Reader};
@@ -42,6 +43,12 @@ mod test {
         assert_query_value: Vec<f32>,
 
         ret_val: RecordBatch,
+    }
+
+    impl DeepSizeOf for ResidualCheckMockIndex {
+        fn deep_size_of_children(&self, _: &mut Context) -> usize {
+            todo!()
+        }
     }
 
     #[async_trait]

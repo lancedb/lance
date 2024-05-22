@@ -23,6 +23,7 @@ use datafusion_physical_expr::{
     expressions::{Column, MaxAccumulator, MinAccumulator},
     PhysicalSortExpr,
 };
+use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
     stream::{self},
@@ -49,6 +50,58 @@ const BTREE_PAGES_NAME: &str = "page_data.lance";
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
 struct OrderableScalarValue(ScalarValue);
+
+impl DeepSizeOf for OrderableScalarValue {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        match &self.0 {
+            ScalarValue::Null => 0,
+            ScalarValue::Boolean(_) => 0,
+            ScalarValue::Float32(_) => 0,
+            ScalarValue::Float64(_) => 0,
+            ScalarValue::Decimal128(_, _, _) => 0,
+            ScalarValue::Decimal256(_, _, _) => 0,
+            ScalarValue::Int8(_) => 0,
+            ScalarValue::Int16(_) => 0,
+            ScalarValue::Int32(_) => 0,
+            ScalarValue::Int64(_) => 0,
+            ScalarValue::UInt8(_) => 0,
+            ScalarValue::UInt16(_) => 0,
+            ScalarValue::UInt32(_) => 0,
+            ScalarValue::UInt64(_) => 0,
+            ScalarValue::Utf8(str) => str.deep_size_of_children(context),
+            ScalarValue::LargeUtf8(str) => str.deep_size_of_children(context),
+            ScalarValue::Binary(bin) => bin.deep_size_of_children(context),
+            ScalarValue::FixedSizeBinary(_, bin) => bin.deep_size_of_children(context),
+            ScalarValue::LargeBinary(bin) => bin.deep_size_of_children(context),
+            ScalarValue::FixedSizeList(arr) => arr.get_array_memory_size(),
+            ScalarValue::List(arr) => arr.get_array_memory_size(),
+            ScalarValue::LargeList(arr) => arr.get_array_memory_size(),
+            ScalarValue::Struct(arr) => arr.get_array_memory_size(),
+            ScalarValue::Date32(_) => 0,
+            ScalarValue::Date64(_) => 0,
+            ScalarValue::Time32Second(_) => 0,
+            ScalarValue::Time32Millisecond(_) => 0,
+            ScalarValue::Time64Microsecond(_) => 0,
+            ScalarValue::Time64Nanosecond(_) => 0,
+            ScalarValue::TimestampSecond(_, _) => 0,
+            ScalarValue::TimestampMillisecond(_, _) => 0,
+            ScalarValue::TimestampMicrosecond(_, _) => 0,
+            ScalarValue::TimestampNanosecond(_, _) => 0,
+            ScalarValue::IntervalYearMonth(_) => 0,
+            ScalarValue::IntervalDayTime(_) => 0,
+            ScalarValue::IntervalMonthDayNano(_) => 0,
+            ScalarValue::DurationSecond(_) => 0,
+            ScalarValue::DurationMillisecond(_) => 0,
+            ScalarValue::DurationMicrosecond(_) => 0,
+            ScalarValue::DurationNanosecond(_) => 0,
+            ScalarValue::Union(_, _, _) => todo!(),
+            // TODO: Should probably track data_type here if we upstream this
+            ScalarValue::Dictionary(_data_type, val) => {
+                OrderableScalarValue(*val.clone()).deep_size_of()
+            }
+        }
+    }
+}
 
 impl Display for OrderableScalarValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -502,7 +555,7 @@ impl Ord for OrderableScalarValue {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 struct PageRecord {
     max: OrderableScalarValue,
     page_number: u32,
@@ -520,7 +573,7 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
 }
 
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
     /// Pages where the value may be null
@@ -640,7 +693,7 @@ impl BTreeLookup {
 ///
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
 /// for faster lookup
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, DeepSizeOf)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
     store: Arc<dyn IndexStore>,
@@ -953,7 +1006,7 @@ fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
 
 /// A trait that must be implemented by anything that wishes to act as a btree subindex
 #[async_trait]
-pub trait BTreeSubIndex: Debug + Send + Sync {
+pub trait BTreeSubIndex: Debug + Send + Sync + DeepSizeOf {
     /// Trains the subindex on a single batch of data and serializes it to Arrow
     async fn train(&self, batch: RecordBatch) -> Result<RecordBatch>;
 

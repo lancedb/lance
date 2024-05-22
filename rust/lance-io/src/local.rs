@@ -16,6 +16,7 @@ use std::os::windows::fs::FileExt;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -57,6 +58,13 @@ pub struct LocalObjectReader {
 
     /// Block size, in bytes.
     block_size: usize,
+}
+
+impl DeepSizeOf for LocalObjectReader {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // Skipping `file` as it should just be a file handle
+        self.path.as_ref().deep_size_of_children(context)
+    }
 }
 
 impl LocalObjectReader {

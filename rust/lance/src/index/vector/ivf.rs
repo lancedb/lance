@@ -19,6 +19,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
@@ -115,6 +116,15 @@ pub struct IVFIndex {
     // hold a weak pointer to avoid cycles
     /// The session cache, used when fetching pages
     session: Weak<Session>,
+}
+
+impl DeepSizeOf for IVFIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.uuid.deep_size_of_children(context)
+            + self.reader.deep_size_of_children(context)
+            + self.sub_index.deep_size_of_children(context)
+        // Skipping session since it is a weak ref
+    }
 }
 
 impl IVFIndex {

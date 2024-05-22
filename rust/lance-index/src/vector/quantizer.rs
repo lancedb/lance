@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow::datatypes::Float32Type;
 use arrow_array::{FixedSizeListArray, Float32Array};
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_arrow::ArrowFloatType;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
@@ -33,7 +34,7 @@ use super::{
 };
 use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
-pub trait Quantization {
+pub trait Quantization: DeepSizeOf {
     type Metadata: QuantizerMetadata + Send + Sync;
     type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore;
 
@@ -59,7 +60,7 @@ impl std::fmt::Display for QuantizationType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub enum Quantizer {
     Product(Arc<dyn ProductQuantizer>),
     Scalar(ScalarQuantizer),
@@ -122,12 +123,12 @@ pub struct QuantizationMetadata {
 }
 
 #[async_trait]
-pub trait QuantizerMetadata: Clone + Sized {
+pub trait QuantizerMetadata: Clone + Sized + DeepSizeOf {
     async fn load(reader: &FileReader) -> Result<Self>;
 }
 
 #[async_trait::async_trait]
-pub trait QuantizerStorage: Clone + Sized {
+pub trait QuantizerStorage: Clone + Sized + DeepSizeOf {
     type Metadata: QuantizerMetadata;
 
     async fn load_partition(
@@ -303,6 +304,15 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfData,
+}
+
+impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.reader.deep_size_of_children(context)
+            + self.quantizer.deep_size_of_children(context)
+            + self.metadata.deep_size_of_children(context)
+            + self.ivf.deep_size_of_children(context)
+    }
 }
 
 impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {

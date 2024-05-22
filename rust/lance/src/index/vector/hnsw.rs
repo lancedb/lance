@@ -10,6 +10,7 @@ use std::{
 
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_index::vector::{hnsw::HNSW, quantizer::Quantizer};
@@ -37,12 +38,12 @@ use crate::RESULT_SCHEMA;
 
 pub mod builder;
 
-#[derive(Clone)]
+#[derive(Clone, DeepSizeOf)]
 pub(crate) struct HNSWIndexOptions {
     pub use_residual: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, DeepSizeOf)]
 pub(crate) struct HNSWIndex<Q: Quantization> {
     distance_type: DistanceType,
 

@@ -972,6 +972,10 @@ impl Dataset {
         Ok(self.ds.index_cache_hit_rate())
     }
 
+    fn cache_size_bytes(&self) -> u64 {
+        self.ds.cache_size_bytes()
+    }
+
     #[staticmethod]
     fn commit(
         dataset_uri: &str,

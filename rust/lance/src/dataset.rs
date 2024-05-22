@@ -6,6 +6,7 @@
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use chrono::{prelude::*, Duration};
+use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
@@ -1069,6 +1070,10 @@ impl Dataset {
     /// Get cache hit ratio.
     pub fn index_cache_hit_rate(&self) -> f32 {
         self.session.index_cache.hit_rate()
+    }
+
+    pub fn cache_size_bytes(&self) -> u64 {
+        self.session.deep_size_of() as u64
     }
 
     /// Get all versions.

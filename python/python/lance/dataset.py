@@ -1517,6 +1517,12 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.create_index(column, index_type, name, replace, kwargs)
         return LanceDataset(self.uri, index_cache_size=index_cache_size)
 
+    def cache_size_bytes(self) -> int:
+        """
+        Return the total size of the index + file metadata caches in bytes.
+        """
+        return self._ds.cache_size_bytes()
+
     @staticmethod
     def _commit(
         base_uri: Union[str, Path],
