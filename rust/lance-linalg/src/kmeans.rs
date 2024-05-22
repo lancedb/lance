@@ -9,19 +9,20 @@
 //! and run ``l2`` distance on the unit vectors.
 //!
 
+use std::collections::HashMap;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::ArrowNumericType;
 use arrow_array::{
     cast::AsArray,
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type, UInt8Type},
     Array, ArrayRef, FixedSizeListArray, Float32Array, PrimitiveArray, UInt32Array,
 };
+use arrow_array::{ArrowNumericType, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
-use half::f16;
+use bitvec::prelude::*;
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
@@ -338,7 +339,45 @@ impl KMeansAlgo<u8> for KModeAlgo {
         distance_type: DistanceType,
     ) -> KMeans {
         assert_eq!(distance_type, DistanceType::Hamming);
-        unimplemented!()
+
+        let mut clusters = HashMap::<u32, Vec<usize>>::new();
+        membership.iter().enumerate().for_each(|(i, part_id_opt)| {
+            if let Some(part_id) = part_id_opt {
+                clusters.entry(*part_id).or_default().push(i);
+            }
+        });
+        let centroids = (0..k as u32)
+            .into_par_iter()
+            .flat_map(|part_id| {
+                if let Some(vecs) = clusters.get(&part_id) {
+                    let mut ones = vec![0_32; dimension * 8];
+                    let cnt = vecs.len();
+                    vecs.iter()
+                        .flat_map(|&i| {
+                            let vec = &data[i * dimension..(i + 1) * dimension];
+                            ones.iter_mut()
+                                .zip(vec.view_bits::<Lsb0>())
+                                .for_each(|(c, v)| {
+                                    if *v.as_ref() {
+                                        *c += 1;
+                                    }
+                                });
+                            let bits = ones.iter().map(|&c| c * 2 > cnt).collect::<BitVec<u8>>();
+
+                            bits.into_vec().into_iter().map(|v| Some(v))
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![None; dimension]
+                }
+            })
+            .collect::<Vec<_>>();
+
+        KMeans {
+            centroids: Arc::new(UInt8Array::from(centroids)),
+            dimension,
+            distance_type,
+        }
     }
 }
 
