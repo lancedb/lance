@@ -5,6 +5,7 @@ use std::any::Any;
 
 use arrow_array::ArrayRef;
 use lance_linalg::distance::MetricType;
+use num_traits::Num;
 
 /// WARNING: Internal API,  API stability is not guaranteed
 pub trait DistCalculator {
@@ -49,4 +50,8 @@ pub trait VectorStore: Send + Sync {
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
 
     fn distance_between(&self, a: u32, b: u32) -> f32;
+
+    fn dist_calculator_from_native<T: Num>(&self, _query: &[T]) -> Self::DistanceCalculator<'_> {
+        todo!("Implement this")
+    }
 }
