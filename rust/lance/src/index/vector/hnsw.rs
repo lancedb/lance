@@ -15,10 +15,11 @@ use lance_file::reader::FileReader;
 use lance_index::vector::{hnsw::HNSW, quantizer::Quantizer};
 use lance_index::{
     vector::{
-        graph::{VectorStore, NEIGHBORS_FIELD},
+        graph::NEIGHBORS_FIELD,
         hnsw::{HnswMetadata, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization},
+        v3::storage::VectorStore,
         Query,
     },
     Index, IndexType,
