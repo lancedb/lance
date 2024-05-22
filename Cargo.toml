@@ -85,7 +85,7 @@ chrono = { version = "0.4.25", default-features = false, features = [
     "std",
     "now",
 ] }
-criterion = { version = "0.5", features = ["async", "async_tokio"] }
+criterion = { version = "0.5", features = ["async", "async_tokio", "html_reports"] }
 crossbeam-queue = "0.3"
 datafusion = { version = "37.1", default-features = false, features = [
     "array_expressions",
@@ -120,6 +120,7 @@ prost = "0.12.2"
 prost-build = "0.12.2"
 prost-types = "0.12.2"
 rand = { version = "0.8.3", features = ["small_rng"] }
+rangemap = { version = "1.0" }
 rayon = "1.10"
 roaring = "0.10.1"
 rustc_version = "0.4"
