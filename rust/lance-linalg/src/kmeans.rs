@@ -352,20 +352,22 @@ impl KMeansAlgo<u8> for KModeAlgo {
                 if let Some(vecs) = clusters.get(&part_id) {
                     let mut ones = vec![0_32; dimension * 8];
                     let cnt = vecs.len();
-                    vecs.iter()
-                        .flat_map(|&i| {
-                            let vec = &data[i * dimension..(i + 1) * dimension];
-                            ones.iter_mut()
-                                .zip(vec.view_bits::<Lsb0>())
-                                .for_each(|(c, v)| {
-                                    if *v.as_ref() {
-                                        *c += 1;
-                                    }
-                                });
-                            let bits = ones.iter().map(|&c| c * 2 > cnt).collect::<BitVec<u8>>();
+                    vecs.iter().for_each(|&i| {
+                        let vec = &data[i * dimension..(i + 1) * dimension];
+                        ones.iter_mut()
+                            .zip(vec.view_bits::<Lsb0>())
+                            .for_each(|(c, v)| {
+                                if *v.as_ref() {
+                                    *c += 1;
+                                }
+                            });
+                    });
 
-                            bits.into_vec().into_iter().map(|v| Some(v))
-                        })
+                    let bits = ones.iter().map(|&c| c * 2 > cnt).collect::<BitVec<u8>>();
+                    bits.as_raw_slice()
+                        .iter()
+                        .copied()
+                        .map(|b| Some(b))
                         .collect::<Vec<_>>()
                 } else {
                     vec![None; dimension]
@@ -449,7 +451,8 @@ impl KMeans {
             .values()
             .as_primitive_opt::<T>()
             .ok_or(Error::InvalidArgumentError(format!(
-                "KMeans: data must be floating number, got: {}",
+                "KMeans: data must be {}, got: {}",
+                T::DATA_TYPE,
                 data.value_type()
             )))?;
 
@@ -552,8 +555,9 @@ impl KMeans {
                 Self::train_kmeans::<UInt8Type, KModeAlgo>(data, k, params)
             }
             _ => Err(ArrowError::InvalidArgumentError(format!(
-                "KMeans: data must be floating number, got: {}",
-                data.value_type()
+                "KMeans: can not train data type {} with distance type: {}",
+                data.value_type(),
+                params.distance_type
             ))),
         }
     }
@@ -798,8 +802,20 @@ mod tests {
         const DIM: usize = 16;
         const K: usize = 32;
         const NUM_VALUES: usize = 256 * K;
-        let values = generate_random_array(DIM * NUM_VALUES);
+
+        let mut rng = SmallRng::from_entropy();
+        let values =
+            UInt8Array::from_iter_values((0..NUM_VALUES * DIM).map(|_| rng.gen_range(0..255)));
+
         let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
-        let kmeans = KMeans::new(&fsl, K, 50).unwrap();
+
+        let params = KMeansParams {
+            distance_type: DistanceType::Hamming,
+            ..Default::default()
+        };
+        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
+        assert_eq!(kmeans.centroids.len(), K * DIM);
+        assert_eq!(kmeans.dimension, DIM);
+        assert_eq!(kmeans.centroids.data_type(), &DataType::UInt8);
     }
 }
