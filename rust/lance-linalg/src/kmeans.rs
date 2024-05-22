@@ -350,8 +350,8 @@ impl KMeansAlgo<u8> for KModeAlgo {
             .into_par_iter()
             .flat_map(|part_id| {
                 if let Some(vecs) = clusters.get(&part_id) {
-                    let mut ones = vec![0_32; dimension * 8];
-                    let cnt = vecs.len();
+                    let mut ones = vec![0_u32; dimension * 8];
+                    let cnt = vecs.len() as u32;
                     vecs.iter().for_each(|&i| {
                         let vec = &data[i * dimension..(i + 1) * dimension];
                         ones.iter_mut()
@@ -367,7 +367,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
                     bits.as_raw_slice()
                         .iter()
                         .copied()
-                        .map(|b| Some(b))
+                        .map(Some)
                         .collect::<Vec<_>>()
                 } else {
                     vec![None; dimension]
