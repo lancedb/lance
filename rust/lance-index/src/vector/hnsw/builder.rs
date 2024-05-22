@@ -32,11 +32,11 @@ use super::super::graph::beam_search;
 use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
 use crate::scalar::IndexWriter;
 use crate::vector::graph::builder::GraphBuilderNode;
-use crate::vector::graph::storage::DistCalculator;
-use crate::vector::graph::{greedy_search, storage::VectorStore};
+use crate::vector::graph::greedy_search;
 use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
+use crate::vector::v3::storage::{DistCalculator, VectorStore};
 use crate::vector::DIST_COL;
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
