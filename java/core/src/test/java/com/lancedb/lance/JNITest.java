@@ -14,7 +14,7 @@
 
 package com.lancedb.lance;
 
-import java.util.List;
+import java.util.Arrays;
 import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
@@ -24,11 +24,11 @@ import com.lancedb.lance.test.JniTestHelper;
 public class JNITest {
   @Test
   public void testInts() {
-    JniTestHelper.parseInts(List.of(1, 2, 3));
+    JniTestHelper.parseInts(Arrays.asList(1, 2, 3));
   }
 
   @Test
   public void testIntsOpt() {
-    JniTestHelper.parseIntsOpt(Optional.of(List.of(1, 2, 3)));
+    JniTestHelper.parseIntsOpt(Optional.of(Arrays.asList(1, 2, 3)));
   }
 }

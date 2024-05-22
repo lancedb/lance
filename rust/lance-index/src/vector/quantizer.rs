@@ -20,7 +20,7 @@ use super::pq::storage::PQ_METADTA_KEY;
 use super::pq::ProductQuantizer;
 use super::sq::storage::SQ_METADATA_KEY;
 use super::{
-    graph::VectorStorage,
+    graph::VectorStore,
     ivf::storage::IvfData,
     pq::{
         storage::{ProductQuantizationMetadata, ProductQuantizationStorage},
@@ -35,7 +35,7 @@ use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
 pub trait Quantization {
     type Metadata: QuantizerMetadata + Send + Sync;
-    type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStorage;
+    type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore;
 
     fn code_dim(&self) -> usize;
     fn column(&self) -> &'static str;

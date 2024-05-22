@@ -70,16 +70,16 @@ async fn merge_streams(
         let batch = match stream.next().await {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => {
-                return Err(Error::IO {
-                    message: format!("failed to read batch: {}", e),
-                    location: location!(),
-                });
+                return Err(Error::io(
+                    format!("failed to read batch: {}", e),
+                    location!(),
+                ));
             }
             None => {
-                return Err(Error::IO {
-                    message: "failed to read batch: unexpected end of stream".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::io(
+                    "failed to read batch: unexpected end of stream".to_string(),
+                    location!(),
+                ));
             }
         };
 
@@ -117,10 +117,10 @@ async fn merge_streams(
                 }
             }
             Some(Err(e)) => {
-                return Err(Error::IO {
-                    message: format!("IVF Shuffler::failed to read batch: {}", e),
-                    location: location!(),
-                });
+                return Err(Error::io(
+                    format!("IVF Shuffler::failed to read batch: {}", e),
+                    location!(),
+                ));
             }
             None => {}
         }
@@ -166,16 +166,16 @@ pub(super) async fn write_pq_partitions(
                     new_streams.push(stream);
                 }
                 Some(Err(e)) => {
-                    return Err(Error::IO {
-                        message: format!("failed to read batch: {}", e),
-                        location: location!(),
-                    });
+                    return Err(Error::io(
+                        format!("failed to read batch: {}", e),
+                        location!(),
+                    ));
                 }
                 None => {
-                    return Err(Error::IO {
-                        message: "failed to read batch: end of stream".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::io(
+                        "failed to read batch: end of stream".to_string(),
+                        location!(),
+                    ));
                 }
             }
         }
@@ -274,16 +274,16 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                     new_streams.push(stream);
                 }
                 Some(Err(e)) => {
-                    return Err(Error::IO {
-                        message: format!("failed to read batch: {}", e),
-                        location: location!(),
-                    });
+                    return Err(Error::io(
+                        format!("failed to read batch: {}", e),
+                        location!(),
+                    ));
                 }
                 None => {
-                    return Err(Error::IO {
-                        message: "failed to read batch: end of stream".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::io(
+                        "failed to read batch: end of stream".to_string(),
+                        location!(),
+                    ));
                 }
             }
         }
@@ -309,7 +309,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             for &idx in previous_indices.iter() {
                 let sub_index = idx.load_partition(part_id, true).await?;
                 let row_ids = Arc::new(UInt64Array::from_iter_values(
-                    sub_index.storage().row_ids().iter().cloned(),
+                    sub_index.row_ids().iter().cloned(),
                 ));
                 row_id_array.push(row_ids);
             }

@@ -47,6 +47,13 @@ jobs:
           java-version: 17
           cache: "maven"
       - run: echo "JAVA_17=$JAVA_HOME" >> $GITHUB_ENV
+      - name: Install Java 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 8
+          cache: "maven"
+      - run: echo "JAVA_8=$JAVA_HOME" >> $GITHUB_ENV
       - name: Install Java 11
         uses: actions/setup-java@v4
         with:
@@ -60,6 +67,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Running tests with Java 11
         run: mvn clean test
+      - name: Running tests with Java 8
+        run: JAVA_HOME=$JAVA_8 mvn clean test   
       - name: Running tests with Java 17
         run: |
           export JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS \
@@ -81,4 +90,4 @@ jobs:
           --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED \
           -Djdk.reflect.useDirectMethodHandle=false \
           -Dio.netty.tryReflectionSetAccessible=true"
-          JAVA_HOME=$JAVA_17 mvn clean test
+          JAVA_HOME=$JAVA_17 mvn clean test   

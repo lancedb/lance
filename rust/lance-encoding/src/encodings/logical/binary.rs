@@ -29,13 +29,13 @@ use super::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder};
 /// A logical scheduler for utf8/binary pages which assumes the data are encoded as List<u8>
 #[derive(Debug)]
 pub struct BinaryPageScheduler {
-    varbin_scheduler: Box<dyn LogicalPageScheduler>,
+    varbin_scheduler: Arc<dyn LogicalPageScheduler>,
     data_type: DataType,
 }
 
 impl BinaryPageScheduler {
     // Create a new ListPageScheduler
-    pub fn new(varbin_scheduler: Box<dyn LogicalPageScheduler>, data_type: DataType) -> Self {
+    pub fn new(varbin_scheduler: Arc<dyn LogicalPageScheduler>, data_type: DataType) -> Self {
         Self {
             varbin_scheduler,
             data_type,
@@ -51,7 +51,7 @@ impl LogicalPageScheduler for BinaryPageScheduler {
         top_level_row: u64,
     ) -> Result<()> {
         trace!("Scheduling binary for {} ranges", ranges.len());
-        let mut temp_context = context.temporary();
+        let mut temp_context = context.temporary(None);
         self.varbin_scheduler
             .schedule_ranges(ranges, &mut temp_context, top_level_row)?;
 

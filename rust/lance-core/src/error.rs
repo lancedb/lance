@@ -59,8 +59,11 @@ pub enum Error {
     Schema { message: String, location: Location },
     #[snafu(display("Not found: {uri}, {location}"))]
     NotFound { uri: String, location: Location },
-    #[snafu(display("LanceError(IO): {message}, {location}"))]
-    IO { message: String, location: Location },
+    #[snafu(display("LanceError(IO): {source}, {location}"))]
+    IO {
+        source: BoxedError,
+        location: Location,
+    },
     #[snafu(display("LanceError(Index): {message}, {location}"))]
     Index { message: String, location: Location },
     #[snafu(display("Lance index not found: {identity}, {location}"))]
@@ -98,6 +101,13 @@ impl Error {
     pub fn invalid_input(message: impl Into<String>, location: Location) -> Self {
         let message: String = message.into();
         Self::InvalidInput {
+            source: message.into(),
+            location,
+        }
+    }
+    pub fn io(message: impl Into<String>, location: Location) -> Self {
+        let message: String = message.into();
+        Self::IO {
             source: message.into(),
             location,
         }
@@ -140,7 +150,7 @@ impl From<std::io::Error> for Error {
     #[track_caller]
     fn from(e: std::io::Error) -> Self {
         Self::IO {
-            message: (e.to_string()),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }
@@ -150,7 +160,7 @@ impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(e: object_store::Error) -> Self {
         Self::IO {
-            message: (e.to_string()),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }
@@ -160,7 +170,7 @@ impl From<prost::DecodeError> for Error {
     #[track_caller]
     fn from(e: prost::DecodeError) -> Self {
         Self::IO {
-            message: (e.to_string()),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }
@@ -170,7 +180,7 @@ impl From<prost::EncodeError> for Error {
     #[track_caller]
     fn from(e: prost::EncodeError) -> Self {
         Self::IO {
-            message: (e.to_string()),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }
@@ -180,7 +190,7 @@ impl From<tokio::task::JoinError> for Error {
     #[track_caller]
     fn from(e: tokio::task::JoinError) -> Self {
         Self::IO {
-            message: (e.to_string()),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }
@@ -190,7 +200,7 @@ impl From<object_store::path::Error> for Error {
     #[track_caller]
     fn from(e: object_store::path::Error) -> Self {
         Self::IO {
-            message: (e.to_string()),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }
@@ -200,7 +210,7 @@ impl From<url::ParseError> for Error {
     #[track_caller]
     fn from(e: url::ParseError) -> Self {
         Self::IO {
-            message: (e.to_string()),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }
@@ -228,7 +238,7 @@ impl From<Error> for ArrowError {
     fn from(value: Error) -> Self {
         match value {
             Error::Arrow { message, .. } => arrow_io_error_from_msg(message), // we lose the error type converting to LanceError
-            Error::IO { message, .. } => arrow_io_error_from_msg(message),
+            Error::IO { source, .. } => arrow_io_error_from_msg(source.to_string()),
             Error::Schema { message, .. } => Self::SchemaError(message),
             Error::Index { message, .. } => arrow_io_error_from_msg(message),
             Error::Stop => arrow_io_error_from_msg("early stop".to_string()),
@@ -242,7 +252,7 @@ impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
     #[track_caller]
     fn from(e: datafusion_sql::sqlparser::parser::ParserError) -> Self {
         Self::IO {
-            message: e.to_string(),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }
@@ -253,7 +263,7 @@ impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
     #[track_caller]
     fn from(e: datafusion_sql::sqlparser::tokenizer::TokenizerError) -> Self {
         Self::IO {
-            message: e.to_string(),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }
@@ -272,7 +282,7 @@ impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
         Self::IO {
-            message: e.to_string(),
+            source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
         }
     }

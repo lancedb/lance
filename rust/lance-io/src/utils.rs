@@ -46,10 +46,10 @@ pub async fn read_binary_array(
             reader, position, length, nullable,
         )),
         _ => {
-            return Err(Error::IO {
-                message: format!("Unsupported binary type: {data_type}",),
-                location: location!(),
-            })
+            return Err(Error::io(
+                format!("Unsupported binary type: {}", data_type),
+                location!(),
+            ));
         }
     };
     let fut = decoder.as_ref().get(params.into());
@@ -81,10 +81,7 @@ pub async fn read_fixed_stride_array(
 pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
     let file_size = reader.size().await?;
     if pos > file_size {
-        return Err(Error::IO {
-            message: "file size is too small".to_string(),
-            location: location!(),
-        });
+        return Err(Error::io("file size is too small".to_string(), location!()));
     }
 
     let range = pos..min(pos + 4096, file_size);
@@ -107,14 +104,13 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
 pub async fn read_struct<
     'm,
     M: Message + Default + 'static,
-    T: ProtoStruct<Proto = M> + From<M>,
+    T: ProtoStruct<Proto = M> + TryFrom<M, Error = Error>,
 >(
     reader: &dyn Reader,
     pos: usize,
 ) -> Result<T> {
     let msg = read_message::<M>(reader, pos).await?;
-    let obj = T::from(msg);
-    Ok(obj)
+    T::try_from(msg)
 }
 
 pub async fn read_last_block(reader: &dyn Reader) -> Result<Bytes> {
@@ -131,13 +127,13 @@ pub async fn read_last_block(reader: &dyn Reader) -> Result<Bytes> {
 pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let len = bytes.len();
     if len < 16 {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "does not have sufficient data, len: {}, bytes: {:?}",
                 len, bytes
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
     let offset_bytes = bytes.slice(len - 16..len - 8);
     Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
@@ -147,13 +143,13 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
 pub fn read_version(bytes: &Bytes) -> Result<(u16, u16)> {
     let len = bytes.len();
     if len < 8 {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "does not have sufficient data, len: {}, bytes: {:?}",
                 len, bytes
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
 
     let major_version = LittleEndian::read_u16(bytes.slice(len - 8..len - 6).as_ref());
@@ -168,11 +164,14 @@ pub fn read_message_from_buf<M: Message + Default>(buf: &Bytes) -> Result<M> {
 }
 
 /// Read a Protobuf-backed struct from a buffer.
-pub fn read_struct_from_buf<M: Message + Default, T: ProtoStruct<Proto = M> + From<M>>(
+pub fn read_struct_from_buf<
+    M: Message + Default,
+    T: ProtoStruct<Proto = M> + TryFrom<M, Error = Error>,
+>(
     buf: &Bytes,
 ) -> Result<T> {
     let msg: M = read_message_from_buf(buf)?;
-    Ok(T::from(msg))
+    T::try_from(msg)
 }
 
 #[cfg(test)]
@@ -187,6 +186,7 @@ mod tests {
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
         utils::read_struct,
+        Error, Result,
     };
 
     // Bytes is a prost::Message, since we don't have any .proto files in this crate we
@@ -204,9 +204,10 @@ mod tests {
         }
     }
 
-    impl From<Bytes> for BytesWrapper {
-        fn from(value: Bytes) -> Self {
-            Self(value)
+    impl TryFrom<Bytes> for BytesWrapper {
+        type Error = Error;
+        fn try_from(value: Bytes) -> Result<Self> {
+            Ok(Self(value))
         }
     }
 

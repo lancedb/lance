@@ -17,6 +17,7 @@ use lance_datagen::{array, gen, RowCount, Seed};
 use crate::{
     decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, PageInfo},
     encoder::{BatchEncoder, EncodedPage, FieldEncoder},
+    encodings::logical::r#struct::SimpleStructDecoder,
     EncodingsIo,
 };
 
@@ -60,34 +61,36 @@ impl EncodingsIo for SimulatedScheduler {
 
 async fn test_decode(
     num_rows: u64,
+    batch_size: u32,
     schema: &Schema,
     column_infos: &[ColumnInfo],
     expected: Option<Arc<dyn Array>>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<DecoderMessage>,
-    ) -> BoxFuture<'static, Result<()>>,
+    ) -> (SimpleStructDecoder, BoxFuture<'static, Result<()>>),
 ) {
     let decode_scheduler = DecodeBatchScheduler::new(schema, column_infos, &Vec::new());
 
     let (tx, rx) = mpsc::unbounded_channel();
 
-    schedule_fn(decode_scheduler, tx).await.unwrap();
+    let (decoder, scheduler_fut) = schedule_fn(decode_scheduler, tx);
 
-    const BATCH_SIZE: u32 = 100;
-    let mut decode_stream = BatchDecodeStream::new(rx, BATCH_SIZE, num_rows).into_stream();
+    scheduler_fut.await.unwrap();
+
+    let mut decode_stream = BatchDecodeStream::new(rx, batch_size, num_rows, decoder).into_stream();
 
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
         let batch = batch.task.await.unwrap();
         if let Some(expected) = expected.as_ref() {
             let actual = batch.column(0);
-            let expected_size = (BATCH_SIZE as usize).min(expected.len() - offset);
+            let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
             assert_eq!(&expected, actual);
         }
-        offset += BATCH_SIZE as usize;
+        offset += batch_size as usize;
     }
 }
 
@@ -119,11 +122,23 @@ fn supports_nulls(data_type: &DataType) -> bool {
 }
 
 // The default will just test the full read
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TestCases {
     ranges: Vec<Range<u64>>,
     indices: Vec<Vec<u64>>,
+    batch_size: u32,
     skip_validation: bool,
+}
+
+impl Default for TestCases {
+    fn default() -> Self {
+        Self {
+            batch_size: 100,
+            ranges: Vec::new(),
+            indices: Vec::new(),
+            skip_validation: false,
+        }
+    }
 }
 
 impl TestCases {
@@ -134,6 +149,11 @@ impl TestCases {
 
     pub fn with_indices(mut self, indices: Vec<u64>) -> Self {
         self.indices.push(indices);
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: u32) -> Self {
+        self.batch_size = batch_size;
         self
     }
 
@@ -237,16 +257,24 @@ async fn check_round_trip_encoding_inner(
     let scheduler_copy = scheduler.clone();
     test_decode(
         num_rows,
+        test_cases.batch_size,
         &schema,
         &column_infos,
         concat_data.clone(),
         |mut decode_scheduler, tx| {
-            async move {
-                decode_scheduler
-                    .schedule_range(0..num_rows, tx, scheduler_copy)
-                    .await
-            }
-            .boxed()
+            #[allow(clippy::single_range_in_vec_init)]
+            let root_decoder = decode_scheduler
+                .root_scheduler
+                .new_root_decoder_ranges(&[0..num_rows]);
+            (
+                root_decoder,
+                async move {
+                    decode_scheduler
+                        .schedule_range(0..num_rows, tx, scheduler_copy)
+                        .await
+                }
+                .boxed(),
+            )
         },
     )
     .await;
@@ -262,11 +290,20 @@ async fn check_round_trip_encoding_inner(
         let range = range.clone();
         test_decode(
             num_rows,
+            test_cases.batch_size,
             &schema,
             &column_infos,
             expected,
             |mut decode_scheduler, tx| {
-                async move { decode_scheduler.schedule_range(range, tx, scheduler).await }.boxed()
+                #[allow(clippy::single_range_in_vec_init)]
+                let root_decoder = decode_scheduler
+                    .root_scheduler
+                    .new_root_decoder_ranges(&[0..num_rows]);
+                (
+                    root_decoder,
+                    async move { decode_scheduler.schedule_range(range, tx, scheduler).await }
+                        .boxed(),
+                )
             },
         )
         .await;
@@ -293,16 +330,23 @@ async fn check_round_trip_encoding_inner(
         let indices = indices.clone();
         test_decode(
             num_rows,
+            test_cases.batch_size,
             &schema,
             &column_infos,
             expected,
             |mut decode_scheduler, tx| {
-                async move {
-                    decode_scheduler
-                        .schedule_take(&indices, tx, scheduler)
-                        .await
-                }
-                .boxed()
+                let root_decoder = decode_scheduler
+                    .root_scheduler
+                    .new_root_decoder_indices(&indices);
+                (
+                    root_decoder,
+                    async move {
+                        decode_scheduler
+                            .schedule_take(&indices, tx, scheduler)
+                            .await
+                    }
+                    .boxed(),
+                )
             },
         )
         .await;

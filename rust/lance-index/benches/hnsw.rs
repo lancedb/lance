@@ -14,37 +14,60 @@ use pprof::criterion::{Output, PProfProfiler};
 
 use lance_index::vector::{
     graph::memory::InMemoryVectorStorage,
-    hnsw::builder::{HNSWBuilder, HnswBuildParams},
+    hnsw::builder::{HnswBuildParams, HNSW},
 };
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::{distance::DistanceType, MatrixView};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 fn bench_hnsw(c: &mut Criterion) {
-    const DIMENSION: usize = 1024;
-    const TOTAL: usize = 1024 * 1024;
+    const DIMENSION: usize = 512;
+    const TOTAL: usize = 10 * 1024;
     const SEED: [u8; 32] = [42; 32];
     const K: usize = 10;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
-    let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
-    let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
+    let mat = MatrixView::<Float32Type>::new(data.into(), DIMENSION);
+    let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
 
     let query = mat.row(0).unwrap();
     c.bench_function(
-        format!("create_hnsw({TOTAL}x1024,levels=6)").as_str(),
+        format!("create_hnsw({TOTAL}x{DIMENSION},levels=6)").as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
-                let hnsw = HNSWBuilder::with_params(
+                let hnsw = HNSW::build_with_storage(
+                    DistanceType::L2,
                     HnswBuildParams::default().max_level(6),
                     vectors.clone(),
                 )
-                .build()
                 .await
                 .unwrap();
                 let uids: HashSet<u32> = hnsw
-                    .search(query.clone(), K, 300, None)
+                    .search_basic(query.clone(), K, 300, None, vectors.as_ref())
+                    .unwrap()
+                    .iter()
+                    .map(|node| node.id)
+                    .collect();
+
+                assert_eq!(uids.len(), K);
+            })
+        },
+    );
+
+    let hnsw = rt
+        .block_on(HNSW::build_with_storage(
+            DistanceType::L2,
+            HnswBuildParams::default().max_level(6),
+            vectors.clone(),
+        ))
+        .unwrap();
+    c.bench_function(
+        format!("search_hnsw{TOTAL}x{DIMENSION}, levels=6").as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| async {
+                let uids: HashSet<u32> = hnsw
+                    .search_basic(query.clone(), K, 300, None, vectors.as_ref())
                     .unwrap()
                     .iter()
                     .map(|node| node.id)

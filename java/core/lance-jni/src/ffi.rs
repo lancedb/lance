@@ -14,11 +14,10 @@
 
 use core::slice;
 
+use crate::error::Result;
 use jni::objects::{JByteBuffer, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{objects::JObject, JNIEnv};
-
-use crate::error::{Error, Result};
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
@@ -171,12 +170,12 @@ impl JNIEnvExt for JNIEnv<'_> {
         if obj.is_null() {
             return Ok(None);
         }
-        let is_empty = self.call_method(obj, "isEmpty", "()Z", &[])?;
-        if is_empty.z()? {
+        let is_present = self.call_method(obj, "isPresent", "()Z", &[])?;
+        if is_present.z()? {
+            f(self, obj).map(Some)
+        } else {
             // TODO(lu): put get java object into here cuz can only get java Object
             Ok(None)
-        } else {
-            f(self, obj).map(Some)
         }
     }
 }

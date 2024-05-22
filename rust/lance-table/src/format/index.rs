@@ -31,10 +31,10 @@ pub struct Index {
     pub fragment_bitmap: Option<RoaringBitmap>,
 }
 
-impl TryFrom<&pb::IndexMetadata> for Index {
+impl TryFrom<pb::IndexMetadata> for Index {
     type Error = Error;
 
-    fn try_from(proto: &pb::IndexMetadata) -> Result<Self> {
+    fn try_from(proto: pb::IndexMetadata) -> Result<Self> {
         let fragment_bitmap = if proto.fragment_bitmap.is_empty() {
             None
         } else {
@@ -44,16 +44,14 @@ impl TryFrom<&pb::IndexMetadata> for Index {
         };
 
         Ok(Self {
-            uuid: proto
-                .uuid
-                .as_ref()
-                .map(Uuid::try_from)
-                .ok_or_else(|| Error::IO {
-                    message: "uuid field does not exist in Index metadata".to_string(),
-                    location: location!(),
-                })??,
-            name: proto.name.clone(),
-            fields: proto.fields.clone(),
+            uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
+                Error::io(
+                    "uuid field does not exist in Index metadata".to_string(),
+                    location!(),
+                )
+            })??,
+            name: proto.name,
+            fields: proto.fields,
             dataset_version: proto.dataset_version,
             fragment_bitmap,
         })

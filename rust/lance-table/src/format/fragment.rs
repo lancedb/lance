@@ -102,15 +102,17 @@ impl From<&DataFile> for pb::DataFile {
     }
 }
 
-impl From<&pb::DataFile> for DataFile {
-    fn from(proto: &pb::DataFile) -> Self {
-        Self::new(
-            &proto.path,
-            proto.fields.clone(),
-            proto.column_indices.clone(),
-            proto.file_major_version,
-            proto.file_minor_version,
-        )
+impl TryFrom<pb::DataFile> for DataFile {
+    type Error = Error;
+
+    fn try_from(proto: pb::DataFile) -> Result<Self> {
+        Ok(Self {
+            path: proto.path,
+            fields: proto.fields,
+            column_indices: proto.column_indices,
+            file_major_version: proto.file_major_version,
+            file_minor_version: proto.file_minor_version,
+        })
     }
 }
 
@@ -140,26 +142,31 @@ pub struct DeletionFile {
     pub num_deleted_rows: Option<usize>,
 }
 
-// TODO: should we convert this to TryFrom and surface the error?
-#[allow(clippy::fallible_impl_from)]
-impl From<&pb::DeletionFile> for DeletionFile {
-    fn from(value: &pb::DeletionFile) -> Self {
+impl TryFrom<pb::DeletionFile> for DeletionFile {
+    type Error = Error;
+
+    fn try_from(value: pb::DeletionFile) -> Result<Self> {
         let file_type = match value.file_type {
             0 => DeletionFileType::Array,
             1 => DeletionFileType::Bitmap,
-            _ => panic!("Invalid deletion file type"),
+            _ => {
+                return Err(Error::NotSupported {
+                    source: "Unknown deletion file type".into(),
+                    location: location!(),
+                })
+            }
         };
         let num_deleted_rows = if value.num_deleted_rows == 0 {
             None
         } else {
             Some(value.num_deleted_rows as usize)
         };
-        Self {
+        Ok(Self {
             read_version: value.read_version,
             id: value.id,
             file_type,
             num_deleted_rows,
-        }
+        })
     }
 }
 
@@ -258,19 +265,25 @@ impl Fragment {
     }
 }
 
-impl From<&pb::DataFragment> for Fragment {
-    fn from(p: &pb::DataFragment) -> Self {
+impl TryFrom<pb::DataFragment> for Fragment {
+    type Error = Error;
+
+    fn try_from(p: pb::DataFragment) -> Result<Self> {
         let physical_rows = if p.physical_rows > 0 {
             Some(p.physical_rows as usize)
         } else {
             None
         };
-        Self {
+        Ok(Self {
             id: p.id,
-            files: p.files.iter().map(DataFile::from).collect(),
-            deletion_file: p.deletion_file.as_ref().map(DeletionFile::from),
+            files: p
+                .files
+                .into_iter()
+                .map(DataFile::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             physical_rows,
-        }
+        })
     }
 }
 
@@ -346,12 +359,12 @@ mod tests {
         });
 
         let proto = pb::DataFragment::from(&fragment);
-        let fragment2 = Fragment::from(&proto);
+        let fragment2 = Fragment::try_from(proto.clone()).unwrap();
         assert_eq!(fragment, fragment2);
 
         fragment.deletion_file = None;
         let proto = pb::DataFragment::from(&fragment);
-        let fragment2 = Fragment::from(&proto);
+        let fragment2 = Fragment::try_from(proto).unwrap();
         assert_eq!(fragment, fragment2);
     }
 

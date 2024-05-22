@@ -67,7 +67,6 @@ mod test {
     use arrow_array::RecordBatch;
     use arrow_schema::Schema;
     use lance_file::writer::{FileWriter, FileWriterOptions};
-    use lance_index::vector::graph::VectorStorage;
     use lance_index::{
         vector::{hnsw::VECTOR_ID_FIELD, Query},
         DatasetIndexExt, Index, IndexMetadata, IndexType, INDEX_FILE_NAME,
@@ -77,6 +76,7 @@ mod test {
     use lance_linalg::distance::MetricType;
     use lance_table::io::manifest::ManifestDescribing;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use serde_json::json;
 
     #[derive(Debug)]
@@ -132,7 +132,7 @@ mod test {
             todo!("panic")
         }
 
-        fn storage(&self) -> &dyn VectorStorage {
+        fn row_ids(&self) -> &[u64] {
             todo!("panic")
         }
 
@@ -251,10 +251,15 @@ mod test {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_vector_index_extension_roundtrip() {
+    async fn test_vector_index_extension_roundtrip(
+        #[values(false, true)] use_experimental_writer: bool,
+    ) {
         // make dataset and index that is not supported natively
-        let test_ds = TestVectorDataset::new().await.unwrap();
+        let test_ds = TestVectorDataset::new(use_experimental_writer)
+            .await
+            .unwrap();
         let idx = test_ds.dataset.load_indices().await.unwrap();
         assert_eq!(idx.len(), 0);
 

@@ -193,13 +193,13 @@ impl Manifest {
     /// Note this does not support recycling of fragment ids.
     pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {
         if since.version >= self.version {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "fragments_since: given version {} is newer than manifest version {}",
                     since.version, self.version
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         let start = since.max_fragment_id();
         Ok(self
@@ -328,8 +328,9 @@ impl ProtoStruct for Manifest {
     type Proto = pb::Manifest;
 }
 
-impl From<pb::Manifest> for Manifest {
-    fn from(p: pb::Manifest) -> Self {
+impl TryFrom<pb::Manifest> for Manifest {
+    type Error = Error;
+    fn try_from(p: pb::Manifest) -> Result<Self> {
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -342,13 +343,18 @@ impl From<pb::Manifest> for Manifest {
             }
             _ => None,
         };
-        let fragments = Arc::new(p.fragments.iter().map(Fragment::from).collect::<Vec<_>>());
+        let fragments = Arc::new(
+            p.fragments
+                .into_iter()
+                .map(Fragment::try_from)
+                .collect::<Result<Vec<_>>>()?,
+        );
         let fragment_offsets = compute_fragment_offsets(fragments.as_slice());
         let fields_with_meta = FieldsWithMeta {
             fields: Fields(p.fields),
             metadata: p.metadata,
         };
-        Self {
+        Ok(Self {
             schema: Schema::from(fields_with_meta),
             version: p.version,
             writer_version,
@@ -366,7 +372,7 @@ impl From<pb::Manifest> for Manifest {
                 Some(p.transaction_file)
             },
             fragment_offsets,
-        }
+        })
     }
 }
 

@@ -96,7 +96,7 @@ public class ScannerTest {
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         try (Scanner scanner = dataset.newScan(new ScanOptions.Builder()
-            .batchSize(batchRows).columns(List.of("id")).build())) {
+            .batchSize(batchRows).columns(Arrays.asList("id")).build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
             int index = 0;
@@ -127,7 +127,7 @@ public class ScannerTest {
       int totalRows = 40;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         try (Scanner scanner = dataset.newScan(new ScanOptions.Builder()
-            .batchSize(totalRows).columns(List.of("id")).build())) {
+            .batchSize(totalRows).columns(Arrays.asList("id")).build())) {
           Schema expectedSchema = new Schema(Arrays.asList(
               Field.nullable("id", new ArrowType.Int(32, true))
           ));
@@ -161,7 +161,7 @@ public class ScannerTest {
       int totalRows = 40;
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        var fragment = dataset.getFragments().get(0);
+        DatasetFragment fragment = dataset.getFragments().get(0);
         try (Scanner scanner = fragment.newScan(batchRows)) {
           testDataset.validateScanResults(dataset, scanner, totalRows, batchRows);
         }
@@ -177,7 +177,7 @@ public class ScannerTest {
       testDataset.createEmptyDataset().close();
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
-        var fragment = dataset.getFragments().get(0);
+        DatasetFragment fragment = dataset.getFragments().get(0);
         try (Scanner scanner = fragment.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
           testDataset.validateScanResults(dataset, scanner, 20, 20);
         }
@@ -194,8 +194,8 @@ public class ScannerTest {
       int totalRows = 40;
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        var fragment = dataset.getFragments().get(0);
-        try (Scanner scanner = fragment.newScan(new ScanOptions.Builder().batchSize(batchRows).columns(List.of("id")).build())) {
+        DatasetFragment fragment = dataset.getFragments().get(0);
+        try (Scanner scanner = fragment.newScan(new ScanOptions.Builder().batchSize(batchRows).columns(Arrays.asList("id")).build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
             int index = 0;
@@ -229,7 +229,7 @@ public class ScannerTest {
       FragmentMetadata metadata0 = testDataset.createNewFragment(fragment0[0], fragment0[1]);
       FragmentMetadata metadata1 = testDataset.createNewFragment(fragment1[0], fragment1[1]);
       FragmentMetadata metadata2 = testDataset.createNewFragment(fragment2[0], fragment2[1]);
-      FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(metadata0, metadata1, metadata2));
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
         validScanResult(dataset, fragment0[0], fragment0[1]);
         validScanResult(dataset, fragment1[0], fragment1[1]);
@@ -250,9 +250,9 @@ public class ScannerTest {
       FragmentMetadata metadata0 = testDataset.createNewFragment(fragment0[0], fragment0[1]);
       FragmentMetadata metadata1 = testDataset.createNewFragment(fragment1[0], fragment1[1]);
       FragmentMetadata metadata2 = testDataset.createNewFragment(fragment2[0], fragment2[1]);
-      FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(metadata0, metadata1, metadata2));
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
-        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentIds(List.of(1, 2)).build())) {
+        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentIds(Arrays.asList(1, 2)).build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
             int rowcount = 0;
@@ -272,7 +272,7 @@ public class ScannerTest {
   }
 
   private void validScanResult(Dataset dataset, int fragmentId, int rowCount) throws Exception {
-    try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentIds(List.of(fragmentId)).build())) {
+    try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentIds(Arrays.asList(fragmentId)).build())) {
       try (ArrowReader reader = scanner.scanBatches()) {
         assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
         reader.loadNextBatch();

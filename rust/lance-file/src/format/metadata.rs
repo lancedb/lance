@@ -52,9 +52,10 @@ impl From<&Metadata> for pb::Metadata {
     }
 }
 
-impl From<pb::Metadata> for Metadata {
-    fn from(m: pb::Metadata) -> Self {
-        Self {
+impl TryFrom<pb::Metadata> for Metadata {
+    type Error = Error;
+    fn try_from(m: pb::Metadata) -> Result<Self> {
+        Ok(Self {
             batch_offsets: m.batch_offsets.clone(),
             page_table_position: m.page_table_position as usize,
             manifest_position: Some(m.manifest_position as usize),
@@ -70,7 +71,7 @@ impl From<pb::Metadata> for Metadata {
             } else {
                 None
             },
-        }
+        })
     }
 }
 
@@ -166,14 +167,14 @@ impl Metadata {
     // TODO: pub(crate)
     pub fn range_to_batches(&self, range: Range<usize>) -> Result<Vec<(i32, Range<usize>)>> {
         if range.end > *(self.batch_offsets.last().unwrap()) as usize {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "Range {:?} is out of bounds {}",
                     range,
                     self.batch_offsets.last().unwrap()
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         let offsets = self.batch_offsets.as_slice();
         let mut batch_id = offsets

@@ -9,28 +9,29 @@
 //! and run ``l2`` distance on the unit vectors.
 //!
 
-use std::ops::DivAssign;
+use std::collections::HashMap;
+use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::vec;
 
 use arrow_array::{
     cast::AsArray,
-    types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array, UInt32Array,
+    types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type, UInt8Type},
+    Array, ArrayRef, FixedSizeListArray, Float32Array, PrimitiveArray, UInt32Array,
 };
+use arrow_array::{ArrowNumericType, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
-use lance_arrow::{ArrowFloatType, FloatArray};
+use bitvec::prelude::*;
 use log::{info, warn};
-use num_traits::{AsPrimitive, Float, FromPrimitive, Zero};
+use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
 
-use crate::distance::norm_l2::Normalize;
+use crate::distance::hamming::hamming;
 use crate::distance::{dot_distance_batch, DistanceType};
 use crate::kernels::argmax;
 use crate::{
-    clustering::Clustering,
     distance::{
         l2::{l2_distance_batch, L2},
         Dot,
@@ -91,48 +92,42 @@ impl KMeansParams {
 
 /// KMeans implementation for Apache Arrow Arrays.
 #[derive(Debug, Clone)]
-pub struct KMeans<T: ArrowFloatType>
-where
-    T::Native: L2 + Dot,
-{
-    /// Centroids for each of the k clusters.
+pub struct KMeans {
+    /// Flattend array of centroids.
     ///
     /// k * dimension.
-    pub centroids: Arc<T::ArrayType>,
+    pub centroids: ArrayRef,
 
-    /// Vector dimension.
+    /// The dimension of each vector.
     pub dimension: usize,
 
-    /// The number of clusters
-    pub k: usize,
-
+    /// How to calculate distance between two vectors.
     pub distance_type: DistanceType,
 }
 
 /// Randomly initialize kmeans centroids.
 ///
 ///
-fn kmeans_random_init<T: ArrowFloatType>(
+fn kmeans_random_init<T: ArrowPrimitiveType>(
     data: &[T::Native],
     dimension: usize,
     k: usize,
     mut rng: impl Rng,
     distance_type: DistanceType,
-) -> Result<KMeans<T>>
-where
-    T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
-{
+) -> KMeans {
     assert!(data.len() >= k * dimension);
-    let chosen = (0..data.len() / dimension)
-        .choose_multiple(&mut rng, k)
-        .to_vec();
-    let mut builder: Vec<T::Native> = Vec::with_capacity(k * dimension);
-    for i in chosen {
-        builder.extend(data[i * dimension..(i + 1) * dimension].iter());
+    let chosen = (0..data.len() / dimension).choose_multiple(&mut rng, k);
+    let centroids = PrimitiveArray::<T>::from_iter_values(
+        chosen
+            .iter()
+            .flat_map(|&i| data[i * dimension..(i + 1) * dimension].iter())
+            .copied(),
+    );
+    KMeans {
+        centroids: Arc::new(centroids),
+        dimension,
+        distance_type,
     }
-    let mut kmeans = KMeans::empty(k, dimension, distance_type);
-    kmeans.centroids = Arc::new(builder.into());
-    Ok(kmeans)
 }
 
 /// Split one big cluster into two smaller clusters. After split, each
@@ -175,189 +170,70 @@ fn hist_stddev(k: usize, membership: &[Option<u32>]) -> f32 {
         .sqrt()
 }
 
-impl<T: ArrowFloatType> KMeans<T>
-where
-    T::Native: AsPrimitive<f32> + L2 + Dot + Normalize,
-{
-    fn empty(k: usize, dimension: usize, distance_type: DistanceType) -> Self {
-        Self {
-            centroids: T::empty_array().into(),
-            dimension,
-            k,
-            distance_type,
-        }
-    }
-
-    /// Create a [`KMeans`] with existing centroids.
-    /// It is useful for continuing training.
-    pub fn with_centroids(
-        centroids: Arc<T::ArrayType>,
-        dimension: usize,
-        distance_type: DistanceType,
-    ) -> Self {
-        let k = centroids.len() / dimension;
-        Self {
-            centroids,
-            dimension,
-            k,
-            distance_type,
-        }
-    }
-
-    /// Initialize a [`KMeans`] with random centroids.
-    ///
-    /// Parameters
-    /// - *data*: training data. provided to do samplings.
-    /// - *k*: the number of clusters.
-    /// - *distance_type*: the distance type to calculate distance.
-    /// - *rng*: random generator.
-    pub fn init_random(
-        data: &[T::Native],
-        dimension: usize,
-        k: usize,
-        distance_type: DistanceType,
-        rng: impl Rng,
-    ) -> Result<Self> {
-        kmeans_random_init(data, dimension, k, rng, distance_type)
-    }
-
-    /// Train a KMeans model on data with `k` clusters.
-    pub fn new(data: &FixedSizeListArray, k: usize, max_iters: u32) -> Result<Self> {
-        let params = KMeansParams {
-            max_iters,
-            distance_type: DistanceType::L2,
-            ..Default::default()
-        };
-        Self::new_with_params(data, k, &params)
-    }
-
-    /// Train a [`KMeans`] model with full parameters.
-    ///
-    /// If the DistanceType is `Cosine`, the input vectors will be normalized with each iteration.
-    pub fn new_with_params(
-        data: &FixedSizeListArray,
-        k: usize,
-        params: &KMeansParams,
-    ) -> Result<Self> {
-        let dimension = data.value_length() as usize;
-        let n = data.len();
-        if n < k {
-            return Err(ArrowError::InvalidArgumentError(
-                format!(
-                    "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
-                    n, k
-                )
-            ));
-        }
-
-        if !data.value_type().is_floating() {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "KMeans: data must be floating number, got: {}",
-                data.value_type()
-            )));
-        }
-
-        let data = data
-            .values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::InvalidArgumentError(format!(
-                "KMeans: data must be floating number, got: {}",
-                data.value_type()
-            )))?;
-
-        let mut best_kmeans = Self::empty(k, dimension, params.distance_type);
-        let mut best_stddev = f32::MAX;
-
-        // TODO: use seed for Rng.
-        let rng = SmallRng::from_entropy();
-        for redo in 1..=params.redos {
-            let mut kmeans: Self = match params.init {
-                KMeanInit::Random => Self::init_random(
-                    data.as_slice(),
-                    dimension,
-                    k,
-                    params.distance_type,
-                    rng.clone(),
-                )?,
-                KMeanInit::KMeanPlusPlus => {
-                    unimplemented!()
-                }
-            };
-
-            let mut loss = f64::MAX;
-            let mut last_membership: Option<Vec<Option<u32>>> = None;
-            for i in 1..=params.max_iters {
-                if i % 10 == 0 {
-                    info!(
-                        "KMeans training: iteration {} / {}, redo={}",
-                        i, params.max_iters, redo
-                    );
-                };
-                let (membership, last_loss) = kmeans.compute_membership_and_loss(data.as_slice());
-                kmeans = Self::to_kmeans(
-                    data.as_slice(),
-                    dimension,
-                    k,
-                    &membership,
-                    params.distance_type,
-                )
-                .unwrap();
-                last_membership = Some(membership);
-                if (loss - last_loss).abs() / last_loss < params.tolerance {
-                    info!(
-                        "KMeans training: converged at iteration {} / {}, redo={}",
-                        i, params.max_iters, redo
-                    );
-                    break;
-                }
-                loss = last_loss;
-            }
-            let stddev = hist_stddev(
-                k,
-                last_membership
-                    .as_ref()
-                    .expect("Last membership should already set"),
-            );
-            if stddev < best_stddev {
-                best_stddev = stddev;
-                best_kmeans = kmeans;
-            }
-        }
-
-        Ok(best_kmeans)
-    }
-
+trait KMeansAlgo<T: Num> {
     /// Recompute the membership of each vector.
     ///
     /// Parameters:
     ///
     /// - *data*: a `N * dimension` floating array. Not necessarily normalized.
     ///
-    fn compute_membership_and_loss(&self, data: &[T::Native]) -> (Vec<Option<u32>>, f64) {
-        let centroids = self.centroids.as_ref().as_slice();
-        let cluster_and_dists = data
-            .par_chunks(self.dimension)
-            .map(|vec| {
-                argmin_value(match self.distance_type {
-                    DistanceType::L2 => l2_distance_batch(vec, centroids, self.dimension),
-                    DistanceType::Dot => dot_distance_batch(vec, centroids, self.dimension),
-                    _ => {
-                        panic!(
-                            "KMeans::find_partitions: {} is not supported",
-                            self.distance_type
-                        );
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
+    fn compute_membership_and_loss(
+        centroids: &[T],
+        data: &[T],
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> (Vec<Option<u32>>, f64);
+
+    /// Construct a new KMeans model.
+    fn to_kmeans(
+        data: &[T],
+        dimension: usize,
+        k: usize,
+        membership: &[Option<u32>],
+        distance_type: DistanceType,
+    ) -> KMeans;
+}
+
+struct KMeansAlgoFloat<T: ArrowNumericType>
+where
+    T::Native: Float + Num,
+{
+    phantom_data: std::marker::PhantomData<T>,
+}
+
+impl<T: ArrowNumericType> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
+where
+    T::Native: Float + Dot + L2 + DivAssign + AddAssign + FromPrimitive + Sync,
+{
+    fn compute_membership_and_loss(
+        centroids: &[T::Native],
+        data: &[T::Native],
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> (Vec<Option<u32>>, f64) {
+        let cluster_and_dists = match distance_type {
+            DistanceType::L2 => data
+                .par_chunks(dimension)
+                .map(|vec| argmin_value(l2_distance_batch(vec, centroids, dimension)))
+                .collect::<Vec<_>>(),
+            DistanceType::Dot => data
+                .par_chunks(dimension)
+                .map(|vec| argmin_value(dot_distance_batch(vec, centroids, dimension)))
+                .collect::<Vec<_>>(),
+            _ => {
+                panic!(
+                    "KMeans::find_partitions: {} is not supported",
+                    distance_type
+                );
+            }
+        };
         (
             cluster_and_dists
-                .par_iter()
+                .iter()
                 .map(|cd| cd.map(|(c, _)| c))
                 .collect::<Vec<_>>(),
             cluster_and_dists
-                .par_iter()
+                .iter()
                 .map(|cd| cd.map(|(_, d)| d).unwrap_or_default() as f64)
                 .sum(),
         )
@@ -369,10 +245,7 @@ where
         k: usize,
         membership: &[Option<u32>],
         distance_type: DistanceType,
-    ) -> Result<Self>
-    where
-        T::Native: L2 + Dot + Normalize,
-    {
+    ) -> KMeans {
         let mut cluster_cnts = vec![0_u64; k];
         let mut new_centroids = vec![T::Native::zero(); k * dimension];
         data.chunks_exact(dimension)
@@ -416,43 +289,277 @@ where
 
         split_clusters(&mut cluster_cnts, &mut new_centroids, dimension);
 
-        Ok(Self {
-            centroids: Arc::new(new_centroids.into()),
+        KMeans {
+            centroids: Arc::new(PrimitiveArray::<T>::from_iter_values(new_centroids)),
             dimension,
-            k,
             distance_type,
-        })
+        }
     }
 }
 
-impl<T: ArrowFloatType> Clustering<T::Native> for KMeans<T>
-where
-    T::Native: L2 + Dot,
-{
-    fn deminsion(&self) -> u32 {
-        self.dimension as u32
-    }
+struct KModeAlgo {}
 
-    fn num_clusters(&self) -> u32 {
-        self.k as u32
-    }
-
-    fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
-        assert_eq!(query.len(), self.dimension);
-
-        kmeans_find_partitions(
-            self.centroids.as_slice(),
-            query,
-            nprobes,
-            self.distance_type,
+impl KMeansAlgo<u8> for KModeAlgo {
+    fn compute_membership_and_loss(
+        centroids: &[u8],
+        data: &[u8],
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> (Vec<Option<u32>>, f64) {
+        assert_eq!(distance_type, DistanceType::Hamming);
+        let cluster_and_dists = data
+            .par_chunks(dimension)
+            .map(|vec| {
+                argmin_value(
+                    centroids
+                        .par_chunks(dimension)
+                        .map(|c| hamming(vec, c))
+                        .collect::<Vec<f32>>()
+                        .into_iter(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (
+            cluster_and_dists
+                .iter()
+                .map(|cd| cd.map(|(c, _)| c))
+                .collect::<Vec<_>>(),
+            cluster_and_dists
+                .iter()
+                .map(|cd| cd.map(|(_, d)| d).unwrap_or_default() as f64)
+                .sum(),
         )
     }
 
-    fn compute_membership(&self, data: &[T::Native], _nprobes: Option<usize>) -> Vec<Option<u32>> {
-        assert!(_nprobes.is_none());
+    fn to_kmeans(
+        data: &[u8],
+        dimension: usize,
+        k: usize,
+        membership: &[Option<u32>],
+        distance_type: DistanceType,
+    ) -> KMeans {
+        assert_eq!(distance_type, DistanceType::Hamming);
 
-        let centroids = self.centroids.as_ref().as_slice();
-        compute_partitions(centroids, data, self.dimension, self.distance_type)
+        let mut clusters = HashMap::<u32, Vec<usize>>::new();
+        membership.iter().enumerate().for_each(|(i, part_id_opt)| {
+            if let Some(part_id) = part_id_opt {
+                clusters.entry(*part_id).or_default().push(i);
+            }
+        });
+        let centroids = (0..k as u32)
+            .into_par_iter()
+            .flat_map(|part_id| {
+                if let Some(vecs) = clusters.get(&part_id) {
+                    let mut ones = vec![0_u32; dimension * 8];
+                    let cnt = vecs.len() as u32;
+                    vecs.iter().for_each(|&i| {
+                        let vec = &data[i * dimension..(i + 1) * dimension];
+                        ones.iter_mut()
+                            .zip(vec.view_bits::<Lsb0>())
+                            .for_each(|(c, v)| {
+                                if *v.as_ref() {
+                                    *c += 1;
+                                }
+                            });
+                    });
+
+                    let bits = ones.iter().map(|&c| c * 2 > cnt).collect::<BitVec<u8>>();
+                    bits.as_raw_slice()
+                        .iter()
+                        .copied()
+                        .map(Some)
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![None; dimension]
+                }
+            })
+            .collect::<Vec<_>>();
+
+        KMeans {
+            centroids: Arc::new(UInt8Array::from(centroids)),
+            dimension,
+            distance_type,
+        }
+    }
+}
+
+impl KMeans {
+    fn empty(dimension: usize, distance_type: DistanceType) -> Self {
+        Self {
+            centroids: arrow_array::array::new_empty_array(&DataType::Float32),
+            dimension,
+            distance_type,
+        }
+    }
+
+    /// Create a [`KMeans`] with existing centroids.
+    /// It is useful for continuing training.
+    pub fn with_centroids(
+        centroids: ArrayRef,
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> Self {
+        assert!(matches!(
+            centroids.data_type(),
+            DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::UInt8
+        ));
+        Self {
+            centroids,
+            dimension,
+            distance_type,
+        }
+    }
+
+    /// Initialize a [`KMeans`] with random centroids.
+    ///
+    /// Parameters
+    /// - *data*: training data. provided to do samplings.
+    /// - *k*: the number of clusters.
+    /// - *distance_type*: the distance type to calculate distance.
+    /// - *rng*: random generator.
+    fn init_random<T: ArrowPrimitiveType>(
+        data: &[T::Native],
+        dimension: usize,
+        k: usize,
+        rng: impl Rng,
+        distance_type: DistanceType,
+    ) -> Self {
+        kmeans_random_init::<T>(data, dimension, k, rng, distance_type)
+    }
+
+    /// Train a KMeans model on data with `k` clusters.
+    pub fn new(data: &FixedSizeListArray, k: usize, max_iters: u32) -> Result<Self> {
+        let params = KMeansParams {
+            max_iters,
+            distance_type: DistanceType::L2,
+            ..Default::default()
+        };
+        Self::new_with_params(data, k, &params)
+    }
+
+    fn train_kmeans<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
+        data: &FixedSizeListArray,
+        k: usize,
+        params: &KMeansParams,
+    ) -> Result<Self>
+    where
+        T::Native: Num,
+    {
+        let dimension = data.value_length() as usize;
+
+        let data = data
+            .values()
+            .as_primitive_opt::<T>()
+            .ok_or(Error::InvalidArgumentError(format!(
+                "KMeans: data must be {}, got: {}",
+                T::DATA_TYPE,
+                data.value_type()
+            )))?;
+
+        let mut best_kmeans = Self::empty(dimension, params.distance_type);
+        let mut best_stddev = f32::MAX;
+
+        // TODO: use seed for Rng.
+        let rng = SmallRng::from_entropy();
+        for redo in 1..=params.redos {
+            let mut kmeans: Self = match params.init {
+                KMeanInit::Random => Self::init_random::<T>(
+                    data.values(),
+                    dimension,
+                    k,
+                    rng.clone(),
+                    params.distance_type,
+                ),
+                KMeanInit::KMeanPlusPlus => {
+                    unimplemented!()
+                }
+            };
+
+            let mut loss = f64::MAX;
+            let mut last_membership: Option<Vec<Option<u32>>> = None;
+            for i in 1..=params.max_iters {
+                if i % 10 == 0 {
+                    info!(
+                        "KMeans training: iteration {} / {}, redo={}",
+                        i, params.max_iters, redo
+                    );
+                };
+                let (membership, last_loss) = Algo::compute_membership_and_loss(
+                    kmeans.centroids.as_primitive::<T>().values(),
+                    data.values(),
+                    dimension,
+                    params.distance_type,
+                );
+                kmeans = Algo::to_kmeans(
+                    data.values(),
+                    dimension,
+                    k,
+                    &membership,
+                    params.distance_type,
+                );
+                last_membership = Some(membership);
+                if (loss - last_loss).abs() / last_loss < params.tolerance {
+                    info!(
+                        "KMeans training: converged at iteration {} / {}, redo={}",
+                        i, params.max_iters, redo
+                    );
+                    break;
+                }
+                loss = last_loss;
+            }
+            let stddev = hist_stddev(
+                k,
+                last_membership
+                    .as_ref()
+                    .expect("Last membership should already set"),
+            );
+            if stddev < best_stddev {
+                best_stddev = stddev;
+                best_kmeans = kmeans;
+            }
+        }
+
+        Ok(best_kmeans)
+    }
+
+    /// Train a [`KMeans`] model with full parameters.
+    ///
+    /// If the DistanceType is `Cosine`, the input vectors will be normalized with each iteration.
+    pub fn new_with_params(
+        data: &FixedSizeListArray,
+        k: usize,
+        params: &KMeansParams,
+    ) -> Result<Self> {
+        let n = data.len();
+        if n < k {
+            return Err(ArrowError::InvalidArgumentError(
+                format!(
+                    "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
+                    n, k
+                )
+            ));
+        }
+
+        match (data.value_type(), params.distance_type) {
+            (DataType::Float16, _) => {
+                Self::train_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(data, k, params)
+            }
+
+            (DataType::Float32, _) => {
+                Self::train_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(data, k, params)
+            }
+            (DataType::Float64, _) => {
+                Self::train_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(data, k, params)
+            }
+            (DataType::UInt8, DistanceType::Hamming) => {
+                Self::train_kmeans::<UInt8Type, KModeAlgo>(data, k, params)
+            }
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "KMeans: can not train data type {} with distance type: {}",
+                data.value_type(),
+                params.distance_type
+            ))),
+        }
     }
 }
 
@@ -598,7 +705,6 @@ pub fn compute_partitions<T: Float + L2 + Dot + Sync>(
 mod tests {
     use std::iter::repeat;
 
-    use arrow_array::types::Float32Type;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
 
@@ -610,7 +716,7 @@ mod tests {
     fn test_train_with_small_dataset() {
         let data = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
         let data = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
-        match KMeans::<Float32Type>::new(&data, 128, 5) {
+        match KMeans::new(&data, 128, 5) {
             Ok(_) => panic!("Should fail to train KMeans"),
             Err(e) => {
                 assert!(e.to_string().contains("smaller than"));
@@ -646,8 +752,12 @@ mod tests {
         let centroids = generate_random_array(DIM * 18);
         let data = generate_random_array(DIM * 20);
 
-        let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, DistanceType::L2);
-        let (membership, loss) = kmeans.compute_membership_and_loss(data.values());
+        let (membership, loss) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(
+            centroids.as_slice(),
+            data.values(),
+            DIM,
+            DistanceType::L2,
+        );
         assert!(loss > 0.0, "loss is not zero: {}", loss);
         membership.iter().for_each(|cd| {
             assert!(cd.is_some());
@@ -677,9 +787,35 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = repeat(f32::NAN).take(DIM * K).collect::<Vec<_>>();
 
-        let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, DistanceType::L2);
-        let (membership, _) = kmeans.compute_membership_and_loss(&values);
+        let (membership, _) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(
+            centroids.as_slice(),
+            &values,
+            DIM,
+            DistanceType::L2,
+        );
 
         membership.iter().for_each(|cd| assert!(cd.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_train_kmode() {
+        const DIM: usize = 16;
+        const K: usize = 32;
+        const NUM_VALUES: usize = 256 * K;
+
+        let mut rng = SmallRng::from_entropy();
+        let values =
+            UInt8Array::from_iter_values((0..NUM_VALUES * DIM).map(|_| rng.gen_range(0..255)));
+
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            distance_type: DistanceType::Hamming,
+            ..Default::default()
+        };
+        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
+        assert_eq!(kmeans.centroids.len(), K * DIM);
+        assert_eq!(kmeans.dimension, DIM);
+        assert_eq!(kmeans.centroids.data_type(), &DataType::UInt8);
     }
 }

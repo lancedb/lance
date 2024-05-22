@@ -10,7 +10,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeListArray, ListArray, UInt64Array,
 };
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 use snafu::{location, Location};
@@ -20,13 +20,18 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, SchedulerContext,
+        DecodeArrayTask, DecoderMessage, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask,
+        SchedulerContext,
     },
     encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
+    encodings::logical::r#struct::SimpleStructScheduler,
     format::pb,
 };
 
-use super::primitive::{AccumulationQueue, PrimitiveFieldEncoder};
+use super::{
+    primitive::{AccumulationQueue, PrimitiveFieldEncoder},
+    r#struct::SimpleStructDecoder,
+};
 
 /// A page scheduler for list fields that encodes offsets in one field and items in another
 ///
@@ -42,34 +47,30 @@ use super::primitive::{AccumulationQueue, PrimitiveFieldEncoder};
 /// Whenever we schedule follow-up I/O like this the priority is based on the top-level row
 /// index.  This helps ensure that earlier rows get finished completely (including follow up
 /// tasks) before we perform I/O for later rows.
-///
-/// TODO: Actually implement the priority system described above
-///
-// TODO: Right now we are assuming that list offsets and list items are written at the same time.
-// As a result, we know which item pages correspond to which offsets page and there are no item
-// pages which overlap two different offsets pages.
-//
-// We could relax this constraint.  Either each offsets page could store the u64 offset into
-// the total range of item pages or each offsets page could store a u64 num_items and a u32
-// first_item_page_offset.
 #[derive(Debug)]
 pub struct ListPageScheduler {
-    offsets_scheduler: Box<dyn LogicalPageScheduler>,
-    items_schedulers: Arc<Vec<Box<dyn LogicalPageScheduler>>>,
+    offsets_scheduler: Arc<dyn LogicalPageScheduler>,
+    items_schedulers: Arc<Vec<Arc<dyn LogicalPageScheduler>>>,
     items_type: DataType,
     offset_type: DataType,
     null_offset_adjustment: u64,
+    // Two list pages might share an items page.  For example, when given a List<Struct<...>>
+    // the struct items page is often very large (if there are no nulls in the struct it will
+    // be 1 giant page) since it is just a header page.  This means the second list page starts
+    // at some offset into the items page which we record here.
+    first_items_page_offset: u32,
 }
 
 impl ListPageScheduler {
     // Create a new ListPageScheduler
     pub fn new(
-        offsets_scheduler: Box<dyn LogicalPageScheduler>,
-        items_schedulers: Vec<Box<dyn LogicalPageScheduler>>,
+        offsets_scheduler: Arc<dyn LogicalPageScheduler>,
+        items_schedulers: Vec<Arc<dyn LogicalPageScheduler>>,
         items_type: DataType,
         // Should be int32 or int64
         offset_type: DataType,
         null_offset_adjustment: u64,
+        first_items_page_offset: u32,
     ) -> Self {
         match &offset_type {
             DataType::Int32 | DataType::Int64 => {}
@@ -81,6 +82,7 @@ impl ListPageScheduler {
             items_type,
             offset_type,
             null_offset_adjustment,
+            first_items_page_offset,
         }
     }
 
@@ -255,9 +257,8 @@ impl LogicalPageScheduler for ListPageScheduler {
             .sum();
         let null_offset_adjustment = self.null_offset_adjustment;
         trace!("Scheduling list offsets ranges: {:?}", offsets_ranges);
-        // Create a channel for the internal schedule / decode loop that is unique
-        // to this page.
-        let mut temporary = context.temporary();
+        // Create a channel for the offsets
+        let mut temporary = context.temporary(None);
         self.offsets_scheduler
             .schedule_ranges(&offsets_ranges, &mut temporary, top_level_row)?;
         let offset_decoders = temporary.into_decoders();
@@ -270,10 +271,12 @@ impl LogicalPageScheduler for ListPageScheduler {
                     message: format!("scheduling offsets yielded {} pages", num_offset_decoders),
                     location: location!(),
                 })?;
+
         let items_schedulers = self.items_schedulers.clone();
         let ranges = ranges.to_vec();
-
-        let mut indirect_context = context.temporary();
+        let items_type = self.items_type.clone();
+        let first_items_page_offset = self.first_items_page_offset;
+        let mut indirect_context = context.temporary(Some(top_level_row));
 
         // First we schedule, as normal, the I/O for the offsets.  Then we immediately spawn
         // a task to decode those offsets and schedule the I/O for the items AND wait for
@@ -287,7 +290,7 @@ impl LogicalPageScheduler for ListPageScheduler {
             let decode_task = scheduled_offsets.drain(num_offsets)?;
             let offsets = decode_task.task.decode()?;
 
-            let (mut item_ranges, offsets, validity) =
+            let (item_ranges, offsets, validity) =
                 Self::decode_offsets(offsets.as_ref(), &ranges, null_offset_adjustment);
 
             trace!(
@@ -300,91 +303,49 @@ impl LogicalPageScheduler for ListPageScheduler {
             if items_schedulers.is_empty() || item_ranges.is_empty() {
                 debug_assert!(item_ranges.iter().all(|r| r.start == r.end));
                 return Ok(IndirectlyLoaded {
-                    item_decoders: Vec::new(),
+                    root_decoder: None,
                     offsets,
                     validity,
                 });
             }
 
-            let mut item_schedulers = VecDeque::from_iter(items_schedulers.iter());
-            let mut row_offset = 0_u64;
-            let mut next_scheduler = item_schedulers.pop_front().unwrap();
-            let mut next_range = item_ranges.pop_front().unwrap();
-            let mut next_item_ranges = Vec::new();
+            // Create a new root scheduler, which has one column, which is our items data
+            let indirect_root_scheduler = SimpleStructScheduler::new_root(
+                vec![items_schedulers.as_ref().clone()],
+                Fields::from(vec![Field::new("item", items_type, true)]),
+            );
 
-            // This is a bit complicated.  We have a list of ranges and we have a list of
-            // item schedulers.  We walk through both lists, scheduling the overlap.  For
-            // example, if we need items [500...1000], [2200..2300] [2500...4000] and we have 5 item
-            // pages with 1000 rows each then we need to schedule:
-            //
-            // page 0: 500..1000
-            // page 1: nothing
-            // page 2: 200..300, 500..1000
-            // page 3: 0..1000
-            // page 4: nothing
-            loop {
-                let current_scheduler_end = row_offset + next_scheduler.num_rows() as u64;
-                if next_range.start > current_scheduler_end {
-                    // All requested items are past this page, continue
-                    row_offset += next_scheduler.num_rows() as u64;
-                    if !next_item_ranges.is_empty() {
-                        // Note: we are providing the same top_level_row to ALL items pages referenced by
-                        // this offsets page.  This gives them higher priority.
-                        // TODO: Ideally we would ALSO have a guarantee from the scheduler that items with
-                        // the same top_level_row are scheduled in FCFS order but I don't think it works
-                        // that way.  Still, this is probably good enough for a while
-                        next_scheduler.schedule_ranges(
-                            &next_item_ranges,
-                            &mut indirect_context,
-                            top_level_row,
-                        )?;
-                        next_item_ranges.clear();
-                    }
-                    next_scheduler = item_schedulers.pop_front().unwrap();
-                } else if next_range.end <= current_scheduler_end {
-                    // Range entirely contained in current scheduler
-                    let page_range = (next_range.start - row_offset) as u32
-                        ..(next_range.end - row_offset) as u32;
-                    next_item_ranges.push(page_range);
-                    if let Some(item_range) = item_ranges.pop_front() {
-                        next_range = item_range;
-                    } else {
-                        // We have processed all pages
-                        break;
-                    }
-                } else {
-                    // Range partially contained in current scheduler
-                    let page_range =
-                        (next_range.start - row_offset) as u32..next_scheduler.num_rows();
-                    next_range = current_scheduler_end..next_range.end;
-                    next_item_ranges.push(page_range);
-                    row_offset += next_scheduler.num_rows() as u64;
-                    if !next_item_ranges.is_empty() {
-                        next_scheduler.schedule_ranges(
-                            &next_item_ranges,
-                            &mut indirect_context,
-                            top_level_row,
-                        )?;
-                        next_item_ranges.clear();
-                    }
-                    next_scheduler = item_schedulers.pop_front().unwrap();
+            let patched_item_ranges = item_ranges
+                .clone()
+                .into_iter()
+                .map(|range| {
+                    (range.start + first_items_page_offset as u64)
+                        ..(range.end + first_items_page_offset as u64)
+                })
+                .collect::<Vec<_>>();
+
+            // Immediately run the scheduling and process the decode messages (we could start
+            // a new thread here for decode to run in parallel but, at the moment, that seems
+            // like overkill)
+            indirect_root_scheduler.schedule_ranges_u64(
+                &patched_item_ranges,
+                &mut indirect_context,
+                top_level_row,
+            )?;
+            let mut root_decoder =
+                indirect_root_scheduler.new_root_decoder_ranges(&patched_item_ranges);
+
+            for message in indirect_context.into_messages() {
+                if let DecoderMessage::Decoder(decoder) = message {
+                    debug_assert!(!decoder.path.is_empty());
+                    root_decoder.accept_child(decoder)?;
                 }
             }
-            if !next_item_ranges.is_empty() {
-                next_scheduler.schedule_ranges(
-                    &next_item_ranges,
-                    &mut indirect_context,
-                    top_level_row,
-                )?;
-            }
-            // TODO: Should probably use into_messages here.  Can figure out once we add
-            // tests for List<Struct<...>>
-            let item_decoders = indirect_context.into_decoders();
 
             Ok(IndirectlyLoaded {
                 offsets,
                 validity,
-                item_decoders,
+                root_decoder: Some(root_decoder),
             })
         });
         let data_type = match &self.offset_type {
@@ -399,8 +360,7 @@ impl LogicalPageScheduler for ListPageScheduler {
         context.emit(Box::new(ListPageDecoder {
             offsets: Vec::new(),
             validity: BooleanBuffer::new(Buffer::from_vec(Vec::<u8>::default()), 0, 0),
-            unawaited_item_decoders: VecDeque::new(),
-            awaited_item_decoders: VecDeque::new(),
+            item_decoder: None,
             rows_drained: 0,
             lists_available: 0,
             num_rows,
@@ -450,9 +410,7 @@ struct ListPageDecoder {
     // offsets and validity will have already been decoded as part of the indirect I/O
     offsets: Vec<u64>,
     validity: BooleanBuffer,
-    // Items will not yet be decoded, that happens in the decode thread
-    unawaited_item_decoders: VecDeque<Box<dyn LogicalPageDecoder>>,
-    awaited_item_decoders: VecDeque<Box<dyn LogicalPageDecoder>>,
+    item_decoder: Option<SimpleStructDecoder>,
     lists_available: u32,
     num_rows: u32,
     rows_drained: u32,
@@ -464,7 +422,8 @@ struct ListPageDecoder {
 struct ListDecodeTask {
     offsets: Vec<u64>,
     validity: BooleanBuffer,
-    items: Vec<Box<dyn DecodeArrayTask>>,
+    // Will be None if there are no items (all empty / null lists)
+    items: Option<Box<dyn DecodeArrayTask>>,
     items_type: DataType,
     offset_type: DataType,
 }
@@ -473,18 +432,14 @@ impl DecodeArrayTask for ListDecodeTask {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
         let items = self
             .items
-            .into_iter()
-            .map(|task| task.decode())
-            .collect::<Result<Vec<_>>>()?;
-        let item_refs = items.iter().map(|item| item.as_ref()).collect::<Vec<_>>();
-        // TODO: could maybe try and "page bridge" these at some point
-        // (assuming item type is primitive) to avoid the concat
-        let items = if item_refs.is_empty() {
-            // This can happen if we have are building an array made only of empty lists
-            new_empty_array(&self.items_type)
-        } else {
-            arrow_select::concat::concat(&item_refs)?
-        };
+            .map(|items| {
+                // When we run the indirect I/O we wrap things in a struct array with a single field
+                // named "item".  We can unwrap that now.
+                let wrapped_items = items.decode()?;
+                Result::Ok(wrapped_items.as_struct().column(0).clone())
+            })
+            .unwrap_or_else(|| Ok(new_empty_array(&self.items_type)))?;
+
         // TODO: we default to nullable true here, should probably use the nullability given to
         // us from the input schema
         let item_field = Arc::new(Field::new("item", self.items_type.clone(), true));
@@ -530,7 +485,8 @@ impl DecodeArrayTask for ListDecodeTask {
 impl LogicalPageDecoder for ListPageDecoder {
     fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
         async move {
-            // wait for the indirect I/O to finish, then wait for enough items to arrive
+            // wait for the indirect I/O to finish, run the scheduler for the indirect
+            // I/O and then wait for enough items to arrive
             if self.unloaded.is_some() {
                 trace!("List scheduler needs to wait for indirect I/O to complete");
                 let indirectly_loaded = self.unloaded.take().unwrap().await;
@@ -541,15 +497,16 @@ impl LogicalPageDecoder for ListPageDecoder {
                     };
                 }
                 let indirectly_loaded = indirectly_loaded.unwrap()?;
+
                 self.offsets = indirectly_loaded.offsets;
                 self.validity = indirectly_loaded.validity;
-                self.unawaited_item_decoders
-                    .extend(indirectly_loaded.item_decoders);
+                self.item_decoder = indirectly_loaded.root_decoder;
             }
             trace!(
-                "List decoder is waiting for {} rows and {} are already available",
+                "List decoder is waiting for {} rows and {} are already available and {} are unawaited",
                 num_rows,
-                self.lists_available
+                self.lists_available,
+                self.num_rows - self.rows_drained
             );
             if self.lists_available >= num_rows {
                 self.lists_available -= num_rows;
@@ -561,44 +518,18 @@ impl LogicalPageDecoder for ListPageDecoder {
             let item_start = self.offsets[offset_wait_start as usize];
             let mut items_needed =
                 self.offsets[offset_wait_start as usize + num_rows as usize] - item_start;
-            // First discount any already available items
-            let items_already_available = self
-                .awaited_item_decoders
-                .iter()
-                .map(|d| d.avail() as u64)
-                .sum::<u64>();
-            trace!(
-                "List's items decoder already has {} items available in {} awaited pages",
-                items_already_available,
-                self.awaited_item_decoders.len(),
-            );
-            items_needed = items_needed.saturating_sub(items_already_available);
-            // The last decoder in the awaited list may not be fully awaited
-            if let Some(last_decoder) = self.awaited_item_decoders.back_mut() {
-                let to_await = items_needed.min(last_decoder.unawaited() as u64) as u32;
+            if items_needed > 0 {
+                // First discount any already available items
+                let items_already_available = self.item_decoder.as_mut().unwrap().avail_u64();
                 trace!(
-                    "List decoder waiting for {} items from the last awaited page",
-                    to_await
+                    "List's items decoder needs {} items and already has {} items available",
+                    items_needed,
+                    items_already_available,
                 );
-                if to_await > 0 {
-                    last_decoder.wait(to_await).await?;
-                    items_needed = items_needed.saturating_sub(last_decoder.avail() as u64);
+                items_needed = items_needed.saturating_sub(items_already_available);
+                if items_needed > 0 {
+                    self.item_decoder.as_mut().unwrap().wait_u64(items_needed).await?;
                 }
-            }
-            // Finally wait for more I/O
-            while items_needed > 0 {
-                let mut next_item_decoder = self.unawaited_item_decoders.pop_front().unwrap();
-                let unawaited = next_item_decoder.unawaited() as u64;
-                trace!(
-                    "List decoder waiting on a new page that has {} items unawaited",
-                    unawaited
-                );
-                let to_await = items_needed.min(unawaited) as u32;
-                // TODO: Seems like this will fail in List<Struct> case
-                next_item_decoder.wait(to_await).await?;
-                // Might end up loading more items than needed so use saturating_sub
-                items_needed = items_needed.saturating_sub(next_item_decoder.avail() as u64);
-                self.awaited_item_decoders.push_back(next_item_decoder);
             }
             // This is technically undercounting a little.  It's possible that we loaded a big items
             // page with many items and then only needed a few of them for the requested lists.  However,
@@ -648,21 +579,16 @@ impl LogicalPageDecoder for ListPageDecoder {
             .slice(self.rows_drained as usize, actual_num_rows as usize);
         let start = offsets[0];
         let end = offsets[offsets.len() - 1];
-        let mut num_items_to_drain = end - start;
+        let num_items_to_drain = end - start;
 
-        let mut item_decodes = Vec::new();
-        while num_items_to_drain > 0 {
-            let next_item_page = self.awaited_item_decoders.front_mut().unwrap();
-            let avail = next_item_page.avail();
-            let to_take = num_items_to_drain.min(avail as u64) as u32;
-            num_items_to_drain -= to_take as u64;
-            let next_task = next_item_page.drain(to_take)?;
-
-            if !next_task.has_more {
-                self.awaited_item_decoders.pop_front();
-            }
-            item_decodes.push(next_task.task);
-        }
+        let item_decode = if num_items_to_drain == 0 {
+            None
+        } else {
+            self.item_decoder
+                .as_mut()
+                .map(|item_decoder| Result::Ok(item_decoder.drain_u64(num_items_to_drain)?.task))
+                .transpose()?
+        };
 
         self.rows_drained += num_rows;
         Ok(NextDecodeTask {
@@ -671,7 +597,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             task: Box::new(ListDecodeTask {
                 offsets,
                 validity,
-                items: item_decodes,
+                items: item_decode,
                 items_type: self.items_type.clone(),
                 offset_type: self.offset_type.clone(),
             }) as Box<dyn DecodeArrayTask>,
@@ -690,7 +616,7 @@ impl LogicalPageDecoder for ListPageDecoder {
 struct IndirectlyLoaded {
     offsets: Vec<u64>,
     validity: BooleanBuffer,
-    item_decoders: Vec<Box<dyn LogicalPageDecoder>>,
+    root_decoder: Option<SimpleStructDecoder>,
 }
 
 impl std::fmt::Debug for IndirectlyLoaded {
@@ -1094,7 +1020,7 @@ mod tests {
         ArrayRef, BooleanArray, ListArray,
     };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::{DataType, Field, Fields};
 
     use crate::testing::{
         check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
@@ -1113,6 +1039,18 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_nested_list() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
+        check_round_trip_encoding_random(field).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_list_struct_list() {
+        let struct_type = DataType::Struct(Fields::from(vec![Field::new(
+            "inner_str",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let field = Field::new("", make_list_type(struct_type), true);
         check_round_trip_encoding_random(field).await;
     }
 
@@ -1146,12 +1084,14 @@ mod tests {
             for idx in order {
                 list_builder.append_value(values[idx].clone());
             }
-            let list_array = list_builder.finish();
+            let list_array = Arc::new(list_builder.finish());
             let test_cases = TestCases::default()
                 .with_indices(vec![1])
                 .with_indices(vec![0])
                 .with_indices(vec![2]);
-            check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
+            check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+            let test_cases = test_cases.with_batch_size(1);
+            check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
         }
 
         // Scenario 2: All lists are empty
@@ -1163,10 +1103,12 @@ mod tests {
         list_builder.append(true);
         list_builder.append_null();
         list_builder.append(true);
-        let list_array = list_builder.finish();
+        let list_array = Arc::new(list_builder.finish());
 
         let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
     }
 
     #[test_log::test(tokio::test)]

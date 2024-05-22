@@ -15,9 +15,13 @@
 package com.lancedb.lance;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import org.apache.arrow.dataset.scanner.Scanner;
@@ -28,6 +32,7 @@ import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -56,19 +61,59 @@ public class FragmentTest {
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(fragmentId, rowCount);
 
       // Commit fragment
-      FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(fragmentMeta));
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
-        var fragment = dataset.getFragments().get(0);
+        DatasetFragment fragment = dataset.getFragments().get(0);
         assertEquals(fragmentId, fragment.getId());
   
-        try (var scanner = fragment.newScan()) {
-          var schemaRes = scanner.schema();
+        try (LanceScanner scanner = fragment.newScan()) {
+          Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
         }
       }
+    }
+  }
+
+  @Test
+  void commitWithoutVersion() {
+    String datasetPath = tempDir.resolve("commit_without_version").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata meta = testDataset.createNewFragment(123, 20);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(meta));
+      assertThrows(IllegalArgumentException.class, () -> {
+        Dataset.commit(allocator, datasetPath, appendOp, Optional.empty());
+      });
+    }
+  }
+
+  @Test
+  void commitOldVersion() {
+    String datasetPath = tempDir.resolve("commit_old_version").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata meta = testDataset.createNewFragment(123, 20);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(meta));
+      assertThrows(IllegalArgumentException.class, () -> {
+        Dataset.commit(allocator, datasetPath, appendOp, Optional.of(0L));
+      });
+    }
+  }
+
+  @Test
+  void appendWithoutFragment() {
+    String datasetPath = tempDir.resolve("append_without_fragment").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      assertThrows(IllegalArgumentException.class, () -> {
+        new FragmentOperation.Append(new ArrayList<>());
+      });
     }
   }
 }

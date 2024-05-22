@@ -150,7 +150,7 @@ pub fn parse_version_from_path(path: &Path) -> Result<u64> {
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
     Path::parse(format!("{base}-{id}")).map_err(|e| Error::IO {
-        message: format!("failed to parse path: {}", e),
+        source: Box::new(e),
         location: location!(),
     })
 }
@@ -382,10 +382,13 @@ pub async fn commit_handler_from_url(
             }))
         }
         "gs" | "az" | "file" | "memory" => Ok(Arc::new(RenameCommitHandler)),
-        unknown_scheme => Err(Error::IO {
-            message: format!("Unsupported URI scheme: {}", unknown_scheme),
-            location: location!(),
-        }),
+
+        unknow_scheme => {
+            let err = lance_core::Error::from(object_store::Error::NotSupported {
+                source: format!("Unsupported URI scheme: {}", unknow_scheme).into(),
+            });
+            Err(err)
+        }
     }
 }
 
