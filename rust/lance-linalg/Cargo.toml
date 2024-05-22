@@ -13,6 +13,7 @@ categories = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
+bitvec = { workspace = true }
 futures = { workspace = true }
 half = { workspace = true }
 lance-arrow = { workspace = true }
