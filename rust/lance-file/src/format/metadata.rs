@@ -52,9 +52,10 @@ impl From<&Metadata> for pb::Metadata {
     }
 }
 
-impl From<pb::Metadata> for Metadata {
-    fn from(m: pb::Metadata) -> Self {
-        Self {
+impl TryFrom<pb::Metadata> for Metadata {
+    type Error = Error;
+    fn try_from(m: pb::Metadata) -> Result<Self> {
+        Ok(Self {
             batch_offsets: m.batch_offsets.clone(),
             page_table_position: m.page_table_position as usize,
             manifest_position: Some(m.manifest_position as usize),
@@ -70,7 +71,7 @@ impl From<pb::Metadata> for Metadata {
             } else {
                 None
             },
-        }
+        })
     }
 }
 

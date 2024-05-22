@@ -104,14 +104,13 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
 pub async fn read_struct<
     'm,
     M: Message + Default + 'static,
-    T: ProtoStruct<Proto = M> + From<M>,
+    T: ProtoStruct<Proto = M> + TryFrom<M, Error = Error>,
 >(
     reader: &dyn Reader,
     pos: usize,
 ) -> Result<T> {
     let msg = read_message::<M>(reader, pos).await?;
-    let obj = T::from(msg);
-    Ok(obj)
+    T::try_from(msg)
 }
 
 pub async fn read_last_block(reader: &dyn Reader) -> Result<Bytes> {
@@ -165,11 +164,14 @@ pub fn read_message_from_buf<M: Message + Default>(buf: &Bytes) -> Result<M> {
 }
 
 /// Read a Protobuf-backed struct from a buffer.
-pub fn read_struct_from_buf<M: Message + Default, T: ProtoStruct<Proto = M> + From<M>>(
+pub fn read_struct_from_buf<
+    M: Message + Default,
+    T: ProtoStruct<Proto = M> + TryFrom<M, Error = Error>,
+>(
     buf: &Bytes,
 ) -> Result<T> {
     let msg: M = read_message_from_buf(buf)?;
-    Ok(T::from(msg))
+    T::try_from(msg)
 }
 
 #[cfg(test)]
@@ -184,6 +186,7 @@ mod tests {
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
         utils::read_struct,
+        Error, Result,
     };
 
     // Bytes is a prost::Message, since we don't have any .proto files in this crate we
@@ -201,9 +204,10 @@ mod tests {
         }
     }
 
-    impl From<Bytes> for BytesWrapper {
-        fn from(value: Bytes) -> Self {
-            Self(value)
+    impl TryFrom<Bytes> for BytesWrapper {
+        type Error = Error;
+        fn try_from(value: Bytes) -> Result<Self> {
+            Ok(Self(value))
         }
     }
 
