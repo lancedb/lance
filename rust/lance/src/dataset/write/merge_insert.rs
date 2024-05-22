@@ -325,7 +325,7 @@ impl MergeInsertJob {
     pub async fn execute_reader(
         self,
         source: Box<dyn RecordBatchReader + Send>,
-    ) -> Result<Arc<Dataset>> {
+    ) -> Result<(Arc<Dataset>, MergeStats)> {
         let stream = reader_to_stream(source);
         self.execute(stream).await
     }
@@ -343,6 +343,7 @@ impl MergeInsertJob {
 
     async fn join_key_as_scalar_index(&self) -> Result<Option<Index>> {
         if self.params.on.len() != 1 {
+            // joining on more than one column
             Ok(None)
         } else {
             let col = &self.params.on[0];
@@ -371,7 +372,7 @@ impl MergeInsertJob {
         let schema = shared_input.schema();
         let field = schema.field_with_name(&self.params.on[0])?;
         let key_only_schema =
-            lance_core::datatypes::Schema::try_from(&Schema::new(vec![field.clone()]))?;
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![field.clone()]))?; // schema for only the key join column
         let index_mapper_input = Arc::new(ProjectionExec::try_new(
             shared_input.clone(),
             Arc::new(key_only_schema),
@@ -380,6 +381,7 @@ impl MergeInsertJob {
         // Then we pass the key column into the index mapper
         let index_column = self.params.on[0].clone();
         let index_mapper = Arc::new(MapIndexExec::new(
+            // create index from original data and key column
             self.dataset.clone(),
             index_column.clone(),
             index_mapper_input,
@@ -459,11 +461,11 @@ impl MergeInsertJob {
         let new_data = session_ctx.read_one_shot(source)?;
         let join_cols = self
             .params
-            .on
+            .on // columns to join on
             .iter()
             .map(|c| c.as_str())
-            .collect::<Vec<_>>();
-        let joined = new_data.join(existing, JoinType::Full, &join_cols, &join_cols, None)?;
+            .collect::<Vec<_>>(); // vector of strings of col names to join
+        let joined = new_data.join(existing, JoinType::Full, &join_cols, &join_cols, None)?; // full join
         Ok(joined.execute_stream().await?)
     }
 
@@ -473,10 +475,11 @@ impl MergeInsertJob {
     ) -> Result<SendableRecordBatchStream> {
         // We need to do a full index scan if we're deleting source data
         let can_use_scalar_index = matches!(
-            self.params.delete_not_matched_by_source,
+            self.params.delete_not_matched_by_source, // this value marks behavior for rows in target that are not matched by the source. Value assigned earlier.
             WhenNotMatchedBySource::Keep
         );
         if can_use_scalar_index {
+            // keeping unmatched rows, no deletion
             if let Some(index) = self.join_key_as_scalar_index().await? {
                 self.create_indexed_scan_joined_stream(source, index).await
             } else {
@@ -492,11 +495,15 @@ impl MergeInsertJob {
     ///
     /// This will take in the source, merge it with the existing target data, and insert new
     /// rows, update existing rows, and delete existing rows
-    pub async fn execute(self, source: SendableRecordBatchStream) -> Result<Arc<Dataset>> {
+    pub async fn execute(
+        self,
+        source: SendableRecordBatchStream,
+    ) -> Result<(Arc<Dataset>, MergeStats)> {
         let schema = source.schema();
 
         let joined = self.create_joined_stream(source).await?;
         let merger = Merger::try_new(self.params, schema.clone())?;
+        let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
         let stream = joined
             .and_then(move |batch| merger.clone().execute_batch(batch))
@@ -515,17 +522,25 @@ impl MergeInsertJob {
 
         // Apply deletions
         let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
+
         let (old_fragments, removed_fragment_ids) =
             Self::apply_deletions(&self.dataset, &removed_row_ids).await?;
 
         // Commit updated and new fragments
-        Self::commit(
+        let committed_ds = Self::commit(
             self.dataset,
             removed_fragment_ids,
             old_fragments,
             new_fragments,
         )
-        .await
+        .await?;
+
+        let stats = Arc::into_inner(merge_statistics)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+
+        Ok((committed_ds, stats))
     }
 
     // Delete a batch of rows by id, returns the fragments modified and the fragments removed
@@ -606,6 +621,19 @@ impl MergeInsertJob {
     }
 }
 
+/// Merger will store these statistics as it runs (for each batch)
+#[derive(Debug, Default, Clone)]
+pub struct MergeStats {
+    /// Number of inserted rows (for user statistics)
+    pub num_inserted_rows: u64,
+    /// Number of updated rows (for user statistics)
+    pub num_updated_rows: u64,
+    /// Number of deleted rows (for user statistics)
+    /// Note: This is different from internal references to 'deleted_rows', since we technically "delete" updated rows during processing.
+    /// However those rows are not shared with the user.
+    pub num_deleted_rows: u64,
+}
+
 // A sync-safe structure that is shared by all of the "process batch" tasks.
 //
 // Note: we are not currently using parallelism but this still needs to be sync because it is
@@ -616,6 +644,8 @@ struct Merger {
     deleted_rows: Arc<Mutex<RoaringTreemap>>,
     // Physical delete expression, only set if params.delete_not_matched_by_source is DeleteIf
     delete_expr: Option<Arc<dyn PhysicalExpr>>,
+    // User statistics for merging
+    merge_stats: Arc<Mutex<MergeStats>>,
     // Physical "when matched update if" expression, only set if params.when_matched is UpdateIf
     match_filter_expr: Option<Arc<dyn PhysicalExpr>>,
     // The parameters controlling the merge
@@ -657,6 +687,7 @@ impl Merger {
         Ok(Self {
             deleted_rows: Arc::new(Mutex::new(RoaringTreemap::new())),
             delete_expr,
+            merge_stats: Arc::new(Mutex::new(MergeStats::default())),
             match_filter_expr,
             params,
             schema,
@@ -721,6 +752,7 @@ impl Merger {
         batch: RecordBatch,
     ) -> datafusion::common::Result<impl Stream<Item = datafusion::common::Result<RecordBatch>>>
     {
+        let mut merge_statistics = self.merge_stats.lock().unwrap();
         let num_fields = batch.schema().fields.len();
         // The schema of the combined batches will be:
         // source_keys, source_payload, target_keys, target_payload, row_id
@@ -743,6 +775,7 @@ impl Merger {
 
         if self.params.when_matched != WhenMatched::DoNothing {
             let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+
             if let Some(match_filter) = self.match_filter_expr {
                 let unzipped = unzip_batch(&matched, &self.schema);
                 let filtered = match_filter.evaluate(&unzipped)?;
@@ -761,6 +794,9 @@ impl Merger {
                     }
                 }
             }
+
+            merge_statistics.num_updated_rows = matched.num_rows() as u64;
+
             // If the filter eliminated all rows then its important we don't try and write
             // the batch at all.  Writing an empty batch currently panics
             if matched.num_rows() > 0 {
@@ -787,11 +823,14 @@ impl Merger {
                 self.schema.clone(),
                 Vec::from_iter(not_matched.columns().iter().cloned()),
             )?;
+
+            merge_statistics.num_inserted_rows = not_matched.num_rows() as u64;
             batches.push(Ok(not_matched));
         }
         match self.params.delete_not_matched_by_source {
             WhenNotMatchedBySource::Delete => {
                 let unmatched = arrow::compute::filter(batch.column(row_id_col), &right_only)?;
+                merge_statistics.num_deleted_rows = unmatched.len() as u64;
                 let row_ids = unmatched.as_primitive::<UInt64Type>();
                 deleted_row_ids.extend(row_ids.values());
             }
@@ -800,6 +839,7 @@ impl Merger {
                 let unmatched = arrow::compute::filter_record_batch(&target_data, &right_only)?;
                 let row_id_col = unmatched.num_columns() - 1;
                 let to_delete = self.delete_expr.unwrap().evaluate(&unmatched)?;
+
                 match to_delete {
                     ColumnarValue::Array(mask) => {
                         let row_ids = arrow::compute::filter(
@@ -807,11 +847,13 @@ impl Merger {
                             mask.as_boolean(),
                         )?;
                         let row_ids = row_ids.as_primitive::<UInt64Type>();
+                        merge_statistics.num_deleted_rows = row_ids.len() as u64;
                         deleted_row_ids.extend(row_ids.values());
                     }
                     ColumnarValue::Scalar(scalar) => {
                         if let ScalarValue::Boolean(Some(true)) = scalar {
                             let row_ids = unmatched.column(row_id_col).as_primitive::<UInt64Type>();
+                            merge_statistics.num_deleted_rows = row_ids.len() as u64;
                             deleted_row_ids.extend(row_ids.values());
                         }
                     }
@@ -819,6 +861,7 @@ impl Merger {
             }
             WhenNotMatchedBySource::Keep => {}
         }
+
         Ok(stream::iter(batches))
     }
 }
@@ -845,6 +888,7 @@ mod tests {
         mut job: MergeInsertJob,
         keys_from_left: &[u32],
         keys_from_right: &[u32],
+        stats: &[u64],
     ) {
         let mut dataset = (*job.dataset).clone();
         dataset.restore().await.unwrap();
@@ -854,7 +898,7 @@ mod tests {
         let new_reader = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
         let new_stream = reader_to_stream(new_reader);
 
-        let merged_dataset = job.execute(new_stream).await.unwrap();
+        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
 
         let batches = merged_dataset
             .scan()
@@ -895,6 +939,9 @@ mod tests {
         right_keys.sort();
         assert_eq!(left_keys, keys_from_left);
         assert_eq!(right_keys, keys_from_right);
+        assert_eq!(merge_stats.num_inserted_rows, stats[0]);
+        assert_eq!(merge_stats.num_updated_rows, stats[1]);
+        assert_eq!(merge_stats.num_deleted_rows, stats[2]);
     }
 
     #[tokio::test]
@@ -940,7 +987,14 @@ mod tests {
             .unwrap()
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[7, 8, 9]).await;
+        check(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3, 4, 5, 6],
+            &[7, 8, 9],
+            &[3, 0, 0],
+        )
+        .await;
 
         // upsert, no delete
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -948,7 +1002,14 @@ mod tests {
             .when_matched(WhenMatched::UpdateAll)
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6, 7, 8, 9]).await;
+        check(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3],
+            &[4, 5, 6, 7, 8, 9],
+            &[3, 3, 0],
+        )
+        .await;
 
         // conditional upsert, no delete
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -958,7 +1019,14 @@ mod tests {
             )
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1, 2, 3, 4, 5], &[6, 7, 8, 9]).await;
+        check(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3, 4, 5],
+            &[6, 7, 8, 9],
+            &[3, 1, 0],
+        )
+        .await;
 
         // conditional update, no matches
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -967,7 +1035,7 @@ mod tests {
             .when_matched(WhenMatched::update_if(&ds, "target.filterme = 'z'").unwrap())
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[]).await;
+        check(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[], &[0, 0, 0]).await;
 
         // update only, no delete (useful for bulk update)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -976,7 +1044,7 @@ mod tests {
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6]).await;
+        check(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6], &[0, 3, 0]).await;
 
         // Conditional update
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -987,7 +1055,7 @@ mod tests {
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1, 2, 3, 6], &[4, 5]).await;
+        check(new_batch.clone(), job, &[1, 2, 3, 6], &[4, 5], &[0, 2, 0]).await;
 
         // No-op (will raise an error)
         assert!(MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -1002,7 +1070,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[4, 5, 6], &[7, 8, 9]).await;
+        check(new_batch.clone(), job, &[4, 5, 6], &[7, 8, 9], &[3, 0, 3]).await;
 
         // upsert, with delete all
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -1011,7 +1079,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9]).await;
+        check(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9], &[3, 3, 3]).await;
 
         // update only, with delete all (unusual)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -1021,7 +1089,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[], &[4, 5, 6]).await;
+        check(new_batch.clone(), job, &[], &[4, 5, 6], &[0, 3, 3]).await;
 
         // just delete all (not real case, just use delete)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -1030,7 +1098,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[4, 5, 6], &[]).await;
+        check(new_batch.clone(), job, &[4, 5, 6], &[], &[0, 0, 3]).await;
 
         // For the "delete some" tests we use key > 1
         let condition = Expr::gt(
@@ -1043,7 +1111,14 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1, 4, 5, 6], &[7, 8, 9]).await;
+        check(
+            new_batch.clone(),
+            job,
+            &[1, 4, 5, 6],
+            &[7, 8, 9],
+            &[3, 0, 2],
+        )
+        .await;
 
         // upsert, with delete some
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -1052,9 +1127,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1], &[4, 5, 6, 7, 8, 9]).await;
+        check(
+            new_batch.clone(),
+            job,
+            &[1],
+            &[4, 5, 6, 7, 8, 9],
+            &[3, 3, 2],
+        )
+        .await;
 
-        // update only, with delete some (unusual)
+        // update only, witxh delete some (unusual)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
@@ -1062,7 +1144,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1], &[4, 5, 6]).await;
+        check(new_batch.clone(), job, &[1], &[4, 5, 6], &[0, 3, 2]).await;
 
         // just delete some (not real case, just use delete)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -1071,7 +1153,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check(new_batch.clone(), job, &[1, 4, 5, 6], &[]).await;
+        check(new_batch.clone(), job, &[1, 4, 5, 6], &[], &[0, 0, 2]).await;
     }
 
     #[tokio::test]
@@ -1140,7 +1222,7 @@ mod tests {
         ));
 
         // Run merge_insert
-        let ds = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        let (ds, _) = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
             .when_matched(WhenMatched::UpdateAll)
@@ -1166,7 +1248,7 @@ mod tests {
             schema.clone(),
         ));
         // Run merge_insert
-        let ds = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        let (ds, _) = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
             .when_matched(WhenMatched::UpdateAll)
@@ -1186,7 +1268,7 @@ mod tests {
         ));
         // Run merge_insert one last time.  The index is now completely out of date.  Every
         // row it points to is a deleted row.  Make sure that doesn't break.
-        let ds = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        let (ds, _) = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
             .when_matched(WhenMatched::UpdateAll)
