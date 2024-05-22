@@ -392,7 +392,6 @@ mod tests {
         file_writer.finish().await.unwrap();
     }
 
-
     #[tokio::test]
     async fn test_write_zero_batches() {
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -474,8 +473,8 @@ mod tests {
             .into_reader_rows(RowCount::from(0), BatchCount::from(10));
 
         let nonzero_reader2 = gen()
-        .col("score", array::rand::<Float64Type>())
-        .into_reader_rows(RowCount::from(1000), BatchCount::from(20));
+            .col("score", array::rand::<Float64Type>())
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(20));
 
         let zero_reader2 = gen()
             .col("score", array::rand::<Float64Type>())
