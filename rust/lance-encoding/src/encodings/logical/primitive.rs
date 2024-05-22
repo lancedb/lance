@@ -526,6 +526,7 @@ pub struct PrimitiveFieldEncoder {
 
 impl PrimitiveFieldEncoder {
     pub fn array_encoder_from_data_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
+        let compressed = std::env::var("LANCE_COMPRESSED_PAGE").is_ok();
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
@@ -534,7 +535,7 @@ impl PrimitiveFieldEncoder {
                 )))))
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(data_type, true)?,
+                ValueEncoder::try_new(data_type, compressed)?,
             )))),
         }
     }

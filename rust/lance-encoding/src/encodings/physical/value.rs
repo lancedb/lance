@@ -31,37 +31,38 @@ pub struct ValuePageScheduler {
     bytes_per_value: u64,
     buffer_offset: u64,
     buffer_size: u64,
+    compressed: bool,
 }
 
 impl ValuePageScheduler {
     pub fn new(bytes_per_value: u64, buffer_offset: u64, buffer_size: u64) -> Self {
+        let compressed = std::env::var("LANCE_COMPRESSED_PAGE").is_ok();
         Self {
             bytes_per_value,
             buffer_offset,
             buffer_size,
+            compressed,
         }
     }
-}
 
-fn decompress_with_ranges(
-    bytes: &Vec<Bytes>,
-    range_offsets: &Vec<std::ops::Range<usize>>,
-) -> Result<Vec<Bytes>> {
-    // TODO: extract the method, add environment controlled by a flag
-    // decompress the bytes and cut the range of bytes
-    // zstd decompress the bytes
-    let bytes_u8: Vec<u8> = bytes.into_iter().flat_map(|b| b.to_vec()).collect();
-    let buffer_compressor = GeneralBufferCompressor::get_compressor("");
-    let mut decompressed_bytes: Vec<u8> = Vec::new();
-    buffer_compressor.decompress(&bytes_u8, &mut decompressed_bytes)?;
+    fn decompress_with_ranges(
+        bytes: &Vec<Bytes>,
+        range_offsets: &Vec<std::ops::Range<usize>>,
+    ) -> Result<Vec<Bytes>> {
+        let bytes_u8: Vec<u8> = bytes.into_iter().flat_map(|b| b.to_vec()).collect();
+        let buffer_compressor = GeneralBufferCompressor::get_compressor("");
+        let mut decompressed_bytes: Vec<u8> = Vec::new();
+        buffer_compressor.decompress(&bytes_u8, &mut decompressed_bytes)?;
 
-    let mut bytes_in_ranges: Vec<Bytes> = Vec::new();
-    for range in range_offsets {
-        let start = range.start;
-        let end = range.end;
-        bytes_in_ranges.push(Bytes::from(decompressed_bytes[start..end].to_vec()));
+        let mut bytes_in_ranges: Vec<Bytes> = Vec::new();
+        bytes_in_ranges.reserve(range_offsets.len());
+        for range in range_offsets {
+            let start = range.start;
+            let end = range.end;
+            bytes_in_ranges.push(Bytes::from(decompressed_bytes[start..end].to_vec()));
+        }
+        Ok(bytes_in_ranges)
     }
-    Ok(bytes_in_ranges)
 }
 
 impl PhysicalPageScheduler for ValuePageScheduler {
@@ -71,12 +72,26 @@ impl PhysicalPageScheduler for ValuePageScheduler {
         scheduler: &dyn EncodingsIo,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
-        let mut min = u64::MAX;
-        let mut max = 0;
-        let byte_ranges = vec![Range {
-            start: self.buffer_offset,
-            end: self.buffer_offset + self.buffer_size,
-        }];
+        let (mut min, mut max) = (u64::MAX, 0);
+        let byte_ranges = if self.compressed {
+            min = self.buffer_offset;
+            max = self.buffer_offset + self.buffer_size;
+            vec![Range {
+                start: min,
+                end: max,
+            }]
+        } else {
+            ranges
+                .iter()
+                .map(|range| {
+                    let start = self.buffer_offset + (range.start as u64 * self.bytes_per_value);
+                    let end = self.buffer_offset + (range.end as u64 * self.bytes_per_value);
+                    min = min.min(start);
+                    max = max.max(end);
+                    start..end
+                })
+                .collect::<Vec<_>>()
+        };
 
         trace!(
             "Scheduling I/O for {} ranges spread across byte range {}..{}",
@@ -87,23 +102,31 @@ impl PhysicalPageScheduler for ValuePageScheduler {
         let bytes = scheduler.submit_request(byte_ranges, top_level_row);
         let bytes_per_value = self.bytes_per_value;
 
-        let range_offsets = ranges
-            .iter()
-            .map(|range| {
-                let start = (range.start as u64 * bytes_per_value) as usize;
-                let end = (range.end as u64 * bytes_per_value) as usize;
-                start..end
-            })
-            .collect::<Vec<_>>();
+        let compressed = self.compressed;
+        let range_offsets = if compressed {
+            ranges
+                .iter()
+                .map(|range| {
+                    let start = (range.start as u64 * bytes_per_value) as usize;
+                    let end = (range.end as u64 * bytes_per_value) as usize;
+                    start..end
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
 
         async move {
             let bytes = bytes.await?;
-            let decompressed_bytes = decompress_with_ranges(&bytes, &range_offsets)?;
+            let data = if compressed {
+                ValuePageScheduler::decompress_with_ranges(&bytes, &range_offsets)?
+            } else {
+                bytes
+            };
 
             Ok(Box::new(ValuePageDecoder {
                 bytes_per_value,
-                data: decompressed_bytes,
-                range_offsets,
+                data,
             }) as Box<dyn PhysicalPageDecoder>)
         }
         .boxed()
@@ -113,7 +136,6 @@ impl PhysicalPageScheduler for ValuePageScheduler {
 struct ValuePageDecoder {
     bytes_per_value: u64,
     data: Vec<Bytes>,
-    range_offsets: Vec<std::ops::Range<usize>>,
 }
 
 impl PhysicalPageDecoder for ValuePageDecoder {
@@ -169,21 +191,17 @@ pub struct ValueEncoder {
 
 impl ValueEncoder {
     pub fn try_new(data_type: &DataType, compressed: bool) -> Result<Self> {
-        if data_type.is_primitive() {
+        if *data_type == DataType::Boolean {
+            Ok(Self {
+                buffer_encoder: Box::<BitmapBufferEncoder>::default(),
+            })
+        } else if data_type.is_fixed_stride() {
             Ok(Self {
                 buffer_encoder: if compressed {
                     Box::<CompressedBufferEncoder>::default()
                 } else {
                     Box::<FlatBufferEncoder>::default()
                 },
-            })
-        } else if *data_type == DataType::Boolean {
-            Ok(Self {
-                buffer_encoder: Box::<BitmapBufferEncoder>::default(),
-            })
-        } else if data_type.is_fixed_stride() {
-            Ok(Self {
-                buffer_encoder: Box::<FlatBufferEncoder>::default(),
             })
         } else {
             Err(Error::invalid_input(
