@@ -22,7 +22,7 @@ use super::{bitmap::Bitmap, encoded_array::EncodedU64Array};
 ///    ▼                                                    
 ///    No──────────────────────────────► Array            
 ///
-/// "Dense" is decided based on ____.
+/// "Dense" is decided based on the estimated byte size of the representation.
 ///
 /// Size of RangeWithBitMap for N values:
 ///     8 bytes + 8 bytes + ceil((max - min) / 8) bytes

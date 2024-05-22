@@ -90,14 +90,14 @@ impl EncodedU64Array {
                 if offsets.is_empty() {
                     None
                 } else {
-                    Some(*base + *offsets.last().unwrap() as u64)
+                    Some(*base + offsets.iter().copied().max().unwrap() as u64)
                 }
             }
             Self::U32 { base, offsets } => {
                 if offsets.is_empty() {
                     None
                 } else {
-                    Some(*base + *offsets.last().unwrap() as u64)
+                    Some(*base + offsets.iter().copied().max().unwrap() as u64)
                 }
             }
             Self::U64(values) => values.iter().copied().max(),
@@ -292,7 +292,7 @@ mod test {
 
         // u16 version, it can start beyong the u16 range, but the
         // relative values must be within u16 range.
-        let relative_values = [0, 42, 43, 99, u16::MAX as u64];
+        let relative_values = [42, 0, 43, u16::MAX as u64, 99];
         let values = relative_values.map(|v| v + 2 * u16::MAX as u64).to_vec();
         let expected = EncodedU64Array::U16 {
             base: 2 * u16::MAX as u64,
@@ -301,7 +301,7 @@ mod test {
         roundtrip_array(values, &expected);
 
         // u32 version
-        let relative_values = [0, 42, 43, 99, u32::MAX as u64];
+        let relative_values = [42, 0, 43, u32::MAX as u64, 99];
         let values = relative_values.map(|v| v + 2 * u32::MAX as u64).to_vec();
         let expected = EncodedU64Array::U32 {
             base: 2 * u32::MAX as u64,
@@ -310,7 +310,7 @@ mod test {
         roundtrip_array(values, &expected);
 
         // u64 version
-        let values = [42, 43, 99, u64::MAX].to_vec();
+        let values = [42, 0, 43, u64::MAX, 99].to_vec();
         let expected = EncodedU64Array::U64(values.clone());
         roundtrip_array(values, &expected);
     }

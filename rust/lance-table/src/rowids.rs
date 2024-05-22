@@ -89,7 +89,7 @@ impl RowIdSequence {
     }
 
     pub fn len(&self) -> u64 {
-        self.iter().count() as u64
+        self.0.iter().map(|segment| segment.len() as u64).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -112,6 +112,7 @@ impl RowIdSequence {
                 return;
             }
         }
+        // TODO: add other optimizations, such as combining two RangeWithHoles.
         self.0.extend(other.0);
     }
 
