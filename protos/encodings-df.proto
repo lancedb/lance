@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+
+syntax = "proto3";
+
+package lance.encodings_datafusion;
+
+import "encodings.proto";
+
+// ZoneMaps are a way to wrap any leaf array with a set of zone maps that
+// can be used to apply pushdown filtering.
+//
+// A "zone map" is the min/max/null_count of a set of rows.  This can be
+// used to quickly filter out zones which are not included in simple predicates
+// like 'x = 5' or 'x > 10'.
+message ZoneMaps {
+
+    // How many rows are covered by each zone map.  There will be
+    // ceil_div(num_rows, rows_per_map) zone maps.
+    uint32 rows_per_map = 1;
+
+    // The zone maps are encoded as struct arrays with 1 row per zone.  This
+    // should be stored in a column metadata buffer.  The struct array should
+    // have 3 children: min: T, max: T, null_count: u32
+    lance.encodings.ArrayEncoding stats = 2;
+    
+    // The underlying array values
+    lance.encodings.ArrayEncoding values = 5;
+}
+

@@ -4,6 +4,7 @@
 use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PhysicalPageScheduler, format::pb};
 
+use self::value::parse_compression_scheme;
 use self::{
     basic::BasicPageScheduler, bitmap::DenseBitmapScheduler, fixed_size_list::FixedListScheduler,
     value::ValuePageScheduler,
@@ -46,14 +47,6 @@ fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> (u64, u64) {
         pb::buffer::BufferType::File => {
             buffers.column_buffers.file_buffers.positions_and_sizes[index]
         }
-    }
-}
-
-pub fn parse_compression_scheme(scheme: &str) -> Result<CompressionScheme, String> {
-    match scheme {
-        "none" => Ok(CompressionScheme::None),
-        "zstd" => Ok(CompressionScheme::Zstd),
-        _ => Err(format!("Unknown compression scheme: {}", scheme)),
     }
 }
 

@@ -6,6 +6,7 @@ members = [
     "rust/lance-core",
     "rust/lance-datagen",
     "rust/lance-encoding",
+    "rust/lance-encoding-datafusion",
     "rust/lance-file",
     "rust/lance-index",
     "rust/lance-io",
@@ -48,6 +49,7 @@ lance-core = { version = "=0.11.1", path = "./rust/lance-core" }
 lance-datafusion = { version = "=0.11.1", path = "./rust/lance-datafusion" }
 lance-datagen = { version = "=0.11.1", path = "./rust/lance-datagen" }
 lance-encoding = { version = "=0.11.1", path = "./rust/lance-encoding" }
+lance-encoding-datafusion = { version = "=0.11.1", path = "./rust/lance-encoding-datafusion" }
 lance-file = { version = "=0.11.1", path = "./rust/lance-file" }
 lance-index = { version = "=0.11.1", path = "./rust/lance-index" }
 lance-io = { version = "=0.11.1", path = "./rust/lance-io" }
