@@ -20,7 +20,6 @@ use super::pq::storage::PQ_METADTA_KEY;
 use super::pq::ProductQuantizer;
 use super::sq::storage::SQ_METADATA_KEY;
 use super::{
-    graph::VectorStore,
     ivf::storage::IvfData,
     pq::{
         storage::{ProductQuantizationMetadata, ProductQuantizationStorage},
@@ -30,6 +29,7 @@ use super::{
         storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage},
         ScalarQuantizer,
     },
+    v3::storage::VectorStore,
 };
 use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 

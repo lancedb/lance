@@ -32,11 +32,11 @@ use super::{distance::build_distance_table_l2, num_centroids, ProductQuantizerIm
 use crate::{
     pb,
     vector::{
-        graph::storage::{DistCalculator, VectorStore},
         ivf::storage::IvfData,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         transform::Transformer,
+        v3::storage::{DistCalculator, VectorStore},
         PQ_CODE_COLUMN,
     },
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,

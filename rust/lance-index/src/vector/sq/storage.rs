@@ -20,8 +20,8 @@ use snafu::{location, Location};
 
 use crate::{
     vector::{
-        graph::{storage::DistCalculator, VectorStore},
         quantizer::{QuantizerMetadata, QuantizerStorage},
+        v3::storage::{DistCalculator, VectorStore},
         SQ_CODE_COLUMN,
     },
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
