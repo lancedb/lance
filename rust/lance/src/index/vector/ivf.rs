@@ -2710,7 +2710,7 @@ mod tests {
 
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 0.7,
+            recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,
