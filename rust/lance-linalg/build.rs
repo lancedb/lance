@@ -59,6 +59,10 @@ fn main() -> Result<(), String> {
             return Err(format!("Unable to build AVX2 f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}", err));
         };
         // There is no SSE instruction set for f16 -> f32 float conversion
+    } else if cfg!(target_arch = "loongarch64") {
+        // Build a version with LSX and LASX
+        build_f16_with_flags("lsx", &["-mlsx"]).unwrap();
+        build_f16_with_flags("lasx", &["-mlasx"]).unwrap();
     } else {
         return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
     }

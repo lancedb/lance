@@ -98,6 +98,10 @@ mod kernel {
         pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn dot_f16_lsx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn dot_f16_lasx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
@@ -120,6 +124,14 @@ impl Dot for f16 {
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx2 => unsafe {
                 kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                kernel::dot_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                kernel::dot_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             _ => dot_scalar::<Self, f32, 16>(x, y),
         }
