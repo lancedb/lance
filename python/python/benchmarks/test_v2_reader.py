@@ -42,7 +42,9 @@ def measure_pyarrow_read_time(path, num_trials, verbose=False):
         parquet_read_time += (end - start).total_seconds()
 
         if verbose:
-            print(f"Parquet Read Time: {parquet_read_time/trial}s")
+            print(
+                f"Parquet Read Time for trial {trial}: {(end - start).total_seconds()}s"
+            )
 
     avg_read_time = parquet_read_time / num_trials
     print(f"Parquet Read Time: {avg_read_time}s")
@@ -66,6 +68,12 @@ def measure_parquet_write_time(table, path, num_trials, verbose=False):
         end = datetime.now()
         parquet_write_time += (end - start).total_seconds()
 
+        if verbose:
+            print(
+                f"Parquet Write Time for trial {trial}: \
+                    {(end - start).total_seconds()}s"
+            )
+
     avg_write_time = parquet_write_time / num_trials
     print(f"Parquet Write Time: {avg_write_time}s")
     return avg_write_time
@@ -87,10 +95,12 @@ def measure_lance_read_time(path, num_trials, batch_size, verbose=False):
         lance_read_time += (end - start).total_seconds()
 
         if verbose:
-            print(f"V2 Read Time: {lance_read_time/trial}s")
+            print(
+                f"Lance Read Time for trial {trial}: {(end - start).total_seconds()}s"
+            )
 
     avg_read_time = lance_read_time / num_trials
-    print(f"V2 Read Time: {avg_read_time}s")
+    print(f"Lance Read Time: {avg_read_time}s")
     return avg_read_time
 
 
@@ -114,6 +124,11 @@ def measure_lance_write_time(dataset, path, num_trials=10, verbose=False):
                 writer.write_batch(batch)
         end = datetime.now()
         lance_write_time += (end - start).total_seconds()
+
+        if verbose:
+            print(
+                f"Lance Write Time for trial {trial}: {(end - start).total_seconds()}s"
+            )
 
     avg_write_time = lance_write_time / num_trials
     print(f"Lance Write Time: {avg_write_time}s")
@@ -310,15 +325,6 @@ def benchmark_sift_vector_encodings(
 
     PATH = dataset_dir + "sift1m.parquet"
     orig_dataset = ds.dataset(PATH)
-    # orig_schema = orig_dataset.schema
-
-    # for field in orig_schema:
-    #     print(field.name, field.type)
-
-    # target_columns = [
-    #     field.name for field in orig_schema if is_fixed_size_list(field.type)
-    # ]
-    # print(target_columns)
 
     table = orig_dataset.to_table()
     parquet_path = "/tmp/parquet_ds.parquet"
@@ -359,13 +365,6 @@ def benchmark_sift_vector_encodings(
         ]
     )
 
-    # os.remove(parquet_path)
-
-    # if os.path.isdir(lance_path):
-    #     shutil.rmtree(lance_path)
-    # else:
-    #     os.remove(lance_path)
-
 
 if __name__ == "__main__":
     if os.path.exists("benchmark_tpch_encodings.csv"):
@@ -386,5 +385,5 @@ if __name__ == "__main__":
         "/home/ubuntu/test/",
         dataset_name="sift1m",
         encoding_type="plain_fixed_size_list",
-        num_trials=3,
+        num_trials=5,
     )
