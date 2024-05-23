@@ -51,11 +51,11 @@ pub fn apply_feature_flags(manifest: &mut Manifest) -> Result<()> {
 }
 
 pub fn can_read_dataset(reader_flags: u64) -> bool {
-    reader_flags <= 2
+    reader_flags <= 3
 }
 
 pub fn can_write_dataset(writer_flags: u64) -> bool {
-    writer_flags <= 2
+    writer_flags <= 3
 }
 
 #[cfg(test)]
@@ -70,7 +70,7 @@ mod tests {
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES | super::FLAG_ROW_IDS
         ));
-        assert!(!can_read_dataset(super::FLAG_ROW_IDS + 1));
+        assert!(!can_read_dataset(super::FLAG_ROW_IDS << 1));
     }
 
     #[test]
@@ -81,6 +81,6 @@ mod tests {
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES | super::FLAG_ROW_IDS
         ));
-        assert!(!can_write_dataset(super::FLAG_ROW_IDS + 1));
+        assert!(!can_write_dataset(super::FLAG_ROW_IDS << 1));
     }
 }
