@@ -17,51 +17,34 @@ pub mod value;
 /// These contain the file buffers shared across the entire file
 #[derive(Clone, Copy, Debug)]
 pub struct FileBuffers<'a> {
-    pub positions: &'a Vec<u64>,
-    pub sizes: &'a Vec<u64>,
+    pub positions_and_sizes: &'a Vec<(u64, u64)>,
 }
 
 /// These contain the file buffers and also buffers specific to a column
 #[derive(Clone, Copy, Debug)]
 pub struct ColumnBuffers<'a, 'b> {
     pub file_buffers: FileBuffers<'a>,
-    pub positions: &'b Vec<u64>,
-    pub sizes: &'b Vec<u64>,
+    pub positions_and_sizes: &'b Vec<(u64, u64)>,
 }
 
 /// These contain the file & column buffers and also buffers specific to a page
 #[derive(Clone, Copy, Debug)]
 pub struct PageBuffers<'a, 'b, 'c> {
     pub column_buffers: ColumnBuffers<'a, 'b>,
-    pub positions: &'c Vec<u64>,
-    pub sizes: &'c Vec<u64>,
+    pub positions_and_sizes: &'c Vec<(u64, u64)>,
 }
 
 // Translate a protobuf buffer description into a position in the file.  This could be a page
 // buffer, a column buffer, or a file buffer.
 fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> (u64, u64) {
-    fn get_from_buffers<'a>(
-        positions: &'a Vec<u64>,
-        sizes: &'a Vec<u64>,
-        index: usize,
-    ) -> (u64, u64) {
-        (positions[index], sizes[index])
-    }
-
     let index = buffer_desc.buffer_index as usize;
 
     match pb::buffer::BufferType::try_from(buffer_desc.buffer_type).unwrap() {
-        pb::buffer::BufferType::Page => get_from_buffers(buffers.positions, buffers.sizes, index),
-        pb::buffer::BufferType::Column => get_from_buffers(
-            buffers.column_buffers.positions,
-            buffers.column_buffers.sizes,
-            index,
-        ),
-        pb::buffer::BufferType::File => get_from_buffers(
-            buffers.column_buffers.file_buffers.positions,
-            buffers.column_buffers.file_buffers.sizes,
-            index,
-        ),
+        pb::buffer::BufferType::Page => buffers.positions_and_sizes[index],
+        pb::buffer::BufferType::Column => buffers.column_buffers.positions_and_sizes[index],
+        pb::buffer::BufferType::File => {
+            buffers.column_buffers.file_buffers.positions_and_sizes[index]
+        }
     }
 }
 

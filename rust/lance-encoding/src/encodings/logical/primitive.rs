@@ -58,8 +58,7 @@ impl PrimitivePageScheduler {
     pub fn new(data_type: DataType, page: Arc<PageInfo>, buffers: ColumnBuffers) -> Self {
         let page_buffers = PageBuffers {
             column_buffers: buffers,
-            positions: &page.buffer_offsets,
-            sizes: &page.buffer_sizes,
+            positions_and_sizes: &page.buffer_offsets_and_sizes,
         };
         Self {
             data_type,

@@ -415,12 +415,16 @@ impl FileReader {
                     .iter()
                     .map(|page| {
                         let num_rows = page.length;
-                        let buffer_offsets = Arc::new(page.buffer_offsets.clone());
-                        let buffer_sizes = Arc::new(page.buffer_sizes.clone());
                         let encoding = Self::fetch_encoding(page.encoding.as_ref().unwrap());
+                        let buffer_offsets_and_sizes = Arc::new(
+                            page.buffer_offsets
+                                .iter()
+                                .zip(page.buffer_sizes.iter())
+                                .map(|(offset, size)| (*offset, *size))
+                                .collect(),
+                        );
                         Arc::new(PageInfo {
-                            buffer_offsets,
-                            buffer_sizes,
+                            buffer_offsets_and_sizes,
                             encoding,
                             num_rows,
                         })
@@ -429,8 +433,7 @@ impl FileReader {
                 Arc::new(ColumnInfo {
                     index: col_idx as u32,
                     page_infos,
-                    buffer_offsets: vec![],
-                    buffer_sizes: vec![],
+                    buffer_offsets_and_sizes: vec![],
                 })
             })
             .collect::<Vec<_>>()
@@ -597,7 +600,6 @@ impl FileReader {
             &projection.schema,
             column_infos.iter().map(|ci| ci.as_ref()),
             &vec![],
-            &vec![],
         );
 
         let root_decoder = decode_scheduler
@@ -634,7 +636,6 @@ impl FileReader {
         let mut decode_scheduler = DecodeBatchScheduler::new(
             &projection.schema,
             column_infos.iter().map(|ci| ci.as_ref()),
-            &vec![],
             &vec![],
         );
 
