@@ -77,7 +77,7 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
         .await?;
 
     for (id, row_ids) in inline_files {
-        let sequence = read_row_ids(&row_ids)?;
+        let sequence = read_row_ids(row_ids)?;
         sequences.push((id, sequence));
     }
 
@@ -88,15 +88,13 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 
 #[cfg(test)]
 mod test {
-    use crate::dataset::WriteParams;
+    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
 
     use super::*;
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::address::RowAddress;
-
-    // TODO: add tests once we support writing.
 
     #[tokio::test]
     async fn test_empty_dataset_rowids() {
@@ -146,14 +144,12 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap();
 
         let found_addresses = (0..num_rows)
-            .into_iter()
-            .map(|i| index.get(i as u64).unwrap())
+            .map(|i| index.get(i).unwrap())
             .collect::<Vec<_>>();
         let expected_addresses = (0..num_rows)
-            .into_iter()
             .map(|i| {
                 let fragment_id = i / 10;
-                RowAddress::new_from_parts(fragment_id as u32, i as u32)
+                RowAddress::new_from_parts(fragment_id as u32, (i % 10) as u32)
             })
             .collect::<Vec<_>>();
         assert_eq!(found_addresses, expected_addresses);
@@ -161,7 +157,97 @@ mod test {
         assert_eq!(dataset.manifest().next_row_id, num_rows);
     }
 
-    // TODO: test with deletions, updates, compact things do the right thing.
+    #[tokio::test]
+    async fn test_row_ids_overwrite() {
+        // Validate we don't re-use after overwriting
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let num_rows = 10u64;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let write_params = WriteParams {
+            enable_experimental_stable_row_ids: true,
+            ..Default::default()
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = temp_dir.path().to_str().unwrap();
+        let dataset = Dataset::write(reader, tmp_path, Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.manifest().next_row_id, num_rows);
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, tmp_path, Some(write_params))
+            .await
+            .unwrap();
+
+        // Overwriting should NOT reset the row id counter.
+        assert_eq!(dataset.manifest().next_row_id, 2 * num_rows);
+
+        let index = get_row_id_index(&dataset).await.unwrap();
+        assert!(index.get(0).is_none());
+        assert!(index.get(num_rows).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_row_ids_update() {
+        // Updated fragments get fresh row ids.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let num_rows = 5u64;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let write_params = WriteParams {
+            enable_experimental_stable_row_ids: true,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.manifest().next_row_id, num_rows);
+
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 3")
+            .unwrap()
+            .set("id", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        let index = get_row_id_index(&dataset).await.unwrap();
+        assert!(index.get(0).is_some());
+        // Old address is still there.
+        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(0, 3)));
+        // New location is there.
+        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(1, 0)));
+    }
+
+    // TODO: compaction does the right thing
 
     // TODO: test scan with row id produces correct values.
 }

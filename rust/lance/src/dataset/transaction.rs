@@ -42,7 +42,7 @@ use lance_file::datatypes::Fields;
 use lance_io::object_store::ObjectStore;
 use lance_table::{
     format::{
-        pb::{self, manifest, IndexMetadata},
+        pb::{self, IndexMetadata},
         Fragment, Index, Manifest, RowIdMeta,
     },
     io::{
@@ -420,7 +420,9 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
-                Self::assign_row_ids(&mut next_row_id, &mut new_fragments)?;
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
                 final_fragments.extend(new_fragments);
             }
             Operation::Delete {
@@ -454,16 +456,22 @@ impl Transaction {
                         Some(f.clone())
                     }
                 }));
-                final_fragments.extend(Self::fragments_with_ids(
-                    new_fragments.clone(),
-                    &mut fragment_id,
-                ));
+                let mut new_fragments =
+                    Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
+                        .collect::<Vec<_>>();
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+                final_fragments.extend(new_fragments);
             }
             Operation::Overwrite { ref fragments, .. } => {
-                final_fragments.extend(Self::fragments_with_ids(
-                    fragments.clone(),
-                    &mut fragment_id,
-                ));
+                let mut new_fragments =
+                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
+                        .collect::<Vec<_>>();
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+                final_fragments.extend(new_fragments);
                 final_indices = Vec::new();
             }
             Operation::Rewrite {
@@ -554,6 +562,10 @@ impl Transaction {
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
+
+        if let Some(next_row_id) = next_row_id {
+            manifest.next_row_id = next_row_id;
+        }
 
         Ok((manifest, final_indices))
     }
@@ -686,7 +698,7 @@ impl Transaction {
         Ok(())
     }
 
-    fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [&mut Fragment]) -> Result<()> {
+    fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
             let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
                 message: "Fragment does not have physical rows".into(),
