@@ -3,7 +3,7 @@
 
 //! In-memory graph representations.
 
-use super::storage::{DistCalculator, VectorStore};
+use crate::vector::v3::storage::{DistCalculator, VectorStore};
 use arrow::array::AsArray;
 use arrow_array::types::Float32Type;
 use arrow_array::ArrayRef;
