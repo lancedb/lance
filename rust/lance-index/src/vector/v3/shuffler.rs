@@ -11,12 +11,12 @@ use lance_io::stream::RecordBatchStream;
 /// A reader that can read the shuffled partitions.
 pub trait IvfShuffleReader: Send + Sync {
     /// Read a partition by partition_id
-    /// will return error if partition_size is 0
+    /// will return Ok(None) if partition_size is 0
     /// check reader.partiton_size(partition_id) before calling this function
     async fn read_partition(
         &self,
         partition_id: usize,
-    ) -> Result<Box<dyn RecordBatchStream + Unpin + 'static>>;
+    ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>;
 
     /// Get the size of the partition by partition_id
     fn partiton_size(&self, partition_id: usize) -> Result<usize>;
@@ -32,10 +32,4 @@ pub trait IvfShuffler {
         mut self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
     ) -> Result<Box<dyn IvfShuffleReader>>;
-}
-
-#[async_trait::async_trait]
-/// A specification to build a IvfShuffler.
-pub trait IvfShufflerSpec {
-    async fn build(&self) -> Box<dyn IvfShuffler>;
 }
