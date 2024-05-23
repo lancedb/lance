@@ -272,6 +272,7 @@ impl ArrayEncoder for BasicEncoder {
                         buffer_index: validity_buffer_index,
                         buffer_type: pb::buffer::BufferType::Page as i32,
                     }),
+                    compression: None,
                 })),
             });
 

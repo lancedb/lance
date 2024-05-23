@@ -154,6 +154,10 @@ message FixedSizeList {
   ArrayEncoding items = 2;
 }
 
+message Compression {
+  string scheme = 1;
+}
+
 // Fixed width items placed contiguously in a buffer
 message Flat {
   // the number of bits per value, must be greater than 0, does
@@ -161,6 +165,9 @@ message Flat {
   uint64 bits_per_value = 1;
   // the buffer of values
   Buffer buffer = 2;
+  // The Compression message can specify the compression scheme (e.g. zstd) and any
+  // other information that is needed for decompression.
+  Compression compression = 3;
 }
 
 // An array encoding for shredded structs that will never be null

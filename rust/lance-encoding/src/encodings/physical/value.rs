@@ -9,6 +9,7 @@ use lance_arrow::DataTypeExt;
 use log::trace;
 use snafu::{location, Location};
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
@@ -44,25 +45,6 @@ impl ValuePageScheduler {
             compressed,
         }
     }
-
-    fn decompress_with_ranges(
-        bytes: &Vec<Bytes>,
-        range_offsets: &Vec<std::ops::Range<usize>>,
-    ) -> Result<Vec<Bytes>> {
-        let bytes_u8: Vec<u8> = bytes.into_iter().flat_map(|b| b.to_vec()).collect();
-        let buffer_compressor = GeneralBufferCompressor::get_compressor("");
-        let mut decompressed_bytes: Vec<u8> = Vec::new();
-        buffer_compressor.decompress(&bytes_u8, &mut decompressed_bytes)?;
-
-        let mut bytes_in_ranges: Vec<Bytes> = Vec::new();
-        bytes_in_ranges.reserve(range_offsets.len());
-        for range in range_offsets {
-            let start = range.start;
-            let end = range.end;
-            bytes_in_ranges.push(Bytes::from(decompressed_bytes[start..end].to_vec()));
-        }
-        Ok(bytes_in_ranges)
-    }
 }
 
 impl PhysicalPageScheduler for ValuePageScheduler {
@@ -76,6 +58,8 @@ impl PhysicalPageScheduler for ValuePageScheduler {
         let byte_ranges = if self.compressed {
             min = self.buffer_offset;
             max = self.buffer_offset + self.buffer_size;
+            // for compressed page, the ranges are always the entire page,
+            // and it is guaranteed that only one range is passed
             vec![Range {
                 start: min,
                 end: max,
@@ -118,15 +102,12 @@ impl PhysicalPageScheduler for ValuePageScheduler {
 
         async move {
             let bytes = bytes.await?;
-            let data = if compressed {
-                ValuePageScheduler::decompress_with_ranges(&bytes, &range_offsets)?
-            } else {
-                bytes
-            };
 
             Ok(Box::new(ValuePageDecoder {
                 bytes_per_value,
-                data,
+                data: bytes,
+                uncompressed_data: Arc::new(Mutex::new(None)),
+                uncompressed_range_offsets: range_offsets,
             }) as Box<dyn PhysicalPageDecoder>)
         }
         .boxed()
@@ -136,6 +117,59 @@ impl PhysicalPageScheduler for ValuePageScheduler {
 struct ValuePageDecoder {
     bytes_per_value: u64,
     data: Vec<Bytes>,
+    uncompressed_data: Arc<Mutex<Option<Vec<Bytes>>>>,
+    uncompressed_range_offsets: Vec<std::ops::Range<usize>>,
+}
+
+impl ValuePageDecoder {
+    fn decompress(&self) -> Result<Vec<Bytes>> {
+        // for compressed page, it is guaranteed that only one range is passed
+        let bytes_u8: Vec<u8> = self.data[0].to_vec();
+        let buffer_compressor = GeneralBufferCompressor::get_compressor("");
+        let mut uncompressed_bytes: Vec<u8> = Vec::new();
+        buffer_compressor.decompress(&bytes_u8, &mut uncompressed_bytes)?;
+
+        let mut bytes_in_ranges: Vec<Bytes> = Vec::new();
+        bytes_in_ranges.reserve(self.uncompressed_range_offsets.len());
+        for range in &self.uncompressed_range_offsets {
+            let start = range.start;
+            let end = range.end;
+            bytes_in_ranges.push(Bytes::from(uncompressed_bytes[start..end].to_vec()));
+        }
+        Ok(bytes_in_ranges)
+    }
+
+    fn get_uncompressed_bytes(&self) -> Result<Arc<Mutex<Option<Vec<Bytes>>>>> {
+        let mut uncompressed_bytes = self.uncompressed_data.lock().unwrap();
+        if uncompressed_bytes.is_none() {
+            *uncompressed_bytes = Some(self.decompress()?);
+        }
+        Ok(Arc::clone(&self.uncompressed_data))
+    }
+
+    fn is_compressed(&self) -> bool {
+        !self.uncompressed_range_offsets.is_empty()
+    }
+
+    fn decode_buffer(
+        &self,
+        buf: &Bytes,
+        bytes_to_skip: &mut u64,
+        bytes_to_take: &mut u64,
+        dest: &mut bytes::BytesMut,
+    ) {
+        let buf_len = buf.len() as u64;
+        if *bytes_to_skip > buf_len {
+            *bytes_to_skip -= buf_len;
+        } else {
+            let bytes_to_take_here = (buf_len - *bytes_to_skip).min(*bytes_to_take);
+            *bytes_to_take -= bytes_to_take_here;
+            let start = *bytes_to_skip as usize;
+            let end = start + bytes_to_take_here as usize;
+            dest.extend_from_slice(&buf.slice(start..end));
+            *bytes_to_skip = 0;
+        }
+    }
 }
 
 impl PhysicalPageDecoder for ValuePageDecoder {
@@ -163,17 +197,14 @@ impl PhysicalPageDecoder for ValuePageDecoder {
 
         debug_assert!(dest.capacity() as u64 >= bytes_to_take);
 
-        for buf in &self.data {
-            let buf_len = buf.len() as u64;
-            if bytes_to_skip > buf_len {
-                bytes_to_skip -= buf_len;
-            } else {
-                let bytes_to_take_here = (buf_len - bytes_to_skip).min(bytes_to_take);
-                bytes_to_take -= bytes_to_take_here;
-                let start = bytes_to_skip as usize;
-                let end = start + bytes_to_take_here as usize;
-                dest.extend_from_slice(&buf.slice(start..end));
-                bytes_to_skip = 0;
+        if self.is_compressed() {
+            let decoding_data = self.get_uncompressed_bytes()?;
+            for buf in decoding_data.lock().unwrap().as_ref().unwrap() {
+                self.decode_buffer(buf, &mut bytes_to_skip, &mut bytes_to_take, dest);
+            }
+        } else {
+            for buf in &self.data {
+                self.decode_buffer(buf, &mut bytes_to_skip, &mut bytes_to_take, dest);
             }
         }
         Ok(())
@@ -187,6 +218,7 @@ impl PhysicalPageDecoder for ValuePageDecoder {
 #[derive(Debug)]
 pub struct ValueEncoder {
     buffer_encoder: Box<dyn BufferEncoder>,
+    compressed: bool,
 }
 
 impl ValueEncoder {
@@ -194,6 +226,7 @@ impl ValueEncoder {
         if *data_type == DataType::Boolean {
             Ok(Self {
                 buffer_encoder: Box::<BitmapBufferEncoder>::default(),
+                compressed,
             })
         } else if data_type.is_fixed_stride() {
             Ok(Self {
@@ -202,6 +235,7 @@ impl ValueEncoder {
                 } else {
                     Box::<FlatBufferEncoder>::default()
                 },
+                compressed,
             })
         } else {
             Err(Error::invalid_input(
@@ -235,6 +269,13 @@ impl ArrayEncoder for ValueEncoder {
                     buffer_index: index,
                     buffer_type: pb::buffer::BufferType::Page as i32,
                 }),
+                compression: if self.compressed {
+                    Some(pb::Compression {
+                        scheme: "zstd".to_string(),
+                    })
+                } else {
+                    None
+                },
             })),
         };
 
