@@ -26,6 +26,7 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
+use crate::encodings::physical::value::CompressionScheme;
 use crate::{
     decoder::{
         DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo,
@@ -37,6 +38,7 @@ use crate::{
         value::ValueEncoder, ColumnBuffers, PageBuffers,
     },
 };
+use crate::encodings::physical::parse_compression_scheme;
 
 /// A page scheduler for primitive fields
 ///
@@ -523,9 +525,13 @@ pub struct PrimitiveFieldEncoder {
     column_index: u32,
 }
 
+fn get_compression_scheme() -> CompressionScheme {
+    let compression_scheme = std::env::var("LANCE_PAGE_COMPRESSION").unwrap_or("none".to_string());
+    parse_compression_scheme(&compression_scheme).unwrap_or(CompressionScheme::None)
+}
+
 impl PrimitiveFieldEncoder {
     pub fn array_encoder_from_data_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
-        let compressed = std::env::var("LANCE_COMPRESSED_PAGE").is_ok();
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
@@ -534,7 +540,7 @@ impl PrimitiveFieldEncoder {
                 )))))
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(data_type, compressed)?,
+                ValueEncoder::try_new(data_type, get_compression_scheme())?,
             )))),
         }
     }

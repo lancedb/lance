@@ -1092,8 +1092,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_compressing_buffer() {
         let fs = FsFixture::default();
-        // set env var LANCE_COMPRESSED_PAGE to `true` temporarily to test compressed page
-        let _env_guard = EnvVarGuard::new("LANCE_COMPRESSED_PAGE", "true");
+        // set env var temporarily to test compressed page
+        let _env_guard = EnvVarGuard::new("LANCE_PAGE_COMPRESSION", "zstd");
 
         let (schema, data) = create_some_file(&fs.object_store, &fs.tmp_path).await;
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();

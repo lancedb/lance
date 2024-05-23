@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PhysicalPageScheduler, format::pb};
 
 use self::{
@@ -48,12 +49,25 @@ fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> (u64, u64) {
     }
 }
 
+pub fn parse_compression_scheme(scheme: &str) -> Result<CompressionScheme, String> {
+    match scheme {
+        "none" => Ok(CompressionScheme::None),
+        "zstd" => Ok(CompressionScheme::Zstd),
+        _ => Err(format!("Unknown compression scheme: {}", scheme)),
+    }
+}
+
 /// Convert a protobuf buffer encoding into a physical page scheduler
 fn get_buffer_decoder(
     encoding: &pb::Flat,
     buffers: &PageBuffers,
 ) -> Box<dyn PhysicalPageScheduler> {
     let (buffer_offset, buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
+    let compression_scheme = if encoding.compression.is_none() {
+        CompressionScheme::None
+    } else {
+        parse_compression_scheme(encoding.compression.as_ref().unwrap().scheme.as_str()).unwrap()
+    };
     match encoding.bits_per_value {
         1 => Box::new(DenseBitmapScheduler::new(buffer_offset)),
         bits_per_value => {
@@ -64,6 +78,7 @@ fn get_buffer_decoder(
                 bits_per_value / 8,
                 buffer_offset,
                 buffer_size,
+                compression_scheme,
             ))
         }
     }

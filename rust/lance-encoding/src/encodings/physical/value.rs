@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fmt;
 use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use bytes::Bytes;
@@ -24,6 +25,22 @@ use super::buffers::{
     BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder, GeneralBufferCompressor,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompressionScheme {
+    None,
+    Zstd,
+}
+
+impl fmt::Display for CompressionScheme {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let scheme_str = match self {
+            CompressionScheme::Zstd => "zstd",
+            CompressionScheme::None => "none",
+        };
+        write!(f, "{}", scheme_str)
+    }
+}
+
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
 pub struct ValuePageScheduler {
@@ -32,17 +49,21 @@ pub struct ValuePageScheduler {
     bytes_per_value: u64,
     buffer_offset: u64,
     buffer_size: u64,
-    compressed: bool,
+    compression_scheme: CompressionScheme,
 }
 
 impl ValuePageScheduler {
-    pub fn new(bytes_per_value: u64, buffer_offset: u64, buffer_size: u64) -> Self {
-        let compressed = std::env::var("LANCE_COMPRESSED_PAGE").is_ok();
+    pub fn new(
+        bytes_per_value: u64,
+        buffer_offset: u64,
+        buffer_size: u64,
+        compression_scheme: CompressionScheme,
+    ) -> Self {
         Self {
             bytes_per_value,
             buffer_offset,
             buffer_size,
-            compressed,
+            compression_scheme,
         }
     }
 }
@@ -55,16 +76,7 @@ impl PhysicalPageScheduler for ValuePageScheduler {
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let (mut min, mut max) = (u64::MAX, 0);
-        let byte_ranges = if self.compressed {
-            min = self.buffer_offset;
-            max = self.buffer_offset + self.buffer_size;
-            // for compressed page, the ranges are always the entire page,
-            // and it is guaranteed that only one range is passed
-            vec![Range {
-                start: min,
-                end: max,
-            }]
-        } else {
+        let byte_ranges = if self.compression_scheme == CompressionScheme::None {
             ranges
                 .iter()
                 .map(|range| {
@@ -75,6 +87,15 @@ impl PhysicalPageScheduler for ValuePageScheduler {
                     start..end
                 })
                 .collect::<Vec<_>>()
+        } else {
+            min = self.buffer_offset;
+            max = self.buffer_offset + self.buffer_size;
+            // for compressed page, the ranges are always the entire page,
+            // and it is guaranteed that only one range is passed
+            vec![Range {
+                start: min,
+                end: max,
+            }]
         };
 
         trace!(
@@ -86,8 +107,7 @@ impl PhysicalPageScheduler for ValuePageScheduler {
         let bytes = scheduler.submit_request(byte_ranges, top_level_row);
         let bytes_per_value = self.bytes_per_value;
 
-        let compressed = self.compressed;
-        let range_offsets = if compressed {
+        let range_offsets = if self.compression_scheme != CompressionScheme::None {
             ranges
                 .iter()
                 .map(|range| {
@@ -218,24 +238,24 @@ impl PhysicalPageDecoder for ValuePageDecoder {
 #[derive(Debug)]
 pub struct ValueEncoder {
     buffer_encoder: Box<dyn BufferEncoder>,
-    compressed: bool,
+    compression_scheme: CompressionScheme,
 }
 
 impl ValueEncoder {
-    pub fn try_new(data_type: &DataType, compressed: bool) -> Result<Self> {
+    pub fn try_new(data_type: &DataType, compression_scheme: CompressionScheme) -> Result<Self> {
         if *data_type == DataType::Boolean {
             Ok(Self {
                 buffer_encoder: Box::<BitmapBufferEncoder>::default(),
-                compressed,
+                compression_scheme,
             })
         } else if data_type.is_fixed_stride() {
             Ok(Self {
-                buffer_encoder: if compressed {
+                buffer_encoder: if compression_scheme != CompressionScheme::None {
                     Box::<CompressedBufferEncoder>::default()
                 } else {
                     Box::<FlatBufferEncoder>::default()
                 },
-                compressed,
+                compression_scheme,
             })
         } else {
             Err(Error::invalid_input(
@@ -269,9 +289,9 @@ impl ArrayEncoder for ValueEncoder {
                     buffer_index: index,
                     buffer_type: pb::buffer::BufferType::Page as i32,
                 }),
-                compression: if self.compressed {
+                compression: if self.compression_scheme != CompressionScheme::None {
                     Some(pb::Compression {
-                        scheme: "zstd".to_string(),
+                        scheme: self.compression_scheme.to_string(),
                     })
                 } else {
                     None
