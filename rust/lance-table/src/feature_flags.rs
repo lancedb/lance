@@ -5,8 +5,8 @@
 
 use snafu::{location, Location};
 
-use crate::{Error, Result};
-use lance_table::format::Manifest;
+use crate::format::Manifest;
+use lance_core::{Error, Result};
 
 pub const FLAG_DELETION_FILES: u64 = 1;
 pub const FLAG_ROW_IDS: u64 = 2;

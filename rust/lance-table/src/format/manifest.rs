@@ -13,6 +13,7 @@ use object_store::path::Path;
 use prost_types::Timestamp;
 
 use super::Fragment;
+use crate::feature_flags::FLAG_ROW_IDS;
 use crate::format::pb;
 use lance_core::cache::FileMetadataCache;
 use lance_core::datatypes::Schema;
@@ -361,8 +362,14 @@ impl TryFrom<pb::Manifest> for Manifest {
             metadata: p.metadata,
         };
 
-        // TODO: if "row_id" feature flag is set, then return an error if fragments
-        // don't all have row_id metadata.
+        if FLAG_ROW_IDS & p.reader_feature_flags != 0
+            && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
+        {
+            return Err(Error::Internal {
+                message: "All fragments must have row ids".into(),
+                location: location!(),
+            });
+        }
 
         Ok(Self {
             schema: Schema::from(fields_with_meta),

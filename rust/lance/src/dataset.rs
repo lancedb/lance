@@ -32,7 +32,6 @@ use tracing::instrument;
 
 pub mod builder;
 pub mod cleanup;
-mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
@@ -49,7 +48,6 @@ mod write;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
-use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
@@ -62,6 +60,7 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
+use lance_table::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -1317,6 +1316,7 @@ mod tests {
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags;
     use lance_table::format::WriterVersion;
     use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;

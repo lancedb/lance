@@ -56,11 +56,9 @@ use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use super::{
-    feature_flags::{apply_feature_flags, FLAG_ROW_IDS},
-    ManifestWriteConfig,
-};
+use super::ManifestWriteConfig;
 use crate::utils::temporal::timestamp_to_nanos;
+use lance_table::feature_flags::{apply_feature_flags, FLAG_ROW_IDS};
 
 /// A change to a dataset that can be retried
 ///
