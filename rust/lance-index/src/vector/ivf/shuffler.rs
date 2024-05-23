@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::compute::{concat_batches, sort_to_indices};
+use arrow::compute::sort_to_indices;
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use futures::stream::repeat_with;
@@ -452,12 +452,7 @@ impl IvfShuffler {
                 )?;
 
                 for batches in shuffled {
-                    if batches.is_empty() {
-                        continue;
-                    }
-                    // concat to avoid slowdown due to small IOs
-                    let batch = concat_batches(&batches[0].schema(), &batches)?;
-                    file_writer.write(&[batch]).await?;
+                    file_writer.write(&batches).await?;
                 }
 
                 file_writer.finish().await?;
