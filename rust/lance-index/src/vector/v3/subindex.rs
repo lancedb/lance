@@ -45,7 +45,7 @@ impl PreFilter for NoPreFilter {
 pub trait IvfSubIndex: Send + Sync + Sized {
     type QueryParams: Default;
 
-    fn index_name(&self) -> &str;
+    fn name(&self) -> &str;
 
     /// Search the sub index for nearest neighbors.
     /// # Arguments:
@@ -62,35 +62,14 @@ pub trait IvfSubIndex: Send + Sync + Sized {
         prefilter: Arc<impl PreFilter>,
     ) -> Result<RecordBatch>;
 
-    // check if the builder supports the metadata schema requested
-    fn supports_metadata(&self, _schema: SchemaRef) -> bool {
-        false
-    }
-
     /// Load the sub index from a struct array with a single row
     fn load(data: StructArray) -> Result<Self>;
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
-    fn index(&self, storage: &impl VectorStore) -> Result<()>;
+    fn index_vectors(&self, storage: &impl VectorStore) -> Result<()>;
 
-    /// Turn the sub index into a struct array
+    /// Encode the sub index into a struct array
     fn to_array(&self) -> Result<StructArray>;
-
-    /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
-    /// The returned value is a struct array with a SINGLE ROW and always have the same schema
-    ///
-    /// It is recommended to not implement this method and use the default implementation
-    /// The implementation should implement `index` and `to_array` method instead, as they make the index
-    /// appendable
-    ///
-    /// NOTE: we use a single record batch to avoid the need of async operations to read the data
-    ///
-    /// The roundtrip looks like
-    /// IvfSubIndexBuilder.index(data).to_array()
-    fn build(&self, storage: &impl VectorStore) -> Result<StructArray> {
-        self.index(storage)?;
-        self.to_array()
-    }
 }
 
 /// A Flat index is any index that stores no metadata, and
@@ -107,7 +86,7 @@ lazy_static::lazy_static! {
 impl IvfSubIndex for FlatIndex {
     type QueryParams = ();
 
-    fn index_name(&self) -> &str {
+    fn name(&self) -> &str {
         "FLAT"
     }
 
@@ -148,7 +127,7 @@ impl IvfSubIndex for FlatIndex {
         Ok(Self {})
     }
 
-    fn index(&self, _: &impl VectorStore) -> Result<()> {
+    fn index_vectors(&self, _: &impl VectorStore) -> Result<()> {
         Ok(())
     }
 
