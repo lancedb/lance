@@ -19,7 +19,7 @@ use crate::vector::{
 use super::storage::VectorStore;
 
 /// A sub index for IVF index
-pub trait IvfSubIndex<T: Num, Store: VectorStore>: Send + Sync + Sized {
+pub trait IvfSubIndex: Send + Sync + Sized {
     type QueryParams: Default;
 
     fn index_name(&self) -> &str;
@@ -30,12 +30,12 @@ pub trait IvfSubIndex<T: Num, Store: VectorStore>: Send + Sync + Sized {
     /// * `k` - The number of nearest neighbors to return
     /// * `params` - The query parameters
     /// * `pre_filter_bitmap` - The pre filter bitmap indicating which vectors to skip
-    fn search(
+    fn search<T: Num>(
         &self,
         query: &[T],
         k: usize,
         params: Self::QueryParams,
-        storage: &Store,
+        storage: &impl VectorStore,
         pre_filter_bitmap: Option<RoaringBitmap>,
     ) -> Result<RecordBatch>;
 
@@ -48,7 +48,7 @@ pub trait IvfSubIndex<T: Num, Store: VectorStore>: Send + Sync + Sized {
     fn load(data: StructArray) -> Result<Self>;
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
-    fn index(&self, storage: &Store) -> Result<()>;
+    fn index(&self, storage: &impl VectorStore) -> Result<()>;
 
     /// Turn the sub index into a struct array
     fn to_array(&self) -> Result<StructArray>;
@@ -64,7 +64,7 @@ pub trait IvfSubIndex<T: Num, Store: VectorStore>: Send + Sync + Sized {
     ///
     /// The roundtrip looks like
     /// IvfSubIndexBuilder.index(data).to_array()
-    fn build(&self, storage: &Store) -> Result<StructArray> {
+    fn build(&self, storage: &impl VectorStore) -> Result<StructArray> {
         self.index(storage)?;
         self.to_array()
     }
@@ -79,19 +79,19 @@ lazy_static::lazy_static! {
     ]));
 }
 
-impl<T: Num, Store: VectorStore> IvfSubIndex<T, Store> for FlatIndex {
+impl IvfSubIndex for FlatIndex {
     type QueryParams = ();
 
     fn index_name(&self) -> &str {
         "FLAT"
     }
 
-    fn search(
+    fn search<T: Num>(
         &self,
         query: &[T],
         k: usize,
         _params: Self::QueryParams,
-        storage: &Store,
+        storage: &impl VectorStore,
         pre_filter_bitmap: Option<RoaringBitmap>,
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator_from_native(query);
@@ -129,7 +129,7 @@ impl<T: Num, Store: VectorStore> IvfSubIndex<T, Store> for FlatIndex {
         Ok(Self {})
     }
 
-    fn index(&self, _: &Store) -> Result<()> {
+    fn index(&self, _: &impl VectorStore) -> Result<()> {
         Ok(())
     }
 

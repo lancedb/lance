@@ -9,7 +9,7 @@ use lance_io::stream::RecordBatchStream;
 
 #[async_trait::async_trait]
 /// A reader that can read the shuffled partitions.
-pub trait IvfShuffleReader: Send + Sync {
+pub trait IvfShuffleReader {
     /// Read a partition by partition_id
     /// will return error if partition_size is 0
     /// check reader.partiton_size(partition_id) before calling this function
