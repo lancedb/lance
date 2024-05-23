@@ -14,14 +14,10 @@ use lance_core::Result;
 
 pub mod builder;
 pub mod memory;
-pub mod storage;
-
-/// Vector storage to back a graph.
-pub use storage::VectorStore;
 
 use crate::vector::DIST_COL;
 
-use self::storage::DistCalculator;
+use crate::vector::v3::storage::DistCalculator;
 
 pub(crate) const NEIGHBORS_COL: &str = "__neighbors";
 

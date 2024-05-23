@@ -19,6 +19,7 @@ pub mod residual;
 pub mod sq;
 pub mod transform;
 pub mod utils;
+pub mod v3;
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
