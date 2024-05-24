@@ -8,6 +8,7 @@ use std::{any::Any, sync::Arc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_file::{
     reader::FileReader,
     writer::{FileWriter, FileWriterOptions, ManifestProvider},
@@ -31,6 +32,14 @@ pub struct LanceIndexStore {
     object_store: ObjectStore,
     index_dir: Path,
     metadata_cache: Option<FileMetadataCache>,
+}
+
+impl DeepSizeOf for LanceIndexStore {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.object_store.deep_size_of_children(context)
+            + self.index_dir.as_ref().deep_size_of_children(context)
+            + self.metadata_cache.deep_size_of_children(context)
+    }
 }
 
 impl LanceIndexStore {

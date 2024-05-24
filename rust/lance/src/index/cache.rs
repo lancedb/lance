@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use deepsize::DeepSizeOf;
 use lance_index::scalar::ScalarIndex;
 use lance_table::format::Index;
 use moka::sync::{Cache, ConcurrentCacheExt};
@@ -11,7 +12,7 @@ use super::vector::VectorIndex;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, DeepSizeOf)]
 struct CacheStats {
     hits: AtomicU64,
     misses: AtomicU64,
@@ -40,6 +41,26 @@ pub struct IndexCache {
     metadata_cache: Arc<Cache<String, Arc<Vec<Index>>>>,
 
     cache_stats: Arc<CacheStats>,
+}
+
+impl DeepSizeOf for IndexCache {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.scalar_cache
+            .iter()
+            .map(|(_, v)| v.deep_size_of_children(context))
+            .sum::<usize>()
+            + self
+                .vector_cache
+                .iter()
+                .map(|(_, v)| v.deep_size_of_children(context))
+                .sum::<usize>()
+            + self
+                .metadata_cache
+                .iter()
+                .map(|(_, v)| v.deep_size_of_children(context))
+                .sum::<usize>()
+            + self.cache_stats.deep_size_of_children(context)
+    }
 }
 
 impl IndexCache {

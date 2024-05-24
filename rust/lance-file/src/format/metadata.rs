@@ -6,12 +6,13 @@ use std::ops::Range;
 
 use crate::datatypes::{Fields, FieldsWithMeta};
 use crate::format::pb;
+use deepsize::DeepSizeOf;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::traits::ProtoStruct;
 use snafu::{location, Location};
 /// Data File Metadata
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, DeepSizeOf, PartialEq)]
 pub struct Metadata {
     /// Offset of each record batch.
     pub batch_offsets: Vec<i32>,
@@ -197,7 +198,7 @@ impl Metadata {
 }
 
 /// Metadata about the statistics
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, DeepSizeOf)]
 pub struct StatisticsMetadata {
     /// Schema of the page-level statistics.
     ///

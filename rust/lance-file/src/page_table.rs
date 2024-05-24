@@ -4,6 +4,7 @@
 use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
+use deepsize::DeepSizeOf;
 use lance_io::encodings::plain::PlainDecoder;
 use lance_io::encodings::Decoder;
 use snafu::{location, Location};
@@ -13,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 use lance_core::{Error, Result};
 use lance_io::traits::{Reader, Writer};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, DeepSizeOf)]
 pub struct PageInfo {
     pub position: usize,
     pub length: usize,
@@ -27,7 +28,7 @@ impl PageInfo {
 
 /// Page lookup table.
 ///
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, DeepSizeOf)]
 pub struct PageTable {
     /// map[field-id,  map[batch-id, PageInfo]]
     pages: BTreeMap<i32, BTreeMap<i32, PageInfo>>,

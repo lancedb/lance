@@ -4,6 +4,7 @@
 use std::{collections::HashSet, ops::Range};
 
 use arrow_array::BooleanArray;
+use deepsize::{Context, DeepSizeOf};
 use roaring::RoaringBitmap;
 
 /// Threshold for when a DeletionVector::Set should be promoted to a DeletionVector::Bitmap.
@@ -16,6 +17,17 @@ pub enum DeletionVector {
     NoDeletions,
     Set(HashSet<u32>),
     Bitmap(RoaringBitmap),
+}
+
+impl DeepSizeOf for DeletionVector {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        match self {
+            Self::NoDeletions => 0,
+            Self::Set(set) => set.deep_size_of_children(context),
+            // Inexact but probably close enough
+            Self::Bitmap(bitmap) => bitmap.serialized_size(),
+        }
+    }
 }
 
 impl DeletionVector {

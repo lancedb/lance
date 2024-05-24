@@ -51,6 +51,7 @@ from .lance import (
 )
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
+from .lance import _Session as Session
 from .optimize import Compaction
 from .schema import LanceSchema
 from .util import td_to_micros
@@ -1516,6 +1517,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.create_index(column, index_type, name, replace, kwargs)
         return LanceDataset(self.uri, index_cache_size=index_cache_size)
+
+    def session(self) -> Session:
+        """
+        Return the dataset session, which holds the dataset's state.
+        """
+        return self._ds.session()
 
     @staticmethod
     def _commit(

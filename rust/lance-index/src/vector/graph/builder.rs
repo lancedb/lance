@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use deepsize::DeepSizeOf;
+
 use super::OrderedFloat;
 use super::OrderedNode;
 use std::sync::Arc;
@@ -8,7 +10,7 @@ use std::sync::Arc;
 /// GraphNode during build.
 ///
 /// WARNING: Internal API,  API stability is not guaranteed
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct GraphBuilderNode {
     /// neighbors of each level of the node.
     pub(crate) bottom_neighbors: Arc<Vec<u32>>,

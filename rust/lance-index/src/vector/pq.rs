@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array};
+use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, DistanceType, Dot, L2};
@@ -31,7 +32,7 @@ pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
 /// Product Quantization
-pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
+pub trait ProductQuantizer: Send + Sync + DeepSizeOf + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 
     /// Compute the distance between query vector to the PQ code.
@@ -95,6 +96,15 @@ where
     /// Codebook[sub_vector_id][pq_code]
     /// ```
     pub codebook: Arc<T::ArrayType>,
+}
+
+impl<T: ArrowFloatType> DeepSizeOf for ProductQuantizerImpl<T>
+where
+    T::Native: Dot + L2,
+{
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.codebook.get_array_memory_size()
+    }
 }
 
 impl<T: ArrowFloatType> ProductQuantizerImpl<T>

@@ -20,6 +20,7 @@ pub mod l2;
 pub mod norm_l2;
 
 pub use cosine::*;
+use deepsize::DeepSizeOf;
 pub use dot::*;
 pub use l2::*;
 pub use norm_l2::*;
@@ -27,7 +28,7 @@ pub use norm_l2::*;
 use crate::Result;
 
 /// Distance metrics type.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, DeepSizeOf)]
 pub enum DistanceType {
     L2,
     Cosine,

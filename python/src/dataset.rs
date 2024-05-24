@@ -65,6 +65,7 @@ use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::schema::LanceSchema;
+use crate::session::Session;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -970,6 +971,10 @@ impl Dataset {
 
     fn index_cache_hit_rate(&self) -> PyResult<f32> {
         Ok(self.ds.index_cache_hit_rate())
+    }
+
+    fn session(&self) -> Session {
+        Session::new(self.ds.session())
     }
 
     #[staticmethod]
