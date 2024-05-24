@@ -65,6 +65,7 @@ use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::schema::LanceSchema;
+use crate::session::Session;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -972,8 +973,8 @@ impl Dataset {
         Ok(self.ds.index_cache_hit_rate())
     }
 
-    fn cache_size_bytes(&self) -> u64 {
-        self.ds.cache_size_bytes()
+    fn session(&self) -> Session {
+        Session::new(self.ds.session())
     }
 
     #[staticmethod]

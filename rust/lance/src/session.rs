@@ -94,6 +94,13 @@ impl Session {
 
         Ok(())
     }
+
+    /// Return the current size of the session in bytes
+    pub fn size_bytes(&self) -> u64 {
+        // We re-expose deep_size_of here so that users don't
+        // need the deepsize crate themselves (e.g. to use deep_size_of)
+        self.deep_size_of() as u64
+    }
 }
 
 impl Default for Session {

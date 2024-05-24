@@ -1058,6 +1058,10 @@ impl Dataset {
         self.base.child(INDICES_DIR)
     }
 
+    pub fn session(&self) -> Arc<Session> {
+        self.session.clone()
+    }
+
     pub fn version(&self) -> Version {
         Version::from(self.manifest.as_ref())
     }

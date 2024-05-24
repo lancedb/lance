@@ -52,54 +52,9 @@ const BTREE_PAGES_NAME: &str = "page_data.lance";
 struct OrderableScalarValue(ScalarValue);
 
 impl DeepSizeOf for OrderableScalarValue {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        match &self.0 {
-            ScalarValue::Null => 0,
-            ScalarValue::Boolean(_) => 0,
-            ScalarValue::Float32(_) => 0,
-            ScalarValue::Float64(_) => 0,
-            ScalarValue::Decimal128(_, _, _) => 0,
-            ScalarValue::Decimal256(_, _, _) => 0,
-            ScalarValue::Int8(_) => 0,
-            ScalarValue::Int16(_) => 0,
-            ScalarValue::Int32(_) => 0,
-            ScalarValue::Int64(_) => 0,
-            ScalarValue::UInt8(_) => 0,
-            ScalarValue::UInt16(_) => 0,
-            ScalarValue::UInt32(_) => 0,
-            ScalarValue::UInt64(_) => 0,
-            ScalarValue::Utf8(str) => str.deep_size_of_children(context),
-            ScalarValue::LargeUtf8(str) => str.deep_size_of_children(context),
-            ScalarValue::Binary(bin) => bin.deep_size_of_children(context),
-            ScalarValue::FixedSizeBinary(_, bin) => bin.deep_size_of_children(context),
-            ScalarValue::LargeBinary(bin) => bin.deep_size_of_children(context),
-            ScalarValue::FixedSizeList(arr) => arr.get_array_memory_size(),
-            ScalarValue::List(arr) => arr.get_array_memory_size(),
-            ScalarValue::LargeList(arr) => arr.get_array_memory_size(),
-            ScalarValue::Struct(arr) => arr.get_array_memory_size(),
-            ScalarValue::Date32(_) => 0,
-            ScalarValue::Date64(_) => 0,
-            ScalarValue::Time32Second(_) => 0,
-            ScalarValue::Time32Millisecond(_) => 0,
-            ScalarValue::Time64Microsecond(_) => 0,
-            ScalarValue::Time64Nanosecond(_) => 0,
-            ScalarValue::TimestampSecond(_, _) => 0,
-            ScalarValue::TimestampMillisecond(_, _) => 0,
-            ScalarValue::TimestampMicrosecond(_, _) => 0,
-            ScalarValue::TimestampNanosecond(_, _) => 0,
-            ScalarValue::IntervalYearMonth(_) => 0,
-            ScalarValue::IntervalDayTime(_) => 0,
-            ScalarValue::IntervalMonthDayNano(_) => 0,
-            ScalarValue::DurationSecond(_) => 0,
-            ScalarValue::DurationMillisecond(_) => 0,
-            ScalarValue::DurationMicrosecond(_) => 0,
-            ScalarValue::DurationNanosecond(_) => 0,
-            ScalarValue::Union(_, _, _) => todo!(),
-            // TODO: Should probably track data_type here if we upstream this
-            ScalarValue::Dictionary(_data_type, val) => {
-                OrderableScalarValue(*val.clone()).deep_size_of()
-            }
-        }
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // deepsize and size both factor in the size of the ScalarValue
+        self.0.size() - std::mem::size_of::<ScalarValue>()
     }
 }
 
@@ -1206,5 +1161,33 @@ impl Stream for IndexReaderStream {
         let reader_copy = this.reader.clone();
         let read_task = async move { reader_copy.read_record_batch(page_number).await }.boxed();
         std::task::Poll::Ready(Some(read_task))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::Int32Type;
+    use arrow_array::FixedSizeListArray;
+    use datafusion_common::ScalarValue;
+    use deepsize::DeepSizeOf;
+
+    use super::OrderableScalarValue;
+
+    #[test]
+    fn test_scalar_value_size() {
+        let size_of_i32 = OrderableScalarValue(ScalarValue::Int32(Some(0))).deep_size_of();
+        let size_of_many_i32 = OrderableScalarValue(ScalarValue::FixedSizeList(Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![Some(vec![Some(0); 128])],
+                128,
+            ),
+        )))
+        .deep_size_of();
+
+        // deep_size_of should account for the rust type overhead
+        assert!(size_of_i32 > 4);
+        assert!(size_of_many_i32 > 128 * 4);
     }
 }
