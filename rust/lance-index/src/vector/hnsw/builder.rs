@@ -208,6 +208,32 @@ impl HNSW {
         Ok(hnsw)
     }
 
+    pub fn build_empty(
+        distance_type: DistanceType,
+        params: HnswBuildParams,
+        storage: Arc<dyn VectorStorage>,
+    ) -> Self {
+        let inner = HNSWBuilderInner::with_params(distance_type, params, storage.as_ref());
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    pub fn insert(
+        &self,
+        node: u32,
+        visited_generator: &mut VisitedGenerator,
+        storage: &dyn VectorStorage,
+    ) -> Result<()> {
+        if node as usize >= self.inner.nodes().len() {
+            return Err(Error::Index {
+                message: "node index is too large for initialized HNSW instance".to_string(),
+                location: location!(),
+            });
+        }
+        self.inner.insert(node, visited_generator, storage)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn search(
         &self,
@@ -586,7 +612,7 @@ impl HNSWBuilderInner {
     }
 
     /// Insert one node.
-    fn insert(
+    pub fn insert(
         &self,
         node: u32,
         visited_generator: &mut VisitedGenerator,
