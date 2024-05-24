@@ -24,7 +24,7 @@ use crate::io::commit::{parse_version_from_path, CommitError, CommitHandler, Man
 /// External manifest store
 ///
 /// This trait abstracts an external storage for source of truth for manifests.
-/// The storge is expected to remember (uri, version) -> manifest_path
+/// The storage is expected to remember (uri, version) -> manifest_path
 /// and able to run transactions on the manifest_path.
 ///
 /// This trait is called an **External** manifest store because the store is
@@ -43,11 +43,31 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     /// the version and the store should not customize it.
     async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>>;
 
+    /// Get the latest manifest location for a given base_uri.
+    async fn get_latest_manifest_location(&self, base_uri: &str) -> Result<Option<ManifestLocation>> {
+        self.get_latest_version(base_uri)
+            .await
+            .map(|res| res.map(|(version, uri)| ManifestLocation {
+                version,
+                uri,
+                size: None,
+            }))
+    }
+
     /// Put the manifest path for a given base_uri and version, should fail if the version already exists
     async fn put_if_not_exists(&self, base_uri: &str, version: u64, path: &str) -> Result<()>;
 
     /// Put the manifest path for a given base_uri and version, should fail if the version **does not** already exist
     async fn put_if_exists(&self, base_uri: &str, version: u64, path: &str) -> Result<()>;
+}
+
+pub struct ManifestLocation {
+    /// The version the manifest corresponds to.
+    pub version: u64,
+    /// URI of the manifest file
+    pub uri: String,
+    /// Size, in bytes, of the manifest file. If it is not known, this field should be `None`.
+    pub size: Option<u64>,
 }
 
 /// External manifest commit handler

@@ -331,6 +331,30 @@ The reader load process is as follows:
 3. ``PUT_EXTERNAL_STORE base_uri, version, mydataset.lance/_versions/{version}.manifest`` update the external store to point to the final manifest
 4. ``RETURN mydataset.lance/_versions/{version}.manifest`` always return the finalized path, return error if synchronization fails
 
+Latest manifest file
+--------------------
+
+To get fast access to the latest version, there is a pointer file called
+``latest.json``. This file contains information about what the latest version
+of the table is. It is a JSON file with the fields:
+
+.. code-block::
+
+    {
+      "version": 24,
+      "manifestPath": "_versions/24.manifest",
+      "manifestSize": 2342501,
+      "readerFlags": 4,
+      "writerFlags": 5
+    }
+
+The ``version`` field is the version of the table. The ``manifestPath`` field is
+the path to the manifest file for that version. ``manifestSize`` is the size of
+the manifest file in bytes, which can be used to bypass the need for a head
+request to find the end of the manifest file. The ``readerFlags`` and
+``writerFlags`` fields are the feature flags for the reader and writer,
+respectively.
+
 Statistics
 ----------
 
