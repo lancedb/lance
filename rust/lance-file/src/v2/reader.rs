@@ -767,6 +767,10 @@ impl FileReader {
     ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
         self.read_stream_projected(params, batch_size, batch_readahead, &self.base_projection)
     }
+
+    pub fn schema(&self) -> Arc<Schema> {
+        self.metadata.file_schema.clone()
+    }
 }
 
 /// Inspects a page and returns a String describing the page's encoding
@@ -890,6 +894,7 @@ mod tests {
         for batch in &data {
             file_writer.write_batch(batch).await.unwrap();
         }
+        file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
         (Arc::new(lance_schema), data)
     }
@@ -955,6 +960,9 @@ mod tests {
         for read_size in [32, 1024, 1024 * 1024] {
             let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
             let file_reader = FileReader::try_open(file_scheduler, None).await.unwrap();
+
+            let schema = file_reader.schema();
+            assert_eq!(schema.metadata.get("foo").unwrap(), "bar");
 
             let batch_stream = file_reader
                 .read_stream(lance_io::ReadBatchParams::RangeFull, read_size, 16)
