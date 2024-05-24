@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fmt;
 use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use bytes::Bytes;
@@ -9,6 +8,7 @@ use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::DataTypeExt;
 use log::trace;
 use snafu::{location, Location};
+use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -149,8 +149,8 @@ impl ValuePageDecoder {
         let mut uncompressed_bytes: Vec<u8> = Vec::new();
         buffer_compressor.decompress(&bytes_u8, &mut uncompressed_bytes)?;
 
-        let mut bytes_in_ranges: Vec<Bytes> = Vec::new();
-        bytes_in_ranges.reserve(self.uncompressed_range_offsets.len());
+        let mut bytes_in_ranges: Vec<Bytes> =
+            Vec::with_capacity(self.uncompressed_range_offsets.len());
         for range in &self.uncompressed_range_offsets {
             let start = range.start;
             let end = range.end;

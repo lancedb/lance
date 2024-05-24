@@ -26,6 +26,7 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
+use crate::encodings::physical::parse_compression_scheme;
 use crate::encodings::physical::value::CompressionScheme;
 use crate::{
     decoder::{
@@ -38,7 +39,6 @@ use crate::{
         value::ValueEncoder, ColumnBuffers, PageBuffers,
     },
 };
-use crate::encodings::physical::parse_compression_scheme;
 
 /// A page scheduler for primitive fields
 ///

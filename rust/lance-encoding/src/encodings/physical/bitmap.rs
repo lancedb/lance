@@ -190,6 +190,7 @@ mod tests {
             ],
         };
         let mut dest = vec![BytesMut::with_capacity(1)];
-        decoder.decode_into(5, 1, &mut dest);
+        let result = decoder.decode_into(5, 1, &mut dest);
+        assert!(result.is_ok()); 
     }
 }

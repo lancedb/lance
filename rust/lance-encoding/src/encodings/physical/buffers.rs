@@ -53,8 +53,8 @@ pub struct GeneralBufferCompressor {}
 impl GeneralBufferCompressor {
     pub fn get_compressor(compression_type: &str) -> Box<dyn BufferCompressor> {
         match compression_type {
-            "" => Box::new(ZstdBufferCompressor::default()),
-            "zstd" => Box::new(ZstdBufferCompressor::default()),
+            "" => Box::<ZstdBufferCompressor>::default(),
+            "zstd" => Box::<ZstdBufferCompressor>::default(),
             _ => panic!("Unsupported compression type: {}", compression_type),
         }
     }
@@ -83,8 +83,7 @@ impl CompressedBufferEncoder {
 
 impl BufferEncoder for CompressedBufferEncoder {
     fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
-        let mut parts: Vec<Buffer> = vec![];
-        parts.reserve(arrays.len());
+        let mut parts = Vec::with_capacity(arrays.len());
         for arr in arrays {
             let buffer = arr.to_data().buffers()[0].clone();
             let buffer_len = buffer.len();
