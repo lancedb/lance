@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Execution nodes
+//!
+//! WARNING: Internal API with no stability guarantees.
+
 mod knn;
 mod optimizer;
 mod planner;
