@@ -1072,7 +1072,7 @@ mod tests {
         fn new(key: &str, new_value: &str) -> Self {
             let original_value = std::env::var(key).ok();
             std::env::set_var(key, new_value);
-            EnvVarGuard {
+            Self {
                 key: key.to_string(),
                 original_value,
             }
@@ -1103,7 +1103,7 @@ mod tests {
             .await
             .unwrap();
 
-        let projection = schema.project(&vec!["score"]).unwrap();
+        let projection = schema.project(&["score"]).unwrap();
         let projection_arrow = Arc::new(ArrowSchema::from(&projection));
         let projection = ReaderProjection {
             schema: projection_arrow,

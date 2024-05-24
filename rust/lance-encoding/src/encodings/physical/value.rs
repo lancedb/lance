@@ -34,8 +34,8 @@ pub enum CompressionScheme {
 impl fmt::Display for CompressionScheme {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let scheme_str = match self {
-            CompressionScheme::Zstd => "zstd",
-            CompressionScheme::None => "none",
+            Self::Zstd => "zstd",
+            Self::None => "none",
         };
         write!(f, "{}", scheme_str)
     }
