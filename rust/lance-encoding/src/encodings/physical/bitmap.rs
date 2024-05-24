@@ -104,7 +104,12 @@ impl PhysicalPageDecoder for BitmapDecoder {
         buffers[0].1 = true;
     }
 
-    fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [BytesMut]) {
+    fn decode_into(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        dest_buffers: &mut [BytesMut],
+    ) -> Result<()> {
         let mut rows_to_skip = rows_to_skip;
 
         let mut dest_builder = BooleanBufferBuilder::new(num_rows as usize);
@@ -141,6 +146,7 @@ impl PhysicalPageDecoder for BitmapDecoder {
         //
         // It's a moot point at the moment since we don't support page bridging
         dest_buffers[0].copy_from_slice(bool_buffer.as_slice());
+        Ok(())
     }
 
     fn num_buffers(&self) -> u32 {
@@ -184,6 +190,7 @@ mod tests {
             ],
         };
         let mut dest = vec![BytesMut::with_capacity(1)];
-        decoder.decode_into(5, 1, &mut dest);
+        let result = decoder.decode_into(5, 1, &mut dest);
+        assert!(result.is_ok());
     }
 }

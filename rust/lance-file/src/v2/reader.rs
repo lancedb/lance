@@ -415,10 +415,16 @@ impl FileReader {
                     .iter()
                     .map(|page| {
                         let num_rows = page.length;
-                        let buffer_offsets = Arc::new(page.buffer_offsets.clone());
                         let encoding = Self::fetch_encoding(page.encoding.as_ref().unwrap());
+                        let buffer_offsets_and_sizes = Arc::new(
+                            page.buffer_offsets
+                                .iter()
+                                .zip(page.buffer_sizes.iter())
+                                .map(|(offset, size)| (*offset, *size))
+                                .collect(),
+                        );
                         Arc::new(PageInfo {
-                            buffer_offsets,
+                            buffer_offsets_and_sizes,
                             encoding,
                             num_rows,
                         })
@@ -427,7 +433,7 @@ impl FileReader {
                 Arc::new(ColumnInfo {
                     index: col_idx as u32,
                     page_infos,
-                    buffer_offsets: vec![],
+                    buffer_offsets_and_sizes: vec![],
                 })
             })
             .collect::<Vec<_>>()
@@ -689,7 +695,7 @@ impl FileReader {
                             return Err(Error::invalid_input(
                                 "Null value in indices array",
                                 location!(),
-                            ))
+                            ));
                         }
                         Some(idx) => {
                             verify_bound(&params, idx as u64, true)?;
@@ -1063,5 +1069,68 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    struct EnvVarGuard {
+        key: String,
+        original_value: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn new(key: &str, new_value: &str) -> Self {
+            let original_value = std::env::var(key).ok();
+            std::env::set_var(key, new_value);
+            Self {
+                key: key.to_string(),
+                original_value,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(ref value) = self.original_value {
+                std::env::set_var(&self.key, value);
+            } else {
+                std::env::remove_var(&self.key);
+            }
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_compressing_buffer() {
+        let fs = FsFixture::default();
+        // set env var temporarily to test compressed page
+        let _env_guard = EnvVarGuard::new("LANCE_PAGE_COMPRESSION", "zstd");
+
+        let (schema, data) = create_some_file(&fs.object_store, &fs.tmp_path).await;
+        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+
+        // We can specify the projection as part of the read operation via read_stream_projected
+        let file_reader = FileReader::try_open(file_scheduler.clone(), None)
+            .await
+            .unwrap();
+
+        let projection = schema.project(&["score"]).unwrap();
+        let projection_arrow = Arc::new(ArrowSchema::from(&projection));
+        let projection = ReaderProjection {
+            schema: projection_arrow,
+            column_indices: projection.fields.iter().map(|f| f.id as u32).collect(),
+        };
+
+        let batch_stream = file_reader
+            .read_stream_projected(lance_io::ReadBatchParams::RangeFull, 1024, 16, &projection)
+            .unwrap();
+
+        let projection_copy = projection.clone();
+        verify_expected(
+            &data,
+            batch_stream,
+            1024,
+            Some(Box::new(move |batch: &RecordBatch| {
+                batch.project_by_schema(&projection_copy.schema).unwrap()
+            })),
+        )
+        .await;
     }
 }

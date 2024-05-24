@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PhysicalPageScheduler, format::pb};
 
 use self::{
@@ -17,33 +18,42 @@ pub mod value;
 /// These contain the file buffers shared across the entire file
 #[derive(Clone, Copy, Debug)]
 pub struct FileBuffers<'a> {
-    pub positions: &'a Vec<u64>,
+    pub positions_and_sizes: &'a Vec<(u64, u64)>,
 }
 
 /// These contain the file buffers and also buffers specific to a column
 #[derive(Clone, Copy, Debug)]
 pub struct ColumnBuffers<'a, 'b> {
     pub file_buffers: FileBuffers<'a>,
-    pub positions: &'b Vec<u64>,
+    pub positions_and_sizes: &'b Vec<(u64, u64)>,
 }
+
 /// These contain the file & column buffers and also buffers specific to a page
 #[derive(Clone, Copy, Debug)]
 pub struct PageBuffers<'a, 'b, 'c> {
     pub column_buffers: ColumnBuffers<'a, 'b>,
-    pub positions: &'c Vec<u64>,
+    pub positions_and_sizes: &'c Vec<(u64, u64)>,
 }
 
 // Translate a protobuf buffer description into a position in the file.  This could be a page
 // buffer, a column buffer, or a file buffer.
-fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> u64 {
+fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> (u64, u64) {
+    let index = buffer_desc.buffer_index as usize;
+
     match pb::buffer::BufferType::try_from(buffer_desc.buffer_type).unwrap() {
-        pb::buffer::BufferType::Page => buffers.positions[buffer_desc.buffer_index as usize],
-        pb::buffer::BufferType::Column => {
-            buffers.column_buffers.positions[buffer_desc.buffer_index as usize]
-        }
+        pb::buffer::BufferType::Page => buffers.positions_and_sizes[index],
+        pb::buffer::BufferType::Column => buffers.column_buffers.positions_and_sizes[index],
         pb::buffer::BufferType::File => {
-            buffers.column_buffers.file_buffers.positions[buffer_desc.buffer_index as usize]
+            buffers.column_buffers.file_buffers.positions_and_sizes[index]
         }
+    }
+}
+
+pub fn parse_compression_scheme(scheme: &str) -> Result<CompressionScheme, String> {
+    match scheme {
+        "none" => Ok(CompressionScheme::None),
+        "zstd" => Ok(CompressionScheme::Zstd),
+        _ => Err(format!("Unknown compression scheme: {}", scheme)),
     }
 }
 
@@ -52,18 +62,23 @@ fn get_buffer_decoder(
     encoding: &pb::Flat,
     buffers: &PageBuffers,
 ) -> Box<dyn PhysicalPageScheduler> {
+    let (buffer_offset, buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
+    let compression_scheme = if encoding.compression.is_none() {
+        CompressionScheme::None
+    } else {
+        parse_compression_scheme(encoding.compression.as_ref().unwrap().scheme.as_str()).unwrap()
+    };
     match encoding.bits_per_value {
-        1 => Box::new(DenseBitmapScheduler::new(get_buffer(
-            encoding.buffer.as_ref().unwrap(),
-            buffers,
-        ))),
+        1 => Box::new(DenseBitmapScheduler::new(buffer_offset)),
         bits_per_value => {
             if bits_per_value % 8 != 0 {
                 todo!("bits_per_value that are not multiples of 8");
             }
             Box::new(ValuePageScheduler::new(
                 bits_per_value / 8,
-                get_buffer(encoding.buffer.as_ref().unwrap(), buffers),
+                buffer_offset,
+                buffer_size,
+                compression_scheme,
             ))
         }
     }

@@ -26,6 +26,8 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
+use crate::encodings::physical::parse_compression_scheme;
+use crate::encodings::physical::value::CompressionScheme;
 use crate::{
     decoder::{
         DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo,
@@ -58,7 +60,7 @@ impl PrimitivePageScheduler {
     pub fn new(data_type: DataType, page: Arc<PageInfo>, buffers: ColumnBuffers) -> Self {
         let page_buffers = PageBuffers {
             column_buffers: buffers,
-            positions: &page.buffer_offsets,
+            positions_and_sizes: &page.buffer_offsets_and_sizes,
         };
         Self {
             data_type,
@@ -176,7 +178,7 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 
         // Go ahead and fill the validity / values buffers
         self.physical_decoder
-            .decode_into(self.rows_to_skip, self.rows_to_take, &mut bufs);
+            .decode_into(self.rows_to_skip, self.rows_to_take, &mut bufs)?;
 
         // Convert the two buffers into an Arrow array
         Self::primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)
@@ -523,6 +525,11 @@ pub struct PrimitiveFieldEncoder {
     column_index: u32,
 }
 
+fn get_compression_scheme() -> CompressionScheme {
+    let compression_scheme = std::env::var("LANCE_PAGE_COMPRESSION").unwrap_or("none".to_string());
+    parse_compression_scheme(&compression_scheme).unwrap_or(CompressionScheme::None)
+}
+
 impl PrimitiveFieldEncoder {
     pub fn array_encoder_from_data_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
@@ -533,7 +540,7 @@ impl PrimitiveFieldEncoder {
                 )))))
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(data_type)?,
+                ValueEncoder::try_new(data_type, get_compression_scheme())?,
             )))),
         }
     }
