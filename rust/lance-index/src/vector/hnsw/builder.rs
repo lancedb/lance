@@ -165,7 +165,7 @@ impl HNSW {
         params: HnswBuildParams,
         storage: Arc<dyn VectorStorage>,
     ) -> Result<Self> {
-        let inner = HNSWBuilderInner::with_params(distance_type, params, storage.as_ref());
+        let inner = HNSWBuilderInner::with_params(distance_type, params, storage.len());
         let hnsw = Self {
             inner: Arc::new(inner),
         };
@@ -210,12 +210,8 @@ impl HNSW {
         Ok(hnsw)
     }
 
-    pub fn build_empty(
-        distance_type: DistanceType,
-        params: HnswBuildParams,
-        storage: Arc<dyn VectorStorage>,
-    ) -> Self {
-        let inner = HNSWBuilderInner::with_params(distance_type, params, storage.as_ref());
+    pub fn build_empty(distance_type: DistanceType, params: HnswBuildParams) -> Self {
+        let inner = HNSWBuilderInner::with_params(distance_type, params, 0);
         Self {
             inner: Arc::new(inner),
         }
@@ -580,9 +576,9 @@ impl HNSWBuilderInner {
     pub fn with_params(
         distance_type: DistanceType,
         params: HnswBuildParams,
-        storage: &dyn VectorStorage,
+        initial_capacity: usize,
     ) -> Self {
-        let len = storage.len();
+        let len = initial_capacity;
         let max_level = params.max_level;
 
         let mut level_count = Vec::with_capacity(max_level as usize);
@@ -606,7 +602,7 @@ impl HNSWBuilderInner {
             visited_generator_queue,
         };
 
-        if storage.is_empty() {
+        if initial_capacity == 0 {
             return builder;
         }
 
