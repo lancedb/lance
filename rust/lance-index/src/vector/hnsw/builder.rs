@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::RwLockReadGuard;
 
 use lance_core::{Error, Result};
 use rand::{thread_rng, Rng};
@@ -136,7 +137,7 @@ impl HNSW {
     // }
 
     pub fn len(&self) -> usize {
-        self.inner.nodes.len()
+        self.inner.nodes.read().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -151,7 +152,7 @@ impl HNSW {
         self.inner.num_nodes(level)
     }
 
-    pub fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
+    pub fn nodes(&self) -> Arc<RwLock<Vec<RwLock<GraphBuilderNode>>>> {
         self.inner.nodes()
     }
 
@@ -223,31 +224,36 @@ impl HNSW {
         visited_generator: &mut VisitedGenerator,
         storage: &dyn VectorStorage,
     ) -> Result<()> {
-        if node as usize >= self.inner.nodes().len() {
+        if node as usize >= self.inner.nodes().read().unwrap().len() {
             // This mutex doesn't exist to avoid invalid memory handling,
             // it exists to make sure we don't OOM/do a bunch of wasteful work
             // by resizing in a bunch of threads at once
             let _lock_guard = self.inner.resize_lock.lock();
-            let mut new_nodes: Vec<_> = self
-                .inner
-                .nodes()
-                .iter()
-                .map(|v| RwLock::new(v.read().unwrap().clone()))
-                .collect();
-            let mut new_size = max(self.inner.nodes().len(), 1);
-            while node as usize >= new_size {
-                new_size = new_size * 2;
-            }
-            // TODO for each value from self.inner.nodes().len() to new_size, do this:
-            for i in self.inner.nodes.len()..new_size {
-                let level = {
-                    if i == 0 {
-                        self.inner.max_level() as usize
-                    } else {
-                        self.inner.random_level() as usize + 1
-                    }
-                };
-                new_nodes.push(RwLock::new(GraphBuilderNode::new(i as u32, level)));
+            if node as usize >= self.inner.nodes().read().unwrap().len() {
+                let mut new_nodes: Vec<_> = self
+                    .inner
+                    .nodes()
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|v| RwLock::new(v.read().unwrap().clone()))
+                    .collect();
+                let mut new_size = max(self.inner.nodes().read().unwrap().len(), 1);
+                while node as usize >= new_size {
+                    new_size = new_size * 2;
+                }
+                for i in self.inner.nodes.read().unwrap().len()..new_size {
+                    let level = {
+                        if i == 0 {
+                            self.inner.max_level() as usize
+                        } else {
+                            self.inner.random_level() as usize + 1
+                        }
+                    };
+                    new_nodes.push(RwLock::new(GraphBuilderNode::new(i as u32, level)));
+                }
+                let mut write_nodes = self.inner.nodes.write().unwrap();
+                *write_nodes = new_nodes;
             }
         }
         self.inner.insert(node, visited_generator, storage)
@@ -266,13 +272,13 @@ impl HNSW {
     ) -> Result<Vec<OrderedNode>> {
         let dist_calc = storage.dist_calculator(query);
         let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
-        let nodes = &self.nodes();
+        let nodes = self.inner.nodes.read().unwrap();
         for level in (0..self.max_level()).rev() {
-            let cur_level = HnswLevelView::new(level, nodes);
+            let cur_level = HnswLevelView::new(level, &nodes);
             ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
         }
 
-        let bottom_level = HnswBottomView::new(nodes);
+        let bottom_level = HnswBottomView::new(&nodes);
         Ok(beam_search(
             &bottom_level,
             &ep,
@@ -380,7 +386,7 @@ impl HNSW {
         let mut distances_builder = ListBuilder::new(arrow_array::builder::Float32Builder::new());
         for level in 0..self.max_level() {
             let level = level as usize;
-            for (id, node) in self.inner.nodes.iter().enumerate() {
+            for (id, node) in self.nodes().read().unwrap().iter().enumerate() {
                 let node = node.read().unwrap();
                 if level >= node.level_neighbors.len() || node.level_neighbors[level].is_empty() {
                     continue;
@@ -533,7 +539,7 @@ impl HNSW {
         let inner = HNSWBuilderInner {
             distance_type,
             params: metadata.params,
-            nodes: Arc::new(nodes.into_iter().map(RwLock::new).collect()),
+            nodes: Arc::new(RwLock::new(nodes.into_iter().map(RwLock::new).collect())),
             level_count: level_count.into_iter().map(AtomicUsize::new).collect(),
             resize_lock: Mutex::new(()),
             entry_point: metadata.entry_point,
@@ -550,7 +556,7 @@ struct HNSWBuilderInner {
     distance_type: DistanceType,
     params: HnswBuildParams,
 
-    nodes: Arc<Vec<RwLock<GraphBuilderNode>>>,
+    nodes: Arc<RwLock<Vec<RwLock<GraphBuilderNode>>>>,
     level_count: Vec<AtomicUsize>,
     resize_lock: Mutex<()>,
 
@@ -568,7 +574,7 @@ impl HNSWBuilderInner {
         self.level_count[level].load(Ordering::Relaxed)
     }
 
-    pub fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
+    pub fn nodes(&self) -> Arc<RwLock<Vec<RwLock<GraphBuilderNode>>>> {
         self.nodes.clone()
     }
 
@@ -595,7 +601,7 @@ impl HNSWBuilderInner {
         let mut builder = Self {
             distance_type,
             params,
-            nodes: Arc::new(Vec::with_capacity(0)),
+            nodes: Arc::new(RwLock::new(Vec::with_capacity(0))),
             resize_lock: Mutex::new(()),
             level_count,
             entry_point: 0,
@@ -616,7 +622,7 @@ impl HNSWBuilderInner {
                 )));
             }
         }
-        builder.nodes = Arc::new(nodes);
+        builder.nodes = Arc::new(RwLock::new(nodes));
 
         builder
     }
@@ -640,7 +646,7 @@ impl HNSWBuilderInner {
         visited_generator: &mut VisitedGenerator,
         storage: &dyn VectorStorage,
     ) -> Result<()> {
-        let nodes = &self.nodes;
+        let nodes = self.nodes.read().unwrap();
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
         let mut ep = OrderedNode::new(
             self.entry_point,
@@ -657,7 +663,7 @@ impl HNSWBuilderInner {
         // ```
         let dist_calc = storage.dist_calculator_from_id(node);
         for level in (target_level + 1..self.params.max_level).rev() {
-            let cur_level = HnswLevelView::new(level, nodes);
+            let cur_level = HnswLevelView::new(level, &nodes);
             ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
         }
 
@@ -669,7 +675,7 @@ impl HNSWBuilderInner {
                 self.level_count[level as usize].fetch_add(1, Ordering::Relaxed);
 
                 let neighbors =
-                    self.search_level(&ep, level, dist_calc.as_ref(), nodes, visited_generator)?;
+                    self.search_level(&ep, level, dist_calc.as_ref(), &nodes, visited_generator)?;
                 for neighbor in &neighbors {
                     current_node.add_neighbor(neighbor.id, neighbor.dist, level);
                 }
@@ -711,7 +717,7 @@ impl HNSWBuilderInner {
         ep: &OrderedNode,
         level: u16,
         dist_calc: &dyn DistCalculator,
-        nodes: &Vec<RwLock<GraphBuilderNode>>,
+        nodes: &RwLockReadGuard<Vec<RwLock<GraphBuilderNode>>>,
         visited_generator: &mut VisitedGenerator,
     ) -> Result<Vec<OrderedNode>> {
         let cur_level = HnswLevelView::new(level, nodes);
@@ -753,7 +759,7 @@ pub(crate) struct HnswLevelView<'a> {
 }
 
 impl<'a> HnswLevelView<'a> {
-    pub fn new(level: u16, nodes: &'a Vec<RwLock<GraphBuilderNode>>) -> Self {
+    pub fn new(level: u16, nodes: &'a RwLockReadGuard<Vec<RwLock<GraphBuilderNode>>>) -> Self {
         Self { level, nodes }
     }
 }
