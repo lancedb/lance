@@ -217,7 +217,7 @@ impl HNSW {
         &self,
         node: u32,
         visited_generator: &mut VisitedGenerator,
-        storage: &dyn VectorStorage,
+        storage: &impl VectorStore,
     ) -> Result<()> {
         if node as usize >= self.inner.nodes().read().unwrap().len() {
             let mut write_nodes = self.inner.nodes.write().unwrap();
