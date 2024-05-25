@@ -228,7 +228,7 @@ impl HNSW {
                     .collect();
                 let mut new_size = max(write_nodes.len(), 1);
                 while node as usize >= new_size {
-                    new_size = new_size * 2;
+                    new_size *= 2;
                 }
                 for i in write_nodes.len()..new_size {
                     let level = {
