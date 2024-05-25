@@ -865,6 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_live_inserts() {
+        // Just run to make sure there are no invalid accesses or deadlocks
         const DIM: usize = 32;
         const TOTAL_BUILD: usize = 2048;
         const TOTAL_QUERY: usize = 512;
@@ -901,9 +902,5 @@ mod tests {
                 res
             })
             .collect();
-        // TODO compute brute force results
-        // TODO compute recall
-
-        //assert_eq!(builder_results, loaded_results);
     }
 }
