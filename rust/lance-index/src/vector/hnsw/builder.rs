@@ -242,6 +242,9 @@ impl HNSW {
                     .collect();
             }
         }
+        if node == 0 {
+            return Ok(());
+        }
         self.inner.insert(node, visited_generator, storage)
     }
 
@@ -858,5 +861,49 @@ mod tests {
             .search_basic(query, k, ef, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
+    }
+
+    #[tokio::test]
+    async fn test_live_inserts() {
+        const DIM: usize = 32;
+        const TOTAL_BUILD: usize = 2048;
+        const TOTAL_QUERY: usize = 512;
+        const TOTAL: usize = TOTAL_BUILD + TOTAL_QUERY;
+        const NUM_EDGES: usize = 20;
+        let data = generate_random_array(TOTAL * DIM);
+        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
+        let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
+        let builder = HNSW::build_empty(
+            DistanceType::L2,
+            HnswBuildParams::default()
+                .num_edges(NUM_EDGES)
+                .ef_construction(50),
+        );
+        // insert all the entries from build_store
+        use crate::vector::hnsw::builder::VisitedGenerator;
+        let mut visited_generator = VisitedGenerator::new(0);
+        for i in 0..TOTAL_BUILD {
+            builder
+                .insert(i as u32, &mut visited_generator, store.as_ref())
+                .unwrap();
+        }
+        let k = 10;
+        let ef = 50;
+        // query for neighbours, and then insert
+
+        let _hsnw_results: Vec<_> = (TOTAL_BUILD..TOTAL)
+            .map(|i| {
+                let query = mat.row(i).unwrap();
+                let res = builder.search_basic(query, k, ef, None, store.as_ref());
+                builder
+                    .insert(i as u32, &mut visited_generator, store.as_ref())
+                    .unwrap();
+                res
+            })
+            .collect();
+        // TODO compute brute force results
+        // TODO compute recall
+
+        //assert_eq!(builder_results, loaded_results);
     }
 }
