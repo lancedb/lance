@@ -6,6 +6,7 @@ use std::{ops::Range, sync::Arc};
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 
+use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::*;
 use lance_core::{Error, Result};
@@ -30,6 +31,12 @@ pub struct ScalarQuantizer {
     pub dim: usize,
 
     pub bounds: Range<f64>,
+}
+
+impl DeepSizeOf for ScalarQuantizer {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        0
+    }
 }
 
 impl ScalarQuantizer {

@@ -19,6 +19,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
@@ -30,7 +31,6 @@ use lance_file::{
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_index::vector::{
-    graph::VectorStorage,
     hnsw::HNSW,
     quantizer::{Quantization, QuantizationMetadata, Quantizer},
 };
@@ -116,6 +116,15 @@ pub struct IVFIndex {
     // hold a weak pointer to avoid cycles
     /// The session cache, used when fetching pages
     session: Weak<Session>,
+}
+
+impl DeepSizeOf for IVFIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.uuid.deep_size_of_children(context)
+            + self.reader.deep_size_of_children(context)
+            + self.sub_index.deep_size_of_children(context)
+        // Skipping session since it is a weak ref
+    }
 }
 
 impl IVFIndex {
@@ -729,7 +738,7 @@ impl VectorIndex for IVFIndex {
         })
     }
 
-    fn storage(&self) -> &dyn VectorStorage {
+    fn row_ids(&self) -> &[u64] {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
@@ -2711,7 +2720,7 @@ mod tests {
 
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 0.7,
+            recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,

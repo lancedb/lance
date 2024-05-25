@@ -19,7 +19,7 @@ exclude = ["python"]
 resolver = "2"
 
 [workspace.package]
-version = "0.11.0"
+version = "0.11.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -42,19 +42,19 @@ categories = [
 rust-version = "1.75"
 
 [workspace.dependencies]
-lance = { version = "=0.11.0", path = "./rust/lance" }
-lance-arrow = { version = "=0.11.0", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.11.0", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.11.0", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.11.0", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.11.0", path = "./rust/lance-encoding" }
-lance-file = { version = "=0.11.0", path = "./rust/lance-file" }
-lance-index = { version = "=0.11.0", path = "./rust/lance-index" }
-lance-io = { version = "=0.11.0", path = "./rust/lance-io" }
-lance-linalg = { version = "=0.11.0", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.11.0", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.11.0", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.11.0", path = "./rust/lance-testing" }
+lance = { version = "=0.11.1", path = "./rust/lance" }
+lance-arrow = { version = "=0.11.1", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.11.1", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.11.1", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.11.1", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.11.1", path = "./rust/lance-encoding" }
+lance-file = { version = "=0.11.1", path = "./rust/lance-file" }
+lance-index = { version = "=0.11.1", path = "./rust/lance-index" }
+lance-io = { version = "=0.11.1", path = "./rust/lance-io" }
+lance-linalg = { version = "=0.11.1", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.11.1", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.11.1", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.11.1", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "51.0.0", optional = false, features = ["prettyprint"] }
@@ -77,6 +77,7 @@ half = { "version" = "2.4.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
+bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
@@ -84,7 +85,7 @@ chrono = { version = "0.4.25", default-features = false, features = [
     "std",
     "now",
 ] }
-criterion = { version = "0.5", features = ["async", "async_tokio"] }
+criterion = { version = "0.5", features = ["async", "async_tokio", "html_reports"] }
 crossbeam-queue = "0.3"
 datafusion = { version = "37.1", default-features = false, features = [
     "array_expressions",
@@ -98,6 +99,7 @@ datafusion-execution = "37.1"
 datafusion-physical-expr = { version = "37.1", features = [
     "regex_expressions",
 ] }
+deepsize = "0.2.0"
 either = "1.0"
 futures = "0.3"
 http = "0.2.9"
@@ -119,6 +121,7 @@ prost = "0.12.2"
 prost-build = "0.12.2"
 prost-types = "0.12.2"
 rand = { version = "0.8.3", features = ["small_rng"] }
+rangemap = { version = "1.0" }
 rayon = "1.10"
 roaring = "0.10.1"
 rustc_version = "0.4"
@@ -140,6 +143,7 @@ tracing = "0.1"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 pretty_assertions = "1.4.0"
+zstd = "0.13.1"
 
 [profile.bench]
 opt-level = 3

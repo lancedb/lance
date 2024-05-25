@@ -9,12 +9,14 @@
 pub mod builder;
 use arrow_schema::{DataType, Field};
 pub use builder::HNSW;
+use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
 
-use super::graph::{OrderedFloat, OrderedNode, VectorStorage};
+use super::graph::{OrderedFloat, OrderedNode};
+use super::v3::storage::VectorStore;
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
@@ -29,7 +31,7 @@ lazy_static::lazy_static! {
     pub static ref VECTOR_ID_FIELD: Field = Field::new(VECTOR_ID_COL, DataType::UInt32, true);
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswMetadata {
     pub entry_point: u32,
     pub params: HnswBuildParams,
@@ -54,7 +56,7 @@ pub fn select_neighbors(
 ///
 /// WARNING: Internal API,  API stability is not guaranteed
 pub fn select_neighbors_heuristic(
-    storage: &dyn VectorStorage,
+    storage: &impl VectorStore,
     candidates: &[OrderedNode],
     k: usize,
 ) -> Vec<OrderedNode> {

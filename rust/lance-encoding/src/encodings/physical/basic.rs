@@ -186,15 +186,20 @@ impl PhysicalPageDecoder for BasicPageDecoder {
         }
     }
 
-    fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [bytes::BytesMut]) {
+    fn decode_into(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        dest_buffers: &mut [bytes::BytesMut],
+    ) -> Result<()> {
         match &self.mode {
             DataNullStatus::Some(decoders) => {
                 decoders
                     .validity
-                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[..1]);
+                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[..1])?;
                 decoders
                     .values
-                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..]);
+                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..])?;
             }
             // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
             // other pages needed the buffer, in which case we need to fill our section
@@ -203,9 +208,10 @@ impl PhysicalPageDecoder for BasicPageDecoder {
             }
             DataNullStatus::None(values) => {
                 dest_buffers[0].fill(1);
-                values.decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..]);
+                values.decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..])?;
             }
         }
+        Ok(())
     }
 
     fn num_buffers(&self) -> u32 {
@@ -266,6 +272,7 @@ impl ArrayEncoder for BasicEncoder {
                         buffer_index: validity_buffer_index,
                         buffer_type: pb::buffer::BufferType::Page as i32,
                     }),
+                    compression: None,
                 })),
             });
 

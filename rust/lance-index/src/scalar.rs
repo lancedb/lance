@@ -13,6 +13,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
 
 use datafusion_expr::Expr;
+use deepsize::DeepSizeOf;
 use lance_core::Result;
 
 use crate::Index;
@@ -48,7 +49,7 @@ pub trait IndexReader: Send + Sync {
 /// named "files".  The index store is responsible for serializing and deserializing
 /// these batches into file data (e.g. as .lance files or .parquet files, etc.)
 #[async_trait]
-pub trait IndexStore: std::fmt::Debug + Send + Sync {
+pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn as_any(&self) -> &dyn Any;
 
     /// Create a new file and return a writer to store data in the file
@@ -173,7 +174,7 @@ impl ScalarQuery {
 
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
-pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index {
+pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not neccesarily ordered

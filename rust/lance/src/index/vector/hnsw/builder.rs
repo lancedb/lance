@@ -16,11 +16,9 @@ pub async fn build_hnsw_model(
     hnsw_params: HnswBuildParams,
     vectors: Arc<dyn Array>,
 ) -> Result<HNSW> {
-    let mat = Arc::new(MatrixView::<Float32Type>::try_from(
-        vectors.as_fixed_size_list(),
-    )?);
+    let mat = MatrixView::<Float32Type>::try_from(vectors.as_fixed_size_list())?;
 
     // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
-    let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
+    let vec_store = Arc::new(InMemoryVectorStorage::new(mat, DistanceType::L2));
     HNSW::build_with_storage(DistanceType::L2, hnsw_params, vec_store).await
 }

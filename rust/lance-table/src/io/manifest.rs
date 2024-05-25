@@ -90,7 +90,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     }
 
     let proto = pb::Manifest::decode(buf)?;
-    Ok(Manifest::from(proto))
+    Manifest::try_from(proto)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
@@ -105,7 +105,7 @@ pub async fn read_manifest_indexes(
 
         Ok(section
             .indices
-            .iter()
+            .into_iter()
             .map(Index::try_from)
             .collect::<Result<Vec<_>>>()?)
     } else {

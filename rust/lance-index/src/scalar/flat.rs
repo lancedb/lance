@@ -12,6 +12,7 @@ use async_trait::async_trait;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
+use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::Result;
 use roaring::RoaringBitmap;
@@ -29,6 +30,12 @@ use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex, ScalarQuery};
 #[derive(Debug)]
 pub struct FlatIndex {
     data: Arc<RecordBatch>,
+}
+
+impl DeepSizeOf for FlatIndex {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.data.get_array_memory_size()
+    }
 }
 
 impl FlatIndex {
@@ -76,6 +83,24 @@ fn remap_batch(batch: RecordBatch, mapping: &HashMap<u64, Option<u64>>) -> Resul
 #[derive(Debug)]
 pub struct FlatIndexMetadata {
     schema: Arc<Schema>,
+}
+
+impl DeepSizeOf for FlatIndexMetadata {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.schema.metadata.deep_size_of_children(context)
+            + self
+                .schema
+                .fields
+                .iter()
+                // This undercounts slightly because it doesn't account for the size of the
+                // field data types
+                .map(|f| {
+                    std::mem::size_of::<Field>()
+                        + f.name().deep_size_of_children(context)
+                        + f.metadata().deep_size_of_children(context)
+                })
+                .sum::<usize>()
+    }
 }
 
 impl FlatIndexMetadata {

@@ -4,7 +4,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::FixedSizeListArray;
+use arrow_array::{Array, FixedSizeListArray};
+use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
@@ -29,6 +30,17 @@ pub struct IvfData {
 
     /// pre-computed row offset for each partition, do not persist.
     partition_row_offsets: Vec<usize>,
+}
+
+impl DeepSizeOf for IvfData {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.centroids
+            .as_ref()
+            .map(|centroids| centroids.get_array_memory_size())
+            .unwrap_or(0)
+            + self.lengths.deep_size_of_children(context)
+            + self.partition_row_offsets.deep_size_of_children(context)
+    }
 }
 
 /// The IVF metadata stored in the Lance Schema

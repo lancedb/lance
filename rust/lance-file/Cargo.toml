@@ -27,6 +27,7 @@ async-trait.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
 datafusion-common.workspace = true
+deepsize.workspace = true
 futures.workspace = true
 lance-datagen.workspace = true
 log.workspace = true

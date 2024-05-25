@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use deepsize::DeepSizeOf;
 use lance_core::cache::FileMetadataCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
@@ -17,7 +18,7 @@ use self::index_extension::IndexExtension;
 pub mod index_extension;
 
 /// A user session tracks the runtime state.
-#[derive(Clone)]
+#[derive(Clone, DeepSizeOf)]
 pub struct Session {
     /// Cache for opened indices.
     pub(crate) index_cache: IndexCache,
@@ -92,6 +93,13 @@ impl Session {
         }
 
         Ok(())
+    }
+
+    /// Return the current size of the session in bytes
+    pub fn size_bytes(&self) -> u64 {
+        // We re-expose deep_size_of here so that users don't
+        // need the deepsize crate themselves (e.g. to use deep_size_of)
+        self.deep_size_of() as u64
     }
 }
 

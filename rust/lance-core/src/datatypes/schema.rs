@@ -10,6 +10,7 @@ use std::{
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::{location, Location};
 
@@ -17,7 +18,7 @@ use super::field::{Field, SchemaCompareOptions};
 use crate::{Error, Result};
 
 /// Lance Schema.
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, DeepSizeOf)]
 pub struct Schema {
     /// Top-level fields in the dataset.
     pub fields: Vec<Field>,

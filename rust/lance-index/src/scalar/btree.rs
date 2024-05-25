@@ -23,6 +23,7 @@ use datafusion_physical_expr::{
     expressions::{Column, MaxAccumulator, MinAccumulator},
     PhysicalSortExpr,
 };
+use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
     stream::{self},
@@ -49,6 +50,13 @@ const BTREE_PAGES_NAME: &str = "page_data.lance";
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
 struct OrderableScalarValue(ScalarValue);
+
+impl DeepSizeOf for OrderableScalarValue {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // deepsize and size both factor in the size of the ScalarValue
+        self.0.size() - std::mem::size_of::<ScalarValue>()
+    }
+}
 
 impl Display for OrderableScalarValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -502,7 +510,7 @@ impl Ord for OrderableScalarValue {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 struct PageRecord {
     max: OrderableScalarValue,
     page_number: u32,
@@ -520,7 +528,7 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
 }
 
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
     /// Pages where the value may be null
@@ -640,7 +648,7 @@ impl BTreeLookup {
 ///
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
 /// for faster lookup
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, DeepSizeOf)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
     store: Arc<dyn IndexStore>,
@@ -953,7 +961,7 @@ fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
 
 /// A trait that must be implemented by anything that wishes to act as a btree subindex
 #[async_trait]
-pub trait BTreeSubIndex: Debug + Send + Sync {
+pub trait BTreeSubIndex: Debug + Send + Sync + DeepSizeOf {
     /// Trains the subindex on a single batch of data and serializes it to Arrow
     async fn train(&self, batch: RecordBatch) -> Result<RecordBatch>;
 
@@ -1153,5 +1161,33 @@ impl Stream for IndexReaderStream {
         let reader_copy = this.reader.clone();
         let read_task = async move { reader_copy.read_record_batch(page_number).await }.boxed();
         std::task::Poll::Ready(Some(read_task))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::Int32Type;
+    use arrow_array::FixedSizeListArray;
+    use datafusion_common::ScalarValue;
+    use deepsize::DeepSizeOf;
+
+    use super::OrderableScalarValue;
+
+    #[test]
+    fn test_scalar_value_size() {
+        let size_of_i32 = OrderableScalarValue(ScalarValue::Int32(Some(0))).deep_size_of();
+        let size_of_many_i32 = OrderableScalarValue(ScalarValue::FixedSizeList(Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![Some(vec![Some(0); 128])],
+                128,
+            ),
+        )))
+        .deep_size_of();
+
+        // deep_size_of should account for the rust type overhead
+        assert!(size_of_i32 > 4);
+        assert!(size_of_many_i32 > 128 * 4);
     }
 }

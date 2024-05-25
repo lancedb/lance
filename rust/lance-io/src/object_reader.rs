@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use lance_core::Result;
 use object_store::{path::Path, ObjectStore};
@@ -24,6 +25,13 @@ pub struct CloudObjectReader {
     pub path: Path,
 
     block_size: usize,
+}
+
+impl DeepSizeOf for CloudObjectReader {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // Skipping object_store because there is no easy way to do that and it shouldn't be too big
+        self.path.as_ref().deep_size_of_children(context)
+    }
 }
 
 impl CloudObjectReader {

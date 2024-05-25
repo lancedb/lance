@@ -152,9 +152,7 @@ public class DatasetTest {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       Dataset dataset = testDataset.createEmptyDataset();
       dataset.close();
-      // dataset.getSchema();
-      // assertThrows(IllegalArgumentException.class, testDataset::getSchema);
-      // assertThrows(RuntimeException.class, dataset::getSchema);
+      assertThrows(RuntimeException.class, dataset::getSchema);
     }
   }
 }

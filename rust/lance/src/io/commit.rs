@@ -59,7 +59,7 @@ async fn read_transaction_file(
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
-    (&transaction).try_into()
+    transaction.try_into()
 }
 
 /// Write a transaction to a file and return the relative path.

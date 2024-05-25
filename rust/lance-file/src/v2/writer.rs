@@ -267,6 +267,15 @@ impl FileWriter {
         Ok(vec![(file_descriptor_position, file_descriptor_len)])
     }
 
+    /// Add a metadata entry to the schema
+    ///
+    /// This method is useful because sometimes the metadata is not known until after the
+    /// data has been written.  This method allows you to alter the schema metadata.  It
+    /// must be called before `finish` is called.
+    pub fn add_schema_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.schema.metadata.insert(key.into(), value.into());
+    }
+
     /// Finishes writing the file
     ///
     /// This method will wait until all data has been flushed to the file.  Then it
@@ -389,6 +398,8 @@ mod tests {
         for batch in reader {
             file_writer.write_batch(&batch.unwrap()).await.unwrap();
         }
+        file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
+        // Tests asserting the contents of the written file are in reader.rs
     }
 }

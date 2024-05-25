@@ -17,11 +17,9 @@ mod test {
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::{
-        vector::{graph::VectorStorage, Query},
-        Index, IndexType,
-    };
+    use lance_index::{vector::Query, Index, IndexType};
     use lance_io::{local::LocalObjectReader, traits::Reader};
     use lance_linalg::distance::MetricType;
     use roaring::RoaringBitmap;
@@ -45,6 +43,12 @@ mod test {
         assert_query_value: Vec<f32>,
 
         ret_val: RecordBatch,
+    }
+
+    impl DeepSizeOf for ResidualCheckMockIndex {
+        fn deep_size_of_children(&self, _: &mut Context) -> usize {
+            todo!()
+        }
     }
 
     #[async_trait]
@@ -106,7 +110,7 @@ mod test {
             Ok(Box::new(self.clone()))
         }
 
-        fn storage(&self) -> &dyn VectorStorage {
+        fn row_ids(&self) -> &[u64] {
             todo!("this method is for only IVF_HNSW_* index");
         }
 

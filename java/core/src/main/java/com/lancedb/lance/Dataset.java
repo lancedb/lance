@@ -71,7 +71,7 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(params);
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
       Data.exportSchema(allocator, schema, null, arrowSchema);
-      var dataset = createWithFfiSchema(arrowSchema.memoryAddress(),
+      Dataset dataset = createWithFfiSchema(arrowSchema.memoryAddress(),
           path, params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
           params.getMaxBytesPerFile(), params.getMode());
       dataset.allocator = allocator;
@@ -94,7 +94,7 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(stream); 
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(params);
-    var dataset = createWithFfiStream(stream.memoryAddress(), path,
+    Dataset dataset = createWithFfiStream(stream.memoryAddress(), path,
         params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
         params.getMaxBytesPerFile(), params.getMode());
     dataset.allocator = allocator;
@@ -119,7 +119,7 @@ public class Dataset implements Closeable {
   public static Dataset open(String path, BufferAllocator allocator) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
-    var dataset = openNative(path);
+    Dataset dataset = openNative(path);
     dataset.allocator = allocator;
     return dataset;
   }
@@ -149,7 +149,7 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(operation);
     Preconditions.checkNotNull(readVersion);
-    var dataset = operation.commit(allocator, path, readVersion);
+    Dataset dataset = operation.commit(allocator, path, readVersion);
     dataset.allocator = allocator;
     return dataset;
   }

@@ -10,15 +10,17 @@ use std::{
 
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_index::vector::{hnsw::HNSW, quantizer::Quantizer};
 use lance_index::{
     vector::{
-        graph::{VectorStorage, NEIGHBORS_FIELD},
+        graph::NEIGHBORS_FIELD,
         hnsw::{HnswMetadata, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization},
+        v3::storage::VectorStore,
         Query,
     },
     Index, IndexType,
@@ -37,18 +39,18 @@ use crate::RESULT_SCHEMA;
 
 pub mod builder;
 
-#[derive(Clone)]
+#[derive(Clone, DeepSizeOf)]
 pub(crate) struct HNSWIndexOptions {
     pub use_residual: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, DeepSizeOf)]
 pub(crate) struct HNSWIndex<Q: Quantization> {
     distance_type: DistanceType,
 
     // Some(T) if the index is loaded, None otherwise
     hnsw: Option<HNSW>,
-    storage: Option<Arc<dyn VectorStorage>>,
+    storage: Option<Arc<Q::Storage>>,
 
     // TODO: move these into IVFIndex after the refactor is complete
     partition_storage: IvfQuantizationStorage<Q>,
@@ -282,8 +284,8 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         }))
     }
 
-    fn storage(&self) -> &dyn VectorStorage {
-        self.storage.as_ref().unwrap().as_ref()
+    fn row_ids(&self) -> &[u64] {
+        self.storage.as_ref().unwrap().row_ids()
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

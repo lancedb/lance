@@ -330,22 +330,24 @@ pub async fn encode_batch(
             let encoded_page = task.await?;
             let mut buffers = encoded_page.array.buffers;
             buffers.sort_by_key(|b| b.index);
-            let mut buffer_offsets = Vec::new();
+            let mut buffer_offsets_and_sizes = Vec::new();
             for buffer in buffers {
-                buffer_offsets.push(data_buffer.len() as u64);
+                let offset = data_buffer.len() as u64;
+                let size = buffer.parts.iter().map(|p| p.len()).sum::<usize>() as u64;
+                buffer_offsets_and_sizes.push((offset, size));
                 for part in buffer.parts {
                     data_buffer.extend_from_slice(&part);
                 }
             }
             pages.push(Arc::new(PageInfo {
-                buffer_offsets: Arc::new(buffer_offsets),
+                buffer_offsets_and_sizes: Arc::new(buffer_offsets_and_sizes),
                 encoding: encoded_page.array.encoding,
                 num_rows: encoded_page.num_rows,
             }))
         }
         page_table.push(ColumnInfo {
             index: 0,
-            buffer_offsets: vec![],
+            buffer_offsets_and_sizes: vec![],
             page_infos: pages,
         })
     }

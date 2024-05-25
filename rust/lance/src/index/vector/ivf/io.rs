@@ -309,7 +309,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             for &idx in previous_indices.iter() {
                 let sub_index = idx.load_partition(part_id, true).await?;
                 let row_ids = Arc::new(UInt64Array::from_iter_values(
-                    sub_index.storage().row_ids().iter().cloned(),
+                    sub_index.row_ids().iter().cloned(),
                 ));
                 row_id_array.push(row_ids);
             }
@@ -385,10 +385,10 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let mut aux_ivf = IvfData::empty();
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     for (part_id, task) in tasks.into_iter().enumerate() {
-        let offset = writer.tell().await?;
-        let length = task.await??;
+        let offset = writer.len();
+        let num_rows = task.await??;
 
-        if length == 0 {
+        if num_rows == 0 {
             ivf.add_partition(offset, 0);
             aux_ivf.add_partition(0);
             hnsw_metadata.push(HnswMetadata::default());
@@ -412,7 +412,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             .try_collect::<Vec<_>>()
             .await?;
         writer.write(&batches).await?;
-        ivf.add_partition(offset, length as u32);
+
+        ivf.add_partition(offset, (writer.len() - offset) as u32);
         hnsw_metadata.push(serde_json::from_str(
             part_reader.schema().metadata[HNSW_METADATA_KEY].as_str(),
         )?);
@@ -438,7 +439,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             std::mem::drop(aux_part_reader);
             object_store.delete(aux_part_file).await?;
 
-            let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             aux_writer.write(&batches).await?;
             aux_ivf.add_partition(num_rows as u32);
         }
@@ -462,6 +462,7 @@ async fn build_hnsw_quantization_partition(
     let row_ids_arrs = row_ids_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
     let row_ids = concat(&row_ids_arrs)?;
     std::mem::drop(row_ids_array);
+    let num_rows = row_ids.len();
 
     let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
     let mut vectors = dataset
@@ -499,8 +500,8 @@ async fn build_hnsw_quantization_partition(
         )),
     };
 
-    let (length, _) = futures::join!(build_hnsw, build_store);
-    length
+    futures::join!(build_hnsw, build_store).0?;
+    Ok(num_rows)
 }
 
 async fn build_and_write_hnsw(

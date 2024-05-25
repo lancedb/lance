@@ -202,21 +202,22 @@ async fn check_round_trip_encoding_inner(
     let mut simulate_write = |mut encoded_page: EncodedPage| {
         trace!("Encoded page {:?}", encoded_page);
         encoded_page.array.buffers.sort_by_key(|b| b.index);
-        let buffer_offsets = encoded_page
+        let buffer_offsets_and_sizes = encoded_page
             .array
             .buffers
             .iter()
             .map(|buf| {
                 let offset = buffer_offset;
-                buffer_offset += buf.parts.iter().map(|part| part.len() as u64).sum::<u64>();
-                offset
+                let size = buf.parts.iter().map(|part| part.len() as u64).sum::<u64>();
+                buffer_offset += size;
+                (offset, size)
             })
             .collect::<Vec<_>>();
 
         let page_info = PageInfo {
             num_rows: encoded_page.num_rows,
             encoding: encoded_page.array.encoding.clone(),
-            buffer_offsets: Arc::new(buffer_offsets.clone()),
+            buffer_offsets_and_sizes: Arc::new(buffer_offsets_and_sizes.clone()),
         };
 
         let col_idx = encoded_page.column_idx as usize;

@@ -4,7 +4,7 @@
 //! I/O utilities.
 
 pub mod commit;
-pub(crate) mod exec;
+pub mod exec;
 
 pub use lance_io::{
     object_store::{ObjectStore, ObjectStoreParams, WrappingObjectStore},

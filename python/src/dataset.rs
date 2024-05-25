@@ -65,6 +65,7 @@ use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::schema::LanceSchema;
+use crate::session::Session;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -175,7 +176,7 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
-    pub fn execute(&mut self, new_data: &PyAny) -> PyResult<()> {
+    pub fn execute(&mut self, new_data: &PyAny) -> PyResult<PyObject> {
         let py = new_data.py();
 
         let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
@@ -199,9 +200,14 @@ impl MergeInsertBuilder {
 
         let dataset = self.dataset.as_ref(py);
 
-        dataset.borrow_mut().ds = new_self;
+        dataset.borrow_mut().ds = new_self.0;
+        let merge_stats = new_self.1;
+        let merge_dict = PyDict::new(py);
+        merge_dict.set_item("num_inserted_rows", merge_stats.num_inserted_rows)?;
+        merge_dict.set_item("num_updated_rows", merge_stats.num_updated_rows)?;
+        merge_dict.set_item("num_deleted_rows", merge_stats.num_deleted_rows)?;
 
-        Ok(())
+        Ok(merge_dict.into())
     }
 }
 
@@ -965,6 +971,10 @@ impl Dataset {
 
     fn index_cache_hit_rate(&self) -> PyResult<f32> {
         Ok(self.ds.index_cache_hit_rate())
+    }
+
+    fn session(&self) -> Session {
+        Session::new(self.ds.session())
     }
 
     #[staticmethod]

@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
 use chrono::{DateTime, Utc};
+use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
@@ -85,6 +86,18 @@ pub struct ObjectStore {
     scheme: String,
     base_path: Path,
     block_size: usize,
+}
+
+impl DeepSizeOf for ObjectStore {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // We aren't counting `inner` here which is problematic but an ObjectStore
+        // shouldn't be too big.  The only exception might be the write cache but, if
+        // the writer cache has data, it means we're using it somewhere else that isn't
+        // a cache and so that doesn't really count.
+        self.scheme.deep_size_of_children(context)
+            + self.base_path.as_ref().deep_size_of_children(context)
+            + self.block_size.deep_size_of_children(context)
+    }
 }
 
 impl std::fmt::Display for ObjectStore {

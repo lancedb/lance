@@ -7,14 +7,15 @@
 
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
-use arrow_array::ArrayRef;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
     FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
@@ -32,11 +33,11 @@ use super::{distance::build_distance_table_l2, num_centroids, ProductQuantizerIm
 use crate::{
     pb,
     vector::{
-        graph::storage::{DistCalculator, VectorStorage},
         ivf::storage::IvfData,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         transform::Transformer,
+        v3::storage::{DistCalculator, VectorStore},
         PQ_CODE_COLUMN,
     },
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
@@ -53,6 +54,15 @@ pub struct ProductQuantizationMetadata {
 
     #[serde(skip)]
     pub codebook: Option<FixedSizeListArray>,
+}
+
+impl DeepSizeOf for ProductQuantizationMetadata {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.codebook
+            .as_ref()
+            .map(|codebook| codebook.get_array_memory_size())
+            .unwrap_or(0)
+    }
 }
 
 #[async_trait]
@@ -134,6 +144,15 @@ pub struct ProductQuantizationStorage {
     // For easy access
     pq_code: Arc<UInt8Array>,
     row_ids: Arc<UInt64Array>,
+}
+
+impl DeepSizeOf for ProductQuantizationStorage {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.codebook.get_array_memory_size()
+            + self.batch.get_array_memory_size()
+            + self.pq_code.get_array_memory_size()
+            + self.row_ids.get_array_memory_size()
+    }
 }
 
 impl PartialEq for ProductQuantizationStorage {
@@ -394,7 +413,8 @@ impl QuantizerStorage for ProductQuantizationStorage {
     }
 }
 
-impl VectorStorage for ProductQuantizationStorage {
+impl VectorStore for ProductQuantizationStorage {
+    type DistanceCalculator<'a> = PQDistCalculator;
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -411,18 +431,18 @@ impl VectorStorage for ProductQuantizationStorage {
         self.metric_type
     }
 
-    fn dist_calculator(&self, query: ArrayRef) -> Box<dyn DistCalculator> {
-        Box::new(PQDistCalculator::new(
+    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
+        PQDistCalculator::new(
             self.codebook.values(),
             self.num_bits,
             self.num_sub_vectors,
             self.pq_code.clone(),
             query.as_primitive::<Float32Type>().values(),
             self.metric_type(),
-        ))
+        )
     }
 
-    fn dist_calculator_from_id(&self, _: u32) -> Box<dyn DistCalculator> {
+    fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
         todo!("distance_between not implemented for PQ storage")
     }
 
@@ -432,7 +452,7 @@ impl VectorStorage for ProductQuantizationStorage {
 }
 
 /// Distance calculator backed by PQ code.
-struct PQDistCalculator {
+pub struct PQDistCalculator {
     distance_table: Vec<f32>,
     pq_code: Arc<UInt8Array>,
     num_sub_vectors: usize,
@@ -468,7 +488,7 @@ impl PQDistCalculator {
     }
 }
 
-impl DistCalculator<'_> for PQDistCalculator {
+impl DistCalculator for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let pq_code = self.get_pq_code(id);
         pq_code

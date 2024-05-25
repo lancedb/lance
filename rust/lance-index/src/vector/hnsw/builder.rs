@@ -7,6 +7,7 @@ use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt32Type};
 use arrow_array::{ArrayRef, RecordBatch};
 use crossbeam_queue::ArrayQueue;
+use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::tokio::spawn_cpu;
@@ -34,18 +35,18 @@ use super::super::graph::beam_search;
 use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
 use crate::scalar::IndexWriter;
 use crate::vector::graph::builder::GraphBuilderNode;
-use crate::vector::graph::storage::DistCalculator;
-use crate::vector::graph::{greedy_search, storage::VectorStorage};
+use crate::vector::graph::greedy_search;
 use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
+use crate::vector::v3::storage::{DistCalculator, VectorStore};
 use crate::vector::DIST_COL;
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
 /// Parameters of building HNSW index
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
     /// max level ofm
     pub max_level: u16,
@@ -113,7 +114,7 @@ impl HnswBuildParams {
 /// During the build, the graph is built layer by layer.
 ///
 /// Each node in the graph has a global ID which is the index on the base layer.
-#[derive(Clone)]
+#[derive(Clone, DeepSizeOf)]
 pub struct HNSW {
     inner: Arc<HNSWBuilderInner>,
 }
@@ -130,11 +131,6 @@ impl Debug for HNSW {
 }
 
 impl HNSW {
-    /// Create a new [`HNSWBuilder`] with in memory vector storage.
-    // pub fn new(distance_type: DistanceType, vectors: Option<Arc<dyn VectorStorage>>) -> Self {
-    //     Self::with_params(distance_type, HnswBuildParams::default(), vectors)
-    // }
-
     pub fn len(&self) -> usize {
         self.inner.nodes.read().unwrap().len()
     }
@@ -163,7 +159,7 @@ impl HNSW {
     pub async fn build_with_storage(
         distance_type: DistanceType,
         params: HnswBuildParams,
-        storage: Arc<dyn VectorStorage>,
+        storage: Arc<impl VectorStore + 'static>,
     ) -> Result<Self> {
         let inner = HNSWBuilderInner::with_params(distance_type, params, storage.len());
         let hnsw = Self {
@@ -258,7 +254,7 @@ impl HNSW {
         ef: usize,
         bitset: Option<RoaringBitmap>,
         visited_generator: &mut VisitedGenerator,
-        storage: &dyn VectorStorage,
+        storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
         let dist_calc = storage.dist_calculator(query);
@@ -266,7 +262,7 @@ impl HNSW {
         let nodes = self.inner.nodes.read().unwrap();
         for level in (0..self.max_level()).rev() {
             let cur_level = HnswLevelView::new(level, &nodes);
-            ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
+            ep = greedy_search(&cur_level, ep, &dist_calc)?;
         }
 
         let bottom_level = HnswBottomView::new(&nodes);
@@ -274,7 +270,7 @@ impl HNSW {
             &bottom_level,
             &ep,
             ef,
-            dist_calc.as_ref(),
+            &dist_calc,
             bitset.as_ref(),
             prefetch_distance,
             visited_generator,
@@ -291,7 +287,7 @@ impl HNSW {
         k: usize,
         ef: usize,
         bitset: Option<RoaringBitmap>,
-        storage: &dyn VectorStorage,
+        storage: &impl VectorStore,
     ) -> Result<Vec<OrderedNode>> {
         let mut visited_generator = self
             .inner
@@ -412,7 +408,10 @@ impl HNSW {
     /// ----------
     /// - *reader*: the file reader to read the graph from.
     /// - *vector_storage*: A preloaded [VectorStorage] storage.
-    pub async fn load(reader: &FileReader, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
+    pub async fn load(
+        reader: &FileReader,
+        vector_storage: Arc<impl VectorStore + 'static>,
+    ) -> Result<Self> {
         let schema = reader.schema();
         let mt = if let Some(index_metadata) = schema.metadata.get(INDEX_METADATA_SCHEMA_KEY) {
             let index_metadata: IndexMetadata = serde_json::from_str(index_metadata)?;
@@ -453,7 +452,7 @@ impl HNSW {
         reader: &FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
-        vector_storage: Arc<dyn VectorStorage>,
+        vector_storage: Arc<impl VectorStore + 'static>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
         if range.is_empty() {
@@ -554,6 +553,16 @@ struct HNSWBuilderInner {
     visited_generator_queue: Arc<ArrayQueue<VisitedGenerator>>,
 }
 
+impl DeepSizeOf for HNSWBuilderInner {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.distance_type.deep_size_of_children(context)
+            + self.params.deep_size_of_children(context)
+            + self.nodes.deep_size_of_children(context)
+            + self.level_count.deep_size_of_children(context)
+        // Skipping the visited_generator_queue
+    }
+}
+
 impl HNSWBuilderInner {
     pub fn max_level(&self) -> u16 {
         self.params.max_level
@@ -632,7 +641,7 @@ impl HNSWBuilderInner {
         &self,
         node: u32,
         visited_generator: &mut VisitedGenerator,
-        storage: &dyn VectorStorage,
+        storage: &impl VectorStore,
     ) -> Result<()> {
         let nodes = self.nodes.read().unwrap();
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
@@ -652,7 +661,7 @@ impl HNSWBuilderInner {
         let dist_calc = storage.dist_calculator_from_id(node);
         for level in (target_level + 1..self.params.max_level).rev() {
             let cur_level = HnswLevelView::new(level, &nodes);
-            ep = greedy_search(&cur_level, ep, dist_calc.as_ref())?;
+            ep = greedy_search(&cur_level, ep, &dist_calc)?;
         }
 
         let mut pruned_neighbors_per_level: Vec<Vec<_>> =
@@ -663,7 +672,7 @@ impl HNSWBuilderInner {
                 self.level_count[level as usize].fetch_add(1, Ordering::Relaxed);
 
                 let neighbors =
-                    self.search_level(&ep, level, dist_calc.as_ref(), &nodes, visited_generator)?;
+                    self.search_level(&ep, level, &dist_calc, &nodes, visited_generator)?;
                 for neighbor in &neighbors {
                     current_node.add_neighbor(neighbor.id, neighbor.dist, level);
                 }
@@ -704,7 +713,7 @@ impl HNSWBuilderInner {
         &self,
         ep: &OrderedNode,
         level: u16,
-        dist_calc: &dyn DistCalculator,
+        dist_calc: &impl DistCalculator,
         nodes: &RwLockReadGuard<Vec<RwLock<GraphBuilderNode>>>,
         visited_generator: &mut VisitedGenerator,
     ) -> Result<Vec<OrderedNode>> {
@@ -720,7 +729,7 @@ impl HNSWBuilderInner {
         )
     }
 
-    fn prune(&self, storage: &dyn VectorStorage, builder_node: &mut GraphBuilderNode, level: u16) {
+    fn prune(&self, storage: &impl VectorStore, builder_node: &mut GraphBuilderNode, level: u16) {
         let m_max = match level {
             0 => self.params.m * 2,
             _ => self.params.m,
@@ -810,7 +819,7 @@ mod tests {
         const TOTAL: usize = 2048;
         const NUM_EDGES: usize = 20;
         let data = generate_random_array(TOTAL * DIM);
-        let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
+        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
         let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
         let builder = HNSW::build_with_storage(
             DistanceType::L2,

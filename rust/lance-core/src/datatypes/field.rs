@@ -18,6 +18,7 @@ use arrow_array::{
     ArrayRef,
 };
 use arrow_schema::{DataType, Field as ArrowField};
+use deepsize::DeepSizeOf;
 use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
 use snafu::{location, Location};
 
@@ -34,7 +35,7 @@ pub struct SchemaCompareOptions {
     pub compare_field_ids: bool,
 }
 /// Encoding enum.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub enum Encoding {
     /// Plain encoding.
     Plain,
@@ -48,7 +49,7 @@ pub enum Encoding {
 
 /// Lance Schema Field
 ///
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct Field {
     pub name: String,
     pub id: i32,

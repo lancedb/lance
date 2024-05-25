@@ -9,6 +9,7 @@ use arrow::{
 };
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_io::object_store::ObjectStore;
@@ -20,8 +21,8 @@ use snafu::{location, Location};
 
 use crate::{
     vector::{
-        graph::{storage::DistCalculator, VectorStorage},
         quantizer::{QuantizerMetadata, QuantizerStorage},
+        v3::storage::{DistCalculator, VectorStore},
         SQ_CODE_COLUMN,
     },
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
@@ -36,6 +37,12 @@ pub struct ScalarQuantizationMetadata {
     pub dim: usize,
     pub num_bits: u16,
     pub bounds: Range<f64>,
+}
+
+impl DeepSizeOf for ScalarQuantizationMetadata {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        0
+    }
 }
 
 #[async_trait]
@@ -73,6 +80,14 @@ pub struct ScalarQuantizationStorage {
     // Helper fields, references to the batch
     row_ids: Arc<UInt64Array>,
     sq_codes: Arc<FixedSizeListArray>,
+}
+
+impl DeepSizeOf for ScalarQuantizationStorage {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.batch.get_array_memory_size()
+            + self.row_ids.get_array_memory_size()
+            + self.sq_codes.get_array_memory_size()
+    }
 }
 
 impl ScalarQuantizationStorage {
@@ -194,7 +209,8 @@ impl QuantizerStorage for ScalarQuantizationStorage {
     }
 }
 
-impl VectorStorage for ScalarQuantizationStorage {
+impl VectorStore for ScalarQuantizationStorage {
+    type DistanceCalculator<'a> = SQDistCalculator<'a>;
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -216,21 +232,17 @@ impl VectorStorage for ScalarQuantizationStorage {
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator<'a>(&'a self, query: ArrayRef) -> Box<dyn DistCalculator<'a> + 'a> {
-        Box::new(SQDistCalculator::new(
-            query,
-            self.sq_codes.as_ref(),
-            self.bounds.clone(),
-        ))
+    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
+        SQDistCalculator::new(query, self.sq_codes.as_ref(), self.bounds.clone())
     }
 
-    fn dist_calculator_from_id<'a>(&'a self, id: u32) -> Box<dyn DistCalculator<'a> + 'a> {
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let dim = self.sq_codes.value_length() as usize;
-        Box::new(SQDistCalculator {
+        SQDistCalculator {
             query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
             sq_codes: self.sq_codes.values().as_primitive::<UInt8Type>().values(),
             dim,
-        })
+        }
     }
 
     fn distance_between(&self, a: u32, b: u32) -> f32 {
@@ -241,7 +253,7 @@ impl VectorStorage for ScalarQuantizationStorage {
     }
 }
 
-struct SQDistCalculator<'a> {
+pub struct SQDistCalculator<'a> {
     query_sq_code: Vec<u8>,
     sq_codes: &'a [u8],
     dim: usize,
@@ -261,7 +273,7 @@ impl<'a> SQDistCalculator<'a> {
     }
 }
 
-impl<'a> DistCalculator<'a> for SQDistCalculator<'a> {
+impl<'a> DistCalculator for SQDistCalculator<'a> {
     fn distance(&self, id: u32) -> f32 {
         let sq_code = &self.sq_codes[id as usize * self.dim..(id as usize + 1) * self.dim];
         l2_distance_uint_scalar(sq_code, &self.query_sq_code)
@@ -277,8 +289,7 @@ impl<'a> DistCalculator<'a> for SQDistCalculator<'a> {
             for offset in (0..self.dim).step_by(CACHE_LINE_SIZE) {
                 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 {
-                    use core::arch::x86_64::_mm_prefetch;
-                    const _MM_HINT_T0: i32 = 1;
+                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
                     _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
                 }
             }

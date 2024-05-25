@@ -73,7 +73,7 @@ async fn main() {
         .await;
     let arrs = batches.iter().map(|b| b.as_ref()).collect::<Vec<_>>();
     let fsl = concat(&arrs).unwrap();
-    let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
+    let mat = MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap();
     println!("Loaded {:?} batches", mat.num_rows());
 
     let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
