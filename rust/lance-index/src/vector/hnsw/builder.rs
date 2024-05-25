@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 
@@ -225,24 +224,17 @@ impl HNSW {
         storage: &dyn VectorStorage,
     ) -> Result<()> {
         if node as usize >= self.inner.nodes().read().unwrap().len() {
-            // This mutex doesn't exist to avoid invalid memory handling,
-            // it exists to make sure we don't OOM/do a bunch of wasteful work
-            // by resizing in a bunch of threads at once
-            let _lock_guard = self.inner.resize_lock.lock();
-            if node as usize >= self.inner.nodes().read().unwrap().len() {
-                let mut new_nodes: Vec<_> = self
-                    .inner
-                    .nodes()
-                    .read()
-                    .unwrap()
+            let mut write_nodes = self.inner.nodes.write().unwrap();
+            if node as usize >= write_nodes.len() {
+                let mut new_nodes: Vec<_> = write_nodes
                     .iter()
                     .map(|v| RwLock::new(v.read().unwrap().clone()))
                     .collect();
-                let mut new_size = max(self.inner.nodes().read().unwrap().len(), 1);
+                let mut new_size = max(write_nodes.len(), 1);
                 while node as usize >= new_size {
                     new_size = new_size * 2;
                 }
-                for i in self.inner.nodes.read().unwrap().len()..new_size {
+                for i in write_nodes.len()..new_size {
                     let level = {
                         if i == 0 {
                             self.inner.max_level() as usize
@@ -252,7 +244,6 @@ impl HNSW {
                     };
                     new_nodes.push(RwLock::new(GraphBuilderNode::new(i as u32, level)));
                 }
-                let mut write_nodes = self.inner.nodes.write().unwrap();
                 *write_nodes = new_nodes;
             }
         }
@@ -541,7 +532,6 @@ impl HNSW {
             params: metadata.params,
             nodes: Arc::new(RwLock::new(nodes.into_iter().map(RwLock::new).collect())),
             level_count: level_count.into_iter().map(AtomicUsize::new).collect(),
-            resize_lock: Mutex::new(()),
             entry_point: metadata.entry_point,
             visited_generator_queue,
         };
@@ -558,7 +548,6 @@ struct HNSWBuilderInner {
 
     nodes: Arc<RwLock<Vec<RwLock<GraphBuilderNode>>>>,
     level_count: Vec<AtomicUsize>,
-    resize_lock: Mutex<()>,
 
     entry_point: u32,
 
@@ -602,7 +591,6 @@ impl HNSWBuilderInner {
             distance_type,
             params,
             nodes: Arc::new(RwLock::new(Vec::with_capacity(0))),
-            resize_lock: Mutex::new(()),
             level_count,
             entry_point: 0,
             visited_generator_queue,
