@@ -222,25 +222,24 @@ impl HNSW {
         if node as usize >= self.inner.nodes().read().unwrap().len() {
             let mut write_nodes = self.inner.nodes.write().unwrap();
             if node as usize >= write_nodes.len() {
-                let mut new_nodes: Vec<_> = write_nodes
-                    .iter()
-                    .map(|v| RwLock::new(v.read().unwrap().clone()))
-                    .collect();
                 let mut new_size = max(write_nodes.len(), 1);
                 while node as usize >= new_size {
                     new_size *= 2;
                 }
-                for i in write_nodes.len()..new_size {
-                    let level = {
-                        if i == 0 {
-                            self.inner.max_level() as usize
-                        } else {
-                            self.inner.random_level() as usize + 1
-                        }
-                    };
-                    new_nodes.push(RwLock::new(GraphBuilderNode::new(i as u32, level)));
-                }
-                *write_nodes = new_nodes;
+                *write_nodes = write_nodes
+                    .iter()
+                    .map(|v| RwLock::new(v.read().unwrap().clone()))
+                    .chain((write_nodes.len()..new_size).map(|i| {
+                        let level = {
+                            if i == 0 {
+                                self.inner.max_level() as usize
+                            } else {
+                                self.inner.random_level() as usize + 1
+                            }
+                        };
+                        RwLock::new(GraphBuilderNode::new(i as u32, level))
+                    }))
+                    .collect();
             }
         }
         self.inner.insert(node, visited_generator, storage)
