@@ -224,6 +224,8 @@ impl HNSW {
             if node as usize >= write_nodes.len() {
                 let mut new_size = max(write_nodes.len(), 1);
                 while node as usize >= new_size {
+                    // TODO consider parametrizing this value for memory usage/extension occurrence
+                    // tradeoff (might not make a big difference)
                     new_size *= 2;
                 }
                 *write_nodes = write_nodes
