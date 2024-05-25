@@ -190,7 +190,9 @@ def benchmark_tpch_encodings(
     """
 
     benchmark_name = benchmark_tpch_encodings.__name__
-    output = csv.writer(open(benchmark_name + "_" + encoding_type + ".csv", "w"))
+    output = csv.writer(
+        open(benchmark_name + "_" + dataset_name + "_" + encoding_type + ".csv", "w")
+    )
     output.writerow(
         [
             "name",
@@ -231,11 +233,16 @@ def benchmark_tpch_encodings(
         if encoding_type == "plain_numeric":
             target_types = [pa.int32(), pa.int64(), pa.float32(), pa.float64()]
         elif encoding_type == "plain_non_numeric":
-            target_types = [pa.string(), pa.date32()]
+            target_types = [pa.string()]
+        elif encoding_type == "plain_timestamp":
+            target_types = [pa.date32()]
 
         target_columns = [
             field.name for field in orig_schema if field.type in target_types
         ]
+        print(target_columns)
+        if len(target_columns) == 0:
+            continue
 
         table = orig_dataset.to_table(columns=target_columns)
         parquet_path = "/tmp/parquet_ds.parquet"
@@ -246,7 +253,7 @@ def benchmark_tpch_encodings(
 
         dataset = ds.dataset(parquet_path)
         num_rows = dataset.count_rows()
-        parquet_size = os.path.getsize(parquet_path) / (1024**2)
+        parquet_size = os.path.getsize(parquet_path) / (1024**3)
 
         parquet_read_time = measure_pyarrow_read_time(
             parquet_path, num_trials=num_trials
@@ -256,7 +263,7 @@ def benchmark_tpch_encodings(
         lance_write_time = measure_lance_write_time(
             table, lance_path, num_trials=num_trials
         )
-        lance_size = os.path.getsize(lance_path) / (1024**2)
+        lance_size = os.path.getsize(lance_path) / (1024**3)
 
         lance_read_time = measure_lance_read_time(
             lance_path, num_trials=num_trials, batch_size=1024 * 8
@@ -288,11 +295,11 @@ def benchmark_tpch_encodings(
 
 """
 Data generation (sift)
-    nvecs = 10000
+    nvecs = 1000000
     ndims = 128
     with open("../sift/sift_base.fvecs", mode="rb") as fobj:
         buf = fobj.read()
-        data = np.array(struct.unpack("<1280000f",
+        data = np.array(struct.unpack("<128000000f",
                         buf[4 : 4 + 4 * nvecs * ndims])).reshape((nvecs, ndims))
         dd = dict(zip(range(nvecs), data))
 
@@ -335,7 +342,7 @@ def benchmark_sift_vector_encodings(
 
     dataset = ds.dataset(parquet_path)
     num_rows = dataset.count_rows()
-    parquet_size = os.path.getsize(parquet_path) / (1024**2)
+    parquet_size = os.path.getsize(parquet_path) / (1024**3)
 
     parquet_read_time = measure_pyarrow_read_time(parquet_path, num_trials=num_trials)
 
@@ -343,7 +350,7 @@ def benchmark_sift_vector_encodings(
     lance_write_time = measure_lance_write_time(
         table, lance_path, num_trials=num_trials
     )
-    lance_size = os.path.getsize(lance_path) / (1024**2)
+    lance_size = os.path.getsize(lance_path) / (1024**3)
 
     lance_read_time = measure_lance_read_time(
         lance_path, num_trials=num_trials, batch_size=1024 * 8
@@ -367,23 +374,47 @@ def benchmark_sift_vector_encodings(
 
 
 if __name__ == "__main__":
-    if os.path.exists("benchmark_tpch_encodings.csv"):
-        os.remove("benchmark_tpch_encodings.csv")
+    # if os.path.exists("benchmark_tpch_encodings_plain_non_numeric.csv"):
+    #     os.remove("benchmark_tpch_encodings_plain_non_numeric.csv")
 
     # benchmark_tpch_lineitem("/home/ubuntu/test/TPCH_SF1/")
+    # benchmark_tpch_encodings(
+    #     "/home/ubuntu/test/TPCH_SF1/",
+    #     dataset_name="tpch_sf1",
+    #     encoding_type="plain_numeric",
+    # )
+    # benchmark_tpch_encodings(
+    #     "/home/ubuntu/test/TPCH_SF1/",
+    #     dataset_name="tpch_sf1",
+    #     encoding_type="plain_non_numeric",
+    # )
+    # benchmark_tpch_encodings(
+    #     "/home/ubuntu/test/TPCH_SF1/",
+    #     dataset_name="tpch_sf1",
+    #     encoding_type="plain_timestamp",
+    # )
+
     benchmark_tpch_encodings(
-        "/home/ubuntu/test/TPCH_SF1/",
-        dataset_name="tpch_sf1",
+        "/home/ubuntu/test/TPCH_SF10/",
+        dataset_name="tpch_sf10",
         encoding_type="plain_numeric",
-    )
-    benchmark_tpch_encodings(
-        "/home/ubuntu/test/TPCH_SF1/",
-        dataset_name="tpch_sf1",
-        encoding_type="plain_non_numeric",
-    )
-    benchmark_sift_vector_encodings(
-        "/home/ubuntu/test/",
-        dataset_name="sift1m",
-        encoding_type="plain_fixed_size_list",
         num_trials=5,
     )
+    benchmark_tpch_encodings(
+        "/home/ubuntu/test/TPCH_SF10/",
+        dataset_name="tpch_sf10",
+        encoding_type="plain_non_numeric",
+        num_trials=5,
+    )
+    benchmark_tpch_encodings(
+        "/home/ubuntu/test/TPCH_SF10/",
+        dataset_name="tpch_sf10",
+        encoding_type="plain_timestamp",
+        num_trials=5,
+    )
+    # benchmark_sift_vector_encodings(
+    #     "/home/ubuntu/test/",
+    #     dataset_name="sift1m",
+    #     encoding_type="plain_fixed_size_list",
+    #     num_trials=5,
+    # )
