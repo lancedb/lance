@@ -310,8 +310,8 @@ impl Dataset {
             .await
             .map_err(|err| match err {
                 object_store::Error::NotFound { path, source } => Error::DatasetNotFound {
-                    path: path.to_string(),
-                    source: source.into(),
+                    path,
+                    source,
                     location: location!(),
                 },
                 _ => Error::IO {

@@ -32,7 +32,6 @@ use futures::{
     StreamExt, TryStreamExt,
 };
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
-use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 use url::Url;
 
@@ -61,15 +60,6 @@ use crate::format::{Index, Manifest};
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LatestManifestPointer {
-    version: u64,
-    location: String,
-    size: u64,
-    reader_flags: u64,
-    writer_flags: u64,
-}
 
 /// Function that writes the manifest to the object store.
 pub type ManifestWriter = for<'a> fn(
