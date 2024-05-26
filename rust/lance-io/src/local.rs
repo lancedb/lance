@@ -111,13 +111,20 @@ impl Reader for LocalObjectReader {
     }
 
     /// Returns the file size.
-    async fn size(&self) -> Result<usize> {
-        Ok(self.file.metadata()?.len() as usize)
+    async fn size(&self) -> object_store::Result<usize> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|err| object_store::Error::Generic {
+                store: "LocalFileSystem",
+                source: err.into(),
+            })?;
+        Ok(metadata.len() as usize)
     }
 
     /// Reads a range of data.
     #[instrument(level = "debug", skip(self))]
-    async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
+    async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {
             let mut buf = BytesMut::with_capacity(range.len());
@@ -132,6 +139,10 @@ impl Reader for LocalObjectReader {
             Ok(buf.freeze())
         })
         .await?
+        .map_err(|err: std::io::Error| object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: err.into(),
+        })
     }
 }
 

@@ -113,8 +113,15 @@ pub async fn read_struct<
     T::try_from(msg)
 }
 
-pub async fn read_last_block(reader: &dyn Reader) -> Result<Bytes> {
-    let file_size = reader.size().await?;
+pub async fn read_last_block(
+    reader: &dyn Reader,
+    size: Option<u64>,
+) -> object_store::Result<Bytes> {
+    let file_size = if let Some(size) = size {
+        size as usize
+    } else {
+        reader.size().await?
+    };
     let block_size = reader.block_size();
     let begin = if file_size < block_size {
         0

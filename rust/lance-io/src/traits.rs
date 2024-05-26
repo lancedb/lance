@@ -86,10 +86,10 @@ pub trait Reader: std::fmt::Debug + Send + Sync {
     fn block_size(&self) -> usize;
 
     /// Object/File Size.
-    async fn size(&self) -> Result<usize>;
+    async fn size(&self) -> object_store::Result<usize>;
 
     /// Read a range of bytes from the object.
     ///
     /// TODO: change to read_at()?
-    async fn get_range(&self, range: Range<usize>) -> Result<Bytes>;
+    async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes>;
 }

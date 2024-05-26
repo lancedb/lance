@@ -22,17 +22,16 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
-use std::{fmt::Debug, fs::DirEntry};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::{fmt::Debug, fs::DirEntry};
 
 use futures::{
     future::{self, BoxFuture},
     stream::BoxStream,
     StreamExt, TryStreamExt,
 };
-use object_store::local::LocalFileSystem;
-use object_store::{path::Path, Error as ObjectStoreError, ObjectStore};
+use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 use url::Url;
@@ -42,10 +41,7 @@ pub mod dynamodb;
 pub mod external_manifest;
 
 use lance_core::{Error, Result};
-use lance_io::{object_store::ObjectStoreExt, testing::__mock_MockObjectStore_OSObjectStore};
-use lance_io::object_store::ObjectStoreParams;
-
-use self::external_manifest::ManifestLocation;
+use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
 
 #[cfg(feature = "dynamodb")]
 use {
@@ -77,7 +73,7 @@ struct LatestManifestPointer {
 
 /// Function that writes the manifest to the object store.
 pub type ManifestWriter = for<'a> fn(
-    object_store: &'a dyn ObjectStore,
+    object_store: &'a dyn OSObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
@@ -93,42 +89,61 @@ pub fn latest_manifest_path(base: &Path) -> Path {
     base.child(LATEST_MANIFEST_NAME)
 }
 
-/// Get the latest manifest path
-async fn current_manifest_path(object_store: &dyn ObjectStore, base: &Path) -> Result<ManifestLocation> {
-    // TODO: list gives us the size, so we could also return the size of the manifest.
-    // That avoids a HEAD request later.
+#[derive(Debug)]
+pub struct ManifestLocation {
+    /// The version the manifest corresponds to.
+    pub version: u64,
+    /// Path of the manifest file, relative to the table root.
+    pub path: Path,
+    /// Size, in bytes, of the manifest file. If it is not known, this field should be `None`.
+    pub size: Option<u64>,
+}
 
-    if let Some(store) = object_store.as_any().downcast_ref::<LocalFileSystem>() {
-        if let Ok(Some(location)) = current_manifest_local(base, store) {
+/// Get the latest manifest path
+async fn current_manifest_path(
+    object_store: &ObjectStore,
+    base: &Path,
+) -> Result<ManifestLocation> {
+    if object_store.is_local() {
+        if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
         }
     }
 
     // We use `list_with_delimiter` to avoid listing the contents of child directories.
     let manifest_files = object_store
+        .inner
         .list_with_delimiter(Some(&base.child(VERSIONS_DIR)))
         .await?;
 
     let current = manifest_files
         .objects
         .into_iter()
-        .map(|meta| meta.location)
-        .filter(|path| {
-            path.filename().is_some() && path.filename().unwrap().ends_with(MANIFEST_EXTENSION)
+        .filter(|meta| {
+            meta.location.filename().is_some()
+                && meta
+                    .location
+                    .filename()
+                    .unwrap()
+                    .ends_with(MANIFEST_EXTENSION)
         })
-        .filter_map(|path| {
-            let version = path
+        .filter_map(|meta| {
+            let version = meta
+                .location
                 .filename()
                 .unwrap()
                 .split_once('.')
                 .and_then(|(version_str, _)| version_str.parse::<u64>().ok())?;
-            Some((version, path))
+            Some((version, meta))
         })
-        .max_by_key(|(version, _)| *version)
-        .map(|(_, path)| path);
+        .max_by_key(|(version, _)| *version);
 
-    if let Some(path) = current {
-        Ok(path)
+    if let Some((version, meta)) = current {
+        Ok(ManifestLocation {
+            version,
+            path: meta.location,
+            size: Some(meta.size as u64),
+        })
     } else {
         Err(Error::NotFound {
             uri: manifest_path(base, 1).to_string(),
@@ -138,30 +153,27 @@ async fn current_manifest_path(object_store: &dyn ObjectStore, base: &Path) -> R
 }
 
 // This is an optimized function that searches for the latest manifest. In
-// object_store, list operations lookup metadata for each file listed. This 
+// object_store, list operations lookup metadata for each file listed. This
 // method only gets the metadata for the found latest manifest.
-fn current_manifest_local(
-    base: &Path,
-    store: &LocalFileSystem,
-) -> std::io::Result<Option<ManifestLocation>> {
-    let path = store.path_to_filesystem(&base.child(VERSIONS_DIR))?;
+fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocation>> {
+    let path = lance_io::local::to_local_path(&base.child(VERSIONS_DIR));
     let entries = std::fs::read_dir(path)?;
 
     let mut latest_entry: Option<(u64, DirEntry)> = None;
 
     for entry in entries {
         let entry = entry?;
-        let filename = entry.file_name().to_string_lossy();
+        let filename_raw = entry.file_name();
+        let filename = filename_raw.to_string_lossy();
         if !filename.ends_with(MANIFEST_EXTENSION) {
             // Need to ignore temporary files, such as
             // .tmp_7.manifest_9c100374-3298-4537-afc6-f5ee7913666d
             continue;
         }
-        let version = if let Some(version) = filename
+        let Some(version) = filename
             .split_once('.')
-            .and_then(|(version_str, _)| version_str.parse::<u64>().ok()) {
-            version
-        } else {
+            .and_then(|(version_str, _)| version_str.parse::<u64>().ok())
+        else {
             continue;
         };
 
@@ -177,7 +189,7 @@ fn current_manifest_local(
     if let Some((version, entry)) = latest_entry {
         Ok(Some(ManifestLocation {
             version,
-            uri: entry.path().to_string_lossy().to_string(),
+            path: entry.path().to_string_lossy().as_ref().into(),
             size: Some(entry.metadata()?.len()),
         }))
     } else {
@@ -187,14 +199,14 @@ fn current_manifest_local(
 
 async fn list_manifests<'a>(
     base_path: &Path,
-    object_store: &'a dyn ObjectStore,
+    object_store: &'a dyn OSObjectStore,
 ) -> Result<BoxStream<'a, Result<Path>>> {
     let base_path = base_path.clone();
     Ok(object_store
         .read_dir_all(&base_path.child(VERSIONS_DIR), None)
         .await?
         .try_filter_map(|obj_meta| {
-            if obj_meta.location.extension() == Some("manifest") {
+            if obj_meta.location.extension() == Some(MANIFEST_EXTENSION) {
                 future::ready(Ok(Some(obj_meta.location)))
             } else {
                 future::ready(Ok(None))
@@ -206,7 +218,7 @@ async fn list_manifests<'a>(
 pub fn parse_version_from_path(path: &Path) -> Result<u64> {
     path.filename()
         .and_then(|name| name.split_once('.'))
-        .filter(|(_, extension)| *extension == "manifest")
+        .filter(|(_, extension)| *extension == MANIFEST_EXTENSION)
         .and_then(|(version, _)| version.parse::<u64>().ok())
         .ok_or(Error::Internal {
             message: format!("Expected manifest file, but found {}", path),
@@ -225,7 +237,7 @@ fn make_staging_manifest_path(base: &Path) -> Result<Path> {
 async fn write_latest_manifest(
     from_path: &Path,
     base_path: &Path,
-    object_store: &dyn ObjectStore,
+    object_store: &dyn OSObjectStore,
 ) -> Result<()> {
     let latest_path = latest_manifest_path(base_path);
     let staging_path = make_staging_manifest_path(from_path)?;
@@ -250,33 +262,33 @@ const DDB_URL_QUERY_KEY: &str = "ddbTableName";
 // TODO: pub(crate)
 #[async_trait::async_trait]
 pub trait CommitHandler: Debug + Send + Sync {
+    async fn resolve_latest_location(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> Result<ManifestLocation> {
+        Ok(current_manifest_path(object_store, base_path).await?)
+    }
+
     /// Get the path to the latest version manifest of a dataset at the base_path
     async fn resolve_latest_version(
         &self,
         base_path: &Path,
-        object_store: &dyn ObjectStore,
+        object_store: &ObjectStore,
     ) -> std::result::Result<Path, Error> {
         // TODO: we need to pade 0's to the version number on the manifest file path
-        Ok(current_manifest_path(object_store, base_path).await?)
+        Ok(current_manifest_path(object_store, base_path).await?.path)
     }
 
     // for default implementation, parse the version from the path
     async fn resolve_latest_version_id(
         &self,
         base_path: &Path,
-        object_store: &dyn ObjectStore,
+        object_store: &ObjectStore,
     ) -> Result<u64> {
-        let path = self.resolve_latest_version(base_path, object_store).await?;
-
-        parse_version_from_path(&path)
-    }
-
-    async fn resolve_latest_manifest_location(
-        &self,
-        base_path: &Path,
-        object_store: &dyn ObjectStore,
-    ) -> Result<ManifestLocation> {
-
+        Ok(current_manifest_path(object_store, base_path)
+            .await?
+            .version)
     }
 
     /// Get the path to a specific versioned manifest of a dataset at the base_path
@@ -284,7 +296,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         version: u64,
-        _object_store: &dyn ObjectStore,
+        _object_store: &dyn OSObjectStore,
     ) -> std::result::Result<Path, Error> {
         Ok(manifest_path(base_path, version))
     }
@@ -293,7 +305,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn list_manifests<'a>(
         &self,
         base_path: &Path,
-        object_store: &'a dyn ObjectStore,
+        object_store: &'a dyn OSObjectStore,
     ) -> Result<BoxStream<'a, Result<Path>>> {
         list_manifests(base_path, object_store).await
     }
@@ -307,7 +319,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn ObjectStore,
+        object_store: &dyn OSObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError>;
 }
@@ -518,7 +530,7 @@ impl CommitHandler for UnsafeCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn ObjectStore,
+        object_store: &dyn OSObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         // Log a one-time warning
@@ -581,7 +593,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn ObjectStore,
+        object_store: &dyn OSObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         let path = self
@@ -627,7 +639,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn ObjectStore,
+        object_store: &dyn OSObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         self.as_ref()
@@ -648,7 +660,7 @@ impl CommitHandler for RenameCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn ObjectStore,
+        object_store: &dyn OSObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.

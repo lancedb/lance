@@ -15,9 +15,11 @@ use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
-use lance_io::utils::{read_metadata_offset, read_struct};
+use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_table::io::commit::{commit_handler_from_url, CommitError, CommitHandler, CommitLock};
+use lance_table::io::commit::{
+    commit_handler_from_url, CommitError, CommitHandler, CommitLock, ManifestLocation,
+};
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
 use object_store::path::Path;
@@ -234,72 +236,33 @@ impl Dataset {
     #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
     #[instrument(skip(params))]
     pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        let (object_store, base_path, commit_handler) =
-            Self::params_from_uri(uri, &params.commit_handler, &params.store_options).await?;
-
-        let latest_manifest = commit_handler
-            .resolve_latest_version(&base_path, &object_store.inner)
+        DatasetBuilder::from_uri(uri)
+            .with_read_params(params.clone())
+            .load()
             .await
-            .map_err(|e| Error::DatasetNotFound {
-                path: base_path.to_string(),
-                source: Box::new(e),
-                location: location!(),
-            })?;
-
-        let session = if let Some(session) = params.session.as_ref() {
-            session.clone()
-        } else {
-            Arc::new(Session::new(
-                params.index_cache_size,
-                params.metadata_cache_size,
-            ))
-        };
-
-        Self::checkout_manifest(
-            Arc::new(object_store),
-            base_path.clone(),
-            &latest_manifest,
-            session,
-            commit_handler,
-        )
-        .await
     }
 
     /// Check out a version of the dataset.
+    #[deprecated(note = "Please use `DatasetBuilder` instead.")]
     pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        let params = ReadParams::default();
-        Self::checkout_with_params(uri, version, &params).await
+        DatasetBuilder::from_uri(uri)
+            .with_version(version)
+            .load()
+            .await
     }
 
     /// Check out a version of the dataset with read params.
+    #[deprecated(note = "Please use `DatasetBuilder` instead.")]
     pub async fn checkout_with_params(
         uri: &str,
         version: u64,
         params: &ReadParams,
     ) -> Result<Self> {
-        let (object_store, base_path, commit_handler) =
-            Self::params_from_uri(uri, &params.commit_handler, &params.store_options).await?;
-
-        let manifest_file = commit_handler
-            .resolve_version(&base_path, version, &object_store.inner)
-            .await?;
-
-        let session = if let Some(session) = params.session.as_ref() {
-            session.clone()
-        } else {
-            Arc::new(Session::new(
-                params.index_cache_size,
-                params.metadata_cache_size,
-            ))
-        };
-        Self::checkout_manifest(
-            Arc::new(object_store),
-            base_path,
-            &manifest_file,
-            session,
-            commit_handler,
-        )
-        .await
+        DatasetBuilder::from_uri(uri)
+            .with_version(version)
+            .with_read_params(params.clone())
+            .load()
+            .await
     }
 
     /// Check out the specified version of this dataset
@@ -309,10 +272,15 @@ impl Dataset {
             .commit_handler
             .resolve_version(&base_path, version, &self.object_store.inner)
             .await?;
+        let manifest_location = ManifestLocation {
+            version,
+            path: manifest_file,
+            size: None,
+        };
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
-            &manifest_file,
+            &manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
         )
@@ -322,36 +290,36 @@ impl Dataset {
     async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
-        manifest_path: &Path,
+        manifest_location: &ManifestLocation,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
     ) -> Result<Self> {
-        let object_reader = object_store
-            .open(manifest_path)
+        let object_reader =
+            object_store
+                .open(&manifest_location.path)
+                .await
+                .map_err(|e| match &e {
+                    Error::NotFound { uri, .. } => Error::DatasetNotFound {
+                        path: uri.clone(),
+                        source: box_error(e),
+                        location: location!(),
+                    },
+                    _ => e,
+                })?;
+        let last_block = read_last_block(object_reader.as_ref(), manifest_location.size)
             .await
-            .map_err(|e| match &e {
-                Error::NotFound { uri, .. } => Error::DatasetNotFound {
-                    path: uri.clone(),
-                    source: box_error(e),
+            .map_err(|err| match err {
+                object_store::Error::NotFound { path, source } => Error::DatasetNotFound {
+                    path: path.to_string(),
+                    source: source.into(),
                     location: location!(),
                 },
-                _ => e,
-            })?;
-        // TODO: remove reference to inner.
-        let get_result = object_store
-            .inner
-            .get(manifest_path)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { path: _, source } => Error::DatasetNotFound {
-                    path: base_path.to_string(),
-                    source,
+                _ => Error::IO {
+                    source: err.into(),
                     location: location!(),
                 },
-                _ => e.into(),
             })?;
-        let bytes = get_result.bytes().await?;
-        let offset = read_metadata_offset(&bytes)?;
+        let offset = read_metadata_offset(&last_block)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
@@ -388,7 +356,7 @@ impl Dataset {
 
         // Read expected manifest path for the dataset
         let dataset_exists = match commit_handler
-            .resolve_latest_version(&base, &object_store.inner)
+            .resolve_latest_version(&base, &object_store)
             .await
         {
             Ok(_) => true,
@@ -621,7 +589,7 @@ impl Dataset {
             &self.object_store,
             &self
                 .commit_handler
-                .resolve_latest_version(&self.base, &self.object_store.inner)
+                .resolve_latest_version(&self.base, &self.object_store)
                 .await?,
         )
         .await
@@ -749,7 +717,7 @@ impl Dataset {
 
         // Test if the dataset exists
         let dataset_exists = match commit_handler
-            .resolve_latest_version(&base, &object_store.inner)
+            .resolve_latest_version(&base, &object_store)
             .await
         {
             Ok(_) => true,
@@ -1097,7 +1065,7 @@ impl Dataset {
     /// we don't return the full version struct.
     pub async fn latest_version_id(&self) -> Result<u64> {
         self.commit_handler
-            .resolve_latest_version_id(&self.base, &self.object_store.inner)
+            .resolve_latest_version_id(&self.base, &self.object_store)
             .await
     }
 
@@ -1606,7 +1574,7 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_version(&dataset.base, &dataset.object_store().inner)
+                .resolve_latest_version(&dataset.base, dataset.object_store())
                 .await
                 .unwrap(),
         )
@@ -1624,7 +1592,7 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_version(&dataset.base, &dataset.object_store().inner)
+                .resolve_latest_version(&dataset.base, dataset.object_store())
                 .await
                 .unwrap(),
         )
@@ -2041,7 +2009,11 @@ mod tests {
         assert_eq!(actual_ds.version().version, 2);
 
         // But we can still check out the first version
-        let first_ver = Dataset::checkout(test_uri, 1).await.unwrap();
+        let first_ver = DatasetBuilder::from_uri(test_uri)
+            .with_version(1)
+            .load()
+            .await
+            .unwrap();
         assert_eq!(first_ver.version().version, 1);
         assert_eq!(&ArrowSchema::from(first_ver.schema()), schema.as_ref());
     }

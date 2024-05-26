@@ -42,14 +42,14 @@ impl CloudObjectReader {
     async fn do_with_retry<'a, O>(
         &self,
         f: impl Fn() -> BoxFuture<'a, std::result::Result<O, object_store::Error>>,
-    ) -> Result<O> {
+    ) -> object_store::Result<O> {
         let mut retries = 3;
         loop {
             match f().await {
                 Ok(val) => return Ok(val),
                 Err(err) => {
                     if retries == 0 {
-                        return Err(err.into());
+                        return Err(err);
                     }
                     retries -= 1;
                 }
@@ -69,7 +69,7 @@ impl Reader for CloudObjectReader {
     }
 
     /// Object/File Size.
-    async fn size(&self) -> Result<usize> {
+    async fn size(&self) -> object_store::Result<usize> {
         let meta = self
             .do_with_retry(|| self.object_store.head(&self.path))
             .await?;
@@ -77,7 +77,7 @@ impl Reader for CloudObjectReader {
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
+    async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes> {
         self.do_with_retry(|| self.object_store.get_range(&self.path, range.clone()))
             .await
     }
