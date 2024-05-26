@@ -134,7 +134,7 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     let metadata_pos = read_metadata_offset(&tail_bytes)?;
     let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
         // We have not read the metadata bytes yet.
-        read_message(reader, metadata_pos).await?
+        read_message(reader, metadata_pos, Some(file_size)).await?
     } else {
         let offset = tail_bytes.len() - (file_size - metadata_pos);
         read_message_from_buf(&tail_bytes.slice(offset..))?

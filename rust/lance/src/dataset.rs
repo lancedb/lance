@@ -5,6 +5,7 @@
 //!
 
 use arrow_array::{RecordBatch, RecordBatchReader};
+use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -306,7 +307,12 @@ impl Dataset {
                     },
                     _ => e,
                 })?;
-        let last_block = read_last_block(object_reader.as_ref(), manifest_location.size)
+        let manifest_size = if let Some(size) = manifest_location.size {
+            size
+        } else {
+            object_reader.size().await? as u64
+        };
+        let last_block = read_last_block(object_reader.as_ref(), Some(manifest_size))
             .await
             .map_err(|err| match err {
                 object_store::Error::NotFound { path, source } => Error::DatasetNotFound {
@@ -320,7 +326,15 @@ impl Dataset {
                 },
             })?;
         let offset = read_metadata_offset(&last_block)?;
-        let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
+
+        // If manifest is in the last block, we can decode directly from memory.
+        let mut manifest = if manifest_size - (offset as u64) <= (last_block.len() as u64) {
+            let message_len = LittleEndian::read_u32(&last_block[offset..offset + 4]) as usize;
+            let message_data = &last_block[offset + 4..offset + 4 + message_len];
+            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)?
+        } else {
+            read_struct(object_reader.as_ref(), offset, Some(manifest_size as usize)).await?
+        };
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
@@ -1270,11 +1284,13 @@ mod tests {
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_table::format::WriterVersion;
+    use lance_table::io::commit::RenameCommitHandler;
     use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
+    use url::Url;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -1490,6 +1506,55 @@ mod tests {
         assert_eq!(result.count_rows(None).await.unwrap(), 0);
         // Since the dataset is empty, will return None.
         assert_eq!(result.manifest.max_fragment_id(), None);
+    }
+
+    #[tokio::test]
+    async fn test_load_manifest_iops() {
+        // Need to use in-memory for accurate IOPS tracking.
+        use crate::utils::test::IoTrackingStore;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(batches, "memory://test", None)
+            .await
+            .unwrap();
+
+        // Then open with wrapping store.
+        let memory_store = dataset.object_store.inner.clone();
+        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let _dataset = DatasetBuilder::from_uri("memory://test")
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_stats_wrapper),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .with_object_store(
+                memory_store,
+                Url::parse("memory://test").unwrap(),
+                Arc::new(RenameCommitHandler),
+            )
+            .load()
+            .await
+            .unwrap();
+
+        let get_iops = || io_stats.lock().unwrap().read_iops;
+
+        // There should be only two IOPS:
+        // 1. List _versions directory to get the latest manifest location
+        // 2. Read the manifest file. (The manifest is small enough to be read in one go.
+        //    Larger manifests would result in more IOPS.)
+        assert_eq!(get_iops(), 2);
     }
 
     #[rstest]

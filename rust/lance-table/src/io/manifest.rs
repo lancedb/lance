@@ -101,7 +101,7 @@ pub async fn read_manifest_indexes(
 ) -> Result<Vec<Index>> {
     if let Some(pos) = manifest.index_section.as_ref() {
         let reader = object_store.open(path).await?;
-        let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
+        let section: pb::IndexSection = read_message(reader.as_ref(), *pos, None).await?;
 
         Ok(section
             .indices
