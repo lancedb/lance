@@ -58,10 +58,13 @@ pub struct CachedFileMetadata {
     pub file_buffers: Vec<BufferDescriptor>,
     /// The number of bytes contained in the data page section of the file
     pub num_data_bytes: u64,
-    /// The number of bytes contained in the column metadata section of the file
+    /// The number of bytes contained in the column metadata (not including buffers
+    /// referenced by the metadata)
     pub num_column_metadata_bytes: u64,
-    /// The number of bytes contained in the global buffer section of the file
+    /// The number of bytes contained in global buffers
     pub num_global_buffer_bytes: u64,
+    /// The number of bytes contained in the CMO and GBO tables
+    pub num_footer_bytes: u64,
     pub major_version: u16,
     pub minor_version: u16,
 }
@@ -100,12 +103,12 @@ pub struct FileReader {
 }
 
 struct Footer {
+    #[allow(dead_code)]
     column_meta_start: u64,
     // We don't use this today because we always load metadata for every column
     // and don't yet support "metadata projection"
     #[allow(dead_code)]
     column_meta_offsets_start: u64,
-    global_buff_start: u64,
     global_buff_offsets_start: u64,
     num_global_buffers: u32,
     num_columns: u32,
@@ -113,7 +116,7 @@ struct Footer {
     minor_version: u16,
 }
 
-const FOOTER_LEN: usize = 48;
+const FOOTER_LEN: usize = 40;
 
 impl FileReader {
     pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
@@ -148,7 +151,6 @@ impl FileReader {
 
         let column_meta_start = cursor.read_u64::<LittleEndian>()?;
         let column_meta_offsets_start = cursor.read_u64::<LittleEndian>()?;
-        let global_buff_start = cursor.read_u64::<LittleEndian>()?;
         let global_buff_offsets_start = cursor.read_u64::<LittleEndian>()?;
         let num_global_buffers = cursor.read_u32::<LittleEndian>()?;
         let num_columns = cursor.read_u32::<LittleEndian>()?;
@@ -178,7 +180,6 @@ impl FileReader {
         Ok(Footer {
             column_meta_start,
             column_meta_offsets_start,
-            global_buff_start,
             global_buff_offsets_start,
             num_global_buffers,
             num_columns,
@@ -189,16 +190,10 @@ impl FileReader {
 
     // TODO: Once we have coalesced I/O we should only read the column metadatas that we need
     async fn read_all_column_metadata(
-        scheduler: &FileScheduler,
+        column_metadata_bytes: Bytes,
         footer: &Footer,
     ) -> Result<Vec<pbfile::ColumnMetadata>> {
         let column_metadata_start = footer.column_meta_start;
-        // This range includes both the offsets table and all of the column metadata
-        // We can't just grab col_meta_start..cmo_table_start because there may be padding
-        // between the last column and the start of the cmo table.
-        let column_metadata_range = column_metadata_start..footer.global_buff_start;
-        let column_metadata_bytes = scheduler.submit_single(column_metadata_range, 0).await?;
-
         // cmo == column_metadata_offsets
         let cmo_table_size = 16 * footer.num_columns as usize;
         let cmo_table = column_metadata_bytes.slice(column_metadata_bytes.len() - cmo_table_size..);
@@ -217,29 +212,56 @@ impl FileReader {
             .collect::<Result<Vec<_>>>()
     }
 
-    async fn get_all_meta_bytes(
-        tail_bytes: Bytes,
+    async fn optimistic_tail_read(
+        data: &Bytes,
+        start_pos: u64,
+        scheduler: &FileScheduler,
+        file_len: u64,
+    ) -> Result<Bytes> {
+        let num_bytes_needed = (file_len - start_pos) as usize;
+        if data.len() >= num_bytes_needed {
+            Ok(data.slice((data.len() - num_bytes_needed)..))
+        } else {
+            let num_bytes_missing = (num_bytes_needed - data.len()) as u64;
+            let start = file_len - num_bytes_needed as u64;
+            let missing_bytes = scheduler
+                .submit_single(start..start + num_bytes_missing, 0)
+                .await?;
+            let mut combined = BytesMut::with_capacity(data.len() + num_bytes_missing as usize);
+            combined.extend(missing_bytes);
+            combined.extend(data);
+            Ok(combined.freeze())
+        }
+    }
+
+    async fn decode_gbo_table(
+        tail_bytes: &Bytes,
         file_len: u64,
         scheduler: &FileScheduler,
         footer: &Footer,
-    ) -> Result<Bytes> {
-        let num_bytes_needed = (file_len - footer.column_meta_start) as usize;
-        if tail_bytes.len() >= num_bytes_needed {
-            Ok(tail_bytes.slice(tail_bytes.len() - num_bytes_needed..))
-        } else {
-            let num_bytes_missing = (num_bytes_needed - tail_bytes.len()) as u64;
-            let missing_bytes = scheduler
-                .submit_single(
-                    footer.column_meta_start..footer.column_meta_start + num_bytes_missing,
-                    0,
-                )
-                .await;
-            let mut combined =
-                BytesMut::with_capacity(tail_bytes.len() + num_bytes_missing as usize);
-            combined.extend(missing_bytes);
-            combined.extend(tail_bytes);
-            Ok(combined.freeze())
+    ) -> Result<Vec<BufferDescriptor>> {
+        // This could, in theory, trigger another IOP but the GBO table should never be large
+        // enough for that to happen
+        let gbo_bytes = Self::optimistic_tail_read(
+            tail_bytes,
+            footer.global_buff_offsets_start,
+            scheduler,
+            file_len,
+        )
+        .await?;
+        let mut global_bufs_cursor = Cursor::new(&gbo_bytes);
+
+        let mut global_buffers = Vec::with_capacity(footer.num_global_buffers as usize);
+        for _ in 0..footer.num_global_buffers {
+            let buf_pos = global_bufs_cursor.read_u64::<LittleEndian>()?;
+            let buf_size = global_bufs_cursor.read_u64::<LittleEndian>()?;
+            global_buffers.push(BufferDescriptor {
+                position: buf_pos,
+                size: buf_size,
+            });
         }
+
+        Ok(global_buffers)
     }
 
     fn decode_schema(schema_bytes: Bytes) -> Result<(u64, lance_core::datatypes::Schema)> {
@@ -272,47 +294,40 @@ impl FileReader {
         let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
         let footer = Self::decode_footer(&tail_bytes)?;
 
-        let all_metadata_bytes =
-            Self::get_all_meta_bytes(tail_bytes, file_len, scheduler, &footer).await?;
-        let meta_offset = footer.column_meta_start;
+        let gbo_table = Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer).await?;
+        if gbo_table.is_empty() {
+            return Err(Error::Internal {
+                message: format!("File did not contain any global buffers, schema expected"),
+                location: location!(),
+            });
+        }
+        let schema_start = gbo_table[0].position;
+        let schema_size = gbo_table[0].size;
 
-        // 2. read any global buffers (just the schema right now)
-        let global_bufs_table_nbytes = footer.num_global_buffers as usize * 16;
-        let global_bufs_table_start = (footer.global_buff_offsets_start - meta_offset) as usize;
-        let global_bufs_table_end = global_bufs_table_start + global_bufs_table_nbytes;
-        let global_bufs_table =
-            all_metadata_bytes.slice(global_bufs_table_start..global_bufs_table_end);
-        let mut global_bufs_cursor = Cursor::new(&global_bufs_table);
-        let schema_pos = global_bufs_cursor.read_u64::<LittleEndian>()? - meta_offset;
-        let schema_size = global_bufs_cursor.read_u64::<LittleEndian>()?;
-        let schema_end = schema_pos + schema_size;
-        let schema_bytes = all_metadata_bytes.slice(schema_pos as usize..schema_end as usize);
+        let num_footer_bytes = file_len - schema_start;
+
+        // By default we read all column metadatas.  We do NOT read the column metadata buffers
+        // at this point.  We only want to read the column metadata for columns we are actually loading.
+        let all_metadata_bytes =
+            Self::optimistic_tail_read(&tail_bytes, schema_start, scheduler, file_len).await?;
+
+        let schema_bytes = all_metadata_bytes.slice(0..schema_size as usize);
         let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
 
         // Next, read the metadata for the columns
-        let column_metadatas = Self::read_all_column_metadata(scheduler, &footer).await?;
+        // This is both the column metadata and the CMO table
+        let column_metadata_start = (footer.column_meta_start - schema_start) as usize;
+        let column_metadata_end = (footer.global_buff_offsets_start - schema_start) as usize;
+        let column_metadata_bytes =
+            all_metadata_bytes.slice(column_metadata_start..column_metadata_end);
+        let column_metadatas =
+            Self::read_all_column_metadata(column_metadata_bytes, &footer).await?;
 
         let footer_start = file_len - FOOTER_LEN as u64;
         let num_data_bytes = footer.column_meta_start;
-        let num_column_metadata_bytes = footer.global_buff_start - footer.column_meta_start;
-        let num_global_buffer_bytes = footer_start - footer.global_buff_start;
-
-        let global_bufs_table_nbytes = footer.num_global_buffers as usize * 16;
-        let global_bufs_table_start = (footer.global_buff_offsets_start - meta_offset) as usize;
-        let global_bufs_table_end = global_bufs_table_start + global_bufs_table_nbytes;
-        let global_bufs_table =
-            all_metadata_bytes.slice(global_bufs_table_start..global_bufs_table_end);
-        let mut global_bufs_cursor = Cursor::new(&global_bufs_table);
-
-        let mut global_buffers = Vec::with_capacity(footer.num_global_buffers as usize);
-        for _ in 0..footer.num_global_buffers {
-            let buf_pos = global_bufs_cursor.read_u64::<LittleEndian>()? - meta_offset;
-            let buf_size = global_bufs_cursor.read_u64::<LittleEndian>()?;
-            global_buffers.push(BufferDescriptor {
-                position: buf_pos,
-                size: buf_size,
-            });
-        }
+        let num_global_buffer_bytes = gbo_table.iter().map(|buf| buf.size).sum::<u64>()
+            + (footer_start - footer.global_buff_offsets_start);
+        let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
 
         let column_infos = Self::meta_to_col_infos(&column_metadatas);
 
@@ -324,7 +339,8 @@ impl FileReader {
             num_data_bytes,
             num_column_metadata_bytes,
             num_global_buffer_bytes,
-            file_buffers: global_buffers,
+            num_footer_bytes,
+            file_buffers: gbo_table,
             major_version: footer.major_version,
             minor_version: footer.minor_version,
         })
@@ -393,14 +409,14 @@ impl FileReader {
     }
 
     fn fetch_encoding(encoding: &pbfile::Encoding) -> pbenc::ArrayEncoding {
-        match &encoding.style {
-            Some(pbfile::encoding::Style::Deferred(_)) => todo!(),
-            Some(pbfile::encoding::Style::Direct(encoding)) => encoding
-                .encoding
-                .as_ref()
-                .unwrap()
-                .to_msg::<pbenc::ArrayEncoding>()
-                .unwrap(),
+        match &encoding.location {
+            Some(pbfile::encoding::Location::Indirect(_)) => todo!(),
+            Some(pbfile::encoding::Location::Direct(encoding)) => {
+                let encoding_buf = Bytes::from(encoding.encoding.clone());
+                let encoding_any = prost_types::Any::decode(encoding_buf).unwrap();
+                encoding_any.to_msg::<pbenc::ArrayEncoding>().unwrap()
+            }
+            Some(pbfile::encoding::Location::None(_)) => panic!(),
             None => panic!(),
         }
     }
@@ -782,33 +798,33 @@ impl FileReader {
 /// Inspects a page and returns a String describing the page's encoding
 pub fn describe_encoding(page: &pbfile::column_metadata::Page) -> String {
     if let Some(encoding) = &page.encoding {
-        if let Some(style) = &encoding.style {
+        if let Some(style) = &encoding.location {
             match style {
-                pbfile::encoding::Style::Deferred(deferred) => {
+                pbfile::encoding::Location::Indirect(indirect) => {
                     format!(
-                        "DeferredEncoding(pos={},size={})",
-                        deferred.buffer_location, deferred.buffer_length
+                        "IndirectEncoding(pos={},size={})",
+                        indirect.buffer_location, indirect.buffer_length
                     )
                 }
-                pbfile::encoding::Style::Direct(direct) => {
-                    if let Some(encoding) = &direct.encoding {
-                        if encoding.type_url == "/lance.encodings.ArrayEncoding" {
-                            let encoding = encoding.to_msg::<pbenc::ArrayEncoding>();
-                            match encoding {
-                                Ok(encoding) => {
-                                    format!("{:#?}", encoding)
-                                }
-                                Err(err) => {
-                                    format!("Unsupported(decode_err={})", err)
-                                }
+                pbfile::encoding::Location::Direct(direct) => {
+                    let encoding_any =
+                        prost_types::Any::decode(Bytes::from(direct.encoding.clone()))
+                            .expect("failed to deserialize encoding as protobuf");
+                    if encoding_any.type_url == "/lance.encodings.ArrayEncoding" {
+                        let encoding = encoding_any.to_msg::<pbenc::ArrayEncoding>();
+                        match encoding {
+                            Ok(encoding) => {
+                                format!("{:#?}", encoding)
                             }
-                        } else {
-                            format!("Unrecognized(type_url={})", encoding.type_url)
+                            Err(err) => {
+                                format!("Unsupported(decode_err={})", err)
+                            }
                         }
                     } else {
-                        "MISSING DIRECT VALUE".to_string()
+                        format!("Unrecognized(type_url={})", encoding_any.type_url)
                     }
                 }
+                pbfile::encoding::Location::None(_) => "NoEncodingDescription".to_string(),
             }
         } else {
             "MISSING STYLE".to_string()

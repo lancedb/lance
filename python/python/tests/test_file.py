@@ -104,7 +104,7 @@ def test_metadata(tmp_path):
     assert metadata.num_rows == 3
     assert metadata.num_global_buffer_bytes > 0
     assert metadata.num_column_metadata_bytes > 0
-    assert metadata.num_data_bytes == 24
+    assert metadata.num_data_bytes == 55
     assert len(metadata.columns) == 1
 
     column = metadata.columns[0]

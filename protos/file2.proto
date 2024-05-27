@@ -6,6 +6,7 @@ syntax = "proto3";
 package lance.file.v2;
 
 import "google/protobuf/any.proto";
+import "google/protobuf/empty.proto";
 
 // # Lance v0.2 File Format
 //
@@ -25,21 +26,22 @@ import "google/protobuf/any.proto";
 // bytes with an extensible metadata block to describe the data.  It is up to
 // the user to interpret these bytes meaningfully.
 //
-// Data buffers can be placed in three different places:
+// Data buffers are written to the file first.  These data buffered can be
+// referenced from three different places in the file:
 //
-// * Global data buffers are placed in the file footer.  These should contain
-//   data that is common across the file (such as the file schema or a common
-//   dictionary)
-// * Column metadata buffers are placed in the column metadata block.  These
-//   should contain data that is common across all pages within the column.
-// * Page data buffers are written in the data pages section of the file.  It
-//   is expected that these will contain the vast majority of the file's data.
+// * Page encodings can reference data buffers.  This is the most common way
+//   that actual data is stored.
+// * Column encodings can reference data buffers.  For example, a column encoding
+//   may reference data buffer(s) containing statistics or dictionaries.
+// * Finally, the global buffer offset table can reference data buffers.  This
+//   is useful for storing data that is shared across multiple columns.
+//   This is also useful for global file metadata (e.g. a schema that describes
+//   the file)
 //
 // ## File Layout
 //
-// Note: the number of pages (PN) is independent of the number of columns (CN)
-//       and each page/column can have any number of buffers (Px_N)/(Cx_N)
-//       which is determined by the encodings.
+// Note: the number of buffers (BN) is independent of the number of columns (CN)
+//       and pages.
 //
 //       Buffers often need to be aligned.  64-byte alignment is common when
 //       working with SIMD operations.  4096-byte alignment is common when
@@ -56,21 +58,15 @@ import "google/protobuf/any.proto";
 //
 // ├──────────────────────────────────┤
 // | Data Pages                       |
-// |   Page 0, Buffer 0*              |
+// |   Data Buffer 0*                 |
 // |   ...                            |
-// |   Page 0, Buffer P0_N*           |
-// |   Page 1, Buffer 0*              |
-// |   ...                            |
-// |   Page PN, Buffer PN_N*          |
+// |   Data Buffer BN*                |
 // ├──────────────────────────────────┤
 // | Column Metadatas                 |
 // | |A| Column 0 Metadata*           |
-// |     Column 0 Meta Buffer 0*      |
-// |     ...                          |
-// |     Column 0 Meta Buffer C0_N*   |
 // |     Column 1 Metadata*           |
 // |     ...                          |
-// |     Column CN Meta Buffer CN_N*  |
+// |     Column CN Metadata*          |
 // ├──────────────────────────────────┤
 // | Column Metadata Offset Table     |
 // | |B| Column 0 Metadata Position*  |
@@ -79,23 +75,17 @@ import "google/protobuf/any.proto";
 // |     Column CN Metadata Position  |
 // |     Column CN Metadata Size      |
 // ├──────────────────────────────────┤
-// | Global Buffers                   |
-// | |C| Global Meta Buffer 0*        |
-// |     ...                          |
-// |     Global Meta Buffer GN*       |
-// ├──────────────────────────────────┤
 // | Global Buffers Offset Table      |
-// | |D| Global Buffer 0 Position*    |
+// | |C| Global Buffer 0 Position*    |
 // |     Global Buffer 0 Size         |
 // |     ...                          |
 // |     Global Buffer GN Position    |
 // |     Global Buffer GN Size        |
 // ├──────────────────────────────────┤
 // | Footer                           |
-// | A u64: Offset to C0 metadata     |
+// | A u64: Offset to column meta 0   |
 // | B u64: Offset to CMO table       |
-// | C u64: Offset to global buf 0    |
-// | D u64: Offset to GBO table       |
+// | C u64: Offset to GBO table       |
 // |   u32: Number of global bufs     |
 // |   u32: Number of columns         |
 // |   u16: Major version             |
@@ -103,6 +93,19 @@ import "google/protobuf/any.proto";
 // |   "LANC"                         |
 // ├──────────────────────────────────┤
 //
+// ## Data Pages
+//
+// A lot of flexiblity is provided in how data is stored.  Note that the file
+// layout has no explicit notion of a page (however, it is a part of the column
+// metadata).  A page's buffers do not strictly need to be contiguous on the
+// disk.  However, it is recommended that buffers within a page be grouped
+// together for best performance.
+//
+// Data pages should be large.  The only time a page should be written to disk
+// is when the writer needs to flush the page to disk because it has accumulated
+// too much data.  Pages are not read in sequential order and if pages are too
+// small then the seek overhead (or request overhead) will be problematic.  We
+// generally advise that pages be at least 8MB or larger.
 //
 // ## Encodings
 //
@@ -119,31 +122,39 @@ import "google/protobuf/any.proto";
 message DeferredEncoding {
    // Location of the buffer containing the encoding.
    //
-   // This buffer will contain a protobuf encoded `DirectEncoding` message.
-   //
    // * If sharing encodings across columns then this will be in a global buffer
    // * If sharing encodings across pages within a column this could be in a
    //   column metadata buffer.
-   // * This format doesn't prevent this from being a page buffer.  However, that
-   //   would mean the reader needs to do an extra IOP before it can even begin
-   //   decoding the page and we don't imagine this being useful.
+   // * This could also be a page buffer if the encoding is not shared, needs
+   //   to be written before the file ends, and the encoding is too large to load
+   //   unless we first determine the page needs to be read.  This combination
+   //   seems unusual.
    uint64 buffer_location = 1;
    uint64 buffer_length = 2;
 }
 
-// Speicifc encodings are not part of the minimal file format.  They are stored
-// as google.protobuf.Any and should be provided by extensions.
+// The encoding is placed directly in the metadata section
 message DirectEncoding {
-    // The encoding
-    google.protobuf.Any encoding = 1;
+    // The bytes that make up the encoding embedded directly in the metadata
+    //
+    // This is the most common approach.
+    bytes encoding = 1;
 }
 
+// An encoding stores the information needed to decode a column or page
+//
+// For example, it could describe if the page is using bit packing, and how many bits
+// there are in each individual value.
+//
+// At the column level it can be used to wrap columns with dictionaries or statistics.
 message Encoding {
-    oneof style {
+    oneof location {
         // The encoding is stored elsewhere and not part of this protobuf message
-        DeferredEncoding deferred = 1;
+        DeferredEncoding indirect = 1;
         // The encoding is stored within this protobuf message
         DirectEncoding direct = 2;
+        // There is no encoding information
+        google.protobuf.Empty none = 3;
     }
 }
 
@@ -171,17 +182,21 @@ message ColumnMetadata {
     // The encoding used to encode the page
     Encoding encoding = 4;
   }
+  // Encoding information about the column itself.  This typically describes
+  // how to interpret the column metadata buffers.  For example, it could
+  // describe how statistics or dictionaries are stored in the column metadata.
+  Encoding encoding = 1;
   // The pages in the column
-  repeated Page pages = 1;   
+  repeated Page pages = 2;   
   // The file offsets of each of the column metadata buffers
   //
   // There may be zero buffers.
-  repeated uint64 buffer_offsets = 2;
+  repeated uint64 buffer_offsets = 3;
   // The size (in bytes) of each of the column metadata buffers
   //
   // This field will have the same length as `buffer_offsets` and
   // may be empty.
-  repeated uint64 buffer_sizes = 3;
+  repeated uint64 buffer_sizes = 4;
 }
 
 // ## Where is the rest?
