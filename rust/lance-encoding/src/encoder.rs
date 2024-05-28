@@ -132,12 +132,6 @@ pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
 /// A task to create a page of data
 pub type EncodeTask = BoxFuture<'static, Result<EncodedPage>>;
 
-/// A buffer of encoded metadata to be placed in the column metadata
-pub struct EncodedMetadataBuffer {
-    // Different parts that will be written to a single buffer on disk
-    pub parts: Vec<Bytes>,
-}
-
 /// Top level encoding trait to code any Arrow array type into one or more pages.
 ///
 /// The field encoder implements buffering and encoding of a single input column
@@ -171,7 +165,7 @@ pub trait FieldEncoder: Send {
     /// This is called only once, after all encode tasks have completed
     ///
     /// By default, returns an empty Vec (no column metadata buffers)
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedMetadataBuffer>>> {
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedBuffer>>> {
         std::future::ready(Ok(vec![])).boxed()
     }
     /// The number of output columns this encoding will create
