@@ -26,7 +26,7 @@ import "google/protobuf/empty.proto";
 // bytes with an extensible metadata block to describe the data.  It is up to
 // the user to interpret these bytes meaningfully.
 //
-// Data buffers are written to the file first.  These data buffered can be
+// Data buffers are written to the file first.  These data buffers can be
 // referenced from three different places in the file:
 //
 // * Page encodings can reference data buffers.  This is the most common way
