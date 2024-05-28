@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::Float32Type;
-use arrow_array::{FixedSizeListArray, Float32Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_arrow::ArrowFloatType;
@@ -34,12 +34,13 @@ use super::{
 };
 use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
-pub trait Quantization: DeepSizeOf {
+pub trait Quantization: DeepSizeOf + Into<Quantizer> {
     type Metadata: QuantizerMetadata + Send + Sync;
     type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore;
 
     fn code_dim(&self) -> usize;
     fn column(&self) -> &'static str;
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef>;
     fn metadata_key(&self) -> &'static str;
     fn quantization_type(&self) -> QuantizationType;
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value>;
@@ -103,6 +104,15 @@ impl Quantizer {
     }
 }
 
+impl<T: ArrowFloatType + 'static> From<ProductQuantizerImpl<T>> for Quantizer
+where
+    T::Native: Dot + L2,
+{
+    fn from(pq: ProductQuantizerImpl<T>) -> Self {
+        Self::Product(Arc::new(pq))
+    }
+}
+
 impl From<Arc<dyn ProductQuantizer>> for Quantizer {
     fn from(pq: Arc<dyn ProductQuantizer>) -> Self {
         Self::Product(pq)
@@ -151,6 +161,11 @@ impl Quantization for ScalarQuantizer {
         SQ_CODE_COLUMN
     }
 
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        let code_array = self.transform::<Float32Type>(vectors)?;
+        Ok(code_array)
+    }
+
     fn metadata_key(&self) -> &'static str {
         SQ_METADATA_KEY
     }
@@ -176,7 +191,7 @@ impl Quantization for ScalarQuantizer {
     }
 }
 
-impl Quantization for dyn ProductQuantizer {
+impl Quantization for Arc<dyn ProductQuantizer> {
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
 
@@ -186,6 +201,11 @@ impl Quantization for dyn ProductQuantizer {
 
     fn column(&self) -> &'static str {
         PQ_CODE_COLUMN
+    }
+
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        let code_array = self.transform(vectors)?;
+        Ok(code_array)
     }
 
     fn metadata_key(&self) -> &'static str {
@@ -209,6 +229,7 @@ impl Quantization for dyn ProductQuantizer {
             num_sub_vectors: self.num_sub_vectors(),
             dimension: self.dimension(),
             codebook: args.codebook,
+            codebook_tensor: Vec::new(),
         })?)
     }
 
@@ -250,6 +271,11 @@ where
         PQ_CODE_COLUMN
     }
 
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        let code_array = self.transform(vectors)?;
+        Ok(code_array)
+    }
+
     fn metadata_key(&self) -> &'static str {
         PQ_METADTA_KEY
     }
@@ -271,6 +297,7 @@ where
             num_sub_vectors: self.num_sub_vectors(),
             dimension: self.dimension(),
             codebook: args.codebook,
+            codebook_tensor: Vec::new(),
         })?)
     }
 

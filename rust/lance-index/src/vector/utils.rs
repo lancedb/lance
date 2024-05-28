@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow::{
+    array::AsArray,
+    datatypes::{Float16Type, Float32Type, Float64Type},
+};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_schema::{DataType, Field};
 use lance_arrow::{ArrowFloatType, FloatType};
@@ -11,10 +15,59 @@ use prost::bytes;
 use rand::distributions::Standard;
 use rand::prelude::*;
 use snafu::{location, Location};
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use super::pb;
 use crate::pb::Tensor;
+
+#[inline]
+pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
+    match array.data_type() {
+        DataType::FixedSizeList(_, _) => {
+            let array = array.as_fixed_size_list();
+            return prefetch_arrow_array(array.values());
+        }
+        DataType::Float16 => {
+            let array = array.as_primitive::<Float16Type>();
+            do_prefetch(array.values().as_ptr_range())
+        }
+        DataType::Float32 => {
+            let array = array.as_primitive::<Float32Type>();
+            do_prefetch(array.values().as_ptr_range())
+        }
+        DataType::Float64 => {
+            let array = array.as_primitive::<Float64Type>();
+            do_prefetch(array.values().as_ptr_range())
+        }
+        _ => {
+            return Err(Error::io(
+                format!("unsupport prefetch on {} type", array.data_type()),
+                location!(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[inline]
+fn do_prefetch<T>(ptrs: Range<*const T>) {
+    // TODO use rust intrinsics instead of x86 intrinsics
+    // TODO finish this
+    unsafe {
+        let (ptr, end_ptr) = (ptrs.start as *const i8, ptrs.end as *const i8);
+        let mut current_ptr = ptr;
+        while current_ptr < end_ptr {
+            const CACHE_LINE_SIZE: usize = 64;
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch(current_ptr, _MM_HINT_T0);
+            }
+            current_ptr = current_ptr.add(CACHE_LINE_SIZE);
+        }
+    }
+}
 
 fn to_pb_data_type<T: ArrowFloatType>() -> pb::tensor::DataType {
     match T::FLOAT_TYPE {
@@ -142,7 +195,7 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
 mod tests {
     use super::*;
 
-    use arrow_array::{types::*, Float16Array, Float32Array, Float64Array};
+    use arrow_array::{Float16Array, Float32Array, Float64Array};
     use half::f16;
     use lance_arrow::bfloat16::BFloat16Type;
     use lance_arrow::FixedSizeListArrayExt;

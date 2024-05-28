@@ -29,7 +29,7 @@ pub trait IvfShuffler {
     /// Shuffle the incoming stream of record batches into IVF partitions.
     /// Returns a IvfShuffleReader that can be used to read the shuffled partitions.
     async fn shuffle(
-        mut self,
+        &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
     ) -> Result<Box<dyn IvfShuffleReader>>;
 }

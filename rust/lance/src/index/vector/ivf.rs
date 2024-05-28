@@ -842,8 +842,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
 pub(crate) struct Ivf {
     /// Centroids of each partition.
     ///
-    /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
-    /// memory allocator.
+    /// It is a 2-D `(num_partitions * dimension)` of vector array.
     pub(crate) centroids: FixedSizeListArray,
 
     /// Offset of each partition in the file.
@@ -1645,25 +1644,31 @@ where
 /// Train IVF partitions using kmeans.
 async fn train_ivf_model(
     data: &FixedSizeListArray,
-    metric_type: MetricType,
+    distance_type: DistanceType,
     params: &IvfBuildParams,
 ) -> Result<Ivf> {
     assert!(
-        metric_type != MetricType::Cosine,
+        distance_type != DistanceType::Cosine,
         "Cosine metric should be done by normalized L2 distance",
     );
     let values = data.values();
     let dim = data.value_length() as usize;
-    match values.data_type() {
-        DataType::Float16 => {
-            do_train_ivf_model::<Float16Type>(values.as_primitive(), dim, metric_type, params).await
+    match (values.data_type(), distance_type) {
+        (DataType::Float16, _) => {
+            do_train_ivf_model::<Float16Type>(values.as_primitive(), dim, distance_type, params)
+                .await
         }
-        DataType::Float32 => {
-            do_train_ivf_model::<Float32Type>(values.as_primitive(), dim, metric_type, params).await
+        (DataType::Float32, _) => {
+            do_train_ivf_model::<Float32Type>(values.as_primitive(), dim, distance_type, params)
+                .await
         }
-        DataType::Float64 => {
-            do_train_ivf_model::<Float64Type>(values.as_primitive(), dim, metric_type, params).await
+        (DataType::Float64, _) => {
+            do_train_ivf_model::<Float64Type>(values.as_primitive(), dim, distance_type, params)
+                .await
         }
+        // (DataType::UInt8, DistanceType::Hamming) => {
+        //     do_train_ivf_model::<UInt8Type>(values.as_primitive(), dim, distance_type, params).await
+        // }
         _ => Err(Error::Index {
             message: "Unsupported data type".to_string(),
             location: location!(),

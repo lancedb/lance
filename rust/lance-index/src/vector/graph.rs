@@ -14,7 +14,6 @@ use deepsize::DeepSizeOf;
 use lance_core::Result;
 
 pub mod builder;
-pub mod memory;
 
 use crate::vector::DIST_COL;
 
