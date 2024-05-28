@@ -297,7 +297,7 @@ impl FileReader {
         let gbo_table = Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer).await?;
         if gbo_table.is_empty() {
             return Err(Error::Internal {
-                message: format!("File did not contain any global buffers, schema expected"),
+                message: "File did not contain any global buffers, schema expected".to_string(),
                 location: location!(),
             });
         }
