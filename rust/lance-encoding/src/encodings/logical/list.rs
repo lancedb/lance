@@ -24,14 +24,17 @@ use crate::{
         SchedulerContext,
     },
     encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
-    encodings::logical::r#struct::SimpleStructScheduler,
+    encodings::{
+        logical::r#struct::SimpleStructScheduler,
+        physical::{
+            basic::BasicEncoder,
+            value::{CompressionScheme, ValueEncoder},
+        },
+    },
     format::pb,
 };
 
-use super::{
-    primitive::{AccumulationQueue, PrimitiveFieldEncoder},
-    r#struct::SimpleStructDecoder,
-};
+use super::{primitive::AccumulationQueue, r#struct::SimpleStructDecoder};
 
 /// A page scheduler for list fields that encodes offsets in one field and items in another
 ///
@@ -674,9 +677,9 @@ impl ListOffsetsEncoder {
                 column_index,
                 keep_original_array,
             ),
-            inner_encoder: PrimitiveFieldEncoder::array_encoder_from_data_type(&DataType::UInt64)
-                .unwrap()
-                .into(),
+            inner_encoder: Arc::new(BasicEncoder::new(Box::new(
+                ValueEncoder::try_new(&DataType::Int64, CompressionScheme::None).unwrap(),
+            ))),
             column_index,
         }
     }

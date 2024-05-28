@@ -26,18 +26,13 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
-use crate::encodings::physical::parse_compression_scheme;
-use crate::encodings::physical::value::CompressionScheme;
 use crate::{
     decoder::{
         DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo,
         PhysicalPageDecoder, PhysicalPageScheduler, SchedulerContext,
     },
-    encoder::{ArrayEncoder, EncodeTask, EncodedPage, FieldEncoder},
-    encodings::physical::{
-        basic::BasicEncoder, decoder_from_array_encoding, fixed_size_list::FslEncoder,
-        value::ValueEncoder, ColumnBuffers, PageBuffers,
-    },
+    encoder::{ArrayEncodingStrategy, EncodeTask, EncodedPage, FieldEncoder},
+    encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
 
 /// A page scheduler for primitive fields
@@ -521,34 +516,15 @@ impl AccumulationQueue {
 
 pub struct PrimitiveFieldEncoder {
     accumulation_queue: AccumulationQueue,
-    encoder: Arc<dyn ArrayEncoder>,
+    array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
     column_index: u32,
 }
 
-fn get_compression_scheme() -> CompressionScheme {
-    let compression_scheme = std::env::var("LANCE_PAGE_COMPRESSION").unwrap_or("none".to_string());
-    parse_compression_scheme(&compression_scheme).unwrap_or(CompressionScheme::None)
-}
-
 impl PrimitiveFieldEncoder {
-    pub fn array_encoder_from_data_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
-        match data_type {
-            DataType::FixedSizeList(inner, dimension) => {
-                Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
-                    Self::array_encoder_from_data_type(inner.data_type())?,
-                    *dimension as u32,
-                )))))
-            }
-            _ => Ok(Box::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(data_type, get_compression_scheme())?,
-            )))),
-        }
-    }
-
     pub fn try_new(
         cache_bytes: u64,
         keep_original_array: bool,
-        data_type: &DataType,
+        array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
         column_index: u32,
     ) -> Result<Self> {
         Ok(Self {
@@ -558,33 +534,16 @@ impl PrimitiveFieldEncoder {
                 keep_original_array,
             ),
             column_index,
-            encoder: Arc::from(Self::array_encoder_from_data_type(data_type)?),
+            array_encoding_strategy,
         })
     }
 
-    pub fn new_with_encoder(
-        cache_bytes: u64,
-        keep_original_array: bool,
-        column_index: u32,
-        encoder: Arc<dyn ArrayEncoder>,
-    ) -> Self {
-        Self {
-            accumulation_queue: AccumulationQueue::new(
-                cache_bytes,
-                column_index,
-                keep_original_array,
-            ),
-            column_index,
-            encoder,
-        }
-    }
-
     // Creates an encode task, consuming all buffered data
-    fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> EncodeTask {
-        let encoder = self.encoder.clone();
+    fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<EncodeTask> {
+        let encoder = self.array_encoding_strategy.create_array_encoder(&arrays)?;
         let column_idx = self.column_index;
 
-        tokio::task::spawn(async move {
+        Ok(tokio::task::spawn(async move {
             let num_rows = arrays.iter().map(|arr| arr.len() as u32).sum();
             let mut buffer_index = 0;
             let array = encoder.encode(&arrays, &mut buffer_index)?;
@@ -595,7 +554,7 @@ impl PrimitiveFieldEncoder {
             })
         })
         .map(|res_res| res_res.unwrap())
-        .boxed()
+        .boxed())
     }
 }
 
@@ -603,7 +562,7 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.insert(array) {
-            Ok(vec![self.do_flush(arrays)])
+            Ok(vec![self.do_flush(arrays)?])
         } else {
             Ok(vec![])
         }
@@ -612,7 +571,7 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.flush() {
-            Ok(vec![self.do_flush(arrays)])
+            Ok(vec![self.do_flush(arrays)?])
         } else {
             Ok(vec![])
         }

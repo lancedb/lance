@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
-use lance_encoding::encoder::{BatchEncoder, EncodeTask, EncodedPage, FieldEncoder};
+use lance_encoding::encoder::{
+    BatchEncoder, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch, EncodedPage, FieldEncoder,
+    FieldEncodingStrategy,
+};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
 use log::debug;
@@ -59,6 +65,7 @@ pub struct FileWriterOptions {
     /// while) might keep a much larger record batch around in memory (even though most
     /// of that batch's data has been written to disk)
     pub keep_original_array: Option<bool>,
+    pub encoding_strategy: Option<Arc<dyn FieldEncodingStrategy>>,
 }
 
 pub struct FileWriter {
@@ -100,8 +107,16 @@ impl FileWriter {
         schema.validate()?;
 
         let keep_original_array = options.keep_original_array.unwrap_or(false);
+        let encoding_strategy = options
+            .encoding_strategy
+            .unwrap_or_else(|| Arc::new(CoreFieldEncodingStrategy::default()));
 
-        let encoder = BatchEncoder::try_new(&schema, cache_bytes_per_column, keep_original_array)?;
+        let encoder = BatchEncoder::try_new(
+            &schema,
+            encoding_strategy.as_ref(),
+            cache_bytes_per_column,
+            keep_original_array,
+        )?;
         let num_columns = encoder.num_columns();
 
         let column_writers = encoder.field_encoders;
@@ -257,20 +272,22 @@ impl FileWriter {
         Ok(metadata_positions)
     }
 
-    fn make_file_descriptor(&self) -> Result<pb::FileDescriptor> {
-        let lance_schema = lance_core::datatypes::Schema::try_from(&self.schema)?;
-        let fields_with_meta = FieldsWithMeta::from(&lance_schema);
+    fn make_file_descriptor(
+        schema: &lance_core::datatypes::Schema,
+        num_rows: u64,
+    ) -> Result<pb::FileDescriptor> {
+        let fields_with_meta = FieldsWithMeta::from(schema);
         Ok(pb::FileDescriptor {
             schema: Some(pb::Schema {
                 fields: fields_with_meta.fields.0,
                 metadata: fields_with_meta.metadata,
             }),
-            length: self.rows_written,
+            length: num_rows,
         })
     }
 
     async fn write_global_buffers(&mut self) -> Result<Vec<(u64, u64)>> {
-        let file_descriptor = self.make_file_descriptor()?;
+        let file_descriptor = Self::make_file_descriptor(&self.schema, self.rows_written)?;
         let file_descriptor_bytes = file_descriptor.encode_to_vec();
         let file_descriptor_len = file_descriptor_bytes.len() as u64;
         let file_descriptor_position = self.writer.tell().await? as u64;
@@ -365,6 +382,122 @@ impl FileWriter {
 
     pub fn path(&self) -> &str {
         &self.path
+    }
+}
+
+/// Utility trait for converting EncodedBatch to Bytes using the
+/// lance file format
+pub trait EncodedBatchWriteExt {
+    /// Serializes into a lance file, including the schema
+    fn try_to_self_described_lance(&self) -> Result<Bytes>;
+    /// Serializes into a lance file, without the schema.
+    ///
+    /// The schema must be provided to deserialize the buffer
+    fn try_to_mini_lance(&self) -> Result<Bytes>;
+}
+
+// Creates a lance footer and appends it to the encoded data
+//
+// The logic here is very similar to logic in the FileWriter except we
+// are using BufMut (put_xyz) instead of AsyncWrite (write_xyz).
+fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes> {
+    // Estimating 1MiB for file footer
+    let mut data = BytesMut::with_capacity(batch.data.len() + 1024 * 1024);
+    data.put(batch.data.clone());
+    // Write column metadata buffers
+    let column_metadata_buffers_start = data.len() as u64;
+    // write global buffers (we write the schema here)
+    let global_buffers_start = data.len() as u64;
+    let global_buffers = if write_schema {
+        let lance_schema = lance_core::datatypes::Schema::try_from(batch.schema.as_ref())?;
+        let descriptor = FileWriter::make_file_descriptor(&lance_schema, batch.num_rows)?;
+        let descriptor_bytes = descriptor.encode_to_vec();
+        let descriptor_len = descriptor_bytes.len() as u64;
+        data.put(descriptor_bytes.as_slice());
+
+        vec![(global_buffers_start, descriptor_len)]
+    } else {
+        vec![]
+    };
+    let col_metadata_start = data.len() as u64;
+
+    let mut col_metadata_positions = Vec::new();
+    // Write column metadata
+    for col in &batch.page_table {
+        let position = data.len() as u64;
+        let pages = col
+            .page_infos
+            .iter()
+            .map(|page_info| {
+                let encoded_encoding = Any::from_msg(&page_info.encoding)?.encode_to_vec();
+                let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
+                    .buffer_offsets_and_sizes
+                    .as_ref()
+                    .clone()
+                    .into_iter()
+                    .unzip();
+                Ok(pbfile::column_metadata::Page {
+                    buffer_offsets,
+                    buffer_sizes,
+                    encoding: Some(pbfile::Encoding {
+                        location: Some(pbfile::encoding::Location::Direct(DirectEncoding {
+                            encoding: encoded_encoding,
+                        })),
+                    }),
+                    length: page_info.num_rows,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
+            col.buffer_offsets_and_sizes.clone().into_iter().unzip();
+        let column = pbfile::ColumnMetadata {
+            pages,
+            buffer_offsets,
+            buffer_sizes,
+            encoding: Some(pbfile::Encoding {
+                location: Some(pbfile::encoding::Location::None(())),
+            }),
+        };
+        let column_bytes = column.encode_to_vec();
+        col_metadata_positions.push((position, data.len() as u64));
+        data.put(column_bytes.as_slice());
+    }
+    // Write column metadata offsets table
+    let cmo_table_start = data.len() as u64;
+    for (meta_pos, meta_len) in col_metadata_positions {
+        data.put_u64_le(meta_pos);
+        data.put_u64_le(meta_len);
+    }
+    // Write global buffers offsets table
+    let gbo_table_start = data.len() as u64;
+    let num_global_buffers = global_buffers.len() as u32;
+    for (gbo_pos, gbo_len) in global_buffers {
+        data.put_u64_le(gbo_pos);
+        data.put_u64_le(gbo_len);
+    }
+
+    // write the footer
+    data.put_u64_le(column_metadata_buffers_start);
+    data.put_u64_le(global_buffers_start);
+    data.put_u64_le(col_metadata_start);
+    data.put_u64_le(cmo_table_start);
+    data.put_u64_le(gbo_table_start);
+    data.put_u32_le(num_global_buffers);
+    data.put_u32_le(batch.page_table.len() as u32);
+    data.put_u16_le(MAJOR_VERSION as u16);
+    data.put_u16_le(MINOR_VERSION_NEXT);
+    data.put(MAGIC.as_slice());
+
+    Ok(data.freeze())
+}
+
+impl EncodedBatchWriteExt for EncodedBatch {
+    fn try_to_self_described_lance(&self) -> Result<Bytes> {
+        concat_lance_footer(self, true)
+    }
+
+    fn try_to_mini_lance(&self) -> Result<Bytes> {
+        concat_lance_footer(self, false)
     }
 }
 

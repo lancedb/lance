@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_array::{Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -16,7 +16,10 @@ use lance_datagen::{array, gen, RowCount, Seed};
 
 use crate::{
     decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, PageInfo},
-    encoder::{BatchEncoder, EncodedPage, FieldEncoder},
+    encoder::{
+        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodedPage, FieldEncoder,
+        FieldEncodingStrategy,
+    },
     encodings::logical::r#struct::SimpleStructDecoder,
     EncodingsIo,
 };
@@ -99,17 +102,20 @@ pub async fn check_round_trip_encoding_random(field: Field) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
+        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_config = HashMap::new();
         let encoder_factory = || {
-            let mut col_idx = 0;
-            let mut field_id_to_col_index = Vec::new();
-            BatchEncoder::get_encoder_for_field(
-                &lance_field,
-                page_size,
-                /*keep_original_array=*/ true,
-                &mut col_idx,
-                &mut field_id_to_col_index,
-            )
-            .unwrap()
+            let mut column_index_seq = ColumnIndexSequence::default();
+            encoding_strategy
+                .create_field_encoder(
+                    &encoding_strategy,
+                    &lance_field,
+                    &mut column_index_seq,
+                    page_size,
+                    true,
+                    &encoding_config,
+                )
+                .unwrap()
         };
         check_round_trip_field_encoding_random(encoder_factory, field.clone()).await
     }
@@ -174,16 +180,19 @@ pub async fn check_round_trip_encoding_of_data(data: Vec<Arc<dyn Array>>, test_c
     let field = Field::new("", example_data.data_type().clone(), true);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
-        let mut col_idx = 0;
-        let mut field_id_to_col_index = Vec::new();
-        let encoder = BatchEncoder::get_encoder_for_field(
-            &lance_field,
-            page_size,
-            /*keep_original=*/ true,
-            &mut col_idx,
-            &mut field_id_to_col_index,
-        )
-        .unwrap();
+        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_config = HashMap::new();
+        let mut column_index_seq = ColumnIndexSequence::default();
+        let encoder = encoding_strategy
+            .create_field_encoder(
+                &encoding_strategy,
+                &lance_field,
+                &mut column_index_seq,
+                page_size,
+                true,
+                &encoding_config,
+            )
+            .unwrap();
         check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases).await
     }
 }
