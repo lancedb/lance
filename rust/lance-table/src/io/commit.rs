@@ -381,7 +381,7 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
-        "gs" | "az" | "file" | "memory" => Ok(Arc::new(RenameCommitHandler)),
+        "gs" | "az" | "file" | "file-object-store" | "memory" => Ok(Arc::new(RenameCommitHandler)),
 
         unknow_scheme => {
             let err = lance_core::Error::from(object_store::Error::NotSupported {
