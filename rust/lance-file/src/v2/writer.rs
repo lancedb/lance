@@ -72,6 +72,17 @@ pub struct FileWriter {
     rows_written: u64,
 }
 
+fn initial_column_metadata() -> pbfile::ColumnMetadata {
+    pbfile::ColumnMetadata {
+        pages: Vec::new(),
+        buffer_offsets: Vec::new(),
+        buffer_sizes: Vec::new(),
+        encoding: Some(pbfile::Encoding {
+            location: Some(pbfile::encoding::Location::None(())),
+        }),
+    }
+}
+
 impl FileWriter {
     /// Create a new FileWriter
     pub fn try_new(
@@ -94,7 +105,7 @@ impl FileWriter {
         let num_columns = encoder.num_columns();
 
         let column_writers = encoder.field_encoders;
-        let column_metadata = vec![pbfile::ColumnMetadata::default(); num_columns as usize];
+        let column_metadata = vec![initial_column_metadata(); num_columns as usize];
 
         Ok(Self {
             writer: object_writer,
@@ -128,13 +139,13 @@ impl FileWriter {
                 self.writer.write_all(part).await?;
             }
         }
-        let encoded_encoding = Any::from_msg(&encoded_page.array.encoding)?;
+        let encoded_encoding = Any::from_msg(&encoded_page.array.encoding)?.encode_to_vec();
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
             encoding: Some(pbfile::Encoding {
-                style: Some(pbfile::encoding::Style::Direct(DirectEncoding {
-                    encoding: Some(encoded_encoding),
+                location: Some(pbfile::encoding::Location::Direct(DirectEncoding {
+                    encoding: encoded_encoding,
                 })),
             }),
             length: encoded_page.num_rows,
@@ -302,33 +313,32 @@ impl FileWriter {
             return Ok(0);
         }
 
-        // 2. write the column metadatas
+        // 2. write the column metadata buffers (coming soon)
+        // 3. write global buffers (we write the schema here)
+        let global_buffer_offsets = self.write_global_buffers().await?;
+        let num_global_buffers = global_buffer_offsets.len() as u32;
+
+        // 4. write the column metadatas
         let column_metadata_start = self.writer.tell().await? as u64;
         let metadata_positions = self.write_column_metadatas().await?;
 
-        // 3. write the column metadata position table
+        // 5. write the column metadata offset table
         let cmo_table_start = self.writer.tell().await? as u64;
         for (meta_pos, meta_len) in metadata_positions {
             self.writer.write_u64_le(meta_pos).await?;
             self.writer.write_u64_le(meta_len).await?;
         }
 
-        // 3. write global buffers (we write the schema here)
-        let global_buffers_start = self.writer.tell().await? as u64;
-        let global_buffer_offsets = self.write_global_buffers().await?;
-        let num_global_buffers = global_buffer_offsets.len() as u32;
-
-        // write global buffers offset table
+        // 6. write global buffers offset table
         let gbo_table_start = self.writer.tell().await? as u64;
         for (gbo_pos, gbo_len) in global_buffer_offsets {
             self.writer.write_u64_le(gbo_pos).await?;
             self.writer.write_u64_le(gbo_len).await?;
         }
 
-        // 6. write the footer
+        // 7. write the footer
         self.writer.write_u64_le(column_metadata_start).await?;
         self.writer.write_u64_le(cmo_table_start).await?;
-        self.writer.write_u64_le(global_buffers_start).await?;
         self.writer.write_u64_le(gbo_table_start).await?;
         self.writer.write_u32_le(num_global_buffers).await?;
         self.writer.write_u32_le(self.num_columns).await?;
