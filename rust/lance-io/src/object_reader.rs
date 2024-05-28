@@ -9,6 +9,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use lance_core::Result;
 use object_store::{path::Path, ObjectStore};
+use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::traits::Reader;
@@ -22,16 +23,24 @@ pub struct CloudObjectReader {
     pub object_store: Arc<dyn ObjectStore>,
     // File path
     pub path: Path,
+    // File size, if known.
+    size: OnceCell<usize>,
 
     block_size: usize,
 }
 
 impl CloudObjectReader {
     /// Create an ObjectReader from URI
-    pub fn new(object_store: Arc<dyn ObjectStore>, path: Path, block_size: usize) -> Result<Self> {
+    pub fn new(
+        object_store: Arc<dyn ObjectStore>,
+        path: Path,
+        block_size: usize,
+        known_size: Option<usize>,
+    ) -> Result<Self> {
         Ok(Self {
             object_store,
             path,
+            size: OnceCell::new_with(known_size),
             block_size,
         })
     }
@@ -70,10 +79,15 @@ impl Reader for CloudObjectReader {
 
     /// Object/File Size.
     async fn size(&self) -> object_store::Result<usize> {
-        let meta = self
-            .do_with_retry(|| self.object_store.head(&self.path))
-            .await?;
-        Ok(meta.size)
+        self.size
+            .get_or_try_init(|| async move {
+                let meta = self
+                    .do_with_retry(|| self.object_store.head(&self.path))
+                    .await?;
+                Ok(meta.size)
+            })
+            .await
+            .cloned()
     }
 
     #[instrument(level = "debug", skip(self))]

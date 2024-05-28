@@ -189,7 +189,7 @@ impl FileReader {
 
             let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
                 // We have not read the metadata bytes yet.
-                read_struct(object_reader, metadata_pos, Some(file_size)).await?
+                read_struct(object_reader, metadata_pos).await?
             } else {
                 let offset = tail_bytes.len() - (file_size - metadata_pos);
                 read_struct_from_buf(&tail_bytes.slice(offset..))?

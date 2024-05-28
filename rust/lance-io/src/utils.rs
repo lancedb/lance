@@ -80,16 +80,8 @@ pub async fn read_fixed_stride_array(
 ///
 /// We write protobuf by first writing the length of the message as a u32,
 /// followed by the message itself.
-pub async fn read_message<M: Message + Default>(
-    reader: &dyn Reader,
-    pos: usize,
-    file_size: Option<usize>,
-) -> Result<M> {
-    let file_size = if let Some(file_size) = file_size {
-        file_size
-    } else {
-        reader.size().await?
-    };
+pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
+    let file_size = reader.size().await?;
     if pos > file_size {
         return Err(Error::io("file size is too small".to_string(), location!()));
     }
@@ -118,21 +110,13 @@ pub async fn read_struct<
 >(
     reader: &dyn Reader,
     pos: usize,
-    file_size: Option<usize>,
 ) -> Result<T> {
-    let msg = read_message::<M>(reader, pos, file_size).await?;
+    let msg = read_message::<M>(reader, pos).await?;
     T::try_from(msg)
 }
 
-pub async fn read_last_block(
-    reader: &dyn Reader,
-    size: Option<u64>,
-) -> object_store::Result<Bytes> {
-    let file_size = if let Some(size) = size {
-        size as usize
-    } else {
-        reader.size().await?
-    };
+pub async fn read_last_block(reader: &dyn Reader) -> object_store::Result<Bytes> {
+    let file_size = reader.size().await?;
     let block_size = reader.block_size();
     let begin = if file_size < block_size {
         0
@@ -243,8 +227,8 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let object_reader = CloudObjectReader::new(Arc::new(store), path, 1024).unwrap();
-        let actual: BytesWrapper = read_struct(&object_reader, pos, None).await.unwrap();
+        let object_reader = CloudObjectReader::new(Arc::new(store), path, 1024, None).unwrap();
+        let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(some_message, actual);
     }
 }

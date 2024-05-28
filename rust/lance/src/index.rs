@@ -130,11 +130,11 @@ impl IndexInformationProvider for ScalarIndexInfo {
 
 async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     let file_size = reader.size().await?;
-    let tail_bytes = read_last_block(reader, Some(file_size as u64)).await?;
+    let tail_bytes = read_last_block(reader).await?;
     let metadata_pos = read_metadata_offset(&tail_bytes)?;
     let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
         // We have not read the metadata bytes yet.
-        read_message(reader, metadata_pos, Some(file_size)).await?
+        read_message(reader, metadata_pos).await?
     } else {
         let offset = tail_bytes.len() - (file_size - metadata_pos);
         read_message_from_buf(&tail_bytes.slice(offset..))?
@@ -512,7 +512,7 @@ impl DatasetIndexInternalExt for Dataset {
         let index_file = index_dir.child(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
 
-        let tailing_bytes = read_last_block(reader.as_ref(), None).await?;
+        let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
 
         // the index file is in lance format since version (0,2)

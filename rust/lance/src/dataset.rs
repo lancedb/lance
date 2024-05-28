@@ -295,45 +295,46 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
     ) -> Result<Self> {
-        let object_reader =
+        let object_reader = if let Some(size) = manifest_location.size {
             object_store
-                .open(&manifest_location.path)
+                .open_with_size(&manifest_location.path, size as usize)
                 .await
-                .map_err(|e| match &e {
-                    Error::NotFound { uri, .. } => Error::DatasetNotFound {
-                        path: uri.clone(),
-                        source: box_error(e),
+        } else {
+            object_store.open(&manifest_location.path).await
+        };
+        let object_reader = object_reader.map_err(|e| match &e {
+            Error::NotFound { uri, .. } => Error::DatasetNotFound {
+                path: uri.clone(),
+                source: box_error(e),
+                location: location!(),
+            },
+            _ => e,
+        })?;
+
+        let last_block =
+            read_last_block(object_reader.as_ref())
+                .await
+                .map_err(|err| match err {
+                    object_store::Error::NotFound { path, source } => Error::DatasetNotFound {
+                        path,
+                        source,
                         location: location!(),
                     },
-                    _ => e,
+                    _ => Error::IO {
+                        source: err.into(),
+                        location: location!(),
+                    },
                 })?;
-        let manifest_size = if let Some(size) = manifest_location.size {
-            size
-        } else {
-            object_reader.size().await? as u64
-        };
-        let last_block = read_last_block(object_reader.as_ref(), Some(manifest_size))
-            .await
-            .map_err(|err| match err {
-                object_store::Error::NotFound { path, source } => Error::DatasetNotFound {
-                    path,
-                    source,
-                    location: location!(),
-                },
-                _ => Error::IO {
-                    source: err.into(),
-                    location: location!(),
-                },
-            })?;
         let offset = read_metadata_offset(&last_block)?;
 
         // If manifest is in the last block, we can decode directly from memory.
-        let mut manifest = if manifest_size - (offset as u64) <= (last_block.len() as u64) {
+        let manifest_size = object_reader.size().await?;
+        let mut manifest = if manifest_size - offset <= last_block.len() {
             let message_len = LittleEndian::read_u32(&last_block[offset..offset + 4]) as usize;
             let message_data = &last_block[offset + 4..offset + 4 + message_len];
             Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)?
         } else {
-            read_struct(object_reader.as_ref(), offset, Some(manifest_size as usize)).await?
+            read_struct(object_reader.as_ref(), offset).await?
         };
 
         if !can_read_dataset(manifest.reader_feature_flags) {

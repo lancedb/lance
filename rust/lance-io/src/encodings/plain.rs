@@ -581,7 +581,7 @@ mod tests {
             writer.flush().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         assert!(reader.size().await.unwrap() > 0);
@@ -705,7 +705,7 @@ mod tests {
             writer.flush().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 2048)
+        let reader = LocalObjectReader::open_local_path(&path, 2048, None)
             .await
             .unwrap();
         assert!(reader.size().await.unwrap() > 0);
@@ -753,7 +753,7 @@ mod tests {
             writer.shutdown().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 2048)
+        let reader = LocalObjectReader::open_local_path(&path, 2048, None)
             .await
             .unwrap();
         assert!(reader.size().await.unwrap() > 0);

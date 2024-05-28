@@ -456,7 +456,7 @@ impl SelfDescribingFileReader for FileReader {
             ),
             location: location!(),
         })?;
-        let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position, None).await?;
+        let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
         populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         let schema = manifest.schema;
         let max_field_id = schema.max_field_id().unwrap_or_default();

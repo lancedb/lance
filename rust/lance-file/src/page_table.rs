@@ -215,7 +215,7 @@ mod tests {
             .unwrap();
         writer.shutdown().await.unwrap();
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let actual = PageTable::load(
@@ -284,7 +284,7 @@ mod tests {
         let mut writer = tokio::fs::File::create(&path).await.unwrap();
         let res = page_table.write(&mut writer, 0).await.unwrap();
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
 

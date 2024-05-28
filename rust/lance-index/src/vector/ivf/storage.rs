@@ -70,7 +70,6 @@ impl IvfData {
         let pb: PbIvf = read_message(
             reader.object_reader.as_ref(),
             ivf_metadata.pb_position as usize,
-            None,
         )
         .await?;
         Self::try_from(pb)

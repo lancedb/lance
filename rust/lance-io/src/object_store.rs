@@ -440,11 +440,29 @@ impl ObjectStore {
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size).await,
+            "file" => LocalObjectReader::open(path, self.block_size, None).await,
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
+                None,
+            )?)),
+        }
+    }
+
+    /// Open a reader for a file with known size.
+    ///
+    /// This size may either have been retrieved from a list operation or
+    /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
+    /// call.
+    pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+        match self.scheme.as_str() {
+            "file" => LocalObjectReader::open(path, self.block_size, Some(known_size)).await,
+            _ => Ok(Box::new(CloudObjectReader::new(
+                self.inner.clone(),
+                path.clone(),
+                self.block_size,
+                Some(known_size),
             )?)),
         }
     }
