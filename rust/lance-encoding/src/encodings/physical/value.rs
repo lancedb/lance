@@ -2,29 +2,25 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::ArrayRef;
-use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
-use lance_arrow::DataTypeExt;
 use log::trace;
 use snafu::{location, Location};
 use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+use crate::encoder::BufferEncodingStrategy;
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
-    encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer, EncodedBuffer},
+    encoder::{ArrayEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
 };
 
 use lance_core::{Error, Result};
 
-use super::bitpack::{num_compressed_bits, BitpackingBufferEncoder};
-use super::buffers::{
-    BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder, GeneralBufferCompressor,
-};
+use super::buffers::GeneralBufferCompressor;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompressionScheme {
@@ -249,79 +245,14 @@ impl PhysicalPageDecoder for ValuePageDecoder {
 
 #[derive(Debug)]
 pub struct ValueEncoder {
-    compression_scheme: CompressionScheme,
-    flat_buffer_encoder: Box<dyn BufferEncoder>,
-    bitpack_buffer_encoder: Option<BitpackingBufferEncoder>,
+    buffer_encoding_strategy: Arc<dyn BufferEncodingStrategy>,
 }
 
 impl ValueEncoder {
-    pub fn try_new(data_type: &DataType, compression_scheme: CompressionScheme) -> Result<Self> {
-        if *data_type == DataType::Boolean {
-            Ok(Self {
-                flat_buffer_encoder: Box::<BitmapBufferEncoder>::default(),
-                bitpack_buffer_encoder: None,
-                compression_scheme,
-            })
-        } else if data_type.is_fixed_stride() {
-            Ok(Self {
-                flat_buffer_encoder: if compression_scheme != CompressionScheme::None {
-                    Box::<CompressedBufferEncoder>::default()
-                } else {
-                    Box::<FlatBufferEncoder>::default()
-                },
-                bitpack_buffer_encoder: Some(BitpackingBufferEncoder::default()),
-                compression_scheme,
-            })
-        } else {
-            Err(Error::invalid_input(
-                format!("Cannot use ValueEncoder to encode {}", data_type),
-                location!(),
-            ))
-        }
-    }
-
-    pub fn try_bitpack_encode(
-        &self,
-        arrays: &[ArrayRef],
-        buffer_index: u32,
-    ) -> Result<Option<(pb::array_encoding::ArrayEncoding, EncodedBuffer)>> {
-        if self.bitpack_buffer_encoder.is_none() {
-            return Ok(None);
-        }
-
-        // calculate the number of bits to compress array items into
-        let mut num_bits = 0;
-        for arr in arrays {
-            match num_compressed_bits(arr.clone()) {
-                Some(arr_max) => num_bits = num_bits.max(arr_max),
-                None => return Ok(None),
-            }
-        }
-
-        // check that the number of bits in the compressed array is less than the
-        // number of bits in the native type. Otherwise there's no point to bitpacking
-        let data_type = arrays[0].data_type();
-        let native_num_bits = 8 * data_type.byte_width() as u64;
-        if num_bits >= native_num_bits {
-            return Ok(None);
-        }
-
-        let encoded_buffer = self
-            .bitpack_buffer_encoder
-            .as_ref()
-            .unwrap()
-            .encode(arrays)?;
-
-        let encoding = pb::array_encoding::ArrayEncoding::Bitpacked(pb::Bitpacked {
-            compressed_bits_per_value: num_bits,
-            uncompressed_bits_per_value: native_num_bits,
-            buffer: Some(pb::Buffer {
-                buffer_index,
-                buffer_type: pb::buffer::BufferType::Page as i32,
-            }),
-        });
-
-        Ok(Some((encoding, encoded_buffer)))
+    pub fn try_new(buffer_encoding_strategy: Arc<dyn BufferEncodingStrategy>) -> Result<Self> {
+        Ok(Self {
+            buffer_encoding_strategy,
+        })
     }
 }
 
@@ -330,47 +261,46 @@ impl ArrayEncoder for ValueEncoder {
         let index = *buffer_index;
         *buffer_index += 1;
 
-        let bitpack_encoding = self.try_bitpack_encode(arrays, index)?;
-        let (array_encoding, encoded_buffer) = match bitpack_encoding {
-            Some((array_encoding, encoded_buffer)) => (array_encoding, encoded_buffer),
-            None => {
-                let data_type = arrays[0].data_type();
-                let bits_per_value = match data_type {
-                    DataType::Boolean => 1,
-                    _ => 8 * data_type.byte_width() as u64,
-                };
+        let buffer_encoder = self
+            .buffer_encoding_strategy
+            .create_buffer_encoder(arrays)?;
+        let encoded_buffer = buffer_encoder.encode(arrays)?;
 
-                let encoded_buffer = self.flat_buffer_encoder.encode(arrays)?;
-                let array_encoding = pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
-                    bits_per_value,
+        let array_encoding =
+            if let Some(bitpacked_bits_per_value) = encoded_buffer.bitpacked_bits_per_value {
+                pb::array_encoding::ArrayEncoding::Bitpacked(pb::Bitpacked {
+                    compressed_bits_per_value: bitpacked_bits_per_value,
+                    uncompressed_bits_per_value: encoded_buffer.bits_per_value,
                     buffer: Some(pb::Buffer {
                         buffer_index: index,
                         buffer_type: pb::buffer::BufferType::Page as i32,
                     }),
-                    compression: if self.compression_scheme != CompressionScheme::None {
-                        Some(pb::Compression {
-                            scheme: self.compression_scheme.to_string(),
-                        })
-                    } else {
-                        None
-                    },
-                });
-
-                (array_encoding, encoded_buffer)
-            }
-        };
+                })
+            } else {
+                pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
+                    bits_per_value: encoded_buffer.bits_per_value,
+                    buffer: Some(pb::Buffer {
+                        buffer_index: index,
+                        buffer_type: pb::buffer::BufferType::Page as i32,
+                    }),
+                    compression: encoded_buffer.compression_scheme.map(|compression_scheme| {
+                        pb::Compression {
+                            scheme: compression_scheme.to_string(),
+                        }
+                    }),
+                })
+            };
 
         let array_bufs = vec![EncodedArrayBuffer {
             parts: encoded_buffer.parts,
             index,
         }];
-        let flat_encoding = pb::ArrayEncoding {
-            array_encoding: Some(array_encoding),
-        };
 
         Ok(EncodedArray {
             buffers: array_bufs,
-            encoding: flat_encoding,
+            encoding: pb::ArrayEncoding {
+                array_encoding: Some(array_encoding),
+            },
         })
     }
 }
@@ -391,10 +321,11 @@ pub(crate) mod tests {
     use arrow_schema::{DataType, Field, TimeUnit};
     use rand::distributions::Uniform;
 
+    use lance_arrow::DataTypeExt;
     use lance_datagen::{array::rand_with_distribution, ArrayGenerator};
 
     use crate::{
-        encoder::ArrayEncoder,
+        encoder::{ArrayEncoder, CoreBufferEncodingStrategy},
         testing::{
             check_round_trip_encoding_generated, check_round_trip_encoding_random,
             ArrayGeneratorProvider,
@@ -463,7 +394,10 @@ pub(crate) mod tests {
         for (data_type, arr, bits_per_value) in test_cases {
             let arrs = vec![arr.clone() as _];
             let mut buffed_index = 1;
-            let encoder = ValueEncoder::try_new(&data_type, CompressionScheme::None).unwrap();
+            let encoder = ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
+                compression_scheme: CompressionScheme::None,
+            }))
+            .unwrap();
             let result = encoder.encode(&arrs, &mut buffed_index).unwrap();
             let array_encoding = result.encoding.array_encoding.unwrap();
 
@@ -525,7 +459,10 @@ pub(crate) mod tests {
         for (data_type, arr) in test_cases {
             let arrs = vec![arr.clone() as _];
             let mut buffed_index = 1;
-            let encoder = ValueEncoder::try_new(&data_type, CompressionScheme::None).unwrap();
+            let encoder = ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
+                compression_scheme: CompressionScheme::None,
+            }))
+            .unwrap();
             let result = encoder.encode(&arrs, &mut buffed_index).unwrap();
             let array_encoding = result.encoding.array_encoding.unwrap();
 

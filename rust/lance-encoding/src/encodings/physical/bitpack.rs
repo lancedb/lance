@@ -66,8 +66,12 @@ impl BufferEncoder for BitpackingBufferEncoder {
             packed_arrays.push(packed.into());
         }
 
+        let data_type = arrays[0].data_type();
         Ok(EncodedBuffer {
             parts: packed_arrays,
+            bits_per_value: (data_type.byte_width() * 8) as u64,
+            bitpacked_bits_per_value: Some(num_bits),
+            compression_scheme: None,
         })
     }
 }

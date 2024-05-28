@@ -23,7 +23,10 @@ use crate::{
         DecodeArrayTask, DecoderMessage, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask,
         SchedulerContext,
     },
-    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
+    encoder::{
+        ArrayEncoder, CoreBufferEncodingStrategy, EncodeTask, EncodedArray, EncodedPage,
+        FieldEncoder,
+    },
     encodings::{
         logical::r#struct::SimpleStructScheduler,
         physical::{
@@ -678,7 +681,10 @@ impl ListOffsetsEncoder {
                 keep_original_array,
             ),
             inner_encoder: Arc::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(&DataType::Int64, CompressionScheme::None).unwrap(),
+                ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
+                    compression_scheme: CompressionScheme::None,
+                }))
+                .unwrap(),
             ))),
             column_index,
         }
