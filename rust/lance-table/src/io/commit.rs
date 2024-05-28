@@ -22,6 +22,7 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
+use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::{fmt::Debug, fs::DirEntry};
@@ -177,9 +178,11 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
     }
 
     if let Some((version, entry)) = latest_entry {
+        let path = Path::from_filesystem_path(entry.path())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
         Ok(Some(ManifestLocation {
             version,
-            path: entry.path().to_string_lossy().as_ref().into(),
+            path,
             size: Some(entry.metadata()?.len()),
         }))
     } else {
