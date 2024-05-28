@@ -10,7 +10,6 @@ A `Lance Dataset` is organized in a directory.
 
     /path/to/dataset:
         data/*.lance  -- Data directory
-        latest.manifest -- The manifest file for the latest version.
         _versions/*.manifest -- Manifest file for each dataset version.
         _indices/{UUID-*}/index.idx -- Secondary index, each index per directory.
         _deletions/*.{arrow,bin} -- Deletion files, which contain ids of rows
@@ -249,8 +248,7 @@ Committing Datasets
 -------------------
 
 A new version of a dataset is committed by writing a new manifest file to the
-``_versions`` directory. Only after successfully committing this file should
-the ``_latest.manifest`` file be updated.
+``_versions`` directory.
 
 To prevent concurrent writers from overwriting each other, the commit process
 must be atomic and consistent for all writers. If two writers try to commit
@@ -287,7 +285,6 @@ The commit process is as follows:
     conflicts, abort the commit. Otherwise, continue.
  4. Build a manifest and attempt to commit it to the next version. If the commit
     fails because another writer has already committed, go back to step 3.
- 5. If the commit succeeds, update the ``_latest.manifest`` file.
 
 When checking whether two transactions conflict, be conservative. If the
 transaction file is missing, assume it conflicts. If the transaction file 
