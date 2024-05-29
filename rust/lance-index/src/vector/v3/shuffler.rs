@@ -19,7 +19,6 @@ use lance_io::{
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
 };
 use object_store::path::Path;
-use snafu::{location, Location};
 
 use crate::vector::PART_ID_COLUMN;
 
