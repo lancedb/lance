@@ -353,6 +353,7 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
+        self.record_read(0);
         self.target.head(location).await
     }
 
@@ -368,10 +369,12 @@ impl ObjectStore for IoTrackingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+        self.record_read(0);
         self.target.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.record_read(0);
         self.target.list_with_delimiter(prefix).await
     }
 

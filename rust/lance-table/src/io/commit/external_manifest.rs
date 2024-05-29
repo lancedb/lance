@@ -9,22 +9,22 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStoreExt;
+use lance_io::object_store::{ObjectStore, ObjectStoreExt};
 use log::warn;
-use object_store::{path::Path, ObjectStore};
+use object_store::{path::Path, ObjectStore as OSObjectStore};
 use snafu::{location, Location};
 
 use super::{
     current_manifest_path, make_staging_manifest_path, manifest_path, write_latest_manifest,
-    MANIFEST_EXTENSION,
+    ManifestLocation, MANIFEST_EXTENSION,
 };
 use crate::format::{Index, Manifest};
-use crate::io::commit::{parse_version_from_path, CommitError, CommitHandler, ManifestWriter};
+use crate::io::commit::{CommitError, CommitHandler, ManifestWriter};
 
 /// External manifest store
 ///
 /// This trait abstracts an external storage for source of truth for manifests.
-/// The storge is expected to remember (uri, version) -> manifest_path
+/// The storage is expected to remember (uri, version) -> manifest_path
 /// and able to run transactions on the manifest_path.
 ///
 /// This trait is called an **External** manifest store because the store is
@@ -43,6 +43,24 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     /// the version and the store should not customize it.
     async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>>;
 
+    /// Get the latest manifest location for a given base_uri.
+    ///
+    /// By default, this calls get_latest_version.  Impls should
+    /// override this method if they store both the location and size
+    /// of the latest manifest.
+    async fn get_latest_manifest_location(
+        &self,
+        base_uri: &str,
+    ) -> Result<Option<ManifestLocation>> {
+        self.get_latest_version(base_uri).await.map(|res| {
+            res.map(|(version, uri)| ManifestLocation {
+                version,
+                path: Path::from(uri),
+                size: None,
+            })
+        })
+    }
+
     /// Put the manifest path for a given base_uri and version, should fail if the version already exists
     async fn put_if_not_exists(&self, base_uri: &str, version: u64, path: &str) -> Result<()>;
 
@@ -60,11 +78,26 @@ pub struct ExternalManifestCommitHandler {
 
 #[async_trait]
 impl CommitHandler for ExternalManifestCommitHandler {
+    async fn resolve_latest_location(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> std::result::Result<ManifestLocation, Error> {
+        let path = self.resolve_latest_version(base_path, object_store).await?;
+        Ok(ManifestLocation {
+            version: self
+                .resolve_latest_version_id(base_path, object_store)
+                .await?,
+            path,
+            size: None,
+        })
+    }
+
     /// Get the latest version of a dataset at the path
     async fn resolve_latest_version(
         &self,
         base_path: &Path,
-        object_store: &dyn ObjectStore,
+        object_store: &ObjectStore,
     ) -> std::result::Result<Path, Error> {
         let version = self
             .external_manifest_store
@@ -87,11 +120,13 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 // TODO: remove copy-rename once we upgrade object_store crate
                 object_store.copy(&manifest_path, &staging).await?;
                 object_store
+                    .inner
                     .rename(&staging, &object_store_manifest_path)
                     .await?;
 
                 // step 2: write _latest.manifest
-                write_latest_manifest(&manifest_path, base_path, object_store).await?;
+                write_latest_manifest(&manifest_path, base_path, object_store.inner.as_ref())
+                    .await?;
 
                 // step 3: update external store to finalize path
                 self.external_manifest_store
@@ -106,14 +141,14 @@ impl CommitHandler for ExternalManifestCommitHandler {
             }
             // Dataset not found in the external store, this could be because the dataset did not
             // use external store for commit before. In this case, we search for the latest manifest
-            None => current_manifest_path(object_store, base_path).await,
+            None => Ok(current_manifest_path(object_store, base_path).await?.path),
         }
     }
 
     async fn resolve_latest_version_id(
         &self,
         base_path: &Path,
-        object_store: &dyn ObjectStore,
+        object_store: &ObjectStore,
     ) -> std::result::Result<u64, Error> {
         let version = self
             .external_manifest_store
@@ -122,7 +157,9 @@ impl CommitHandler for ExternalManifestCommitHandler {
 
         match version {
             Some((version, _)) => Ok(version),
-            None => parse_version_from_path(&current_manifest_path(object_store, base_path).await?),
+            None => Ok(current_manifest_path(object_store, base_path)
+                .await?
+                .version),
         }
     }
 
@@ -130,7 +167,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         version: u64,
-        object_store: &dyn ObjectStore,
+        object_store: &dyn OSObjectStore,
     ) -> std::result::Result<Path, Error> {
         let path_res = self
             .external_manifest_store

@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
+use lance_table::io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation};
 use object_store::{aws::AwsCredentialProvider, DynObjectStore};
 use snafu::{location, Location};
 use tracing::instrument;
@@ -213,15 +213,20 @@ impl DatasetBuilder {
         let version = self.version;
 
         let (object_store, commit_handler) = self.build_object_store().await?;
-        let base_path = object_store.base_path();
+        let base_path = object_store.base_path().clone();
         let manifest = match version {
             Some(version) => {
-                commit_handler
-                    .resolve_version(base_path, version, &object_store.inner)
-                    .await?
+                let path = commit_handler
+                    .resolve_version(&base_path, version, &object_store.inner)
+                    .await?;
+                ManifestLocation {
+                    version,
+                    path,
+                    size: None,
+                }
             }
             None => commit_handler
-                .resolve_latest_version(base_path, &object_store.inner)
+                .resolve_latest_location(&base_path, &object_store)
                 .await
                 .map_err(|e| Error::DatasetNotFound {
                     path: base_path.to_string(),
@@ -231,7 +236,7 @@ impl DatasetBuilder {
         };
 
         Dataset::checkout_manifest(
-            Arc::new(object_store.clone()),
+            Arc::new(object_store),
             base_path.clone(),
             &manifest,
             session,

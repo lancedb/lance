@@ -139,7 +139,7 @@ mod test {
         let make_idx = move |assert_query: Vec<f32>, metric: MetricType| async move {
             let f = tempfile::NamedTempFile::new().unwrap();
 
-            let reader = LocalObjectReader::open_local_path(f.path(), 64)
+            let reader = LocalObjectReader::open_local_path(f.path(), 64, None)
                 .await
                 .unwrap();
 
