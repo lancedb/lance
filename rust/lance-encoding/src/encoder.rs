@@ -461,16 +461,16 @@ pub async fn encode_batch(
                 let size = data_buffer.len() as u64 - buffer_offset;
                 buffer_offsets_and_sizes.push((buffer_offset, size));
             }
-            pages.push(Arc::new(PageInfo {
+            pages.push(PageInfo {
                 buffer_offsets_and_sizes: Arc::new(buffer_offsets_and_sizes),
                 encoding: encoded_page.array.encoding,
                 num_rows: encoded_page.num_rows,
-            }))
+            })
         }
         page_table.push(ColumnInfo {
             index: 0,
             buffer_offsets_and_sizes: vec![],
-            page_infos: pages,
+            page_infos: Arc::new(pages),
         })
     }
     Ok(EncodedBatch {

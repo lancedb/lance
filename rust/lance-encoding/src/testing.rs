@@ -205,7 +205,8 @@ async fn check_round_trip_encoding_inner(
     test_cases: &TestCases,
 ) {
     let mut all_encoded_pages = Vec::new();
-    let mut page_infos: Vec<Vec<Arc<PageInfo>>> = vec![Vec::new(); encoder.num_columns() as usize];
+    let mut page_infos: Vec<Vec<PageInfo>> = Vec::with_capacity(encoder.num_columns() as usize);
+    page_infos.resize_with(encoder.num_columns() as usize, Default::default);
     let mut buffer_offset = 0;
 
     let mut simulate_write = |mut encoded_page: EncodedPage| {
@@ -231,7 +232,7 @@ async fn check_round_trip_encoding_inner(
 
         let col_idx = encoded_page.column_idx as usize;
         all_encoded_pages.push(encoded_page);
-        page_infos[col_idx].push(Arc::new(page_info));
+        page_infos[col_idx].push(page_info);
     };
 
     for arr in &data {
@@ -251,7 +252,9 @@ async fn check_round_trip_encoding_inner(
     let column_infos = page_infos
         .into_iter()
         .enumerate()
-        .map(|(col_idx, page_infos)| ColumnInfo::new(col_idx as u32, page_infos, Vec::new()))
+        .map(|(col_idx, page_infos)| {
+            ColumnInfo::new(col_idx as u32, Arc::new(page_infos), Vec::new())
+        })
         .collect::<Vec<_>>();
     let schema = Schema::new(vec![field.clone()]);
 
@@ -278,12 +281,8 @@ async fn check_round_trip_encoding_inner(
                 .new_root_decoder_ranges(&[0..num_rows]);
             (
                 root_decoder,
-                async move {
-                    decode_scheduler
-                        .schedule_range(0..num_rows, tx, scheduler_copy)
-                        .await
-                }
-                .boxed(),
+                async move { decode_scheduler.schedule_range(0..num_rows, tx, scheduler_copy) }
+                    .boxed(),
             )
         },
     )
@@ -311,8 +310,7 @@ async fn check_round_trip_encoding_inner(
                     .new_root_decoder_ranges(&[0..num_rows]);
                 (
                     root_decoder,
-                    async move { decode_scheduler.schedule_range(range, tx, scheduler).await }
-                        .boxed(),
+                    async move { decode_scheduler.schedule_range(range, tx, scheduler) }.boxed(),
                 )
             },
         )
@@ -350,12 +348,7 @@ async fn check_round_trip_encoding_inner(
                     .new_root_decoder_indices(&indices);
                 (
                     root_decoder,
-                    async move {
-                        decode_scheduler
-                            .schedule_take(&indices, tx, scheduler)
-                            .await
-                    }
-                    .boxed(),
+                    async move { decode_scheduler.schedule_take(&indices, tx, scheduler) }.boxed(),
                 )
             },
         )
