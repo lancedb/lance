@@ -114,7 +114,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
         debug_assert!(self.range_idx < self.ranges.len());
         // Get our current range
         let mut range = self.ranges[self.range_idx].clone();
-        range.start = range.start + self.range_offset;
+        range.start += self.range_offset;
 
         let mut cur_page = &self.scheduler.page_schedulers[self.page_idx];
         trace!(

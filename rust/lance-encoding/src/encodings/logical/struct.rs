@@ -120,7 +120,7 @@ impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
         while old_rows_scheduled == self.rows_scheduled {
             let mut next_child = self.children.pop().unwrap();
             trace!("Scheduling more rows for child {}", next_child.col_idx);
-            let scoped = context.push(&next_child.col_name, next_child.col_idx);
+            let scoped = context.push(next_child.col_name, next_child.col_idx);
             let child_scan = next_child
                 .job
                 .schedule_next(scoped.context, top_level_row)?;
