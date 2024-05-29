@@ -44,6 +44,10 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>>;
 
     /// Get the latest manifest location for a given base_uri.
+    ///
+    /// By default, this calls get_latest_version.  Impls should
+    /// override this method if they store both the location and size
+    /// of the latest manifest.
     async fn get_latest_manifest_location(
         &self,
         base_uri: &str,
