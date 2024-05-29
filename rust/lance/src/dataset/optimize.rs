@@ -1371,8 +1371,9 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_compact_distributed() {
+    async fn test_compact_distributed(#[values(false, true)] use_stable_row_id: bool) {
         // Can run the tasks independently
         // Can provide subset of tasks to commit_compaction
         // Once committed, can't commit remaining tasks
@@ -1385,6 +1386,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
+            enable_experimental_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1426,16 +1428,34 @@ mod tests {
         )
         .await
         .unwrap();
-        // 1 commit for each task's reserve fragments plus 1 for
-        // the call to commit_compaction
-        assert_eq!(dataset.manifest.version, 5);
+
+        if use_stable_row_id {
+            // 1 commit for reserve fragments and 1 for final commit, both
+            // from the call to commit_compaction
+            assert_eq!(dataset.manifest.version, 3);
+        } else {
+            // 1 commit for each task's reserve fragments plus 1 for
+            // the call to commit_compaction
+            assert_eq!(dataset.manifest.version, 5);
+        }
 
         // Can commit the remaining tasks
         commit_compaction(&mut dataset, results, Arc::new(IgnoreRemap::default()))
             .await
             .unwrap();
-        // The reserve fragments call already happened for this task
-        // and so we just see the bump from the commit_compaction
-        assert_eq!(dataset.manifest.version, 6);
+        if use_stable_row_id {
+            // 1 commit for reserve fragments and 1 for final commit, both
+            // from the call to commit_compaction
+            assert_eq!(dataset.manifest.version, 5);
+        } else {
+            // The reserve fragments call already happened for this task
+            // and so we just see the bump from the commit_compaction
+            assert_eq!(dataset.manifest.version, 6);
+        }
+
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_ROW_IDS > 0,
+            use_stable_row_id,
+        );
     }
 }
