@@ -10,13 +10,13 @@
     <packaging>pom</packaging>
 
     <name>Lance Parent</name>
-    <description>LanceDB Java API</description>
+    <description>Lance Format Java API</description>
     <url>http://lancedb.com/</url>
 
     <developers>
         <developer>
-            <name>Rong Rong</name>
-            <email>rong@apache.org</email>
+            <name>Lance DB Dev Group</name>
+            <email>dev@lancedb.com</email>
         </developer>
     </developers>
     <licenses>
