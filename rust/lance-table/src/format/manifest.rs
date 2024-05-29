@@ -129,7 +129,7 @@ impl Manifest {
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             fragment_offsets,
-            next_row_id: previous.next_row_id, // How is this updated?
+            next_row_id: previous.next_row_id,
         }
     }
 

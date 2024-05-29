@@ -424,7 +424,7 @@ row id
 row address
   The current location of a row in the table. This is a u64 that can be thought
   of as a pair of two u32 values: the fragment id and the local row offset. For
-  example, if the row address is (42, 9), then the row is in the 42nd fragment
+  example, if the row address is (42, 9), then the row is in the 42rd fragment
   and is the 10th row in that fragment.
 
 row id sequence
