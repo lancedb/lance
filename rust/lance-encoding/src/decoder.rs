@@ -50,7 +50,8 @@
 //!
 //! Typically, a "logical encoding" will have both a logical decoder and a field scheduler.
 //! Meanwhile, a "physical encoding" will have a physical decoder but no corresponding field
-//! scheduler.
+//! scheduler.git add --all
+//!
 //!
 //! # General notes
 //!
@@ -530,7 +531,7 @@ impl DecodeBatchScheduler {
         &mut self,
         ranges: &[Range<u64>],
         io: Arc<dyn EncodingsIo>,
-        mut schedule_action: impl FnMut(DecoderMessage) -> (),
+        mut schedule_action: impl FnMut(DecoderMessage),
     ) -> Result<()> {
         let mut rows_to_schedule = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         trace!("Scheduling ranges {:?} ({} rows)", ranges, rows_to_schedule);
