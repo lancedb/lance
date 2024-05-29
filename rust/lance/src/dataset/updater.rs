@@ -319,9 +319,11 @@ impl DeletionRestorer {
         let deleted_batch_offsets = self.deleted_batch_offsets_in_range(batch.num_rows() as u32);
         let batch = add_blanks(batch, &deleted_batch_offsets)?;
 
-        // validation just in case
         if let Some(batch_size) = self.batch_size {
-            if batch.num_rows() != batch_size as usize {
+            // validation just in case, when the input has a fixed batch size then the
+            // output should have the same fixed batch size (except the last batch)
+            let is_last = self.is_exhausted();
+            if batch.num_rows() != batch_size as usize && !is_last {
                 return Err(Error::Internal {
                     message: format!(
                         "Fragment Updater: batch size mismatch: {} != {}",
