@@ -88,21 +88,33 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 
 #[cfg(test)]
 mod test {
-    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
+    use std::ops::Range;
+
+    use crate::dataset::{builder::DatasetBuilder, UpdateBuilder, WriteMode, WriteParams};
 
     use super::*;
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::Future;
     use lance_core::utils::address::RowAddress;
 
-    #[tokio::test]
-    async fn test_empty_dataset_rowids() {
+    fn sequence_batch(values: Range<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             DataType::Int32,
             false,
         )]));
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(values))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_empty_dataset_rowids() {
+        let schema = sequence_batch(0..0).schema();
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
@@ -120,18 +132,9 @@ mod test {
 
     #[tokio::test]
     async fn test_new_row_ids() {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
         let num_rows = 25u64;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )
-        .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let batch = sequence_batch(0..num_rows as i32);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
             max_rows_per_file: 10,
@@ -160,19 +163,10 @@ mod test {
     #[tokio::test]
     async fn test_row_ids_overwrite() {
         // Validate we don't re-use after overwriting
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
         let num_rows = 10u64;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )
-        .unwrap();
+        let batch = sequence_batch(0..num_rows as i32);
 
-        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
             ..Default::default()
@@ -185,7 +179,7 @@ mod test {
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
 
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             mode: WriteMode::Overwrite,
             ..Default::default()
@@ -203,21 +197,50 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_row_ids_append() {
+        // Validate we handle row ids well when appending concurrently.
+        fn write_batch<'a>(uri: &'a str, start: &mut i32) -> impl Future<Output = Result<()>> + 'a {
+            let batch = sequence_batch(*start..(*start + 10));
+            *start += 10;
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let write_params = WriteParams {
+                enable_experimental_stable_row_ids: true,
+                mode: WriteMode::Append,
+                ..Default::default()
+            };
+            async move {
+                let _ = Dataset::write(reader, uri, Some(write_params)).await?;
+                Ok(())
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = temp_dir.path().to_str().unwrap();
+        let mut start = 0;
+        // Just do one first to create the dataset.
+        write_batch(tmp_path, &mut start).await.unwrap();
+        // Now do the rest concurrently.
+        let futures = (0..5)
+            .map(|_| write_batch(tmp_path, &mut start))
+            .collect::<Vec<_>>();
+        futures::future::try_join_all(futures).await.unwrap();
+
+        let dataset = DatasetBuilder::from_uri(tmp_path).load().await.unwrap();
+
+        assert_eq!(dataset.manifest().next_row_id, 60);
+
+        let index = get_row_id_index(&dataset).await.unwrap();
+        assert!(index.get(0).is_some());
+        assert!(index.get(60).is_none());
+    }
+
+    #[tokio::test]
     async fn test_row_ids_update() {
         // Updated fragments get fresh row ids.
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
         let num_rows = 5u64;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )
-        .unwrap();
+        let batch = sequence_batch(0..num_rows as i32);
 
-        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
             ..Default::default()
