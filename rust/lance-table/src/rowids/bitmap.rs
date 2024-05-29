@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#[derive(PartialEq, Eq, Clone)]
+use deepsize::DeepSizeOf;
+
+#[derive(PartialEq, Eq, Clone, DeepSizeOf)]
 pub struct Bitmap {
     pub data: Vec<u8>,
     pub len: usize,
