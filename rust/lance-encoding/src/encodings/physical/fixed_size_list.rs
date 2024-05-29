@@ -7,7 +7,7 @@ use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
+    decoder::{PageScheduler, PhysicalPageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
     EncodingsIo,
@@ -18,12 +18,12 @@ use crate::{
 /// This scheduler is, itself, primitive
 #[derive(Debug)]
 pub struct FixedListScheduler {
-    items_scheduler: Box<dyn PhysicalPageScheduler>,
+    items_scheduler: Box<dyn PageScheduler>,
     dimension: u32,
 }
 
 impl FixedListScheduler {
-    pub fn new(items_scheduler: Box<dyn PhysicalPageScheduler>, dimension: u32) -> Self {
+    pub fn new(items_scheduler: Box<dyn PageScheduler>, dimension: u32) -> Self {
         Self {
             items_scheduler,
             dimension,
@@ -31,7 +31,7 @@ impl FixedListScheduler {
     }
 }
 
-impl PhysicalPageScheduler for FixedListScheduler {
+impl PageScheduler for FixedListScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[std::ops::Range<u32>],

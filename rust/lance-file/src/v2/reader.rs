@@ -439,16 +439,16 @@ impl FileReader {
                                 .map(|(offset, size)| (*offset, *size))
                                 .collect(),
                         );
-                        Arc::new(PageInfo {
+                        PageInfo {
                             buffer_offsets_and_sizes,
                             encoding,
                             num_rows,
-                        })
+                        }
                     })
                     .collect::<Vec<_>>();
                 Arc::new(ColumnInfo {
                     index: col_idx as u32,
-                    page_infos,
+                    page_infos: Arc::new(page_infos),
                     buffer_offsets_and_sizes: vec![],
                 })
             })
@@ -627,9 +627,7 @@ impl FileReader {
         let num_rows_to_read = range.end - range.start;
 
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
-        tokio::task::spawn(
-            async move { decode_scheduler.schedule_range(range, tx, scheduler).await },
-        );
+        tokio::task::spawn(async move { decode_scheduler.schedule_range(range, tx, scheduler) });
 
         Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream())
     }
@@ -664,11 +662,7 @@ impl FileReader {
         let num_rows_to_read = indices.len() as u64;
 
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
-        tokio::task::spawn(async move {
-            decode_scheduler
-                .schedule_take(&indices, tx, scheduler)
-                .await
-        });
+        tokio::task::spawn(async move { decode_scheduler.schedule_take(&indices, tx, scheduler) });
 
         Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream())
     }

@@ -17,25 +17,57 @@ use log::trace;
 
 use crate::{
     decoder::{
-        DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, SchedulerContext,
+        DecodeArrayTask, DecoderReady, FieldScheduler, LogicalPageDecoder, NextDecodeTask,
+        ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{CoreArrayEncodingStrategy, EncodeTask, FieldEncoder},
 };
 
 use super::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder};
 
-// TODO: Support large string, binary, large binary
+/// Wraps a varbin scheduler and uses a BinaryPageDecoder to cast
+/// the result to the appropriate type
+#[derive(Debug)]
+pub struct BinarySchedulingJob<'a> {
+    scheduler: &'a BinaryFieldScheduler,
+    inner: Box<dyn SchedulingJob + 'a>,
+}
+
+impl<'a> SchedulingJob for BinarySchedulingJob<'a> {
+    fn schedule_next(
+        &mut self,
+        context: &mut SchedulerContext,
+        top_level_row: u64,
+    ) -> Result<ScheduledScanLine> {
+        let inner_scan = self.inner.schedule_next(context, top_level_row)?;
+        let wrapped_decoders = inner_scan
+            .decoders
+            .into_iter()
+            .map(|decoder| DecoderReady {
+                path: decoder.path,
+                decoder: Box::new(BinaryPageDecoder {
+                    inner: decoder.decoder,
+                    data_type: self.scheduler.data_type.clone(),
+                }),
+            })
+            .collect::<Vec<_>>();
+        Ok(ScheduledScanLine {
+            decoders: wrapped_decoders,
+            rows_scheduled: inner_scan.rows_scheduled,
+        })
+    }
+}
 
 /// A logical scheduler for utf8/binary pages which assumes the data are encoded as List<u8>
 #[derive(Debug)]
-pub struct BinaryPageScheduler {
-    varbin_scheduler: Arc<dyn LogicalPageScheduler>,
+pub struct BinaryFieldScheduler {
+    varbin_scheduler: Arc<dyn FieldScheduler>,
     data_type: DataType,
 }
 
-impl BinaryPageScheduler {
+impl BinaryFieldScheduler {
     // Create a new ListPageScheduler
-    pub fn new(varbin_scheduler: Arc<dyn LogicalPageScheduler>, data_type: DataType) -> Self {
+    pub fn new(varbin_scheduler: Arc<dyn FieldScheduler>, data_type: DataType) -> Self {
         Self {
             varbin_scheduler,
             data_type,
@@ -43,47 +75,20 @@ impl BinaryPageScheduler {
     }
 }
 
-impl LogicalPageScheduler for BinaryPageScheduler {
-    fn schedule_ranges(
-        &self,
-        ranges: &[std::ops::Range<u32>],
-        context: &mut SchedulerContext,
-        top_level_row: u64,
-    ) -> Result<()> {
+impl FieldScheduler for BinaryFieldScheduler {
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Box<dyn SchedulingJob + 'a>> {
         trace!("Scheduling binary for {} ranges", ranges.len());
-        let mut temp_context = context.temporary(None);
-        self.varbin_scheduler
-            .schedule_ranges(ranges, &mut temp_context, top_level_row)?;
-
-        for decoder in temp_context.into_decoders() {
-            let decoder = Box::new(BinaryPageDecoder {
-                inner: decoder,
-                data_type: self.data_type.clone(),
-            });
-            context.emit(decoder);
-        }
-
-        Ok(())
+        let varbin_job = self.varbin_scheduler.schedule_ranges(ranges)?;
+        Ok(Box::new(BinarySchedulingJob {
+            scheduler: self,
+            inner: varbin_job,
+        }))
     }
 
-    fn schedule_take(
-        &self,
-        indices: &[u32],
-        context: &mut SchedulerContext,
-        top_level_row: u64,
-    ) -> Result<()> {
-        trace!("Scheduling binary for {} indices", indices.len());
-        self.schedule_ranges(
-            &indices
-                .iter()
-                .map(|&idx| idx..(idx + 1))
-                .collect::<Vec<_>>(),
-            context,
-            top_level_row,
-        )
-    }
-
-    fn num_rows(&self) -> u32 {
+    fn num_rows(&self) -> u64 {
         self.varbin_scheduler.num_rows()
     }
 }

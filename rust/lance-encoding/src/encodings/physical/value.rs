@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
+    decoder::{PageScheduler, PhysicalPageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
@@ -79,7 +79,7 @@ impl ValuePageScheduler {
     }
 }
 
-impl PhysicalPageScheduler for ValuePageScheduler {
+impl PageScheduler for ValuePageScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[std::ops::Range<u32>],
