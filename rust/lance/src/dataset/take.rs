@@ -371,32 +371,23 @@ mod test {
         t
     }
 
-    /*
-    // #[rstest]
-    // #[tokio::test]
-    // async fn test_take(#[values(false, true)] use_experimental_writer: bool) {
+    #[rstest]
     #[tokio::test]
-    async fn test_take() {
+    async fn test_take(#[values(false, true)] use_experimental_writer: bool) {
         let test_dir = tempfile::tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, false),
             ArrowField::new("s", DataType::Utf8, false),
         ]));
-
-        let rows_per_batch = 20;
-        let batches: Vec<RecordBatch> = (0..2)
+        let batches: Vec<RecordBatch> = (0..20)
             .map(|i| {
                 RecordBatch::try_new(
                     schema.clone(),
                     vec![
-                        Arc::new(Int32Array::from_iter_values(i * rows_per_batch..(i + 1) * rows_per_batch)),
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
                         Arc::new(StringArray::from_iter_values(
-                            (i * rows_per_batch..(i + 1) * rows_per_batch).map(|i| {
-                                // let x = i + 199;
-                                format!("str-{i}")
-                                // "a"
-                            }),
+                            (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
                         )),
                     ],
                 )
@@ -407,8 +398,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer: true,
-            // use_experimental_writer,
+            use_experimental_writer,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -417,41 +407,19 @@ mod test {
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        // assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
         let projection = Schema::try_from(schema.as_ref()).unwrap();
-
-        let takes = (17..22).collect::<Vec<u64>>();
-        // let takes = [
-        //     // 2, 1
-        //     // 200,
-        //     // 199
-        //     // 39
-        //     1..20,
-
-        //     // 200,
-        //     // 199
-        //     // 1,
-        //     // 2,
-        // ];
         let values = dataset
             .take(
-                &takes,
-                // &[
-                //     1,
-                //     2,
-                //     3,
-                //     4,
-                //     5,
-                //     6,
-                //     7,
-                //     // 200, // 200
-                //     // 199, // 199
-                //     // 39,  // 39
-                //     // 40,  // 40
-                //     // 199, // 40
-                //     // 40,  // 40
-                //     // 125, // 125
-                // ],
+                &[
+                    200, // 200
+                    199, // 199
+                    39,  // 39
+                    40,  // 40
+                    199, // 40
+                    40,  // 40
+                    125, // 125
+                ],
                 &projection,
             )
             .await
@@ -460,31 +428,13 @@ mod test {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    Arc::new(Int32Array::from_iter_values(
-                        takes.clone().into_iter().map(|x| x as i32)
-                        // [
-                        // 1,
-                        // 2,
-                        // 3,
-                        // 4,
-                        // 5,
-                        // 6,
-                        // 7,
-
-                        // // 200,
-                        // // 199,
-                        // //39, 40, 199, 40, 125
-                        // ]
-                    )),
+                    Arc::new(Int32Array::from_iter_values([
+                        200, 199, 39, 40, 199, 40, 125
+                    ])),
                     Arc::new(StringArray::from_iter_values(
-                        //
-                        takes
-                            .clone()
+                        [200, 199, 39, 40, 199, 40, 125]
                             .iter()
-                            .map(|i| {
-                                let x = i + 199;
-                                format!("str-{i}")
-                            })
+                            .map(|v| format!("str-{v}"))
                     )),
                 ],
             )
@@ -492,7 +442,6 @@ mod test {
             values
         );
     }
-    */
 
     #[rstest]
     #[tokio::test]

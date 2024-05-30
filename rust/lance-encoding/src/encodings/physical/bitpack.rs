@@ -157,8 +157,6 @@ fn pack_bits(
     dst_idx: &mut usize,
     dst_offset: &mut u8,
 ) {
-    // let mut dst_idx = 0;
-    // let mut dst_offset = 0;
     let bit_len = byte_len as u64 * 8;
 
     let mut mask = 0u64;
@@ -220,38 +218,6 @@ fn pack_bits(
             src_idx += (byte_len as u64 - partial_bytes_written + to_next_byte) as usize;
         }
     }
-
-    // if num_bits == 7 {
-    //     let mut strs = vec![];
-    //     for i in 0..dst.len() {
-    //         strs.push(format!("{:08b}", dst[i]))
-    //     }
-
-    //     println!("num_bits = {:?}", num_bits);
-
-    //     // println!("strs = {:?}", strs);
-    //     strs.reverse();
-    //     let mut all_str = strs.join("");
-    //     let all_str = all_str.chars().rev().collect::<String>();
-
-    //     // println!("all_str = {:?}", all_str);
-    //     let mut chunks = all_str.chars()
-    //         .collect::<Vec<char>>()
-    //         .chunks(7)
-    //         .map(|c| c.iter().rev().collect::<String>())
-    //         .collect::<Vec<String>>();
-    //     // chunks.reverse();
-    //     for i in 0..chunks.len() {
-    //         let as_int = u8::from_str_radix(&chunks[i], 2).unwrap();
-    //         println!("chunk {} = {} = {} = {:#x} = {:?}", i, chunks[i], as_int, as_int, as_int as char);
-    //     }
-    // }
-
-    // for i in 0..dst.len() {
-    //     println!("encoded byte = {} = {} = {:#x} = {:#b}", i, dst[i], dst[i], dst[i]);
-    // }
-
-    // dst
 }
 
 // A physical scheduler for bitpacked buffers
