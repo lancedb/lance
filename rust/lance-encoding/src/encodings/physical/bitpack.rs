@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::io::Read;
-
 use arrow::array::ArrayData;
 use arrow::datatypes::{ArrowPrimitiveType, UInt16Type, UInt32Type, UInt64Type, UInt8Type};
 use arrow_array::{cast::AsArray, Array, ArrayRef, PrimitiveArray};
@@ -77,7 +75,13 @@ impl BufferEncoder for BitpackingBufferEncoder {
         let mut dst_idx = 0;
         let mut dst_offset = 0;
         for arr in arrays {
-            pack_array(arr.clone(), num_bits, &mut dst_buffer, &mut dst_idx, &mut dst_offset)?;
+            pack_array(
+                arr.clone(),
+                num_bits,
+                &mut dst_buffer,
+                &mut dst_idx,
+                &mut dst_offset,
+            )?;
             // packed_arrays.push(packed.into());
         }
 
@@ -100,17 +104,30 @@ fn count_items_to_pack(arrays: &[ArrayRef]) -> usize {
             count += buffer.len();
         }
     }
-    
+
     count
 }
 
-fn pack_array(arr: ArrayRef, num_bits: u64, dst: &mut Vec<u8>, dst_idx: &mut usize, dst_offset: &mut u8) -> Result<()> {
+fn pack_array(
+    arr: ArrayRef,
+    num_bits: u64,
+    dst: &mut [u8],
+    dst_idx: &mut usize,
+    dst_offset: &mut u8,
+) -> Result<()> {
     match arr.data_type() {
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-            pack_buffers(arr.to_data(), num_bits, arr.data_type().byte_width(), dst, dst_idx, dst_offset);
-            
+            pack_buffers(
+                arr.to_data(),
+                num_bits,
+                arr.data_type().byte_width(),
+                dst,
+                dst_idx,
+                dst_offset,
+            );
+
             Ok(())
-        },
+        }
         _ => Err(Error::InvalidInput {
             source: format!("Invalid data type for bitpacking: {}", arr.data_type()).into(),
             location: location!(),
@@ -118,14 +135,28 @@ fn pack_array(arr: ArrayRef, num_bits: u64, dst: &mut Vec<u8>, dst_idx: &mut usi
     }
 }
 
-fn pack_buffers(data: ArrayData, num_bits: u64, byte_len: usize, dst: &mut Vec<u8>, dst_idx: &mut usize, dst_offset: &mut u8) {
+fn pack_buffers(
+    data: ArrayData,
+    num_bits: u64,
+    byte_len: usize,
+    dst: &mut [u8],
+    dst_idx: &mut usize,
+    dst_offset: &mut u8,
+) {
     let buffers = data.buffers();
     for buffer in buffers {
         pack_bits(buffer, num_bits, byte_len, dst, dst_idx, dst_offset);
     }
 }
 
-fn pack_bits(src: &[u8], num_bits: u64, byte_len: usize, dst: &mut Vec<u8>, dst_idx: &mut usize, dst_offset: &mut u8) {
+fn pack_bits(
+    src: &[u8],
+    num_bits: u64,
+    byte_len: usize,
+    dst: &mut [u8],
+    dst_idx: &mut usize,
+    dst_offset: &mut u8,
+) {
     // let mut dst_idx = 0;
     // let mut dst_offset = 0;
     let bit_len = byte_len as u64 * 8;
@@ -222,8 +253,6 @@ fn pack_bits(src: &[u8], num_bits: u64, byte_len: usize, dst: &mut Vec<u8>, dst_
 
     // dst
 }
-
-
 
 // A physical scheduler for bitpacked buffers
 #[derive(Debug, Clone, Copy)]

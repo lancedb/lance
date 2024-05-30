@@ -427,7 +427,7 @@ mod test {
         //     // 199
         //     // 39
         //     1..20,
-        
+
         //     // 200,
         //     // 199
         //     // 1,
@@ -470,14 +470,14 @@ mod test {
                         // 5,
                         // 6,
                         // 7,
-                        
-                        // // 200, 
-                        // // 199, 
+
+                        // // 200,
+                        // // 199,
                         // //39, 40, 199, 40, 125
                         // ]
                     )),
                     Arc::new(StringArray::from_iter_values(
-                        // 
+                        //
                         takes
                             .clone()
                             .iter()
@@ -534,8 +534,6 @@ mod test {
             err.to_string()
         );
     }
-
-
 
     #[rstest]
     #[tokio::test]
