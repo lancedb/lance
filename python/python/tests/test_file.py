@@ -50,27 +50,40 @@ def test_take(tmp_path):
     assert table == pa.table({"a": [0, 77, 83]})
 
 
-def test_different_types(tmp_path):
+def check_round_trip(tmp_path, table):
     path = tmp_path / "foo.lance"
-    schema = pa.schema(
-        [
-            pa.field("large_string", pa.large_string()),
-            pa.field("large_binary", pa.large_binary()),
-        ]
-    )
-    writer = LanceFileWriter(str(path), schema)
-    data = pa.table(
-        {
-            "large_string": pa.array(["foo", "bar", "baz"], pa.large_string()),
-            "large_binary": pa.array([b"foo", b"bar", b"baz"], pa.large_binary()),
-        }
-    )
-    writer.write_batch(data)
-    writer.close()
-
+    with LanceFileWriter(str(path), table.schema) as writer:
+        for batch in table.to_batches():
+            writer.write_batch(pa.table(batch))
     reader = LanceFileReader(str(path))
     result = reader.read_all().to_table()
-    assert result == data
+    assert result == table
+
+
+def test_different_types(tmp_path):
+    check_round_trip(
+        tmp_path,
+        pa.table(
+            {
+                "large_string": pa.array(["foo", "bar", "baz"], pa.large_string()),
+                "large_binary": pa.array([b"foo", b"bar", b"baz"], pa.large_binary()),
+            }
+        ),
+    )
+
+
+def test_with_nulls(tmp_path):
+    check_round_trip(
+        tmp_path,
+        pa.table(
+            {
+                "some_null_1": pa.array([1, 2, None], pa.int64()),
+                "some_null_2": pa.array([None, None, 3], pa.int64()),
+                "all_null": pa.array([None, None, None], pa.int64()),
+                "null_strings": pa.array([None, "foo", None], pa.string()),
+            }
+        ),
+    )
 
 
 def test_round_trip(tmp_path):

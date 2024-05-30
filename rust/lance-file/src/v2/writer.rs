@@ -135,9 +135,11 @@ impl FileWriter {
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
-        let mut buffer_offsets = Vec::with_capacity(encoded_page.array.buffers.len());
-        let mut buffer_sizes = Vec::with_capacity(encoded_page.array.buffers.len());
-        for buffer in encoded_page.array.buffers {
+        let mut buffers = encoded_page.array.buffers;
+        buffers.sort_by_key(|b| b.index);
+        let mut buffer_offsets = Vec::with_capacity(buffers.len());
+        let mut buffer_sizes = Vec::with_capacity(buffers.len());
+        for buffer in buffers {
             buffer_offsets.push(self.writer.tell().await? as u64);
             buffer_sizes.push(
                 buffer
