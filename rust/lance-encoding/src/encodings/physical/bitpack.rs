@@ -358,11 +358,6 @@ impl PhysicalPageDecoder for BitpackedPageDecoder {
         let dst = &mut dest_buffers[0];
         let mut dst_idx = dst.len(); // index for current byte being written to destination buffer
 
-        // ensure we have enough capacity
-        // TODO uncomment
-        // let capacity_needed = dst.capacity() as i64 - dst.len() as i64 + num_rows as i64;
-        // debug_assert!(capacity_needed <= 0);
-
         // create bit mask for source bits
         let mut mask = 0u64;
         for _ in 0..self.bits_per_value {
@@ -465,11 +460,6 @@ impl PhysicalPageDecoder for BitpackedPageDecoder {
         // add pad any extra needed 0s onto end of buffer
         dst.extend([0].repeat(dst_idx + 1 - dst.len()));
 
-        // TODO remove
-        // println!("{:?} {:?}", self, dst);
-        // for b in dst.clone().into_iter() {
-        //     println!("{:?}", b);
-        // }
         Ok(())
     }
 
