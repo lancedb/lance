@@ -792,11 +792,12 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
 
             let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
             let store = Arc::new(store);
+            let full_path = format!("{}{}", url.host_str().unwrap_or_default(), url.path());
 
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("az"),
-                base_path: Path::from(url.path()),
+                base_path: Path::from(full_path),
                 block_size: 64 * 1024,
             })
         }
