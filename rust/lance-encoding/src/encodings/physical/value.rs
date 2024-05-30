@@ -563,6 +563,15 @@ pub(crate) mod tests {
                     ),
                 ),
             ),
+            // check less than one byte for single-byte type
+            (
+                DataType::UInt64,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
+                        Uniform::new(129, 259),
+                    ),
+                ),
+            ),
             // check byte aligned for single byte
             (
                 DataType::UInt32,

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::io::Read;
+
 use arrow::array::ArrayData;
 use arrow::datatypes::{ArrowPrimitiveType, UInt16Type, UInt32Type, UInt64Type, UInt8Type};
 use arrow_array::{cast::AsArray, Array, ArrayRef, PrimitiveArray};
@@ -51,6 +53,7 @@ pub struct BitpackingBufferEncoder {}
 
 impl BufferEncoder for BitpackingBufferEncoder {
     fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
+        // TODO -- num bits can be a struct field now that we have the strategy
         let mut num_bits = 0;
         for arr in arrays {
             let arr_max = num_compressed_bits(arr.clone()).ok_or(Error::InvalidInput {
@@ -60,15 +63,27 @@ impl BufferEncoder for BitpackingBufferEncoder {
             num_bits = num_bits.max(arr_max);
         }
 
-        let mut packed_arrays = vec![];
+        // calculate the total number of bytes we need to allocate for the destination.
+        // this will be the number of items in the source array times the number of bits.
+        let count_items = count_items_to_pack(arrays);
+        // TODO: make function for count & round up
+        let mut dst_bytes_total = count_items * num_bits as usize / 8;
+        // if if there's a partial byte at the end, we need to allocate one more byte
+        if (count_items * num_bits as usize) % 8 != 0 {
+            dst_bytes_total += 1;
+        }
+
+        let mut dst_buffer = vec![0u8; dst_bytes_total];
+        let mut dst_idx = 0;
+        let mut dst_offset = 0;
         for arr in arrays {
-            let packed = pack_array(arr.clone(), num_bits)?;
-            packed_arrays.push(packed.into());
+            pack_array(arr.clone(), num_bits, &mut dst_buffer, &mut dst_idx, &mut dst_offset)?;
+            // packed_arrays.push(packed.into());
         }
 
         let data_type = arrays[0].data_type();
         Ok(EncodedBuffer {
-            parts: packed_arrays,
+            parts: vec![dst_buffer.into()],
             bits_per_value: (data_type.byte_width() * 8) as u64,
             bitpacked_bits_per_value: Some(num_bits),
             compression_scheme: None,
@@ -76,30 +91,43 @@ impl BufferEncoder for BitpackingBufferEncoder {
     }
 }
 
-fn pack_buffers(data: ArrayData, num_bits: u64, byte_len: usize) -> Vec<u8> {
-    let buffers = data.buffers();
-    let mut packed_buffers = vec![];
-    for buffer in buffers {
-        let packed_buffer = pack_bits(buffer, num_bits, byte_len);
-        packed_buffers.push(packed_buffer);
+fn count_items_to_pack(arrays: &[ArrayRef]) -> usize {
+    let mut count = 0;
+    for arr in arrays {
+        let data = arr.to_data();
+        let buffers = data.buffers();
+        for buffer in buffers {
+            count += buffer.len();
+        }
     }
-    packed_buffers.concat()
+    
+    count
 }
 
-fn pack_bits(src: &[u8], num_bits: u64, byte_len: usize) -> Vec<u8> {
-    // calculate the total number of bytes we need to allocate for the destination.
-    // this will be the number of items in the source array times the number of bits.
-    let src_items = src.len() / byte_len;
-    let mut dst_bytes_total = src_items * num_bits as usize / 8;
-
-    // if if there's a partial byte at the end, we need to allocate one more byte
-    if (src_items * num_bits as usize) % 8 != 0 {
-        dst_bytes_total += 1;
+fn pack_array(arr: ArrayRef, num_bits: u64, dst: &mut Vec<u8>, dst_idx: &mut usize, dst_offset: &mut u8) -> Result<()> {
+    match arr.data_type() {
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            pack_buffers(arr.to_data(), num_bits, arr.data_type().byte_width(), dst, dst_idx, dst_offset);
+            
+            Ok(())
+        },
+        _ => Err(Error::InvalidInput {
+            source: format!("Invalid data type for bitpacking: {}", arr.data_type()).into(),
+            location: location!(),
+        }),
     }
+}
 
-    let mut dst = vec![0u8; dst_bytes_total];
-    let mut dst_idx = 0;
-    let mut dst_offset = 0;
+fn pack_buffers(data: ArrayData, num_bits: u64, byte_len: usize, dst: &mut Vec<u8>, dst_idx: &mut usize, dst_offset: &mut u8) {
+    let buffers = data.buffers();
+    for buffer in buffers {
+        pack_bits(buffer, num_bits, byte_len, dst, dst_idx, dst_offset);
+    }
+}
+
+fn pack_bits(src: &[u8], num_bits: u64, byte_len: usize, dst: &mut Vec<u8>, dst_idx: &mut usize, dst_offset: &mut u8) {
+    // let mut dst_idx = 0;
+    // let mut dst_offset = 0;
     let bit_len = byte_len as u64 * 8;
 
     let mut mask = 0u64;
@@ -115,17 +143,17 @@ fn pack_bits(src: &[u8], num_bits: u64, byte_len: usize) -> Vec<u8> {
         let mut src_bits_written = 0;
 
         while src_bits_written < num_bits {
-            dst[dst_idx] += (curr_src >> src_offset) << dst_offset;
+            dst[*dst_idx] += (curr_src >> src_offset) << *dst_offset as u64;
             let bits_written = (num_bits - src_bits_written)
                 .min(8 - src_offset)
-                .min(8 - dst_offset);
+                .min(8 - *dst_offset as u64);
             src_bits_written += bits_written;
-            dst_offset += bits_written;
+            *dst_offset += bits_written as u8;
             src_offset += bits_written;
 
-            if dst_offset == 8 {
-                dst_idx += 1;
-                dst_offset = 0;
+            if *dst_offset == 8 {
+                *dst_idx += 1;
+                *dst_offset = 0;
             }
 
             if src_offset == 8 {
@@ -162,20 +190,40 @@ fn pack_bits(src: &[u8], num_bits: u64, byte_len: usize) -> Vec<u8> {
         }
     }
 
-    dst
+    // if num_bits == 7 {
+    //     let mut strs = vec![];
+    //     for i in 0..dst.len() {
+    //         strs.push(format!("{:08b}", dst[i]))
+    //     }
+
+    //     println!("num_bits = {:?}", num_bits);
+
+    //     // println!("strs = {:?}", strs);
+    //     strs.reverse();
+    //     let mut all_str = strs.join("");
+    //     let all_str = all_str.chars().rev().collect::<String>();
+
+    //     // println!("all_str = {:?}", all_str);
+    //     let mut chunks = all_str.chars()
+    //         .collect::<Vec<char>>()
+    //         .chunks(7)
+    //         .map(|c| c.iter().rev().collect::<String>())
+    //         .collect::<Vec<String>>();
+    //     // chunks.reverse();
+    //     for i in 0..chunks.len() {
+    //         let as_int = u8::from_str_radix(&chunks[i], 2).unwrap();
+    //         println!("chunk {} = {} = {} = {:#x} = {:?}", i, chunks[i], as_int, as_int, as_int as char);
+    //     }
+    // }
+
+    // for i in 0..dst.len() {
+    //     println!("encoded byte = {} = {} = {:#x} = {:#b}", i, dst[i], dst[i], dst[i]);
+    // }
+
+    // dst
 }
 
-fn pack_array(arr: ArrayRef, num_bits: u64) -> Result<Vec<u8>> {
-    match arr.data_type() {
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => Ok(
-            pack_buffers(arr.to_data(), num_bits, arr.data_type().byte_width()),
-        ),
-        _ => Err(Error::InvalidInput {
-            source: format!("Invalid data type for bitpacking: {}", arr.data_type()).into(),
-            location: location!(),
-        }),
-    }
-}
+
 
 // A physical scheduler for bitpacked buffers
 #[derive(Debug, Clone, Copy)]
@@ -259,6 +307,7 @@ impl PhysicalPageScheduler for BitpackedScheduler {
     }
 }
 
+#[derive(Debug)]
 struct BitpackedPageDecoder {
     // bit offsets of the first value within each buffer
     buffer_bit_start_offsets: Vec<u8>,
@@ -315,6 +364,7 @@ impl PhysicalPageDecoder for BitpackedPageDecoder {
         let mut dst_idx = dst.len(); // index for current byte being written to destination buffer
 
         // ensure we have enough capacity
+        // TODO uncomment
         // let capacity_needed = dst.capacity() as i64 - dst.len() as i64 + num_rows as i64;
         // debug_assert!(capacity_needed <= 0);
 
@@ -420,6 +470,11 @@ impl PhysicalPageDecoder for BitpackedPageDecoder {
         // add pad any extra needed 0s onto end of buffer
         dst.extend([0].repeat(dst_idx + 1 - dst.len()));
 
+        // TODO remove
+        // println!("{:?} {:?}", self, dst);
+        // for b in dst.clone().into_iter() {
+        //     println!("{:?}", b);
+        // }
         Ok(())
     }
 
