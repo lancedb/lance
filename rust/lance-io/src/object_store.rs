@@ -360,9 +360,7 @@ impl ObjectStore {
             }
             Ok(url) => {
                 let store = Self::new_from_url(url.clone(), params.clone()).await?;
-                let full_path = format!("{}{}", url.host_str().unwrap_or(""), url.path());
-                let path = Path::from(full_path);
-                Ok((store, path))
+                Ok((store, Path::from(url.path())))
             }
             Err(_) => Self::from_path(uri),
         }?;
@@ -989,7 +987,7 @@ mod tests {
         let uri = "s3://bucket/foo.lance";
         let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
         assert_eq!(store.scheme, "s3");
-        assert_eq!(path.to_string(), "bucket/foo.lance");
+        assert_eq!(path.to_string(), "foo.lance");
 
         let (store, path) = ObjectStore::from_uri("s3+ddb://bucket/foo.lance")
             .await
