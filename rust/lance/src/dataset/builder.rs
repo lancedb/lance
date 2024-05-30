@@ -190,11 +190,7 @@ impl DatasetBuilder {
                     self.options.block_size,
                     self.options.object_store_wrapper,
                 ),
-                Path::from(format!(
-                    "{}{}",
-                    store.1.host_str().unwrap_or_default(),
-                    store.1.path()
-                )),
+                Path::from(store.1.path()),
                 commit_handler,
             )),
             None => {

@@ -413,8 +413,8 @@ impl ObjectStore {
         println!("SCHEME: {}", self.scheme.as_str());
         match self.scheme.as_str() {
             "file" | "file-object-store" => path.to_string(),
+            "memory" => format!("memory://{}", path),
             s => {
-                println!("S3: {}", path);
                 let mut url = Url::from_directory_path(path.to_string()).unwrap();
                 url.set_scheme(s).expect("schema not valid");
                 url.to_string()
@@ -968,13 +968,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "s3");
-        assert_eq!(path.to_string(), "bucket/foo.lance");
+        assert_eq!(path.to_string(), "foo.lance");
 
         let (store, path) = ObjectStore::from_uri("gs://bucket/foo.lance")
             .await
             .unwrap();
         assert_eq!(store.scheme, "gs");
-        assert_eq!(path.to_string(), "bucket/foo.lance");
+        assert_eq!(path.to_string(), "foo.lance");
     }
 
     #[tokio::test]
