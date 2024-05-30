@@ -590,9 +590,9 @@ impl Dataset {
         self.append_impl(batches, params).await
     }
 
-    /// Get the base URI of the dataset.
-    pub fn uri(&self) -> &Path {
-        &self.base
+    /// Get the fully qualified URI of this dataset.
+    pub fn uri(&self) -> String {
+        self.object_store.qualified_uri(&self.base)
     }
 
     /// Get the full manifest of the dataset version.

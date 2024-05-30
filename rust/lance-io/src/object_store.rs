@@ -356,19 +356,16 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Self, Path)> {
-        let (object_store, base_path) = match Url::parse(uri) {
+        let object_store = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
                 Self::from_path(uri)
             }
-            Ok(url) => {
-                let store = Self::new_from_url(url.clone(), params.clone()).await?;
-                let path = Path::from(url.path());
-                Ok((store, path))
-            }
+            Ok(url) => Self::new_from_url(url.clone(), params.clone()).await,
             Err(_) => Self::from_path(uri),
         }?;
 
+        let base_path = object_store.base_path().clone();
         Ok((
             Self {
                 inner: params
@@ -382,7 +379,7 @@ impl ObjectStore {
         ))
     }
 
-    pub fn from_path_with_scheme(str_path: &str, scheme: &str) -> Result<(Self, Path)> {
+    pub fn from_path_with_scheme(str_path: &str, scheme: &str) -> Result<Self> {
         let expanded = tilde(str_path).to_string();
 
         let mut expanded_path = path_abs::PathAbs::new(expanded)
@@ -395,18 +392,15 @@ impl ObjectStore {
                 expanded_path = std::env::current_dir()?.to_path_buf();
             }
         }
-        Ok((
-            Self {
-                inner: Arc::new(LocalFileSystem::new()).traced(),
-                scheme: String::from(scheme),
-                base_path: Path::from_absolute_path(expanded_path.as_path())?,
-                block_size: 4 * 1024, // 4KB block size
-            },
-            Path::from_absolute_path(expanded_path.as_path())?,
-        ))
+        Ok(Self {
+            inner: Arc::new(LocalFileSystem::new()).traced(),
+            scheme: String::from(scheme),
+            base_path: Path::from_absolute_path(expanded_path.as_path())?,
+            block_size: 4 * 1024, // 4KB block size
+        })
     }
 
-    pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
+    pub fn from_path(str_path: &str) -> Result<Self> {
         Self::from_path_with_scheme(str_path, "file")
     }
 
@@ -449,6 +443,35 @@ impl ObjectStore {
 
     pub fn base_path(&self) -> &Path {
         &self.base_path
+    }
+
+    /// Returns the fully qualified URI for the given path.
+    ///
+    /// Example:
+    ///
+    /// ```
+    /// # use object_store::path::Path;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use tokio::runtime::Runtime;
+    /// #
+    /// # let mut rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// let (object_store, base) = ObjectStore::from_uri("s3://bucket/prefix").await.unwrap();
+    /// let path = Path::from("data.lance");
+    /// let uri = object_store.qualified_uri(&path);
+    /// assert_eq!(uri, "s3://bucket/prefix/data.lance");
+    /// });
+    /// ```
+    ///
+    pub fn qualified_uri(&self, path: &Path) -> String {
+        let abs_path = path
+            .parts()
+            .fold(self.base_path.clone(), |acc, f| acc.child(f));
+
+        match self.scheme.as_str() {
+            "file" => abs_path.to_string(),
+            _ => format!("{}://{}", self.scheme, abs_path),
+        }
     }
 
     /// Open a file for path.
@@ -707,14 +730,6 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
         "s3" | "s3+ddb" => {
             storage_options.with_env_s3();
 
-            // if url.scheme() == "s3+ddb" && options.commit_handler.is_some() {
-            //     return Err(Error::InvalidInput {
-            //         source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
-            //             .into(),
-            //         location: location!(),
-            //     });
-            // }
-
             let storage_options = storage_options.as_s3_options();
             let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
@@ -744,14 +759,14 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 .with_region(region);
             let store = builder.build()?;
 
+            let full_path = format!("{}{}", url.host_str().unwrap_or_default(), url.path());
             Ok(ObjectStore {
                 inner: Arc::new(store),
                 scheme: String::from(url.scheme()),
-                base_path: Path::from(url.path()),
+                base_path: Path::from(full_path),
                 block_size: 64 * 1024,
             })
         }
-
         "gs" => {
             storage_options.with_env_gcs();
             let mut builder = GoogleCloudStorageBuilder::new().with_url(url.as_ref());
@@ -763,10 +778,12 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             // object_store 0.10.0 is available.
             let store = PatchedGoogleCloudStorage(Arc::new(store));
             let store = Arc::new(store);
+
+            let full_path = format!("{}{}", url.host_str().unwrap_or_default(), url.path());
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("gs"),
-                base_path: Path::from(url.path()),
+                base_path: Path::from(full_path),
                 block_size: 64 * 1024,
             })
         }
@@ -787,10 +804,11 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
         // however this makes testing harder as we can't use the same code path
         // "file-object-store" forces local file system dataset to use the same
         // code path as cloud object stores
-        "file" => Ok(ObjectStore::from_path(url.path())?.0),
-        "file-object-store" => {
-            Ok(ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0)
-        }
+        "file" => Ok(ObjectStore::from_path(url.path())?),
+        "file-object-store" => Ok(ObjectStore::from_path_with_scheme(
+            url.path(),
+            "file-object-store",
+        )?),
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
