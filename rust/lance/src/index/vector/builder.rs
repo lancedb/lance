@@ -18,7 +18,7 @@ use lance_index::{
         quantizer::Quantization,
         transform::Transformer,
         v3::{
-            shuffler::{IvfShuffleReader, IvfShuffler},
+            shuffler::{ShuffleReader, Shuffler},
             storage::{StorageBuilder, VectorStore},
             subindex::IvfSubIndex,
         },
@@ -43,7 +43,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     dataset: Dataset,
     column: String,
     distance_type: DistanceType,
-    shuffler: Box<dyn IvfShuffler>,
+    shuffler: Box<dyn Shuffler>,
     index_dir: String,
     ivf_params: IvfBuildParams,
     sub_index_params: S::BuildParams,
@@ -58,7 +58,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         dataset: Dataset,
         column: String,
         distance_type: DistanceType,
-        shuffler: Box<dyn IvfShuffler>,
+        shuffler: Box<dyn Shuffler>,
         index_dir: String,
         ivf_params: IvfBuildParams,
         sub_index_params: S::BuildParams,
@@ -137,10 +137,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         // TODO: load ivf model
     }
 
-    async fn shuffle_data(
-        &self,
-        centroids: FixedSizeListArray,
-    ) -> Result<Box<dyn IvfShuffleReader>> {
+    async fn shuffle_data(&self, centroids: FixedSizeListArray) -> Result<Box<dyn ShuffleReader>> {
         let transformer = Arc::new(lance_index::vector::ivf::new_ivf_with_quantizer(
             centroids,
             self.distance_type,
@@ -200,7 +197,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         let mut writer = FileWriter::try_new(
             writer,
             path.to_string(),
-            batch.schema_ref().as_ref().try_into()?,
+            storage_batch.schema_ref().as_ref().try_into()?,
             Default::default(),
         )?;
         writer.write_batch(&storage_batch).await?;
@@ -231,9 +228,13 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
 
         let storage_path = dir_path.child(INDEX_AUXILIARY_FILE_NAME);
         let index_path = dir_path.child(INDEX_FILE_NAME);
-        // setup the writers later because we prefer to infer the schema from the first batch
         let mut storage_writer = None;
-        let mut index_writer = None;
+        let mut index_writer = FileWriter::try_new(
+            self.dataset.object_store().create(&index_path).await?,
+            index_path.to_string(),
+            self.sub_index.schema().as_ref().try_into()?,
+            Default::default(),
+        )?;
 
         // maintain the IVF partitions
         let mut storage_ivf = IvfData::empty();
@@ -241,51 +242,45 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), 64);
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
             if storage_size == 0 {
-                storage_ivf.add_partition(0);
-                index_ivf.add_partition(0);
-                continue;
+                storage_ivf.add_partition(0)
+            } else {
+                let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
+                let reader =
+                    FileReader::try_open(scheduler.open_file(&storage_part_path).await?, None)
+                        .await?;
+                let batch = reader
+                    .read_stream(ReadBatchParams::RangeFull, storage_size as u32, 1)?
+                    .try_next()
+                    .await?
+                    .ok_or(Error::io("empty storage batch", location!()))?;
+                if storage_writer.is_none() {
+                    storage_writer = Some(FileWriter::try_new(
+                        self.dataset.object_store().create(&storage_path).await?,
+                        storage_path.to_string(),
+                        batch.schema_ref().as_ref().try_into()?,
+                        Default::default(),
+                    )?);
+                }
+                storage_writer.as_mut().unwrap().write_batch(&batch).await?;
             }
 
-            let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
-            let reader =
-                FileReader::try_open(scheduler.open_file(&storage_part_path).await?, None).await?;
-            let batch = reader
-                .read_stream(ReadBatchParams::RangeFull, storage_size as u32, 1)?
-                .try_next()
-                .await?
-                .ok_or(Error::io("empty storage batch", location!()))?;
-            if storage_writer.is_none() {
-                storage_writer = Some(FileWriter::try_new(
-                    self.dataset.object_store().create(&storage_path).await?,
-                    storage_path.to_string(),
-                    batch.schema_ref().as_ref().try_into()?,
-                    Default::default(),
-                )?);
+            if index_size == 0 {
+                index_ivf.add_partition(0)
+            } else {
+                let index_part_path = self.temp_dir.child(format!("index_part{}", part_id));
+                let reader =
+                    FileReader::try_open(scheduler.open_file(&index_part_path).await?, None)
+                        .await?;
+                let batch = reader
+                    .read_stream(ReadBatchParams::RangeFull, index_size as u32, 1)?
+                    .try_next()
+                    .await?
+                    .ok_or(Error::io("empty index batch", location!()))?;
+                index_writer.write_batch(&batch).await?;
             }
-            storage_writer.as_mut().unwrap().write_batch(&batch).await?;
-
-            let index_part_path = self.temp_dir.child(format!("index_part{}", part_id));
-            let reader =
-                FileReader::try_open(scheduler.open_file(&index_part_path).await?, None).await?;
-            let batch = reader
-                .read_stream(ReadBatchParams::RangeFull, index_size as u32, 1)?
-                .try_next()
-                .await?
-                .ok_or(Error::io("empty index batch", location!()))?;
-            if index_writer.is_none() {
-                index_writer = Some(FileWriter::try_new(
-                    self.dataset.object_store().create(&index_path).await?,
-                    index_path.to_string(),
-                    batch.schema_ref().as_ref().try_into()?,
-                    Default::default(),
-                )?);
-            }
-            index_writer.as_mut().unwrap().write_batch(&batch).await?;
         }
 
-        let (mut storage_writer, mut index_writer) =
-            (storage_writer.unwrap(), index_writer.unwrap());
-
+        let mut storage_writer = storage_writer.unwrap();
         let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
         storage_writer.add_schema_metadata(
             IVF_METADATA_KEY,
@@ -306,5 +301,87 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         index_writer.finish().await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, ops::Range, sync::Arc};
+
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::{
+        flat::index::{FlatIndex, FlatQuantizer},
+        ivf::IvfBuildParams,
+        v3::shuffler::IvfShuffler,
+    };
+    use lance_linalg::distance::DistanceType;
+    use lance_testing::datagen::generate_random_array_with_range;
+    use object_store::path::Path;
+    use tempfile::tempdir;
+
+    use crate::Dataset;
+
+    const DIM: usize = 32;
+
+    async fn generate_test_dataset(
+        test_uri: &str,
+        range: Range<f32>,
+    ) -> (Dataset, Arc<FixedSizeListArray>) {
+        let vectors = generate_random_array_with_range(1000 * DIM, range);
+        let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
+            .into_iter()
+            .collect();
+
+        let schema: Arc<_> = Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )])
+        .with_metadata(metadata)
+        .into();
+        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        (dataset, array)
+    }
+
+    #[tokio::test]
+    async fn test_build_ivf_flat() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::default();
+        let index_dir = tempdir().unwrap();
+        let index_dir = Path::from(index_dir.path().to_str().unwrap());
+        let shuffler = IvfShuffler::new(
+            dataset.object_store().clone(),
+            index_dir.child("shuffled"),
+            ivf_params.num_partitions,
+        );
+
+        let flat_index = FlatIndex::default();
+        let fq = FlatQuantizer::new(DIM, DistanceType::L2);
+        let builder = super::IvfIndexBuilder::new(
+            dataset,
+            "vector".to_owned(),
+            DistanceType::L2,
+            Box::new(shuffler),
+            index_dir.to_string(),
+            ivf_params,
+            (),
+            flat_index,
+            fq,
+        )
+        .unwrap();
+
+        builder.build().await.unwrap();
     }
 }

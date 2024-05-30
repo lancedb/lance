@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::vector::quantizer::QuantizerStorage;
 use crate::vector::utils::prefetch_arrow_array;
 use crate::vector::v3::storage::{DistCalculator, VectorStore};
 use arrow::array::AsArray;
@@ -12,13 +13,18 @@ use arrow::datatypes::UInt64Type;
 use arrow_array::{types::Float32Type, RecordBatch};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt64Array};
 use arrow_schema::DataType;
+use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
+use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
 use snafu::{location, Location};
 
-const FLAT_COLUMN: &str = "flat";
+use super::index::FlatMetadata;
+
+pub const FLAT_COLUMN: &str = "flat";
 
 /// All data are stored in memory
+#[derive(Clone)]
 pub struct FlatStorage {
     batch: RecordBatch,
     distance_type: DistanceType,
@@ -26,6 +32,25 @@ pub struct FlatStorage {
     // helper fields
     row_ids: Arc<UInt64Array>,
     vectors: Arc<FixedSizeListArray>,
+}
+
+impl DeepSizeOf for FlatStorage {
+    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+        self.batch.get_array_memory_size()
+    }
+}
+
+#[async_trait::async_trait]
+impl QuantizerStorage for FlatStorage {
+    type Metadata = FlatMetadata;
+    async fn load_partition(
+        _: &FileReader,
+        _: std::ops::Range<usize>,
+        _: DistanceType,
+        _: &Self::Metadata,
+    ) -> Result<Self> {
+        unimplemented!("Flat will be used in new index builder which doesn't require this")
+    }
 }
 
 impl FlatStorage {

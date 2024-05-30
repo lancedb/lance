@@ -61,6 +61,9 @@ pub trait IvfSubIndex: Send + Sync + Sized {
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
     fn index_vectors(&self, storage: &impl VectorStore, params: Self::BuildParams) -> Result<()>;
 
+    /// Return the schema of the sub index
+    fn schema(&self) -> arrow_schema::SchemaRef;
+
     /// Encode the sub index into a record batch
     fn to_batch(&self) -> Result<RecordBatch>;
 }
