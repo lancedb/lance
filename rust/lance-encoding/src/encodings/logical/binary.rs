@@ -253,6 +253,10 @@ impl FieldEncoder for BinaryFieldEncoder {
     fn num_columns(&self) -> u32 {
         2
     }
+
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        self.varbin_encoder.finish()
+    }
 }
 
 #[cfg(test)]

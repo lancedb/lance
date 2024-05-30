@@ -218,7 +218,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
@@ -232,8 +232,6 @@ use tracing::instrument;
 use crate::encoder::EncodedBatch;
 use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
-// use crate::encodings::logical::binary::BinaryPageScheduler;
-// use crate::encodings::logical::list::ListPageScheduler;
 use crate::encodings::logical::primitive::PrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
@@ -264,6 +262,7 @@ pub struct ColumnInfo {
     pub page_infos: Arc<Vec<PageInfo>>,
     /// File positions and their sizes of the column-level buffers
     pub buffer_offsets_and_sizes: Vec<(u64, u64)>,
+    pub encoding: pb::ColumnEncoding,
 }
 
 impl ColumnInfo {
@@ -272,11 +271,13 @@ impl ColumnInfo {
         index: u32,
         page_infos: Arc<Vec<PageInfo>>,
         buffer_offsets_and_sizes: Vec<(u64, u64)>,
+        encoding: pb::ColumnEncoding,
     ) -> Self {
         Self {
             index,
             page_infos,
             buffer_offsets_and_sizes,
+            encoding,
         }
     }
 }
@@ -306,7 +307,87 @@ pub struct DecodeBatchScheduler {
     pub root_scheduler: SimpleStructScheduler,
 }
 
-impl DecodeBatchScheduler {
+// A trait that handles the mapping from Arrow schema to field decoders.
+//
+// Note that the decoders can only be figured out using both the schema AND
+// the column metadata.  In theory, one could infer the decoder / column type
+// using only the column metadata.  However, field nullability would be
+// missing / incorrect and its also not as easy as it sounds since pages can
+// have different encodings and those encodings often have various layers.
+// Also, sometimes the inference is just impossible.  For example,
+// Timestamp, Float64, Int64, and UInt64 will all be encoded as 8-byte value
+// encoding.  The only way to know the data type is to look at the schema.
+//
+// We also can't just guess the encoding based on the schema.  This is because
+// there may be multiple different ways to encode a field and it may even
+// change on a page-by-page basis.
+//
+// For example, if a field is a struct field then we expect a header
+// column that could have one of a few different encodings.
+//
+// This could be encoded with "simple struct" and an empty header column
+// followed by the shredded child columns.  It could be encoded as a nullable
+// struct where the nulls are in a dense bitmap.  It could even be encoded
+// as a packed (row-major) struct where there is only a single column containing
+// all of the data!
+//
+// TODO: Still lots of research to do here in different ways that
+// we can map schemas to buffers.
+//
+// Example: repetition levels - the validity bitmaps for nested
+// fields are fatter (more than one bit per row) and contain
+// validity information about parent fields (e.g. is this a
+// struct-struct-null or struct-null-null or null-null-null?)
+//
+// Examples: sentinel-shredding - instead of creating a wider
+// validity bitmap we assign more sentinels to each column.  So
+// if the values of an int32 array have a max of 1000 then we can
+// use 1001 to mean null int32 and 1002 to mean null parent.
+//
+// Examples: Sparse structs - the struct column has a validity
+// bitmap that must be read if you plan on reading the struct
+// or any nested field.  However, this could be a compressed
+// bitmap stored in metadata.  A perk for this approach is that
+// the child fields can then have a smaller size than the parent
+// field.  E.g. if a struct is 1000 rows and 900 of them are
+// null then there is one validity bitmap of length 1000 and
+// 100 rows of each of the children.
+pub trait FieldDecoderStrategy {
+    fn create_field_scheduler(
+        &self,
+        data_type: &DataType,
+        column_infos: &mut dyn Iterator<Item = &ColumnInfo>,
+        buffers: FileBuffers,
+    ) -> Result<Arc<dyn FieldScheduler>>;
+}
+
+pub struct CoreFieldDecoderStrategy;
+
+impl CoreFieldDecoderStrategy {
+    fn ensure_values_encoded(column_info: &ColumnInfo) -> Result<()> {
+        let column_encoding = column_info
+            .encoding
+            .column_encoding
+            .as_ref()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    format!(
+                        "the column at index {} was missing a ColumnEncoding",
+                        column_info.index
+                    ),
+                    location!(),
+                )
+            })?;
+        if matches!(
+            column_encoding,
+            pb::column_encoding::ColumnEncoding::Values(_)
+        ) {
+            Ok(())
+        } else {
+            Err(Error::invalid_input(format!("the column at index {} was wrapped with {:?} and no decoder was registered to handle it", column_info.index, column_encoding), location!()))
+        }
+    }
+
     fn is_primitive(data_type: &DataType) -> bool {
         if data_type.is_primitive() {
             true
@@ -324,20 +405,22 @@ impl DecodeBatchScheduler {
         data_type: &DataType,
         column: &ColumnInfo,
         buffers: FileBuffers,
-    ) -> Arc<dyn FieldScheduler> {
+    ) -> Result<Arc<dyn FieldScheduler>> {
+        Self::ensure_values_encoded(column)?;
         // Primitive fields map to a single column
         let column_buffers = ColumnBuffers {
             file_buffers: buffers,
             positions_and_sizes: &column.buffer_offsets_and_sizes,
         };
-        Arc::new(PrimitiveFieldScheduler::new(
+        Ok(Arc::new(PrimitiveFieldScheduler::new(
             data_type.clone(),
             column.page_infos.clone(),
             column_buffers,
-        ))
+        )))
     }
 
     fn check_simple_struct(column_info: &ColumnInfo) -> Result<()> {
+        Self::ensure_values_encoded(column_info)?;
         if !column_info.page_infos.len() == 1 {
             return Err(Error::InvalidInput { source: format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into(), location: location!() });
         }
@@ -347,60 +430,15 @@ impl DecodeBatchScheduler {
             _ => Err(Error::InvalidInput { source: format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into(), location: location!() }),
         }
     }
-    // This function is where the all important mapping from Arrow schema
-    // to decoders happens.  Note that the decoders can only be figured out
-    // using both the schema AND the column metadata.  In theory, one could
-    // infer the decoder / column type using only the column metadata.  However,
-    // field nullability would be missing / incorrect and its also not as easy
-    // as it sounds since pages can have different encodings and those encodings
-    // often have various layers.  Also, sometimes the inference is just impossible.
-    // For example, both Timestamp, Float64, Int64, and UInt64 will be encoded
-    // as 8-byte value encoding.  The only way to know the data type is to look
-    // at the schema.
-    //
-    // We also can't just guess the encoding based on the schema.  This is because
-    // there may be multiple different ways to encode a field and it may even
-    // change on a page-by-page basis.
-    //
-    // For example, if a field is a struct field then we expect a header
-    // column that could have one of a few different encodings.
-    //
-    // This could be encoded with "simple struct" and an empty header column
-    // followed by the shredded child columns.  It could be encoded as a nullable
-    // struct where the nulls are in a dense bitmap.  It could even be encoded
-    // as a packed (row-major) struct where there is only a single column containing
-    // all of the data!
-    //
-    // TODO: Still lots of research to do here in different ways that
-    // we can map schemas to buffers.
-    //
-    // Example: repetition levels - the validity bitmaps for nested
-    // fields are fatter (more than one bit per row) and contain
-    // validity information about parent fields (e.g. is this a
-    // struct-struct-null or struct-null-null or null-null-null?)
-    //
-    // Examples: sentinel-shredding - instead of creating a wider
-    // validity bitmap we assign more sentinels to each column.  So
-    // if the values of an int32 array have a max of 1000 then we can
-    // use 1001 to mean null int32 and 1002 to mean null parent.
-    //
-    // Examples: Sparse structs - the struct column has a validity
-    // bitmap that must be read if you plan on reading the struct
-    // or any nested field.  However, this could be a compressed
-    // bitmap stored in metadata.  A perk for this approach is that
-    // the child fields can then have a smaller size than the parent
-    // field.  E.g. if a struct is 1000 rows and 900 of them are
-    // null then there is one validity bitmap of length 1000 and
-    // 100 rows of each of the children.
-    //
-    // TODO: In the future, this will need to be more flexible if
-    // we want to allow custom encodings.  E.g. if the field's encoding
-    // is not an encoding we expect then we should delegate to a plugin.
-    fn create_field_scheduler<'a>(
+}
+
+impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
+    fn create_field_scheduler(
+        &self,
         data_type: &DataType,
-        column_infos: &mut impl Iterator<Item = &'a ColumnInfo>,
+        column_infos: &mut dyn Iterator<Item = &ColumnInfo>,
         buffers: FileBuffers,
-    ) -> Arc<dyn FieldScheduler> {
+    ) -> Result<Arc<dyn FieldScheduler>> {
         if Self::is_primitive(data_type) {
             let primitive_col = column_infos.next().unwrap();
             return Self::create_primitive_scheduler(data_type, primitive_col, buffers);
@@ -418,12 +456,13 @@ impl DecodeBatchScheduler {
             }
             DataType::List(items_field) | DataType::LargeList(items_field) => {
                 let offsets_column = column_infos.next().unwrap();
+                Self::ensure_values_encoded(offsets_column)?;
                 let offsets_column_buffers = ColumnBuffers {
                     file_buffers: buffers,
                     positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
                 };
                 let items_scheduler =
-                    Self::create_field_scheduler(items_field.data_type(), column_infos, buffers);
+                    self.create_field_scheduler(items_field.data_type(), column_infos, buffers)?;
 
                 let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
                     .page_infos
@@ -463,13 +502,13 @@ impl DecodeBatchScheduler {
                 } else {
                     DataType::Int64
                 };
-                Arc::new(ListFieldScheduler::new(
+                Ok(Arc::new(ListFieldScheduler::new(
                     inner,
                     items_scheduler,
                     items_field.data_type().clone(),
                     offset_type,
                     null_offset_adjustments,
-                )) as Arc<dyn FieldScheduler>
+                )) as Arc<dyn FieldScheduler>)
             }
             DataType::Utf8 | DataType::Binary | DataType::LargeBinary | DataType::LargeUtf8 => {
                 let list_type = if matches!(data_type, DataType::Utf8 | DataType::Binary) {
@@ -477,9 +516,12 @@ impl DecodeBatchScheduler {
                 } else {
                     DataType::LargeList(Arc::new(Field::new("item", DataType::UInt8, true)))
                 };
-                let list_decoder = Self::create_field_scheduler(&list_type, column_infos, buffers);
-                Arc::new(BinaryFieldScheduler::new(list_decoder, data_type.clone()))
-                    as Arc<dyn FieldScheduler>
+                let list_decoder =
+                    self.create_field_scheduler(&list_type, column_infos, buffers)?;
+                Ok(
+                    Arc::new(BinaryFieldScheduler::new(list_decoder, data_type.clone()))
+                        as Arc<dyn FieldScheduler>,
+                )
             }
             DataType::Struct(fields) => {
                 let column_info = column_infos.next().unwrap();
@@ -487,27 +529,33 @@ impl DecodeBatchScheduler {
                 let child_schedulers = fields
                     .iter()
                     .map(|field| {
-                        Self::create_field_scheduler(field.data_type(), column_infos, buffers)
+                        self.create_field_scheduler(field.data_type(), column_infos, buffers)
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
                 // For now, we don't record nullability for structs.  As a result, there is always
                 // only one "page" of struct data.  In the future, this will change.  A null-aware
                 // struct scheduler will need to first calculate how many rows are in the struct page
                 // and then find the child pages that overlap.  This should be doable.
-                Arc::new(SimpleStructScheduler::new(child_schedulers, fields.clone()))
+                Ok(Arc::new(SimpleStructScheduler::new(
+                    child_schedulers,
+                    fields.clone(),
+                )))
             }
             // Still need support for string / binary / dictionary / RLE
             _ => todo!("Decoder support for data type {:?}", data_type),
         }
     }
+}
 
+impl DecodeBatchScheduler {
     /// Creates a new decode scheduler with the expected schema and the column
     /// metadata of the file.
-    pub fn new<'a>(
+    pub fn try_new<'a>(
         schema: &'a Schema,
         column_infos: impl IntoIterator<Item = &'a ColumnInfo>,
         file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
-    ) -> Self {
+        field_decoder_strategy: &dyn FieldDecoderStrategy,
+    ) -> Result<Self> {
         let mut col_info_iter = column_infos.into_iter();
         let buffers = FileBuffers {
             positions_and_sizes: file_buffer_positions_and_sizes,
@@ -516,11 +564,15 @@ impl DecodeBatchScheduler {
             .fields
             .iter()
             .map(|field| {
-                Self::create_field_scheduler(field.data_type(), &mut col_info_iter, buffers)
+                field_decoder_strategy.create_field_scheduler(
+                    field.data_type(),
+                    &mut col_info_iter,
+                    buffers,
+                )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let root_scheduler = SimpleStructScheduler::new(field_schedulers, schema.fields.clone());
-        Self { root_scheduler }
+        Ok(Self { root_scheduler })
     }
 
     pub fn from_scheduler(root_scheduler: SimpleStructScheduler) -> Self {
@@ -871,21 +923,6 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
 
-struct FixedPriorityIo {
-    io: Arc<dyn EncodingsIo>,
-    priority: u64,
-}
-
-impl EncodingsIo for FixedPriorityIo {
-    fn submit_request(
-        &self,
-        range: Vec<Range<u64>>,
-        _priority: u64,
-    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
-        self.io.submit_request(range, self.priority)
-    }
-}
-
 /// Contains the context for a scheduler
 pub struct SchedulerContext {
     recv: Option<mpsc::UnboundedReceiver<DecoderMessage>>,
@@ -1091,9 +1128,16 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
 }
 
 /// Decodes a batch of data from an in-memory structure created by [`crate::encoder::encode_batch`]
-pub async fn decode_batch(batch: &EncodedBatch) -> Result<RecordBatch> {
-    let mut decode_scheduler =
-        DecodeBatchScheduler::new(batch.schema.as_ref(), &batch.page_table, &vec![]);
+pub async fn decode_batch(
+    batch: &EncodedBatch,
+    field_decoder_strategy: &dyn FieldDecoderStrategy,
+) -> Result<RecordBatch> {
+    let mut decode_scheduler = DecodeBatchScheduler::try_new(
+        batch.schema.as_ref(),
+        &batch.page_table,
+        &vec![],
+        field_decoder_strategy,
+    )?;
     let (tx, rx) = unbounded_channel();
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
     decode_scheduler.schedule_range(0..batch.num_rows, tx, io_scheduler)?;

@@ -24,6 +24,7 @@ datafusion-physical-expr.workspace = true
 futures.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+snafu.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

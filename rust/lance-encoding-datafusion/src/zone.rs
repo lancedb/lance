@@ -10,17 +10,43 @@ use datafusion_common::{arrow::datatypes::DataType, ScalarValue};
 use datafusion_expr::Accumulator;
 use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
 use futures::{future::BoxFuture, FutureExt};
-use lance_encoding::encoder::{
-    encode_batch, CoreFieldEncodingStrategy, EncodedBuffer, FieldEncoder,
+use lance_encoding::{
+    decoder::{FieldScheduler, SchedulingJob},
+    encoder::{
+        encode_batch, CoreFieldEncodingStrategy, EncodedBuffer, EncodedColumn, FieldEncoder,
+    },
+    format::pb,
 };
 
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_file::v2::writer::EncodedBatchWriteExt;
+use snafu::{location, Location};
 
+#[derive(Debug)]
 struct CreatedZoneMap {
     min: ScalarValue,
     max: ScalarValue,
     null_count: u32,
+}
+
+#[derive(Debug)]
+pub struct ZoneMapsFieldScheduler {
+    inner: Arc<dyn FieldScheduler>,
+    zone_maps: Vec<CreatedZoneMap>,
+    rows_per_zone: u32,
+}
+
+impl FieldScheduler for ZoneMapsFieldScheduler {
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Box<dyn SchedulingJob + 'a>> {
+        self.inner.schedule_ranges(ranges)
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.inner.num_rows()
+    }
 }
 
 /// A field encoder that creates zone maps for the data it encodes
@@ -110,7 +136,7 @@ impl ZoneMapsFieldEncoder {
         Ok(())
     }
 
-    async fn maps_to_metadata(&mut self) -> Result<Vec<EncodedBuffer>> {
+    async fn maps_to_metadata(&mut self) -> Result<EncodedBuffer> {
         let maps = std::mem::take(&mut self.maps);
         let (mins, (maxes, null_counts)): (Vec<_>, (Vec<_>, Vec<_>)) = maps
             .into_iter()
@@ -128,9 +154,9 @@ impl ZoneMapsFieldEncoder {
         let encoding_strategy = CoreFieldEncodingStrategy::default();
         let encoded_zone_maps = encode_batch(&zone_maps, &encoding_strategy, u64::MAX).await?;
         let zone_maps_buffer = encoded_zone_maps.try_to_mini_lance()?;
-        Ok(vec![EncodedBuffer {
+        Ok(EncodedBuffer {
             parts: vec![Buffer::from(zone_maps_buffer)],
-        }])
+        })
     }
 }
 
@@ -156,8 +182,36 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         self.items_encoder.flush()
     }
 
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedBuffer>>> {
-        async move { self.maps_to_metadata().await }.boxed()
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        async move {
+            let items_columns = self.items_encoder.finish().await?;
+            if items_columns.is_empty() {
+                return Err(Error::invalid_input("attempt to apply zone maps to a field encoder that generated zero columns of data".to_string(), location!()))
+            }
+            let items_column = items_columns.into_iter().next().unwrap();
+            let final_pages = items_column.final_pages;
+            let mut column_buffers = items_column.column_buffers;
+            let zone_buffer_index = column_buffers.len();
+            column_buffers.push(self.maps_to_metadata().await?);
+            let column_encoding = pb::ColumnEncoding {
+                column_encoding: Some(pb::column_encoding::ColumnEncoding::ZoneIndex(Box::new(
+                    pb::ZoneIndex {
+                        inner: Some(Box::new(items_column.encoding)),
+                        rows_per_zone: self.rows_per_map,
+                        zone_map_buffer: Some(pb::Buffer {
+                            buffer_index: zone_buffer_index as u32,
+                            buffer_type: i32::from(pb::buffer::BufferType::Column),
+                        }),
+                    },
+                ))),
+            };
+            Ok(vec![EncodedColumn {
+                encoding: column_encoding,
+                final_pages,
+                column_buffers,
+            }])
+        }
+        .boxed()
     }
 
     fn num_columns(&self) -> u32 {
@@ -209,13 +263,6 @@ mod tests {
             encoder.maybe_encode(array.clone()).unwrap();
         }
 
-        let zone_maps_buffer = encoder.finish().await.unwrap();
-        assert_eq!(zone_maps_buffer.len(), 1);
-        let zone_maps_buffer = zone_maps_buffer.into_iter().next().unwrap();
-        assert_eq!(zone_maps_buffer.parts.len(), 1);
-        let zone_maps_buffer = zone_maps_buffer.parts.into_iter().next().unwrap();
-        // TODO: Once reading is available we can check the contents of the zone maps buffer
-        // TODO: Test out the different types
-        assert!(!zone_maps_buffer.is_empty());
+        encoder.finish().await.unwrap();
     }
 }

@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, TimeUnit};
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance_encoding::encoder::{encode_batch, CoreFieldEncodingStrategy};
+use lance_encoding::{
+    decoder::CoreFieldDecoderStrategy,
+    encoder::{encode_batch, CoreFieldEncodingStrategy},
+};
 
 const PRIMITIVE_TYPES: &[DataType] = &[
     DataType::Date32,
@@ -65,7 +68,10 @@ fn bench_decode(c: &mut Criterion) {
         group.bench_function(func_name, |b| {
             b.iter(|| {
                 let batch = rt
-                    .block_on(lance_encoding::decoder::decode_batch(&encoded))
+                    .block_on(lance_encoding::decoder::decode_batch(
+                        &encoded,
+                        &CoreFieldDecoderStrategy,
+                    ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
             })
@@ -93,7 +99,10 @@ fn bench_decode_fsl(c: &mut Criterion) {
         group.bench_function(func_name, |b| {
             b.iter(|| {
                 let batch = rt
-                    .block_on(lance_encoding::decoder::decode_batch(&encoded))
+                    .block_on(lance_encoding::decoder::decode_batch(
+                        &encoded,
+                        &CoreFieldDecoderStrategy,
+                    ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
             })

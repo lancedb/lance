@@ -84,9 +84,7 @@ fn initial_column_metadata() -> pbfile::ColumnMetadata {
         pages: Vec::new(),
         buffer_offsets: Vec::new(),
         buffer_sizes: Vec::new(),
-        encoding: Some(pbfile::Encoding {
-            location: Some(pbfile::encoding::Location::None(())),
-        }),
+        encoding: None,
     }
 }
 
@@ -317,6 +315,53 @@ impl FileWriter {
         self.schema.metadata.insert(key.into(), value.into());
     }
 
+    async fn finish_writers(&mut self) -> Result<()> {
+        let mut col_idx = 0;
+        for mut writer in std::mem::take(&mut self.column_writers) {
+            let columns = writer.finish().await?;
+            debug_assert_eq!(
+                columns.len(),
+                writer.num_columns() as usize,
+                "Expected {} columns from column at index {} and got {}",
+                writer.num_columns(),
+                col_idx,
+                columns.len()
+            );
+            for column in columns {
+                for page in column.final_pages {
+                    self.write_page(page).await?;
+                }
+                let column_metadata = &mut self.column_metadata[col_idx];
+                let mut buffer_pos = self.writer.tell().await? as u64;
+                for buffer in column.column_buffers {
+                    column_metadata.buffer_offsets.push(buffer_pos);
+                    let mut size = 0;
+                    for part in buffer.parts {
+                        self.writer.write_all(&part).await?;
+                        size += part.len() as u64;
+                    }
+                    buffer_pos += size;
+                    column_metadata.buffer_sizes.push(size);
+                }
+                let encoded_encoding = Any::from_msg(&column.encoding)?.encode_to_vec();
+                column_metadata.encoding = Some(pbfile::Encoding {
+                    location: Some(pbfile::encoding::Location::Direct(pbfile::DirectEncoding {
+                        encoding: encoded_encoding,
+                    })),
+                });
+                col_idx += 1;
+            }
+        }
+        if col_idx as usize != self.column_metadata.len() {
+            panic!(
+                "Column writers finished with {} columns but we expected {}",
+                col_idx,
+                self.column_metadata.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Finishes writing the file
     ///
     /// This method will wait until all data has been flushed to the file.  Then it
@@ -337,13 +382,14 @@ impl FileWriter {
             .collect::<FuturesUnordered<_>>();
         self.write_pages(encoding_tasks).await?;
 
+        self.finish_writers().await?;
+
         // No data, so don't create a file
         if self.rows_written == 0 {
             self.writer.shutdown().await?;
             return Ok(0);
         }
 
-        // 2. write the column metadata buffers (coming soon)
         // 3. write global buffers (we write the schema here)
         let global_buffer_offsets = self.write_global_buffers().await?;
         let num_global_buffers = global_buffer_offsets.len() as u32;

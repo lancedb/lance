@@ -7,7 +7,6 @@ use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
-use futures::FutureExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
@@ -77,6 +76,19 @@ pub struct EncodedArray {
     pub encoding: pb::ArrayEncoding,
 }
 
+impl EncodedArray {
+    pub fn into_parts(mut self) -> (Vec<EncodedBuffer>, pb::ArrayEncoding) {
+        self.buffers.sort_by_key(|b| b.index);
+        (
+            self.buffers
+                .into_iter()
+                .map(|b| EncodedBuffer { parts: b.parts })
+                .collect(),
+            self.encoding,
+        )
+    }
+}
+
 /// An encoded page of data
 ///
 /// Maps to a top-level array
@@ -129,6 +141,30 @@ pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray>;
 }
 
+pub fn values_column_encoding() -> pb::ColumnEncoding {
+    pb::ColumnEncoding {
+        column_encoding: Some(pb::column_encoding::ColumnEncoding::Values(())),
+    }
+}
+
+pub struct EncodedColumn {
+    pub column_buffers: Vec<EncodedBuffer>,
+    pub encoding: pb::ColumnEncoding,
+    pub final_pages: Vec<EncodedPage>,
+}
+
+impl Default for EncodedColumn {
+    fn default() -> Self {
+        Self {
+            column_buffers: Default::default(),
+            encoding: pb::ColumnEncoding {
+                column_encoding: Some(pb::column_encoding::ColumnEncoding::Values(())),
+            },
+            final_pages: Default::default(),
+        }
+    }
+}
+
 /// A task to create a page of data
 pub type EncodeTask = BoxFuture<'static, Result<EncodedPage>>;
 
@@ -160,14 +196,12 @@ pub trait FieldEncoder: Send {
     /// This may be called intermittently throughout encoding but will always be called
     /// once at the end of encoding just before calling finish
     fn flush(&mut self) -> Result<Vec<EncodeTask>>;
-    /// Finish encoding and return column metadata buffers
+    /// Finish encoding and return column metadata
     ///
     /// This is called only once, after all encode tasks have completed
     ///
-    /// By default, returns an empty Vec (no column metadata buffers)
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedBuffer>>> {
-        std::future::ready(Ok(vec![])).boxed()
-    }
+    /// This returns a Vec because a single field may have created multiple columns
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>>;
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
 }
@@ -426,6 +460,25 @@ pub struct EncodedBatch {
     pub num_rows: u64,
 }
 
+fn write_page_to_data_buffer(page: EncodedPage, data_buffer: &mut BytesMut) -> PageInfo {
+    let mut buffers = page.array.buffers;
+    buffers.sort_by_key(|b| b.index);
+    let mut buffer_offsets_and_sizes = Vec::new();
+    for buffer in buffers {
+        let buffer_offset = data_buffer.len() as u64;
+        for part in buffer.parts {
+            data_buffer.extend_from_slice(&part);
+        }
+        let size = data_buffer.len() as u64 - buffer_offset;
+        buffer_offsets_and_sizes.push((buffer_offset, size));
+    }
+    PageInfo {
+        buffer_offsets_and_sizes: Arc::new(buffer_offsets_and_sizes),
+        encoding: page.array.encoding,
+        num_rows: page.num_rows,
+    }
+}
+
 /// Helper method to encode a batch of data into memory
 ///
 /// This is primarily for testing and benchmarking but could be useful in other
@@ -444,34 +497,49 @@ pub async fn encode_batch(
         true,
     )?;
     let mut page_table = Vec::new();
+    let mut col_idx_offset = 0;
     for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
         let mut tasks = encoder.maybe_encode(arr.clone())?;
         tasks.extend(encoder.flush()?);
-        let mut pages = Vec::new();
+        let mut pages = HashMap::<u32, Vec<PageInfo>>::new();
+        let mut max_col_idx = -1_i64;
         for task in tasks {
             let encoded_page = task.await?;
-            let mut buffers = encoded_page.array.buffers;
-            buffers.sort_by_key(|b| b.index);
-            let mut buffer_offsets_and_sizes = Vec::new();
-            for buffer in buffers {
+            max_col_idx = max_col_idx.max(encoded_page.column_idx as i64);
+            pages
+                .entry(encoded_page.column_idx)
+                .or_default()
+                .push(write_page_to_data_buffer(encoded_page, &mut data_buffer));
+        }
+        let encoded_columns = encoder.finish().await?;
+        let num_columns = encoded_columns.len();
+        debug_assert_eq!(encoded_columns.len() as i64, max_col_idx);
+        for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
+            let col_idx = col_idx + col_idx_offset;
+            let mut col_buffer_offsets_and_sizes = Vec::new();
+            for buffer in encoded_column.column_buffers {
                 let buffer_offset = data_buffer.len() as u64;
                 for part in buffer.parts {
                     data_buffer.extend_from_slice(&part);
                 }
                 let size = data_buffer.len() as u64 - buffer_offset;
-                buffer_offsets_and_sizes.push((buffer_offset, size));
+                col_buffer_offsets_and_sizes.push((buffer_offset, size));
             }
-            pages.push(PageInfo {
-                buffer_offsets_and_sizes: Arc::new(buffer_offsets_and_sizes),
-                encoding: encoded_page.array.encoding,
-                num_rows: encoded_page.num_rows,
+            for page in encoded_column.final_pages {
+                pages
+                    .entry(page.column_idx)
+                    .or_default()
+                    .push(write_page_to_data_buffer(page, &mut data_buffer));
+            }
+            let col_pages = std::mem::take(pages.entry(col_idx as u32).or_default());
+            page_table.push(ColumnInfo {
+                index: col_idx as u32,
+                buffer_offsets_and_sizes: col_buffer_offsets_and_sizes,
+                page_infos: Arc::new(col_pages),
+                encoding: encoded_column.encoding,
             })
         }
-        page_table.push(ColumnInfo {
-            index: 0,
-            buffer_offsets_and_sizes: vec![],
-            page_infos: Arc::new(pages),
-        })
+        col_idx_offset += num_columns;
     }
     Ok(EncodedBatch {
         data: data_buffer.freeze(),

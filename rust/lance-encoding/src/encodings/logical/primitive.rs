@@ -31,7 +31,7 @@ use crate::{
         DecodeArrayTask, FieldScheduler, LogicalPageDecoder, NextDecodeTask, PageInfo,
         PageScheduler, PhysicalPageDecoder, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{ArrayEncodingStrategy, EncodeTask, EncodedPage, FieldEncoder},
+    encoder::{ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, FieldEncoder},
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
 
@@ -668,5 +668,9 @@ impl FieldEncoder for PrimitiveFieldEncoder {
 
     fn num_columns(&self) -> u32 {
         1
+    }
+
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        std::future::ready(Ok(vec![EncodedColumn::default()])).boxed()
     }
 }

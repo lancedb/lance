@@ -18,7 +18,7 @@ use crate::{
         DecodeArrayTask, DecoderReady, FieldScheduler, LogicalPageDecoder, NextDecodeTask,
         ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
+    encoder::{EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
     format::pb,
 };
 use lance_core::{Error, Result};
@@ -561,6 +561,19 @@ impl FieldEncoder for StructFieldEncoder {
             .map(|child| child.num_columns())
             .sum::<u32>()
             + 1
+    }
+
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        async move {
+            let mut columns = Vec::new();
+            // Add a column for the struct header
+            columns.push(EncodedColumn::default());
+            for child in self.children.iter_mut() {
+                columns.extend(child.finish().await?);
+            }
+            Ok(columns)
+        }
+        .boxed()
     }
 }
 

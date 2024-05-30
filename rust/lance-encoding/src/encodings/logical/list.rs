@@ -23,7 +23,7 @@ use crate::{
         DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, LogicalPageDecoder, NextDecodeTask,
         ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
+    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
     encodings::{
         logical::r#struct::SimpleStructScheduler,
         physical::{
@@ -1144,6 +1144,15 @@ impl FieldEncoder for ListFieldEncoder {
 
     fn num_columns(&self) -> u32 {
         self.items_encoder.num_columns() + 1
+    }
+
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        async move {
+            let mut columns = vec![EncodedColumn::default()];
+            columns.extend(self.items_encoder.finish().await?);
+            Ok(columns)
+        }
+        .boxed()
     }
 }
 

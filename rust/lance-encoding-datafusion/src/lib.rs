@@ -1,14 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use arrow_schema::DataType;
-use lance_encoding::encoder::{
-    ColumnIndexSequence, CoreFieldEncodingStrategy, FieldEncodingStrategy,
+use lance_encoding::{
+    decoder::{ColumnInfo, CoreFieldDecoderStrategy, FieldDecoderStrategy, FieldScheduler},
+    encoder::{ColumnIndexSequence, CoreFieldEncodingStrategy, FieldEncodingStrategy},
+    encodings::physical::FileBuffers,
 };
 use zone::ZoneMapsFieldEncoder;
 
 pub mod format;
 pub mod zone;
+
+struct LanceDfFieldDecoderStrategy {
+    core: CoreFieldDecoderStrategy,
+}
+
+impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
+    fn create_field_scheduler(
+        &self,
+        data_type: &DataType,
+        column_infos: &mut dyn Iterator<Item = &ColumnInfo>,
+        buffers: FileBuffers,
+    ) -> lance_core::Result<Arc<dyn FieldScheduler>> {
+        todo!()
+    }
+}
 
 /// Wraps the core encoding strategy and adds the encoders from this
 /// crate

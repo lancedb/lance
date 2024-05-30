@@ -15,9 +15,12 @@ use lance_core::Result;
 use lance_datagen::{array, gen, RowCount, Seed};
 
 use crate::{
-    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, PageInfo},
+    decoder::{
+        BatchDecodeStream, ColumnInfo, CoreFieldDecoderStrategy, DecodeBatchScheduler,
+        DecoderMessage, PageInfo,
+    },
     encoder::{
-        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodedPage, FieldEncoder,
+        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodedBuffer, EncodedPage, FieldEncoder,
         FieldEncodingStrategy,
     },
     encodings::logical::r#struct::SimpleStructDecoder,
@@ -29,18 +32,8 @@ pub(crate) struct SimulatedScheduler {
 }
 
 impl SimulatedScheduler {
-    pub fn new(data: Vec<EncodedPage>) -> Self {
-        let mut bytes = BytesMut::new();
-        for page in data.into_iter() {
-            for buf in page.array.buffers {
-                for part in buf.parts.into_iter() {
-                    bytes.extend_from_slice(&part)
-                }
-            }
-        }
-        Self {
-            data: bytes.freeze(),
-        }
+    pub fn new(data: Bytes) -> Self {
+        Self { data }
     }
 
     fn satisfy_request(&self, req: Range<u64>) -> Bytes {
@@ -73,7 +66,9 @@ async fn test_decode(
         UnboundedSender<DecoderMessage>,
     ) -> (SimpleStructDecoder, BoxFuture<'static, Result<()>>),
 ) {
-    let decode_scheduler = DecodeBatchScheduler::new(schema, column_infos, &Vec::new());
+    let decode_scheduler =
+        DecodeBatchScheduler::try_new(schema, column_infos, &Vec::new(), &CoreFieldDecoderStrategy)
+            .unwrap();
 
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -197,6 +192,49 @@ pub async fn check_round_trip_encoding_of_data(data: Vec<Arc<dyn Array>>, test_c
     }
 }
 
+struct SimulatedWriter {
+    page_infos: Vec<Vec<PageInfo>>,
+    encoded_data: BytesMut,
+}
+
+impl SimulatedWriter {
+    fn new(num_columns: u32) -> Self {
+        let mut page_infos = Vec::with_capacity(num_columns as usize);
+        page_infos.resize_with(num_columns as usize, Default::default);
+        Self {
+            page_infos,
+            encoded_data: BytesMut::new(),
+        }
+    }
+
+    fn write_buffer(&mut self, buffer: EncodedBuffer) -> (u64, u64) {
+        let offset = self.encoded_data.len() as u64;
+        for part in buffer.parts.iter() {
+            self.encoded_data.extend_from_slice(&part);
+        }
+        let size = self.encoded_data.len() as u64 - offset;
+        (offset, size)
+    }
+
+    fn write_page(&mut self, encoded_page: EncodedPage) {
+        trace!("Encoded page {:?}", encoded_page);
+        let (page_buffers, page_encoding) = encoded_page.array.into_parts();
+        let buffer_offsets_and_sizes = page_buffers
+            .into_iter()
+            .map(|b| self.write_buffer(b))
+            .collect::<Vec<_>>();
+
+        let page_info = PageInfo {
+            num_rows: encoded_page.num_rows,
+            encoding: page_encoding,
+            buffer_offsets_and_sizes: Arc::new(buffer_offsets_and_sizes.clone()),
+        };
+
+        let col_idx = encoded_page.column_idx as usize;
+        self.page_infos[col_idx].push(page_info);
+    }
+}
+
 /// This is the inner-most check function that actually runs the round trip and tests it
 async fn check_round_trip_encoding_inner(
     mut encoder: Box<dyn FieldEncoder>,
@@ -204,58 +242,46 @@ async fn check_round_trip_encoding_inner(
     data: Vec<Arc<dyn Array>>,
     test_cases: &TestCases,
 ) {
-    let mut all_encoded_pages = Vec::new();
-    let mut page_infos: Vec<Vec<PageInfo>> = Vec::with_capacity(encoder.num_columns() as usize);
-    page_infos.resize_with(encoder.num_columns() as usize, Default::default);
-    let mut buffer_offset = 0;
-
-    let mut simulate_write = |mut encoded_page: EncodedPage| {
-        trace!("Encoded page {:?}", encoded_page);
-        encoded_page.array.buffers.sort_by_key(|b| b.index);
-        let buffer_offsets_and_sizes = encoded_page
-            .array
-            .buffers
-            .iter()
-            .map(|buf| {
-                let offset = buffer_offset;
-                let size = buf.parts.iter().map(|part| part.len() as u64).sum::<u64>();
-                buffer_offset += size;
-                (offset, size)
-            })
-            .collect::<Vec<_>>();
-
-        let page_info = PageInfo {
-            num_rows: encoded_page.num_rows,
-            encoding: encoded_page.array.encoding.clone(),
-            buffer_offsets_and_sizes: Arc::new(buffer_offsets_and_sizes.clone()),
-        };
-
-        let col_idx = encoded_page.column_idx as usize;
-        all_encoded_pages.push(encoded_page);
-        page_infos[col_idx].push(page_info);
-    };
+    let mut writer = SimulatedWriter::new(encoder.num_columns());
 
     for arr in &data {
         for encode_task in encoder.maybe_encode(arr.clone()).unwrap() {
             let encoded_page = encode_task.await.unwrap();
-            simulate_write(encoded_page);
+            writer.write_page(encoded_page);
         }
     }
 
     for encode_task in encoder.flush().unwrap() {
         let encoded_page = encode_task.await.unwrap();
-        simulate_write(encoded_page);
+        writer.write_page(encoded_page);
     }
 
-    let scheduler = Arc::new(SimulatedScheduler::new(all_encoded_pages)) as Arc<dyn EncodingsIo>;
+    let encoded_columns = encoder.finish().await.unwrap();
+    let mut column_infos = Vec::new();
+    for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
+        for page in encoded_column.final_pages {
+            writer.write_page(page);
+        }
 
-    let column_infos = page_infos
-        .into_iter()
-        .enumerate()
-        .map(|(col_idx, page_infos)| {
-            ColumnInfo::new(col_idx as u32, Arc::new(page_infos), Vec::new())
-        })
-        .collect::<Vec<_>>();
+        let col_buffer_off_and_size = encoded_column
+            .column_buffers
+            .into_iter()
+            .map(|b| writer.write_buffer(b))
+            .collect();
+
+        let column_info = ColumnInfo::new(
+            col_idx as u32,
+            Arc::new(std::mem::take(&mut writer.page_infos[col_idx])),
+            col_buffer_off_and_size,
+            encoded_column.encoding,
+        );
+
+        column_infos.push(column_info);
+    }
+
+    let scheduler =
+        Arc::new(SimulatedScheduler::new(writer.encoded_data.freeze())) as Arc<dyn EncodingsIo>;
+
     let schema = Schema::new(vec![field.clone()]);
 
     let num_rows = data.iter().map(|arr| arr.len() as u64).sum::<u64>();

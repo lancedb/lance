@@ -9,11 +9,14 @@ use bytes::{Bytes, BytesMut};
 use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_encoding::{
-    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, PageInfo, ReadBatchTask},
+    decoder::{
+        BatchDecodeStream, ColumnInfo, CoreFieldDecoderStrategy, DecodeBatchScheduler, PageInfo,
+        ReadBatchTask,
+    },
     EncodingsIo,
 };
 use log::debug;
-use prost::Message;
+use prost::{Message, Name};
 use snafu::{location, Location};
 
 use lance_core::{
@@ -346,75 +349,13 @@ impl FileReader {
         })
     }
 
-    pub async fn print_all_metadata(metadata: &CachedFileMetadata) -> Result<()> {
-        // 1. read and print the footer
-        println!("# Footer");
-        println!();
-        println!(
-            "File version           : {}.{}",
-            MAJOR_VERSION, MINOR_VERSION_NEXT
-        );
-        println!("Data bytes             : {}", metadata.num_data_bytes);
-        println!("Col. meta bytes: {}", metadata.num_column_metadata_bytes);
-        println!("Glo. data bytes: {}", metadata.num_global_buffer_bytes);
-
-        // 2. print the global buffers
-        println!("Global buffers:");
-        for file_buffer in &metadata.file_buffers {
-            println!(
-                " * {}..{}",
-                file_buffer.position,
-                file_buffer.position + file_buffer.size
-            );
-        }
-
-        println!("Columns:");
-        for (idx, col) in metadata.column_metadatas.iter().enumerate() {
-            println!(" * Column {}", idx);
-            println!();
-            println!("   Buffers:");
-            for idx in 0..col.buffer_offsets.len() {
-                println!(
-                    "    * {}..{}",
-                    col.buffer_offsets[idx],
-                    col.buffer_offsets[idx] + col.buffer_sizes[idx]
-                );
-            }
-            println!("   Pages:");
-            println!();
-            for (page_idx, page) in col.pages.iter().enumerate() {
-                println!("   * Page {}", page_idx);
-                println!();
-                println!("     Buffers:");
-                for buf_idx in 0..page.buffer_offsets.len() {
-                    println!(
-                        "      * {}..{}",
-                        page.buffer_offsets[buf_idx],
-                        page.buffer_offsets[buf_idx] + page.buffer_sizes[buf_idx]
-                    );
-                }
-                let encoding = page.encoding.as_ref().unwrap();
-                let encoding = Self::fetch_encoding(encoding);
-                println!("     Encoding:");
-                println!();
-                let encoding_dbg = format!("{:#?}", encoding);
-                for line in encoding_dbg.lines() {
-                    println!("       {}", line);
-                }
-                println!();
-            }
-        }
-
-        Ok(())
-    }
-
-    fn fetch_encoding(encoding: &pbfile::Encoding) -> pbenc::ArrayEncoding {
+    fn fetch_encoding<M: Default + Name + Sized>(encoding: &pbfile::Encoding) -> M {
         match &encoding.location {
             Some(pbfile::encoding::Location::Indirect(_)) => todo!(),
             Some(pbfile::encoding::Location::Direct(encoding)) => {
                 let encoding_buf = Bytes::from(encoding.encoding.clone());
                 let encoding_any = prost_types::Any::decode(encoding_buf).unwrap();
-                encoding_any.to_msg::<pbenc::ArrayEncoding>().unwrap()
+                encoding_any.to_msg::<M>().unwrap()
             }
             Some(pbfile::encoding::Location::None(_)) => panic!(),
             None => panic!(),
@@ -450,6 +391,7 @@ impl FileReader {
                     index: col_idx as u32,
                     page_infos: Arc::new(page_infos),
                     buffer_offsets_and_sizes: vec![],
+                    encoding: Self::fetch_encoding(dbg!(col_meta).encoding.as_ref().unwrap()),
                 })
             })
             .collect::<Vec<_>>()
@@ -612,11 +554,12 @@ impl FileReader {
             batch_size,
             column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
         );
-        let mut decode_scheduler = DecodeBatchScheduler::new(
+        let mut decode_scheduler = DecodeBatchScheduler::try_new(
             &projection.schema,
             column_infos.iter().map(|ci| ci.as_ref()),
             &vec![],
-        );
+            &CoreFieldDecoderStrategy,
+        )?;
 
         let root_decoder = decode_scheduler
             .root_scheduler
@@ -647,11 +590,12 @@ impl FileReader {
             batch_size,
             column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
         );
-        let mut decode_scheduler = DecodeBatchScheduler::new(
+        let mut decode_scheduler = DecodeBatchScheduler::try_new(
             &projection.schema,
             column_infos.iter().map(|ci| ci.as_ref()),
             &vec![],
-        );
+            &CoreFieldDecoderStrategy,
+        )?;
 
         let root_decoder = decode_scheduler
             .root_scheduler
