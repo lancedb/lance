@@ -382,7 +382,7 @@ impl ObjectStore {
         ))
     }
 
-    pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
+    pub fn from_path_with_scheme(str_path: &str, scheme: &str) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
 
         let mut expanded_path = path_abs::PathAbs::new(expanded)
@@ -398,12 +398,16 @@ impl ObjectStore {
         Ok((
             Self {
                 inner: Arc::new(LocalFileSystem::new()).traced(),
-                scheme: String::from("file"),
+                scheme: String::from(scheme),
                 base_path: Path::from_absolute_path(expanded_path.as_path())?,
                 block_size: 4 * 1024, // 4KB block size
             },
             Path::from_absolute_path(expanded_path.as_path())?,
         ))
+    }
+
+    pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
+        Self::from_path_with_scheme(str_path, "file")
     }
 
     async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
@@ -453,11 +457,29 @@ impl ObjectStore {
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size).await,
+            "file" => LocalObjectReader::open(path, self.block_size, None).await,
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
+                None,
+            )?)),
+        }
+    }
+
+    /// Open a reader for a file with known size.
+    ///
+    /// This size may either have been retrieved from a list operation or
+    /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
+    /// call.
+    pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+        match self.scheme.as_str() {
+            "file" => LocalObjectReader::open(path, self.block_size, Some(known_size)).await,
+            _ => Ok(Box::new(CloudObjectReader::new(
+                self.inner.clone(),
+                path.clone(),
+                self.block_size,
+                Some(known_size),
             )?)),
         }
     }
@@ -761,7 +783,14 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 block_size: 64 * 1024,
             })
         }
+        // we have a bypass logic to use `tokio::fs` directly to lower overhead
+        // however this makes testing harder as we can't use the same code path
+        // "file-object-store" forces local file system dataset to use the same
+        // code path as cloud object stores
         "file" => Ok(ObjectStore::from_path(url.path())?.0),
+        "file-object-store" => {
+            Ok(ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0)
+        }
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
@@ -886,6 +915,7 @@ lazy_static::lazy_static! {
         "gs",
         "az",
         "file",
+        "file-object-store",
         "memory"
       ]);
 }

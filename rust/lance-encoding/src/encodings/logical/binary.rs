@@ -19,7 +19,7 @@ use crate::{
     decoder::{
         DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, SchedulerContext,
     },
-    encoder::{EncodeTask, FieldEncoder},
+    encoder::{CoreArrayEncodingStrategy, EncodeTask, FieldEncoder},
 };
 
 use super::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder};
@@ -173,7 +173,7 @@ impl BinaryFieldEncoder {
             PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_column,
                 keep_original_array,
-                &DataType::UInt8,
+                Arc::new(CoreArrayEncodingStrategy),
                 column_index + 1,
             )
             .unwrap(),

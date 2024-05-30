@@ -91,7 +91,8 @@ impl IoTask {
         let bytes = self
             .reader
             .get_range(self.to_read.start as usize..self.to_read.end as usize)
-            .await;
+            .await
+            .map_err(Error::from);
         (self.when_done)(bytes);
     }
 }

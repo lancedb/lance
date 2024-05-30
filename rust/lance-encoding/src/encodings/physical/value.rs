@@ -41,6 +41,17 @@ impl fmt::Display for CompressionScheme {
     }
 }
 
+pub fn parse_compression_scheme(scheme: &str) -> Result<CompressionScheme> {
+    match scheme {
+        "none" => Ok(CompressionScheme::None),
+        "zstd" => Ok(CompressionScheme::Zstd),
+        _ => Err(Error::invalid_input(
+            format!("Unknown compression scheme: {}", scheme),
+            location!(),
+        )),
+    }
+}
+
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
 pub struct ValuePageScheduler {

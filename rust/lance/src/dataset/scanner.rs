@@ -1731,6 +1731,55 @@ mod test {
         }
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_local_object_store() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("s", DataType::Utf8, true),
+        ]));
+
+        let batches: Vec<RecordBatch> = (0..5)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(&format!("file-object-store://{}", test_uri))
+            .await
+            .unwrap();
+        let mut builder = dataset.scan();
+        builder.batch_size(8);
+        let mut stream = builder.try_into_stream().await.unwrap();
+        for expected_len in [8, 2, 8, 2, 8, 2, 8, 2, 8, 2] {
+            assert_eq!(
+                stream.next().await.unwrap().unwrap().num_rows(),
+                expected_len as usize
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_filter_parsing() -> Result<()> {
         let test_ds = TestVectorDataset::new(false).await?;

@@ -137,7 +137,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     /// use lance_io::{local::LocalObjectReader, encodings::binary::BinaryDecoder, traits::Reader};
     ///
     /// async {
-    ///     let reader = LocalObjectReader::open_local_path("/tmp/foo.lance", 2048).await.unwrap();
+    ///     let reader = LocalObjectReader::open_local_path("/tmp/foo.lance", 2048, None).await.unwrap();
     ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024, true);
     /// };
     /// ```
@@ -494,7 +494,7 @@ mod tests {
 
         let pos = write_test_data(&path, arrs).await.unwrap();
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let read_len = arrs.iter().map(|a| a.len()).sum();
@@ -562,7 +562,7 @@ mod tests {
         let pos = encoder.encode(&[&data]).await.unwrap();
         object_writer.shutdown().await.unwrap();
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -605,7 +605,7 @@ mod tests {
         let path = temp_dir.path().join("foo");
 
         let pos = write_test_data(&path, &[&data]).await.unwrap();
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -627,7 +627,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("foo");
         let pos = write_test_data(&path, &[&data]).await.unwrap();
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -658,7 +658,7 @@ mod tests {
         let path = temp_dir.path().join("foo");
         let pos = write_test_data(&path, &[&data]).await.unwrap();
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -738,7 +738,7 @@ mod tests {
             pos
         };
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<BinaryType>::new(reader.as_ref(), pos, data.len(), true);

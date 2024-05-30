@@ -77,14 +77,16 @@ pub async fn read_fixed_stride_array(
 }
 
 /// Read a protobuf message at file position 'pos'.
-// TODO: pub(crate)
+///
+/// We write protobuf by first writing the length of the message as a u32,
+/// followed by the message itself.
 pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
     let file_size = reader.size().await?;
     if pos > file_size {
         return Err(Error::io("file size is too small".to_string(), location!()));
     }
 
-    let range = pos..min(pos + 4096, file_size);
+    let range = pos..min(pos + reader.block_size(), file_size);
     let buf = reader.get_range(range.clone()).await?;
     let msg_len = LittleEndian::read_u32(&buf) as usize;
 
@@ -113,7 +115,7 @@ pub async fn read_struct<
     T::try_from(msg)
 }
 
-pub async fn read_last_block(reader: &dyn Reader) -> Result<Bytes> {
+pub async fn read_last_block(reader: &dyn Reader) -> object_store::Result<Bytes> {
     let file_size = reader.size().await?;
     let block_size = reader.block_size();
     let begin = if file_size < block_size {
@@ -225,7 +227,7 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let object_reader = CloudObjectReader::new(Arc::new(store), path, 1024).unwrap();
+        let object_reader = CloudObjectReader::new(Arc::new(store), path, 1024, None).unwrap();
         let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(some_message, actual);
     }

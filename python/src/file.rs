@@ -185,6 +185,7 @@ impl LanceFileWriter {
             FileWriterOptions {
                 data_cache_bytes,
                 keep_original_array,
+                ..Default::default()
             },
         )
         .infer_error()?;
