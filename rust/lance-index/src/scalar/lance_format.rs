@@ -183,9 +183,13 @@ mod tests {
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path: &Path = tempdir.path();
-        let object_store = ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        let index_dir = object_store.base_path().clone();
-        Arc::new(LanceIndexStore::new(object_store, index_dir, None))
+        let (object_store, test_path) =
+            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
+        Arc::new(LanceIndexStore::new(
+            object_store,
+            test_path.to_owned(),
+            None,
+        ))
     }
 
     struct MockTrainingSource {

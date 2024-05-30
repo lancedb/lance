@@ -84,6 +84,11 @@ pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
+    /// Uri of the dataset.
+    ///
+    /// On cloud storage, we can not use [Dataset::base] to build the full uri because the
+    /// `bucket` is swlloed in the inner [ObjectStore].
+    uri: String,
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) session: Arc<Session>,
@@ -351,9 +356,11 @@ impl Dataset {
         }
 
         populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+        let uri = object_store.uri(&base_path);
         Ok(Self {
             object_store,
             base: base_path,
+            uri,
             manifest: Arc::new(manifest),
             commit_handler,
             session,
@@ -495,6 +502,7 @@ impl Dataset {
         Ok(Self {
             object_store,
             base,
+            uri: uri.to_string(),
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
             commit_handler,
@@ -591,8 +599,8 @@ impl Dataset {
     }
 
     /// Get the fully qualified URI of this dataset.
-    pub fn uri(&self) -> String {
-        self.object_store.qualified_uri(&self.base)
+    pub fn uri(&self) -> &str {
+        &self.uri
     }
 
     /// Get the full manifest of the dataset version.
@@ -789,6 +797,7 @@ impl Dataset {
         Ok(Self {
             object_store: Arc::new(object_store),
             base,
+            uri: base_uri.to_string(),
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
             commit_handler,
