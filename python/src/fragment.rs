@@ -443,7 +443,11 @@ pub fn cleanup_partial_writes(base_uri: &str, files: Vec<(String, String)>) -> P
         .collect();
 
     #[allow(clippy::map_identity)]
-    async fn inner(store: ObjectStore, base_path: Path, files: Vec<(Path, String)>) -> Result<(), ::lance::Error> {
+    async fn inner(
+        store: ObjectStore,
+        base_path: Path,
+        files: Vec<(Path, String)>,
+    ) -> Result<(), ::lance::Error> {
         let files_iter = files
             .iter()
             .map(|(path, multipart_id)| (path, multipart_id));
