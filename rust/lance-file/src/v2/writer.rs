@@ -360,6 +360,34 @@ mod tests {
     use object_store::path::Path;
 
     use crate::v2::writer::{FileWriter, FileWriterOptions};
+    use crate::v2::reader::FileReader;
+    use tempfile::TempDir;
+    use lance_io::scheduler::ScanScheduler;
+    use futures::StreamExt;
+
+    struct FsFixture {
+        _tmp_dir: TempDir,
+        tmp_path: Path,
+        object_store: Arc<ObjectStore>,
+        scheduler: Arc<ScanScheduler>,
+    }
+
+    impl Default for FsFixture {
+        fn default() -> Self {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
+            let tmp_path = Path::parse(tmp_path).unwrap();
+            let tmp_path = tmp_path.child("some_file.lance");
+            let object_store = Arc::new(ObjectStore::local());
+            let scheduler = ScanScheduler::new(object_store.clone(), 8);
+            Self {
+                _tmp_dir: tmp_dir,
+                object_store,
+                tmp_path,
+                scheduler,
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_basic_write() {
@@ -392,6 +420,33 @@ mod tests {
         file_writer.finish().await.unwrap();
     }
 
+    async fn helper_verify_num_rows(tmp_path: &Path, expected_rows_per_batch: u64, expected_batches: u64) {
+        let fs = FsFixture::default();
+        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+
+        let file_reader = FileReader::try_open(file_scheduler.clone(), None)
+        .await
+        .unwrap();
+
+        let mut batch_stream = file_reader
+        .read_stream(lance_io::ReadBatchParams::RangeFull, 1024, 16)
+        .unwrap();
+
+        let mut batch_count = 0;
+        let mut total_rows = 0;
+        
+        while let Some(batch) = batch_stream.next().await {
+
+            batch_count += 1;
+            let mut batch = batch.unwrap();
+            let mut rows_to_verify = batch.num_rows() as u64;
+
+            assert_eq!(rows_to_verify, expected_rows_per_batch);
+        }
+
+        assert_eq!(batch_count, expected_batches);
+    }
+
     #[tokio::test]
     async fn test_write_zero_batches() {
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -422,6 +477,7 @@ mod tests {
         }
 
         file_writer.finish().await.unwrap();
+        helper_verify_num_rows(&tmp_path, 1000, 0).await;
     }
 
     #[tokio::test]
@@ -454,6 +510,7 @@ mod tests {
         }
 
         file_writer.finish().await.unwrap();
+        helper_verify_num_rows(&tmp_path, 0, 0).await;
     }
 
     #[tokio::test]
