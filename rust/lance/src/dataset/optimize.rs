@@ -88,7 +88,6 @@ use std::sync::{Arc, RwLock};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_index::DatasetIndexExt;
-use lance_table::feature_flags::FLAG_ROW_IDS;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 
@@ -628,7 +627,7 @@ async fn rewrite_files(
     // information.
     let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats).await?;
     // If we aren't using move-stable row ids, then we need to remap indices.
-    let needs_remapping = dataset.manifest.writer_feature_flags & FLAG_ROW_IDS == 0;
+    let needs_remapping = !dataset.manifest.uses_move_stable_row_ids();
     let mut scanner = dataset.scan();
     scanner
         .with_fragments(fragments.clone())
@@ -745,7 +744,7 @@ pub async fn commit_compaction(
     }
 
     // If we aren't using move-stable row ids, then we need to remap indices.
-    let needs_remapping = dataset.manifest.writer_feature_flags & FLAG_ROW_IDS == 0;
+    let needs_remapping = !dataset.manifest.uses_move_stable_row_ids();
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
@@ -822,12 +821,19 @@ pub async fn commit_compaction(
 #[cfg(test)]
 mod tests {
 
+    use std::collections::HashSet;
+
     use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_core::utils::address::RowAddress;
+    use lance_index::IndexType;
+    use lance_linalg::distance::MetricType;
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use tempfile::tempdir;
+
+    use crate::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 
     use self::remapping::RemappedIndex;
 
@@ -1454,8 +1460,85 @@ mod tests {
         }
 
         assert_eq!(
-            dataset.manifest.writer_feature_flags & FLAG_ROW_IDS > 0,
+            dataset.manifest.uses_move_stable_row_ids(),
             use_stable_row_id,
         );
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_indices() {
+        // Validate behavior of indices after compaction with move-stable row ids.
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(
+                RandomVector::new().vec_width(128).named("vec".to_owned()),
+            ))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(5_000),
+            "memory://test/table",
+            Some(WriteParams {
+                enable_experimental_stable_row_ids: true,
+                max_rows_per_file: 1_000, // 5 files
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let params = VectorIndexParams::ivf_pq(1, 8, 8, MetricType::L2, 50);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vector".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        async fn index_set(dataset: &Dataset) -> HashSet<String> {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .map(|index| index.name.clone())
+                .collect()
+        }
+        let indices = index_set(&dataset).await;
+
+        async fn vector_query(dataset: &Dataset) -> RecordBatch {
+            dataset
+                .scan()
+                .nearest("vec", &vec![0.0; 128].into(), 10)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+        }
+        let before_result = vector_query(&dataset).await;
+
+        let _metrics = compact_files(&mut dataset, Default::default(), None)
+            .await
+            .unwrap();
+
+        // The indices should be unchanged after compaction, since we are using
+        // move-stable row ids.
+        let current_indices = index_set(&dataset).await;
+        assert_eq!(indices, current_indices);
+
+        // TODO: query the indices and make sure we get the same results
+        let after_result = vector_query(&dataset).await;
+        assert_eq!(before_result, after_result);
     }
 }

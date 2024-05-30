@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
 
+use crate::dataset::rowids::get_row_id_index;
 use crate::{Error, Result};
 use arrow::{array::as_struct_array, compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
@@ -137,8 +139,20 @@ pub async fn take_rows(
         return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
     }
 
+    let row_ids = if dataset.manifest.uses_move_stable_row_ids() {
+        // Need to map the row ids to addresses
+        let index = get_row_id_index(dataset).await?;
+        let addresses = row_ids
+            .iter()
+            .filter_map(|id| index.get(*id).map(|address| address.into()))
+            .collect::<Vec<_>>();
+        Cow::Owned(addresses)
+    } else {
+        Cow::Borrowed(row_ids)
+    };
+
     let projection = Arc::new(projection.clone());
-    let row_id_meta = check_row_ids(row_ids);
+    let row_id_meta = check_row_ids(&row_ids);
 
     // This method is mostly to annotate the send bound to avoid the
     // higher-order lifetime error.
@@ -231,7 +245,7 @@ pub async fn take_rows(
         let schema_with_row_id = Arc::new(ArrowSchema::from(&projection_with_row_id));
 
         // Slow case: need to re-map data into expected order
-        let mut sorted_row_ids = Vec::from(row_ids);
+        let mut sorted_row_ids = Vec::from(row_ids.clone());
         sorted_row_ids.sort();
         // Group ROW Ids by the fragment
         let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
@@ -329,17 +343,17 @@ pub fn take_scan(
     )))
 }
 
-struct RowIdMeta {
+struct RowIdStats {
     sorted: bool,
     contiguous: bool,
 }
 
-fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
+fn check_row_ids(row_ids: &[u64]) -> RowIdStats {
     let mut sorted = true;
     let mut contiguous = true;
 
     if row_ids.is_empty() {
-        return RowIdMeta { sorted, contiguous };
+        return RowIdStats { sorted, contiguous };
     }
 
     let mut last_id = row_ids[0];
@@ -353,7 +367,7 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
         last_id = *id;
     }
 
-    RowIdMeta { sorted, contiguous }
+    RowIdStats { sorted, contiguous }
 }
 
 #[cfg(test)]

@@ -58,7 +58,7 @@ use uuid::Uuid;
 
 use super::ManifestWriteConfig;
 use crate::utils::temporal::timestamp_to_nanos;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
+use lance_table::feature_flags::apply_feature_flags;
 
 /// A change to a dataset that can be retried
 ///
@@ -386,10 +386,8 @@ impl Transaction {
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already or
-            match (current_manifest, config.use_move_stable_row_ids) {
-                (Some(manifest), _)
-                    if manifest.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0 =>
-                {
+            match (current_manifest, config.use_stable_row_ids) {
+                (Some(manifest), _) if manifest.uses_move_stable_row_ids() => {
                     Some(manifest.next_row_id)
                 }
                 (None, true) => Some(0),

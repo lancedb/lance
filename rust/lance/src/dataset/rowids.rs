@@ -80,7 +80,9 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 mod test {
     use std::ops::Range;
 
-    use crate::dataset::{builder::DatasetBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::dataset::{
+        builder::DatasetBuilder, optimize::compact_files, UpdateBuilder, WriteMode, WriteParams,
+    };
 
     use super::*;
 
@@ -258,6 +260,33 @@ mod test {
         assert_eq!(index.get(3), Some(RowAddress::new_from_parts(0, 3)));
         // New location is there.
         assert_eq!(index.get(5), Some(RowAddress::new_from_parts(1, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_take_after_compaction() {
+        let batch = sequence_batch(0..100_i32);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                enable_experimental_stable_row_ids: true,
+                max_rows_per_file: 10, // 10 files
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let indices = &[0, 45, 99];
+        let expected = dataset.take_rows(indices, dataset.schema()).await.unwrap();
+
+        let _ = compact_files(&mut dataset, Default::default(), None)
+            .await
+            .unwrap();
+
+        let actual = dataset.take_rows(indices, dataset.schema()).await.unwrap();
+
+        assert_eq!(expected, actual);
     }
 
     // TODO: compaction does the right thing
