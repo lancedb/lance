@@ -33,6 +33,7 @@ itertools.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true
 lance-datafusion.workspace = true
+lance-encoding.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true
 lance-linalg.workspace = true

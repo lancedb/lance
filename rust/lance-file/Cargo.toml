@@ -38,13 +38,13 @@ prost.workspace = true
 prost-types.workspace = true
 roaring.workspace = true
 snafu.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 rand.workspace = true
-tempfile.workspace = true
 proptest.workspace = true
 pretty_assertions.workspace = true
 test-log.workspace = true

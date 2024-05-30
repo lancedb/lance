@@ -7,6 +7,7 @@ use arrow_array::{FixedSizeListArray, RecordBatch};
 use futures::prelude::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{Error, Result};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_index::{
     pb,
@@ -246,11 +247,19 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
                 storage_ivf.add_partition(0)
             } else {
                 let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
-                let reader =
-                    FileReader::try_open(scheduler.open_file(&storage_part_path).await?, None)
-                        .await?;
+                let reader = FileReader::try_open(
+                    scheduler.open_file(&storage_part_path).await?,
+                    None,
+                    DecoderMiddlewareChain::default(),
+                )
+                .await?;
                 let batches = reader
-                    .read_stream(ReadBatchParams::RangeFull, u32::MAX, 1)?
+                    .read_stream(
+                        ReadBatchParams::RangeFull,
+                        u32::MAX,
+                        1,
+                        FilterExpression::no_filter(),
+                    )?
                     .try_collect::<Vec<_>>()
                     .await?;
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
@@ -270,11 +279,19 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
                 index_ivf.add_partition(0)
             } else {
                 let index_part_path = self.temp_dir.child(format!("index_part{}", part_id));
-                let reader =
-                    FileReader::try_open(scheduler.open_file(&index_part_path).await?, None)
-                        .await?;
+                let reader = FileReader::try_open(
+                    scheduler.open_file(&index_part_path).await?,
+                    None,
+                    DecoderMiddlewareChain::default(),
+                )
+                .await?;
                 let batches = reader
-                    .read_stream(ReadBatchParams::RangeFull, u32::MAX, 1)?
+                    .read_stream(
+                        ReadBatchParams::RangeFull,
+                        u32::MAX,
+                        1,
+                        FilterExpression::no_filter(),
+                    )?
                     .try_collect::<Vec<_>>()
                     .await?;
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;

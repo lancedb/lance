@@ -12,6 +12,7 @@ use future::join_all;
 use futures::prelude::*;
 use lance_arrow::RecordBatchExt;
 use lance_core::{utils::tokio::spawn_cpu, Error, Result};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
@@ -230,13 +231,22 @@ impl ShuffleReader for IvfShufflerReader {
         let scheduler = ScanScheduler::new(Arc::new(self.object_store.clone()), 32);
         let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
 
-        let reader =
-            FileReader::try_open(scheduler.open_file(&partition_path).await?, None).await?;
+        let reader = FileReader::try_open(
+            scheduler.open_file(&partition_path).await?,
+            None,
+            DecoderMiddlewareChain::default(),
+        )
+        .await?;
         let schema = reader.schema().as_ref().into();
 
         Ok(Some(Box::new(RecordBatchStreamAdapter::new(
             Arc::new(schema),
-            reader.read_stream(lance_io::ReadBatchParams::RangeFull, 4096, 16)?,
+            reader.read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                4096,
+                16,
+                FilterExpression::no_filter(),
+            )?,
         ))))
     }
 

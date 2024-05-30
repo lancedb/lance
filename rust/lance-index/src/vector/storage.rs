@@ -12,6 +12,7 @@ use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
+use lance_encoding::decoder::FilterExpression;
 use lance_file::v2::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::DistanceType;
@@ -219,7 +220,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let range = self.ivf.row_range(part_id);
         let batches = self
             .reader
-            .read_stream(ReadBatchParams::Range(range), 4096, 16)?
+            .read_stream(
+                ReadBatchParams::Range(range),
+                4096,
+                16,
+                FilterExpression::no_filter(),
+            )?
             .try_collect::<Vec<_>>()
             .await?;
         let schema = Arc::new(self.reader.schema().as_ref().into());

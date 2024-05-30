@@ -22,6 +22,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::ROW_ID_FIELD;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_encoding::decoder::DecoderMiddlewareChain;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
 use lance_file::v2::reader::ReaderProjection;
@@ -232,6 +233,8 @@ impl GenericFileReader for FileReader {
 }
 
 mod v2_adapter {
+    use lance_encoding::decoder::FilterExpression;
+
     use super::*;
 
     #[derive(Debug, Clone)]
@@ -252,7 +255,6 @@ mod v2_adapter {
         }
 
         pub fn projection_from_lance(&self, schema: &Schema) -> ReaderProjection {
-            let arrow_schema = Arc::new(ArrowSchema::from(schema));
             let column_indices = schema
                 .fields
                 .iter()
@@ -266,7 +268,7 @@ mod v2_adapter {
                 })
                 .collect::<Vec<_>>();
             ReaderProjection {
-                schema: arrow_schema,
+                schema: Arc::new(schema.clone()),
                 column_indices,
             }
         }
@@ -288,6 +290,7 @@ mod v2_adapter {
                     ReadBatchParams::Range(range.start as usize..range.end as usize),
                     batch_size,
                     &projection,
+                    FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
                     task: v2_task.task.map_err(Error::from).boxed(),
@@ -304,7 +307,12 @@ mod v2_adapter {
             let projection = self.projection_from_lance(projection.as_ref());
             Ok(self
                 .reader
-                .read_tasks(ReadBatchParams::RangeFull, batch_size, &projection)?
+                .read_tasks(
+                    ReadBatchParams::RangeFull,
+                    batch_size,
+                    &projection,
+                    FilterExpression::no_filter(),
+                )?
                 .map(|v2_task| ReadBatchTask {
                     task: v2_task.task.map_err(Error::from).boxed(),
                     num_rows: v2_task.num_rows,
@@ -322,7 +330,12 @@ mod v2_adapter {
             let projection = self.projection_from_lance(projection.as_ref());
             Ok(self
                 .reader
-                .read_tasks(ReadBatchParams::Indices(indices), batch_size, &projection)?
+                .read_tasks(
+                    ReadBatchParams::Indices(indices),
+                    batch_size,
+                    &projection,
+                    FilterExpression::no_filter(),
+                )?
                 .map(|v2_task| ReadBatchTask {
                     task: v2_task.task.map_err(Error::from).boxed(),
                     num_rows: v2_task.num_rows,
@@ -499,7 +512,14 @@ impl FileFragment {
             let path = self.dataset.data_dir().child(data_file.path.as_str());
             let store_scheduler = ScanScheduler::new(self.dataset.object_store.clone(), 16);
             let file_scheduler = store_scheduler.open_file(&path).await?;
-            let reader = Arc::new(v2::reader::FileReader::try_open(file_scheduler, None).await?);
+            let reader = Arc::new(
+                v2::reader::FileReader::try_open(
+                    file_scheduler,
+                    None,
+                    DecoderMiddlewareChain::default(),
+                )
+                .await?,
+            );
             let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
                 data_file
                     .fields
