@@ -765,6 +765,7 @@ mod tests {
     use lance_linalg::{distance::DistanceType, MatrixView};
     use lance_table::format::SelfDescribingFileReader;
     use lance_testing::datagen::generate_random_array;
+    use object_store::path::Path;
 
     use crate::vector::{
         graph::{memory::InMemoryVectorStorage, DISTS_FIELD, NEIGHBORS_FIELD},
@@ -790,7 +791,7 @@ mod tests {
         .unwrap();
 
         let object_store = ObjectStore::memory();
-        let path = object_store.base_path().child("test_builder_write_load");
+        let path = Path::from("test_builder_write_load");
         let writer = object_store.create(&path).await.unwrap();
         let schema = Schema::new(vec![
             VECTOR_ID_FIELD.clone(),
