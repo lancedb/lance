@@ -3,8 +3,7 @@
 
 use super::Dataset;
 use crate::{Error, Result};
-use futures::future::Either;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use snafu::{location, Location};
 use std::sync::Arc;
 
@@ -13,6 +12,46 @@ use lance_table::{
     rowids::{read_row_ids, RowIdIndex, RowIdSequence},
 };
 
+/// Load a row id sequence from the given dataset and fragment.
+pub async fn load_row_id_sequence(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<Arc<RowIdSequence>> {
+    // Virtual path to prevent collisions in the cache.
+    let path = dataset.base.child(fragment.id.to_string()).child("row_ids");
+    match &fragment.row_id_meta {
+        None => Err(Error::Internal {
+            message: "Missing row id meta".into(),
+            location: location!(),
+        }),
+        Some(RowIdMeta::Inline(data)) => {
+            dataset
+                .session
+                .file_metadata_cache
+                .get_or_insert(&path, |_path| async { read_row_ids(data) })
+                .await
+        }
+        Some(RowIdMeta::External(file_slice)) => {
+            dataset
+                .session
+                .file_metadata_cache
+                .get_or_insert(&path, |_path| async {
+                    let path = dataset.base.child(file_slice.path.as_str());
+                    let range = file_slice.offset as usize
+                        ..(file_slice.offset as usize + file_slice.size as usize);
+                    let data = dataset
+                        .object_store
+                        .open(&path)
+                        .await?
+                        .get_range(range)
+                        .await?;
+                    read_row_ids(&data)
+                })
+                .await
+        }
+    }
+}
+
 /// Load row id sequences from the given dataset and fragments.
 ///
 /// Returned as a vector of (fragment_id, sequence) pairs. These are not
@@ -20,33 +59,10 @@ use lance_table::{
 pub fn load_row_id_sequences<'a>(
     dataset: &'a Dataset,
     fragments: &'a [Fragment],
-) -> impl Stream<Item = Result<(u32, RowIdSequence)>> + 'a {
+) -> impl Stream<Item = Result<(u32, Arc<RowIdSequence>)>> + 'a {
     futures::stream::iter(fragments)
-        .map(|fragment| match &fragment.row_id_meta {
-            None => Either::Left(futures::future::ready(Err(Error::Internal {
-                message: "Missing row id meta".into(),
-                location: location!(),
-            }))),
-            Some(RowIdMeta::Inline(data)) => {
-                let res = read_row_ids(data).map(|sequence| (fragment.id as u32, sequence));
-                Either::Left(futures::future::ready(res))
-            }
-            Some(RowIdMeta::External(file_slice)) => {
-                let path = dataset.base.child(file_slice.path.as_str());
-                let range = file_slice.offset as usize
-                    ..(file_slice.offset as usize + file_slice.size as usize);
-                let dataset = dataset.clone();
-                Either::Right(async move {
-                    let data = dataset
-                        .object_store
-                        .open(&path)
-                        .await?
-                        .get_range(range)
-                        .await?;
-                    let sequence = read_row_ids(&data)?;
-                    Ok((fragment.id as u32, sequence))
-                })
-            }
+        .map(|fragment| {
+            load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
         })
         .buffer_unordered(num_cpus::get())
 }
@@ -308,6 +324,4 @@ mod test {
         // Data including row ids should be the same.
         assert_eq!(expected, actual);
     }
-
-    // TODO: test scan with row id produces correct values.
 }

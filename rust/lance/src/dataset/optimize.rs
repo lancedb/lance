@@ -638,6 +638,8 @@ async fn rewrite_files(
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         let data_no_row_ids = make_rowid_capture_stream(row_ids.clone(), data)?;
         (Some(row_ids), data_no_row_ids)
+    } else if fragments.iter().any(|f| f.deletion_file.is_some()) {
+        todo!("Handle case where we are materializing deletions");
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         (None, data)
@@ -713,7 +715,9 @@ async fn rechunk_stable_row_ids(
     });
 
     let new_sequences = lance_table::rowids::rechunk_sequences(
-        old_sequences.into_iter().map(|(_, seq)| seq),
+        old_sequences
+            .into_iter()
+            .map(|(_, seq)| seq.as_ref().clone()),
         new_fragments
             .iter()
             .map(|frag| frag.physical_rows.unwrap() as u64),
