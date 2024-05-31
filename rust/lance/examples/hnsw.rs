@@ -9,16 +9,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
-use arrow_array::types::Float32Type;
+use arrow_array::{types::Float32Type, Array, FixedSizeListArray};
 use arrow_select::concat::concat;
 use clap::Parser;
 use futures::StreamExt;
 use lance::Dataset;
 use lance_index::vector::{
-    graph::memory::InMemoryVectorStorage,
+    flat::storage::FlatStorage,
     hnsw::{builder::HnswBuildParams, HNSW},
 };
-use lance_linalg::{distance::DistanceType, MatrixView};
+use lance_linalg::distance::DistanceType;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -41,10 +41,13 @@ struct Args {
     max_level: u16,
 }
 
-fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
+fn ground_truth(fsl: &FixedSizeListArray, query: &[f32], k: usize) -> HashSet<u32> {
     let mut dists = vec![];
-    for i in 0..mat.num_rows() {
-        let dist = lance_linalg::distance::l2_distance(query, mat.row_ref(i).unwrap());
+    for i in 0..fsl.len() {
+        let dist = lance_linalg::distance::l2_distance(
+            query,
+            fsl.value(i).as_primitive::<Float32Type>().values(),
+        );
         dists.push((dist, i as u32));
     }
     dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -72,15 +75,14 @@ async fn main() {
         .collect::<Vec<_>>()
         .await;
     let arrs = batches.iter().map(|b| b.as_ref()).collect::<Vec<_>>();
-    let fsl = concat(&arrs).unwrap();
-    let mat = MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap();
-    println!("Loaded {:?} batches", mat.num_rows());
+    let fsl = concat(&arrs).unwrap().as_fixed_size_list().clone();
+    println!("Loaded {:?} batches", fsl.len());
 
-    let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
+    let vector_store = Arc::new(FlatStorage::new(fsl.clone(), DistanceType::L2));
 
-    let q = mat.row(0).unwrap();
+    let q = fsl.value(0);
     let k = 10;
-    let gt = ground_truth(&mat, q.as_primitive::<Float32Type>().values(), k);
+    let gt = ground_truth(&fsl, q.as_primitive::<Float32Type>().values(), k);
 
     for ef_construction in [15, 30, 50] {
         let now = std::time::Instant::now();

@@ -197,6 +197,17 @@ impl FileWriter {
         Ok(())
     }
 
+    /// Schedule batches of data to be written to the file
+    pub async fn write_batches(
+        &mut self,
+        batches: impl Iterator<Item = &RecordBatch>,
+    ) -> Result<()> {
+        for batch in batches {
+            self.write_batch(batch).await?;
+        }
+        Ok(())
+    }
+
     /// Schedule a batch of data to be written to the file
     ///
     /// Note: the future returned by this method may complete before the data has been fully

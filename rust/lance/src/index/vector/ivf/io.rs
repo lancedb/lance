@@ -316,6 +316,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }
 
         let code_column = match &quantizer {
+            Quantizer::Flat(_) => None,
             Quantizer::Product(pq) => Some(pq.column()),
             Quantizer::Scalar(_) => None,
         };
@@ -483,6 +484,12 @@ async fn build_hnsw_quantization_partition(
     let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), vectors.clone(), writer);
 
     let build_store = match quantizer {
+        Quantizer::Flat(_) => {
+            return Err(Error::Index {
+                message: "Flat quantizer is not supported for IVF_HNSW".to_string(),
+                location: location!(),
+            });
+        }
         Quantizer::Product(pq) => tokio::spawn(build_and_write_pq_storage(
             metric_type,
             row_ids,

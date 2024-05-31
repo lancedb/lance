@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation};
-use object_store::{aws::AwsCredentialProvider, DynObjectStore};
+use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
 use snafu::{location, Location};
 use tracing::instrument;
 use url::Url;
@@ -176,7 +176,7 @@ impl DatasetBuilder {
     }
 
     /// Build a lance object store for the given config
-    pub async fn build_object_store(self) -> Result<(ObjectStore, Arc<dyn CommitHandler>)> {
+    pub async fn build_object_store(self) -> Result<(ObjectStore, Path, Arc<dyn CommitHandler>)> {
         let commit_handler = match self.commit_handler {
             Some(commit_handler) => Ok(commit_handler),
             None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await,
@@ -190,12 +190,13 @@ impl DatasetBuilder {
                     self.options.block_size,
                     self.options.object_store_wrapper,
                 ),
+                Path::from(store.1.path()),
                 commit_handler,
             )),
             None => {
-                let (store, _path) =
+                let (store, path) =
                     ObjectStore::from_uri_and_params(&self.table_uri, &self.options).await?;
-                Ok((store, commit_handler))
+                Ok((store, path, commit_handler))
             }
         }
     }
@@ -211,9 +212,9 @@ impl DatasetBuilder {
         };
 
         let version = self.version;
+        let table_uri = self.table_uri.clone();
 
-        let (object_store, commit_handler) = self.build_object_store().await?;
-        let base_path = object_store.base_path().clone();
+        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
         let manifest = match version {
             Some(version) => {
                 let path = commit_handler
@@ -229,15 +230,16 @@ impl DatasetBuilder {
                 .resolve_latest_location(&base_path, &object_store)
                 .await
                 .map_err(|e| Error::DatasetNotFound {
-                    path: base_path.to_string(),
                     source: Box::new(e),
+                    path: base_path.to_string(),
                     location: location!(),
                 })?,
         };
 
         Dataset::checkout_manifest(
             Arc::new(object_store),
-            base_path.clone(),
+            base_path,
+            table_uri,
             &manifest,
             session,
             commit_handler,

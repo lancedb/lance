@@ -3,9 +3,15 @@
 
 use std::any::Any;
 
-use arrow_array::ArrayRef;
-use lance_linalg::distance::MetricType;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::Field;
+use lance_arrow::RecordBatchExt;
+use lance_core::{Error, Result};
+use lance_linalg::distance::{DistanceType, MetricType};
 use num_traits::Num;
+use snafu::{location, Location};
+
+use crate::vector::quantizer::Quantization;
 
 /// WARNING: Internal API,  API stability is not guaranteed
 pub trait DistCalculator {
@@ -26,6 +32,12 @@ pub trait VectorStore: Send + Sync {
     type DistanceCalculator<'a>: DistCalculator
     where
         Self: 'a;
+
+    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
+    where
+        Self: Sized;
+
+    fn to_batch(&self) -> Result<RecordBatch>;
 
     fn as_any(&self) -> &dyn Any;
 
@@ -53,5 +65,38 @@ pub trait VectorStore: Send + Sync {
 
     fn dist_calculator_from_native<T: Num>(&self, _query: &[T]) -> Self::DistanceCalculator<'_> {
         todo!("Implement this")
+    }
+}
+
+pub struct StorageBuilder<Q: Quantization> {
+    column: String,
+    distance_type: DistanceType,
+    quantizer: Q,
+}
+
+impl<Q: Quantization> StorageBuilder<Q> {
+    pub fn new(column: String, distance_type: DistanceType, quantizer: Q) -> Self {
+        Self {
+            column,
+            distance_type,
+            quantizer,
+        }
+    }
+
+    pub fn build(&self, batch: &RecordBatch) -> Result<Q::Storage> {
+        let vectors = batch.column_by_name(&self.column).ok_or(Error::Schema {
+            message: format!("column {} not found", self.column),
+            location: location!(),
+        })?;
+        let code_array = self.quantizer.quantize(vectors.as_ref())?;
+        let batch = batch.drop_column(&self.column)?.try_with_column(
+            Field::new(
+                self.quantizer.column(),
+                code_array.data_type().clone(),
+                true,
+            ),
+            code_array,
+        )?;
+        Q::Storage::try_from_batch(batch, self.distance_type)
     }
 }
