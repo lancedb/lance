@@ -279,13 +279,13 @@ impl BufferEncodingStrategy for CoreBufferEncodingStrategy {
         if *data_type == DataType::Boolean {
             return Ok(Box::<BitmapBufferEncoder>::default());
         }
+        
+        if self.compression_scheme != CompressionScheme::None {
+            return Ok(Box::<CompressedBufferEncoder>::default());
+        }
 
         if let Some(bitpacking_encoder) = self.try_bitpacked_encoding(arrays) {
             return Ok(Box::new(bitpacking_encoder));
-        }
-
-        if self.compression_scheme != CompressionScheme::None {
-            return Ok(Box::<CompressedBufferEncoder>::default());
         }
 
         Ok(Box::<FlatBufferEncoder>::default())
