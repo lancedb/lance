@@ -19,7 +19,10 @@ use crate::{
             binary::BinaryFieldEncoder, list::ListFieldEncoder, primitive::PrimitiveFieldEncoder,
             r#struct::StructFieldEncoder,
         },
-        physical::{basic::BasicEncoder, fixed_size_list::FslEncoder, value::ValueEncoder},
+        physical::{
+            basic::BasicEncoder, binary::BinaryEncoder, fixed_size_list::FslEncoder,
+            value::ValueEncoder,
+        },
     },
     format::pb,
 };
@@ -200,6 +203,15 @@ impl CoreArrayEncodingStrategy {
                     *dimension as u32,
                 )))))
             }
+            DataType::Utf8 => {
+                let bin_indices_encoder = Self::array_encoder_from_type(&DataType::UInt64)?;
+                let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8)?;
+
+                Ok(Box::new(BinaryEncoder::new(
+                    bin_indices_encoder,
+                    bin_bytes_encoder,
+                )))
+            }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::try_new(data_type, get_compression_scheme())?,
             )))),
@@ -312,7 +324,8 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
             | DataType::UInt64
             | DataType::UInt8
             | DataType::FixedSizeBinary(_)
-            | DataType::FixedSizeList(_, _) => Ok(Box::new(PrimitiveFieldEncoder::try_new(
+            | DataType::FixedSizeList(_, _)
+            | DataType::Utf8 => Ok(Box::new(PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_column,
                 keep_original_array,
                 self.array_encoding_strategy.clone(),
@@ -356,7 +369,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                     header_idx,
                 )))
             }
-            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
+            DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
                 let list_idx = column_index.next_column_index(field.id);
                 column_index.skip();
                 Ok(Box::new(BinaryFieldEncoder::new(

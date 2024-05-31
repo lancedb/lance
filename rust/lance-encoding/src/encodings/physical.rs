@@ -11,6 +11,7 @@ use self::{
 };
 
 pub mod basic;
+pub mod binary;
 pub mod bitmap;
 pub mod buffers;
 pub mod fixed_size_list;
@@ -121,5 +122,6 @@ pub fn decoder_from_array_encoding(
         //
         // This will change in the future when we add support for struct nullability.
         pb::array_encoding::ArrayEncoding::Struct(_) => unreachable!(),
+        pb::array_encoding::ArrayEncoding::Binary(_) => unreachable!(),
     }
 }

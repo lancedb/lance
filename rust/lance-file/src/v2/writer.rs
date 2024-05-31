@@ -507,8 +507,10 @@ impl EncodedBatchWriteExt for EncodedBatch {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::types::Float64Type;
-    use arrow_array::RecordBatchReader;
+    use arrow_array::{
+        types::Float64Type, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
+    };
+    use arrow_schema::{DataType, Field, Schema};
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
@@ -546,5 +548,47 @@ mod tests {
         file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
         // Tests asserting the contents of the written file are in reader.rs
+    }
+
+    #[tokio::test]
+    async fn test_string_array_encoding() {
+        // create table with string column
+        let tmp_path = Path::parse("/home/ubuntu/test/strings.lance").unwrap();
+        let obj_store = Arc::new(ObjectStore::local());
+        let writer = obj_store.create(&tmp_path).await.unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("strings", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(StringArray::from(vec![
+                    "abcd", "hello", "abcd", "apple", "hello", "abcd",
+                ])),
+            ],
+        );
+
+        let batches = vec![batch];
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+
+        let mut file_writer = FileWriter::try_new(
+            writer,
+            tmp_path.to_string(),
+            lance_schema,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        for batch in batches {
+            println!("Writing batch...");
+            println!("{:?}", batch);
+            file_writer.write_batch(&batch.unwrap()).await.unwrap();
+        }
+
+        file_writer.finish().await.unwrap();
     }
 }
