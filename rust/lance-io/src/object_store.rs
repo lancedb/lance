@@ -696,6 +696,14 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
         "s3" | "s3+ddb" => {
             storage_options.with_env_s3();
 
+            // if url.scheme() == "s3+ddb" && options.commit_handler.is_some() {
+            //     return Err(Error::InvalidInput {
+            //         source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
+            //             .into(),
+            //         location: location!(),
+            //     });
+            // }
+
             let storage_options = storage_options.as_s3_options();
             let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
