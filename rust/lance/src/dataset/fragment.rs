@@ -1606,16 +1606,21 @@ impl FragmentReader {
 
 #[cfg(test)]
 mod tests {
-
     use arrow_arith::numeric::mul;
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_io::object_store::ObjectStoreParams;
+    use lance_table::io::commit::RenameCommitHandler;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
+    use url::Url;
 
     use super::*;
-    use crate::dataset::transaction::Operation;
+    use crate::{
+        dataset::{builder::DatasetBuilder, transaction::Operation, ReadParams},
+        utils::test::{IoStats, IoTrackingStore},
+    };
 
     async fn create_dataset(test_uri: &str, use_experimental_writer: bool) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -2356,5 +2361,72 @@ mod tests {
         assert!(matches!(res, Err(Error::IO { .. })));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_open_fragment_iops() {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "i",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema().clone()),
+            "memory://test",
+            None,
+        )
+        .await
+        .unwrap();
+        // Delete some rows so we have a deletion vector as well
+        dataset.delete("i >= 10").await.unwrap();
+
+        // Reset dataset to reset the session
+        let memory_store = dataset.object_store.inner.clone();
+        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let dataset = DatasetBuilder::from_uri("memory://test")
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_stats_wrapper),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .with_object_store(
+                memory_store,
+                Url::parse("memory://test").unwrap(),
+                Arc::new(RenameCommitHandler),
+            )
+            .load()
+            .await
+            .unwrap();
+        let fragment = dataset.get_fragments().pop().unwrap();
+
+        // Reset stats
+        let reset_stats = || {
+            let mut io_stats = io_stats.lock().unwrap();
+            let stats = std::mem::replace(&mut *io_stats, IoStats::default());
+            stats
+        };
+        let _ = reset_stats();
+
+        let _reader = fragment.open(dataset.schema(), true).await.unwrap();
+
+        // Expecting an IOP for:
+        // 1. Get file size
+        // 2. File metadata
+        // 3. Load page table
+        // 4. Stats page table
+        // 5. Reading deletion file
+        let stats = reset_stats();
+        assert_eq!(stats.read_iops, 5);
+
+        // On second read, everything should be cached.
+        let _reader = fragment.open(dataset.schema(), true).await.unwrap();
+        let stats = reset_stats();
+        assert_eq!(stats.read_iops, 0);
     }
 }
