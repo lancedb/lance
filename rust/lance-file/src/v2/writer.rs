@@ -338,10 +338,10 @@ impl FileWriter {
         self.write_pages(encoding_tasks).await?;
 
         // No data, so don't create a file
-        if self.rows_written == 0 {
-            self.writer.shutdown().await?;
-            return Ok(0);
-        }
+        // if self.rows_written == 0 {
+        //     self.writer.shutdown().await?;
+        //     return Ok(0);
+        // }
 
         // 2. write the column metadata buffers (coming soon)
         // 3. write global buffers (we write the schema here)

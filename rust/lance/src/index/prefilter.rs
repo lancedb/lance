@@ -19,6 +19,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::utils::mask::RowIdTreeMap;
+use lance_index::vector::v3::subindex;
 use lance_table::format::Fragment;
 use lance_table::format::Index;
 use roaring::RoaringBitmap;
@@ -208,5 +209,15 @@ impl PreFilter {
             .get()
             .expect("filter_row_ids called without call to wait_for_ready")
             .selected_indices(row_ids)
+    }
+}
+
+#[async_trait]
+impl subindex::PreFilter for PreFilter {
+    async fn wait_for_ready(&self) -> Result<()> {
+        Self::wait_for_ready(self).await
+    }
+    fn should_drop(&self, id: u64) -> bool {
+        !self.check_one(id)
     }
 }

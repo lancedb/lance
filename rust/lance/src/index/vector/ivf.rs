@@ -97,6 +97,7 @@ use crate::{
 
 mod builder;
 mod io;
+pub mod v2;
 
 /// IVF Index.
 pub struct IVFIndex {

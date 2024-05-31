@@ -13,7 +13,6 @@ use itertools::Itertools;
 use lance_core::{Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
-use num_traits::Num;
 use serde::{Deserialize, Serialize};
 
 use crate::vector::{
@@ -23,7 +22,7 @@ use crate::vector::{
         storage::{DistCalculator, VectorStore},
         subindex::{IvfSubIndex, PreFilter},
     },
-    DIST_COL,
+    Query, DIST_COL,
 };
 
 use super::storage::{FlatStorage, FLAT_COLUMN};
@@ -40,23 +39,36 @@ lazy_static::lazy_static! {
     ]).into();
 }
 
+#[derive(Default)]
+pub struct FlatQueryParams {}
+
+impl From<&Query> for FlatQueryParams {
+    fn from(_: &Query) -> Self {
+        Self {}
+    }
+}
+
 impl IvfSubIndex for FlatIndex {
-    type QueryParams = ();
+    type QueryParams = FlatQueryParams;
     type BuildParams = ();
+
+    fn use_residual() -> bool {
+        false
+    }
 
     fn name(&self) -> &str {
         "FLAT"
     }
 
-    fn search<T: Num>(
+    fn search(
         &self,
-        query: &[T],
+        query: ArrayRef,
         k: usize,
         _params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<impl PreFilter>,
     ) -> Result<RecordBatch> {
-        let dist_calc = storage.dist_calculator_from_native(query);
+        let dist_calc = storage.dist_calculator(query);
         let (row_ids, dists): (Vec<u64>, Vec<f32>) = (0..storage.len())
             .filter(|&id| !prefilter.should_drop(storage.row_ids()[id]))
             .map(|id| OrderedNode {
@@ -90,7 +102,7 @@ impl IvfSubIndex for FlatIndex {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        Schema::empty().into()
+        Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
     }
 
     fn to_batch(&self) -> Result<RecordBatch> {
@@ -149,7 +161,7 @@ impl Quantization for FlatQuantizer {
         Ok(serde_json::to_value(metadata)?)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         "flat"
     }
 

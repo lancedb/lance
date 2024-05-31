@@ -17,6 +17,7 @@ use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
+use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
 use lance_io::traits::Reader;
@@ -31,6 +32,7 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
+use vector::ivf::v2::IVFIndex;
 
 pub(crate) mod append;
 pub(crate) mod cache;
@@ -552,6 +554,17 @@ impl DatasetIndexInternalExt for Dataset {
                     reader,
                 )
                 .await
+            }
+
+            (0, 3) => {
+                let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
+                    self.object_store.clone(),
+                    self.indices_dir(),
+                    uuid.to_owned(),
+                    Arc::downgrade(&self.session),
+                )
+                .await?;
+                Ok(Arc::new(ivf))
             }
 
             _ => Err(Error::Index {

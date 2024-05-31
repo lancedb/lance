@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use core::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::Float32Type;
@@ -13,6 +14,7 @@ use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_table::format::SelfDescribingFileReader;
+use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
@@ -35,14 +37,14 @@ use super::{
 };
 use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
-pub trait Quantization: DeepSizeOf + Into<Quantizer> {
+pub trait Quantization: Send + Sync + DeepSizeOf + Into<Quantizer> {
     type Metadata: QuantizerMetadata + Send + Sync;
     type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore;
 
     fn code_dim(&self) -> usize;
     fn column(&self) -> &'static str;
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef>;
-    fn metadata_key(&self) -> &'static str;
+    fn metadata_key() -> &'static str;
     fn quantization_type(&self) -> QuantizationType;
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value>;
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer>;
@@ -90,9 +92,9 @@ impl Quantizer {
 
     pub fn metadata_key(&self) -> &'static str {
         match self {
-            Self::Flat(fq) => fq.metadata_key(),
-            Self::Product(pq) => pq.metadata_key(),
-            Self::Scalar(sq) => sq.metadata_key(),
+            Self::Flat(_) => FlatQuantizer::metadata_key(),
+            Self::Product(_) => ProductQuantizerImpl::<Float32Type>::metadata_key(),
+            Self::Scalar(_) => ScalarQuantizer::metadata_key(),
         }
     }
 
@@ -142,11 +144,14 @@ pub struct QuantizationMetadata {
 }
 
 #[async_trait]
-pub trait QuantizerMetadata: Clone + Sized + DeepSizeOf {
+pub trait QuantizerMetadata:
+    fmt::Debug + Clone + Sized + DeepSizeOf + for<'a> Deserialize<'a> + Serialize
+{
     async fn load(reader: &FileReader) -> Result<Self>;
+    // fn try_from_json(s: &str) -> Result<Self>;
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 pub trait QuantizerStorage: Clone + Sized + DeepSizeOf {
     type Metadata: QuantizerMetadata;
 
@@ -156,6 +161,12 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf {
         metric_type: MetricType,
         metadata: &Self::Metadata,
     ) -> Result<Self>;
+
+    // fn try_from_batch(
+    //     batch: RecordBatch,
+    //     distance_type: DistanceType,
+    //     metadata: &Self::Metadata,
+    // ) -> Result<Self>;
 }
 
 impl Quantization for ScalarQuantizer {
@@ -175,7 +186,7 @@ impl Quantization for ScalarQuantizer {
         Ok(code_array)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         SQ_METADATA_KEY
     }
 
@@ -217,7 +228,7 @@ impl Quantization for Arc<dyn ProductQuantizer> {
         Ok(code_array)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         PQ_METADTA_KEY
     }
 
@@ -285,7 +296,7 @@ where
         Ok(code_array)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         PQ_METADTA_KEY
     }
 

@@ -32,7 +32,7 @@ use super::scale_to_u8;
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScalarQuantizationMetadata {
     pub dim: usize,
     pub num_bits: u16,
@@ -64,6 +64,13 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
             location: location!(),
         })
     }
+
+    // fn try_from_json(metadata_str: &str) -> Result<Self> {
+    //     serde_json::from_str(metadata_str).map_err(|_| Error::Index {
+    //         message: format!("Failed to parse index metadata: {}", metadata_str),
+    //         location: location!(),
+    //     })
+    // }
 }
 
 #[derive(Clone)]

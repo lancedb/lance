@@ -47,7 +47,7 @@ use crate::{
 
 pub const PQ_METADTA_KEY: &str = "lance:pq";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
     pub codebook_position: usize,
     pub num_bits: u32,
