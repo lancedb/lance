@@ -170,6 +170,18 @@ message Flat {
   Compression compression = 3;
 }
 
+// Items are bitpacked in a buffer
+message Bitpacked {
+  // the number of bits used for a value in the buffer
+  uint64 compressed_bits_per_value = 1;
+
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 2;
+
+  // The items in the list
+  Buffer buffer = 3;
+}
+
 // An array encoding for shredded structs that will never be null
 //
 // There is no actual data in this column.
@@ -185,5 +197,6 @@ message ArrayEncoding {
         FixedSizeList fixed_size_list = 3;
         List list = 4;
         SimpleStruct struct = 5;
+        Bitpacked bitpacked = 6;
     }
 }

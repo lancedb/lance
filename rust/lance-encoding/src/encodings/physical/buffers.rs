@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{cast::AsArray, ArrayRef};
 use std::io::{Cursor, Write};
 
+use arrow_array::{cast::AsArray, Array, ArrayRef};
 use arrow_buffer::{BooleanBufferBuilder, Buffer};
 use arrow_schema::DataType;
+
+use lance_arrow::DataTypeExt;
 use lance_core::Result;
 
 use crate::encoder::{BufferEncoder, EncodedBuffer};
+
+use super::value::CompressionScheme;
 
 #[derive(Debug, Default)]
 pub struct FlatBufferEncoder {}
@@ -19,7 +23,13 @@ impl BufferEncoder for FlatBufferEncoder {
             .iter()
             .map(|arr| arr.to_data().buffers()[0].clone())
             .collect::<Vec<_>>();
-        Ok(EncodedBuffer { parts })
+        let data_type = arrays[0].data_type();
+        Ok(EncodedBuffer {
+            parts,
+            bits_per_value: (data_type.byte_width() * 8) as u64,
+            bitpacked_bits_per_value: None,
+            compression_scheme: None,
+        })
     }
 }
 
@@ -92,7 +102,15 @@ impl BufferEncoder for CompressedBufferEncoder {
             self.compressor.compress(buffer_data, &mut compressed)?;
             parts.push(Buffer::from(compressed));
         }
-        Ok(EncodedBuffer { parts })
+
+        let data_type = arrays[0].data_type();
+
+        Ok(EncodedBuffer {
+            parts,
+            bits_per_value: (data_type.byte_width() * 8) as u64,
+            bitpacked_bits_per_value: None,
+            compression_scheme: Some(CompressionScheme::Zstd),
+        })
     }
 }
 
@@ -122,7 +140,12 @@ impl BufferEncoder for BitmapBufferEncoder {
         }
         let buffer = builder.finish().into_inner();
         let parts = vec![buffer];
-        let buffer = EncodedBuffer { parts };
+        let buffer = EncodedBuffer {
+            parts,
+            bits_per_value: 1,
+            bitpacked_bits_per_value: None,
+            compression_scheme: None,
+        };
         Ok(buffer)
     }
 }

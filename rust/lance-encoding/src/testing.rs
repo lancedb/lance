@@ -12,7 +12,7 @@ use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::Result;
-use lance_datagen::{array, gen, RowCount, Seed};
+use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 
 use crate::{
     decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, PageInfo},
@@ -97,8 +97,38 @@ async fn test_decode(
     }
 }
 
+pub trait ArrayGeneratorProvider {
+    fn provide(&self) -> Box<dyn ArrayGenerator>;
+    fn copy(&self) -> Box<dyn ArrayGeneratorProvider>;
+}
+struct RandomArrayGeneratorProvider {
+    field: Field,
+}
+
+impl ArrayGeneratorProvider for RandomArrayGeneratorProvider {
+    fn provide(&self) -> Box<dyn ArrayGenerator> {
+        array::rand_type(self.field.data_type())
+    }
+
+    fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
+        return Box::new(RandomArrayGeneratorProvider {
+            field: self.field.clone(),
+        });
+    }
+}
+
 /// Given a field this will test the round trip encoding and decoding of random data
 pub async fn check_round_trip_encoding_random(field: Field) {
+    let array_generator_provider = RandomArrayGeneratorProvider {
+        field: field.clone(),
+    };
+    check_round_trip_encoding_generated(field, Box::new(array_generator_provider)).await;
+}
+
+pub async fn check_round_trip_encoding_generated(
+    field: Field,
+    array_generator_provider: Box<dyn ArrayGeneratorProvider>,
+) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
@@ -117,7 +147,14 @@ pub async fn check_round_trip_encoding_random(field: Field) {
                 )
                 .unwrap()
         };
-        check_round_trip_field_encoding_random(encoder_factory, field.clone()).await
+
+        // let array_generator_provider = RandomArrayGeneratorProvider{field: field.clone()};
+        check_round_trip_field_encoding_random(
+            encoder_factory,
+            field.clone(),
+            array_generator_provider.copy(),
+        )
+        .await
     }
 }
 
@@ -262,7 +299,6 @@ async fn check_round_trip_encoding_inner(
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };
 
-    // We always try a full decode, regardless of the test cases provided
     debug!("Testing full decode");
     let scheduler_copy = scheduler.clone();
     test_decode(
@@ -370,6 +406,7 @@ const NUM_RANDOM_ROWS: u32 = 10000;
 async fn check_round_trip_field_encoding_random(
     encoder_factory: impl Fn() -> Box<dyn FieldEncoder>,
     field: Field,
+    array_generator_provider: Box<dyn ArrayGeneratorProvider>,
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
         for use_slicing in [false, true] {
@@ -404,7 +441,7 @@ async fn check_round_trip_field_encoding_random(
                 // example, a list array sliced into smaller arrays will have arrays whose
                 // starting offset is not 0.
                 if use_slicing {
-                    let mut generator = gen().anon_col(array::rand_type(field.data_type()));
+                    let mut generator = gen().anon_col(array_generator_provider.provide());
                     if let Some(null_rate) = null_rate {
                         generator.with_random_nulls(null_rate);
                     }
@@ -422,7 +459,7 @@ async fn check_round_trip_field_encoding_random(
                     for i in 0..num_ingest_batches {
                         let mut generator = gen()
                             .with_seed(Seed::from(i as u64))
-                            .anon_col(array::rand_type(field.data_type()));
+                            .anon_col(array_generator_provider.provide());
                         if let Some(null_rate) = null_rate {
                             generator.with_random_nulls(null_rate);
                         }

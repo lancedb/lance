@@ -12,6 +12,7 @@ use self::{
 
 pub mod basic;
 pub mod bitmap;
+pub mod bitpack;
 pub mod buffers;
 pub mod fixed_size_list;
 pub mod value;
@@ -77,6 +78,19 @@ fn get_buffer_decoder(
     }
 }
 
+fn get_bitpacked_buffer_decoder(
+    encoding: &pb::Bitpacked,
+    buffers: &PageBuffers,
+) -> Box<dyn PhysicalPageScheduler> {
+    let (buffer_offset, _buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
+
+    Box::new(bitpack::BitpackedScheduler::new(
+        encoding.compressed_bits_per_value,
+        encoding.uncompressed_bits_per_value,
+        buffer_offset,
+    ))
+}
+
 /// Convert a protobuf array encoding into a physical page scheduler
 pub fn decoder_from_array_encoding(
     encoding: &pb::ArrayEncoding,
@@ -100,6 +114,9 @@ pub fn decoder_from_array_encoding(
                     Box::new(BasicPageScheduler::new_all_null())
                 }
             }
+        }
+        pb::array_encoding::ArrayEncoding::Bitpacked(bitpacked) => {
+            get_bitpacked_buffer_decoder(bitpacked, buffers)
         }
         pb::array_encoding::ArrayEncoding::Flat(flat) => get_buffer_decoder(flat, buffers),
         pb::array_encoding::ArrayEncoding::FixedSizeList(fixed_size_list) => {
