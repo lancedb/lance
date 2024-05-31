@@ -287,7 +287,7 @@ impl Dataset {
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
-            self.uri.to_string(),
+            self.uri.clone(),
             &manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
