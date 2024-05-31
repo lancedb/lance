@@ -126,3 +126,7 @@ harness = false
 [[bench]]
 name = "ivf_pq"
 harness = false
+
+[[bench]]
+name = "open_fragment"
+harness = false
