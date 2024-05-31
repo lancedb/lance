@@ -755,19 +755,21 @@ impl<'a> Graph for HnswBottomView<'a> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::Float32Type;
+    use arrow_array::FixedSizeListArray;
     use arrow_schema::Schema;
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_file::{
         reader::FileReader,
         writer::{FileWriter, FileWriterOptions},
     };
     use lance_io::object_store::ObjectStore;
-    use lance_linalg::{distance::DistanceType, MatrixView};
+    use lance_linalg::distance::DistanceType;
     use lance_table::format::SelfDescribingFileReader;
     use lance_testing::datagen::generate_random_array;
 
     use crate::vector::{
-        graph::{memory::InMemoryVectorStorage, DISTS_FIELD, NEIGHBORS_FIELD},
+        flat::storage::FlatStorage,
+        graph::{DISTS_FIELD, NEIGHBORS_FIELD},
         hnsw::{builder::HnswBuildParams, HNSW, VECTOR_ID_FIELD},
     };
 
@@ -777,8 +779,8 @@ mod tests {
         const TOTAL: usize = 2048;
         const NUM_EDGES: usize = 20;
         let data = generate_random_array(TOTAL * DIM);
-        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
-        let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
+        let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
+        let store = Arc::new(FlatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::build_with_storage(
             DistanceType::L2,
             HnswBuildParams::default()
@@ -807,7 +809,7 @@ mod tests {
             .unwrap();
         let loaded_builder = HNSW::load(&reader, store.clone()).await.unwrap();
 
-        let query = mat.row(0).unwrap();
+        let query = fsl.value(0);
         let k = 10;
         let ef = 50;
         let builder_results = builder

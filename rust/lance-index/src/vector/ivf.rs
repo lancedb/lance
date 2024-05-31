@@ -56,6 +56,7 @@ pub fn new_ivf_with_quantizer(
     range: Option<Range<u32>>,
 ) -> Result<Ivf> {
     match quantizer {
+        Quantizer::Flat(_) => Ok(Ivf::new_flat(centroids, metric_type, vector_column, range)),
         Quantizer::Product(pq) => Ok(Ivf::with_pq(
             centroids,
             metric_type,
@@ -93,6 +94,40 @@ impl Ivf {
         Self {
             centroids,
             distance_type: metric_type,
+            transforms,
+        }
+    }
+
+    pub fn new_flat(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        range: Option<Range<u32>>,
+    ) -> Self {
+        let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
+
+        let dt = if distance_type == DistanceType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
+        } else {
+            distance_type
+        };
+
+        let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), dt, vector_column));
+        transforms.push(ivf_transform.clone());
+
+        if let Some(range) = range {
+            transforms.push(Arc::new(transform::PartitionFilter::new(
+                PART_ID_COLUMN,
+                range,
+            )));
+        }
+
+        Self {
+            centroids,
+            distance_type,
             transforms,
         }
     }
