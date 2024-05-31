@@ -432,7 +432,7 @@ impl FragmentMetadata {
 
 #[pyfunction(name = "_cleanup_partial_writes")]
 pub fn cleanup_partial_writes(base_uri: &str, files: Vec<(String, String)>) -> PyResult<()> {
-    let (store, _) = RT
+    let (store, base_path) = RT
         .runtime
         .block_on(ObjectStore::from_uri(base_uri))
         .map_err(|err| PyIOError::new_err(format!("Failed to create object store: {}", err)))?;
@@ -443,15 +443,19 @@ pub fn cleanup_partial_writes(base_uri: &str, files: Vec<(String, String)>) -> P
         .collect();
 
     #[allow(clippy::map_identity)]
-    async fn inner(store: ObjectStore, files: Vec<(Path, String)>) -> Result<(), ::lance::Error> {
+    async fn inner(
+        store: ObjectStore,
+        base_path: Path,
+        files: Vec<(Path, String)>,
+    ) -> Result<(), ::lance::Error> {
         let files_iter = files
             .iter()
             .map(|(path, multipart_id)| (path, multipart_id));
-        lance::dataset::cleanup::cleanup_partial_writes(&store, files_iter).await
+        lance::dataset::cleanup::cleanup_partial_writes(&store, &base_path, files_iter).await
     }
 
     RT.runtime
-        .block_on(inner(store, files))
+        .block_on(inner(store, base_path, files))
         .map_err(|err| PyIOError::new_err(format!("Failed to cleanup files: {}", err)))
 }
 

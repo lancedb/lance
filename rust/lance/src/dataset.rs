@@ -84,6 +84,11 @@ pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
+    /// Uri of the dataset.
+    ///
+    /// On cloud storage, we can not use [Dataset::base] to build the full uri because the
+    /// `bucket` is swlloed in the inner [ObjectStore].
+    uri: String,
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) session: Arc<Session>,
@@ -282,6 +287,7 @@ impl Dataset {
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
+            self.uri.to_string(),
             &manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
@@ -292,6 +298,7 @@ impl Dataset {
     async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
+        uri: String,
         manifest_location: &ManifestLocation,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
@@ -354,6 +361,7 @@ impl Dataset {
         Ok(Self {
             object_store,
             base: base_path,
+            uri,
             manifest: Arc::new(manifest),
             commit_handler,
             session,
@@ -495,6 +503,7 @@ impl Dataset {
         Ok(Self {
             object_store,
             base,
+            uri: uri.to_string(),
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
             commit_handler,
@@ -590,9 +599,9 @@ impl Dataset {
         self.append_impl(batches, params).await
     }
 
-    /// Get the base URI of the dataset.
-    pub fn uri(&self) -> &Path {
-        &self.base
+    /// Get the fully qualified URI of this dataset.
+    pub fn uri(&self) -> &str {
+        &self.uri
     }
 
     /// Get the full manifest of the dataset version.
@@ -789,6 +798,7 @@ impl Dataset {
         Ok(Self {
             object_store: Arc::new(object_store),
             base,
+            uri: base_uri.to_string(),
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
             commit_handler,
@@ -3377,5 +3387,39 @@ mod tests {
         assert!(res.is_err());
 
         assert!(!dataset_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_dataset_uri_roundtrips() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let vectors = Arc::new(Int32Array::from_iter_values(vec![]));
+
+        let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let uri = dataset.uri();
+        assert_eq!(uri, test_uri);
+
+        let ds2 = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            ds2.latest_version_id().await.unwrap(),
+            dataset.latest_version_id().await.unwrap()
+        );
     }
 }

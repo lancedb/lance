@@ -138,7 +138,7 @@ pub async fn write_fragments(
         {
             Ok(dataset) => {
                 let store = dataset.object_store().clone();
-                let base = dataset.uri().clone();
+                let base = dataset.base.clone();
                 (Some(dataset), store, base)
             }
             Err(Error::DatasetNotFound { .. }) => {

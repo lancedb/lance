@@ -580,14 +580,14 @@ impl FileFragment {
         fragment: &Fragment,
     ) -> Result<Option<Arc<DeletionVector>>> {
         if let Some(deletion_file) = &fragment.deletion_file {
-            let path = deletion_file_path(object_store.base_path(), fragment.id, deletion_file);
+            let path = deletion_file_path(&self.dataset.base, fragment.id, deletion_file);
 
             let deletion_vector = self
                 .dataset
                 .session
                 .file_metadata_cache
                 .get_or_insert(&path, |_| async {
-                    read_deletion_file(object_store.base_path(), fragment, object_store)
+                    read_deletion_file(&self.dataset.base, fragment, object_store)
                         .await?
                         .ok_or(Error::io(
                             format!(
