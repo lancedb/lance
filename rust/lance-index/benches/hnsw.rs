@@ -7,16 +7,17 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use arrow_array::types::Float32Type;
+use arrow_array::{types::Float32Type, FixedSizeListArray};
 use criterion::{criterion_group, criterion_main, Criterion};
+use lance_arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_index::vector::{
-    graph::memory::InMemoryVectorStorage,
+    flat::storage::FlatStorage,
     hnsw::builder::{HnswBuildParams, HNSW},
 };
-use lance_linalg::{distance::DistanceType, MatrixView};
+use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array_with_seed;
 
 fn bench_hnsw(c: &mut Criterion) {
@@ -28,10 +29,10 @@ fn bench_hnsw(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
-    let mat = MatrixView::<Float32Type>::new(data.into(), DIMENSION);
-    let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), DistanceType::L2));
+    let fsl = FixedSizeListArray::try_new_from_values(data, DIMENSION as i32).unwrap();
+    let vectors = Arc::new(FlatStorage::new(fsl.clone(), DistanceType::L2));
 
-    let query = mat.row(0).unwrap();
+    let query = fsl.value(0);
     c.bench_function(
         format!("create_hnsw({TOTAL}x{DIMENSION},levels=6)").as_str(),
         |b| {

@@ -44,7 +44,7 @@ pub trait Shuffler {
     /// Shuffle the incoming stream of record batches into IVF partitions.
     /// Returns a IvfShuffleReader that can be used to read the shuffled partitions.
     async fn shuffle(
-        mut self,
+        &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
     ) -> Result<Box<dyn ShuffleReader>>;
 }
@@ -77,7 +77,7 @@ impl IvfShuffler {
 #[async_trait::async_trait]
 impl Shuffler for IvfShuffler {
     async fn shuffle(
-        mut self,
+        &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
     ) -> Result<Box<dyn ShuffleReader>> {
         let mut writers: Vec<FileWriter> = vec![];

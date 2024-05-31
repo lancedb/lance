@@ -16,6 +16,7 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
@@ -26,6 +27,7 @@ use lance_io::{
 use lance_linalg::{distance::MetricType, MatrixView};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
@@ -54,6 +56,9 @@ pub struct ProductQuantizationMetadata {
 
     #[serde(skip)]
     pub codebook: Option<FixedSizeListArray>,
+
+    // empty for old format
+    pub codebook_tensor: Vec<u8>,
 }
 
 impl DeepSizeOf for ProductQuantizationMetadata {
@@ -350,6 +355,7 @@ impl ProductQuantizationStorage {
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
             codebook: None,
+            codebook_tensor: Vec::new(),
         };
 
         let index_metadata = IndexMetadata {
@@ -415,6 +421,86 @@ impl QuantizerStorage for ProductQuantizationStorage {
 
 impl VectorStore for ProductQuantizationStorage {
     type DistanceCalculator<'a> = PQDistCalculator;
+
+    fn try_from_batch(
+        batch: RecordBatch,
+        distance_type: lance_linalg::distance::DistanceType,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let metadata_json = batch
+            .schema_ref()
+            .metadata()
+            .get("metadata")
+            .ok_or(Error::Index {
+                message: "Metadata not found in schema".to_string(),
+                location: location!(),
+            })?;
+        let metadata: ProductQuantizationMetadata = serde_json::from_str(metadata_json)?;
+
+        // now it supports only Float32Type
+        let codebook_tensor = pb::Tensor::decode(metadata.codebook_tensor.as_slice())?;
+        let codebook = FixedSizeListArray::try_from(&codebook_tensor)?;
+
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .ok_or(Error::Index {
+                message: "Row IDs column not found in batch".to_string(),
+                location: location!(),
+            })?
+            .as_primitive::<UInt64Type>()
+            .clone();
+        let pq_code = batch
+            .column_by_name(PQ_CODE_COLUMN)
+            .ok_or(Error::Index {
+                message: "PQ code column not found in batch".to_string(),
+                location: location!(),
+            })?
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<UInt8Type>()
+            .clone();
+
+        Ok(Self {
+            codebook: Arc::new(codebook.values().as_primitive::<Float32Type>().clone()),
+            batch,
+            num_bits: metadata.num_bits,
+            num_sub_vectors: metadata.num_sub_vectors,
+            dimension: metadata.dimension,
+            metric_type: distance_type,
+            pq_code: Arc::new(pq_code),
+            row_ids: Arc::new(row_ids),
+        })
+    }
+
+    fn to_batch(&self) -> Result<RecordBatch> {
+        let codebook_fsl = FixedSizeListArray::try_new_from_values(
+            self.codebook.as_ref().clone(),
+            self.dimension as i32,
+        )?;
+        let codebook = pb::Tensor::try_from(&codebook_fsl)?.encode_to_vec();
+        let metadata = ProductQuantizationMetadata {
+            codebook_position: 0, // deprecated in new format
+            num_bits: self.num_bits,
+            num_sub_vectors: self.num_sub_vectors,
+            dimension: self.dimension,
+            codebook: None,
+            codebook_tensor: codebook,
+        };
+
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let metadata = HashMap::from_iter(vec![("metadata".to_string(), metadata_json)]);
+
+        let schema = self
+            .batch
+            .schema_ref()
+            .as_ref()
+            .clone()
+            .with_metadata(metadata);
+        Ok(self.batch.clone().with_schema(schema.into())?)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
