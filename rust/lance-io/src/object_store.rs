@@ -409,19 +409,6 @@ impl ObjectStore {
         configure_store(url.as_str(), params).await
     }
 
-    pub fn uri(&self, path: &Path) -> String {
-        println!("SCHEME: {}", self.scheme.as_str());
-        match self.scheme.as_str() {
-            "file" | "file-object-store" => path.to_string(),
-            "memory" => format!("memory://{}", path),
-            s => {
-                let mut url = Url::from_directory_path(path.to_string()).unwrap();
-                url.set_scheme(s).expect("schema not valid");
-                url.to_string()
-            }
-        }
-    }
-
     /// Local object store.
     pub fn local() -> Self {
         Self {

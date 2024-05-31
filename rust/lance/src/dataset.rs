@@ -287,6 +287,7 @@ impl Dataset {
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
+            self.uri.to_string(),
             &manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
@@ -297,6 +298,7 @@ impl Dataset {
     async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
+        uri: String,
         manifest_location: &ManifestLocation,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
@@ -356,7 +358,6 @@ impl Dataset {
         }
 
         populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
-        let uri = object_store.uri(&base_path);
         Ok(Self {
             object_store,
             base: base_path,
@@ -3386,5 +3387,39 @@ mod tests {
         assert!(res.is_err());
 
         assert!(!dataset_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_dataset_uri_roundtrips() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let vectors = Arc::new(Int32Array::from_iter_values(vec![]));
+
+        let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let uri = dataset.uri();
+        assert_eq!(uri, test_uri);
+
+        let ds2 = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            ds2.latest_version_id().await.unwrap(),
+            dataset.latest_version_id().await.unwrap()
+        );
     }
 }

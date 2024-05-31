@@ -212,6 +212,7 @@ impl DatasetBuilder {
         };
 
         let version = self.version;
+        let table_uri = self.table_uri.clone();
 
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
         let manifest = match version {
@@ -238,6 +239,7 @@ impl DatasetBuilder {
         Dataset::checkout_manifest(
             Arc::new(object_store),
             base_path,
+            table_uri,
             &manifest,
             session,
             commit_handler,
