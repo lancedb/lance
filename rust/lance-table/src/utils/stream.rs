@@ -17,6 +17,8 @@ use lance_core::{
 };
 use lance_io::ReadBatchParams;
 
+use crate::rowids::RowIdSequence;
+
 pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
 /// A task, emitted by a file reader, that will produce a batch (of the
 /// given size)
@@ -176,6 +178,7 @@ fn apply_row_id_and_deletes(
     batch: RecordBatch,
     batch_offset: u32,
     fragment_id: u32,
+    row_id_sequence: Option<&RowIdSequence>,
     config: &RowIdAndDeletesConfig,
 ) -> Result<RecordBatch> {
     let mut deletion_vector = config.deletion_vector.as_ref();
@@ -193,19 +196,27 @@ fn apply_row_id_and_deletes(
     let num_rows = batch.num_rows() as u32;
 
     let row_ids = if should_fetch_row_id {
-        let ids_in_batch = config
-            .params
-            .slice(batch_offset as usize, num_rows as usize)
-            .unwrap()
-            .to_offsets()
-            .unwrap();
-        let row_ids: Vec<u64> = ids_in_batch
-            .values()
-            .iter()
-            .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))
-            .collect();
+        if let Some(row_id_sequence) = row_id_sequence {
+            let row_ids = row_id_sequence
+                .slice(batch_offset as usize, num_rows as usize)
+                .iter()
+                .collect::<Vec<u64>>();
+            Some(row_ids)
+        } else {
+            let ids_in_batch = config
+                .params
+                .slice(batch_offset as usize, num_rows as usize)
+                .unwrap()
+                .to_offsets()
+                .unwrap();
+            let row_ids: Vec<u64> = ids_in_batch
+                .values()
+                .iter()
+                .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))
+                .collect();
 
-        Some(row_ids)
+            Some(row_ids)
+        }
     } else {
         None
     };
@@ -243,6 +254,7 @@ fn apply_row_id_and_deletes(
 pub fn wrap_with_row_id_and_delete(
     stream: ReadBatchTaskStream,
     fragment_id: u32,
+    row_id_sequence: Option<Arc<RowIdSequence>>,
     config: RowIdAndDeletesConfig,
 ) -> ReadBatchFutStream {
     let config = Arc::new(config);
@@ -254,9 +266,16 @@ pub fn wrap_with_row_id_and_delete(
             let num_rows = batch_task.num_rows;
             offset += num_rows;
             let task = batch_task.task;
+            let row_id_sequence_ref = row_id_sequence.clone();
             async move {
                 let batch = task.await?;
-                apply_row_id_and_deletes(batch, this_offset, fragment_id, config.as_ref())
+                apply_row_id_and_deletes(
+                    batch,
+                    this_offset,
+                    fragment_id,
+                    row_id_sequence_ref.as_deref(),
+                    config.as_ref(),
+                )
             }
             .boxed()
         })
@@ -344,7 +363,7 @@ mod tests {
                     make_deletions_null: false,
                     total_num_rows: 100,
                 };
-                let stream = super::wrap_with_row_id_and_delete(data, fragment_id, config);
+                let stream = super::wrap_with_row_id_and_delete(data, fragment_id, None, config);
                 let batches = stream.buffered(1).try_collect::<Vec<_>>().await.unwrap();
 
                 let mut offset = 0;
@@ -437,7 +456,8 @@ mod tests {
                                 make_deletions_null,
                                 total_num_rows: 100,
                             };
-                            let stream = super::wrap_with_row_id_and_delete(data, frag_id, config);
+                            let stream =
+                                super::wrap_with_row_id_and_delete(data, frag_id, None, config);
                             let batches = stream
                                 .buffered(1)
                                 .filter_map(|batch| {

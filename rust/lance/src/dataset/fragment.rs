@@ -1527,7 +1527,7 @@ impl FragmentReader {
         };
         let output_schema = Arc::new(self.output_schema.clone());
         Ok(
-            wrap_with_row_id_and_delete(merged, self.fragment_id as u32, config)
+            wrap_with_row_id_and_delete(merged, self.fragment_id as u32, todo!(), config)
                 // Finally, reorder the columns to match the order specified in the projection
                 .map(move |batch_fut| {
                     let output_schema = output_schema.clone();

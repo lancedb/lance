@@ -262,10 +262,9 @@ mod test {
         assert_eq!(index.get(5), Some(RowAddress::new_from_parts(1, 0)));
     }
 
-    #[tokio::test]
-    async fn test_take_after_compaction() {
+    async fn compactable_dataset() -> Dataset {
         let batch = sequence_batch(0..100_i32);
-        let mut dataset = Dataset::write(
+        Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
             "memory://",
             Some(WriteParams {
@@ -275,7 +274,12 @@ mod test {
             }),
         )
         .await
-        .unwrap();
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_take_after_compaction() {
+        let mut dataset = compactable_dataset().await;
 
         let indices = &[0, 45, 99];
         let expected = dataset.take_rows(indices, dataset.schema()).await.unwrap();
@@ -289,7 +293,21 @@ mod test {
         assert_eq!(expected, actual);
     }
 
-    // TODO: compaction does the right thing
+    #[tokio::test]
+    async fn test_scan_after_compaction() {
+        let mut dataset = compactable_dataset().await;
+
+        let expected = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+
+        let _ = compact_files(&mut dataset, Default::default(), None)
+            .await
+            .unwrap();
+
+        let actual = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+
+        // Data including row ids should be the same.
+        assert_eq!(expected, actual);
+    }
 
     // TODO: test scan with row id produces correct values.
 }

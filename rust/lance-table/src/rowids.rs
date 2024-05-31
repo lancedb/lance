@@ -32,6 +32,8 @@ use snafu::{location, Location};
 
 use segment::U64Segment;
 
+use crate::utils::LanceIteratorExtension;
+
 /// A sequence of row ids.
 ///
 /// Row ids are u64s that:
@@ -208,6 +210,74 @@ impl RowIdSequence {
             .collect();
 
         (row_ids, segment_ranges)
+    }
+
+    pub fn slice(&self, offset: usize, len: usize) -> RowIdSeqSlice<'_> {
+        // Find the starting position
+        let mut offset_start = offset;
+        let mut segment_offset = 0;
+        for segment in &self.0 {
+            let segment_len = segment.len();
+            if offset_start < segment_len {
+                break;
+            }
+            offset_start -= segment_len;
+            segment_offset += 1;
+        }
+
+        // Find the ending position
+        let mut offset_last = offset_start + len;
+        let segment_offset_last = segment_offset;
+        for segment in &self.0[segment_offset..] {
+            let segment_len = segment.len();
+            if offset_last <= segment_len {
+                break;
+            }
+            offset_last -= segment_len;
+        }
+
+        RowIdSeqSlice {
+            segments: &self.0[segment_offset..=segment_offset_last],
+            offset_start,
+            offset_last,
+        }
+    }
+}
+
+pub struct RowIdSeqSlice<'a> {
+    /// Current slice of the segments we cover
+    segments: &'a [U64Segment],
+    /// Offset into the first segment to start iterating from
+    offset_start: usize,
+    /// Offset into the last segment to stop iterating at
+    offset_last: usize,
+}
+
+impl<'a> RowIdSeqSlice<'a> {
+    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        let mut known_size = self.segments.iter().map(|segment| segment.len()).sum();
+        known_size -= self.offset_start;
+        known_size -= self.segments.last().unwrap().len() - self.offset_last;
+
+        self.segments
+            .iter()
+            .enumerate()
+            .flat_map(move |(i, segment)| {
+                match i {
+                    0 if self.segments.len() == 1 => {
+                        let len = self.offset_last - self.offset_start;
+                        // TODO: Optimize this so we don't have to use skip
+                        // (take is probably fine though.)
+                        Box::new(segment.iter().skip(self.offset_start).take(len))
+                            as Box<dyn Iterator<Item = u64>>
+                    }
+                    0 => Box::new(segment.iter().skip(self.offset_start)),
+                    1 => Box::new(segment.iter().take(self.offset_last)),
+                    _ => Box::new(segment.iter()),
+                }
+            })
+            // TODO: unit test iteration and size hint
+            .exact_size(known_size)
     }
 }
 
