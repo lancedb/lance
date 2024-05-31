@@ -101,6 +101,12 @@ pub struct WriteParams {
     /// Unless you are intentionally testing the v2 writer, you should leave this as false
     /// as the v2 writer is still experimental and not fully implemented.
     pub use_experimental_writer: bool,
+
+    /// Experimental: if set to true, the writer will use move-stable row ids.
+    /// These row ids are stable after compaction operations, but not after updates.
+    /// This makes compaction more efficient, since with stable row ids no
+    /// secondary indices need to be updated to point to new row ids.
+    pub enable_move_stable_row_ids: bool,
 }
 
 impl Default for WriteParams {
@@ -116,6 +122,7 @@ impl Default for WriteParams {
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
             use_experimental_writer: false,
+            enable_move_stable_row_ids: false,
         }
     }
 }

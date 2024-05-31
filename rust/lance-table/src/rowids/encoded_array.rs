@@ -3,10 +3,12 @@
 
 use std::ops::Range;
 
+use deepsize::DeepSizeOf;
+
 /// Encoded array of u64 values.
 ///
 /// This is a internal data type used as part of row id indices.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub enum EncodedU64Array {
     /// u64 values represented as u16 offset from a base value.
     ///
