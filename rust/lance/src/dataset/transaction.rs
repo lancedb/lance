@@ -386,7 +386,7 @@ impl Transaction {
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already or
-            match (current_manifest, config.use_stable_row_ids) {
+            match (current_manifest, config.use_move_stable_row_ids) {
                 (Some(manifest), _) if manifest.uses_move_stable_row_ids() => {
                     Some(manifest.next_row_id)
                 }

@@ -254,7 +254,7 @@ impl Manifest {
     }
 
     pub fn uses_move_stable_row_ids(&self) -> bool {
-        self.reader_feature_flags & FLAG_ROW_IDS != 0
+        self.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0
     }
 }
 
