@@ -105,7 +105,7 @@ mod test {
         )]));
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
         let write_params = WriteParams {
-            enable_experimental_stable_row_ids: true,
+            enable_move_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))
@@ -133,7 +133,7 @@ mod test {
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let write_params = WriteParams {
-            enable_experimental_stable_row_ids: true,
+            enable_move_stable_row_ids: true,
             max_rows_per_file: 10,
             ..Default::default()
         };
@@ -174,7 +174,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         let write_params = WriteParams {
-            enable_experimental_stable_row_ids: true,
+            enable_move_stable_row_ids: true,
             ..Default::default()
         };
         let temp_dir = tempfile::tempdir().unwrap();
@@ -219,7 +219,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         let write_params = WriteParams {
-            enable_experimental_stable_row_ids: true,
+            enable_move_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))

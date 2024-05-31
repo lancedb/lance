@@ -489,7 +489,7 @@ impl Dataset {
         );
 
         let manifest_config = ManifestWriteConfig {
-            use_stable_row_ids: params.enable_experimental_stable_row_ids,
+            use_move_stable_row_ids: params.enable_move_stable_row_ids,
             ..Default::default()
         };
         let manifest = if let Some(dataset) = &dataset {
@@ -1229,7 +1229,7 @@ impl Dataset {
 pub(crate) struct ManifestWriteConfig {
     auto_set_feature_flags: bool,  // default true
     timestamp: Option<SystemTime>, // default None
-    use_stable_row_ids: bool,      // default false
+    use_move_stable_row_ids: bool, // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -1237,7 +1237,7 @@ impl Default for ManifestWriteConfig {
         Self {
             auto_set_feature_flags: true,
             timestamp: None,
-            use_stable_row_ids: false,
+            use_move_stable_row_ids: false,
         }
     }
 }
@@ -1668,7 +1668,7 @@ mod tests {
             &ManifestWriteConfig {
                 auto_set_feature_flags: false,
                 timestamp: None,
-                use_stable_row_ids: false,
+                use_move_stable_row_ids: false,
             },
         )
         .await

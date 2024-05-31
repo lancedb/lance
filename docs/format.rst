@@ -408,15 +408,15 @@ document. Until they are defined in the specification, there is no guarantee tha
 readers will be able to safely interpret new forms of statistics.
 
 
-Feature: Row IDs
-----------------
+Feature: Move-Stable Row IDs
+----------------------------
 
 The row ids features assigns a unique u64 id to each row in the table. This id is
-stable after compaction, but is not necessarily stable after a row is updated.
-(A future feature may make them stable after updates.) To make access fast, a
-secondary index is created that maps row ids to their locations in the table.
-The respective parts of these indices are stored in the respective fragment's
-metadata.
+stable after being moved (such as during compaction), but is not necessarily
+stable after a row is updated. (A future feature may make them stable after
+updates.) To make access fast, a secondary index is created that maps row ids to
+their locations in the table. The respective parts of these indices are stored
+in the respective fragment's metadata.
 
 row id
   A unique auto-incrementing u64 id assigned to each row in the table.
@@ -443,6 +443,12 @@ making a commit, the writer uses that field to assign row ids to new fragments.
 If the commit fails, the writer will re-read the new ``next_row_id``, update
 the new row ids, and then try again. This is similar to how the ``max_fragment_id``
 is used to assign new fragment ids.
+
+When a row id updated, it it typically assigned a new row id rather than
+reusing the old one. This is because this feature doesn't have a mechanism to
+update secondary indices that may reference the old values for the row id. By
+deleting the old row id and creating a new one, the secondary indices will avoid
+referencing stale data.
 
 Row ID sequences
 ~~~~~~~~~~~~~~~~

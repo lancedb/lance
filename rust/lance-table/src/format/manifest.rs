@@ -13,7 +13,7 @@ use object_store::path::Path;
 use prost_types::Timestamp;
 
 use super::Fragment;
-use crate::feature_flags::FLAG_ROW_IDS;
+use crate::feature_flags::FLAG_MOVE_STABLE_ROW_IDS;
 use crate::format::pb;
 use lance_core::cache::FileMetadataCache;
 use lance_core::datatypes::Schema;
@@ -362,7 +362,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             metadata: p.metadata,
         };
 
-        if FLAG_ROW_IDS & p.reader_feature_flags != 0
+        if FLAG_MOVE_STABLE_ROW_IDS & p.reader_feature_flags != 0
             && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
         {
             return Err(Error::Internal {

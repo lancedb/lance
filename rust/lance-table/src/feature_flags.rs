@@ -8,8 +8,12 @@ use snafu::{location, Location};
 use crate::format::Manifest;
 use lance_core::{Error, Result};
 
+/// Fragments may contain deletion files, which record the tombstones of
+/// soft-deleted rows.
 pub const FLAG_DELETION_FILES: u64 = 1;
-pub const FLAG_ROW_IDS: u64 = 2;
+/// Row ids are table after moves, but not updates. Fragments contain an index
+/// mapping row ids to row addresses.
+pub const FLAG_MOVE_STABLE_ROW_IDS: u64 = 2;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(manifest: &mut Manifest) -> Result<()> {
@@ -43,8 +47,8 @@ pub fn apply_feature_flags(manifest: &mut Manifest) -> Result<()> {
                 location!(),
             ));
         }
-        manifest.reader_feature_flags |= FLAG_ROW_IDS;
-        manifest.writer_feature_flags |= FLAG_ROW_IDS;
+        manifest.reader_feature_flags |= FLAG_MOVE_STABLE_ROW_IDS;
+        manifest.writer_feature_flags |= FLAG_MOVE_STABLE_ROW_IDS;
     }
 
     Ok(())
@@ -66,21 +70,21 @@ mod tests {
     fn test_read_check() {
         assert!(can_read_dataset(0));
         assert!(can_read_dataset(super::FLAG_DELETION_FILES));
-        assert!(can_read_dataset(super::FLAG_ROW_IDS));
+        assert!(can_read_dataset(super::FLAG_MOVE_STABLE_ROW_IDS));
         assert!(can_read_dataset(
-            super::FLAG_DELETION_FILES | super::FLAG_ROW_IDS
+            super::FLAG_DELETION_FILES | super::FLAG_MOVE_STABLE_ROW_IDS
         ));
-        assert!(!can_read_dataset(super::FLAG_ROW_IDS << 1));
+        assert!(!can_read_dataset(super::FLAG_MOVE_STABLE_ROW_IDS << 1));
     }
 
     #[test]
     fn test_write_check() {
         assert!(can_write_dataset(0));
         assert!(can_write_dataset(super::FLAG_DELETION_FILES));
-        assert!(can_write_dataset(super::FLAG_ROW_IDS));
+        assert!(can_write_dataset(super::FLAG_MOVE_STABLE_ROW_IDS));
         assert!(can_write_dataset(
-            super::FLAG_DELETION_FILES | super::FLAG_ROW_IDS
+            super::FLAG_DELETION_FILES | super::FLAG_MOVE_STABLE_ROW_IDS
         ));
-        assert!(!can_write_dataset(super::FLAG_ROW_IDS << 1));
+        assert!(!can_write_dataset(super::FLAG_MOVE_STABLE_ROW_IDS << 1));
     }
 }
