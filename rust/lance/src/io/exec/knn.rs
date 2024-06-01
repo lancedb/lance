@@ -641,7 +641,7 @@ impl ExecutionPlan for ANNSubIndexExec {
                             .map(Ok::<_, DataFusionError>))
                     }
                 })
-                .try_flatten_unordered(10)
+                .try_flatten_unordered(None)
                 .map(move |result| {
                     let pre_filter = pre_filter.clone();
                     let query = query.clone();
@@ -665,12 +665,7 @@ impl ExecutionPlan for ANNSubIndexExec {
                             .await
                     }
                 })
-                .buffered(10)
-                .map(|r| {
-                    r.map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
-                    })
-                })
+                .buffered(num_cpus::get())
                 .boxed(),
         )))
     }
