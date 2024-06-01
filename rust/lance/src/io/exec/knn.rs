@@ -21,7 +21,7 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{flat::flat_search, Query, DIST_COL};
+use lance_index::vector::{flat::flat_search, Query, DIST_COL, PART_ID_COLUMN};
 use lance_io::stream::RecordBatchStream;
 use lance_table::format::Index;
 use snafu::{location, Location};
@@ -32,6 +32,7 @@ use tracing::{instrument, Instrument};
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
 use crate::index::prefilter::{FilterLoader, PreFilter};
+use crate::index::vector::ivf::IVFIndex;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 
@@ -476,6 +477,173 @@ impl ExecutionPlan for KNNIndexExec {
         Ok(Statistics {
             num_rows: Precision::Exact(
                 self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+            ),
+            ..Statistics::new_unknown(self.schema().as_ref())
+        })
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+}
+
+pub struct ANNIvfPartitionExec {}
+
+/// Physical Plan to execute on a IVF sub-partition.
+#[derive(Debug)]
+pub struct ANNSubIndexExec {
+    /// Inner input source node.
+    input: Arc<dyn ExecutionPlan>,
+
+    dataset: Arc<Dataset>,
+
+    /// Index metadata.
+    index_meta: Index,
+
+    /// Vector Query.
+    query: Query,
+
+    /// Prefiltering input
+    prefilter_source: PreFilterSource,
+
+    /// Datafusion Plan Properties
+    properties: PlanProperties,
+}
+
+impl ANNSubIndexExec {
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        index_meta: Index,
+        query: Query,
+        prefilter_source: PreFilterSource,
+    ) -> Result<Self> {
+        if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
+            return Err(Error::Index {
+                message: format!(
+                    "ANNSubIndexExec node: input schema does not have \"{}\" column",
+                    PART_ID_COLUMN
+                ),
+                location: location!(),
+            });
+        }
+        let properties = input.properties().clone();
+        Ok(Self {
+            input,
+            dataset,
+            index_meta,
+            query,
+            prefilter_source,
+            properties,
+        })
+    }
+}
+
+impl DisplayAs for ANNSubIndexExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "ANNSubIndex: name={}, k={}",
+                    self.index_meta.name,
+                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+                )
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for ANNSubIndexExec {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        KNN_INDEX_SCHEMA.clone()
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        match &self.prefilter_source {
+            PreFilterSource::None => vec![],
+            PreFilterSource::FilteredRowIds(src) => vec![src.clone()],
+            PreFilterSource::ScalarIndexQuery(src) => vec![src.clone()],
+        }
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
+        let prefilter_loader = match &self.prefilter_source {
+            PreFilterSource::FilteredRowIds(src_node) => {
+                let stream = src_node.execute(partition, context.clone())?;
+                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
+            PreFilterSource::ScalarIndexQuery(src_node) => {
+                let stream = src_node.execute(partition, context.clone())?;
+                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
+            PreFilterSource::None => None,
+        };
+
+        let pre_filter = Arc::new(PreFilter::new(
+            self.dataset.clone(),
+            &[self.index_meta.clone()],
+            prefilter_loader,
+        ));
+
+        let input_stream = self.input.execute(partition, context)?;
+        let schema = self.schema();
+        let uuid = self.index_meta.uuid.to_string();
+        let query = self.query.clone();
+        let ds = self.dataset.clone();
+        let prefilter = pre_filter.clone();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            input_stream
+                .map(move |batch| {
+                    let ds = ds.clone();
+                    let prefilter = prefilter.clone();
+                    let query = query.clone();
+                    let uuid = uuid.clone();
+                    async move {
+                        let raw_index = ds.open_vector_index(&query.column, &uuid).await?;
+                        let index = raw_index.as_any().downcast_ref::<IVFIndex>().ok_or(
+                            Error::Execution {
+                                message: "sub-index is not a IVF type".to_string(),
+                                location: location!(),
+                            },
+                        )?;
+                        index
+                            .search_in_partition(0, &query, prefilter.clone())
+                            .await
+                    }
+                })
+                .buffer_unordered(num_cpus::get())
+                .map(|r| {
+                    r.map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
+                    })
+                })
+                .boxed(),
+        )))
+    }
+
+    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
+        Ok(Statistics {
+            num_rows: Precision::Exact(
+                self.query.k
+                    * self.query.refine_factor.unwrap_or(1) as usize
+                    * self.input.statistics()?.num_rows.get_value().unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
