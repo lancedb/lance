@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow::datatypes::UInt32Type;
 use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -18,7 +19,8 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_plan::{ExecutionMode, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::stream::repeat_with;
+use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL, PART_ID_COLUMN};
@@ -490,6 +492,10 @@ impl ExecutionPlan for KNNIndexExec {
 pub struct ANNIvfPartitionExec {}
 
 /// Physical Plan to execute on a IVF sub-partition.
+///
+/// A IVF-{PQ/SQ/HNSW} query plan is:
+///
+/// AnnSubIndexExec -> AnnPartitionExec
 #[derive(Debug)]
 pub struct ANNSubIndexExec {
     /// Inner input source node.
@@ -606,29 +612,60 @@ impl ExecutionPlan for ANNSubIndexExec {
         let uuid = self.index_meta.uuid.to_string();
         let query = self.query.clone();
         let ds = self.dataset.clone();
-        let prefilter = pre_filter.clone();
+        let column = self.query.column.clone();
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
+            schema.clone(),
             input_stream
-                .map(move |batch| {
+                .and_then(move |batch| {
                     let ds = ds.clone();
-                    let prefilter = prefilter.clone();
-                    let query = query.clone();
                     let uuid = uuid.clone();
+                    let column = column.clone();
+
                     async move {
-                        let raw_index = ds.open_vector_index(&query.column, &uuid).await?;
+                        let part_id_arr = batch.column_by_name(PART_ID_COLUMN).ok_or(
+                            DataFusionError::Execution(
+                                "ANNSubIndexExec: input missing part_id column".to_string(),
+                            ),
+                        )?;
+                        let part_id_arr = part_id_arr.as_primitive_opt::<UInt32Type>().ok_or(
+                            DataFusionError::Execution(
+                                "ANNSubIndexExec: part_id column has incorrect type".to_string(),
+                            ),
+                        )?;
+
+                        let raw_index = ds.open_vector_index(&column, &uuid).await?;
+
+                        Ok(stream::iter(part_id_arr.values().to_vec().into_iter())
+                            .zip(repeat_with(move || raw_index.clone()))
+                            .map(Ok::<_, DataFusionError>))
+                    }
+                })
+                .try_flatten_unordered(10)
+                .map(move |result| {
+                    let pre_filter = pre_filter.clone();
+                    let query = query.clone();
+
+                    async move {
+                        let (part_id, raw_index) = result?;
+
                         let index = raw_index.as_any().downcast_ref::<IVFIndex>().ok_or(
-                            Error::Execution {
-                                message: "sub-index is not a IVF type".to_string(),
-                                location: location!(),
-                            },
+                            DataFusionError::Execution(
+                                "ANNSubIndexExec: sub-index is not a IVF type".to_string(),
+                            ),
                         )?;
                         index
-                            .search_in_partition(0, &query, prefilter.clone())
+                            .search_in_partition(part_id as usize, &query, pre_filter)
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to calculate KNN: {}",
+                                    e
+                                ))
+                            })
                             .await
                     }
                 })
-                .buffer_unordered(num_cpus::get())
+                .buffered(10)
                 .map(|r| {
                     r.map_err(|e| {
                         DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
