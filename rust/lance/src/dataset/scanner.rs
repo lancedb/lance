@@ -46,10 +46,9 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{new_knn_exec, FilterPlan, PreFilterSource};
 use crate::io::exec::{
-    KNNFlatExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec, ScanConfig,
-    TakeExec,
+    new_knn_exec, FilterPlan, KNNFlatExec, LancePushdownScanExec, LanceScanExec, Planner,
+    PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
@@ -1409,10 +1408,6 @@ impl Scanner {
         };
 
         let inner_fanout_search = new_knn_exec(self.dataset.clone(), &index, q, prefilter_source)?;
-        println!(
-            "KNN inner search schema: {:#?}",
-            inner_fanout_search.schema()
-        );
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {

@@ -30,6 +30,8 @@ use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
 use lance_io::stream::RecordBatchStream;
+use lance_linalg::distance::DistanceType;
+use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
 use log::warn;
 use snafu::{location, Location};
@@ -41,6 +43,7 @@ use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
 use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::vector::ivf::IVFIndex;
+use crate::index::vector::VectorIndex;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 
@@ -383,7 +386,7 @@ pub(crate) fn new_knn_exec(
         query.clone(),
     )?;
 
-    let sub_index = ANNSubIndexExec::try_new(
+    let sub_index = ANNIvfSubIndexExec::try_new(
         Arc::new(ivf_node),
         dataset,
         Arc::new(indices.to_vec()),
@@ -644,6 +647,13 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                             "ANNIVFPartitionExec: index is not a IVF type".to_string(),
                         ),
                     )?;
+
+                    let mut query = query.clone();
+                    if index.metric_type() == DistanceType::Cosine {
+                        let key = normalize_arrow(&query.key)?;
+                        query.key = key;
+                    };
+
                     let partitions = index.find_partitions(&query).map_err(|e| {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
                     })?;
@@ -669,13 +679,16 @@ impl ExecutionPlan for ANNIvfPartitionExec {
     }
 }
 
-/// Physical Plan to execute on a IVF sub-partition.
+/// Datafusion [ExecutionPlan] to run search on IVF partitions.
 ///
 /// A IVF-{PQ/SQ/HNSW} query plan is:
 ///
-/// AnnSubIndexExec -> AnnPartitionExec
+/// ```text
+/// AnnSubIndexExec: k=10
+///   AnnPartitionExec: nprobes=20
+/// ```
 #[derive(Debug)]
-pub struct ANNSubIndexExec {
+pub struct ANNIvfSubIndexExec {
     /// Inner input source node.
     input: Arc<dyn ExecutionPlan>,
 
@@ -693,7 +706,7 @@ pub struct ANNSubIndexExec {
     properties: PlanProperties,
 }
 
-impl ANNSubIndexExec {
+impl ANNIvfSubIndexExec {
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
@@ -726,7 +739,7 @@ impl ANNSubIndexExec {
     }
 }
 
-impl DisplayAs for ANNSubIndexExec {
+impl DisplayAs for ANNIvfSubIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -742,7 +755,7 @@ impl DisplayAs for ANNSubIndexExec {
     }
 }
 
-impl ExecutionPlan for ANNSubIndexExec {
+impl ExecutionPlan for ANNIvfSubIndexExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -864,6 +877,13 @@ impl ExecutionPlan for ANNSubIndexExec {
                                 "ANNSubIndexExec: sub-index is not a IVF type".to_string(),
                             ),
                         )?;
+
+                        let mut query = query.clone();
+                        if index.metric_type() == DistanceType::Cosine {
+                            let key = normalize_arrow(&query.key)?;
+                            query.key = key;
+                        };
+
                         index
                             .search_in_partition(part_id as usize, &query, pre_filter)
                             .map_err(|e| {
