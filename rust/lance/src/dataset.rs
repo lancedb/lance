@@ -35,12 +35,12 @@ use tracing::instrument;
 
 pub mod builder;
 pub mod cleanup;
-mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
 pub mod optimize;
 pub mod progress;
+mod rowids;
 pub mod scanner;
 mod schema_evolution;
 mod take;
@@ -51,7 +51,6 @@ mod write;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
-use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
@@ -64,6 +63,7 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
+use lance_table::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -479,13 +479,17 @@ impl Dataset {
             None,
         );
 
+        let manifest_config = ManifestWriteConfig {
+            use_move_stable_row_ids: params.enable_move_stable_row_ids,
+            ..Default::default()
+        };
         let manifest = if let Some(dataset) = &dataset {
             commit_transaction(
                 dataset,
                 &object_store,
                 commit_handler.as_ref(),
                 &transaction,
-                &Default::default(),
+                &manifest_config,
                 &Default::default(),
             )
             .await?
@@ -495,7 +499,7 @@ impl Dataset {
                 commit_handler.as_ref(),
                 &base,
                 &transaction,
-                &Default::default(),
+                &manifest_config,
             )
             .await?
         };
@@ -1218,6 +1222,7 @@ impl Dataset {
 pub(crate) struct ManifestWriteConfig {
     auto_set_feature_flags: bool,  // default true
     timestamp: Option<SystemTime>, // default None
+    use_move_stable_row_ids: bool, // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -1225,6 +1230,7 @@ impl Default for ManifestWriteConfig {
         Self {
             auto_set_feature_flags: true,
             timestamp: None,
+            use_move_stable_row_ids: false,
         }
     }
 }
@@ -1239,7 +1245,7 @@ pub(crate) async fn write_manifest_file(
     config: &ManifestWriteConfig,
 ) -> std::result::Result<(), CommitError> {
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest);
+        apply_feature_flags(manifest)?;
     }
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -1303,6 +1309,7 @@ mod tests {
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags;
     use lance_table::format::WriterVersion;
     use lance_table::io::commit::RenameCommitHandler;
     use lance_table::io::deletion::read_deletion_file;
@@ -1705,6 +1712,7 @@ mod tests {
             &ManifestWriteConfig {
                 auto_set_feature_flags: false,
                 timestamp: None,
+                use_move_stable_row_ids: false,
             },
         )
         .await
