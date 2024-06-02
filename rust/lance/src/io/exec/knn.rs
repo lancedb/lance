@@ -599,7 +599,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     Ok::<_, DataFusionError>(batch)
                 }
             })
-            .buffer_unordered(1);
+            .buffered(1);
         let schema = self.schema();
         Ok(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
