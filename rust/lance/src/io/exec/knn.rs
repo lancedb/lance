@@ -582,7 +582,8 @@ impl DisplayAs for ANNIvfPartitionExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ANNIVFPartitionExec: nprobes={}, deltas={}",
+                    "ANNIvfPartition: uuid={}, nprobes={}, deltas={}",
+                    self.index_uuids[0],
                     self.query.nprobes,
                     self.index_uuids.len()
                 )
@@ -731,8 +732,10 @@ impl DisplayAs for ANNSubIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ANNSubIndex: k={}",
+                    "ANNSubIndex: name={}, k={}, deltas={}",
+                    self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+                    self.indices.len()
                 )
             }
         }
@@ -750,9 +753,9 @@ impl ExecutionPlan for ANNSubIndexExec {
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
-            PreFilterSource::None => vec![],
-            PreFilterSource::FilteredRowIds(src) => vec![src.clone()],
-            PreFilterSource::ScalarIndexQuery(src) => vec![src.clone()],
+            PreFilterSource::None => vec![self.input.clone()],
+            PreFilterSource::FilteredRowIds(src) => vec![self.input.clone(), src.clone()],
+            PreFilterSource::ScalarIndexQuery(src) => vec![self.input.clone(), src.clone()],
         }
     }
 
