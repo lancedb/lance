@@ -337,7 +337,7 @@ lazy_static::lazy_static! {
     ]));
 }
 
-pub(crate) fn new_knn_exec(
+pub fn new_knn_exec(
     dataset: Arc<Dataset>,
     indices: &[Index],
     query: &Query,
@@ -357,7 +357,7 @@ pub(crate) fn new_knn_exec(
         prefilter_source,
     )?;
 
-    return Ok(Arc::new(sub_index));
+    Ok(Arc::new(sub_index))
 }
 
 /// [ExecutionPlan] to execute the find the closest IVF partitions.
@@ -441,7 +441,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
         Ok(Statistics {
-            num_rows: Precision::Exact(self.query.nprobes as usize),
+            num_rows: Precision::Exact(self.query.nprobes),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
@@ -695,7 +695,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
 
                         Ok::<_, DataFusionError>(
-                            stream::iter(part_ids.into_iter())
+                            stream::iter(part_ids)
                                 .zip(repeat_with(move || (raw_index.clone(), pre_filter.clone())))
                                 .map(Ok::<_, DataFusionError>),
                         )
