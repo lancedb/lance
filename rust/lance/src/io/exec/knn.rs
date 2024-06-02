@@ -7,8 +7,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::datatypes::UInt32Type;
-use arrow_array::cast::AsArray;
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::StringArray;
+use arrow_array::{
+    builder::{ListBuilder, UInt32Builder},
+    cast::AsArray,
+    RecordBatch, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::stats::Precision;
@@ -23,7 +27,7 @@ use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{flat::flat_search, Query, DIST_COL, PART_ID_COLUMN};
+use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
 use lance_io::stream::RecordBatchStream;
 use lance_table::format::Index;
 use log::warn;
@@ -361,7 +365,8 @@ lazy_static::lazy_static! {
     ]));
 
     static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
-        Field::new(PART_ID_COLUMN, DataType::UInt32, false),
+        Field::new(PART_ID_COLUMN, DataType::List(Field::new("item", DataType::UInt32, false).into()), false),
+        Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
     ]));
 }
 
@@ -495,21 +500,41 @@ impl ExecutionPlan for KNNIndexExec {
 /// Physical Plan to execute the IVF partition search.
 ///
 /// It searches the partition IDs using the input query.
+///
+/// It allows to search multiple delta indices in parallel, and returns a
+/// single RecordBatch with the partition IDs.
+///
+/// The schema of the output RecordBatch is:
+///
+/// ```text
+/// {
+///    "__ivf_part_id": List<UInt32>,
+///    "__index_uuid": String,
+/// }
+/// ```
 #[derive(Debug)]
 pub struct ANNIvfPartitionExec {
     dataset: Arc<Dataset>,
 
+    /// The vector query to execute.
     query: Query,
 
-    index_uuid: String,
+    /// The UUIDs of the indices to search.
+    index_uuids: Vec<String>,
 
     properties: PlanProperties,
 }
 
 impl ANNIvfPartitionExec {
-    pub fn try_new(dataset: Arc<Dataset>, index_uuid: String, query: Query) -> Result<Self> {
+    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<String>, query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
         check_vector_column(&dataset_schema.into(), &query.column)?;
+        if index_uuids.is_empty() {
+            return Err(Error::Execution {
+                message: "ANNIVFPartitionExec node: no index found for query".to_string(),
+                location: location!(),
+            });
+        }
 
         let schema = KNN_PARTITION_SCHEMA.clone();
         let properties = PlanProperties::new(
@@ -521,7 +546,7 @@ impl ANNIvfPartitionExec {
         Ok(Self {
             dataset,
             query,
-            index_uuid,
+            index_uuids,
             properties,
         })
     }
@@ -531,7 +556,12 @@ impl DisplayAs for ANNIvfPartitionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ANNIVFPartitionExec: nprobes={}", self.query.nprobes)
+                write!(
+                    f,
+                    "ANNIVFPartitionExec: nprobes={}, deltas={}",
+                    self.query.nprobes,
+                    self.index_uuids.len()
+                )
             }
         }
     }
@@ -575,12 +605,12 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
-        let uuid = self.index_uuid.clone();
+        let ds = self.dataset.clone();
 
-        let stream = stream::iter(vec![self.dataset.clone()])
-            .map(move |ds| {
+        let stream = stream::iter(self.index_uuids.clone())
+            .map(move |uuid| {
                 let query = query.clone();
-                let uuid = uuid.clone();
+                let ds = ds.clone();
 
                 async move {
                     let raw_index = ds.open_vector_index(&query.column, &uuid).await?;
@@ -592,14 +622,19 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     let partitions = index.find_partitions(&query).map_err(|e| {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
                     })?;
+
+                    let mut list_builder = ListBuilder::new(UInt32Builder::new());
+                    list_builder.append_value(partitions.iter());
+                    let partition_col = list_builder.finish();
+                    let uuid_col = StringArray::from(vec![uuid.as_str()]);
                     let batch = RecordBatch::try_new(
                         KNN_PARTITION_SCHEMA.clone(),
-                        vec![Arc::new(partitions)],
+                        vec![Arc::new(partition_col), Arc::new(uuid_col)],
                     )?;
                     Ok::<_, DataFusionError>(batch)
                 }
             })
-            .buffered(1);
+            .buffered(self.index_uuids.len());
         let schema = self.schema();
         Ok(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
