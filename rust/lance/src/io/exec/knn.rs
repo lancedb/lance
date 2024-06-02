@@ -26,6 +26,7 @@ use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL, PART_ID_COLUMN};
 use lance_io::stream::RecordBatchStream;
 use lance_table::format::Index;
+use log::warn;
 use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -125,6 +126,32 @@ impl DFRecordBatchStream for KNNFlatStream {
     }
 }
 
+/// Check vector column exists and has the correct data type.
+fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
+    let field = schema.field_with_name(column).map_err(|_| {
+        Error::io(
+            format!("Query column '{}' not found in input schema", column),
+            location!(),
+        )
+    })?;
+    match field.data_type() {
+        DataType::FixedSizeList(list_field, _)
+            if matches!(
+                list_field.data_type(),
+                DataType::UInt8 | DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) => Ok(()),
+        _ => {
+           Err(Error::io(
+                format!(
+                    "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
+                    column, field.data_type()
+                ),
+                location!(),
+            ))
+        }
+    }
+}
+
 /// [ExecutionPlan] for Flat KNN (bruteforce) search.
 ///
 /// Preconditions:
@@ -162,27 +189,7 @@ impl KNNFlatExec {
     /// Returns an error if the preconditions are not met.
     pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
         let schema = input.schema();
-        let field = schema.field_with_name(&query.column).map_err(|_| {
-            Error::io(
-                format!(
-                    "KNNFlatExec node: query column {} not found in input schema",
-                    query.column
-                ),
-                location!(),
-            )
-        })?;
-        match field.data_type() {
-            DataType::FixedSizeList(list_field, _) if list_field.data_type().is_floating() => {}
-            _ => {
-                return Err(Error::io(
-                    format!(
-                        "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
-                        query.column, field.data_type()
-                    ),
-                    location!(),
-                ));
-            }
-        }
+        check_vector_column(&schema, &query.column)?;
 
         let mut fields = schema.fields().to_vec();
         if schema.field_with_name(DIST_COL).is_err() {
@@ -352,6 +359,10 @@ lazy_static::lazy_static! {
         Field::new(DIST_COL, DataType::Float32, true),
         ROW_ID_FIELD.clone(),
     ]));
+
+    static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new(PART_ID_COLUMN, DataType::UInt32, false),
+    ]));
 }
 
 /// [ExecutionPlan] for KNNIndex node.
@@ -400,15 +411,7 @@ impl KNNIndexExec {
             ));
         }
         let schema = dataset.schema();
-        if schema.field(query.column.as_str()).is_none() {
-            return Err(Error::io(
-                format!(
-                    "KNNIndexExec node: query column {} does not exist in dataset.",
-                    query.column
-                ),
-                location!(),
-            ));
-        };
+        check_vector_column(&schema.into(), &query.column)?;
 
         let properties = PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
@@ -489,7 +492,81 @@ impl ExecutionPlan for KNNIndexExec {
     }
 }
 
-pub struct ANNIvfPartitionExec {}
+/// Physical Plan to execute the IVF partition search.
+///
+/// It searches the partition IDs using the input query.
+#[derive(Debug)]
+pub struct ANNIvfPartitionExec {
+    dataset: Arc<Dataset>,
+
+    query: Query,
+
+    properties: PlanProperties,
+}
+
+impl ANNIvfPartitionExec {
+    pub fn try_new(dataset: Arc<Dataset>, query: Query) -> Result<Self> {
+        let dataset_schema = dataset.schema();
+        check_vector_column(&dataset_schema.into(), &query.column)?;
+
+        let schema = KNN_PARTITION_SCHEMA.clone();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::RoundRobinBatch(1),
+            ExecutionMode::Bounded,
+        );
+
+        Ok(Self {
+            dataset,
+            query,
+            properties,
+        })
+    }
+}
+
+impl DisplayAs for ANNIvfPartitionExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "ANNIVFPartitionExec: nprobes={}", self.query.nprobes)
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for ANNIvfPartitionExec {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        KNN_PARTITION_SCHEMA.clone()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        warn!("ANNIVFPartitionExec: with_new_children called, but no children to replace");
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        todo!()
+    }
+}
 
 /// Physical Plan to execute on a IVF sub-partition.
 ///
