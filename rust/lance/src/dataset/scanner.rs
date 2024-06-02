@@ -46,7 +46,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{FilterPlan, PreFilterSource};
+use crate::io::exec::{new_knn_exec, FilterPlan, PreFilterSource};
 use crate::io::exec::{
     KNNFlatExec, KNNIndexExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec,
     ScanConfig, TakeExec,
@@ -1408,12 +1408,11 @@ impl Scanner {
             (_, _, false) => PreFilterSource::None,
         };
 
-        let inner_fanout_search = Arc::new(KNNIndexExec::try_new(
-            self.dataset.clone(),
-            index,
-            q,
-            prefilter_source,
-        )?);
+        let inner_fanout_search = new_knn_exec(self.dataset.clone(), &index, q, prefilter_source)?;
+        println!(
+            "KNN inner search schema: {:#?}",
+            inner_fanout_search.schema()
+        );
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {

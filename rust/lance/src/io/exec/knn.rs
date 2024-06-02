@@ -371,7 +371,7 @@ lazy_static::lazy_static! {
     ]));
 }
 
-fn new_knn_exec(
+pub(crate) fn new_knn_exec(
     dataset: Arc<Dataset>,
     indices: &[Index],
     query: &Query,
@@ -647,7 +647,8 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
                     })?;
 
-                    let mut list_builder = ListBuilder::new(UInt32Builder::new());
+                    let mut list_builder = ListBuilder::new(UInt32Builder::new())
+                        .with_field(Field::new("item", DataType::UInt32, false));
                     list_builder.append_value(partitions.iter());
                     let partition_col = list_builder.finish();
                     let uuid_col = StringArray::from(vec![uuid.as_str()]);
@@ -708,7 +709,11 @@ impl ANNSubIndexExec {
                 location: location!(),
             });
         }
-        let properties = input.properties().clone();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            ExecutionMode::Bounded,
+        );
         Ok(Self {
             input,
             dataset,
