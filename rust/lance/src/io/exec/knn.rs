@@ -524,14 +524,13 @@ impl ExecutionPlan for KNNIndexExec {
     }
 }
 
-/// Physical Plan to execute the IVF partition search.
+/// [ExecutionPlan] to execute the find the closest IVF partitions.
 ///
 /// It searches the partition IDs using the input query.
 ///
 /// It allows to search multiple delta indices in parallel, and returns a
-/// single RecordBatch with the partition IDs.
-///
-/// The schema of the output RecordBatch is:
+/// single RecordBatch, where each row contains the partition IDs and the delta index
+/// `uuid`:
 ///
 /// ```text
 /// {
