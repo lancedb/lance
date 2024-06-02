@@ -25,6 +25,7 @@ use datafusion::physical_plan::{ExecutionMode, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use itertools::Itertools;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
@@ -348,7 +349,7 @@ fn knn_index_stream(
     RecordBatchStreamAdapter::new(schema, s)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PreFilterSource {
     /// The prefilter input is an array of row ids that match the filter condition
     FilteredRowIds(Arc<dyn ExecutionPlan>),
@@ -368,6 +369,29 @@ lazy_static::lazy_static! {
         Field::new(PART_ID_COLUMN, DataType::List(Field::new("item", DataType::UInt32, false).into()), false),
         Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
     ]));
+}
+
+fn new_knn_exec(
+    dataset: Arc<Dataset>,
+    indices: &[Index],
+    query: &Query,
+    prefilter_source: PreFilterSource,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let ivf_node = ANNIvfPartitionExec::try_new(
+        dataset.clone(),
+        indices.iter().map(|idx| idx.uuid.to_string()).collect_vec(),
+        query.clone(),
+    )?;
+
+    let sub_index = ANNSubIndexExec::try_new(
+        Arc::new(ivf_node),
+        dataset,
+        Arc::new(indices.to_vec()),
+        query.clone(),
+        prefilter_source,
+    )?;
+
+    return Ok(Arc::new(sub_index));
 }
 
 /// [ExecutionPlan] for KNNIndex node.
@@ -655,8 +679,7 @@ pub struct ANNSubIndexExec {
 
     dataset: Arc<Dataset>,
 
-    /// Index metadata.
-    index_meta: Index,
+    indices: Arc<Vec<Index>>,
 
     /// Vector Query.
     query: Query,
@@ -672,7 +695,7 @@ impl ANNSubIndexExec {
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
-        index_meta: Index,
+        indices: Arc<Vec<Index>>,
         query: Query,
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
@@ -689,7 +712,7 @@ impl ANNSubIndexExec {
         Ok(Self {
             input,
             dataset,
-            index_meta,
+            indices,
             query,
             prefilter_source,
             properties,
@@ -703,8 +726,7 @@ impl DisplayAs for ANNSubIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ANNSubIndex: name={}, k={}",
-                    self.index_meta.name,
+                    "ANNSubIndex: k={}",
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                 )
             }
@@ -741,65 +763,93 @@ impl ExecutionPlan for ANNSubIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
-        let prefilter_loader = match &self.prefilter_source {
-            PreFilterSource::FilteredRowIds(src_node) => {
-                let stream = src_node.execute(partition, context.clone())?;
-                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
-            }
-            PreFilterSource::ScalarIndexQuery(src_node) => {
-                let stream = src_node.execute(partition, context.clone())?;
-                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
-            }
-            PreFilterSource::None => None,
-        };
+        let input_stream = self.input.execute(partition, context.clone())?;
 
-        let pre_filter = Arc::new(PreFilter::new(
-            self.dataset.clone(),
-            &[self.index_meta.clone()],
-            prefilter_loader,
-        ));
-
-        let input_stream = self.input.execute(partition, context)?;
         let schema = self.schema();
-        let uuid = self.index_meta.uuid.to_string();
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
+        let indices = self.indices.clone();
+        let prefilter_source = self.prefilter_source.clone();
+
+        // Per-delta-index stream:
+        //   Stream<(parttitions, index uuid)>
+        let per_index_stream = input_stream
+            .and_then(move |batch| {
+                let part_id_col = batch
+                    .column_by_name(PART_ID_COLUMN)
+                    .expect("ANNSubIndexExec: input missing part_id column");
+                let part_id_arr = part_id_col.as_list::<i32>().clone();
+                let index_uuid_col = batch
+                    .column_by_name(INDEX_UUID_COLUMN)
+                    .expect("ANNSubIndexExec: input missing index_uuid column");
+                let index_uuid = index_uuid_col.as_string::<i32>().clone();
+
+                let plan = part_id_arr
+                    .iter()
+                    .zip(index_uuid.iter())
+                    .map(|(part_id, uuid)| {
+                        // TODO: eliminate exceesive copying here to fight with lifetime.
+                        let partitions = part_id
+                            .unwrap()
+                            .as_primitive::<UInt32Type>()
+                            .values()
+                            .to_vec();
+                        let uuid = uuid.unwrap().to_string();
+                        Ok((partitions, uuid))
+                    })
+                    .collect_vec();
+                async move { Ok(stream::iter(plan)) }
+            })
+            .try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema.clone(),
-            input_stream
-                .and_then(move |batch| {
+            per_index_stream
+                .and_then(move |(part_ids, index_uuid)| {
                     let ds = ds.clone();
-                    let uuid = uuid.clone();
                     let column = column.clone();
+                    let indices = indices.clone();
+                    let context = context.clone();
+                    let prefilter_source = prefilter_source.clone();
+
+                    let index_meta = indices
+                        .iter()
+                        .find(|idx| idx.uuid.to_string() == index_uuid)
+                        .unwrap()
+                        .clone();
 
                     async move {
-                        let part_id_arr = batch.column_by_name(PART_ID_COLUMN).ok_or(
-                            DataFusionError::Execution(
-                                "ANNSubIndexExec: input missing part_id column".to_string(),
-                            ),
-                        )?;
-                        let part_id_arr = part_id_arr.as_primitive_opt::<UInt32Type>().ok_or(
-                            DataFusionError::Execution(
-                                "ANNSubIndexExec: part_id column has incorrect type".to_string(),
-                            ),
-                        )?;
+                        let prefilter_loader = match &prefilter_source {
+                            PreFilterSource::FilteredRowIds(src_node) => {
+                                let stream = src_node.execute(partition, context.clone())?;
+                                Some(Box::new(FilteredRowIdsToPrefilter(stream))
+                                    as Box<dyn FilterLoader>)
+                            }
+                            PreFilterSource::ScalarIndexQuery(src_node) => {
+                                let stream = src_node.execute(partition, context.clone())?;
+                                Some(Box::new(SelectionVectorToPrefilter(stream))
+                                    as Box<dyn FilterLoader>)
+                            }
+                            PreFilterSource::None => None,
+                        };
+                        let pre_filter =
+                            Arc::new(PreFilter::new(ds.clone(), &[index_meta], prefilter_loader));
 
-                        let raw_index = ds.open_vector_index(&column, &uuid).await?;
+                        let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
 
-                        Ok(stream::iter(part_id_arr.values().to_vec().into_iter())
-                            .zip(repeat_with(move || raw_index.clone()))
-                            .map(Ok::<_, DataFusionError>))
+                        Ok::<_, DataFusionError>(
+                            stream::iter(part_ids.into_iter())
+                                .zip(repeat_with(move || (raw_index.clone(), pre_filter.clone())))
+                                .map(Ok::<_, DataFusionError>),
+                        )
                     }
                 })
-                .try_flatten_unordered(None)
+                .try_flatten()
                 .map(move |result| {
-                    let pre_filter = pre_filter.clone();
                     let query = query.clone();
-
                     async move {
-                        let (part_id, raw_index) = result?;
+                        let (part_id, (raw_index, pre_filter)) = result?;
 
                         let index = raw_index.as_any().downcast_ref::<IVFIndex>().ok_or(
                             DataFusionError::Execution(
