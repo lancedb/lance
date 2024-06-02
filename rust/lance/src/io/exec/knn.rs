@@ -501,11 +501,13 @@ pub struct ANNIvfPartitionExec {
 
     query: Query,
 
+    index_uuid: String,
+
     properties: PlanProperties,
 }
 
 impl ANNIvfPartitionExec {
-    pub fn try_new(dataset: Arc<Dataset>, query: Query) -> Result<Self> {
+    pub fn try_new(dataset: Arc<Dataset>, index_uuid: String, query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
         check_vector_column(&dataset_schema.into(), &query.column)?;
 
@@ -519,6 +521,7 @@ impl ANNIvfPartitionExec {
         Ok(Self {
             dataset,
             query,
+            index_uuid,
             properties,
         })
     }
@@ -543,6 +546,13 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         KNN_PARTITION_SCHEMA.clone()
     }
 
+    fn statistics(&self) -> DataFusionResult<Statistics> {
+        Ok(Statistics {
+            num_rows: Precision::Exact(self.query.nprobes as usize),
+            ..Statistics::new_unknown(self.schema().as_ref())
+        })
+    }
+
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
@@ -564,7 +574,37 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         _partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        todo!()
+        let query = self.query.clone();
+        let uuid = self.index_uuid.clone();
+
+        let stream = stream::iter(vec![self.dataset.clone()])
+            .map(move |ds| {
+                let query = query.clone();
+                let uuid = uuid.clone();
+
+                async move {
+                    let raw_index = ds.open_vector_index(&query.column, &uuid).await?;
+                    let index = raw_index.as_any().downcast_ref::<IVFIndex>().ok_or(
+                        DataFusionError::Execution(
+                            "ANNIVFPartitionExec: index is not a IVF type".to_string(),
+                        ),
+                    )?;
+                    let partitions = index.find_partitions(&query).map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to find partitions: {}", e))
+                    })?;
+                    let batch = RecordBatch::try_new(
+                        KNN_PARTITION_SCHEMA.clone(),
+                        vec![Arc::new(partitions)],
+                    )?;
+                    Ok::<_, DataFusionError>(batch)
+                }
+            })
+            .buffer_unordered(1);
+        let schema = self.schema();
+        Ok(
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
+                as SendableRecordBatchStream,
+        )
     }
 }
 
