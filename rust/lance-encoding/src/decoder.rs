@@ -218,7 +218,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
