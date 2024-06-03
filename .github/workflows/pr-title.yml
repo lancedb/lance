@@ -1,7 +1,7 @@
 name: PR Checks
 
 on:
-  # This needs to be a pull_request_target event to allow the workflow to 
+  # This needs to be a pull_request_target event to allow the workflow to
   # modify labels on the PR.
   pull_request_target:
     types: [opened, edited, synchronize, reopened]
@@ -53,9 +53,9 @@ jobs:
     name: Verify PR title / description conforms to semantic-release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "20"
       # These rules are disabled because Github will always ensure there
       # is a blank line between the title and the body and Github will
       # word wrap the description field to ensure a reasonable max line
@@ -80,7 +80,6 @@ jobs:
         with:
           script: |
             const message = `**ACTION NEEDED**
-              
               Lance follows the [Conventional Commits specification](https://www.conventionalcommits.org/en/v1.0.0/) for release automation.
 
               The PR title and description are used as the merge commit message.\
