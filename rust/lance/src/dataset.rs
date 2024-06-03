@@ -1324,10 +1324,10 @@ mod tests {
         t
     }
 
-    async fn create_file(path: &std::path::Path, mode: WriteMode, use_experimental_writer: bool) {
+    async fn create_file(path: &std::path::Path, mode: WriteMode, use_legacy_format: bool) {
         let mut fields = vec![ArrowField::new("i", DataType::Int32, false)];
         // TODO (GH-2347): currently the v2 writer does not support dictionary columns.
-        if !use_experimental_writer {
+        if use_legacy_format {
             fields.push(ArrowField::new(
                 "dict",
                 DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
@@ -1340,7 +1340,7 @@ mod tests {
             .map(|i| {
                 let mut arrays =
                     vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)) as ArrayRef];
-                if !use_experimental_writer {
+                if use_legacy_format {
                     arrays.push(Arc::new(
                         DictionaryArray::try_new(
                             UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
@@ -1359,7 +1359,7 @@ mod tests {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
             mode,
-            use_experimental_writer,
+            use_legacy_format,
             ..WriteParams::default()
         };
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1387,7 +1387,7 @@ mod tests {
 
         // The batch size batches the group size.
         // (the v2 writer has no concept of group size)
-        if !use_experimental_writer {
+        if use_legacy_format {
             for batch in &actual_batches {
                 assert_eq!(batch.num_rows(), 10);
             }
@@ -1417,19 +1417,17 @@ mod tests {
 
     #[rstest]
     #[lance_test_macros::test(tokio::test)]
-    async fn test_create_dataset(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_create_dataset(#[values(false, true)] use_legacy_format: bool) {
         // Appending / Overwriting a dataset that does not exist is treated as Create
         for mode in [WriteMode::Create, WriteMode::Append, Overwrite] {
             let test_dir = tempdir().unwrap();
-            create_file(test_dir.path(), mode, use_experimental_writer).await
+            create_file(test_dir.path(), mode, use_legacy_format).await
         }
     }
 
     #[rstest]
     #[lance_test_macros::test(tokio::test)]
-    async fn test_create_and_fill_empty_dataset(
-        #[values(false, true)] use_experimental_writer: bool,
-    ) {
+    async fn test_create_and_fill_empty_dataset(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1453,7 +1451,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         // We should be able to append even if the metadata doesn't exactly match.
@@ -1510,7 +1508,7 @@ mod tests {
 
     #[rstest]
     #[lance_test_macros::test(tokio::test)]
-    async fn test_create_with_empty_iter(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_create_with_empty_iter(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1522,7 +1520,7 @@ mod tests {
         // check schema of reader and original is same
         assert_eq!(schema.as_ref(), reader.schema().as_ref());
         let write_params = Some(WriteParams {
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         });
         let result = Dataset::write(reader, test_uri, write_params)
@@ -1586,7 +1584,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_write_params(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_write_params(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1607,7 +1605,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 100,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let dataset = Dataset::write(batches, test_uri, Some(write_params))
@@ -1623,7 +1621,7 @@ mod tests {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment.open(dataset.schema(), false).await.unwrap();
             // No group / batch concept in v2
-            if !use_experimental_writer {
+            if use_legacy_format {
                 assert_eq!(reader.legacy_num_batches(), 10);
                 for i in 0..reader.legacy_num_batches() as u32 {
                     assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
@@ -1634,7 +1632,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_write_manifest(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_write_manifest(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1654,7 +1652,7 @@ mod tests {
             batches,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         );
@@ -1734,7 +1732,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -1745,7 +1743,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn append_dataset(#[values(false, true)] use_experimental_writer: bool) {
+    async fn append_dataset(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1763,7 +1761,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1824,7 +1822,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_self_dataset_append(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_self_dataset_append(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1842,7 +1840,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1908,7 +1906,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_self_dataset_append_schema_different(
-        #[values(false, true)] use_experimental_writer: bool,
+        #[values(false, true)] use_legacy_format: bool,
     ) {
         let test_dir = tempdir().unwrap();
 
@@ -1938,7 +1936,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2023,7 +2021,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn overwrite_dataset(#[values(false, true)] use_experimental_writer: bool) {
+    async fn overwrite_dataset(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -2041,7 +2039,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2113,7 +2111,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_fast_count_rows(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_fast_count_rows(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -2136,7 +2134,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2159,7 +2157,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_create_index(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_create_index(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
 
         let dimension = 16;
@@ -2189,7 +2187,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -2217,7 +2215,7 @@ mod tests {
         // Append should inherit index
         let write_params = WriteParams {
             mode: WriteMode::Append,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
@@ -2253,7 +2251,7 @@ mod tests {
         // Overwrite should invalidate index
         let write_params = WriteParams {
             mode: WriteMode::Overwrite,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()];
@@ -2272,7 +2270,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_create_scalar_index(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_create_scalar_index(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2282,7 +2280,7 @@ mod tests {
             data.into_reader_rows(RowCount::from(16 * 1024), BatchCount::from(4)),
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -2312,7 +2310,7 @@ mod tests {
         dataset.index_statistics(&index_name).await.unwrap();
     }
 
-    async fn create_bad_file(use_experimental_writer: bool) -> Result<Dataset> {
+    async fn create_bad_file(use_legacy_format: bool) -> Result<Dataset> {
         let test_dir = tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -2336,7 +2334,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -2345,9 +2343,9 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_bad_field_name(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_bad_field_name(#[values(false, true)] use_legacy_format: bool) {
         // don't allow `.` in the field name
-        assert!(create_bad_file(use_experimental_writer).await.is_err());
+        assert!(create_bad_file(use_legacy_format).await.is_err());
     }
 
     #[tokio::test]
@@ -2358,7 +2356,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_merge(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_merge(#[values(false, true)] use_legacy_format: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, false),
             ArrowField::new("x", DataType::Float32, false),
@@ -2385,7 +2383,7 @@ mod tests {
 
         let write_params = WriteParams {
             mode: WriteMode::Append,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
 
@@ -2475,7 +2473,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_large_merge(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_large_merge(#[values(false, true)] use_legacy_format: bool) {
         // Tests a merge that spans multiple batches within files
 
         // This test also tests "null filling" when merging (e.g. when keys do not match
@@ -2491,7 +2489,7 @@ mod tests {
 
         let write_params = WriteParams {
             mode: WriteMode::Append,
-            use_experimental_writer,
+            use_legacy_format,
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
             ..Default::default()
@@ -2515,7 +2513,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_delete(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_delete(#[values(false, true)] use_legacy_format: bool) {
         use std::collections::HashSet;
 
         fn sequence_data(range: Range<u32>) -> RecordBatch {
@@ -2543,7 +2541,7 @@ mod tests {
         let data = sequence_data(0..100);
         // Split over two files.
         let batches = vec![data.slice(0, 50), data.slice(50, 50)];
-        let mut dataset = TestDatasetGenerator::new(batches, use_experimental_writer)
+        let mut dataset = TestDatasetGenerator::new(batches, use_legacy_format)
             .make_hostile(test_uri)
             .await;
 
@@ -2679,7 +2677,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_restore(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_restore(#[values(false, true)] use_legacy_format: bool) {
         // Create a table
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -2699,7 +2697,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -2738,7 +2736,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_search_empty(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_search_empty(#[values(false, true)] use_legacy_format: bool) {
         // Create a table
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "vec",
@@ -2766,7 +2764,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -2808,7 +2806,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_search_empty_after_delete(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_search_empty_after_delete(#[values(false, true)] use_legacy_format: bool) {
         // Create a table
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "vec",
@@ -2836,7 +2834,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -2914,7 +2912,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_num_small_files(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_num_small_files(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let dimensions = 16;
         let column_name = "vec";
@@ -2943,7 +2941,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -3054,7 +3052,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_v0_7_5_migration(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_v0_7_5_migration(#[values(false, true)] use_legacy_format: bool) {
         // We migrate to add Fragment.physical_rows and DeletionFile.num_deletions
         // after this version.
 
@@ -3083,7 +3081,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let write_params = WriteParams {
             mode: WriteMode::Append,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let dataset = Dataset::write(batches, test_uri, Some(write_params))
@@ -3124,9 +3122,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_fix_v0_8_0_broken_migration(
-        #[values(false, true)] use_experimental_writer: bool,
-    ) {
+    async fn test_fix_v0_8_0_broken_migration(#[values(false, true)] use_legacy_format: bool) {
         // The migration from v0.7.5 was broken in 0.8.0. This validates we can
         // automatically fix tables that have this problem.
 
@@ -3156,7 +3152,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let write_params = WriteParams {
             mode: WriteMode::Append,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let dataset = Dataset::write(batches, test_uri, Some(write_params))
@@ -3206,7 +3202,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_v0_8_14_invalid_index_fragment_bitmap(
-        #[values(false, true)] use_experimental_writer: bool,
+        #[values(false, true)] use_legacy_format: bool,
     ) {
         // Old versions of lance could create an index whose fragment bitmap was
         // invalid because it did not include fragments that were part of the index
@@ -3254,7 +3250,7 @@ mod tests {
             .append(
                 data,
                 Some(WriteParams {
-                    use_experimental_writer,
+                    use_legacy_format,
                     ..Default::default()
                 }),
             )
@@ -3339,9 +3335,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_bfloat16_roundtrip(
-        #[values(false, true)] use_experimental_writer: bool,
-    ) -> Result<()> {
+    async fn test_bfloat16_roundtrip(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
         let inner_field = Arc::new(
             ArrowField::new("item", DataType::FixedSizeBinary(2), true).with_metadata(
                 [
@@ -3371,7 +3365,7 @@ mod tests {
             RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
