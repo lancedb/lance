@@ -92,7 +92,7 @@ impl FileReader {
     ///
     /// Open the file at the given path using the provided object store.
     ///
-    /// The passed fragment ID determines the first 32-bits of the row IDs.
+    /// The passed fragment ID determines the first 32-bits of the row addresses.
     ///
     /// If a manifest is passed in, it will be used to load the schema and dictionary.
     /// This is typically done if the file is part of a dataset fragment. If no manifest

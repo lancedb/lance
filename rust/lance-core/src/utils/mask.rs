@@ -14,19 +14,19 @@ use crate::Result;
 
 use super::address::RowAddress;
 
-/// A row id mask to select or deselect particular row ids
+/// A row id mask to select or deselect particular row addresses
 ///
 /// If both the allow_list and the block_list are Some then the only selected
-/// row ids are those that are in the allow_list but not in the block_list
+/// row addresses are those that are in the allow_list but not in the block_list
 /// (the block_list takes precedence)
 ///
 /// If both the allow_list and the block_list are None (the default) then
-/// all row ids are selected
+/// all row addresses are selected
 #[derive(Clone, Debug, Default)]
 pub struct RowIdMask {
-    /// If Some then only these row ids are selected
+    /// If Some then only these row addresses are selected
     pub allow_list: Option<RowIdTreeMap>,
-    /// If Some then these row ids are not selected.
+    /// If Some then these row addresses are not selected.
     pub block_list: Option<RowIdTreeMap>,
 }
 

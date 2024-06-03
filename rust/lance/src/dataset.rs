@@ -287,7 +287,7 @@ impl Dataset {
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
-            self.uri.to_string(),
+            self.uri.clone(),
             &manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
@@ -955,7 +955,7 @@ impl Dataset {
         take::take(self, row_indices, projection).await
     }
 
-    /// Take rows by the internal ROW ids.
+    /// Take rows by the internal row ids.
     pub async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
         take::take_rows(self, row_ids, projection).await
     }
@@ -2610,7 +2610,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(deletion_vector.len(), 10);
-        // The second fragment starts at 50, so 90..100 becomes 40..50 in local row ids.
+        // The second fragment starts at 50, so 90..100 becomes 40..50 in local row offsets.
         assert_eq!(
             deletion_vector.into_iter().collect::<HashSet<_>>(),
             (40..50).collect::<HashSet<_>>()

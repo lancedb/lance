@@ -212,7 +212,7 @@ mod test {
             *start += 10;
             let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
             let write_params = WriteParams {
-                enable_experimental_stable_row_ids: true,
+                enable_move_stable_row_ids: true,
                 mode: WriteMode::Append,
                 ..Default::default()
             };
@@ -284,7 +284,7 @@ mod test {
             RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
             "memory://",
             Some(WriteParams {
-                enable_experimental_stable_row_ids: true,
+                enable_move_stable_row_ids: true,
                 max_rows_per_file: 10, // 10 files
                 ..Default::default()
             }),

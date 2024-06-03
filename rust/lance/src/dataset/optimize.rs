@@ -1396,7 +1396,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
-            enable_experimental_stable_row_ids: use_stable_row_id,
+            enable_move_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1481,7 +1481,7 @@ mod tests {
             data_gen.batch(5_000),
             "memory://test/table",
             Some(WriteParams {
-                enable_experimental_stable_row_ids: true,
+                enable_move_stable_row_ids: true,
                 max_rows_per_file: 1_000, // 5 files
                 ..Default::default()
             }),

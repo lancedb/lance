@@ -811,8 +811,8 @@ impl FileFragment {
                 }
             }
 
-            for row_id in deletion_vector {
-                if row_id >= *expected_length as u32 {
+            for offset in deletion_vector {
+                if offset >= *expected_length as u32 {
                     let deletion_file_meta = self.metadata.deletion_file.as_ref().unwrap();
                     return Err(Error::corrupt_file(
                         deletion_file_path(
@@ -820,7 +820,7 @@ impl FileFragment {
                             self.metadata.id,
                             deletion_file_meta,
                         ),
-                        format!("deletion vector contains row id that is out of range. Row id: {} Fragment length: {}", row_id, expected_length),
+                        format!("deletion vector contains offset that is out of range. Offset: {} Fragment length: {}", offset, expected_length),
                         location!(),
                     ));
                 }
