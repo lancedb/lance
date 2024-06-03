@@ -58,7 +58,7 @@ pub struct PrimitiveFieldScheduler {
 }
 
 impl PrimitiveFieldScheduler {
-    pub fn new(data_type: DataType, pages: Arc<Vec<PageInfo>>, buffers: ColumnBuffers) -> Self {
+    pub fn new(data_type: DataType, pages: Arc<[PageInfo]>, buffers: ColumnBuffers) -> Self {
         let page_schedulers = pages
             .iter()
             .map(|page| {

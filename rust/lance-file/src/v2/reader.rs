@@ -432,12 +432,12 @@ impl FileReader {
                     .map(|page| {
                         let num_rows = page.length;
                         let encoding = Self::fetch_encoding(page.encoding.as_ref().unwrap());
-                        let buffer_offsets_and_sizes = Arc::new(
+                        let buffer_offsets_and_sizes = Arc::from(
                             page.buffer_offsets
                                 .iter()
                                 .zip(page.buffer_sizes.iter())
                                 .map(|(offset, size)| (*offset, *size))
-                                .collect(),
+                                .collect::<Vec<_>>(),
                         );
                         PageInfo {
                             buffer_offsets_and_sizes,
@@ -448,8 +448,8 @@ impl FileReader {
                     .collect::<Vec<_>>();
                 Arc::new(ColumnInfo {
                     index: col_idx as u32,
-                    page_infos: Arc::new(page_infos),
-                    buffer_offsets_and_sizes: vec![],
+                    page_infos: Arc::from(page_infos),
+                    buffer_offsets_and_sizes: Arc::new([]),
                 })
             })
             .collect::<Vec<_>>()

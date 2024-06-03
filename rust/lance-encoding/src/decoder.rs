@@ -250,7 +250,7 @@ pub struct PageInfo {
     /// The encoding that explains the buffers in the page
     pub encoding: pb::ArrayEncoding,
     /// The offsets and sizes of the buffers in the file
-    pub buffer_offsets_and_sizes: Arc<Vec<(u64, u64)>>,
+    pub buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
 }
 
 /// Metadata describing a column in a file
@@ -261,22 +261,22 @@ pub struct ColumnInfo {
     /// The index of the column in the file
     pub index: u32,
     /// The metadata for each page in the column
-    pub page_infos: Arc<Vec<PageInfo>>,
+    pub page_infos: Arc<[PageInfo]>,
     /// File positions and their sizes of the column-level buffers
-    pub buffer_offsets_and_sizes: Vec<(u64, u64)>,
+    pub buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
 }
 
 impl ColumnInfo {
     /// Create a new instance
     pub fn new(
         index: u32,
-        page_infos: Arc<Vec<PageInfo>>,
+        page_infos: Arc<[PageInfo]>,
         buffer_offsets_and_sizes: Vec<(u64, u64)>,
     ) -> Self {
         Self {
             index,
             page_infos,
-            buffer_offsets_and_sizes,
+            buffer_offsets_and_sizes: buffer_offsets_and_sizes.into_boxed_slice().into(),
         }
     }
 }
@@ -455,7 +455,7 @@ impl DecodeBatchScheduler {
                     .unzip();
                 let inner = Arc::new(PrimitiveFieldScheduler::new(
                     DataType::UInt64,
-                    Arc::new(inner_infos),
+                    Arc::from(inner_infos.into_boxed_slice()),
                     offsets_column_buffers,
                 )) as Arc<dyn FieldScheduler>;
                 let offset_type = if matches!(data_type, DataType::List(_)) {

@@ -227,7 +227,9 @@ async fn check_round_trip_encoding_inner(
         let page_info = PageInfo {
             num_rows: encoded_page.num_rows,
             encoding: encoded_page.array.encoding.clone(),
-            buffer_offsets_and_sizes: Arc::new(buffer_offsets_and_sizes.clone()),
+            buffer_offsets_and_sizes: Arc::from(
+                buffer_offsets_and_sizes.clone().into_boxed_slice(),
+            ),
         };
 
         let col_idx = encoded_page.column_idx as usize;
@@ -253,7 +255,11 @@ async fn check_round_trip_encoding_inner(
         .into_iter()
         .enumerate()
         .map(|(col_idx, page_infos)| {
-            ColumnInfo::new(col_idx as u32, Arc::new(page_infos), Vec::new())
+            ColumnInfo::new(
+                col_idx as u32,
+                Arc::from(page_infos.into_boxed_slice()),
+                Vec::new(),
+            )
         })
         .collect::<Vec<_>>();
     let schema = Schema::new(vec![field.clone()]);

@@ -19,21 +19,21 @@ pub mod value;
 /// These contain the file buffers shared across the entire file
 #[derive(Clone, Copy, Debug)]
 pub struct FileBuffers<'a> {
-    pub positions_and_sizes: &'a Vec<(u64, u64)>,
+    pub positions_and_sizes: &'a [(u64, u64)],
 }
 
 /// These contain the file buffers and also buffers specific to a column
 #[derive(Clone, Copy, Debug)]
 pub struct ColumnBuffers<'a, 'b> {
     pub file_buffers: FileBuffers<'a>,
-    pub positions_and_sizes: &'b Vec<(u64, u64)>,
+    pub positions_and_sizes: &'b [(u64, u64)],
 }
 
 /// These contain the file & column buffers and also buffers specific to a page
 #[derive(Clone, Copy, Debug)]
 pub struct PageBuffers<'a, 'b, 'c> {
     pub column_buffers: ColumnBuffers<'a, 'b>,
-    pub positions_and_sizes: &'c Vec<(u64, u64)>,
+    pub positions_and_sizes: &'c [(u64, u64)],
 }
 
 // Translate a protobuf buffer description into a position in the file.  This could be a page
