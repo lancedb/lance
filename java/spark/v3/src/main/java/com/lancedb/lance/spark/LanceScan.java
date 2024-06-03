@@ -27,6 +27,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 import java.io.Serializable;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.IntStream;
 
 public class LanceScan implements Batch, Scan, Serializable {
@@ -34,10 +35,12 @@ public class LanceScan implements Batch, Scan, Serializable {
 
   private final StructType schema;
   private final LanceConfig options;
+  private final Optional<String> whereConditions;
 
-  public LanceScan(StructType schema, LanceConfig options) {
+  public LanceScan(StructType schema, LanceConfig options, Optional<String> whereConditions) {
     this.schema = schema;
     this.options = options;
+    this.whereConditions = whereConditions;
   }
 
   @Override
@@ -49,7 +52,7 @@ public class LanceScan implements Batch, Scan, Serializable {
   public InputPartition[] planInputPartitions() {
     List<LanceSplit> splits = LanceSplit.generateLanceSplits(options);
     return IntStream.range(0, splits.size())
-        .mapToObj(i -> new LanceInputPartition(schema, i, splits.get(i), options))
+        .mapToObj(i -> new LanceInputPartition(schema, i, splits.get(i), options, whereConditions))
         .toArray(InputPartition[]::new);
   }
 

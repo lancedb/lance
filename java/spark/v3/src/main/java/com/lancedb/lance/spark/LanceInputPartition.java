@@ -19,6 +19,7 @@ import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.Serializable;
+import java.util.Optional;
 
 public class LanceInputPartition implements InputPartition, Serializable {
   private static final long serialVersionUID = 4723894723984723984L;
@@ -27,13 +28,15 @@ public class LanceInputPartition implements InputPartition, Serializable {
   private final int partitionId;
   private final LanceSplit lanceSplit;
   private final LanceConfig config;
+  private final Optional<String> whereCondition;
 
   public LanceInputPartition(StructType schema, int partitionId,
-      LanceSplit lanceSplit, LanceConfig config) {
+      LanceSplit lanceSplit, LanceConfig config, Optional<String> whereCondition) {
     this.schema = schema;
     this.partitionId = partitionId;
     this.lanceSplit = lanceSplit;
     this.config = config;
+    this.whereCondition = whereCondition;
   }
 
   public StructType getSchema() {
@@ -50,5 +53,9 @@ public class LanceInputPartition implements InputPartition, Serializable {
 
   public LanceConfig getConfig() {
     return config;
+  }
+  
+  public Optional<String> getWhereCondition() {
+    return whereCondition;
   }
 }

@@ -19,6 +19,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -28,7 +29,7 @@ public class LanceColumnarPartitionReaderTest {
   public void test() throws Exception {
     LanceSplit split = new LanceSplit(Arrays.asList(0, 1));
     LanceInputPartition partition = new LanceInputPartition(
-        TestUtils.TestTable1Config.schema, 0, split, TestUtils.TestTable1Config.lanceConfig);
+        TestUtils.TestTable1Config.schema, 0, split, TestUtils.TestTable1Config.lanceConfig, Optional.empty());
     try (LanceColumnarPartitionReader reader = new LanceColumnarPartitionReader(partition)) {
       List<List<Long>> expectedValues = TestUtils.TestTable1Config.expectedValues;
       int rowIndex = 0;

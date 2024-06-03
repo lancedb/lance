@@ -25,38 +25,47 @@ public class LanceConfig implements Serializable {
   private static final long serialVersionUID = 827364827364823764L;
   public static final String CONFIG_DB_PATH = "db";
   public static final String CONFIG_TABLE_NAME = "table";
+  public static final String CONFIG_PUSH_DOWN_FILTERS = "pushDownFilters";
   private static final String LANCE_FILE_SUFFIX = ".lance";
+
+  private static final boolean DEFAULT_PUSH_DOWN_FILTERS = true;
 
   private final String dbPath;
   private final String tableName;
   private final String tablePath;
+  private final boolean pushDownFilters;
 
-  private LanceConfig(String dbPath, String tableName, String tablePath) {
+  private LanceConfig(String dbPath, String tableName, String tablePath, boolean pushDownFilters) {
     this.dbPath = dbPath;
     this.tableName = tableName;
     this.tablePath = tablePath;
-  }
-
-  public static LanceConfig from(CaseInsensitiveStringMap options) {
-    if (options.containsKey(CONFIG_DB_PATH) && options.containsKey(CONFIG_TABLE_NAME)) {
-      return new Builder()
-          .setDbPath(options.get(CONFIG_DB_PATH))
-          .setTableName(options.get(CONFIG_TABLE_NAME))
-          .build();
-    } else {
-      throw new IllegalArgumentException("Missing required options");
-    }
+    this.pushDownFilters = pushDownFilters;
   }
 
   public static LanceConfig from(Map<String, String> properties) {
-    if (properties.containsKey(CONFIG_DB_PATH) && properties.containsKey(CONFIG_TABLE_NAME)) {
-      return new Builder()
-          .setDbPath(properties.get(CONFIG_DB_PATH))
-          .setTableName(properties.get(CONFIG_TABLE_NAME))
-          .build();
-    } else {
+    return from(new CaseInsensitiveStringMap(properties));
+  }
+
+  public static LanceConfig from(CaseInsensitiveStringMap options) {
+    if (!options.containsKey(CONFIG_DB_PATH) || !options.containsKey(CONFIG_TABLE_NAME)) {
       throw new IllegalArgumentException("Missing required options");
     }
+
+    String dbPath = options.get(CONFIG_DB_PATH);
+    String tableName = options.get(CONFIG_TABLE_NAME);
+    boolean pushDownFilters = options.getBoolean(CONFIG_PUSH_DOWN_FILTERS, DEFAULT_PUSH_DOWN_FILTERS);
+
+    String tablePath = calculateTablePath(dbPath, tableName);
+
+    return new LanceConfig(dbPath, tableName, tablePath, pushDownFilters);
+  }
+
+  private static String calculateTablePath(String dbPath, String tableName) {
+    StringBuilder sb = new StringBuilder().append(dbPath);
+    if (!dbPath.endsWith("/")) {
+      sb.append("/");
+    }
+    return sb.append(tableName).append(LANCE_FILE_SUFFIX).toString();
   }
 
   public String getDbPath() {
@@ -71,34 +80,7 @@ public class LanceConfig implements Serializable {
     return tablePath;
   }
 
-  public static class Builder {
-    private String dbPath;
-    private String tableName;
-
-    public Builder setDbPath(String dbPath) {
-      this.dbPath = dbPath;
-      return this;
-    }
-
-    public Builder setTableName(String tableName) {
-      this.tableName = tableName;
-      return this;
-    }
-
-    public LanceConfig build() {
-      if (dbPath == null || tableName == null) {
-        throw new IllegalArgumentException("dbPath and tableName are required");
-      }
-      String tablePath = calculateTablePath(dbPath, tableName);
-      return new LanceConfig(dbPath, tableName, tablePath);
-    }
-
-    private String calculateTablePath(String dbPath, String tableName) {
-      StringBuilder sb = new StringBuilder().append(dbPath);
-      if (!dbPath.endsWith("/")) {
-        sb.append("/");
-      }
-      return sb.append(tableName).append(LANCE_FILE_SUFFIX).toString();
-    }
+  public boolean isPushDownFilters() {
+    return pushDownFilters;
   }
 }

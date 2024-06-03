@@ -16,6 +16,7 @@ package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.Dataset;
 import com.lancedb.lance.DatasetFragment;
+import com.lancedb.lance.spark.LanceInputPartition;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.spark.sql.types.StructType;
@@ -44,8 +45,8 @@ public class LanceReader {
   }
 
   public static LanceFragmentScanner getFragmentScanner(int fragmentId,
-      String tablePath, StructType schema) {
-    return LanceFragmentScanner.create(fragmentId, tablePath, schema, allocator);
+      LanceInputPartition inputPartition) {
+    return LanceFragmentScanner.create(fragmentId, inputPartition, allocator);
   }
 }
 

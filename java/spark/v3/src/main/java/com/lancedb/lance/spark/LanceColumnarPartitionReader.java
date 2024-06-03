@@ -46,8 +46,7 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
       }
       fragmentReader = LanceFragmentColumnarBatchScanner.create(
           inputPartition.getLanceSplit().getFragments().get(fragmentIndex),
-          inputPartition.getConfig().getTablePath(),
-          inputPartition.getSchema());
+          inputPartition);
       fragmentIndex++;
       if (fragmentReader.loadNextBatch()) {
         if (currentBatch != null) {

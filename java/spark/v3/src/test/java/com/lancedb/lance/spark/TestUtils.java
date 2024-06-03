@@ -24,6 +24,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 public class TestUtils {
   /**
@@ -58,6 +59,8 @@ public class TestUtils {
         DataTypes.createStructField("b", DataTypes.LongType, true),
         DataTypes.createStructField("c", DataTypes.LongType, true),
     });
+    
+    public static final LanceInputPartition inputPartition;
 
     static {
       URL resource = TestUtils.class.getResource("/example_db");
@@ -68,6 +71,7 @@ public class TestUtils {
       }
       tablePath = String.format("%s/%s.lance", dbPath, tableName);
       lanceConfig = createLanceConfig(dbPath, tableName);
+      inputPartition = new LanceInputPartition(schema, 0, new LanceSplit(Arrays.asList(0, 1)), lanceConfig, Optional.empty());
     }
   }
 }

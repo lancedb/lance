@@ -80,7 +80,7 @@ public class LanceReaderTest {
   
   public void validateFragment(List<List<Object>> expectedValues, int fragment, StructType schema) throws IOException {
     try (LanceFragmentScanner scanner = LanceReader.getFragmentScanner(
-        fragment, TestUtils.TestTable1Config.tablePath, schema)) {
+        fragment, TestUtils.TestTable1Config.inputPartition)) {
       try (ArrowReader reader = scanner.getArrowReader()) {
         VectorSchemaRoot root = reader.getVectorSchemaRoot();
         assertNotNull(root);
