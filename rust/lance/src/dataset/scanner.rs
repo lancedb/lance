@@ -6,7 +6,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow::datatypes::ArrowPrimitiveType;
+use arrow_array::{Array, Int64Array, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -30,7 +31,6 @@ use datafusion::scalar::ScalarValue;
 use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
-use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_index::vector::{Query, DIST_COL};
@@ -423,7 +423,12 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest(&mut self, column: &str, q: &dyn Array, k: usize) -> Result<&mut Self> {
+    pub fn nearest<T: ArrowPrimitiveType>(
+        &mut self,
+        column: &str,
+        q: &PrimitiveArray<T>,
+        k: usize,
+    ) -> Result<&mut Self> {
         self.ensure_not_fragment_scan()?;
 
         if k == 0 {
@@ -440,7 +445,7 @@ impl Scanner {
             format!("Column {} not found", column),
             location!(),
         ))?;
-        let key = match field.data_type() {
+        let key: Box<dyn Array> = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
                 if dt.data_type() == q.data_type() {
                     Box::new(q.clone())
@@ -1973,6 +1978,8 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_knn_with_prefilter(#[values(false, true)] use_experimental_writer: bool) {
+        use arrow_array::Float32Array;
+
         let mut test_ds = TestVectorDataset::new(use_experimental_writer)
             .await
             .unwrap();

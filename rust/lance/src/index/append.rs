@@ -130,6 +130,7 @@ pub async fn merge_indices<'a>(
 mod tests {
     use super::*;
 
+    use arrow::datatypes::Float32Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::UInt32Type;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
@@ -361,7 +362,7 @@ mod tests {
             .scan()
             .project(&["id"])
             .unwrap()
-            .nearest("vector", array.value(0).as_primitive(), 2)
+            .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 2)
             .unwrap()
             .try_into_batch()
             .await

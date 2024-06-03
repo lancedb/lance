@@ -490,6 +490,7 @@ impl ExecutionPlan for KNNIndexExec {
 mod tests {
     use super::*;
 
+    use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
@@ -557,7 +558,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stream = dataset
             .scan()
-            .nearest("vector", as_primitive_array(&q), 10)
+            .nearest("vector", as_primitive_array::<Float32Type>(&q), 10)
             .unwrap()
             .try_into_stream()
             .await
