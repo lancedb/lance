@@ -215,7 +215,7 @@ impl IVFIndex {
         }
     }
 
-    async fn search_in_partition(
+    pub(crate) async fn search_in_partition(
         &self,
         partition_id: usize,
         query: &Query,

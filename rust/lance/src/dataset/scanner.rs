@@ -46,10 +46,9 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{FilterPlan, PreFilterSource};
 use crate::io::exec::{
-    KNNFlatExec, KNNIndexExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec,
-    ScanConfig, TakeExec,
+    knn::new_knn_exec, FilterPlan, KNNFlatExec, LancePushdownScanExec, LanceScanExec, Planner,
+    PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
@@ -1408,12 +1407,7 @@ impl Scanner {
             (_, _, false) => PreFilterSource::None,
         };
 
-        let inner_fanout_search = Arc::new(KNNIndexExec::try_new(
-            self.dataset.clone(),
-            index,
-            q,
-            prefilter_source,
-        )?);
+        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -3804,7 +3798,8 @@ mod test {
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
     SortExec: TopK(fetch=42), expr=...
-      KNNIndex: name=..., k=42, deltas=1",
+      ANNSubIndex: name=..., k=42, deltas=1
+        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3816,7 +3811,8 @@ mod test {
     KNNFlat: k=10 metric=l2
       Take: columns=\"_distance, _rowid, vec\"
         SortExec: TopK(fetch=40), expr=...
-          KNNIndex: name=..., k=40, deltas=1",
+          ANNSubIndex: name=..., k=40, deltas=1
+            ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3846,7 +3842,8 @@ mod test {
     FilterExec: i@3 > 10
       Take: columns=\"_distance, _rowid, vec, i\"
         SortExec: TopK(fetch=17), expr=...
-          KNNIndex: name=..., k=17, deltas=1",
+          ANNSubIndex: name=..., k=17, deltas=1
+            ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3862,7 +3859,8 @@ mod test {
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
     SortExec: TopK(fetch=17), expr=...
-      KNNIndex: name=..., k=17, deltas=1
+      ANNSubIndex: name=..., k=17, deltas=1
+        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
         FilterExec: i@0 > 10
           LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
         )
@@ -3884,7 +3882,8 @@ mod test {
               LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1",
+              ANNSubIndex: name=..., k=5, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3904,7 +3903,8 @@ mod test {
                   LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
               Take: columns=\"_distance, _rowid, vec\"
                 SortExec: TopK(fetch=5), expr=...
-                  KNNIndex: name=..., k=5, deltas=1",
+                  ANNSubIndex: name=..., k=5, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3930,7 +3930,8 @@ mod test {
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1
+              ANNSubIndex: name=..., k=5, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
                 FilterExec: i@0 > 10
                   LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
         )
@@ -3953,7 +3954,8 @@ mod test {
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
     SortExec: TopK(fetch=5), expr=...
-      KNNIndex: name=..., k=5, deltas=1
+      ANNSubIndex: name=..., k=5, deltas=1
+        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
         ScalarIndexQuery: query=i > 10",
         )
         .await?;
@@ -3979,7 +3981,8 @@ mod test {
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1
+              ANNSubIndex: name=..., k=5, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
                 ScalarIndexQuery: query=i > 10",
         )
         .await?;
@@ -4005,7 +4008,8 @@ mod test {
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1
+              ANNSubIndex: name=..., k=5, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
                 ScalarIndexQuery: query=i > 10",
         )
         .await?;
