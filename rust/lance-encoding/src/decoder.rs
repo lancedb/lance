@@ -871,21 +871,6 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
 
-struct FixedPriorityIo {
-    io: Arc<dyn EncodingsIo>,
-    priority: u64,
-}
-
-impl EncodingsIo for FixedPriorityIo {
-    fn submit_request(
-        &self,
-        range: Vec<Range<u64>>,
-        _priority: u64,
-    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
-        self.io.submit_request(range, self.priority)
-    }
-}
-
 /// Contains the context for a scheduler
 pub struct SchedulerContext {
     recv: Option<mpsc::UnboundedReceiver<DecoderMessage>>,
