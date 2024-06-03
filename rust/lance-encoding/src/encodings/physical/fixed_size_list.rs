@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use arrow_array::{cast::AsArray, ArrayRef};
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
@@ -35,7 +37,7 @@ impl PageScheduler for FixedListScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[std::ops::Range<u32>],
-        scheduler: &dyn EncodingsIo,
+        scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let expanded_ranges = ranges

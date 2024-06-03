@@ -866,7 +866,7 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u32>],
-        scheduler: &dyn EncodingsIo,
+        scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
