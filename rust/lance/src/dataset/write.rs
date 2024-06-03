@@ -682,7 +682,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reader.num_batches(), 1);
-        let batch = reader.read_batch(0, .., &schema, None).await.unwrap();
+        let batch = reader.read_batch(0, .., &schema).await.unwrap();
         assert_eq!(batch, data);
     }
 }

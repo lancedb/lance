@@ -13,7 +13,7 @@ use futures::{
 use lance_arrow::RecordBatchExt;
 use lance_core::{
     utils::{address::RowAddress, deletion::DeletionVector},
-    Result, ROW_ID, ROW_ID_FIELD,
+    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_io::ReadBatchParams;
 
@@ -134,7 +134,7 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
         .iter()
         .zip(batch.columns())
         .map(|(field, col)| {
-            if field.name() == ROW_ID {
+            if field.name() == ROW_ID || field.name() == ROW_ADDR {
                 let col_data = col.to_data();
                 // If it already has a validity bitmap, then AND it with the mask.
                 // Otherwise, use the boolean buffer as the mask.
@@ -164,6 +164,8 @@ pub struct RowIdAndDeletesConfig {
     pub params: ReadBatchParams,
     /// Whether to include the row id column in the final batch
     pub with_row_id: bool,
+    /// Whether to include the row address column in the final batch
+    pub with_row_addr: bool,
     /// An optional deletion vector to apply to the batch
     pub deletion_vector: Option<Arc<DeletionVector>>,
     /// Whether to make deleted rows null instead of filtering them out
@@ -195,27 +197,35 @@ fn apply_row_id_and_deletes(
 
     let num_rows = batch.num_rows() as u32;
 
+    let row_addrs = if config.with_row_addr || (should_fetch_row_id && row_id_sequence.is_none()) {
+        let ids_in_batch = config
+            .params
+            .slice(batch_offset as usize, num_rows as usize)
+            .unwrap()
+            .to_offsets()
+            .unwrap();
+        let row_addrs: UInt64Array = ids_in_batch
+            .values()
+            .iter()
+            .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))
+            .collect();
+
+        Some(Arc::new(row_addrs))
+    } else {
+        None
+    };
+
     let row_ids = if should_fetch_row_id {
         if let Some(row_id_sequence) = row_id_sequence {
             let row_ids = row_id_sequence
                 .slice(batch_offset as usize, num_rows as usize)
                 .iter()
-                .collect::<Vec<u64>>();
-            Some(row_ids)
+                .collect::<UInt64Array>();
+            Some(Arc::new(row_ids))
         } else {
-            let ids_in_batch = config
-                .params
-                .slice(batch_offset as usize, num_rows as usize)
-                .unwrap()
-                .to_offsets()
-                .unwrap();
-            let row_ids: Vec<u64> = ids_in_batch
-                .values()
-                .iter()
-                .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))
-                .collect();
-
-            Some(row_ids)
+            // If we don't have a row id sequence, can assume the row ids are
+            // the same as the row addresses.
+            row_addrs.clone()
         }
     } else {
         None
@@ -229,12 +239,21 @@ fn apply_row_id_and_deletes(
     // We should try to move this to later.
     let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
     let _enter = span.enter();
-    let deletion_mask =
-        deletion_vector.and_then(|v| v.build_predicate(row_ids.as_ref().unwrap().iter()));
+    let deletion_mask = deletion_vector.and_then(|v| {
+        let row_ids: &[u64] = row_ids.as_ref().unwrap().values();
+        v.build_predicate(row_ids.iter())
+    });
 
     let batch = if config.with_row_id {
-        let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
+        let row_id_arr = row_ids.unwrap();
         batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
+    } else {
+        batch
+    };
+
+    let batch = if config.with_row_addr {
+        let row_addr_arr = row_addrs.unwrap();
+        batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
     } else {
         batch
     };
@@ -359,6 +378,7 @@ mod tests {
                 let config = RowIdAndDeletesConfig {
                     params: params.clone(),
                     with_row_id: true,
+                    with_row_addr: false,
                     deletion_vector: None,
                     make_deletions_null: false,
                     total_num_rows: 100,
@@ -452,6 +472,7 @@ mod tests {
                             let config = RowIdAndDeletesConfig {
                                 params: ReadBatchParams::RangeFull,
                                 with_row_id,
+                                with_row_addr: false,
                                 deletion_vector: deletion_vector.clone(),
                                 make_deletions_null,
                                 total_num_rows: 100,

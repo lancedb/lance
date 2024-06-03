@@ -9,12 +9,13 @@ use crate::{Error, Result};
 use arrow::{array::as_struct_array, compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::Schema as ArrowSchema;
 use arrow_select::interleave::interleave;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
-use lance_core::{datatypes::Schema, ROW_ID};
+use lance_core::datatypes::Schema;
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use snafu::{location, Location};
 
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
@@ -139,7 +140,9 @@ pub async fn take_rows(
         return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
     }
 
-    let row_ids = if dataset.manifest.uses_move_stable_row_ids() {
+    dbg!(row_ids);
+
+    let row_addrs = if dataset.manifest.uses_move_stable_row_ids() {
         // Need to map the row ids to addresses
         let index = get_row_id_index(dataset).await?;
         let addresses = row_ids
@@ -151,8 +154,10 @@ pub async fn take_rows(
         Cow::Borrowed(row_ids)
     };
 
+    dbg!(row_addrs.as_ref());
+
     let projection = Arc::new(projection.clone());
-    let row_id_meta = check_row_ids(&row_ids);
+    let row_id_meta = check_row_ids(&row_addrs);
 
     // This method is mostly to annotate the send bound to avoid the
     // higher-order lifetime error.
@@ -162,21 +167,21 @@ pub async fn take_rows(
         fragment: FileFragment,
         row_ids: Vec<u32>,
         projection: Arc<Schema>,
-        with_row_id: bool,
+        with_row_address: bool,
     ) -> impl Future<Output = Result<RecordBatch>> + Send {
         async move {
             fragment
-                .take_rows(&row_ids, projection.as_ref(), with_row_id)
+                .take_rows(&row_ids, projection.as_ref(), false, with_row_address)
                 .await
         }
     }
 
     if row_id_meta.contiguous {
         // Fastest path: Can use `read_range` directly
-        let start = row_ids.first().expect("empty range passed to take_rows");
+        let start = row_addrs.first().expect("empty range passed to take_rows");
         let fragment_id = (start >> 32) as usize;
         let range_start = *start as u32 as usize;
-        let range_end = *row_ids.last().expect("empty range passed to take_rows") as u32 as usize;
+        let range_end = *row_addrs.last().expect("empty range passed to take_rows") as u32 as usize;
         let range = range_start..(range_end + 1);
 
         let fragment = dataset.get_fragment(fragment_id).ok_or_else(|| {
@@ -186,18 +191,18 @@ pub async fn take_rows(
             )
         })?;
 
-        let reader = fragment.open(projection.as_ref(), false).await?;
+        let reader = fragment.open(projection.as_ref(), false, false).await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_id_meta.sorted {
         // Don't need to re-arrange data, just concatenate
 
         let mut batches: Vec<_> = Vec::new();
-        let mut current_fragment = row_ids[0] >> 32;
+        let mut current_fragment = row_addrs[0] >> 32;
         let mut current_start = 0;
-        let mut row_ids_iter = row_ids.iter().enumerate();
+        let mut row_addrs_iter = row_addrs.iter().enumerate();
         'outer: loop {
             let (fragment_id, range) = loop {
-                if let Some((i, row_id)) = row_ids_iter.next() {
+                if let Some((i, row_id)) = row_addrs_iter.next() {
                     let fragment_id = row_id >> 32;
                     if fragment_id != current_fragment {
                         let next = (current_fragment, current_start..i);
@@ -205,9 +210,9 @@ pub async fn take_rows(
                         current_start = i;
                         break next;
                     }
-                } else if current_start != row_ids.len() {
-                    let next = (current_fragment, current_start..row_ids.len());
-                    current_start = row_ids.len();
+                } else if current_start != row_addrs.len() {
+                    let next = (current_fragment, current_start..row_addrs.len());
+                    current_start = row_addrs.len();
                     break next;
                 } else {
                     break 'outer;
@@ -217,15 +222,15 @@ pub async fn take_rows(
             let fragment = dataset.get_fragment(fragment_id as usize).ok_or_else(|| {
                 Error::invalid_input(
                     format!(
-                        "row_id {} belongs to non-existant fragment: {}",
-                        row_ids[range.start], fragment_id
+                        "row address {} belongs to non-existant fragment: {}",
+                        row_addrs[range.start], fragment_id
                     ),
                     location!(),
                 )
             })?;
-            let row_ids: Vec<u32> = row_ids[range].iter().map(|x| *x as u32).collect();
+            let row_offsets: Vec<u32> = row_addrs[range].iter().map(|x| *x as u32).collect();
 
-            let batch_fut = do_take(fragment, row_ids, projection.clone(), false);
+            let batch_fut = do_take(fragment, row_offsets, projection.clone(), false);
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
@@ -234,34 +239,31 @@ pub async fn take_rows(
             .await?;
         Ok(concat_batches(&batches[0].schema(), &batches)?)
     } else {
-        let projection_with_row_id = Schema::merge(
+        let projection_with_row_addr = Schema::merge(
             projection.as_ref(),
-            &ArrowSchema::new(vec![ArrowField::new(
-                ROW_ID,
-                arrow::datatypes::DataType::UInt64,
-                false,
-            )]),
+            &ArrowSchema::new(vec![ROW_ADDR_FIELD.clone()]),
         )?;
-        let schema_with_row_id = Arc::new(ArrowSchema::from(&projection_with_row_id));
+        let schema_with_row_addr = Arc::new(ArrowSchema::from(&projection_with_row_addr));
 
         // Slow case: need to re-map data into expected order
-        let mut sorted_row_ids = Vec::from(row_ids.clone());
-        sorted_row_ids.sort();
+        let mut sorted_row_addrs = Vec::from(row_addrs.clone());
+        sorted_row_addrs.sort();
         // Group ROW Ids by the fragment
-        let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-        sorted_row_ids.iter().for_each(|row_id| {
+        let mut row_addrs_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        sorted_row_addrs.iter().for_each(|row_id| {
             let fragment_id = row_id >> 32;
             let offset = (row_id - (fragment_id << 32)) as u32;
-            row_ids_per_fragment
+            row_addrs_per_fragment
                 .entry(fragment_id)
                 .and_modify(|v| v.push(offset))
                 .or_insert_with(|| vec![offset]);
         });
+        dbg!(&row_addrs_per_fragment);
 
         let fragments = dataset.get_fragments();
         let fragment_and_indices = fragments.into_iter().filter_map(|f| {
-            let local_row_ids = row_ids_per_fragment.remove(&(f.id() as u64))?;
-            Some((f, local_row_ids))
+            let row_offsets = row_addrs_per_fragment.remove(&(f.id() as u64))?;
+            Some((f, row_offsets))
         });
 
         let mut batches = futures::stream::iter(fragment_and_indices)
@@ -269,9 +271,9 @@ pub async fn take_rows(
             .buffered(4 * num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
-
+        dbg!(&batches);
         let one_batch = if batches.len() > 1 {
-            concat_batches(&schema_with_row_id, &batches)?
+            concat_batches(&schema_with_row_addr, &batches)?
         } else {
             batches.pop().unwrap()
         };
@@ -281,15 +283,18 @@ pub async fn take_rows(
         // to match the requested order.
 
         let returned_row_ids = one_batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .ok_or_else(|| Error::Internal {
-                message: "ROW_ID column not found".into(),
+                message: format!(
+                    "_rowaddr column not found in schema {}",
+                    one_batch.schema().as_ref()
+                ),
                 location: location!(),
             })?
             .as_primitive::<UInt64Type>()
             .values();
 
-        let remapping_index: UInt64Array = row_ids
+        let remapping_index: UInt64Array = row_addrs
             .iter()
             .filter_map(|o| {
                 returned_row_ids
@@ -299,6 +304,8 @@ pub async fn take_rows(
             })
             .collect();
 
+        dbg!(&sorted_row_addrs);
+        // Problem: remapping index has row addresses, one_batch has row ids.
         debug_assert_eq!(remapping_index.len(), one_batch.num_rows());
 
         // Remove the row id column.
@@ -343,17 +350,17 @@ pub fn take_scan(
     )))
 }
 
-struct RowIdStats {
+struct RowAddrStats {
     sorted: bool,
     contiguous: bool,
 }
 
-fn check_row_ids(row_ids: &[u64]) -> RowIdStats {
+fn check_row_ids(row_ids: &[u64]) -> RowAddrStats {
     let mut sorted = true;
     let mut contiguous = true;
 
     if row_ids.is_empty() {
-        return RowIdStats { sorted, contiguous };
+        return RowAddrStats { sorted, contiguous };
     }
 
     let mut last_id = row_ids[0];
@@ -367,13 +374,13 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdStats {
         last_id = *id;
     }
 
-    RowIdStats { sorted, contiguous }
+    RowAddrStats { sorted, contiguous }
 }
 
 #[cfg(test)]
 mod test {
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
-    use arrow_schema::DataType;
+    use arrow_schema::{DataType, Field as ArrowField};
     use rstest::rstest;
 
     use crate::dataset::{scanner::test_dataset::TestVectorDataset, WriteParams};

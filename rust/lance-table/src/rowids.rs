@@ -26,6 +26,7 @@ use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
 use lance_core::{Error, Result};
+use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
 use snafu::{location, Location};
@@ -153,7 +154,7 @@ impl RowIdSequence {
 
     /// Find the row ids in the sequence.
     ///
-    /// Returns the row ids sorted by their appearane in the sequence.
+    /// Returns the row ids sorted by their appearance in the sequence.
     /// Also returns the segment index and the range where that segment's
     /// row id matches are found in the returned row id vector.
     fn find_ids(
@@ -241,6 +242,18 @@ impl RowIdSequence {
             offset_start,
             offset_last,
         }
+    }
+
+    pub fn get(&self, index: usize) -> Option<u64> {
+        let mut offset = 0;
+        for segment in &self.0 {
+            let segment_len = segment.len();
+            if index < offset + segment_len {
+                return segment.get(index - offset);
+            }
+            offset += segment_len;
+        }
+        None
     }
 }
 
@@ -357,6 +370,51 @@ pub fn rechunk_sequences(
     }
 
     Ok(chunked_sequences)
+}
+
+/// Selects the row ids from a sequence based on the provided offsets.
+pub fn select_row_ids<'a>(
+    sequence: &'a RowIdSequence,
+    offsets: &'a ReadBatchParams,
+) -> Result<Vec<u64>> {
+    match offsets {
+        ReadBatchParams::Indices(indices) => indices
+            .values()
+            .iter()
+            .map(|index| {
+                sequence.get(*index as usize).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "Index out of bounds: {} for sequence of length {}",
+                            index,
+                            sequence.len()
+                        ),
+                        location!(),
+                    )
+                })
+            })
+            .collect(),
+        ReadBatchParams::Range(range) => {
+            let sequence = sequence.slice(
+                range.start,
+                range.end - range.start,
+            );
+            Ok(sequence.iter().collect())
+        }
+        ReadBatchParams::RangeFull => Ok(sequence.iter().collect()),
+        ReadBatchParams::RangeTo(to) => {
+            let len = to.end;
+            let sequence = sequence.slice(0, len);
+            Ok(sequence.iter().collect())
+        }
+        ReadBatchParams::RangeFrom(from) => {
+            let sequence = sequence.slice(
+                from.start,
+                sequence.len() as usize - from.start,
+            );
+            Ok(sequence.iter().collect())
+        }
+    }
 }
 
 #[cfg(test)]

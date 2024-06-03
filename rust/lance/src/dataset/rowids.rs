@@ -324,4 +324,6 @@ mod test {
         // Data including row ids should be the same.
         assert_eq!(expected, actual);
     }
+
+    // TODO: query / scan / take after deletion, compaction, then deletion
 }

@@ -1621,7 +1621,7 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
-            let reader = fragment.open(dataset.schema(), false).await.unwrap();
+            let reader = fragment.open(dataset.schema(), false, false).await.unwrap();
             // No group / batch concept in v2
             if !use_experimental_writer {
                 assert_eq!(reader.legacy_num_batches(), 10);
