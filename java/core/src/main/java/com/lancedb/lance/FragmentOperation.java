@@ -19,7 +19,6 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 /** Fragment related operations. */
 public abstract class FragmentOperation {

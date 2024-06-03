@@ -14,8 +14,7 @@
 
 package com.lancedb.lance.spark;
 
-import com.lancedb.lance
-    .spark.internal.LanceConfig;
+import com.lancedb.lance.spark.internal.LanceConfig;
 import org.apache.arrow.util.Preconditions;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.read.Batch;
