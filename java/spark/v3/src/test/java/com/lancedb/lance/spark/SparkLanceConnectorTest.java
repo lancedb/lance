@@ -21,6 +21,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -96,7 +97,7 @@ public class SparkLanceConnectorTest {
         .select("y", "b");
 
     List<List<Long>> expectedValues = TestUtils.TestTable1Config.expectedValues.stream()
-        .map(row -> List.of(row.get(1), row.get(2)))
+        .map(row -> Arrays.asList(row.get(1), row.get(2)))
         .collect(Collectors.toList());
 
     validateData(data, expectedValues);
@@ -112,7 +113,7 @@ public class SparkLanceConnectorTest {
         .filter("y > 3");
 
     List<List<Long>> expectedValues = TestUtils.TestTable1Config.expectedValues.stream()
-        .map(row -> List.of(row.get(1), row.get(2))) // "y" is at index 1, "b" is at index 2
+        .map(row -> Arrays.asList(row.get(1), row.get(2))) // "y" is at index 1, "b" is at index 2
         .filter(row -> row.get(0) > 3)
         .collect(Collectors.toList());
 
