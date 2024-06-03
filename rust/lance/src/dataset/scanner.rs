@@ -423,7 +423,7 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+    pub fn nearest(&mut self, column: &str, q: &dyn Array, k: usize) -> Result<&mut Self> {
         self.ensure_not_fragment_scan()?;
 
         if k == 0 {
@@ -442,8 +442,8 @@ impl Scanner {
         ))?;
         let key = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
-                if dt.data_type().is_floating() {
-                    coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
+                if dt.data_type() == q.data_type() {
+                    Box::new(q.clone())
                 } else {
                     return Err(Error::io(
                         format!(
