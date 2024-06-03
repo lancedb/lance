@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use core::panic;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BooleanArray, StringArray, UInt32Array, UInt8Array};
+use arrow_array::{Array, ArrayRef, BooleanArray, StringArray, UInt32Array, UInt8Array, Int32Array};
 use arrow_buffer::BooleanBuffer;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
@@ -17,6 +18,8 @@ use crate::{
 };
 
 use lance_core::Result;
+use arrow_schema::DataType;
+use arrow_cast::cast::cast;
 
 use super::buffers::BitmapBufferEncoder;
 
@@ -38,24 +41,23 @@ impl BinaryEncoder {
     }
 }
 
+// Returns indices arrays from string arrays
+// These arrays are padded with a 0 at the beginning
 fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
     let index_arrays: Vec<ArrayRef> = arrays
         .iter()
         .filter_map(|arr| {
             if let Some(string_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                let mut int_arr = Vec::new();
 
-                let mut cum_sz: u32 = 0;
-                for i in 0..string_arr.len() {
-                    let s = string_arr.value(i);
-                    let sz = s.len() as u32;
-                    cum_sz += sz;
-                    int_arr.push(cum_sz);
+                let offsets = string_arr.value_offsets().to_vec();
+
+                let new_int_arr = Int32Array::from(offsets);
+                match cast(&new_int_arr, &DataType::UInt64) {
+                    Ok(res) => Some(Arc::new(res) as ArrayRef),
+                    Err(_) => panic!("Failed to cast to uint64"),
                 }
-                // Arc::new(UInt32Array::from(int_arr));
-                Some(Arc::new(UInt32Array::from(int_arr)) as ArrayRef)
             } else {
-                None
+                panic!("Failed to downcast data to string array");
             }
         })
         .collect();
@@ -68,15 +70,12 @@ fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
         .iter()
         .filter_map(|arr| {
             if let Some(string_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                let mut byte_arr = Vec::new();
 
-                for i in 0..string_arr.len() {
-                    let s = string_arr.value(i).as_bytes();
-                    byte_arr.extend_from_slice(s);
-                }
-                Some(Arc::new(UInt8Array::from(byte_arr)) as ArrayRef)
+                let values = string_arr.values().to_vec();
+                let bytes_arr = Arc::new(UInt8Array::from(values)) as ArrayRef;
+                Some(bytes_arr)
             } else {
-                None
+                panic!("Failed to downcast data to string array");
             }
         })
         .collect();
@@ -91,17 +90,20 @@ impl ArrayEncoder for BinaryEncoder {
             .map(|arr| (arr.null_count() as u32, arr.len() as u32))
             .fold((0, 0), |acc, val| (acc.0 + val.0, acc.1 + val.1));
 
-        if null_count == 0 {
+        if null_count != 0 {
+            panic!("Data contains null values, not currently supported for binary data.")
+        }
+        else {
             let index_arrays = get_indices_from_string_arrays(arrays);
             let encoded_indices = self.indices_encoder.encode(&index_arrays, buffer_index)?;
-            // for arr in &index_arrays {
-            //     println!("indices: {:?}", arr);
-            // }
+            for arr in &index_arrays {
+                println!("indices: {:?}", arr);
+            }
 
             let byte_arrays = get_bytes_from_string_arrays(arrays);
-            // for arr in &byte_arrays {
-            //     println!("arr: {:?}", arr);
-            // }
+            for arr in &byte_arrays {
+                println!("arr: {:?}", arr);
+            }
             let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
 
             let mut encoded_buffers = encoded_indices.buffers;
@@ -121,20 +123,20 @@ impl ArrayEncoder for BinaryEncoder {
         }
         // Currently not handling all null cases in this array encoder.
         // TODO: Separate behavior for all null rows vs some null rows
-        else {
-            let nullability = pb::nullable::Nullability::AllNulls(pb::nullable::AllNull {});
+        // else if null_count == row_count {
+        //     let nullability = pb::nullable::Nullability::AllNulls(pb::nullable::AllNull {});
 
-            Ok(EncodedArray {
-                buffers: vec![],
-                encoding: pb::ArrayEncoding {
-                    array_encoding: Some(pb::array_encoding::ArrayEncoding::Nullable(Box::new(
-                        pb::Nullable {
-                            nullability: Some(nullability),
-                        },
-                    ))),
-                },
-            })
-        }
+        //     Ok(EncodedArray {
+        //         buffers: vec![],
+        //         encoding: pb::ArrayEncoding {
+        //             array_encoding: Some(pb::array_encoding::ArrayEncoding::Nullable(Box::new(
+        //                 pb::Nullable {
+        //                     nullability: Some(nullability),
+        //                 },
+        //             ))),
+        //         },
+        //     })
+        // }
 
         // let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
         // let encoding = pb::nullable::Nullability::NoNulls(Box::new(pb::nullable::NoNull {
