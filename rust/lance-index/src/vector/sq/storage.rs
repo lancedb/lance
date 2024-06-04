@@ -414,3 +414,13 @@ impl<'a> DistCalculator for SQDistCalculator<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_chunks() {
+        
+    }
+}

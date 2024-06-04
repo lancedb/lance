@@ -13,7 +13,11 @@ use snafu::{location, Location};
 
 use crate::vector::quantizer::Quantization;
 
-/// WARNING: Internal API,  API stability is not guaranteed
+/// <section class="warning">
+///  Internal API
+///
+///  API stability is not guaranteed
+/// </section>
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
     fn prefetch(&self, _id: u32) {}
