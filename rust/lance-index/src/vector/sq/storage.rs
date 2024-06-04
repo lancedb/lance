@@ -129,8 +129,8 @@ impl SQStorageChunk {
         self.row_ids.len()
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.batch.schema()
+    fn schema(&self) -> &SchemaRef {
+        self.batch.schema_ref()
     }
 
     fn row_id(&self, id: u32) -> u64 {
@@ -308,6 +308,13 @@ impl VectorStore for ScalarQuantizationStorage {
                 .with_schema(schema.clone())
                 .expect("attach schema")
         }))
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        self.chunks
+            .first_key_value()
+            .map(|(_, c)| c.schema())
+            .unwrap()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

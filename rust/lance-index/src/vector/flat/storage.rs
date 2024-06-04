@@ -12,7 +12,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
 use arrow_array::{types::Float32Type, RecordBatch};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt64Array};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, SchemaRef};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
@@ -115,6 +115,10 @@ impl VectorStore for FlatStorage {
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok([self.batch.clone()].into_iter())
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        self.batch.schema_ref()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

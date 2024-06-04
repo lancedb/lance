@@ -4,7 +4,7 @@
 use std::any::Any;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::Field;
+use arrow_schema::{Field, SchemaRef};
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
@@ -40,6 +40,8 @@ pub trait VectorStore: Send + Sync {
     fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
     where
         Self: Sized;
+
+    fn schema(&self) -> &SchemaRef;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>>;
 

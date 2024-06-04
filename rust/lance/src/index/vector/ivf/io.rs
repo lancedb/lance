@@ -24,8 +24,11 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::quantizer::{Quantization as _, Quantizer};
-use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::{
+    quantizer::{Quantization, Quantizer},
+    sq::ScalarQuantizer,
+    v3::storage::VectorStore,
+};
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
@@ -550,7 +553,9 @@ async fn build_and_write_sq_storage(
     })
     .await?;
 
-    writer.write_record_batch(storage.batch().clone()).await?;
+    for batch in storage.to_batches()? {
+        writer.write_record_batch(batch.clone()).await?;
+    }
     writer.finish().await?;
     Ok(())
 }

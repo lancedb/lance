@@ -500,6 +500,10 @@ impl VectorStore for ProductQuantizationStorage {
         Ok([self.batch.clone().with_schema(schema.into())?].into_iter())
     }
 
+    fn schema(&self) -> &SchemaRef {
+        self.batch.schema_ref()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
