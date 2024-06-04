@@ -84,7 +84,6 @@ pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
-    base_path: Path,
     block_size: usize,
 }
 
@@ -94,9 +93,7 @@ impl DeepSizeOf for ObjectStore {
         // shouldn't be too big.  The only exception might be the write cache but, if
         // the writer cache has data, it means we're using it somewhere else that isn't
         // a cache and so that doesn't really count.
-        self.scheme.deep_size_of_children(context)
-            + self.base_path.as_ref().deep_size_of_children(context)
-            + self.block_size.deep_size_of_children(context)
+        self.scheme.deep_size_of_children(context) + self.block_size.deep_size_of_children(context)
     }
 }
 
@@ -356,15 +353,14 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Self, Path)> {
-        let (object_store, base_path) = match Url::parse(uri) {
+        let (object_store, path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
                 Self::from_path(uri)
             }
             Ok(url) => {
                 let store = Self::new_from_url(url.clone(), params.clone()).await?;
-                let path = Path::from(url.path());
-                Ok((store, path))
+                Ok((store, Path::from(url.path())))
             }
             Err(_) => Self::from_path(uri),
         }?;
@@ -378,7 +374,7 @@ impl ObjectStore {
                     .unwrap_or(object_store.inner),
                 ..object_store
             },
-            base_path,
+            path,
         ))
     }
 
@@ -399,7 +395,6 @@ impl ObjectStore {
             Self {
                 inner: Arc::new(LocalFileSystem::new()).traced(),
                 scheme: String::from(scheme),
-                base_path: Path::from_absolute_path(expanded_path.as_path())?,
                 block_size: 4 * 1024, // 4KB block size
             },
             Path::from_absolute_path(expanded_path.as_path())?,
@@ -419,7 +414,6 @@ impl ObjectStore {
         Self {
             inner: Arc::new(LocalFileSystem::new()).traced(),
             scheme: String::from("file"),
-            base_path: Path::from("/"),
             block_size: 4 * 1024, // 4KB block size
         }
     }
@@ -429,7 +423,6 @@ impl ObjectStore {
         Self {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            base_path: Path::from("/"),
             block_size: 64 * 1024,
         }
     }
@@ -445,10 +438,6 @@ impl ObjectStore {
 
     pub fn set_block_size(&mut self, new_size: usize) {
         self.block_size = new_size;
-    }
-
-    pub fn base_path(&self) -> &Path {
-        &self.base_path
     }
 
     /// Open a file for path.
@@ -747,11 +736,9 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             Ok(ObjectStore {
                 inner: Arc::new(store),
                 scheme: String::from(url.scheme()),
-                base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             })
         }
-
         "gs" => {
             storage_options.with_env_gcs();
             let mut builder = GoogleCloudStorageBuilder::new().with_url(url.as_ref());
@@ -763,23 +750,21 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             // object_store 0.10.0 is available.
             let store = PatchedGoogleCloudStorage(Arc::new(store));
             let store = Arc::new(store);
+
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("gs"),
-                base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             })
         }
         "az" => {
             storage_options.with_env_azure();
-
             let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
             let store = Arc::new(store);
 
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("az"),
-                base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             })
         }
@@ -794,7 +779,6 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            base_path: Path::from(url.path()),
             block_size: 64 * 1024,
         }),
         unknow_scheme => {
@@ -824,7 +808,6 @@ impl ObjectStore {
         Self {
             inner: store,
             scheme: scheme.into(),
-            base_path: location.path().into(),
             block_size,
         }
     }
@@ -967,6 +950,26 @@ mod tests {
                 .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
         }
+    }
+
+    #[tokio::test]
+    async fn test_cloud_paths() {
+        let uri = "s3://bucket/foo.lance";
+        let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
+        assert_eq!(store.scheme, "s3");
+        assert_eq!(path.to_string(), "foo.lance");
+
+        let (store, path) = ObjectStore::from_uri("s3+ddb://bucket/foo.lance")
+            .await
+            .unwrap();
+        assert_eq!(store.scheme, "s3");
+        assert_eq!(path.to_string(), "foo.lance");
+
+        let (store, path) = ObjectStore::from_uri("gs://bucket/foo.lance")
+            .await
+            .unwrap();
+        assert_eq!(store.scheme, "gs");
+        assert_eq!(path.to_string(), "foo.lance");
     }
 
     #[tokio::test]

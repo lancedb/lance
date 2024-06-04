@@ -12,6 +12,26 @@ use snafu::{location, Location};
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 
+pub fn get_vector_dim(dataset: &Dataset, column: &str) -> Result<usize> {
+    let schema = dataset.schema();
+    let field = schema.field(column).ok_or(Error::Index {
+        message: format!("Column {} does not exist in schema {}", column, schema),
+        location: location!(),
+    })?;
+    let data_type = field.data_type();
+    if let arrow_schema::DataType::FixedSizeList(_, dim) = data_type {
+        Ok(dim as usize)
+    } else {
+        Err(Error::Index {
+            message: format!(
+                "Column {} is not a FixedSizeListArray, but {:?}",
+                column, data_type
+            ),
+            location: location!(),
+        })
+    }
+}
+
 /// Maybe sample training data from dataset, specified by column name.
 ///
 /// Returns a [FixedSizeListArray], containing the training dataset.

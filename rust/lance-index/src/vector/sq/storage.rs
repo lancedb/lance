@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range};
 
 use arrow::{
     array::AsArray,
-    datatypes::{Float32Type, UInt8Type},
+    datatypes::{Float32Type, UInt64Type, UInt8Type},
 };
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
 use async_trait::async_trait;
@@ -78,8 +78,8 @@ pub struct ScalarQuantizationStorage {
     batch: RecordBatch,
 
     // Helper fields, references to the batch
-    row_ids: Arc<UInt64Array>,
-    sq_codes: Arc<FixedSizeListArray>,
+    row_ids: UInt64Array,
+    sq_codes: FixedSizeListArray,
 }
 
 impl DeepSizeOf for ScalarQuantizationStorage {
@@ -97,28 +97,22 @@ impl ScalarQuantizationStorage {
         bounds: Range<f64>,
         batch: RecordBatch,
     ) -> Result<Self> {
-        let row_ids = Arc::new(
-            batch
-                .column_by_name(ROW_ID)
-                .ok_or(Error::Index {
-                    message: "Row ID column not found in the batch".to_owned(),
-                    location: location!(),
-                })?
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .clone(),
-        );
-        let sq_codes = Arc::new(
-            batch
-                .column_by_name(SQ_CODE_COLUMN)
-                .ok_or(Error::Index {
-                    message: "SQ code column not found in the batch".to_owned(),
-                    location: location!(),
-                })?
-                .as_fixed_size_list()
-                .clone(),
-        );
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .ok_or(Error::Index {
+                message: "Row ID column not found in the batch".to_owned(),
+                location: location!(),
+            })?
+            .as_primitive::<UInt64Type>()
+            .clone();
+        let sq_codes = batch
+            .column_by_name(SQ_CODE_COLUMN)
+            .ok_or(Error::Index {
+                message: "SQ code column not found in the batch".to_owned(),
+                location: location!(),
+            })?
+            .as_fixed_size_list()
+            .clone();
 
         Ok(Self {
             num_bits,
@@ -150,7 +144,7 @@ impl ScalarQuantizationStorage {
         self.row_ids.values()
     }
 
-    pub fn sq_codes(&self) -> &Arc<FixedSizeListArray> {
+    pub fn sq_codes(&self) -> &FixedSizeListArray {
         &self.sq_codes
     }
 
@@ -211,6 +205,69 @@ impl QuantizerStorage for ScalarQuantizationStorage {
 
 impl VectorStore for ScalarQuantizationStorage {
     type DistanceCalculator<'a> = SQDistCalculator<'a>;
+
+    fn try_from_batch(
+        batch: RecordBatch,
+        distance_type: lance_linalg::distance::DistanceType,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let metadata_json = batch
+            .schema_ref()
+            .metadata()
+            .get("metadata")
+            .ok_or(Error::Schema {
+                message: "metadata not found".to_string(),
+                location: location!(),
+            })?;
+        let metadata: ScalarQuantizationMetadata = serde_json::from_str(metadata_json)?;
+
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .ok_or(Error::Schema {
+                message: "Row ID column not found in the batch".to_string(),
+                location: location!(),
+            })?
+            .as_primitive::<UInt64Type>()
+            .clone();
+        let sq_codes = batch
+            .column_by_name(SQ_CODE_COLUMN)
+            .ok_or(Error::Schema {
+                message: "SQ code column not found in the batch".to_string(),
+                location: location!(),
+            })?
+            .as_fixed_size_list()
+            .clone();
+
+        Ok(Self {
+            metric_type: distance_type,
+            num_bits: metadata.num_bits,
+            bounds: metadata.bounds.clone(),
+            batch,
+            row_ids,
+            sq_codes,
+        })
+    }
+
+    fn to_batch(&self) -> Result<RecordBatch> {
+        let metadata = ScalarQuantizationMetadata {
+            dim: self.sq_codes.value_length() as usize,
+            num_bits: self.num_bits,
+            bounds: self.bounds.clone(),
+        };
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let metadata = HashMap::from_iter(vec![("metadata".to_owned(), metadata_json)]);
+
+        let schema = self
+            .batch
+            .schema_ref()
+            .as_ref()
+            .clone()
+            .with_metadata(metadata);
+        Ok(self.batch.clone().with_schema(schema.into())?)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -233,7 +290,7 @@ impl VectorStore for ScalarQuantizationStorage {
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        SQDistCalculator::new(query, self.sq_codes.as_ref(), self.bounds.clone())
+        SQDistCalculator::new(query, &self.sq_codes, self.bounds.clone())
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {

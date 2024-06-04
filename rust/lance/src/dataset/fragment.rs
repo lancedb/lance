@@ -580,14 +580,14 @@ impl FileFragment {
         fragment: &Fragment,
     ) -> Result<Option<Arc<DeletionVector>>> {
         if let Some(deletion_file) = &fragment.deletion_file {
-            let path = deletion_file_path(object_store.base_path(), fragment.id, deletion_file);
+            let path = deletion_file_path(&self.dataset.base, fragment.id, deletion_file);
 
             let deletion_vector = self
                 .dataset
                 .session
                 .file_metadata_cache
                 .get_or_insert(&path, |_| async {
-                    read_deletion_file(object_store.base_path(), fragment, object_store)
+                    read_deletion_file(&self.dataset.base, fragment, object_store)
                         .await?
                         .ok_or(Error::io(
                             format!(
@@ -1617,7 +1617,7 @@ mod tests {
     use super::*;
     use crate::dataset::transaction::Operation;
 
-    async fn create_dataset(test_uri: &str, use_experimental_writer: bool) -> Dataset {
+    async fn create_dataset(test_uri: &str, use_legacy_format: bool) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
             ArrowField::new("s", DataType::Utf8, true),
@@ -1641,7 +1641,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1672,7 +1672,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer: true,
+            use_legacy_format: false,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1687,7 +1687,7 @@ mod tests {
     async fn test_fragment_scan() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri, false).await;
+        let dataset = create_dataset(test_uri, true).await;
         let fragment = &dataset.get_fragments()[2];
         let mut scanner = fragment.scan();
         let batches = scanner
@@ -1768,7 +1768,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         // Creates 400 rows in 10 fragments
-        let mut dataset = create_dataset(test_uri, false).await;
+        let mut dataset = create_dataset(test_uri, true).await;
         // Delete last 20 rows in first fragment
         dataset.delete("i >= 20").await.unwrap();
         // Last fragment has 20 rows but 40 addressible rows
@@ -1796,7 +1796,7 @@ mod tests {
     async fn test_fragment_scan_deletions() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri, false).await;
+        let mut dataset = create_dataset(test_uri, true).await;
         dataset.delete("i >= 0 and i < 15").await.unwrap();
 
         let fragment = &dataset.get_fragments()[0];
@@ -1827,7 +1827,7 @@ mod tests {
     async fn test_fragment_take_indices() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri, false).await;
+        let mut dataset = create_dataset(test_uri, true).await;
         let fragment = dataset
             .get_fragments()
             .into_iter()
@@ -1875,7 +1875,7 @@ mod tests {
     async fn test_fragment_take_rows() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri, false).await;
+        let mut dataset = create_dataset(test_uri, true).await;
         let fragment = dataset
             .get_fragments()
             .into_iter()
@@ -1940,7 +1940,7 @@ mod tests {
     async fn test_recommit_from_file() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri, false).await;
+        let dataset = create_dataset(test_uri, true).await;
         let schema = dataset.schema();
         let dataset_rows = dataset.count_rows(None).await.unwrap();
 
@@ -1984,10 +1984,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_fragment_count(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_fragment_count(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri, use_experimental_writer).await;
+        let dataset = create_dataset(test_uri, use_legacy_format).await;
         let fragment = dataset.get_fragments().pop().unwrap();
 
         assert_eq!(fragment.count_rows().await.unwrap(), 40);
@@ -2013,11 +2013,11 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_append_new_columns(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_append_new_columns(#[values(false, true)] use_legacy_format: bool) {
         for with_delete in [true, false] {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
-            let mut dataset = create_dataset(test_uri, use_experimental_writer).await;
+            let mut dataset = create_dataset(test_uri, use_legacy_format).await;
             dataset.validate().await.unwrap();
             assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 
@@ -2102,10 +2102,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_merge_fragment(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_merge_fragment(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri, use_experimental_writer).await;
+        let mut dataset = create_dataset(test_uri, use_legacy_format).await;
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 

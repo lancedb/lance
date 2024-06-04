@@ -405,13 +405,13 @@ pub async fn cleanup_old_versions(
 /// have been started but never finished.
 pub async fn cleanup_partial_writes(
     store: &ObjectStore,
+    base_path: &Path,
     objects: impl IntoIterator<Item = (&Path, &String)>,
 ) -> Result<()> {
     futures::stream::iter(objects)
         .map(Ok)
         .try_for_each_concurrent(num_cpus::get() * 2, |(path, multipart_id)| async move {
-            let path: Path = store
-                .base_path()
+            let path: Path = base_path
                 .child("data")
                 .parts()
                 .chain(path.parts())
@@ -1126,7 +1126,7 @@ mod tests {
             (&path2, &non_existent_multipart_id),
         ];
 
-        cleanup_partial_writes(dataset.object_store(), objects)
+        cleanup_partial_writes(dataset.object_store(), &dataset.base, objects)
             .await
             .unwrap();
     }

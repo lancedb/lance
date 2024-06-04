@@ -83,6 +83,8 @@ message Manifest {
   //
   // Known flags:
   // * 1: deletion files are present
+  // * 2: move_stable_row_ids: row IDs are tracked and stable after move operations
+  //       (such as compaction), but not updates.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -114,6 +116,11 @@ message Manifest {
   // version of the table the transaction read from, and {uuid} is a 
   // hyphen-separated UUID.
   string transaction_file = 12;
+
+  // The next unused row id. If zero, then the table does not have any rows.
+  //
+  // This is only used if the "move_stable_row_ids" feature flag is set.
+  uint64 next_row_id = 14;
 } // Manifest
 
 // Auxiliary Data attached to a version.
@@ -166,6 +173,20 @@ message DataFragment {
 
   // File that indicates which rows, if any, should be considered deleted.
   DeletionFile deletion_file = 3;
+
+  // TODO: What's the simplest way we can allow an inline tombstone bitmap?
+
+  // A serialized RowIdSequence message (see rowids.proto).
+  //
+  // These are the row ids for the fragment, in order of the rows as they appear.
+  // That is, if a fragment has 3 rows, and the row ids are [1, 42, 3], then the
+  // first row is row 1, the second row is row 42, and the third row is row 3.
+  oneof row_id_sequence {
+    // If small (< 200KB), the row ids are stored inline.
+    bytes inline_row_ids = 5;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_row_ids = 6;
+  } // row_id_sequence
 
   // Number of original rows in the fragment, this includes rows that are 
   // now marked with deletion tombstones. To compute the current number of rows, 
@@ -273,3 +294,11 @@ message DeletionFile {
   uint64 num_deleted_rows = 4;
 } // DeletionFile
 
+message ExternalFile {
+  // Path to the file, relative to the root of the table.
+  string path = 1;
+  // The offset in the file where the data starts.
+  uint64 offset = 2;
+  // The size of the data in the file.
+  uint64 size = 3;
+}

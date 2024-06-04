@@ -403,3 +403,83 @@ compatible.
 However, writers should not write extra fields that aren't described in this
 document. Until they are defined in the specification, there is no guarantee that
 readers will be able to safely interpret new forms of statistics.
+
+
+Feature: Move-Stable Row IDs
+----------------------------
+
+The row ids features assigns a unique u64 id to each row in the table. This id is
+stable after being moved (such as during compaction), but is not necessarily
+stable after a row is updated. (A future feature may make them stable after
+updates.) To make access fast, a secondary index is created that maps row ids to
+their locations in the table. The respective parts of these indices are stored
+in the respective fragment's metadata.
+
+row id
+  A unique auto-incrementing u64 id assigned to each row in the table.
+
+row address
+  The current location of a row in the table. This is a u64 that can be thought
+  of as a pair of two u32 values: the fragment id and the local row offset. For
+  example, if the row address is (42, 9), then the row is in the 42rd fragment
+  and is the 10th row in that fragment.
+
+row id sequence
+  The sequence of row ids in a fragment.
+
+row id index
+  A secondary index that maps row ids to row addresses. This index is constructed
+  by reading all the row id sequences.
+
+Assigning row ids
+~~~~~~~~~~~~~~~~~
+
+Row ids are assigned in a monotonically increasing sequence. The next row id is
+stored in the manifest as the field ``next_row_id``. This starts at zero. When
+making a commit, the writer uses that field to assign row ids to new fragments.
+If the commit fails, the writer will re-read the new ``next_row_id``, update
+the new row ids, and then try again. This is similar to how the ``max_fragment_id``
+is used to assign new fragment ids.
+
+When a row id updated, it it typically assigned a new row id rather than
+reusing the old one. This is because this feature doesn't have a mechanism to
+update secondary indices that may reference the old values for the row id. By
+deleting the old row id and creating a new one, the secondary indices will avoid
+referencing stale data.
+
+Row ID sequences
+~~~~~~~~~~~~~~~~
+
+The row id values for a fragment are stored in a ``RowIdSequence`` protobuf
+message. This is described in the `protos/rowids.proto`_ file. Row id sequences
+are just arrays of u64 values, which have representations optimized for the
+common case where they are sorted and possibly contiguous. For example, a new
+fragment will have a row id sequence that is just a simple range, so it is 
+stored as a ``start`` and ``end`` value.
+
+These sequence messages are either stored inline in the fragment metadata, or
+are written to a separate file and referenced from the fragment metadata. This
+choice is typically made based on the size of the sequence. If the sequence is
+small, it is stored inline. If it is large, it is written to a separate file. By
+keeping the small sequences inline, we can avoid the overhead of additional IO
+operations.
+
+.. literalinclude:: ../protos/table.proto
+   :language: protobuf
+   :start-at:   oneof row_id_sequence {
+   :end-at: } // row_id_sequence
+   :caption: `protos/table.proto`_
+
+Row ID index
+~~~~~~~~~~~~
+
+To ensure fast access to rows by their row id, a secondary index is created that
+maps row ids to their locations in the table. This index is built when a table is
+loaded, based on the row id sequences in the fragments. For example, if fragment
+42 has a row id sequence of ``[0, 63, 10]``, then the index will have entries for
+``0 -> (42, 0)``, ``63 -> (42, 1)``, ``10 -> (42, 2)``. The exact form of this
+index is left up to the implementation, but it should be optimized for fast lookups.
+
+.. _protos/table.proto: https://github.com/lancedb/lance/blob/main/protos/table.proto
+.. _protos/rowids.proto: https://github.com/lancedb/lance/blob/main/protos/rowids.proto
+

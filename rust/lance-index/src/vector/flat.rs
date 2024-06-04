@@ -25,6 +25,9 @@ use tracing::instrument;
 
 use super::{Query, DIST_COL};
 
+pub mod index;
+pub mod storage;
+
 fn distance_field() -> ArrowField {
     ArrowField::new(DIST_COL, DataType::Float32, true)
 }

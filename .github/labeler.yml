@@ -22,3 +22,9 @@ labels:
   title: "^ci(\\(.+\\))?!?:.*"
 - label: chore
   title: "^(chore|test|build|style)(\\(.+\\))?!?:.*"
+- label: java
+  files:
+    - "java\\/.*"
+- label: python
+  files:
+    - "python\\/.*"

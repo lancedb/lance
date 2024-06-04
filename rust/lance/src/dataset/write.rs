@@ -96,11 +96,17 @@ pub struct WriteParams {
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
 
-    /// If set to true then the Lance v2 writer will be used instead of the Lance v1 writer
+    /// If set to true then the Lance v1 writer will be used instead of the Lance v2 writer
     ///
-    /// Unless you are intentionally testing the v2 writer, you should leave this as false
+    /// Unless you are intentionally testing the v2 writer, you should leave this as true
     /// as the v2 writer is still experimental and not fully implemented.
-    pub use_experimental_writer: bool,
+    pub use_legacy_format: bool,
+
+    /// Experimental: if set to true, the writer will use move-stable row ids.
+    /// These row ids are stable after compaction operations, but not after updates.
+    /// This makes compaction more efficient, since with stable row ids no
+    /// secondary indices need to be updated to point to new row ids.
+    pub enable_move_stable_row_ids: bool,
 }
 
 impl Default for WriteParams {
@@ -115,7 +121,8 @@ impl Default for WriteParams {
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
-            use_experimental_writer: false,
+            use_legacy_format: true,
+            enable_move_stable_row_ids: false,
         }
     }
 }
@@ -138,7 +145,7 @@ pub async fn write_fragments(
         {
             Ok(dataset) => {
                 let store = dataset.object_store().clone();
-                let base = dataset.uri().clone();
+                let base = dataset.base.clone();
                 (Some(dataset), store, base)
             }
             Err(Error::DatasetNotFound { .. }) => {
@@ -208,20 +215,16 @@ pub async fn write_fragments_internal(
         schema
     };
 
-    let mut buffered_reader = if params.use_experimental_writer {
+    let mut buffered_reader = if params.use_legacy_format {
+        chunk_stream(data, params.max_rows_per_group)
+    } else {
         // In v2 we don't care about group size but we do want to chunk
         // by max_rows_per_file
         chunk_stream(data, params.max_rows_per_file)
-    } else {
-        chunk_stream(data, params.max_rows_per_group)
     };
 
-    let writer_generator = WriterGenerator::new(
-        object_store,
-        base_dir,
-        schema,
-        params.use_experimental_writer,
-    );
+    let writer_generator =
+        WriterGenerator::new(object_store, base_dir, schema, params.use_legacy_format);
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
@@ -344,21 +347,13 @@ pub async fn open_writer(
     object_store: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
-    use_v2: bool,
+    use_legacy_format: bool,
 ) -> Result<Box<dyn GenericWriter>> {
     let filename = format!("{}.lance", Uuid::new_v4());
 
     let full_path = base_dir.child(DATA_DIR).child(filename.as_str());
 
-    let writer = if use_v2 {
-        let writer = object_store.create(&full_path).await?;
-        Box::new(v2::writer::FileWriter::try_new(
-            writer,
-            filename,
-            schema.clone(),
-            FileWriterOptions::default(),
-        )?) as Box<dyn GenericWriter>
-    } else {
+    let writer = if use_legacy_format {
         Box::new((
             FileWriter::<ManifestDescribing>::try_new(
                 object_store,
@@ -369,6 +364,14 @@ pub async fn open_writer(
             .await?,
             filename,
         ))
+    } else {
+        let writer = object_store.create(&full_path).await?;
+        Box::new(v2::writer::FileWriter::try_new(
+            writer,
+            filename,
+            schema.clone(),
+            FileWriterOptions::default(),
+        )?) as Box<dyn GenericWriter>
     };
     Ok(writer)
 }
@@ -378,7 +381,7 @@ struct WriterGenerator {
     object_store: Arc<ObjectStore>,
     base_dir: Path,
     schema: Schema,
-    use_v2: bool,
+    use_legacy_format: bool,
 }
 
 impl WriterGenerator {
@@ -386,13 +389,13 @@ impl WriterGenerator {
         object_store: Arc<ObjectStore>,
         base_dir: &Path,
         schema: &Schema,
-        use_v2: bool,
+        use_legacy_format: bool,
     ) -> Self {
         Self {
             object_store,
             base_dir: base_dir.clone(),
             schema: schema.clone(),
-            use_v2,
+            use_legacy_format,
         }
     }
 
@@ -404,7 +407,7 @@ impl WriterGenerator {
             &self.object_store,
             &self.schema,
             &self.base_dir,
-            self.use_v2,
+            self.use_legacy_format,
         )
         .await?;
 
@@ -565,7 +568,7 @@ mod tests {
         .unwrap();
 
         let write_params = WriteParams {
-            use_experimental_writer: true,
+            use_legacy_format: false,
             // This parameter should be ignored
             max_rows_per_group: 1,
             ..Default::default()
@@ -632,7 +635,7 @@ mod tests {
         .unwrap();
 
         let write_params = WriteParams {
-            use_experimental_writer: false,
+            use_legacy_format: true,
             ..Default::default()
         };
         let data_stream = Box::pin(RecordBatchStreamAdapter::new(

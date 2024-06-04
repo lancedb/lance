@@ -11,7 +11,7 @@ use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
+    decoder::{PageScheduler, PhysicalPageDecoder},
     EncodingsIo,
 };
 
@@ -30,7 +30,7 @@ impl DenseBitmapScheduler {
     }
 }
 
-impl PhysicalPageScheduler for DenseBitmapScheduler {
+impl PageScheduler for DenseBitmapScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u32>],

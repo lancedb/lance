@@ -22,6 +22,7 @@ mod index;
 mod segment;
 mod serde;
 
+use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
 pub use serde::{read_row_ids, write_row_ids};
@@ -40,7 +41,7 @@ use segment::U64Segment;
 /// contiguous or sorted.
 ///
 /// We can make optimizations that assume uniqueness.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct RowIdSequence(Vec<U64Segment>);
 
 impl std::fmt::Display for RowIdSequence {

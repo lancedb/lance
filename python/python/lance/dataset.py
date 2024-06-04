@@ -2385,7 +2385,7 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    use_experimental_writer: bool = False,
+    use_legacy_format: bool = True,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2425,9 +2425,9 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    use_experimental_writer : optional, bool
-        Use the Lance v2 writer to write Lance v2 files.  This is not recommended
-        at this time as there are several known limitations in the v2 writer.
+    use_legacy_format : optional, bool, default True
+        Use the Lance v1 writer to write Lance v1 files.  The default is currently
+        True but will change as we roll out the v2 format.
     """
     if _check_for_hugging_face(data_obj):
         # Huggingface datasets
@@ -2449,7 +2449,7 @@ def write_dataset(
         "max_bytes_per_file": max_bytes_per_file,
         "progress": progress,
         "storage_options": storage_options,
-        "use_experimental_writer": use_experimental_writer,
+        "use_legacy_format": use_legacy_format,
     }
 
     if commit_lock:

@@ -561,7 +561,7 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer: false,
+                use_legacy_format: true,
                 ..Default::default()
             }),
         )
@@ -622,9 +622,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_append_columns_udf(
-        #[values(false, true)] use_experimental_writer: bool,
-    ) -> Result<()> {
+    async fn test_append_columns_udf(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
         use arrow_array::Float64Array;
 
         let num_rows = 5;
@@ -646,7 +644,7 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -752,7 +750,7 @@ mod test {
             Some(WriteParams {
                 max_rows_per_file: 50,
                 max_rows_per_group: 25,
-                use_experimental_writer: false,
+                use_legacy_format: true,
                 ..Default::default()
             }),
         )
@@ -797,6 +795,7 @@ mod test {
                         files: vec![],
                         id: 0,
                         deletion_file: None,
+                        row_id_meta: None,
                         physical_rows: Some(50),
                     }))
                 } else {
@@ -896,9 +895,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_rename_columns(
-        #[values(false, true)] use_experimental_writer: bool,
-    ) -> Result<()> {
+    async fn test_rename_columns(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
         use std::collections::HashMap;
 
         use arrow_array::{ArrayRef, StructArray};
@@ -940,7 +937,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -1012,7 +1009,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_cast_column(#[values(false, true)] use_experimental_writer: bool) -> Result<()> {
+    async fn test_cast_column(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
         // Create a table with 2 scalar columns, 1 vector column
 
         use arrow::datatypes::{Int32Type, Int64Type};
@@ -1064,7 +1061,7 @@ mod test {
             RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -1215,7 +1212,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_drop_columns(#[values(false, true)] use_experimental_writer: bool) -> Result<()> {
+    async fn test_drop_columns(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
         use std::collections::HashMap;
 
         use arrow_array::{ArrayRef, Float32Array, StructArray};
@@ -1264,7 +1261,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -1309,9 +1306,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_drop_add_columns(
-        #[values(false, true)] use_experimental_writer: bool,
-    ) -> Result<()> {
+    async fn test_drop_add_columns(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -1328,7 +1323,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
