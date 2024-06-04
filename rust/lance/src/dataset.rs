@@ -1653,7 +1653,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_write_manifest(#[values(false, true)] use_legacy_format: bool) {
-        use lance_table::feature_flags::FLAG_INVALID;
+        use lance_table::feature_flags::FLAG_UNKNOWN;
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -1692,7 +1692,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(manifest.writer_feature_flags, 0);
+        if !use_legacy_format {
+            assert_eq!(manifest.writer_feature_flags, FLAG_USE_V2_FORMAT);
+        }
         assert_eq!(manifest.reader_feature_flags, 0);
 
         // Create one with deletions
@@ -1720,8 +1722,8 @@ mod tests {
         );
 
         // Write with custom manifest
-        manifest.writer_feature_flags |= FLAG_INVALID; // Set another flag
-        manifest.reader_feature_flags |= FLAG_INVALID;
+        manifest.writer_feature_flags |= FLAG_UNKNOWN; // Set another flag
+        manifest.reader_feature_flags |= FLAG_UNKNOWN;
         manifest.version += 1;
         write_manifest_file(
             dataset.object_store(),
