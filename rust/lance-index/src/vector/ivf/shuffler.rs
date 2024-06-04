@@ -295,7 +295,7 @@ impl IvfShuffler {
                 .expect("part id should exist");
 
             let mut stream = stream::iter(start..end)
-                .map(|i| reader.read_batch(i as i32, .., &lance_schema, None))
+                .map(|i| reader.read_batch(i as i32, .., &lance_schema))
                 .buffer_unordered(16);
 
             while let Some(batch) = stream.next().await {
@@ -335,9 +335,7 @@ impl IvfShuffler {
             let total_batch = reader.num_batches();
 
             let mut stream = stream::iter(start..end)
-                .map(|i| {
-                    reader.read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema(), None)
-                })
+                .map(|i| reader.read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema()))
                 .buffered(16)
                 .enumerate();
 
@@ -481,7 +479,7 @@ impl IvfShuffler {
                 .zip(stream::repeat(reader))
                 .map(|(i, reader)| async move {
                     reader
-                        .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema(), None)
+                        .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema())
                         .await
                 })
                 .buffered(4);

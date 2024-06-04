@@ -126,8 +126,6 @@ fn ranges_to_tasks(
                     &ReadBatchParams::Range(range.clone()),
                     &projection,
                     batch_idx,
-                    false,
-                    None,
                 )
                 .await
             })
@@ -200,11 +198,9 @@ impl GenericFileReader for FileReader {
         projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
         let indices_vec = indices.to_vec();
-        let mut reader = self.clone();
+        let reader = self.clone();
         // In the new path the row id is added by the fragment and not the file
-        reader.with_row_id(false);
-        let task_fut =
-            async move { reader.take(&indices_vec, projection.as_ref(), None).await }.boxed();
+        let task_fut = async move { reader.take(&indices_vec, projection.as_ref()).await }.boxed();
         let task = std::future::ready(ReadBatchTask {
             task: task_fut,
             num_rows: indices.len() as u32,
@@ -480,7 +476,7 @@ impl FileFragment {
             if with_row_id || !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
-                let mut reader = FileReader::try_new_with_fragment_id(
+                let reader = FileReader::try_new_with_fragment_id(
                     &self.dataset.object_store,
                     &path,
                     self.schema().clone(),
@@ -490,7 +486,6 @@ impl FileFragment {
                     Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
-                reader.with_row_id(with_row_id);
                 let initialized_schema = reader
                     .schema()
                     .project_by_schema(schema_per_file.as_ref())?;
@@ -1250,9 +1245,6 @@ impl FragmentReader {
 
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
         self.with_row_id = true;
-        if let Some(legacy_reader) = self.readers[0].0.as_legacy_opt_mut() {
-            legacy_reader.with_row_id(true);
-        }
         self.output_schema = self
             .output_schema
             .try_with_column(ROW_ID_FIELD.clone())
@@ -1262,11 +1254,6 @@ impl FragmentReader {
 
     pub(crate) fn with_make_deletions_null(&mut self) -> &mut Self {
         self.make_deletions_null = true;
-        for (reader, _) in self.readers.iter_mut() {
-            if let Some(legacy_reader) = reader.as_legacy_opt_mut() {
-                legacy_reader.with_make_deletions_null(true);
-            }
-        }
         self
     }
 
@@ -1332,40 +1319,6 @@ impl FragmentReader {
         }
     }
 
-    #[cfg(test)]
-    async fn read_impl<'a, Fut>(
-        &'a self,
-        read_fn: impl Fn(&'a dyn GenericFileReader, &'a Schema) -> Fut,
-    ) -> Result<RecordBatch>
-    where
-        Fut: std::future::Future<Output = Result<RecordBatch>> + 'a,
-    {
-        let futures = self
-            .readers
-            .iter()
-            .map(|(reader, schema)| read_fn(reader.as_ref(), schema))
-            .collect::<Vec<_>>();
-        let batches = try_join_all(futures).await?;
-        Ok(merge_batches(&batches)?.project_by_schema(&self.output_schema)?)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn legacy_read_batch(
-        &self,
-        batch_id: usize,
-        params: impl Into<ReadBatchParams> + Clone,
-    ) -> Result<RecordBatch> {
-        self.read_impl(move |reader, schema| {
-            reader.as_legacy().read_batch(
-                batch_id as i32,
-                params.clone(),
-                schema,
-                self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
-            )
-        })
-        .await
-    }
-
     /// Read a batch of rows from the fragment, with a subset of columns.
     ///
     /// Note: the projection must be a subset of the schema the reader was created with.
@@ -1380,11 +1333,11 @@ impl FragmentReader {
         params: impl Into<ReadBatchParams> + Clone,
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        let read_tasks = self
-            .readers
-            .iter()
-            .enumerate()
-            .map(|(reader_idx, (reader, schema))| {
+        // These will be concatenated horizontally.
+        let mut batches = vec![];
+
+        if !projection.fields.is_empty() {
+            let read_tasks = self.readers.iter().map(|(reader, schema)| {
                 let projection = schema.intersection(projection);
                 let params = params.clone();
 
@@ -1394,29 +1347,51 @@ impl FragmentReader {
                     // Apply ? inside the task to keep read_tasks a simple iter of futures
                     // for try_join_all
                     let projection = projection?;
-                    // We always get the row_id from the first reader and so we need that even
-                    // if the projection is empty
-                    let need_for_row_id = self.with_row_id && reader_idx == 0;
-                    if projection.fields.is_empty() && !need_for_row_id {
+                    if projection.fields.is_empty() {
                         // The projection caused one of the data files to become
                         // irrelevant and so we can skip it
                         Result::Ok(None)
                     } else {
                         Ok(Some(
                             reader
-                                .read_batch(
-                                    batch_id as i32,
-                                    params,
-                                    &projection,
-                                    self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
-                                )
+                                .read_batch(batch_id as i32, params, &projection)
                                 .await?,
                         ))
                     }
                 }
             });
-        let batches = try_join_all(read_tasks).await?;
-        let batches = batches.into_iter().flatten().collect::<Vec<_>>();
+            let results = try_join_all(read_tasks).await?;
+            batches.extend(results.into_iter().flatten());
+        }
+
+        // If desired, add row id column
+        let params = params.into();
+        let first_reader = self.readers[0].0.as_legacy();
+        let batch_offset = (0..batch_id)
+            .map(|i| first_reader.num_rows_in_batch(i as i32))
+            .sum();
+        let rows_in_batch = first_reader.num_rows_in_batch(batch_id as i32);
+        if self.with_row_id {
+            let ids_in_batch = params
+                .slice(batch_offset, rows_in_batch)
+                .unwrap()
+                .to_offsets()
+                .unwrap();
+            let row_ids: UInt64Array = ids_in_batch
+                .values()
+                .iter()
+                .map(|row_id| {
+                    u64::from(RowAddress::new_from_parts(self.fragment_id as u32, *row_id))
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()])),
+                vec![Arc::new(row_ids)],
+            )?;
+            batches.push(batch);
+        }
+
+        // TODO: we also have to apply the deletion vector
 
         let output_schema = {
             let mut output_schema = ArrowSchema::from(projection);
@@ -1428,7 +1403,42 @@ impl FragmentReader {
 
         let result = merge_batches(&batches)?.project_by_schema(&output_schema)?;
 
-        Ok(result)
+        // Need to apply deletions as well
+        // In order to apply deletions we need to change the parameters to be
+        // relative to the file, not the batch.
+        let file_params = match params {
+            ReadBatchParams::Indices(indices) => ReadBatchParams::Indices(
+                indices
+                    .values()
+                    .iter()
+                    .map(|i| *i + batch_offset as u32)
+                    .collect(),
+            ),
+            ReadBatchParams::RangeFull => {
+                ReadBatchParams::Range(batch_offset..(batch_offset + rows_in_batch))
+            }
+            ReadBatchParams::RangeFrom(start) => {
+                ReadBatchParams::Range((start.start + batch_offset)..(batch_offset + rows_in_batch))
+            }
+            ReadBatchParams::RangeTo(end) => {
+                ReadBatchParams::Range(batch_offset..(end.end + batch_offset))
+            }
+            ReadBatchParams::Range(range) => {
+                ReadBatchParams::Range((range.start + batch_offset)..(range.end + batch_offset))
+            }
+        };
+        lance_table::utils::stream::apply_row_id_and_deletes(
+            result,
+            0,
+            self.fragment_id as u32,
+            &RowIdAndDeletesConfig {
+                params: file_params,
+                deletion_vector: self.deletion_vec.clone(),
+                with_row_id: false, // We already added the row id column
+                make_deletions_null: self.make_deletions_null,
+                total_num_rows: first_reader.len() as u32,
+            },
+        )
     }
 
     fn new_read_impl(
@@ -1804,19 +1814,28 @@ mod tests {
         reader.with_make_deletions_null();
 
         // Since the first batch is all deleted, it will return an empty batch.
-        let batch1 = reader.legacy_read_batch(0, ..).await.unwrap();
+        let batch1 = reader
+            .legacy_read_batch_projected(0, .., dataset.schema())
+            .await
+            .unwrap();
         assert_eq!(batch1.num_rows(), 0);
 
         // The second batch is partially deleted, so the deleted rows will be
         // marked null with null row ids.
-        let batch2 = reader.legacy_read_batch(1, ..).await.unwrap();
+        let batch2 = reader
+            .legacy_read_batch_projected(1, .., dataset.schema())
+            .await
+            .unwrap();
         assert_eq!(
             batch2.column_by_name(ROW_ID).unwrap().as_ref(),
             &UInt64Array::from_iter((10..20).map(|v| if v < 15 { None } else { Some(v) }))
         );
 
         // The final batch is not deleted, so it will be returned as-is.
-        let batch3 = reader.legacy_read_batch(2, ..).await.unwrap();
+        let batch3 = reader
+            .legacy_read_batch_projected(2, .., dataset.schema())
+            .await
+            .unwrap();
         assert_eq!(
             batch3.column_by_name(ROW_ID).unwrap().as_ref(),
             &UInt64Array::from_iter_values(20..30)
