@@ -64,13 +64,6 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
             location: location!(),
         })
     }
-
-    // fn try_from_json(metadata_str: &str) -> Result<Self> {
-    //     serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-    //         message: format!("Failed to parse index metadata: {}", metadata_str),
-    //         location: location!(),
-    //     })
-    // }
 }
 
 #[derive(Clone)]

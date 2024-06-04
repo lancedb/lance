@@ -73,7 +73,7 @@ pub struct IVFIndex<I: IvfSubIndex + 'static, Q: Quantization> {
 
 impl<I: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<I, Q> {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.uuid.deep_size_of_children(context)
+        self.uuid.deep_size_of_children(context) + self.storage.deep_size_of_children(context)
         // Skipping session since it is a weak ref
     }
 }
@@ -193,20 +193,6 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
         let param = (&query).into();
         pre_filter.wait_for_ready().await?;
         part_index.search(query.key, query.k, param, &storage, pre_filter)
-        // match query.key.data_type() {
-        //     arrow::datatypes::DataType::Float16 => {
-
-        //     }
-        //     arrow::datatypes::DataType::Float32 => {
-        //         part_index.search(query.key, query.k, (&query).into(), &storage, pre_filter)
-        //     }
-        //     arrow::datatypes::DataType::Float64 => {
-        //         part_index.search(query.key, query.k, (&query).into(), &storage, pre_filter)
-        //     }
-        //     _ => Err(Error::Index {
-        //         message: "unsupported data type".to_string(),
-        //         location: Location::new(file!(), line!(), column!()),
-        //     }),
     }
 
     /// preprocess the query vector given the partition id.
@@ -272,14 +258,9 @@ impl<I: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<I, 
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        todo!()
-        // let mut frag_ids = RoaringBitmap::default();
-        // let part_ids = 0..self.ivf.num_partitions();
-        // for part_id in part_ids {
-        //     let part = self.load_partition(part_id, false).await?;
-        //     frag_ids |= part.calculate_included_frags().await?;
-        // }
-        // Ok(frag_ids)
+        unimplemented!(
+            "this method is only needed for migrating older manifests, not for this new index"
+        )
     }
 }
 

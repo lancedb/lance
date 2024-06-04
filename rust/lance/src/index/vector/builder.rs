@@ -305,10 +305,6 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         index_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
         index_writer
             .add_schema_metadata(IVF_METADATA_KEY, hex::encode(index_ivf_pb.encode_to_vec()));
-        // index_writer.add_schema_metadata(
-        //     IVF_PARTITION_KEY,
-        //     serde_json::to_string(&partitions_metadata)?,
-        // );
 
         storage_writer.finish().await?;
         index_writer.finish().await?;

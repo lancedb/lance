@@ -148,7 +148,6 @@ pub trait QuantizerMetadata:
     fmt::Debug + Clone + Sized + DeepSizeOf + for<'a> Deserialize<'a> + Serialize
 {
     async fn load(reader: &FileReader) -> Result<Self>;
-    // fn try_from_json(s: &str) -> Result<Self>;
 }
 
 #[async_trait]
@@ -161,12 +160,6 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf {
         metric_type: MetricType,
         metadata: &Self::Metadata,
     ) -> Result<Self>;
-
-    // fn try_from_batch(
-    //     batch: RecordBatch,
-    //     distance_type: DistanceType,
-    //     metadata: &Self::Metadata,
-    // ) -> Result<Self>;
 }
 
 impl Quantization for ScalarQuantizer {

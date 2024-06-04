@@ -136,18 +136,6 @@ impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     }
 }
 
-// impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {
-//     fn clone(&self) -> Self {
-//         Self {
-//             reader: self.reader.clone(),
-//             metric_type: self.metric_type,
-//             quantizer: self.quantizer.clone(),
-//             metadata: self.metadata.clone(),
-//             ivf: self.ivf.clone(),
-//         }
-//     }
-// }
-
 #[allow(dead_code)]
 impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
