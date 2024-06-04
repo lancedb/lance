@@ -195,10 +195,13 @@ impl ScalarQuantizationStorage {
         self.bounds.clone()
     }
 
-    /// Get the chunk that covers the id, panic if the id is out of range
+    /// Get the chunk that covers the id.
     ///
     /// Returns:
     /// `(offset, chunk)`
+    ///
+    /// We did not check out of range in this call. But the out of range will
+    /// panic once you access the data in the last [SQStorageChunk].
     #[inline]
     fn chunk(&self, id: u32) -> (&u32, &SQStorageChunk) {
         self.chunks
@@ -419,8 +422,43 @@ impl<'a> DistCalculator for SQDistCalculator<'a> {
 mod tests {
     use super::*;
 
+    use arrow_array::FixedSizeListArray;
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_arrow::FixedSizeListArrayExt;
+    use rand::prelude::*;
+
     #[test]
     fn test_get_chunks() {
-        
+        const DIM: usize = 64;
+
+        let mut rng = rand::thread_rng();
+        let row_ids = UInt64Array::from_iter_values(0..100);
+        let sq_code = UInt8Array::from_iter_values((0..100 * DIM).map(|_| rng.gen::<u8>()));
+        let fsl = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(
+                SQ_CODE_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(fsl)]).unwrap();
+
+        let storage =
+            ScalarQuantizationStorage::new(8, DistanceType::L2, -0.7..0.7, batch).unwrap();
+
+        assert_eq!(storage.len(), 100);
+
+        let (offset, chunk) = storage.chunk(0);
+        assert_eq!(*offset, 0);
+        assert_eq!(chunk.row_id(20), 20);
+
+        let (offset, _) = storage.chunk(50);
+        assert_eq!(*offset, 0);
     }
 }
