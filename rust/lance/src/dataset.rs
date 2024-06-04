@@ -65,6 +65,7 @@ use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_table::feature_flags::{
     apply_feature_flags, can_read_dataset, can_write_dataset, should_use_legacy_format,
+    FLAG_USE_V2_FORMAT,
 };
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -485,6 +486,7 @@ impl Dataset {
 
         let manifest_config = ManifestWriteConfig {
             use_move_stable_row_ids: params.enable_move_stable_row_ids,
+            use_legacy_format: Some(params.use_legacy_format),
             ..Default::default()
         };
         let manifest = if let Some(dataset) = &dataset {
@@ -504,7 +506,6 @@ impl Dataset {
                 &base,
                 &transaction,
                 &manifest_config,
-                params.use_legacy_format,
             )
             .await?
         };
@@ -800,7 +801,6 @@ impl Dataset {
                 &base,
                 &transaction,
                 &Default::default(),
-                /*use_legacy_format=*/ true,
             )
             .await?
         };
@@ -1226,9 +1226,10 @@ impl Dataset {
 
 #[derive(Debug)]
 pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,  // default true
-    timestamp: Option<SystemTime>, // default None
-    use_move_stable_row_ids: bool, // default false
+    auto_set_feature_flags: bool,    // default true
+    timestamp: Option<SystemTime>,   // default None
+    use_move_stable_row_ids: bool,   // default false
+    use_legacy_format: Option<bool>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -1237,6 +1238,7 @@ impl Default for ManifestWriteConfig {
             auto_set_feature_flags: true,
             timestamp: None,
             use_move_stable_row_ids: false,
+            use_legacy_format: None,
         }
     }
 }
@@ -1250,8 +1252,20 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<Index>>,
     config: &ManifestWriteConfig,
 ) -> std::result::Result<(), CommitError> {
+    let was_using_legacy = should_use_legacy_format(manifest.writer_feature_flags);
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest)?;
+    }
+    // For now, we don't auto-detect use_v2_format.  Instead, if the user
+    // asks for it, we set it.  Otherwise we use what was there before.
+    if let Some(use_legacy_format) = config.use_legacy_format {
+        if !use_legacy_format {
+            manifest.writer_feature_flags |= FLAG_USE_V2_FORMAT;
+        }
+    } else if was_using_legacy {
+        manifest.writer_feature_flags &= !FLAG_USE_V2_FORMAT;
+    } else {
+        manifest.writer_feature_flags |= FLAG_USE_V2_FORMAT;
     }
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -1719,6 +1733,7 @@ mod tests {
                 auto_set_feature_flags: false,
                 timestamp: None,
                 use_move_stable_row_ids: false,
+                use_legacy_format: None,
             },
         )
         .await
