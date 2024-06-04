@@ -24,7 +24,7 @@ use lance_io::{
     traits::{WriteExt, Writer},
     utils::read_message,
 };
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::{distance::DistanceType, MatrixView};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
 use prost::Message;
@@ -144,7 +144,7 @@ pub struct ProductQuantizationStorage {
     num_bits: u32,
     num_sub_vectors: usize,
     dimension: usize,
-    metric_type: MetricType,
+    distance_type: DistanceType,
 
     // For easy access
     pq_code: Arc<UInt8Array>,
@@ -162,7 +162,7 @@ impl DeepSizeOf for ProductQuantizationStorage {
 
 impl PartialEq for ProductQuantizationStorage {
     fn eq(&self, other: &Self) -> bool {
-        self.metric_type.eq(&other.metric_type)
+        self.distance_type.eq(&other.distance_type)
             && self.codebook.eq(&other.codebook)
             && self.num_bits.eq(&other.num_bits)
             && self.num_sub_vectors.eq(&other.num_sub_vectors)
@@ -180,7 +180,7 @@ impl ProductQuantizationStorage {
         num_bits: u32,
         num_sub_vectors: usize,
         dimension: usize,
-        metric_type: MetricType,
+        distance_type: DistanceType,
     ) -> Result<Self> {
         let Some(row_ids) = batch.column_by_name(ROW_ID) else {
             return Err(Error::Index {
@@ -231,13 +231,14 @@ impl ProductQuantizationStorage {
             num_sub_vectors,
             num_bits,
             dimension,
-            metric_type,
+            distance_type,
         })
     }
 
     pub fn batch(&self) -> &RecordBatch {
         &self.batch
     }
+
     /// Build a PQ storage from ProductQuantizer and a RecordBatch.
     ///
     /// Parameters
@@ -305,10 +306,11 @@ impl ProductQuantizationStorage {
                 message: format!("Failed to parse index metadata: {}", metadata_str),
                 location: location!(),
             })?;
-        let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
+        let distance_type: DistanceType =
+            DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
         let metadata = ProductQuantizationMetadata::load(&reader).await?;
-        Self::load_partition(&reader, 0..reader.len(), metric_type, &metadata).await
+        Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata).await
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -360,7 +362,7 @@ impl ProductQuantizationStorage {
 
         let index_metadata = IndexMetadata {
             index_type: "PQ".to_string(),
-            distance_type: self.metric_type.to_string(),
+            distance_type: self.distance_type.to_string(),
         };
 
         let mut schema_metadata = HashMap::new();
@@ -388,7 +390,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
     async fn load_partition(
         reader: &FileReader,
         range: std::ops::Range<usize>,
-        metric_type: MetricType,
+        distance_type: DistanceType,
         metadata: &Self::Metadata,
     ) -> Result<Self> {
         // Hard coded to float32 for now
@@ -414,7 +416,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.num_bits,
             metadata.num_sub_vectors,
             metadata.dimension,
-            metric_type,
+            distance_type,
         )
     }
 }
@@ -422,10 +424,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
 impl VectorStore for ProductQuantizationStorage {
     type DistanceCalculator<'a> = PQDistCalculator;
 
-    fn try_from_batch(
-        batch: RecordBatch,
-        distance_type: lance_linalg::distance::DistanceType,
-    ) -> Result<Self>
+    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
     where
         Self: Sized,
     {
@@ -468,7 +467,7 @@ impl VectorStore for ProductQuantizationStorage {
             num_bits: metadata.num_bits,
             num_sub_vectors: metadata.num_sub_vectors,
             dimension: metadata.dimension,
-            metric_type: distance_type,
+            distance_type,
             pq_code: Arc::new(pq_code),
             row_ids: Arc::new(row_ids),
         })
@@ -513,8 +512,8 @@ impl VectorStore for ProductQuantizationStorage {
         self.row_ids.values()
     }
 
-    fn metric_type(&self) -> MetricType {
-        self.metric_type
+    fn distance_type(&self) -> DistanceType {
+        self.distance_type
     }
 
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
@@ -524,7 +523,7 @@ impl VectorStore for ProductQuantizationStorage {
             self.num_sub_vectors,
             self.pq_code.clone(),
             query.as_primitive::<Float32Type>().values(),
-            self.metric_type(),
+            self.distance_type,
         )
     }
 
@@ -552,12 +551,12 @@ impl PQDistCalculator {
         num_sub_vectors: usize,
         pq_code: Arc<UInt8Array>,
         query: &[f32],
-        metric_type: MetricType,
+        distance_type: DistanceType,
     ) -> Self {
-        let distance_table = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
+        let distance_table = if matches!(distance_type, DistanceType::Cosine | DistanceType::L2) {
             build_distance_table_l2(codebook, num_bits, num_sub_vectors, query)
         } else {
-            unimplemented!("Metric type not supported: {:?}", metric_type);
+            unimplemented!("DistanceType is not supported: {:?}", distance_type);
         };
         Self {
             distance_table,
@@ -606,7 +605,7 @@ mod tests {
             8,
             DIM,
             codebook,
-            MetricType::L2,
+            DistanceType::L2,
         ));
 
         let schema = ArrowSchema::new(vec![

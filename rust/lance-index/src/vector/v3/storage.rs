@@ -7,7 +7,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{DistanceType, MetricType};
+use lance_linalg::distance::DistanceType;
 use num_traits::Num;
 use snafu::{location, Location};
 
@@ -50,8 +50,8 @@ pub trait VectorStore: Send + Sync {
 
     fn row_ids(&self) -> &[u64];
 
-    /// Return the metric type of the vectors.
-    fn metric_type(&self) -> MetricType;
+    /// Return [DistanceType].
+    fn distance_type(&self) -> DistanceType;
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///

@@ -129,7 +129,7 @@ impl VectorStore for FlatStorage {
         self.row_ids.values()
     }
 
-    fn metric_type(&self) -> DistanceType {
+    fn distance_type(&self) -> DistanceType {
         self.distance_type
     }
 

@@ -13,7 +13,7 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::{l2_distance_uint_scalar, MetricType};
+use lance_linalg::distance::{l2_distance_uint_scalar, DistanceType, MetricType};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,7 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
 
 #[derive(Clone)]
 pub struct ScalarQuantizationStorage {
-    metric_type: MetricType,
+    distance_type: DistanceType,
 
     // Metadata
     num_bits: u16,
@@ -116,7 +116,7 @@ impl ScalarQuantizationStorage {
 
         Ok(Self {
             num_bits,
-            metric_type,
+            distance_type: metric_type,
             bounds,
             batch,
             row_ids,
@@ -129,7 +129,7 @@ impl ScalarQuantizationStorage {
     }
 
     pub fn metric_type(&self) -> MetricType {
-        self.metric_type
+        self.distance_type
     }
 
     pub fn bounds(&self) -> Range<f64> {
@@ -241,7 +241,7 @@ impl VectorStore for ScalarQuantizationStorage {
             .clone();
 
         Ok(Self {
-            metric_type: distance_type,
+            distance_type,
             num_bits: metadata.num_bits,
             bounds: metadata.bounds.clone(),
             batch,
@@ -281,8 +281,8 @@ impl VectorStore for ScalarQuantizationStorage {
     }
 
     /// Return the metric type of the vectors.
-    fn metric_type(&self) -> MetricType {
-        self.metric_type
+    fn distance_type(&self) -> DistanceType {
+        self.distance_type
     }
 
     /// Create a [DistCalculator] to compute the distance between the query.
