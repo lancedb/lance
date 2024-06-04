@@ -46,10 +46,9 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{FilterPlan, PreFilterSource};
 use crate::io::exec::{
-    KNNFlatExec, KNNIndexExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec,
-    ScanConfig, TakeExec,
+    knn::new_knn_exec, FilterPlan, KNNFlatExec, LancePushdownScanExec, LanceScanExec, Planner,
+    PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
@@ -1413,12 +1412,7 @@ impl Scanner {
             (_, _, false) => PreFilterSource::None,
         };
 
-        let inner_fanout_search = Arc::new(KNNIndexExec::try_new(
-            self.dataset.clone(),
-            index,
-            q,
-            prefilter_source,
-        )?);
+        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -1515,7 +1509,9 @@ pub mod test_dataset {
 
     use std::vec;
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+    };
     use arrow_schema::ArrowError;
     use lance_index::IndexType;
     use tempfile::{tempdir, TempDir};
@@ -1541,7 +1537,7 @@ pub mod test_dataset {
     }
 
     impl TestVectorDataset {
-        pub async fn new(use_experimental_writer: bool) -> Result<Self> {
+        pub async fn new(use_legacy_format: bool) -> Result<Self> {
             let tmp_dir = tempdir()?;
             let path = tmp_dir.path().to_str().unwrap();
 
@@ -1587,7 +1583,7 @@ pub mod test_dataset {
 
             let params = WriteParams {
                 max_rows_per_group: 10,
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1660,8 +1656,8 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
-        RecordBatchIterator, StringArray, StructArray,
+        ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Int32Array, LargeStringArray,
+        PrimitiveArray, RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_select::take;
@@ -1787,7 +1783,7 @@ mod test {
 
     #[tokio::test]
     async fn test_filter_parsing() -> Result<()> {
-        let test_ds = TestVectorDataset::new(false).await?;
+        let test_ds = TestVectorDataset::new(true).await?;
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -1820,8 +1816,8 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_limit(#[values(false, true)] use_experimental_writer: bool) -> Result<()> {
-        let test_ds = TestVectorDataset::new(use_experimental_writer).await?;
+    async fn test_limit(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+        let test_ds = TestVectorDataset::new(use_legacy_format).await?;
         let dataset = &test_ds.dataset;
 
         let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
@@ -1838,11 +1834,9 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_nodes(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_knn_nodes(#[values(false, true)] use_legacy_format: bool) {
         for build_index in &[true, false] {
-            let mut test_ds = TestVectorDataset::new(use_experimental_writer)
-                .await
-                .unwrap();
+            let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
             if *build_index {
                 test_ds.make_vector_index().await.unwrap();
             }
@@ -1895,10 +1889,8 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_new_data(#[values(false, true)] use_experimental_writer: bool) {
-        let mut test_ds = TestVectorDataset::new(use_experimental_writer)
-            .await
-            .unwrap();
+    async fn test_knn_with_new_data(#[values(false, true)] use_legacy_format: bool) {
+        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -1977,12 +1969,8 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_prefilter(#[values(false, true)] use_experimental_writer: bool) {
-        use arrow_array::Float32Array;
-
-        let mut test_ds = TestVectorDataset::new(use_experimental_writer)
-            .await
-            .unwrap();
+    async fn test_knn_with_prefilter(#[values(false, true)] use_legacy_format: bool) {
+        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
         test_ds.make_vector_index().await.unwrap();
         let dataset = &test_ds.dataset;
 
@@ -2038,13 +2026,11 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_filter_new_data(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_knn_filter_new_data(#[values(false, true)] use_legacy_format: bool) {
         // This test verifies that a filter (prefilter or postfilter) gets applied to the flat KNN results
         // in a combined KNN scan (a scan that combines results from an indexed ANN with an unindexed flat
         // search of new data)
-        let mut test_ds = TestVectorDataset::new(use_experimental_writer)
-            .await
-            .unwrap();
+        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -2104,10 +2090,8 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_filter(#[values(false, true)] use_experimental_writer: bool) {
-        let test_ds = TestVectorDataset::new(use_experimental_writer)
-            .await
-            .unwrap();
+    async fn test_knn_with_filter(#[values(false, true)] use_legacy_format: bool) {
+        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2157,10 +2141,8 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_refine_factor(#[values(false, true)] use_experimental_writer: bool) {
-        let test_ds = TestVectorDataset::new(use_experimental_writer)
-            .await
-            .unwrap();
+    async fn test_refine_factor(#[values(false, true)] use_legacy_format: bool) {
+        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2210,7 +2192,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
         // This test doesn't make sense for v2 files, there is no way to get an out-of-order scan
-        let test_ds = TestVectorDataset::new(/*use_experimental_writer=*/ false)
+        let test_ds = TestVectorDataset::new(/*use_legacy_format=*/ true)
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
@@ -2260,7 +2242,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_scan_order(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_scan_order(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2284,7 +2266,7 @@ mod test {
 
         let params = WriteParams {
             mode: WriteMode::Append,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
 
@@ -2331,7 +2313,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_scan_sort(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_scan_sort(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2364,7 +2346,7 @@ mod test {
             data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -2418,7 +2400,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_sort_multi_columns(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_sort_multi_columns(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2443,7 +2425,7 @@ mod test {
             data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -2471,7 +2453,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_ann_prefilter(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_ann_prefilter(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2492,7 +2474,7 @@ mod test {
         .unwrap()];
 
         let write_params = WriteParams {
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2543,7 +2525,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_filter_on_large_utf8(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_filter_on_large_utf8(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2562,7 +2544,7 @@ mod test {
         .unwrap()];
 
         let write_params = WriteParams {
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2596,7 +2578,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_filter_with_regex(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_filter_with_regex(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2615,7 +2597,7 @@ mod test {
         .unwrap()];
 
         let write_params = WriteParams {
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2684,7 +2666,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer: false,
+            use_legacy_format: true,
             ..Default::default()
         };
         Dataset::write(batches, test_uri, Some(write_params))
@@ -2737,7 +2719,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_ann_with_deletion(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_ann_with_deletion(#[values(false, true)] use_legacy_format: bool) {
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
@@ -2779,7 +2761,7 @@ mod test {
                 reader,
                 test_uri,
                 Some(WriteParams {
-                    use_experimental_writer,
+                    use_legacy_format,
                     ..Default::default()
                 }),
             )
@@ -2879,7 +2861,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     mode: WriteMode::Append,
-                    use_experimental_writer,
+                    use_legacy_format,
                     ..Default::default()
                 }),
             )
@@ -2928,7 +2910,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_count_rows_with_filter(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_count_rows_with_filter(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen = BatchGenerator::new().col(Box::new(
@@ -2938,7 +2920,7 @@ mod test {
             data_gen.batch(32),
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -2961,7 +2943,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_dynamic_projection(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_dynamic_projection(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen =
@@ -2970,7 +2952,7 @@ mod test {
             data_gen.batch(32),
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -3006,7 +2988,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_column_casting_function(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_column_casting_function(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen =
@@ -3015,7 +2997,7 @@ mod test {
             data_gen.batch(32),
             test_uri,
             Some(WriteParams {
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -3097,7 +3079,7 @@ mod test {
     }
 
     impl ScalarIndexTestFixture {
-        async fn new(use_experimental_writer: bool) -> Self {
+        async fn new(use_legacy_format: bool) -> Self {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
@@ -3122,7 +3104,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     max_rows_per_file: 500,
-                    use_experimental_writer,
+                    use_legacy_format,
                     ..Default::default()
                 }),
             )
@@ -3173,7 +3155,7 @@ mod test {
                 .append(
                     RecordBatchIterator::new(vec![Ok(append_data)], data.schema()),
                     Some(WriteParams {
-                        use_experimental_writer,
+                        use_legacy_format,
                         ..Default::default()
                     }),
                 )
@@ -3495,8 +3477,8 @@ mod test {
     // different configurations to ensure that we get consistent results
     #[rstest]
     #[tokio::test]
-    async fn test_secondary_index_scans(#[values(false, true)] use_experimental_writer: bool) {
-        let fixture = ScalarIndexTestFixture::new(use_experimental_writer).await;
+    async fn test_secondary_index_scans(#[values(false, true)] use_legacy_format: bool) {
+        let fixture = ScalarIndexTestFixture::new(use_legacy_format).await;
 
         for use_index in [false, true] {
             for use_projection in [false, true] {
@@ -3581,7 +3563,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_late_materialization(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_late_materialization(#[values(false, true)] use_legacy_format: bool) {
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
         let data = gen()
@@ -3602,7 +3584,7 @@ mod test {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
-                use_experimental_writer,
+                use_legacy_format,
                 ..Default::default()
             }),
         )
@@ -3683,9 +3665,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_project_nested(
-        #[values(false, true)] use_experimental_writer: bool,
-    ) -> Result<()> {
+    async fn test_project_nested(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
         let struct_i_field = ArrowField::new("i", DataType::Int32, true);
         let struct_o_field = ArrowField::new("o", DataType::Utf8, true);
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -3726,7 +3706,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         Dataset::write(batches, test_uri, Some(write_params))
@@ -3752,14 +3732,14 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_plans(#[values(false, true)] use_experimental_writer: bool) -> Result<()> {
+    async fn test_plans(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
         // Create a vector dataset
-        let mut dataset = TestVectorDataset::new(use_experimental_writer).await?;
+        let mut dataset = TestVectorDataset::new(use_legacy_format).await?;
 
         // Scans
         // ---------------------------------------------------------------------
         // Experimental writer does not use LancePushdownScan
-        if !use_experimental_writer {
+        if use_legacy_format {
             assert_plan_equals(
                 &dataset.dataset,
                 |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
@@ -3811,7 +3791,8 @@ mod test {
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
     SortExec: TopK(fetch=42), expr=...
-      KNNIndex: name=..., k=42, deltas=1",
+      ANNSubIndex: name=..., k=42, deltas=1
+        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3823,7 +3804,8 @@ mod test {
     KNNFlat: k=10 metric=l2
       Take: columns=\"_distance, _rowid, vec\"
         SortExec: TopK(fetch=40), expr=...
-          KNNIndex: name=..., k=40, deltas=1",
+          ANNSubIndex: name=..., k=40, deltas=1
+            ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3853,7 +3835,8 @@ mod test {
     FilterExec: i@3 > 10
       Take: columns=\"_distance, _rowid, vec, i\"
         SortExec: TopK(fetch=17), expr=...
-          KNNIndex: name=..., k=17, deltas=1",
+          ANNSubIndex: name=..., k=17, deltas=1
+            ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3869,7 +3852,8 @@ mod test {
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
     SortExec: TopK(fetch=17), expr=...
-      KNNIndex: name=..., k=17, deltas=1
+      ANNSubIndex: name=..., k=17, deltas=1
+        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
         FilterExec: i@0 > 10
           LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
         )
@@ -3891,7 +3875,8 @@ mod test {
               LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1",
+              ANNSubIndex: name=..., k=5, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3911,7 +3896,8 @@ mod test {
                   LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
               Take: columns=\"_distance, _rowid, vec\"
                 SortExec: TopK(fetch=5), expr=...
-                  KNNIndex: name=..., k=5, deltas=1",
+                  ANNSubIndex: name=..., k=5, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3937,7 +3923,8 @@ mod test {
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1
+              ANNSubIndex: name=..., k=5, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
                 FilterExec: i@0 > 10
                   LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
         )
@@ -3960,7 +3947,8 @@ mod test {
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
     SortExec: TopK(fetch=5), expr=...
-      KNNIndex: name=..., k=5, deltas=1
+      ANNSubIndex: name=..., k=5, deltas=1
+        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
         ScalarIndexQuery: query=i > 10",
         )
         .await?;
@@ -3986,7 +3974,8 @@ mod test {
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1
+              ANNSubIndex: name=..., k=5, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
                 ScalarIndexQuery: query=i > 10",
         )
         .await?;
@@ -4012,7 +4001,8 @@ mod test {
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
-              KNNIndex: name=..., k=5, deltas=1
+              ANNSubIndex: name=..., k=5, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
                 ScalarIndexQuery: query=i > 10",
         )
         .await?;
