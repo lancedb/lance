@@ -25,6 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use lance_table::feature_flags::FLAG_USE_V2_FORMAT;
 use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest, WriterVersion};
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
 use lance_table::io::deletion::read_deletion_file;
@@ -117,11 +118,16 @@ pub(crate) async fn commit_new_dataset(
     base_path: &Path,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
+    use_legacy_format: bool,
 ) -> Result<Manifest> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) =
         transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
+
+    if !use_legacy_format {
+        manifest.writer_feature_flags |= FLAG_USE_V2_FORMAT;
+    }
 
     write_manifest_file(
         object_store,

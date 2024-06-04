@@ -63,7 +63,9 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
-use lance_table::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
+use lance_table::feature_flags::{
+    apply_feature_flags, can_read_dataset, can_write_dataset, should_use_legacy_format,
+};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -388,7 +390,7 @@ impl Dataset {
             Err(e) => return Err(e),
         };
 
-        let (batches, mut schema) = peek_reader_schema(Box::new(batches)).await?;
+        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
         let stream = reader_to_stream(batches);
 
         // Running checks for the different write modes
@@ -439,19 +441,8 @@ impl Dataset {
                         ..Default::default()
                     },
                 )?;
-                let use_v2 = matches!(
-                    d.schema()
-                        .metadata
-                        .get("lance:use_lance_v2")
-                        .map(|s| s.as_str()),
-                    Some("true")
-                );
-                params.use_legacy_format = !use_v2;
+                params.use_legacy_format = should_use_legacy_format(m.writer_feature_flags);
             }
-        } else if !params.use_legacy_format {
-            schema
-                .metadata
-                .insert("lance:use_lance_v2".to_string(), "true".to_string());
         }
 
         let params = params; // discard mut
@@ -513,6 +504,7 @@ impl Dataset {
                 &base,
                 &transaction,
                 &manifest_config,
+                params.use_legacy_format,
             )
             .await?
         };
@@ -808,6 +800,7 @@ impl Dataset {
                 &base,
                 &transaction,
                 &Default::default(),
+                /*use_legacy_format=*/ true,
             )
             .await?
         };
@@ -1646,6 +1639,8 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_write_manifest(#[values(false, true)] use_legacy_format: bool) {
+        use lance_table::feature_flags::FLAG_INVALID;
+
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1711,8 +1706,8 @@ mod tests {
         );
 
         // Write with custom manifest
-        manifest.writer_feature_flags = 5; // Set another flag
-        manifest.reader_feature_flags = 5;
+        manifest.writer_feature_flags |= FLAG_INVALID; // Set another flag
+        manifest.reader_feature_flags |= FLAG_INVALID;
         manifest.version += 1;
         write_manifest_file(
             dataset.object_store(),
