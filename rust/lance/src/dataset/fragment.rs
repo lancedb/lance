@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array, UInt64Array};
-use arrow_schema::Schema as ArrowSchema;
+use arrow_array::{NullArray, RecordBatch, RecordBatchReader, UInt32Array, UInt64Array};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
@@ -1333,10 +1333,13 @@ impl FragmentReader {
         params: impl Into<ReadBatchParams> + Clone,
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        // These will be concatenated horizontally.
-        let mut batches = vec![];
+        let first_reader = self.readers[0].0.as_legacy();
+        let batch_offset = (0..batch_id)
+            .map(|i| first_reader.num_rows_in_batch(i as i32))
+            .sum();
+        let rows_in_batch = first_reader.num_rows_in_batch(batch_id as i32);
 
-        if !projection.fields.is_empty() {
+        let batches = if !projection.fields.is_empty() {
             let read_tasks = self.readers.iter().map(|(reader, schema)| {
                 let projection = schema.intersection(projection);
                 let params = params.clone();
@@ -1361,49 +1364,33 @@ impl FragmentReader {
                 }
             });
             let results = try_join_all(read_tasks).await?;
-            batches.extend(results.into_iter().flatten());
-        }
-
-        // If desired, add row id column
-        let params = params.into();
-        let first_reader = self.readers[0].0.as_legacy();
-        let batch_offset = (0..batch_id)
-            .map(|i| first_reader.num_rows_in_batch(i as i32))
-            .sum();
-        let rows_in_batch = first_reader.num_rows_in_batch(batch_id as i32);
-        if self.with_row_id {
-            let ids_in_batch = params
-                .slice(batch_offset, rows_in_batch)
+            results.into_iter().flatten().collect::<Vec<RecordBatch>>()
+        } else {
+            let expected_rows = params
+                .clone()
+                .into()
+                .slice(0, rows_in_batch)
                 .unwrap()
-                .to_offsets()
-                .unwrap();
-            let row_ids: UInt64Array = ids_in_batch
-                .values()
-                .iter()
-                .map(|row_id| {
-                    u64::from(RowAddress::new_from_parts(self.fragment_id as u32, *row_id))
-                })
-                .collect();
-            let batch = RecordBatch::try_new(
-                Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()])),
-                vec![Arc::new(row_ids)],
-            )?;
-            batches.push(batch);
-        }
-
-        // TODO: we also have to apply the deletion vector
-
-        let output_schema = {
-            let mut output_schema = ArrowSchema::from(projection);
-            if self.with_row_id {
-                output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone())?;
-            }
-            output_schema
+                .to_offsets()?
+                .len();
+            let dummy_array = Arc::new(NullArray::new(expected_rows));
+            vec![RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "dummy",
+                    DataType::Null,
+                    false,
+                )])),
+                vec![dummy_array],
+            )
+            .unwrap()
+            .project(&[])
+            .unwrap()]
         };
 
-        let result = merge_batches(&batches)?.project_by_schema(&output_schema)?;
+        let params = params.into();
+        let result = merge_batches(&batches)?;
 
-        // Need to apply deletions as well
+        // Need to apply deletions and row ids.
         // In order to apply deletions we need to change the parameters to be
         // relative to the file, not the batch.
         let file_params = match params {
@@ -1427,18 +1414,28 @@ impl FragmentReader {
                 ReadBatchParams::Range((range.start + batch_offset)..(range.end + batch_offset))
             }
         };
-        lance_table::utils::stream::apply_row_id_and_deletes(
+        let result = lance_table::utils::stream::apply_row_id_and_deletes(
             result,
             0,
             self.fragment_id as u32,
             &RowIdAndDeletesConfig {
                 params: file_params,
                 deletion_vector: self.deletion_vec.clone(),
-                with_row_id: false, // We already added the row id column
+                with_row_id: self.with_row_id,
                 make_deletions_null: self.make_deletions_null,
                 total_num_rows: first_reader.len() as u32,
             },
-        )
+        )?;
+
+        let output_schema = {
+            let mut output_schema = ArrowSchema::from(projection);
+            if self.with_row_id {
+                output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone())?;
+            }
+            output_schema
+        };
+
+        Ok(result.project_by_schema(&output_schema)?)
     }
 
     fn new_read_impl(
