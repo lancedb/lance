@@ -1728,7 +1728,7 @@ def test_migrate_manifest(tmp_path: Path):
 
 def test_v2_dataset(tmp_path: Path):
     table = pa.table({"a": range(100), "b": range(100)})
-    dataset = lance.write_dataset(table, tmp_path, use_experimental_writer=True)
+    dataset = lance.write_dataset(table, tmp_path, use_legacy_format=False)
     batches = list(dataset.to_batches())
     assert len(batches) == 1
     assert pa.Table.from_batches(batches) == table
