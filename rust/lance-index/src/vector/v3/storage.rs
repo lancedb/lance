@@ -45,11 +45,11 @@ pub trait VectorStore: Send + Sync {
     where
         Self: Sized;
 
+    fn as_any(&self) -> &dyn Any;
+
     fn schema(&self) -> &SchemaRef;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>>;
-
-    fn as_any(&self) -> &dyn Any;
 
     fn len(&self) -> usize;
 
