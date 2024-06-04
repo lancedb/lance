@@ -43,20 +43,22 @@ use lance_io::object_store::ObjectStore;
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
-        Fragment, Index, Manifest,
+        Fragment, Index, Manifest, RowIdMeta,
     },
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
     },
+    rowids::{write_row_ids, RowIdSequence},
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use super::{feature_flags::apply_feature_flags, ManifestWriteConfig};
+use super::ManifestWriteConfig;
 use crate::utils::temporal::timestamp_to_nanos;
+use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 
 /// A change to a dataset that can be retried
 ///
@@ -382,6 +384,25 @@ impl Transaction {
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
 
+        let mut next_row_id = {
+            // Only use row ids if the feature flag is set already or
+            match (current_manifest, config.use_move_stable_row_ids) {
+                (Some(manifest), _)
+                    if manifest.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0 =>
+                {
+                    Some(manifest.next_row_id)
+                }
+                (None, true) => Some(0),
+                (_, false) => None,
+                (Some(_), true) => {
+                    return Err(Error::NotSupported {
+                        source: "Cannot enable stable row ids on existing dataset".into(),
+                        location: location!(),
+                    });
+                }
+            }
+        };
+
         let maybe_existing_fragments =
             current_manifest
                 .map(|m| m.fragments.as_ref())
@@ -396,10 +417,13 @@ impl Transaction {
         match &self.operation {
             Operation::Append { ref fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
-                final_fragments.extend(Self::fragments_with_ids(
-                    fragments.clone(),
-                    &mut fragment_id,
-                ));
+                let mut new_fragments =
+                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
+                        .collect::<Vec<_>>();
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+                final_fragments.extend(new_fragments);
             }
             Operation::Delete {
                 ref updated_fragments,
@@ -432,16 +456,22 @@ impl Transaction {
                         Some(f.clone())
                     }
                 }));
-                final_fragments.extend(Self::fragments_with_ids(
-                    new_fragments.clone(),
-                    &mut fragment_id,
-                ));
+                let mut new_fragments =
+                    Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
+                        .collect::<Vec<_>>();
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+                final_fragments.extend(new_fragments);
             }
             Operation::Overwrite { ref fragments, .. } => {
-                final_fragments.extend(Self::fragments_with_ids(
-                    fragments.clone(),
-                    &mut fragment_id,
-                ));
+                let mut new_fragments =
+                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
+                        .collect::<Vec<_>>();
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+                final_fragments.extend(new_fragments);
                 final_indices = Vec::new();
             }
             Operation::Rewrite {
@@ -521,7 +551,7 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest);
+            apply_feature_flags(&mut manifest)?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -532,6 +562,10 @@ impl Transaction {
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
+
+        if let Some(next_row_id) = next_row_id {
+            manifest.next_row_id = next_row_id;
+        }
 
         Ok((manifest, final_indices))
     }
@@ -660,6 +694,22 @@ impl Transaction {
                 }
                 final_fragments.extend(new_fragments);
             }
+        }
+        Ok(())
+    }
+
+    fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
+        for fragment in fragments {
+            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
+                message: "Fragment does not have physical rows".into(),
+                location: location!(),
+            })? as u64;
+            let row_ids = *next_row_id..(*next_row_id + physical_rows);
+            let sequence = RowIdSequence::from(row_ids);
+            // TODO: write to a separate file if large. Possibly share a file with other fragments.
+            let serialized = write_row_ids(&sequence);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+            *next_row_id += physical_rows;
         }
         Ok(())
     }

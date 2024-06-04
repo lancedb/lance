@@ -21,7 +21,7 @@ message U64Segment {
     message Range {
         /// The start of the range, inclusive.
         uint64 start = 1;
-        /// The enc of the range, exclusive.
+        /// The end of the range, exclusive.
         uint64 end = 2;
     }
 
@@ -43,7 +43,7 @@ message U64Segment {
     message RangeWithBitmap {
         /// The start of the range, inclusive.
         uint64 start = 1;
-        /// The enc of the range, exclusive.
+        /// The end of the range, exclusive.
         uint64 end = 2;
         /// A bitmap of the values in the range. The bitmap is a sequence of bytes,
         /// where each byte represents 8 values. The first byte represents values
@@ -67,7 +67,7 @@ message U64Segment {
         /// A general array of values, which is not sorted.
         EncodedU64Array array = 5;
     }
-}
+} // RowIdSegment
 
 /// A basic bitpacked array of u64 values.
 message EncodedU64Array {

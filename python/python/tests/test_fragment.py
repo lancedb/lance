@@ -246,7 +246,7 @@ def test_fragment_meta():
         "column_indices: [], file_major_version: 0, file_minor_version: 0 }, "
         'DataFile { path: "1.lance", fields: [1], column_indices: [], '
         "file_major_version: 0, file_minor_version: 0 }], deletion_file: None, "
-        "physical_rows: Some(100) }"
+        "row_id_meta: None, physical_rows: Some(100) }"
     )
 
 
@@ -261,7 +261,7 @@ def test_fragment_v2(tmp_path):
     fragments = write_fragments(
         tab,
         tmp_path,
-        use_experimental_writer=True,
+        use_legacy_format=False,
     )
     assert len(fragments) == 1
     ds = lance.dataset(dataset_uri)

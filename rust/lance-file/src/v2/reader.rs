@@ -432,24 +432,24 @@ impl FileReader {
                     .map(|page| {
                         let num_rows = page.length;
                         let encoding = Self::fetch_encoding(page.encoding.as_ref().unwrap());
-                        let buffer_offsets_and_sizes = Arc::new(
+                        let buffer_offsets_and_sizes = Arc::from(
                             page.buffer_offsets
                                 .iter()
                                 .zip(page.buffer_sizes.iter())
                                 .map(|(offset, size)| (*offset, *size))
-                                .collect(),
+                                .collect::<Vec<_>>(),
                         );
-                        Arc::new(PageInfo {
+                        PageInfo {
                             buffer_offsets_and_sizes,
                             encoding,
                             num_rows,
-                        })
+                        }
                     })
                     .collect::<Vec<_>>();
                 Arc::new(ColumnInfo {
                     index: col_idx as u32,
-                    page_infos,
-                    buffer_offsets_and_sizes: vec![],
+                    page_infos: Arc::from(page_infos),
+                    buffer_offsets_and_sizes: Arc::new([]),
                 })
             })
             .collect::<Vec<_>>()
@@ -627,9 +627,7 @@ impl FileReader {
         let num_rows_to_read = range.end - range.start;
 
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
-        tokio::task::spawn(
-            async move { decode_scheduler.schedule_range(range, tx, scheduler).await },
-        );
+        tokio::task::spawn(async move { decode_scheduler.schedule_range(range, tx, scheduler) });
 
         Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream())
     }
@@ -664,11 +662,7 @@ impl FileReader {
         let num_rows_to_read = indices.len() as u64;
 
         let scheduler = self.scheduler.clone() as Arc<dyn EncodingsIo>;
-        tokio::task::spawn(async move {
-            decode_scheduler
-                .schedule_take(&indices, tx, scheduler)
-                .await
-        });
+        tokio::task::spawn(async move { decode_scheduler.schedule_take(&indices, tx, scheduler) });
 
         Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream())
     }

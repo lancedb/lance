@@ -440,8 +440,8 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
                     .buffer_offsets_and_sizes
                     .as_ref()
-                    .clone()
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .unzip();
                 Ok(pbfile::column_metadata::Page {
                     buffer_offsets,
@@ -456,7 +456,7 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
             })
             .collect::<Result<Vec<_>>>()?;
         let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
-            col.buffer_offsets_and_sizes.clone().into_iter().unzip();
+            col.buffer_offsets_and_sizes.iter().cloned().unzip();
         let column = pbfile::ColumnMetadata {
             pages,
             buffer_offsets,
