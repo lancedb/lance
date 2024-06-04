@@ -30,6 +30,16 @@ fn hamming_autovec<const L: usize>(x: &[u8], y: &[u8]) -> f32 {
         .sum::<u32>()) as f32
 }
 
+pub fn hamming_distance_batch<'a>(
+    from: &'a [u8],
+    to: &'a [u8],
+    dimension: usize,
+) -> Box<dyn Iterator<Item = f32> + 'a> {
+    debug_assert_eq!(from.len(), dimension);
+    debug_assert_eq!(to.len() % dimension, 0);
+    Box::new(to.chunks_exact(dimension).map(|v| hamming(from, v)))
+}
+
 /// Scalar version of hamming distance. Used for benchmarks.
 #[inline]
 pub fn hamming_scalar(x: &[u8], y: &[u8]) -> f32 {

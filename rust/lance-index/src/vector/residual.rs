@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{
+    ops::{AddAssign, DivAssign},
+    sync::Arc,
+};
 
 use arrow_array::{
     cast::AsArray,
-    types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type, UInt32Type},
-    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
+    types::{Float16Type, Float32Type, Float64Type, UInt32Type},
+    Array, ArrowNumericType, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
-use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partitions;
-use num_traits::Float;
+use lance_linalg::{
+    distance::{DistanceType, Dot, L2},
+    kmeans::KMeansAlgoFloat,
+};
+use num_traits::{Float, FromPrimitive, Num};
 use rayon::prelude::*;
 use snafu::{location, Location};
 
@@ -53,29 +59,31 @@ impl ResidualTransform {
     }
 }
 
-fn do_compute_residual<T: ArrowPrimitiveType>(
+fn do_compute_residual<T: ArrowNumericType>(
     centroids: &FixedSizeListArray,
     vectors: &FixedSizeListArray,
     distance_type: Option<DistanceType>,
     partitions: Option<&UInt32Array>,
 ) -> Result<FixedSizeListArray>
 where
-    T::Native: Float + L2 + Dot,
+    T::Native: Num + Float + L2 + Dot + DivAssign + AddAssign + FromPrimitive,
 {
     let dimension = centroids.value_length() as usize;
-    let centroids_slice = centroids.values().as_primitive::<T>().values();
-    let vectors_slice = vectors.values().as_primitive::<T>().values();
+    let centroids = centroids.values().as_primitive::<T>();
+    let vectors = vectors.values().as_primitive::<T>();
 
     let part_ids = partitions.cloned().unwrap_or_else(|| {
-        compute_partitions(
-            centroids_slice,
-            vectors_slice,
+        compute_partitions::<T, KMeansAlgoFloat<T>>(
+            centroids,
+            vectors,
             dimension,
             distance_type.expect("provide either partitions or distance type"),
         )
         .into()
     });
 
+    let vectors_slice = vectors.values();
+    let centroids_slice = centroids.values();
     let residuals = vectors_slice
         .par_chunks(dimension)
         .enumerate()
