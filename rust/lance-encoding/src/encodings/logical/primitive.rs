@@ -164,11 +164,10 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
         self.global_row_offset += cur_page.num_rows as u64;
         self.page_idx += 1;
 
-        let physical_decoder = cur_page.scheduler.schedule_ranges(
-            &ranges_in_page,
-            context.io().as_ref(),
-            top_level_row,
-        );
+        let physical_decoder =
+            cur_page
+                .scheduler
+                .schedule_ranges(&ranges_in_page, context.io(), top_level_row);
 
         let logical_decoder = PrimitiveFieldDecoder {
             data_type: self.scheduler.data_type.clone(),
