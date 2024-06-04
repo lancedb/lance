@@ -518,10 +518,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
-    use crate::v2::{
-        reader::FileReader,
-        writer::{FileWriter, FileWriterOptions},
-    };
+    use crate::v2::writer::{FileWriter, FileWriterOptions};
 
     #[tokio::test]
     async fn test_basic_write() {
