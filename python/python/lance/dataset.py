@@ -399,7 +399,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool, default False
             Run filter before the vector search.
         with_row_id: bool, default False
-            Return physical row ID.
+            Return row ID.
         use_stats: bool, default True
             Use stats pushdown during filters.
 
@@ -2046,7 +2046,7 @@ class ScannerBuilder:
         return self
 
     def with_row_id(self, with_row_id: bool = True) -> ScannerBuilder:
-        """Enable returns with physical row IDs."""
+        """Enable returns with row IDs."""
         self._with_row_id = with_row_id
         return self
 

@@ -426,7 +426,7 @@ impl HNSW {
             .map(|i| {
                 let start = range.start + level_offsets[i];
                 let end = range.start + level_offsets[i + 1];
-                reader.read_range(start..end, reader.schema(), None)
+                reader.read_range(start..end, reader.schema())
             })
             .buffered(num_cpus::get())
             .try_collect()

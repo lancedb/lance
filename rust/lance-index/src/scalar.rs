@@ -177,7 +177,7 @@ impl ScalarQuery {
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
-    /// Returns all row ids that satisfy the query, these row ids are not neccesarily ordered
+    /// Returns all row ids that satisfy the query, these row ids are not necessarily ordered
     async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array>;
 
     /// Load the scalar index from storage

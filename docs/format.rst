@@ -44,8 +44,8 @@ deleted from the fragment.
 
 .. image:: _static/fragment_structure.png
 
-Every row has a unique id, which is an u64 that is composed of two u32s: the
-fragment id and the local row id. The local row id is just the index of the
+Every row has a unique row address, which is an u64 that is composed of two u32s: the
+fragment id and the local row offset. The local row offset is just the index of the
 row in the data files.
 
 File Structure
@@ -201,12 +201,12 @@ Deletion
 --------
 
 Rows can be marked deleted by adding a deletion file next to the data in the
-``_deletions`` folder. These files contain the indices of rows that have between
+``_deletions`` folder. These files contain the local offsets of rows that have between
 deleted for some fragment. For a given version of the dataset, each fragment can
 have up to one deletion file. Fragments that have no deleted rows have no deletion
 file.
 
-Readers should filter out row ids contained in these deletion files during a 
+Readers should filter out row offsets contained in these deletion files during a 
 scan or ANN search.
 
 Deletion files come in two flavors:
@@ -423,6 +423,9 @@ row address
   of as a pair of two u32 values: the fragment id and the local row offset. For
   example, if the row address is (42, 9), then the row is in the 42rd fragment
   and is the 10th row in that fragment.
+
+row offset
+  The index of a row in a fragment. This is a u32 that is unique within a fragment.
 
 row id sequence
   The sequence of row ids in a fragment.

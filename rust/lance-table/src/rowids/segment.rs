@@ -273,6 +273,7 @@ impl U64Segment {
         match self {
             Self::Range(range) => {
                 let start = range.start + offset as u64;
+                debug_assert!(start + len as u64 <= range.end);
                 Self::Range(start..(start + len as u64))
             }
             Self::RangeWithHoles { range, holes } => {

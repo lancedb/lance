@@ -272,14 +272,14 @@ message DataFile {
 // where {extension} is `.arrow` or `.bin` depending on the type of deletion.
 message DeletionFile {
   // Type of deletion file, which varies depending on what is the most efficient
-  // way to store the deleted row ids. If none, then will be unspecified. If there are
+  // way to store the deleted row offsets. If none, then will be unspecified. If there are
   // sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there are
   // densely deleted rows, then BIT_MAP is the most efficient.
   enum DeletionFileType {
-    // Deletion file is a single Int32Array of deleted row ids. This is stored as
+    // Deletion file is a single Int32Array of deleted row offsets. This is stored as
     // an Arrow IPC file with one batch and one column. Has a .arrow extension.
     ARROW_ARRAY = 0;
-    // Deletion file is a Roaring Bitmap of deleted row ids. Has a .bin extension.
+    // Deletion file is a Roaring Bitmap of deleted row offsets. Has a .bin extension.
     BITMAP = 1;
   }
 

@@ -11,7 +11,7 @@ use roaring::RoaringBitmap;
 const BITMAP_THRESDHOLD: usize = 5_000;
 // TODO: Benchmark to find a better value.
 
-/// Represents a set of deleted row ids in a single fragment.
+/// Represents a set of deleted row offsets in a single fragment.
 #[derive(Debug, Clone)]
 pub enum DeletionVector {
     NoDeletions,

@@ -961,7 +961,7 @@ impl Dataset {
         take::take(self, row_indices, projection).await
     }
 
-    /// Take rows by the internal ROW ids.
+    /// Take rows by the internal row ids.
     pub async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
         take::take_rows(self, row_ids, projection).await
     }
@@ -1639,7 +1639,7 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
-            let reader = fragment.open(dataset.schema(), false).await.unwrap();
+            let reader = fragment.open(dataset.schema(), false, false).await.unwrap();
             // No group / batch concept in v2
             if use_legacy_format {
                 assert_eq!(reader.legacy_num_batches(), 10);
@@ -2633,7 +2633,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(deletion_vector.len(), 10);
-        // The second fragment starts at 50, so 90..100 becomes 40..50 in local row ids.
+        // The second fragment starts at 50, so 90..100 becomes 40..50 in local row offsets.
         assert_eq!(
             deletion_vector.into_iter().collect::<HashSet<_>>(),
             (40..50).collect::<HashSet<_>>()

@@ -264,7 +264,7 @@ impl FragmentScanner {
 
         // We will call the reader with projections. In order for this to work
         // we must ensure that we open the fragment with the maximal schema.
-        let mut reader = fragment.open(dataset.schema(), false).await?;
+        let mut reader = fragment.open(dataset.schema(), false, false).await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }

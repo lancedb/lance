@@ -214,7 +214,7 @@ pub struct Fragment {
     /// Files within the fragment.
     pub files: Vec<DataFile>,
 
-    /// Optional file with deleted row ids.
+    /// Optional file with deleted local row offsets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletion_file: Option<DeletionFile>,
 

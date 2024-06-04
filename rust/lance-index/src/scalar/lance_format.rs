@@ -73,13 +73,8 @@ impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
 #[async_trait]
 impl IndexReader for FileReader {
     async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
-        self.read_batch(
-            offset as i32,
-            ReadBatchParams::RangeFull,
-            self.schema(),
-            None,
-        )
-        .await
+        self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
+            .await
     }
 
     async fn num_batches(&self) -> u32 {

@@ -406,7 +406,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                     batch_id as i32,
                     ReadBatchParams::RangeFull,
                     part_reader.schema(),
-                    None,
                 )
             })
             .buffered(num_cpus::get())
@@ -431,7 +430,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                         batch_id as i32,
                         ReadBatchParams::RangeFull,
                         aux_part_reader.schema(),
-                        None,
                     )
                 })
                 .buffered(num_cpus::get())
