@@ -60,6 +60,8 @@ pub trait VectorStore: Send + Sync {
     /// Get the lance ROW ID from one vector.
     fn row_id(&self, id: u32) -> u64;
 
+    fn row_ids(&self) -> impl Iterator<Item = &u64>;
+
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some

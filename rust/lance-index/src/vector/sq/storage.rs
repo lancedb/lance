@@ -338,6 +338,10 @@ impl VectorStore for ScalarQuantizationStorage {
         chunk.row_id(id - offset)
     }
 
+    fn row_ids(&self) -> impl Iterator<Item = &u64> {
+        self.chunks.values().flat_map(|c| c.row_ids.values())
+    }
+
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some

@@ -140,7 +140,7 @@ mod test {
             todo!("panic")
         }
 
-        fn row_ids(&self) -> &[u64] {
+        fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
             todo!("panic")
         }
 

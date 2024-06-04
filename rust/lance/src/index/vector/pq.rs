@@ -106,7 +106,7 @@ impl PQIndex {
         row_ids: Arc<UInt64Array>,
         num_sub_vectors: i32,
     ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
-        let indices_to_keep = pre_filter.filter_row_ids(row_ids.values());
+        let indices_to_keep = pre_filter.filter_row_ids(row_ids.values().iter());
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
@@ -254,7 +254,7 @@ impl VectorIndex for PQIndex {
         }))
     }
 
-    fn row_ids(&self) -> &[u64] {
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 

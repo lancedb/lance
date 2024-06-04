@@ -520,6 +520,10 @@ impl VectorStore for ProductQuantizationStorage {
         self.row_ids.values()[id as usize]
     }
 
+    fn row_ids(&self) -> impl Iterator<Item = &u64> {
+        self.row_ids.values().iter()
+    }
+
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
         PQDistCalculator::new(
             self.codebook.values(),

@@ -166,13 +166,12 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             return Ok(RecordBatch::new_empty(schema));
         }
 
-        let row_ids = storage.row_ids();
         let bitmap = if pre_filter.is_empty() {
             None
         } else {
             pre_filter.wait_for_ready().await?;
 
-            let indices = pre_filter.filter_row_ids(row_ids);
+            let indices = pre_filter.filter_row_ids(storage.row_ids());
             Some(
                 RoaringBitmap::from_sorted_iter(indices.into_iter().map(|i| i as u32)).map_err(
                     |e| Error::Index {
@@ -195,7 +194,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
 
         let results = hnsw.search_basic(query.key.clone(), k, ef, bitmap, storage.as_ref())?;
 
-        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.id as usize]));
+        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| storage.row_id(x.id)));
         let distances = Arc::new(Float32Array::from_iter_values(
             results.iter().map(|x| x.dist.0),
         ));
@@ -284,8 +283,8 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         }))
     }
 
-    fn row_ids(&self) -> &[u64] {
-        self.storage.as_ref().unwrap().row_ids()
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
+        Box::new(self.storage.as_ref().unwrap().row_ids())
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

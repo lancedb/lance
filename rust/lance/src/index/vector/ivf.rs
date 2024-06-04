@@ -738,7 +738,7 @@ impl VectorIndex for IVFIndex {
         })
     }
 
-    fn row_ids(&self) -> &[u64] {
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
