@@ -448,12 +448,10 @@ impl Dataset {
                 );
                 params.use_legacy_format = !use_v2;
             }
-        } else {
-            if !params.use_legacy_format {
-                schema
-                    .metadata
-                    .insert("lance:use_lance_v2".to_string(), "true".to_string());
-            }
+        } else if !params.use_legacy_format {
+            schema
+                .metadata
+                .insert("lance:use_lance_v2".to_string(), "true".to_string());
         }
 
         let params = params; // discard mut
