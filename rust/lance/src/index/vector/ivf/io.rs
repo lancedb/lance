@@ -31,7 +31,7 @@ use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::{DistanceType, MetricType};
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
@@ -538,14 +538,14 @@ async fn build_and_write_pq_storage(
 }
 
 async fn build_and_write_sq_storage(
-    metric_type: MetricType,
+    distance_type: DistanceType,
     row_ids: Arc<dyn Array>,
     vectors: Arc<dyn Array>,
     sq: ScalarQuantizer,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<()> {
     let storage = spawn_cpu(move || {
-        let storage = build_sq_storage(metric_type, row_ids, vectors, sq)?;
+        let storage = build_sq_storage(distance_type, row_ids, vectors, sq)?;
         Ok(storage)
     })
     .await?;

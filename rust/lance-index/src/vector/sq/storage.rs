@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Range,
+    sync::Arc,
+};
 
 use arrow::{
     array::AsArray,
     datatypes::{Float32Type, UInt64Type, UInt8Type},
 };
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
@@ -66,37 +71,21 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
     }
 }
 
+/// An immutable chunk of SclarQuantizationStorage.
 #[derive(Clone)]
-pub struct ScalarQuantizationStorage {
-    distance_type: DistanceType,
-
-    // Metadata
-    num_bits: u16,
-    bounds: Range<f64>,
-
-    // Row IDs and SQ codes
+struct SQStorageChunk {
     batch: RecordBatch,
 
     // Helper fields, references to the batch
+    // These fields share the `Arc` pointer to the columns in batch,
+    // so it does not take more memory.
     row_ids: UInt64Array,
     sq_codes: FixedSizeListArray,
 }
 
-impl DeepSizeOf for ScalarQuantizationStorage {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
-            + self.row_ids.get_array_memory_size()
-            + self.sq_codes.get_array_memory_size()
-    }
-}
-
-impl ScalarQuantizationStorage {
-    pub fn new(
-        num_bits: u16,
-        distance_type: DistanceType,
-        bounds: Range<f64>,
-        batch: RecordBatch,
-    ) -> Result<Self> {
+impl SQStorageChunk {
+    // Create a new chunk from a RecordBatch.
+    fn new(batch: RecordBatch) -> Result<Self> {
         let row_ids = batch
             .column_by_name(ROW_ID)
             .ok_or(Error::Index {
@@ -113,14 +102,71 @@ impl ScalarQuantizationStorage {
             })?
             .as_fixed_size_list()
             .clone();
+        Ok(Self {
+            batch,
+            row_ids,
+            sq_codes,
+        })
+    }
 
+    /// Returns vector dimension
+    fn dim(&self) -> usize {
+        self.sq_codes.value_length() as usize
+    }
+
+    fn len(&self) -> usize {
+        self.row_ids.len()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.batch.schema()
+    }
+
+    /// Expose per chunk ROW IDs.
+    fn row_ids(&self) -> &[u64] {
+        self.row_ids.values()
+    }
+}
+
+impl DeepSizeOf for SQStorageChunk {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.batch.get_array_memory_size()
+    }
+}
+
+#[derive(Clone)]
+pub struct ScalarQuantizationStorage {
+    distance_type: DistanceType,
+
+    // Metadata
+    num_bits: u16,
+    bounds: Range<f64>,
+
+    /// Chunks of storage
+    chunks: BTreeMap<usize, SQStorageChunk>,
+}
+
+impl DeepSizeOf for ScalarQuantizationStorage {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.chunks
+            .iter()
+            .map(|c| c.deep_size_of_children(context))
+            .sum()
+    }
+}
+
+impl ScalarQuantizationStorage {
+    pub fn new(
+        num_bits: u16,
+        distance_type: DistanceType,
+        bounds: Range<f64>,
+        batch: RecordBatch,
+    ) -> Result<Self> {
         Ok(Self {
             num_bits,
             distance_type,
             bounds,
-            batch,
-            row_ids,
-            sq_codes,
+            chunks: [(0, SQStorageChunk::new(batch)?)].into_iter().collect(),
         })
     }
 
@@ -130,18 +176,6 @@ impl ScalarQuantizationStorage {
 
     pub fn bounds(&self) -> Range<f64> {
         self.bounds.clone()
-    }
-
-    pub fn batch(&self) -> &RecordBatch {
-        &self.batch
-    }
-
-    pub fn row_ids(&self) -> &[u64] {
-        self.row_ids.values()
-    }
-
-    pub fn sq_codes(&self) -> &FixedSizeListArray {
-        &self.sq_codes
     }
 
     pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
@@ -219,36 +253,12 @@ impl VectorStore for ScalarQuantizationStorage {
             })?;
         let metadata: ScalarQuantizationMetadata = serde_json::from_str(metadata_json)?;
 
-        let row_ids = batch
-            .column_by_name(ROW_ID)
-            .ok_or(Error::Schema {
-                message: "Row ID column not found in the batch".to_string(),
-                location: location!(),
-            })?
-            .as_primitive::<UInt64Type>()
-            .clone();
-        let sq_codes = batch
-            .column_by_name(SQ_CODE_COLUMN)
-            .ok_or(Error::Schema {
-                message: "SQ code column not found in the batch".to_string(),
-                location: location!(),
-            })?
-            .as_fixed_size_list()
-            .clone();
-
-        Ok(Self {
-            distance_type,
-            num_bits: metadata.num_bits,
-            bounds: metadata.bounds.clone(),
-            batch,
-            row_ids,
-            sq_codes,
-        })
+        Self::new(metadata.num_bits, distance_type, metadata.bounds, batch)
     }
 
-    fn to_batch(&self) -> Result<RecordBatch> {
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         let metadata = ScalarQuantizationMetadata {
-            dim: self.sq_codes.value_length() as usize,
+            dim: self.chunks.first_key_value().map(|(_, c)| c.dim()).unwrap(),
             num_bits: self.num_bits,
             bounds: self.bounds.clone(),
         };
@@ -256,12 +266,19 @@ impl VectorStore for ScalarQuantizationStorage {
         let metadata = HashMap::from_iter(vec![("metadata".to_owned(), metadata_json)]);
 
         let schema = self
-            .batch
-            .schema_ref()
-            .as_ref()
-            .clone()
+            .chunks
+            .first_key_value()
+            .map(|(_, c)| c.schema().as_ref().clone())
+            .unwrap()
             .with_metadata(metadata);
-        Ok(self.batch.clone().with_schema(schema.into())?)
+        let schema = Arc::new(schema);
+        Ok(self.chunks.iter().map(move |(_, chunk)| {
+            chunk
+                .batch
+                .clone()
+                .with_schema(schema.clone())
+                .expect("attach schema")
+        }))
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -269,7 +286,10 @@ impl VectorStore for ScalarQuantizationStorage {
     }
 
     fn len(&self) -> usize {
-        self.batch.num_rows()
+        self.chunks
+            .last_key_value()
+            .map(|(&offset, batch)| offset + batch.len())
+            .unwrap_or_default()
     }
 
     fn row_ids(&self) -> &[u64] {

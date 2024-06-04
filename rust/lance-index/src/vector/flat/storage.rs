@@ -113,8 +113,8 @@ impl VectorStore for FlatStorage {
         })
     }
 
-    fn to_batch(&self) -> Result<RecordBatch> {
-        Ok(self.batch.clone())
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
+        Ok([self.batch.clone()].into_iter())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

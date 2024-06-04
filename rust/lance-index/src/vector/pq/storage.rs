@@ -473,7 +473,7 @@ impl VectorStore for ProductQuantizationStorage {
         })
     }
 
-    fn to_batch(&self) -> Result<RecordBatch> {
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         let codebook_fsl = FixedSizeListArray::try_new_from_values(
             self.codebook.as_ref().clone(),
             self.dimension as i32,
@@ -497,7 +497,7 @@ impl VectorStore for ProductQuantizationStorage {
             .as_ref()
             .clone()
             .with_metadata(metadata);
-        Ok(self.batch.clone().with_schema(schema.into())?)
+        Ok([self.batch.clone().with_schema(schema.into())?].into_iter())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -37,7 +37,7 @@ pub trait VectorStore: Send + Sync {
     where
         Self: Sized;
 
-    fn to_batch(&self) -> Result<RecordBatch>;
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>>;
 
     fn as_any(&self) -> &dyn Any;
 
