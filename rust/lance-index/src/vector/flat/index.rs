@@ -58,7 +58,7 @@ impl IvfSubIndex for FlatIndex {
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator_from_native(query);
         let (row_ids, dists): (Vec<u64>, Vec<f32>) = (0..storage.len())
-            .filter(|&id| !prefilter.should_drop(storage.row_ids()[id]))
+            .filter(|&id| !prefilter.should_drop(storage.row_id(id as u32)))
             .map(|id| OrderedNode {
                 id: id as u32,
                 dist: OrderedFloat(dist_calc.distance(id as u32)),
@@ -69,7 +69,7 @@ impl IvfSubIndex for FlatIndex {
                 |OrderedNode {
                      id,
                      dist: OrderedFloat(dist),
-                 }| (storage.row_ids()[id as usize], dist),
+                 }| (storage.row_id(id), dist),
             )
             .unzip();
 

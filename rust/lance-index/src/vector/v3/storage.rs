@@ -27,7 +27,11 @@ pub trait DistCalculator {
 ///
 /// TODO: should we rename this to "VectorDistance"?;
 ///
-/// WARNING: Internal API,  API stability is not guaranteed
+/// <section class="warning">
+///  Internal API
+///
+///  API stability is not guaranteed
+/// </section>
 pub trait VectorStore: Send + Sync {
     type DistanceCalculator<'a>: DistCalculator
     where
@@ -48,10 +52,11 @@ pub trait VectorStore: Send + Sync {
         self.len() == 0
     }
 
-    fn row_ids(&self) -> &[u64];
-
     /// Return [DistanceType].
     fn distance_type(&self) -> DistanceType;
+
+    /// Get the lance ROW ID from one vector.
+    fn row_id(&self, id: u32) -> u64;
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///

@@ -3,7 +3,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    ops::Range,
+    ops::{Bound::Included, Range},
     sync::Arc,
 };
 
@@ -11,7 +11,7 @@ use arrow::{
     array::AsArray,
     datatypes::{Float32Type, UInt64Type, UInt8Type},
 };
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array, UInt8Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
@@ -76,11 +76,13 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
 struct SQStorageChunk {
     batch: RecordBatch,
 
+    dim: usize,
+
     // Helper fields, references to the batch
     // These fields share the `Arc` pointer to the columns in batch,
     // so it does not take more memory.
     row_ids: UInt64Array,
-    sq_codes: FixedSizeListArray,
+    sq_codes: UInt8Array,
 }
 
 impl SQStorageChunk {
@@ -94,16 +96,25 @@ impl SQStorageChunk {
             })?
             .as_primitive::<UInt64Type>()
             .clone();
-        let sq_codes = batch
+        let fsl = batch
             .column_by_name(SQ_CODE_COLUMN)
             .ok_or(Error::Index {
                 message: "SQ code column not found in the batch".to_owned(),
                 location: location!(),
             })?
-            .as_fixed_size_list()
+            .as_fixed_size_list();
+        let dim = fsl.value_length() as usize;
+        let sq_codes = fsl
+            .values()
+            .as_primitive_opt::<UInt8Type>()
+            .ok_or(Error::Index {
+                message: "SQ code column is not FixedSizeList<u8>".to_owned(),
+                location: location!(),
+            })?
             .clone();
         Ok(Self {
             batch,
+            dim,
             row_ids,
             sq_codes,
         })
@@ -111,7 +122,7 @@ impl SQStorageChunk {
 
     /// Returns vector dimension
     fn dim(&self) -> usize {
-        self.sq_codes.value_length() as usize
+        self.dim
     }
 
     fn len(&self) -> usize {
@@ -122,9 +133,14 @@ impl SQStorageChunk {
         self.batch.schema()
     }
 
-    /// Expose per chunk ROW IDs.
-    fn row_ids(&self) -> &[u64] {
-        self.row_ids.values()
+    fn row_id(&self, id: u32) -> u64 {
+        self.row_ids.value(id as usize)
+    }
+
+    /// Get a slice of SQ code for id
+    fn sq_code_slice(&self, id: u32) -> &[u8] {
+        assert!(id < self.len() as u32);
+        &self.sq_codes.values()[id as usize * self.dim..(id + 1) as usize * self.dim]
     }
 }
 
@@ -143,7 +159,8 @@ pub struct ScalarQuantizationStorage {
     bounds: Range<f64>,
 
     /// Chunks of storage
-    chunks: BTreeMap<usize, SQStorageChunk>,
+    /// A ordered map of `<start_id, chunk>`
+    chunks: BTreeMap<u32, SQStorageChunk>,
 }
 
 impl DeepSizeOf for ScalarQuantizationStorage {
@@ -176,6 +193,18 @@ impl ScalarQuantizationStorage {
 
     pub fn bounds(&self) -> Range<f64> {
         self.bounds.clone()
+    }
+
+    /// Get the chunk that covers the id, panic if the id is out of range
+    ///
+    /// Returns:
+    /// `(offset, chunk)`
+    #[inline]
+    fn chunk(&self, id: u32) -> (&u32, &SQStorageChunk) {
+        self.chunks
+            .range((Included(&0), Included(&id)))
+            .next_back()
+            .unwrap()
     }
 
     pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
@@ -272,7 +301,7 @@ impl VectorStore for ScalarQuantizationStorage {
             .unwrap()
             .with_metadata(metadata);
         let schema = Arc::new(schema);
-        Ok(self.chunks.iter().map(move |(_, chunk)| {
+        Ok(self.chunks.values().map(move |chunk| {
             chunk
                 .batch
                 .clone()
@@ -288,12 +317,8 @@ impl VectorStore for ScalarQuantizationStorage {
     fn len(&self) -> usize {
         self.chunks
             .last_key_value()
-            .map(|(&offset, batch)| offset + batch.len())
+            .map(|(&offset, batch)| offset as usize + batch.len())
             .unwrap_or_default()
-    }
-
-    fn row_ids(&self) -> &[u64] {
-        self.row_ids.values()
     }
 
     /// Return the metric type of the vectors.
@@ -301,82 +326,80 @@ impl VectorStore for ScalarQuantizationStorage {
         self.distance_type
     }
 
+    fn row_id(&self, id: u32) -> u64 {
+        let (offset, chunk) = self.chunk(id);
+        chunk.row_id(id - offset)
+    }
+
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        SQDistCalculator::new(query, &self.sq_codes, self.bounds.clone())
+        SQDistCalculator::new(query, self, self.bounds.clone())
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
-        let dim = self.sq_codes.value_length() as usize;
+        let (offset, chunk) = self.chunk(id);
+        let query_sq_code = chunk.sq_code_slice(id - offset).to_vec();
         SQDistCalculator {
-            query_sq_code: get_sq_code(&self.sq_codes, id).to_vec(),
-            sq_codes: self.sq_codes.values().as_primitive::<UInt8Type>().values(),
-            dim,
+            query_sq_code,
+            storage: self,
         }
     }
 
     fn distance_between(&self, a: u32, b: u32) -> f32 {
+        let (offset_a, chunk_a) = self.chunk(a);
+        let (offset_b, chunk_b) = self.chunk(b);
         l2_distance_uint_scalar(
-            get_sq_code(&self.sq_codes, a),
-            get_sq_code(&self.sq_codes, b),
+            chunk_a.sq_code_slice(a - offset_a),
+            chunk_b.sq_code_slice(b - offset_b),
         )
     }
 }
 
 pub struct SQDistCalculator<'a> {
     query_sq_code: Vec<u8>,
-    sq_codes: &'a [u8],
-    dim: usize,
+    storage: &'a ScalarQuantizationStorage,
 }
 
 impl<'a> SQDistCalculator<'a> {
-    fn new(query: ArrayRef, sq_codes: &'a FixedSizeListArray, bounds: Range<f64>) -> Self {
+    fn new(query: ArrayRef, storage: &'a ScalarQuantizationStorage, bounds: Range<f64>) -> Self {
         let query_sq_code =
             scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), bounds);
-        let sq_codes_values = sq_codes.values().as_primitive::<UInt8Type>();
-        let dim = sq_codes.value_length() as usize;
         Self {
             query_sq_code,
-            sq_codes: sq_codes_values.values(),
-            dim,
+            storage,
         }
     }
 }
 
 impl<'a> DistCalculator for SQDistCalculator<'a> {
     fn distance(&self, id: u32) -> f32 {
-        let sq_code = &self.sq_codes[id as usize * self.dim..(id as usize + 1) * self.dim];
+        let (offset, chunk) = self.storage.chunk(id);
+        let sq_code = chunk.sq_code_slice(id - offset);
         l2_distance_uint_scalar(sq_code, &self.query_sq_code)
     }
-    #[allow(unused_variables)]
-    fn prefetch(&self, _id: u32) {
-        const CACHE_LINE_SIZE: usize = 64;
-        unsafe {
-            use std::process::id;
-            let base_ptr = self.sq_codes.as_ptr().add(id as usize * self.dim);
 
-            // Loop over the sq_code to prefetch each cache line
-            for offset in (0..self.dim).step_by(CACHE_LINE_SIZE) {
-                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                {
-                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                    _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
+    #[allow(unused_variables)]
+    fn prefetch(&self, id: u32) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            const CACHE_LINE_SIZE: usize = 64;
+
+            let (offset, chunk) = self.storage.chunk(id);
+            let dim = chunk.dim();
+            let base_ptr = chunk.sq_code_slice(id - offset).as_ptr();
+
+            unsafe {
+                // Loop over the sq_code to prefetch each cache line
+                for offset in (0..self.dim).step_by(CACHE_LINE_SIZE) {
+                    {
+                        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                        _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
+                    }
                 }
             }
         }
     }
-}
-
-fn get_sq_code(sq_codes: &FixedSizeListArray, id: u32) -> &[u8] {
-    let dim = sq_codes.value_length() as usize;
-    let values: &[u8] = sq_codes
-        .values()
-        .as_any()
-        .downcast_ref::<UInt8Array>()
-        .unwrap()
-        .values();
-    &values[id as usize * dim..(id as usize + 1) * dim]
 }

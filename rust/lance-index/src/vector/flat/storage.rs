@@ -30,7 +30,7 @@ pub struct FlatStorage {
     distance_type: DistanceType,
 
     // helper fields
-    row_ids: Arc<UInt64Array>,
+    pub(super) row_ids: Arc<UInt64Array>,
     vectors: Arc<FixedSizeListArray>,
 }
 
@@ -125,12 +125,12 @@ impl VectorStore for FlatStorage {
         self.vectors.len()
     }
 
-    fn row_ids(&self) -> &[u64] {
-        self.row_ids.values()
-    }
-
     fn distance_type(&self) -> DistanceType {
         self.distance_type
+    }
+
+    fn row_id(&self, id: u32) -> u64 {
+        self.row_ids.values()[id as usize]
     }
 
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
