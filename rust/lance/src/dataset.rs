@@ -388,7 +388,7 @@ impl Dataset {
             Err(e) => return Err(e),
         };
 
-        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let (batches, mut schema) = peek_reader_schema(Box::new(batches)).await?;
         let stream = reader_to_stream(batches);
 
         // Running checks for the different write modes
@@ -411,7 +411,6 @@ impl Dataset {
                 ..params
             };
         }
-        let params = params; // discard mut
 
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
@@ -440,8 +439,24 @@ impl Dataset {
                         ..Default::default()
                     },
                 )?;
+                let use_v2 = matches!(
+                    d.schema()
+                        .metadata
+                        .get("lance:use_lance_v2")
+                        .map(|s| s.as_str()),
+                    Some("true")
+                );
+                params.use_legacy_format = !use_v2;
+            }
+        } else {
+            if !params.use_legacy_format {
+                schema
+                    .metadata
+                    .insert("lance:use_lance_v2".to_string(), "true".to_string());
             }
         }
+
+        let params = params; // discard mut
 
         if let Some(d) = dataset.as_ref() {
             if !can_write_dataset(d.manifest.writer_feature_flags) {
