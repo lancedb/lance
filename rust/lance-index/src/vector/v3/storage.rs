@@ -25,7 +25,7 @@ pub trait DistCalculator {
 
 /// Vector Storage is the abstraction to store the vectors.
 ///
-/// It can be in-memory raw vectors or on disk PQ code.
+/// It can be in-memory or on-disk, raw vector or quantized vectors.
 ///
 /// It abstracts away the logic to compute the distance between vectors.
 ///
@@ -36,14 +36,12 @@ pub trait DistCalculator {
 ///
 ///  API stability is not guaranteed
 /// </section>
-pub trait VectorStore: Send + Sync {
+pub trait VectorStore: Send + Sync + Sized {
     type DistanceCalculator<'a>: DistCalculator
     where
         Self: 'a;
 
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
-    where
-        Self: Sized;
+    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>;
 
     fn as_any(&self) -> &dyn Any;
 
@@ -65,6 +63,10 @@ pub trait VectorStore: Send + Sync {
     fn row_id(&self, id: u32) -> u64;
 
     fn row_ids(&self) -> impl Iterator<Item = &u64>;
+
+    /// Append Raw [RecordBatch] into the Storage.
+    /// The storage implement will perform quantization if necessary.
+    fn append_record_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///

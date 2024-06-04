@@ -305,6 +305,14 @@ impl VectorStore for ScalarQuantizationStorage {
         }))
     }
 
+    fn append_record_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+        // TODO: use chunked storage
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let mut storage = self.clone();
+        storage.batch = new_batch;
+        Ok(self)
+    }
+
     fn schema(&self) -> &SchemaRef {
         self.chunks
             .first_key_value()
@@ -323,7 +331,7 @@ impl VectorStore for ScalarQuantizationStorage {
             .unwrap_or_default()
     }
 
-    /// Return the metric type of the vectors.
+    /// Return the [DistanceType] of the vectors.
     fn distance_type(&self) -> DistanceType {
         self.distance_type
     }

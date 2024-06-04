@@ -9,6 +9,7 @@ use crate::vector::quantizer::QuantizerStorage;
 use crate::vector::utils::prefetch_arrow_array;
 use crate::vector::v3::storage::{DistCalculator, VectorStore};
 use arrow::array::AsArray;
+use arrow::compute::{concat, concat_batches};
 use arrow::datatypes::UInt64Type;
 use arrow_array::{types::Float32Type, RecordBatch};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt64Array};
@@ -81,10 +82,7 @@ impl FlatStorage {
 impl VectorStore for FlatStorage {
     type DistanceCalculator<'a> = FlatDistanceCal;
 
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
-    where
-        Self: Sized,
-    {
+    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
@@ -115,6 +113,14 @@ impl VectorStore for FlatStorage {
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok([self.batch.clone()].into_iter())
+    }
+
+    fn append_record_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+        // TODO: use chunked storage
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let mut storage = self.clone();
+        storage.batch = new_batch;
+        Ok(storage)
     }
 
     fn schema(&self) -> &SchemaRef {
