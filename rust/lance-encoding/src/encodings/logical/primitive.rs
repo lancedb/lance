@@ -14,7 +14,7 @@ use arrow_array::{
         TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
         TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray,
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray, StringArray
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
@@ -469,6 +469,16 @@ impl PrimitiveFieldDecodeTask {
                     *dimension,
                     items_array,
                     fsl_nulls,
+                )))
+            }
+            DataType::Utf8 => {
+                // get offsets_buffer (indices) from buffer
+
+                // get values_buffer (bytes) from buffer
+
+                Ok(Arc::new(StringArray::new(
+                    offsets_buffer, // indices
+                    values_buffer, // bytes
                 )))
             }
             _ => Err(Error::io(

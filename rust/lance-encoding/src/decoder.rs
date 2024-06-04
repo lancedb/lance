@@ -313,7 +313,7 @@ impl DecodeBatchScheduler {
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
+                DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) | DataType::Utf8 => true,
                 DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
                 _ => false,
             }
@@ -471,7 +471,7 @@ impl DecodeBatchScheduler {
                     null_offset_adjustments,
                 )) as Arc<dyn FieldScheduler>
             }
-            DataType::Utf8 | DataType::Binary | DataType::LargeBinary | DataType::LargeUtf8 => {
+            DataType::Binary | DataType::LargeBinary | DataType::LargeUtf8 => {
                 let list_type = if matches!(data_type, DataType::Utf8 | DataType::Binary) {
                     DataType::List(Arc::new(Field::new("item", DataType::UInt8, true)))
                 } else {

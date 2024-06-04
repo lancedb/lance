@@ -11,7 +11,7 @@ use log::trace;
 // use rand::seq::index;
 
 use crate::{
-    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
+    decoder::{PhysicalPageDecoder, PageScheduler},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
@@ -22,6 +22,89 @@ use arrow_schema::DataType;
 use arrow_cast::cast::cast;
 
 use super::buffers::BitmapBufferEncoder;
+
+#[derive(Debug)]
+pub struct BinaryPageScheduler {
+    indices_scheduler: Box<dyn PageScheduler>,
+    bytes_scheduler: Box<dyn PageScheduler>,
+}
+
+impl BinaryPageScheduler {
+    pub fn new(indices_scheduler: Box<dyn PageScheduler>, bytes_scheduler: Box<dyn PageScheduler>) -> Self {
+        Self {
+            indices_scheduler,
+            bytes_scheduler,
+        }
+    }
+}
+
+impl PageScheduler for BinaryPageScheduler {
+    fn schedule_ranges(
+        &self,
+        ranges: &[std::ops::Range<u32>],
+        scheduler: &dyn EncodingsIo,
+        top_level_row: u64,
+    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+
+        let indices_page_decoder =
+            self.indices_scheduler
+                .schedule_ranges(&ranges, scheduler, top_level_row);
+        
+        let bytes_page_decoder = 
+            self.bytes_scheduler
+                .schedule_ranges(&ranges, scheduler, top_level_row);
+        
+        async move {
+            let indices_decoder = indices_page_decoder.await?;
+            let bytes_decoder = bytes_page_decoder.await?;
+
+            Ok(Box::new(BinaryPageDecoder {
+                indices_decoder,
+                bytes_decoder,
+            }) as Box<dyn PhysicalPageDecoder>)
+        }
+        .boxed()
+    }
+}
+
+struct BinaryPageDecoder {
+    indices_decoder: Box<dyn PhysicalPageDecoder>,
+    bytes_decoder: Box<dyn PhysicalPageDecoder>,
+}
+
+impl PhysicalPageDecoder for BinaryPageDecoder {
+    fn update_capacity(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        buffers: &mut [(u64, bool)],
+        all_null: &mut bool,
+    ) {
+
+        self.indices_decoder
+            .update_capacity(rows_to_skip, num_rows, buffers, all_null);
+        self.bytes_decoder
+            .update_capacity(rows_to_skip, num_rows, buffers, all_null);
+    }
+
+    fn decode_into(
+        &self,
+        rows_to_skip: u32,
+        num_rows: u32,
+        dest_buffers: &mut [bytes::BytesMut],
+    ) -> Result<()> {
+        
+        self.indices_decoder.decode_into(rows_to_skip, num_rows, &mut dest_buffers[..1])?;
+        self.bytes_decoder.decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..])?;
+
+        Ok(())
+    }
+
+    fn num_buffers(&self) -> u32 {
+        self.indices_decoder.num_buffers() + self.bytes_decoder.num_buffers()
+    }
+}
+
 
 #[derive(Debug)]
 pub struct BinaryEncoder {
