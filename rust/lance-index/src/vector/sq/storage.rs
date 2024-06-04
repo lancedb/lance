@@ -33,7 +33,7 @@ use crate::{
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
-use super::scale_to_u8;
+use super::{scale_to_u8, ScalarQuantizer};
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
 
@@ -152,11 +152,9 @@ impl DeepSizeOf for SQStorageChunk {
 
 #[derive(Clone)]
 pub struct ScalarQuantizationStorage {
-    distance_type: DistanceType,
+    quantizer: ScalarQuantizer,
 
-    // Metadata
-    num_bits: u16,
-    bounds: Range<f64>,
+    distance_type: DistanceType,
 
     /// Chunks of storage
     /// A ordered map of `<start_id, chunk>`
@@ -179,20 +177,14 @@ impl ScalarQuantizationStorage {
         bounds: Range<f64>,
         batch: RecordBatch,
     ) -> Result<Self> {
+        let chunk = SQStorageChunk::new(batch)?;
+
+        let quantizer = ScalarQuantizer::with_bounds(num_bits, chunk.dim(), bounds);
         Ok(Self {
-            num_bits,
+            quantizer,
             distance_type,
-            bounds,
-            chunks: [(0, SQStorageChunk::new(batch)?)].into_iter().collect(),
+            chunks: [(0, chunk)].into_iter().collect(),
         })
-    }
-
-    pub fn num_bits(&self) -> u16 {
-        self.num_bits
-    }
-
-    pub fn bounds(&self) -> Range<f64> {
-        self.bounds.clone()
     }
 
     /// Get the chunk that covers the id.
@@ -291,8 +283,8 @@ impl VectorStore for ScalarQuantizationStorage {
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         let metadata = ScalarQuantizationMetadata {
             dim: self.chunks.first_key_value().map(|(_, c)| c.dim()).unwrap(),
-            num_bits: self.num_bits,
-            bounds: self.bounds.clone(),
+            num_bits: self.quantizer.num_bits,
+            bounds: self.quantizer.bounds.clone(),
         };
         let metadata_json = serde_json::to_string(&metadata)?;
         let metadata = HashMap::from_iter(vec![("metadata".to_owned(), metadata_json)]);
@@ -350,7 +342,7 @@ impl VectorStore for ScalarQuantizationStorage {
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        SQDistCalculator::new(query, self, self.bounds.clone())
+        SQDistCalculator::new(query, self, self.quantizer.bounds.clone())
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
