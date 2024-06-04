@@ -13,7 +13,7 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::{l2_distance_uint_scalar, DistanceType, MetricType};
+use lance_linalg::distance::{l2_distance_uint_scalar, DistanceType};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
@@ -93,7 +93,7 @@ impl DeepSizeOf for ScalarQuantizationStorage {
 impl ScalarQuantizationStorage {
     pub fn new(
         num_bits: u16,
-        metric_type: MetricType,
+        distance_type: DistanceType,
         bounds: Range<f64>,
         batch: RecordBatch,
     ) -> Result<Self> {
@@ -116,7 +116,7 @@ impl ScalarQuantizationStorage {
 
         Ok(Self {
             num_bits,
-            distance_type: metric_type,
+            distance_type,
             bounds,
             batch,
             row_ids,
@@ -126,10 +126,6 @@ impl ScalarQuantizationStorage {
 
     pub fn num_bits(&self) -> u16 {
         self.num_bits
-    }
-
-    pub fn metric_type(&self) -> MetricType {
-        self.distance_type
     }
 
     pub fn bounds(&self) -> Range<f64> {
@@ -167,10 +163,10 @@ impl ScalarQuantizationStorage {
                 message: format!("Failed to parse index metadata: {}", metadata_str),
                 location: location!(),
             })?;
-        let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
+        let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
         let metadata = ScalarQuantizationMetadata::load(&reader).await?;
 
-        Self::load_partition(&reader, 0..reader.len(), metric_type, &metadata).await
+        Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata).await
     }
 }
 
@@ -188,7 +184,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
     async fn load_partition(
         reader: &FileReader,
         range: std::ops::Range<usize>,
-        metric_type: MetricType,
+        distance_type: DistanceType,
         metadata: &Self::Metadata,
     ) -> Result<Self> {
         let schema = reader.schema();
@@ -196,7 +192,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
 
         Self::new(
             metadata.num_bits,
-            metric_type,
+            distance_type,
             metadata.bounds.clone(),
             batch,
         )
