@@ -1687,8 +1687,9 @@ mod tests {
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
-    use arrow_array::{RecordBatchIterator, RecordBatchReader, UInt64Array};
+    use arrow_array::{Float16Array, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::Field;
+    use half::prelude::f16;
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
@@ -2344,7 +2345,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float16Array::from_iter_values(repeat(f16::from_f32(0.5)).take(DIM)),
                 5,
             )
             .unwrap()
@@ -2412,7 +2413,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float16Array::from_iter_values(repeat(f16::from_f32(0.5)).take(DIM)),
                 5,
             )
             .unwrap()
