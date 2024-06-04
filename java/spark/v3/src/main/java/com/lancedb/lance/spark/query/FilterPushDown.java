@@ -61,7 +61,46 @@ public class FilterPushDown {
     if (filter instanceof GreaterThan) {
       GreaterThan f = (GreaterThan) filter;
       return Optional.of(f.attribute() + " > " + f.value());
+    } else if (filter instanceof LessThan) {
+      LessThan f = (LessThan) filter;
+      return Optional.of(f.attribute() + " < " + f.value());
+    } else if (filter instanceof LessThanOrEqual) {
+      LessThanOrEqual f = (LessThanOrEqual) filter;
+      return Optional.of(f.attribute() + " <= " + f.value());
+    } else if (filter instanceof GreaterThanOrEqual) {
+      GreaterThanOrEqual f = (GreaterThanOrEqual) filter;
+      return Optional.of(f.attribute() + " >= " + f.value());
+    } else if (filter instanceof EqualTo) {
+      EqualTo f = (EqualTo) filter;
+      return Optional.of(f.attribute() + " == " + f.value());
+    } else if (filter instanceof Or) {
+      Or f = (Or) filter;
+      Optional<String> left = compileFilter(f.left());
+      Optional<String> right = compileFilter(f.right());
+      if (left.isEmpty()) return right;
+      if (right.isEmpty()) return left;
+      return Optional.of(String.format("(%s) OR (%s)", left.get(), right.get()));
+    } else if (filter instanceof And) {
+      And f = (And) filter;
+      Optional<String> left = compileFilter(f.left());
+      Optional<String> right = compileFilter(f.right());
+      if (left.isEmpty()) return right;
+      if (right.isEmpty()) return left;
+      return Optional.of(String.format("(%s) AND (%s)",
+          left.get(), right.get()));
+    } else if (filter instanceof IsNull) {
+      IsNull f = (IsNull) filter;
+      return Optional.of(String.format("%s IS NULL", f.attribute()));
+    } else if (filter instanceof  IsNotNull) {
+      IsNotNull f = (IsNotNull) filter;
+      return Optional.of(String.format("%s IS NOT NULL", f.attribute()));
+    } else if (filter instanceof Not) {
+      Not f = (Not) filter;
+      Optional<String> child = compileFilter(f.child());
+      if (child.isEmpty()) return child;
+      return Optional.of(String.format("NOT (%s)", child.get()));
     }
+
     return Optional.empty();
   }
 
@@ -89,23 +128,23 @@ public class FilterPushDown {
 
   public static boolean isFilterSupported(Filter filter) {
     if (filter instanceof EqualTo) {
-      return false;
+      return true;
     } else if (filter instanceof EqualNullSafe) {
       return false;
     } else if (filter instanceof In) {
       return false;
     } else if (filter instanceof LessThan) {
-      return false;
+      return true;
     } else if (filter instanceof LessThanOrEqual) {
-      return false;
+      return true;
     } else if (filter instanceof GreaterThan) {
       return true;
     } else if (filter instanceof GreaterThanOrEqual) {
-      return false;
+      return true;
     } else if (filter instanceof IsNull) {
-      return false;
+      return true;
     } else if (filter instanceof IsNotNull) {
-      return false;
+      return true;
     } else if (filter instanceof StringStartsWith) {
       return false;
     } else if (filter instanceof StringEndsWith) {
@@ -113,11 +152,14 @@ public class FilterPushDown {
     } else if (filter instanceof StringContains) {
       return false;
     } else if (filter instanceof Not) {
-      return false;
+      Not f = (Not) filter;
+      return isFilterSupported(f.child());
     } else if (filter instanceof Or) {
-      return false;
+      Or f = (Or) filter;
+      return isFilterSupported(f.left()) && isFilterSupported(f.right());
     } else if (filter instanceof And) {
-      return false;
+      And f = (And) filter;
+      return isFilterSupported(f.left()) && isFilterSupported(f.right());
     } else {
       return false;
     }

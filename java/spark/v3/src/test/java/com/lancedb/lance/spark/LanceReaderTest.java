@@ -16,6 +16,7 @@ package com.lancedb.lance.spark;
 
 import com.lancedb.lance.spark.internal.LanceFragmentScanner;
 import com.lancedb.lance.spark.internal.LanceReader;
+import com.lancedb.lance.spark.utils.Optional;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.DataTypes;
@@ -79,8 +80,9 @@ public class LanceReaderTest {
   }
   
   public void validateFragment(List<List<Object>> expectedValues, int fragment, StructType schema) throws IOException {
-    try (LanceFragmentScanner scanner = LanceReader.getFragmentScanner(
-        fragment, TestUtils.TestTable1Config.inputPartition)) {
+    try (LanceFragmentScanner scanner = LanceReader.getFragmentScanner(fragment,
+        new LanceInputPartition(schema, 0, new LanceSplit(Arrays.asList(fragment)),
+            TestUtils.TestTable1Config.lanceConfig, Optional.empty()))) {
       try (ArrowReader reader = scanner.getArrowReader()) {
         VectorSchemaRoot root = reader.getVectorSchemaRoot();
         assertNotNull(root);

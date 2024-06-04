@@ -30,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 public class SparkLanceConnectorTest {
   private static SparkSession spark;
   private static String dbPath;
+  private static Dataset<Row> data;
 
   @BeforeAll
   static void setup() {
@@ -38,6 +39,10 @@ public class SparkLanceConnectorTest {
         .master("local")
         .getOrCreate();
     dbPath = TestUtils.TestTable1Config.dbPath;
+    data = spark.read().format("lance")
+        .option("db", dbPath)
+        .option("table", TestUtils.TestTable1Config.tableName)
+        .load();
   }
 
   @AfterAll
@@ -66,57 +71,58 @@ public class SparkLanceConnectorTest {
 
   @Test
   public void readAll() {
-    Dataset<Row> data = spark.read().format("lance")
-        .option("db", dbPath)
-        .option("table", TestUtils.TestTable1Config.tableName)
-        .load();
     validateData(data, TestUtils.TestTable1Config.expectedValues);
   }
 
   @Test
   public void filter() {
-    Dataset<Row> data = spark.read().format("lance")
-        .option("db", dbPath)
-        .option("table", TestUtils.TestTable1Config.tableName)
-        .load()
-        .filter("x > 1");
-
-    List<List<Long>> expectedValues = TestUtils.TestTable1Config.expectedValues.stream()
+    validateData(data.filter("x > 1"), TestUtils.TestTable1Config.expectedValues.stream()
         .filter(row -> row.get(0) > 1)
-        .collect(Collectors.toList());
-
-    validateData(data, expectedValues);
+        .collect(Collectors.toList()));
+    validateData(data.filter("y == 4"), TestUtils.TestTable1Config.expectedValues.stream()
+        .filter(row -> row.get(1) == 4)
+        .collect(Collectors.toList()));
+    validateData(data.filter("b >= 6"), TestUtils.TestTable1Config.expectedValues.stream()
+        .filter(row -> row.get(2) >= 6)
+        .collect(Collectors.toList()));
+    validateData(data.filter("c < -1"), TestUtils.TestTable1Config.expectedValues.stream()
+        .filter(row -> row.get(3) < -1)
+        .collect(Collectors.toList()));
+    validateData(data.filter("c <= -1"), TestUtils.TestTable1Config.expectedValues.stream()
+        .filter(row -> row.get(3) <= -1)
+        .collect(Collectors.toList()));
+    validateData(data.filter("c == -2"), TestUtils.TestTable1Config.expectedValues.stream()
+        .filter(row -> row.get(3) == -2)
+        .collect(Collectors.toList()));
+    validateData(data.filter("x > 1").filter("y < 6"), TestUtils.TestTable1Config.expectedValues.stream()
+        .filter(row -> row.get(0) > 1)
+        .filter(row -> row.get(1) < 6)
+        .collect(Collectors.toList()));
+    validateData(data.filter("x > 1 and y < 6"), TestUtils.TestTable1Config.expectedValues.stream()
+        .filter(row -> row.get(0) > 1)
+        .filter(row -> row.get(1) < 6)
+        .collect(Collectors.toList()));
+    validateData(data.filter("x > 1 or y < 6"), TestUtils.TestTable1Config.expectedValues.stream()
+        .filter(row -> (row.get(0) > 1) || (row.get(1) < 6))
+        .collect(Collectors.toList()));
+    validateData(data.filter("(x >= 1 and x <= 2) or (c >= -2 and c < 0)"), TestUtils.TestTable1Config.expectedValues.stream()
+        .filter(row -> (row.get(0) >= 1 && row.get(0) <= 2) || (row.get(3) >= -2 && row.get(3) < 0))
+        .collect(Collectors.toList()));
   }
 
   @Test
   public void select() {
-    Dataset<Row> data = spark.read().format("lance")
-        .option("db", dbPath)
-        .option("table", TestUtils.TestTable1Config.tableName)
-        .load()
-        .select("y", "b");
-
-    List<List<Long>> expectedValues = TestUtils.TestTable1Config.expectedValues.stream()
+    validateData(data.select("y", "b"), TestUtils.TestTable1Config.expectedValues.stream()
         .map(row -> Arrays.asList(row.get(1), row.get(2)))
-        .collect(Collectors.toList());
-
-    validateData(data, expectedValues);
+        .collect(Collectors.toList()));
   }
 
   @Test
   public void filterSelect() {
-    Dataset<Row> data = spark.read().format("lance")
-        .option("db", dbPath)
-        .option("table", TestUtils.TestTable1Config.tableName)
-        .load()
-        .select("y", "b")
-        .filter("y > 3");
-
-    List<List<Long>> expectedValues = TestUtils.TestTable1Config.expectedValues.stream()
-        .map(row -> Arrays.asList(row.get(1), row.get(2))) // "y" is at index 1, "b" is at index 2
-        .filter(row -> row.get(0) > 3)
-        .collect(Collectors.toList());
-
-    validateData(data, expectedValues);
+    validateData(data.select("y", "b").filter("y > 3"),
+        TestUtils.TestTable1Config.expectedValues.stream()
+            .map(row -> Arrays.asList(row.get(1), row.get(2))) // "y" is at index 1, "b" is at index 2
+            .filter(row -> row.get(0) > 3)
+            .collect(Collectors.toList()));
   }
 }
