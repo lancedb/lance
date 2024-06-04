@@ -15,11 +15,11 @@
 package com.lancedb.lance.spark;
 
 import com.lancedb.lance.spark.internal.LanceConfig;
+import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.Serializable;
-import java.util.Optional;
 
 public class LanceInputPartition implements InputPartition, Serializable {
   private static final long serialVersionUID = 4723894723984723984L;
@@ -54,7 +54,7 @@ public class LanceInputPartition implements InputPartition, Serializable {
   public LanceConfig getConfig() {
     return config;
   }
-  
+
   public Optional<String> getWhereCondition() {
     return whereCondition;
   }

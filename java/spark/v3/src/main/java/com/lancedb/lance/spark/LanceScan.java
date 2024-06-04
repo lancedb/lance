@@ -15,6 +15,7 @@
 package com.lancedb.lance.spark;
 
 import com.lancedb.lance.spark.internal.LanceConfig;
+import com.lancedb.lance.spark.utils.Optional;
 import org.apache.arrow.util.Preconditions;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.read.Batch;
@@ -27,7 +28,6 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 import java.io.Serializable;
 import java.util.List;
-import java.util.Optional;
 import java.util.stream.IntStream;
 
 public class LanceScan implements Batch, Scan, Serializable {

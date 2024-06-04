@@ -1,5 +1,20 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.lancedb.lance.spark.query;
 
+import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.sources.And;
 import org.apache.spark.sql.sources.EqualNullSafe;
 import org.apache.spark.sql.sources.EqualTo;
@@ -19,7 +34,6 @@ import org.apache.spark.sql.sources.StringStartsWith;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class FilterPushDown {
@@ -42,15 +56,15 @@ public class FilterPushDown {
         .collect(Collectors.joining(" AND "));
     return Optional.of(whereClause);
   }
-  
-  private static Optional<String> compileFilter (Filter filter) {
+
+  private static Optional<String> compileFilter(Filter filter) {
     if (filter instanceof GreaterThan) {
       GreaterThan f = (GreaterThan) filter;
-      return Optional.of(escapeAttr(f.attribute()) + " > " + f.value());
+      return Optional.of(f.attribute() + " > " + f.value());
     }
     return Optional.empty();
   }
-  
+
   /**
    * @param filters filters to see if Lance supported the filter push down
    * @return the accepted push down filters (row 0) and rejected post scan filters (row 1)
@@ -106,14 +120,6 @@ public class FilterPushDown {
       return false;
     } else {
       return false;
-    }
-  }
-
-  private static String escapeAttr(String attr) {
-    if (attr.contains("\"")) {
-      return attr;
-    } else {
-      return "\"" + attr + "\"";
     }
   }
 }

@@ -17,7 +17,6 @@ package com.lancedb.lance.spark.internal;
 import com.lancedb.lance.spark.LanceInputPartition;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
-import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ArrowColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 

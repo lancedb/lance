@@ -72,8 +72,13 @@ impl Error {
     }
 
     pub fn throw(&self, env: &mut JNIEnv) {
+        let msg = format!(
+            "Error when throwing java exception {}: {}",
+            self.java_class.as_str(),
+            self.message
+        );
         env.throw_new(self.java_class.as_str(), &self.message)
-            .expect("Error when throwing Java exception");
+            .expect(msg.as_str());
     }
 }
 

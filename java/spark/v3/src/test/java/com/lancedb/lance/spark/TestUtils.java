@@ -15,6 +15,7 @@
 package com.lancedb.lance.spark;
 
 import com.lancedb.lance.spark.internal.LanceConfig;
+import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
@@ -24,7 +25,6 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 public class TestUtils {
   /**

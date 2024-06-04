@@ -53,7 +53,8 @@ public class LanceConfig implements Serializable {
 
     String dbPath = options.get(CONFIG_DB_PATH);
     String tableName = options.get(CONFIG_TABLE_NAME);
-    boolean pushDownFilters = options.getBoolean(CONFIG_PUSH_DOWN_FILTERS, DEFAULT_PUSH_DOWN_FILTERS);
+    boolean pushDownFilters = options.getBoolean(CONFIG_PUSH_DOWN_FILTERS,
+        DEFAULT_PUSH_DOWN_FILTERS);
 
     String tablePath = calculateTablePath(dbPath, tableName);
 

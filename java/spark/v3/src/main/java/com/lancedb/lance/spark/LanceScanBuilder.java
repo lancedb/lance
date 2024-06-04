@@ -16,6 +16,7 @@ package com.lancedb.lance.spark;
 
 import com.lancedb.lance.spark.internal.LanceConfig;
 import com.lancedb.lance.spark.query.FilterPushDown;
+import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.connector.read.SupportsPushDownFilters;
@@ -23,12 +24,11 @@ import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.types.StructType;
 
-import java.util.Optional;
-
-public class LanceScanBuilder implements ScanBuilder, SupportsPushDownRequiredColumns, SupportsPushDownFilters {
+public class LanceScanBuilder implements ScanBuilder,
+    SupportsPushDownRequiredColumns, SupportsPushDownFilters {
   private final LanceConfig options;
   private StructType schema;
-  
+
   private Filter[] pushedFilters = new Filter[0];
 
   public LanceScanBuilder(StructType schema, LanceConfig options) {
