@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Secondary Index pre-filter
 //!
 //! Based on the query, we might have information about which fragment ids and
