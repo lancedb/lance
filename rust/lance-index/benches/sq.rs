@@ -65,7 +65,7 @@ fn create_sq_batch(row_id_range: Range<u64>, dim: usize) -> RecordBatch {
 fn bench_storge(c: &mut Criterion) {
     let mut rng = rand::thread_rng();
 
-    c.bench_function("ScalarQuantizationStorage,chunks=1x1M", |b| {
+    c.bench_function("ScalarQuantizationStorage,chunks=1x10K", |b| {
         let batch = create_sq_batch(0..10240, 128);
         let storage =
             ScalarQuantizationStorage::try_new(8, DistanceType::L2, -1.0..1.0, [batch]).unwrap();
@@ -77,7 +77,7 @@ fn bench_storge(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("ScalarQuantizationStorage,chunks=1024x1M", |b| {
+    c.bench_function("ScalarQuantizationStorage,chunks=1024x10K", |b| {
         let storage = ScalarQuantizationStorage::try_new(
             8,
             DistanceType::L2,
