@@ -21,7 +21,7 @@ use rand::prelude::*;
 
 fn create_full_batch(range: Range<u64>, dim: usize) -> RecordBatch {
     let mut rng = rand::thread_rng();
-    let row_ids = UInt64Array::from_iter_values(range.clone().into_iter());
+    let row_ids = UInt64Array::from_iter_values(range);
     let sq_code =
         UInt8Array::from_iter_values(repeat_with(|| rng.gen::<u8>()).take(row_ids.len() * dim));
     let sq_code_fsl = FixedSizeListArray::try_new_from_values(sq_code, dim as i32).unwrap();
