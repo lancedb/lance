@@ -149,7 +149,7 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
 #[async_trait]
 impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         let schema = RESULT_SCHEMA.clone();
 
         let hnsw = self.hnsw.as_ref().ok_or(Error::Index {

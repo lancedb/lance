@@ -28,7 +28,9 @@ use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
+use lance_index::vector::{
+    flat::flat_search, Query, VectorIndex, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
+};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
@@ -41,9 +43,8 @@ use tracing::{instrument, Instrument};
 
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
-use crate::index::prefilter::{FilterLoader, PreFilter};
+use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::ivf::IVFIndex;
-use crate::index::vector::VectorIndex;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 
@@ -689,8 +690,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             }
                             PreFilterSource::None => None,
                         };
-                        let pre_filter =
-                            Arc::new(PreFilter::new(ds.clone(), &[index_meta], prefilter_loader));
+                        let pre_filter = Arc::new(DatasetPreFilter::new(
+                            ds.clone(),
+                            &[index_meta],
+                            prefilter_loader,
+                        ));
 
                         let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
 

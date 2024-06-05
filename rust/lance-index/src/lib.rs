@@ -17,6 +17,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 pub mod optimize;
+pub mod prefilter;
 pub mod scalar;
 pub mod traits;
 pub mod vector;

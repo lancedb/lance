@@ -101,7 +101,7 @@ impl PQIndex {
 
     /// Filter the row id and PQ code arrays based on the pre-filter.
     fn filter_arrays(
-        pre_filter: &PreFilter,
+        pre_filter: &dyn PreFilter,
         code: Arc<UInt8Array>,
         row_ids: Arc<UInt64Array>,
         num_sub_vectors: i32,
@@ -170,7 +170,7 @@ impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     #[instrument(level = "debug", skip_all, name = "PQIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
