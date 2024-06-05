@@ -228,13 +228,14 @@ impl RowIdSequence {
 
         // Find the ending position
         let mut offset_last = offset_start + len;
-        let segment_offset_last = segment_offset;
+        let mut segment_offset_last = segment_offset;
         for segment in &self.0[segment_offset..] {
             let segment_len = segment.len();
             if offset_last <= segment_len {
                 break;
             }
             offset_last -= segment_len;
+            segment_offset_last += 1;
         }
 
         RowIdSeqSlice {
@@ -257,6 +258,7 @@ impl RowIdSequence {
     }
 }
 
+#[derive(Debug)]
 pub struct RowIdSeqSlice<'a> {
     /// Current slice of the segments we cover
     segments: &'a [U64Segment],
@@ -272,6 +274,7 @@ impl<'a> RowIdSeqSlice<'a> {
         known_size -= self.offset_start;
         known_size -= self.segments.last().unwrap().len() - self.offset_last;
 
+        let end = self.segments.len() - 1;
         self.segments
             .iter()
             .enumerate()
@@ -285,11 +288,10 @@ impl<'a> RowIdSeqSlice<'a> {
                             as Box<dyn Iterator<Item = u64>>
                     }
                     0 => Box::new(segment.iter().skip(self.offset_start)),
-                    1 => Box::new(segment.iter().take(self.offset_last)),
+                    i if i == end => Box::new(segment.iter().take(self.offset_last)),
                     _ => Box::new(segment.iter()),
                 }
             })
-            // TODO: unit test iteration and size hint
             .exact_size(known_size)
     }
 }
@@ -377,29 +379,39 @@ pub fn select_row_ids<'a>(
     sequence: &'a RowIdSequence,
     offsets: &'a ReadBatchParams,
 ) -> Result<Vec<u64>> {
+    let out_of_bounds_err = |offset: u32| {
+        Error::invalid_input(
+            format!(
+                "Index out of bounds: {} for sequence of length {}",
+                offset,
+                sequence.len()
+            ),
+            location!(),
+        )
+    };
+
     match offsets {
         ReadBatchParams::Indices(indices) => indices
             .values()
             .iter()
             .map(|index| {
-                sequence.get(*index as usize).ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "Index out of bounds: {} for sequence of length {}",
-                            index,
-                            sequence.len()
-                        ),
-                        location!(),
-                    )
-                })
+                sequence
+                    .get(*index as usize)
+                    .ok_or_else(|| out_of_bounds_err(*index))
             })
             .collect(),
         ReadBatchParams::Range(range) => {
+            if range.end > sequence.len() as usize {
+                return Err(out_of_bounds_err(range.end as u32));
+            }
             let sequence = sequence.slice(range.start, range.end - range.start);
             Ok(sequence.iter().collect())
         }
         ReadBatchParams::RangeFull => Ok(sequence.iter().collect()),
         ReadBatchParams::RangeTo(to) => {
+            if to.end > sequence.len() as usize {
+                return Err(out_of_bounds_err(to.end as u32));
+            }
             let len = to.end;
             let sequence = sequence.slice(0, len);
             Ok(sequence.iter().collect())
@@ -472,6 +484,49 @@ mod test {
     }
 
     #[test]
+    fn test_row_id_slice() {
+        // The type of sequence isn't that relevant to the implementation, so
+        // we can just have a single one with all the segment types.
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(30..35), // 5
+            U64Segment::RangeWithHoles {
+                // 8
+                range: 50..60,
+                holes: vec![53, 54].into(),
+            },
+            U64Segment::SortedArray(vec![7, 9].into()), // 2
+            U64Segment::RangeWithBitmap {
+                range: 0..5,
+                bitmap: [true, false, true, false, true].as_slice().into(),
+            },
+            U64Segment::Array(vec![35, 39].into()),
+            U64Segment::Range(40..50),
+        ]);
+
+        // All possible offsets and lengths
+        for offset in 0..sequence.len() as usize {
+            for len in 0..sequence.len() as usize {
+                if offset + len > sequence.len() as usize {
+                    continue;
+                }
+                let slice = sequence.slice(offset, len);
+
+                let actual = slice.iter().collect::<Vec<_>>();
+                let expected = sequence.iter().skip(offset).take(len).collect::<Vec<_>>();
+                assert_eq!(
+                    actual, expected,
+                    "Failed for offset {} and len {}",
+                    offset, len
+                );
+
+                let (claimed_size, claimed_max) = slice.iter().size_hint();
+                assert_eq!(claimed_max, Some(claimed_size)); // Exact size hint
+                assert_eq!(claimed_size, actual.len()); // Correct size hint
+            }
+        }
+    }
+
+    #[test]
     fn test_row_id_sequence_rechunk() {
         fn assert_rechunked(
             input: Vec<RowIdSequence>,
@@ -520,5 +575,83 @@ mod test {
         // Too many segments -> error
         let result = rechunk_sequences(many_segments.clone(), vec![5]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_row_ids() {
+        // All forms of offsets
+        let offsets = [
+            ReadBatchParams::Indices(vec![1, 3, 9, 5, 7, 6].into()),
+            ReadBatchParams::Range(2..8),
+            ReadBatchParams::RangeFull,
+            ReadBatchParams::RangeTo(..5),
+            ReadBatchParams::RangeFrom(5..),
+        ];
+
+        // Sequences with all segment types. These have at least 10 elements,
+        // so they are valid for all the above offsets.
+        let sequences = [
+            RowIdSequence(vec![
+                U64Segment::Range(0..5),
+                U64Segment::RangeWithHoles {
+                    range: 50..60,
+                    holes: vec![53, 54].into(),
+                },
+                U64Segment::SortedArray(vec![7, 9].into()),
+            ]),
+            RowIdSequence(vec![
+                U64Segment::RangeWithBitmap {
+                    range: 0..5,
+                    bitmap: [true, false, true, false, true].as_slice().into(),
+                },
+                U64Segment::Array(vec![30, 20, 10].into()),
+                U64Segment::Range(40..50),
+            ]),
+        ];
+
+        for params in offsets {
+            for sequence in &sequences {
+                let row_ids = select_row_ids(sequence, &params).unwrap();
+                let flat_sequence = sequence.iter().collect::<Vec<_>>();
+
+                // Transform params into bounded ones
+                let selection: Vec<usize> = match &params {
+                    ReadBatchParams::RangeFull => (0..flat_sequence.len()).collect(),
+                    ReadBatchParams::RangeTo(to) => (0..to.end).collect(),
+                    ReadBatchParams::RangeFrom(from) => (from.start..flat_sequence.len()).collect(),
+                    ReadBatchParams::Range(range) => range.clone().collect(),
+                    ReadBatchParams::Indices(indices) => {
+                        indices.values().iter().map(|i| *i as usize).collect()
+                    }
+                };
+
+                let expected = selection
+                    .into_iter()
+                    .map(|i| flat_sequence[i])
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    row_ids, expected,
+                    "Failed for params {:?} on the sequence {:?}",
+                    &params, sequence
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_select_row_ids_out_of_bounds() {
+        let offsets = [
+            ReadBatchParams::Indices(vec![1, 1000, 4].into()),
+            ReadBatchParams::Range(2..1000),
+            ReadBatchParams::RangeTo(..1000),
+        ];
+
+        let sequence = RowIdSequence::from(0..10);
+
+        for params in offsets {
+            let result = select_row_ids(&sequence, &params);
+            assert!(result.is_err());
+            assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
+        }
     }
 }
