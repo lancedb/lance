@@ -1334,9 +1334,8 @@ impl FragmentReader {
         projection: &Schema,
     ) -> Result<RecordBatch> {
         let first_reader = self.readers[0].0.as_legacy();
-        let batch_offset = (0..batch_id)
-            .map(|i| first_reader.num_rows_in_batch(i as i32))
-            .sum();
+        // All batches have the same size in v1, except for the last one.
+        let batch_offset = batch_id * first_reader.num_rows_in_batch(0);
         let rows_in_batch = first_reader.num_rows_in_batch(batch_id as i32);
 
         let batches = if !projection.fields.is_empty() {
@@ -1366,6 +1365,11 @@ impl FragmentReader {
             let results = try_join_all(read_tasks).await?;
             results.into_iter().flatten().collect::<Vec<RecordBatch>>()
         } else {
+            // If we are selecting no columns, we can assume we are just getting
+            // the row ids. If this is the case, we need to generate an empty
+            // batch with the correct number of rows. This simplest way I've found
+            // is to create a batch with a single column of nulls and then project
+            // that column away.
             let expected_rows = params
                 .clone()
                 .into()
@@ -1373,6 +1377,7 @@ impl FragmentReader {
                 .unwrap()
                 .to_offsets()?
                 .len();
+            // The null array doesn't require any stack allocated buffers, so it is lightweight.
             let dummy_array = Arc::new(NullArray::new(expected_rows));
             vec![RecordBatch::try_new(
                 Arc::new(ArrowSchema::new(vec![ArrowField::new(
