@@ -294,7 +294,6 @@ impl<'a> RowIdSeqSlice<'a> {
     }
 }
 
-
 /// Re-chunk a sequences of row ids into chunks of a given size.
 ///
 /// # Errors
@@ -396,10 +395,7 @@ pub fn select_row_ids<'a>(
             })
             .collect(),
         ReadBatchParams::Range(range) => {
-            let sequence = sequence.slice(
-                range.start,
-                range.end - range.start,
-            );
+            let sequence = sequence.slice(range.start, range.end - range.start);
             Ok(sequence.iter().collect())
         }
         ReadBatchParams::RangeFull => Ok(sequence.iter().collect()),
@@ -409,10 +405,7 @@ pub fn select_row_ids<'a>(
             Ok(sequence.iter().collect())
         }
         ReadBatchParams::RangeFrom(from) => {
-            let sequence = sequence.slice(
-                from.start,
-                sequence.len() as usize - from.start,
-            );
+            let sequence = sequence.slice(from.start, sequence.len() as usize - from.start);
             Ok(sequence.iter().collect())
         }
     }

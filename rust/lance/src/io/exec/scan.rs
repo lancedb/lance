@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
@@ -18,8 +18,9 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream;
 use futures::stream::Stream;
 use futures::{StreamExt, TryStreamExt};
+use lance_arrow::SchemaExt;
 use lance_core::utils::tracing::StreamTracingExt;
-use lance_core::ROW_ID_FIELD;
+use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_table::format::Fragment;
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
@@ -30,9 +31,12 @@ async fn open_file(
     file_fragment: FileFragment,
     projection: Arc<Schema>,
     with_row_id: bool,
+    with_row_address: bool,
     with_make_deletions_null: bool,
 ) -> Result<FragmentReader> {
-    let mut reader = file_fragment.open(projection.as_ref(), with_row_id).await?;
+    let mut reader = file_fragment
+        .open(projection.as_ref(), with_row_id, with_row_address)
+        .await?;
 
     if with_make_deletions_null {
         reader.with_make_deletions_null();
@@ -48,6 +52,8 @@ pub struct LanceStream {
     projection: Arc<Schema>,
 
     with_row_id: bool,
+
+    with_row_address: bool,
 }
 
 impl LanceStream {
@@ -63,6 +69,8 @@ impl LanceStream {
     ///  - ***fragment_readahead***: the number of fragments to read ahead (only
     ///    if scan_in_order = false).
     ///  - ***with_row_id***: load row ID from the datasets.
+    ///  - ***with_row_address***: load row address from the datasets.
+    ///  - ***with_make_deletions_null***: make deletions null.
     ///  - ***scan_in_order***: whether to scan the fragments in the provided order.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
@@ -73,6 +81,7 @@ impl LanceStream {
         batch_readahead: usize,
         fragment_readahead: usize,
         with_row_id: bool,
+        with_row_address: bool,
         with_make_deletions_null: bool,
         scan_in_order: bool,
     ) -> Result<Self> {
@@ -90,6 +99,7 @@ impl LanceStream {
                         file_fragment,
                         project_schema.clone(),
                         with_row_id,
+                        with_row_address,
                         with_make_deletions_null,
                     ))
                 })
@@ -116,6 +126,7 @@ impl LanceStream {
                         file_fragment,
                         project_schema.clone(),
                         with_row_id,
+                        with_row_address,
                         with_make_deletions_null,
                     ))
                 })
@@ -146,6 +157,7 @@ impl LanceStream {
             inner_stream,
             projection,
             with_row_id,
+            with_row_address,
         })
     }
 }
@@ -155,20 +167,21 @@ impl core::fmt::Debug for LanceStream {
         f.debug_struct("LanceStream")
             .field("projection", &self.projection)
             .field("with_row_id", &self.with_row_id)
+            .field("with_row_address", &self.with_row_address)
             .finish()
     }
 }
 
 impl RecordBatchStream for LanceStream {
     fn schema(&self) -> SchemaRef {
-        let schema: ArrowSchema = self.projection.as_ref().into();
+        let mut schema: ArrowSchema = self.projection.as_ref().into();
         if self.with_row_id {
-            let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
-            fields.push(Arc::new(ROW_ID_FIELD.clone()));
-            Arc::new(ArrowSchema::new(fields))
-        } else {
-            Arc::new(schema)
+            schema = schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
         }
+        if self.with_row_address {
+            schema = schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
+        }
+        Arc::new(schema)
     }
 }
 
@@ -190,6 +203,7 @@ pub struct LanceScanExec {
     batch_readahead: usize,
     fragment_readahead: usize,
     with_row_id: bool,
+    with_row_address: bool,
     with_make_deletions_null: bool,
     ordered_output: bool,
     output_schema: Arc<ArrowSchema>,
@@ -209,10 +223,11 @@ impl DisplayAs for LanceScanExec {
                     .join(", ");
                 write!(
                     f,
-                    "LanceScan: uri={}, projection=[{}], row_id={}, ordered={}",
+                    "LanceScan: uri={}, projection=[{}], row_id={}, row_addr={}, ordered={}",
                     self.dataset.data_dir(),
                     columns,
                     self.with_row_id,
+                    self.with_row_address,
                     self.ordered_output
                 )
             }
@@ -230,17 +245,22 @@ impl LanceScanExec {
         batch_readahead: usize,
         fragment_readahead: usize,
         with_row_id: bool,
+        with_row_address: bool,
         with_make_deletions_null: bool,
         ordered_ouput: bool,
     ) -> Self {
-        let output_schema: ArrowSchema = projection.as_ref().into();
-        let output_schema = if with_row_id {
-            let mut fields: Vec<Arc<Field>> = output_schema.fields.to_vec();
-            fields.push(Arc::new(ROW_ID_FIELD.clone()));
-            Arc::new(ArrowSchema::new(fields))
-        } else {
-            Arc::new(output_schema)
-        };
+        let mut output_schema: ArrowSchema = projection.as_ref().into();
+
+        if with_row_id {
+            output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
+        }
+        if with_row_address {
+            output_schema = output_schema
+                .try_with_column(ROW_ADDR_FIELD.clone())
+                .unwrap();
+        }
+        let output_schema = Arc::new(output_schema);
+
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -254,6 +274,7 @@ impl LanceScanExec {
             batch_readahead,
             fragment_readahead,
             with_row_id,
+            with_row_address,
             with_make_deletions_null,
             ordered_output: ordered_ouput,
             output_schema,
@@ -302,6 +323,7 @@ impl ExecutionPlan for LanceScanExec {
             self.batch_readahead,
             self.fragment_readahead,
             self.with_row_id,
+            self.with_row_address,
             self.with_make_deletions_null,
             self.ordered_output,
         )?))

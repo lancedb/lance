@@ -398,7 +398,8 @@ impl RecordBatchExt for RecordBatch {
             arr.fields().to_vec(),
             self.schema().metadata.clone(),
         ));
-        Self::try_new(schema, arr.columns().to_vec())
+        let batch = RecordBatch::from(arr);
+        batch.with_schema(schema)
     }
 
     fn merge(&self, other: &Self) -> Result<Self> {
@@ -455,6 +456,7 @@ impl RecordBatchExt for RecordBatch {
     }
 
     fn project_by_schema(&self, schema: &Schema) -> Result<Self> {
+        // TODO: test can project by empty schema
         let struct_array: StructArray = self.clone().into();
         self.try_new_from_struct_array(project(&struct_array, schema.fields())?)
     }
@@ -467,6 +469,12 @@ impl RecordBatchExt for RecordBatch {
 }
 
 fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
+    if fields.is_empty() {
+        return Ok(StructArray::new_empty_fields(
+            struct_array.len(),
+            struct_array.nulls().cloned(),
+        ));
+    }
     let mut columns: Vec<ArrayRef> = vec![];
     for field in fields.iter() {
         if let Some(col) = struct_array.column_by_name(field.name()) {

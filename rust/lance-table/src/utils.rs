@@ -45,4 +45,3 @@ impl<I: Iterator> Iterator for ExactSize<I> {
         (self.size, Some(self.size))
     }
 }
-

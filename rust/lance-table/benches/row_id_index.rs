@@ -16,7 +16,7 @@
 // How can I write out the file? Where should I put it?
 // How can I take a argument to set the size of the index?
 
-use std::{collections::HashMap, io::Write, ops::Range};
+use std::{collections::HashMap, io::Write, ops::Range, sync::Arc};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
@@ -41,7 +41,7 @@ fn make_frag_sequences(
     num_rows: u64,
     num_frags: u64,
     percent_deletion: f32,
-) -> Vec<(u32, RowIdSequence)> {
+) -> Vec<(u32, Arc<RowIdSequence>)> {
     let rows_per_frag = num_rows / num_frags;
     let mut start = 0;
     (0..num_frags)
@@ -51,7 +51,7 @@ fn make_frag_sequences(
                 (rows_per_frag as f32 * percent_deletion) as usize,
             );
             start += rows_per_frag;
-            (i as u32, sequence)
+            (i as u32, Arc::new(sequence))
         })
         .collect()
 }

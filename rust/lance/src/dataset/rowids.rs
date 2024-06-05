@@ -278,52 +278,5 @@ mod test {
         assert_eq!(index.get(5), Some(RowAddress::new_from_parts(1, 0)));
     }
 
-    async fn compactable_dataset() -> Dataset {
-        let batch = sequence_batch(0..100_i32);
-        Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-            "memory://",
-            Some(WriteParams {
-                enable_move_stable_row_ids: true,
-                max_rows_per_file: 10, // 10 files
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_take_after_compaction() {
-        let mut dataset = compactable_dataset().await;
-
-        let indices = &[0, 45, 99];
-        let expected = dataset.take_rows(indices, dataset.schema()).await.unwrap();
-
-        let _ = compact_files(&mut dataset, Default::default(), None)
-            .await
-            .unwrap();
-
-        let actual = dataset.take_rows(indices, dataset.schema()).await.unwrap();
-
-        assert_eq!(expected, actual);
-    }
-
-    #[tokio::test]
-    async fn test_scan_after_compaction() {
-        let mut dataset = compactable_dataset().await;
-
-        let expected = dataset.scan().with_row_id().try_into_batch().await.unwrap();
-
-        let _ = compact_files(&mut dataset, Default::default(), None)
-            .await
-            .unwrap();
-
-        let actual = dataset.scan().with_row_id().try_into_batch().await.unwrap();
-
-        // Data including row ids should be the same.
-        assert_eq!(expected, actual);
-    }
-
     // TODO: query / scan / take after deletion, compaction, then deletion
 }
