@@ -12,10 +12,8 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{
-    NullArray, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array,
-};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_array::{RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array};
+use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
