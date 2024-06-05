@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The Lance Authors
-
 //! Secondary Index pre-filter
 //!
 //! Based on the query, we might have information about which fragment ids and
@@ -30,13 +27,7 @@ use crate::error::Result;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 
-/// A trait to be implemented by anything supplying a prefilter row id mask
-///
-/// This trait is for internal use only and has no stability guarantees.
-#[async_trait]
-pub trait FilterLoader: Send + 'static {
-    async fn load(self: Box<Self>) -> Result<RowIdMask>;
-}
+pub use lance_index::prefilter::{FilterLoader, PreFilter};
 
 /// Filter out row ids that we know are not relevant to the query.
 ///
@@ -44,7 +35,7 @@ pub trait FilterLoader: Send + 'static {
 /// that should be applied to the search
 ///
 /// This struct is for internal use only and has no stability guarantees.
-pub struct PreFilter {
+pub struct DatasetPreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await
     // these tasks only when we've done as much work as we can without them.
@@ -54,7 +45,7 @@ pub struct PreFilter {
     pub(super) final_mask: Mutex<OnceCell<RowIdMask>>,
 }
 
-impl PreFilter {
+impl DatasetPreFilter {
     pub fn new(
         dataset: Arc<Dataset>,
         indices: &[Index],
@@ -77,10 +68,6 @@ impl PreFilter {
             filtered_ids,
             final_mask: Mutex::new(OnceCell::new()),
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.deleted_ids.is_none() && self.filtered_ids.is_none()
     }
 
     /// Check whether a single row id should be included in the query.
@@ -167,14 +154,17 @@ impl PreFilter {
             )
         }
     }
+}
 
+#[async_trait]
+impl PreFilter for DatasetPreFilter {
     /// Waits for the prefilter to be fully loaded
     ///
     /// The prefilter loads in the background while the rest of the index
     /// search is running.  When you are ready to use the prefilter you
     /// must first call this method to ensure it is fully loaded.  This
     /// allows `filter_row_ids` to be a synchronous method.
-    pub async fn wait_for_ready(&self) -> Result<()> {
+    async fn wait_for_ready(&self) -> Result<()> {
         if let Some(filtered_ids) = &self.filtered_ids {
             filtered_ids.wait_ready().await?;
         }
@@ -195,6 +185,10 @@ impl PreFilter {
         Ok(())
     }
 
+    fn is_empty(&self) -> bool {
+        self.deleted_ids.is_none() && self.filtered_ids.is_none()
+    }
+
     /// Check whether a slice of row ids should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
@@ -202,7 +196,7 @@ impl PreFilter {
     ///
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
-    pub fn filter_row_ids(&self, row_ids: &[u64]) -> Vec<u64> {
+    fn filter_row_ids(&self, row_ids: &[u64]) -> Vec<u64> {
         let final_mask = self.final_mask.lock().unwrap();
         final_mask
             .get()

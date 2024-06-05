@@ -38,7 +38,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch>;
+    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch>;
 
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.

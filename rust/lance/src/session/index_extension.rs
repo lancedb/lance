@@ -115,7 +115,7 @@ mod test {
 
     #[async_trait::async_trait]
     impl VectorIndex for MockIndex {
-        async fn search(&self, _: &Query, _: Arc<PreFilter>) -> Result<RecordBatch> {
+        async fn search(&self, _: &Query, _: Arc<dyn PreFilter>) -> Result<RecordBatch> {
             todo!("panic")
         }
 

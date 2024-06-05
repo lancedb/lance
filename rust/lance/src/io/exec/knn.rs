@@ -41,7 +41,7 @@ use tracing::{instrument, Instrument};
 
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
-use crate::index::prefilter::{FilterLoader, PreFilter};
+use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::ivf::IVFIndex;
 use crate::index::vector::VectorIndex;
 use crate::index::DatasetIndexInternalExt;
@@ -689,8 +689,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             }
                             PreFilterSource::None => None,
                         };
-                        let pre_filter =
-                            Arc::new(PreFilter::new(ds.clone(), &[index_meta], prefilter_loader));
+                        let pre_filter = Arc::new(DatasetPreFilter::new(
+                            ds.clone(),
+                            &[index_meta],
+                            prefilter_loader,
+                        ));
 
                         let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
 
