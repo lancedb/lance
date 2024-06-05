@@ -26,6 +26,7 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import java.util.Map;
 
 public class LanceDataSource implements TableProvider, DataSourceRegister {
+  private static final String name = "lance";
 
   @Override
   public StructType inferSchema(CaseInsensitiveStringMap options) {
@@ -46,6 +47,6 @@ public class LanceDataSource implements TableProvider, DataSourceRegister {
 
   @Override
   public String shortName() {
-    return "lance";
+    return name;
   }
 }

@@ -33,11 +33,7 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
 
   @Override
   public boolean next() throws IOException {
-    if (fragmentReader != null && fragmentReader.loadNextBatch()) {
-      if (currentBatch != null) {
-        currentBatch.close();
-      }
-      currentBatch = fragmentReader.getCurrentBatch();
+    if (loadNextBatchFromCurrentReader()) {
       return true;
     }
     while (fragmentIndex < inputPartition.getLanceSplit().getFragments().size()) {
@@ -48,13 +44,20 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
           inputPartition.getLanceSplit().getFragments().get(fragmentIndex),
           inputPartition);
       fragmentIndex++;
-      if (fragmentReader.loadNextBatch()) {
-        if (currentBatch != null) {
-          currentBatch.close();
-        }
-        currentBatch = fragmentReader.getCurrentBatch();
+      if (loadNextBatchFromCurrentReader()) {
         return true;
       }
+    }
+    return false;
+  }
+
+  private boolean loadNextBatchFromCurrentReader() throws IOException {
+    if (fragmentReader != null && fragmentReader.loadNextBatch()) {
+      if (currentBatch != null) {
+        currentBatch.close();
+      }
+      currentBatch = fragmentReader.getCurrentBatch();
+      return true;
     }
     return false;
   }
