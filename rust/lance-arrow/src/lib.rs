@@ -398,7 +398,7 @@ impl RecordBatchExt for RecordBatch {
             arr.fields().to_vec(),
             self.schema().metadata.clone(),
         ));
-        let batch = RecordBatch::from(arr);
+        let batch = Self::from(arr);
         batch.with_schema(schema)
     }
 
@@ -703,5 +703,72 @@ mod tests {
             )
             .unwrap()
         )
+    }
+
+    #[test]
+    fn test_schema_project_by_schema() {
+        let metadata = [("key".to_string(), "value".to_string())];
+        let schema = Arc::new(
+            Schema::new(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Utf8, true),
+            ])
+            .with_metadata(metadata.clone().into()),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..20).map(|i| format!("str-{}", i)),
+                )),
+            ],
+        )
+        .unwrap();
+
+        // Empty schema
+        let empty_schema = Schema::empty();
+        let empty_projected = batch.project_by_schema(&empty_schema).unwrap();
+        let expected_schema = empty_schema.with_metadata(metadata.clone().into());
+        assert_eq!(
+            empty_projected,
+            RecordBatch::from(StructArray::new_empty_fields(batch.num_rows(), None))
+                .with_schema(Arc::new(expected_schema))
+                .unwrap()
+        );
+
+        // Re-ordered schema
+        let reordered_schema = Schema::new(vec![
+            Field::new("b", DataType::Utf8, true),
+            Field::new("a", DataType::Int32, true),
+        ]);
+        let reordered_projected = batch.project_by_schema(&reordered_schema).unwrap();
+        let expected_schema = Arc::new(reordered_schema.with_metadata(metadata.clone().into()));
+        assert_eq!(
+            reordered_projected,
+            RecordBatch::try_new(
+                expected_schema,
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        (0..20).map(|i| format!("str-{}", i)),
+                    )),
+                    Arc::new(Int32Array::from_iter_values(0..20)),
+                ],
+            )
+            .unwrap()
+        );
+
+        // Sub schema
+        let sub_schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let sub_projected = batch.project_by_schema(&sub_schema).unwrap();
+        let expected_schema = Arc::new(sub_schema.with_metadata(metadata.clone().into()));
+        assert_eq!(
+            sub_projected,
+            RecordBatch::try_new(
+                expected_schema,
+                vec![Arc::new(Int32Array::from_iter_values(0..20))],
+            )
+            .unwrap()
+        );
     }
 }

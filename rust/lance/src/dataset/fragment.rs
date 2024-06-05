@@ -474,7 +474,7 @@ impl FileFragment {
         let mut reader = FragmentReader::try_new(
             self.id(),
             deletion_vec,
-            dbg!(row_id_sequence),
+            row_id_sequence,
             opened_files,
             ArrowSchema::from(projection),
             self.count_rows().await?,

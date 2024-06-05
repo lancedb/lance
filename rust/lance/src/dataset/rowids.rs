@@ -96,9 +96,7 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 mod test {
     use std::ops::Range;
 
-    use crate::dataset::{
-        builder::DatasetBuilder, optimize::compact_files, UpdateBuilder, WriteMode, WriteParams,
-    };
+    use crate::dataset::{builder::DatasetBuilder, UpdateBuilder, WriteMode, WriteParams};
 
     use super::*;
 
