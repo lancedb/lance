@@ -172,7 +172,7 @@ pub struct RowIdAndDeletesConfig {
     pub total_num_rows: u32,
 }
 
-fn apply_row_id_and_deletes(
+pub fn apply_row_id_and_deletes(
     batch: RecordBatch,
     batch_offset: u32,
     fragment_id: u32,
