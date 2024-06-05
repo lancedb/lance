@@ -495,6 +495,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(storage.len(), 400);
+        let storage =
+            ScalarQuantizationStorage::try_new(8, DistanceType::L2, -0.7..0.7, first_batch)
+                .unwrap();
 
         let (offset, chunk) = storage.chunk(0);
         assert_eq!(offset, 0);
