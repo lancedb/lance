@@ -192,7 +192,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         metadata: &Self::Metadata,
     ) -> Result<Self> {
         let schema = reader.schema();
-        let batch = reader.read_range(range, schema, None).await?;
+        let batch = reader.read_range(range, schema).await?;
 
         Self::new(
             metadata.num_bits,
