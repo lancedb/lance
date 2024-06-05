@@ -14,7 +14,7 @@ mod test {
 
     use approx::assert_relative_eq;
     use arrow::array::AsArray;
-    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use deepsize::{Context, DeepSizeOf};
@@ -93,6 +93,15 @@ mod test {
             Ok(self.ret_val.clone())
         }
 
+        async fn search_in_partition(
+            &self,
+            _partition_id: usize,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+        ) -> Result<RecordBatch> {
+            todo!("panic")
+        }
+
         fn is_loadable(&self) -> bool {
             true
         }
@@ -112,6 +121,10 @@ mod test {
             _length: usize,
         ) -> Result<Box<dyn VectorIndex>> {
             Ok(Box::new(self.clone()))
+        }
+
+        fn find_partitions(&self, _query: &Query) -> Result<UInt32Array> {
+            Ok(UInt32Array::from_iter_values(0..1))
         }
 
         fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {

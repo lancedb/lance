@@ -212,34 +212,6 @@ impl IVFIndex {
             Ok(query.clone())
         }
     }
-
-    pub(crate) async fn search_in_partition(
-        &self,
-        partition_id: usize,
-        query: &Query,
-        pre_filter: Arc<dyn PreFilter>,
-    ) -> Result<RecordBatch> {
-        let part_index = self.load_partition(partition_id, true).await?;
-
-        let query = self.preprocess_query(partition_id, query)?;
-        let batch = part_index.search(&query, pre_filter).await?;
-        Ok(batch)
-    }
-
-    /// find the IVF partitions ids given the query vector.
-    ///
-    /// Internal API with no stability guarantees.
-    ///
-    /// Assumes the query vector is normalized if the metric type is cosine.
-    pub fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
-        let mt = if self.metric_type == MetricType::Cosine {
-            MetricType::L2
-        } else {
-            self.metric_type
-        };
-
-        self.ivf.find_partitions(&query.key, query.nprobes, mt)
-    }
 }
 
 impl std::fmt::Debug for IVFIndex {
@@ -713,6 +685,19 @@ impl VectorIndex for IVFIndex {
         Ok(as_struct_array(&taken_distances).into())
     }
 
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        let part_index = self.load_partition(partition_id, true).await?;
+
+        let query = self.preprocess_query(partition_id, query)?;
+        let batch = part_index.search(&query, pre_filter).await?;
+        Ok(batch)
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
@@ -735,6 +720,21 @@ impl VectorIndex for IVFIndex {
             message: "Flat index does not support load".to_string(),
             location: location!(),
         })
+    }
+
+    /// find the IVF partitions ids given the query vector.
+    ///
+    /// Internal API with no stability guarantees.
+    ///
+    /// Assumes the query vector is normalized if the metric type is cosine.
+    fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+        let mt = if self.metric_type == MetricType::Cosine {
+            MetricType::L2
+        } else {
+            self.metric_type
+        };
+
+        self.ivf.find_partitions(&query.key, query.nprobes, mt)
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {

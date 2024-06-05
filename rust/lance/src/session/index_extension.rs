@@ -65,7 +65,7 @@ mod test {
         sync::{atomic::AtomicBool, Arc},
     };
 
-    use arrow_array::RecordBatch;
+    use arrow_array::{RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use deepsize::DeepSizeOf;
     use lance_file::writer::{FileWriter, FileWriterOptions};
@@ -119,6 +119,15 @@ mod test {
             todo!("panic")
         }
 
+        async fn search_in_partition(
+            &self,
+            _partition_id: usize,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+        ) -> Result<RecordBatch> {
+            todo!("panic")
+        }
+
         fn is_loadable(&self) -> bool {
             true
         }
@@ -137,6 +146,10 @@ mod test {
             _: usize,
             _: usize,
         ) -> Result<Box<dyn VectorIndex>> {
+            todo!("panic")
+        }
+
+        fn find_partitions(&self, _query: &Query) -> Result<UInt32Array> {
             todo!("panic")
         }
 

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::datatypes::ArrowPrimitiveType;
+use arrow_array::Float32Array;
 use arrow_array::{Array, Int64Array, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
@@ -31,6 +32,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
+use lance_arrow::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_index::vector::{Query, DIST_COL};
@@ -448,6 +450,11 @@ impl Scanner {
             DataType::FixedSizeList(dt, _) => {
                 if dt.data_type() == q.data_type() {
                     Box::new(q.clone())
+                } else if dt.data_type().is_floating() && *q.data_type() == DataType::Float32 {
+                    coerce_float_vector(
+                        q.as_any().downcast_ref::<Float32Array>().unwrap(),
+                        FloatType::try_from(dt.data_type())?,
+                    )?
                 } else {
                     return Err(Error::io(
                         format!(
@@ -1011,7 +1018,9 @@ impl Scanner {
         let schema = self.dataset.schema();
         if let Some(field) = schema.field(&q.column) {
             match field.data_type() {
-                DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
+                DataType::FixedSizeList(subfield, _)
+                    if subfield.data_type().is_floating()
+                        || *subfield.data_type() == DataType::UInt8 => {}
                 _ => {
                     return Err(Error::io(
                         format!(
@@ -1509,7 +1518,9 @@ pub mod test_dataset {
 
     use std::vec;
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+    };
     use arrow_schema::ArrowError;
     use lance_index::IndexType;
     use tempfile::{tempdir, TempDir};
@@ -1654,8 +1665,8 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
-        RecordBatchIterator, StringArray, StructArray,
+        ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Int32Array, LargeStringArray,
+        PrimitiveArray, RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_select::take;
@@ -1968,8 +1979,6 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_knn_with_prefilter(#[values(false, true)] use_experimental_writer: bool) {
-        use arrow_array::Float32Array;
-
         let mut test_ds = TestVectorDataset::new(use_experimental_writer)
             .await
             .unwrap();

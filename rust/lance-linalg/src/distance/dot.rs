@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::Error;
 use arrow_array::types::{Float16Type, Float64Type};
-use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
+use arrow_array::{cast::AsArray, types::Float32Type, Array, Float32Array};
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FloatArray};
@@ -202,23 +202,22 @@ pub fn dot_distance_batch<'a, T: Dot>(
 
 fn do_dot_distance_arrow_batch<T: ArrowFloatType>(
     from: &T::ArrayType,
-    to: &FixedSizeListArray,
+    to: &dyn Array,
 ) -> Result<Arc<Float32Array>>
 where
     T::Native: Dot,
 {
-    let dimension = to.value_length() as usize;
+    let dimension = from.len();
     debug_assert_eq!(from.len(), dimension);
 
     // TODO: if we detect there is a run of nulls, should we skip those?
     let to_values =
-        to.values()
-            .as_any()
+        to.as_any()
             .downcast_ref::<T::ArrayType>()
             .ok_or(Error::InvalidArgumentError(format!(
                 "Invalid type: expect {:?} got {:?}",
                 from.data_type(),
-                to.value_type()
+                to.data_type()
             )))?;
 
     let dists = to_values
@@ -244,13 +243,7 @@ where
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn dot_distance_arrow_batch(
-    from: &dyn Array,
-    to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>> {
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
+pub fn dot_distance_arrow_batch(from: &dyn Array, to: &dyn Array) -> Result<Arc<Float32Array>> {
     match *from.data_type() {
         DataType::Float16 => do_dot_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
         DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),

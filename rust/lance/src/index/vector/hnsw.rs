@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{Float32Array, RecordBatch, UInt32Array, UInt64Array};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
@@ -205,6 +205,15 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         )?)
     }
 
+    async fn search_in_partition(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        unimplemented!("this method is for only IVF index")
+    }
+
     fn is_loadable(&self) -> bool {
         true
     }
@@ -285,6 +294,10 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
         Box::new(self.storage.as_ref().unwrap().row_ids())
+    }
+
+    fn find_partitions(&self, _query: &Query) -> Result<UInt32Array> {
+        unimplemented!("this method is for only IVF index")
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

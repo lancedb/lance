@@ -14,7 +14,7 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, DistanceType, Dot, L2};
 use lance_linalg::kernels::argmin_value_float;
-use lance_linalg::kmeans::kmeans_find_partitions;
+use lance_linalg::kmeans::kmeans_find_partitions_float;
 use lance_linalg::{distance::MetricType, MatrixView};
 use rayon::prelude::*;
 use snafu::{location, Location};
@@ -375,8 +375,13 @@ where
                             num_sub_vectors,
                             sub_idx,
                         );
-                        let parts = kmeans_find_partitions(centroids, sub_vector, 1, distance_type)
-                            .expect("kmeans_find_partitions failed");
+                        let parts = kmeans_find_partitions_float::<T>(
+                            centroids,
+                            sub_vector,
+                            1,
+                            distance_type,
+                        )
+                        .expect("kmeans_find_partitions failed");
                         parts.values().iter().map(|v| *v as u8).collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>()

@@ -3,6 +3,13 @@
 
 //! Hamming distance.
 
+use std::sync::Arc;
+
+use arrow_array::{cast::AsArray, types::UInt8Type, Array, Float32Array};
+use arrow_schema::DataType;
+
+use crate::{Error, Result};
+
 /// Hamming distance between two vectors.
 #[inline]
 pub fn hamming(x: &[u8], y: &[u8]) -> f32 {
@@ -38,6 +45,27 @@ pub fn hamming_distance_batch<'a>(
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
     Box::new(to.chunks_exact(dimension).map(|v| hamming(from, v)))
+}
+
+pub fn hamming_distance_arrow_batch(from: &dyn Array, to: &dyn Array) -> Result<Arc<Float32Array>> {
+    let dists = match *from.data_type() {
+        DataType::UInt8 => hamming_distance_batch(
+            from.as_primitive::<UInt8Type>().values(),
+            to.as_primitive::<UInt8Type>().values(),
+            from.len(),
+        ),
+        _ => {
+            return Err(Error::InvalidArgumentError(format!(
+                "Unsupported data type: {:?}",
+                from.data_type()
+            )))
+        }
+    };
+
+    Ok(Arc::new(Float32Array::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    )))
 }
 
 /// Scalar version of hamming distance. Used for benchmarks.

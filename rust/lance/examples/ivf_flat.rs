@@ -6,12 +6,12 @@
 //! run with `cargo run --release --example hnsw`
 
 use std::collections::HashMap;
-use std::ops::{Range, RangeInclusive};
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt8Type;
-use arrow_array::types::Float32Type;
+
 use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema};
 use clap::Parser;
@@ -19,13 +19,10 @@ use futures::TryStreamExt;
 use lance::index::vector::VectorIndexParams;
 use lance::Dataset;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_index::vector::ivf::IvfBuildParams;
-use lance_index::vector::sq::builder::SQBuildParams;
+
 use lance_index::{DatasetIndexExt, IndexType};
-use lance_linalg::distance::{DistanceType, MetricType};
+use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_u8_array_with_range;
-use tempfile::tempdir;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -59,6 +56,7 @@ fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashS
     dists.into_iter().map(|(_, i)| i).collect()
 }
 
+#[allow(dead_code)]
 async fn generate_u8_test_dataset(
     test_uri: &str,
     dim: usize,
@@ -124,44 +122,44 @@ async fn main() {
         .as_primitive::<UInt8Type>()
         .clone();
 
-    // let columns: &[&str] = &[];
-    // let mut scan = dataset.scan();
-    // let plan = scan
-    //     .project(columns)
-    //     .unwrap()
-    //     .with_row_id()
-    //     .nearest(column, &q, args.k)
-    //     .unwrap()
-    //     .nprobs(args.nprobe);
-    // println!("{:?}", plan.explain_plan(true).await.unwrap());
+    let columns: &[&str] = &[];
+    let mut scan = dataset.scan();
+    let plan = scan
+        .project(columns)
+        .unwrap()
+        .with_row_id()
+        .nearest(column, &q, args.k)
+        .unwrap()
+        .nprobs(args.nprobe);
+    println!("{:?}", plan.explain_plan(true).await.unwrap());
 
-    // let now = std::time::Instant::now();
-    // plan.try_into_stream()
-    //     .await
-    //     .unwrap()
-    //     .try_collect::<Vec<_>>()
-    //     .await
-    //     .unwrap();
-    // println!(
-    //     "nprobe={}, k={}, search={:?}",
-    //     args.nprobe,
-    //     args.k,
-    //     now.elapsed(),
-    // );
+    let now = std::time::Instant::now();
+    plan.try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    println!(
+        "nprobe={}, k={}, search={:?}",
+        args.nprobe,
+        args.k,
+        now.elapsed(),
+    );
 
-    // let now = std::time::Instant::now();
-    // for _ in 0..10 {
-    //     plan.try_into_stream()
-    //         .await
-    //         .unwrap()
-    //         .try_collect::<Vec<_>>()
-    //         .await
-    //         .unwrap();
-    // }
-    // println!(
-    //     "warm up: nprobe={}, k={}, search={:?}",
-    //     args.nprobe,
-    //     args.k,
-    //     now.elapsed().div_f32(10.0),
-    // );
+    let now = std::time::Instant::now();
+    for _ in 0..10 {
+        plan.try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+    }
+    println!(
+        "warm up: nprobe={}, k={}, search={:?}",
+        args.nprobe,
+        args.k,
+        now.elapsed().div_f32(10.0),
+    );
 }
