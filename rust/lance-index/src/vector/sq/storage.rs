@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    ops::{Bound::Included, Range},
-    sync::Arc,
-};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_array::{
     cast::AsArray,
@@ -158,8 +154,8 @@ pub struct ScalarQuantizationStorage {
     distance_type: DistanceType,
 
     /// Chunks of storage
-    /// A ordered map of `<start_id, chunk>`
-    chunks: BTreeMap<u32, SQStorageChunk>,
+    offsets: Vec<u32>,
+    chunks: Vec<SQStorageChunk>,
 }
 
 impl DeepSizeOf for ScalarQuantizationStorage {
@@ -171,6 +167,8 @@ impl DeepSizeOf for ScalarQuantizationStorage {
     }
 }
 
+const SQ_CHUNK_CAPACITY: usize = 1024;
+
 impl ScalarQuantizationStorage {
     pub fn try_new(
         num_bits: u16,
@@ -178,19 +176,20 @@ impl ScalarQuantizationStorage {
         bounds: Range<f64>,
         batches: impl IntoIterator<Item = RecordBatch>,
     ) -> Result<Self> {
-        let mut total = 0_u32;
-        let mut chunks = BTreeMap::<u32, SQStorageChunk>::new();
+        let mut chunks = Vec::with_capacity(SQ_CHUNK_CAPACITY);
+        let mut offsets = Vec::with_capacity(SQ_CHUNK_CAPACITY + 1);
+        offsets.push(0);
         for batch in batches.into_iter() {
-            let size = batch.num_rows();
+            offsets.push(offsets.last().unwrap() + batch.num_rows() as u32);
             let chunk = SQStorageChunk::new(batch)?;
-            chunks.insert(total, chunk);
-            total += size as u32;
+            chunks.push(chunk);
         }
-        let quantizer = ScalarQuantizer::with_bounds(num_bits, chunks[&0].dim(), bounds);
+        let quantizer = ScalarQuantizer::with_bounds(num_bits, chunks[0].dim(), bounds);
 
         Ok(Self {
             quantizer,
             distance_type,
+            offsets,
             chunks,
         })
     }
@@ -203,11 +202,11 @@ impl ScalarQuantizationStorage {
     /// We did not check out of range in this call. But the out of range will
     /// panic once you access the data in the last [SQStorageChunk].
     #[inline]
-    fn chunk(&self, id: u32) -> (&u32, &SQStorageChunk) {
-        self.chunks
-            .range((Included(&0), Included(&id)))
-            .next_back()
-            .unwrap()
+    fn chunk(&self, id: u32) -> (u32, &SQStorageChunk) {
+        match self.offsets.binary_search(&id) {
+            Ok(o) => (self.offsets[o], &self.chunks[o]),
+            Err(o) => (self.offsets[o - 1], &self.chunks[o - 1]),
+        }
     }
 
     pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
@@ -290,21 +289,20 @@ impl VectorStore for ScalarQuantizationStorage {
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         let metadata = ScalarQuantizationMetadata {
-            dim: self.chunks.first_key_value().map(|(_, c)| c.dim()).unwrap(),
+            dim: self.chunks[0].dim(),
             num_bits: self.quantizer.num_bits,
             bounds: self.quantizer.bounds.clone(),
         };
         let metadata_json = serde_json::to_string(&metadata)?;
         let metadata = HashMap::from_iter(vec![("metadata".to_owned(), metadata_json)]);
 
-        let schema = self
-            .chunks
-            .first_key_value()
-            .map(|(_, c)| c.schema().as_ref().clone())
-            .unwrap()
+        let schema = self.chunks[0]
+            .schema()
+            .as_ref()
+            .clone()
             .with_metadata(metadata);
         let schema = Arc::new(schema);
-        Ok(self.chunks.values().map(move |chunk| {
+        Ok(self.chunks.iter().map(move |chunk| {
             chunk
                 .batch
                 .clone()
@@ -327,16 +325,14 @@ impl VectorStore for ScalarQuantizationStorage {
         let mut storage = self.clone();
         let offset = self.len() as u32;
         let new_chunk = SQStorageChunk::new(new_batch)?;
-        storage.chunks.insert(offset, new_chunk);
+        storage.offsets.push(offset + new_chunk.len() as u32);
+        storage.chunks.push(new_chunk);
 
         Ok(storage)
     }
 
     fn schema(&self) -> &SchemaRef {
-        self.chunks
-            .first_key_value()
-            .map(|(_, c)| c.schema())
-            .unwrap()
+        self.chunks[0].schema()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -344,10 +340,7 @@ impl VectorStore for ScalarQuantizationStorage {
     }
 
     fn len(&self) -> usize {
-        self.chunks
-            .last_key_value()
-            .map(|(&offset, batch)| offset as usize + batch.len())
-            .unwrap_or_default()
+        *self.offsets.last().unwrap() as usize
     }
 
     /// Return the [DistanceType] of the vectors.
@@ -361,7 +354,7 @@ impl VectorStore for ScalarQuantizationStorage {
     }
 
     fn row_ids(&self) -> impl Iterator<Item = &u64> {
-        self.chunks.values().flat_map(|c| c.row_ids.values())
+        self.chunks.iter().flat_map(|c| c.row_ids.values())
     }
 
     /// Create a [DistCalculator] to compute the distance between the query.
@@ -439,9 +432,9 @@ impl<'a> DistCalculator for SQDistCalculator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::iter::repeat_with;
-
     use super::*;
+
+    use std::iter::repeat_with;
 
     use arrow_array::FixedSizeListArray;
     use arrow_schema::{DataType, Field, Schema};
@@ -476,24 +469,22 @@ mod tests {
     fn test_get_chunks() {
         const DIM: usize = 64;
 
-        let first_batch = create_record_batch(0..100);
-
         let storage = ScalarQuantizationStorage::try_new(
             8,
             DistanceType::L2,
             -0.7..0.7,
-            [first_batch].into_iter(),
+            (0..4).map(|start| create_record_batch(start * 100..(start + 1) * 100)),
         )
         .unwrap();
 
-        assert_eq!(storage.len(), 100);
+        assert_eq!(storage.len(), 400);
 
         let (offset, chunk) = storage.chunk(0);
-        assert_eq!(*offset, 0);
+        assert_eq!(offset, 0);
         assert_eq!(chunk.row_id(20), 20);
 
         let (offset, _) = storage.chunk(50);
-        assert_eq!(*offset, 0);
+        assert_eq!(offset, 0);
 
         let row_ids = UInt64Array::from_iter_values(100..250);
         let vector_data = generate_random_array(row_ids.len() * DIM);
@@ -515,9 +506,13 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(fsl)]).unwrap();
         let storage = storage.append_batch(second_batch, "vector").unwrap();
 
-        assert_eq!(storage.len(), 250);
+        assert_eq!(storage.len(), 550);
         let (offset, chunk) = storage.chunk(112);
-        assert_eq!(*offset, 100);
+        assert_eq!(offset, 100);
         assert_eq!(chunk.row_id(10), 110);
+
+        let (offset, chunk) = storage.chunk(432);
+        assert_eq!(offset, 400);
+        assert_eq!(chunk.row_id(5), 105);
     }
 }
