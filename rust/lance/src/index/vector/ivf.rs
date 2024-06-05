@@ -46,7 +46,7 @@ use lance_index::{
         },
         pq::{PQBuildParams, ProductQuantizer},
         sq::{builder::SQBuildParams, ScalarQuantizer},
-        Query, DIST_COL,
+        Query, VectorIndex, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -81,7 +81,6 @@ use super::{
     hnsw::HNSWIndex,
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
-    VectorIndex,
 };
 use crate::{dataset::builder::DatasetBuilder, index::vector::sq::build_sq_model};
 use crate::{
