@@ -139,7 +139,7 @@ impl SQStorageChunk {
     /// Get a slice of SQ code for id
     #[inline]
     fn sq_code_slice(&self, id: u32) -> &[u8] {
-        assert!(id < self.len() as u32);
+        // assert!(id < self.len() as u32);
         &self.sq_codes.values()[id as usize * self.dim..(id + 1) as usize * self.dim]
     }
 }
@@ -204,7 +204,6 @@ impl ScalarQuantizationStorage {
     ///
     /// We did not check out of range in this call. But the out of range will
     /// panic once you access the data in the last [SQStorageChunk].
-    #[inline]
     fn chunk(&self, id: u32) -> (u32, &SQStorageChunk) {
         match self.offsets.binary_search(&id) {
             Ok(o) => (self.offsets[o], &self.chunks[o]),
@@ -437,7 +436,7 @@ impl<'a> DistCalculator for SQDistCalculator<'a> {
 
             unsafe {
                 // Loop over the sq_code to prefetch each cache line
-                for offset in (0..self.dim).step_by(CACHE_LINE_SIZE) {
+                for offset in (0..dim).step_by(CACHE_LINE_SIZE) {
                     {
                         use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
                         _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
