@@ -73,15 +73,6 @@ impl DatasetPreFilter {
         }
     }
 
-    /// Check whether a single row id should be included in the query.
-    pub fn check_one(&self, row_id: u64) -> bool {
-        let final_mask = self.final_mask.lock().unwrap();
-        final_mask
-            .get()
-            .expect("check_one called before wait_ready")
-            .selected(row_id)
-    }
-
     #[instrument(level = "debug", skip_all)]
     async fn do_create_deletion_mask(
         dataset: Arc<Dataset>,
