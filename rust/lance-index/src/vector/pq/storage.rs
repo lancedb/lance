@@ -501,8 +501,7 @@ impl VectorStore for ProductQuantizationStorage {
         Ok([self.batch.clone().with_schema(schema.into())?].into_iter())
     }
 
-    fn append_record_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
-        // TODO: use chunked storage
+    fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
         let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
         let mut storage = self.clone();
         storage.batch = new_batch;

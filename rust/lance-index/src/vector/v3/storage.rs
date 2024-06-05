@@ -66,7 +66,7 @@ pub trait VectorStore: Send + Sync + Sized {
 
     /// Append Raw [RecordBatch] into the Storage.
     /// The storage implement will perform quantization if necessary.
-    fn append_record_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
+    fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///

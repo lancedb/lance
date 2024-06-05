@@ -7,11 +7,11 @@ use std::{
     sync::Arc,
 };
 
-use arrow::{
-    array::AsArray,
-    datatypes::{Float32Type, UInt64Type, UInt8Type},
+use arrow_array::{
+    cast::AsArray,
+    types::{Float32Type, UInt64Type, UInt8Type},
+    ArrayRef, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_array::{ArrayRef, RecordBatch, UInt64Array, UInt8Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
@@ -27,6 +27,7 @@ use snafu::{location, Location};
 use crate::{
     vector::{
         quantizer::{QuantizerMetadata, QuantizerStorage},
+        transform::Transformer,
         v3::storage::{DistCalculator, VectorStore},
         SQ_CODE_COLUMN,
     },
@@ -305,12 +306,23 @@ impl VectorStore for ScalarQuantizationStorage {
         }))
     }
 
-    fn append_record_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+    fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self> {
         // TODO: use chunked storage
-        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let transformer = super::transform::SQTransformer::new(
+            self.quantizer.clone(),
+            vector_column.to_string(),
+            SQ_CODE_COLUMN.to_string(),
+        );
+
+        let new_batch = transformer.transform(&batch)?;
+
+        // self.quantizer.transform(data)
         let mut storage = self.clone();
-        storage.batch = new_batch;
-        Ok(self)
+        let offset = self.len() as u32;
+        let new_chunk = SQStorageChunk::new(new_batch)?;
+        storage.chunks.insert(offset, new_chunk);
+
+        Ok(storage)
     }
 
     fn schema(&self) -> &SchemaRef {
