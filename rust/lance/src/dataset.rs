@@ -63,7 +63,10 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
-use lance_table::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
+use lance_table::feature_flags::{
+    apply_feature_flags, can_read_dataset, can_write_dataset, should_use_legacy_format,
+    FLAG_USE_V2_FORMAT,
+};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -411,7 +414,6 @@ impl Dataset {
                 ..params
             };
         }
-        let params = params; // discard mut
 
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
@@ -440,8 +442,11 @@ impl Dataset {
                         ..Default::default()
                     },
                 )?;
+                params.use_legacy_format = should_use_legacy_format(m.writer_feature_flags);
             }
         }
+
+        let params = params; // discard mut
 
         if let Some(d) = dataset.as_ref() {
             if !can_write_dataset(d.manifest.writer_feature_flags) {
@@ -481,6 +486,7 @@ impl Dataset {
 
         let manifest_config = ManifestWriteConfig {
             use_move_stable_row_ids: params.enable_move_stable_row_ids,
+            use_legacy_format: Some(params.use_legacy_format),
             ..Default::default()
         };
         let manifest = if let Some(dataset) = &dataset {
@@ -1220,9 +1226,10 @@ impl Dataset {
 
 #[derive(Debug)]
 pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,  // default true
-    timestamp: Option<SystemTime>, // default None
-    use_move_stable_row_ids: bool, // default false
+    auto_set_feature_flags: bool,    // default true
+    timestamp: Option<SystemTime>,   // default None
+    use_move_stable_row_ids: bool,   // default false
+    use_legacy_format: Option<bool>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -1231,6 +1238,7 @@ impl Default for ManifestWriteConfig {
             auto_set_feature_flags: true,
             timestamp: None,
             use_move_stable_row_ids: false,
+            use_legacy_format: None,
         }
     }
 }
@@ -1244,8 +1252,20 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<Index>>,
     config: &ManifestWriteConfig,
 ) -> std::result::Result<(), CommitError> {
+    let was_using_legacy = should_use_legacy_format(manifest.writer_feature_flags);
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest)?;
+    }
+    // For now, we don't auto-detect use_v2_format.  Instead, if the user
+    // asks for it, we set it.  Otherwise we use what was there before.
+    if let Some(use_legacy_format) = config.use_legacy_format {
+        if !use_legacy_format {
+            manifest.writer_feature_flags |= FLAG_USE_V2_FORMAT;
+        }
+    } else if was_using_legacy {
+        manifest.writer_feature_flags &= !FLAG_USE_V2_FORMAT;
+    } else {
+        manifest.writer_feature_flags |= FLAG_USE_V2_FORMAT;
     }
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -1633,6 +1653,8 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_write_manifest(#[values(false, true)] use_legacy_format: bool) {
+        use lance_table::feature_flags::FLAG_UNKNOWN;
+
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1670,7 +1692,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(manifest.writer_feature_flags, 0);
+        if !use_legacy_format {
+            assert_eq!(manifest.writer_feature_flags, FLAG_USE_V2_FORMAT);
+        }
         assert_eq!(manifest.reader_feature_flags, 0);
 
         // Create one with deletions
@@ -1698,8 +1722,8 @@ mod tests {
         );
 
         // Write with custom manifest
-        manifest.writer_feature_flags = 5; // Set another flag
-        manifest.reader_feature_flags = 5;
+        manifest.writer_feature_flags |= FLAG_UNKNOWN; // Set another flag
+        manifest.reader_feature_flags |= FLAG_UNKNOWN;
         manifest.version += 1;
         write_manifest_file(
             dataset.object_store(),
@@ -1711,6 +1735,7 @@ mod tests {
                 auto_set_feature_flags: false,
                 timestamp: None,
                 use_move_stable_row_ids: false,
+                use_legacy_format: None,
             },
         )
         .await

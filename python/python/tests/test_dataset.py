@@ -1734,3 +1734,55 @@ def test_v2_dataset(tmp_path: Path):
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
     assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+
+    # Append will write v2 if dataset was originally created with v2
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=True, mode="append"
+    )
+
+    assert len(dataset.get_fragments()) == 2
+
+    fragment = list(dataset.get_fragments())[1]
+    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=True, mode="overwrite"
+    )
+    fragment = list(dataset.get_fragments())[0]
+    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+
+    # Append will write v1 if dataset was originally created with v1
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=False, mode="append"
+    )
+
+    fragment = list(dataset.get_fragments())[1]
+    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+
+    # Writing an empty table with v2 will put dataset in "v2 mode"
+    dataset = lance.write_dataset(
+        [], tmp_path, schema=table.schema, use_legacy_format=False, mode="overwrite"
+    )
+
+    assert len(dataset.get_fragments()) == 0
+
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=True, mode="append"
+    )
+
+    fragment = list(dataset.get_fragments())[0]
+    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+
+    # Writing an empty table with v1 will put dataset in "v1 mode"
+    dataset = lance.write_dataset(
+        [], tmp_path, schema=table.schema, use_legacy_format=True, mode="overwrite"
+    )
+
+    assert len(dataset.get_fragments()) == 0
+
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=False, mode="append"
+    )
+
+    fragment = list(dataset.get_fragments())[0]
+    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
