@@ -68,7 +68,23 @@ fn bench_storge(c: &mut Criterion) {
     c.bench_function("ScalarQuantizationStorage,chunks=1x1M", |b| {
         let batch = create_sq_batch(0..10240, 128);
         let storage =
-            ScalarQuantizationStorage::try_new(8, DistanceType::L2, -1.0..1.0, batch).unwrap();
+            ScalarQuantizationStorage::try_new(8, DistanceType::L2, -1.0..1.0, [batch]).unwrap();
+        let total = storage.len();
+        b.iter(|| {
+            let a = rng.gen_range(0..total as u32);
+            let b = rng.gen_range(0..total as u32);
+            storage.distance_between(a, b)
+        });
+    });
+
+    c.bench_function("ScalarQuantizationStorage,chunks=1024x1M", |b| {
+        let storage = ScalarQuantizationStorage::try_new(
+            8,
+            DistanceType::L2,
+            -1.0..1.0,
+            repeat_with(|| create_sq_batch(0..10240, 128)).take(1024),
+        )
+        .unwrap();
         let total = storage.len();
         b.iter(|| {
             let a = rng.gen_range(0..total as u32);

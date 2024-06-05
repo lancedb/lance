@@ -176,15 +176,22 @@ impl ScalarQuantizationStorage {
         num_bits: u16,
         distance_type: DistanceType,
         bounds: Range<f64>,
-        batch: RecordBatch,
+        batches: impl IntoIterator<Item = RecordBatch>,
     ) -> Result<Self> {
-        let chunk = SQStorageChunk::new(batch)?;
+        let mut total = 0_u32;
+        let mut chunks = BTreeMap::<u32, SQStorageChunk>::new();
+        for batch in batches.into_iter() {
+            let size = batch.num_rows();
+            let chunk = SQStorageChunk::new(batch)?;
+            chunks.insert(total, chunk);
+            total += size as u32;
+        }
+        let quantizer = ScalarQuantizer::with_bounds(num_bits, chunks[&0].dim(), bounds);
 
-        let quantizer = ScalarQuantizer::with_bounds(num_bits, chunk.dim(), bounds);
         Ok(Self {
             quantizer,
             distance_type,
-            chunks: [(0, chunk)].into_iter().collect(),
+            chunks,
         })
     }
 
@@ -253,7 +260,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
             metadata.num_bits,
             distance_type,
             metadata.bounds.clone(),
-            batch,
+            [batch].into_iter(),
         )
     }
 }
@@ -278,7 +285,7 @@ impl VectorStore for ScalarQuantizationStorage {
             })?;
         let metadata: ScalarQuantizationMetadata = serde_json::from_str(metadata_json)?;
 
-        Self::try_new(metadata.num_bits, distance_type, metadata.bounds, batch)
+        Self::try_new(metadata.num_bits, distance_type, metadata.bounds, [batch])
     }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
@@ -471,8 +478,13 @@ mod tests {
 
         let first_batch = create_record_batch(0..100);
 
-        let storage =
-            ScalarQuantizationStorage::try_new(8, DistanceType::L2, -0.7..0.7, first_batch).unwrap();
+        let storage = ScalarQuantizationStorage::try_new(
+            8,
+            DistanceType::L2,
+            -0.7..0.7,
+            [first_batch].into_iter(),
+        )
+        .unwrap();
 
         assert_eq!(storage.len(), 100);
 
