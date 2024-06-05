@@ -25,9 +25,15 @@ mod serde;
 use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
+use lance_core::{Error, Result};
+use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
+use snafu::{location, Location};
+
 use segment::U64Segment;
+
+use crate::utils::LanceIteratorExtension;
 
 /// A sequence of row ids.
 ///
@@ -41,7 +47,7 @@ use segment::U64Segment;
 /// contiguous or sorted.
 ///
 /// We can make optimizations that assume uniqueness.
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq, Eq)]
 pub struct RowIdSequence(Vec<U64Segment>);
 
 impl std::fmt::Display for RowIdSequence {
@@ -148,7 +154,7 @@ impl RowIdSequence {
 
     /// Find the row ids in the sequence.
     ///
-    /// Returns the row ids sorted by their appearane in the sequence.
+    /// Returns the row ids sorted by their appearance in the sequence.
     /// Also returns the segment index and the range where that segment's
     /// row id matches are found in the returned row id vector.
     fn find_ids(
@@ -205,6 +211,210 @@ impl RowIdSequence {
             .collect();
 
         (row_ids, segment_ranges)
+    }
+
+    pub fn slice(&self, offset: usize, len: usize) -> RowIdSeqSlice<'_> {
+        // Find the starting position
+        let mut offset_start = offset;
+        let mut segment_offset = 0;
+        for segment in &self.0 {
+            let segment_len = segment.len();
+            if offset_start < segment_len {
+                break;
+            }
+            offset_start -= segment_len;
+            segment_offset += 1;
+        }
+
+        // Find the ending position
+        let mut offset_last = offset_start + len;
+        let segment_offset_last = segment_offset;
+        for segment in &self.0[segment_offset..] {
+            let segment_len = segment.len();
+            if offset_last <= segment_len {
+                break;
+            }
+            offset_last -= segment_len;
+        }
+
+        RowIdSeqSlice {
+            segments: &self.0[segment_offset..=segment_offset_last],
+            offset_start,
+            offset_last,
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<u64> {
+        let mut offset = 0;
+        for segment in &self.0 {
+            let segment_len = segment.len();
+            if index < offset + segment_len {
+                return segment.get(index - offset);
+            }
+            offset += segment_len;
+        }
+        None
+    }
+}
+
+pub struct RowIdSeqSlice<'a> {
+    /// Current slice of the segments we cover
+    segments: &'a [U64Segment],
+    /// Offset into the first segment to start iterating from
+    offset_start: usize,
+    /// Offset into the last segment to stop iterating at
+    offset_last: usize,
+}
+
+impl<'a> RowIdSeqSlice<'a> {
+    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        let mut known_size = self.segments.iter().map(|segment| segment.len()).sum();
+        known_size -= self.offset_start;
+        known_size -= self.segments.last().unwrap().len() - self.offset_last;
+
+        self.segments
+            .iter()
+            .enumerate()
+            .flat_map(move |(i, segment)| {
+                match i {
+                    0 if self.segments.len() == 1 => {
+                        let len = self.offset_last - self.offset_start;
+                        // TODO: Optimize this so we don't have to use skip
+                        // (take is probably fine though.)
+                        Box::new(segment.iter().skip(self.offset_start).take(len))
+                            as Box<dyn Iterator<Item = u64>>
+                    }
+                    0 => Box::new(segment.iter().skip(self.offset_start)),
+                    1 => Box::new(segment.iter().take(self.offset_last)),
+                    _ => Box::new(segment.iter()),
+                }
+            })
+            // TODO: unit test iteration and size hint
+            .exact_size(known_size)
+    }
+}
+
+
+/// Re-chunk a sequences of row ids into chunks of a given size.
+///
+/// # Errors
+///
+/// Will return an error if the sum of the chunk sizes is not equal to the total
+/// number of row ids in the sequences.
+pub fn rechunk_sequences(
+    sequences: impl IntoIterator<Item = RowIdSequence>,
+    chunk_sizes: impl IntoIterator<Item = u64>,
+) -> Result<Vec<RowIdSequence>> {
+    // TODO: return an iterator. (with a good size hint?)
+    let chunk_size_iter = chunk_sizes.into_iter();
+    let mut chunked_sequences = Vec::with_capacity(chunk_size_iter.size_hint().0);
+    let mut segment_iter = sequences
+        .into_iter()
+        .flat_map(|sequence| sequence.0.into_iter())
+        .peekable();
+
+    let mut segment_offset = 0_u64;
+    for chunk_size in chunk_size_iter {
+        let mut sequence = RowIdSequence(Vec::new());
+        let mut remaining = chunk_size;
+
+        let too_many_segments_error = || {
+            Error::invalid_input(
+                "Got too many segments for the provided chunk lengths",
+                location!(),
+            )
+        };
+
+        while remaining > 0 {
+            let remaining_in_segment = segment_iter
+                .peek()
+                .map_or(0, |segment| segment.len() as u64 - segment_offset);
+            use std::cmp::Ordering::*;
+            match (remaining_in_segment.cmp(&remaining), remaining_in_segment) {
+                (Greater, _) => {
+                    // Can only push part of the segment, we are done with this chunk.
+                    let segment = segment_iter
+                        .peek()
+                        .ok_or_else(too_many_segments_error)?
+                        .slice(segment_offset as usize, remaining as usize);
+                    sequence.extend(RowIdSequence(vec![segment]));
+                    segment_offset += remaining;
+                    remaining = 0;
+                }
+                (_, 0) => {
+                    // Can push the entire segment.
+                    let segment = segment_iter.next().ok_or_else(too_many_segments_error)?;
+                    sequence.extend(RowIdSequence(vec![segment]));
+                    remaining = 0;
+                }
+                (_, _) => {
+                    // Push remaining segment
+                    let segment = segment_iter
+                        .next()
+                        .ok_or_else(too_many_segments_error)?
+                        .slice(segment_offset as usize, remaining_in_segment as usize);
+                    sequence.extend(RowIdSequence(vec![segment]));
+                    segment_offset = 0;
+                    remaining -= remaining_in_segment;
+                }
+            }
+        }
+
+        chunked_sequences.push(sequence);
+    }
+
+    if segment_iter.peek().is_some() {
+        return Err(Error::invalid_input(
+            "Got too few segments for the provided chunk lengths",
+            location!(),
+        ));
+    }
+
+    Ok(chunked_sequences)
+}
+
+/// Selects the row ids from a sequence based on the provided offsets.
+pub fn select_row_ids<'a>(
+    sequence: &'a RowIdSequence,
+    offsets: &'a ReadBatchParams,
+) -> Result<Vec<u64>> {
+    match offsets {
+        ReadBatchParams::Indices(indices) => indices
+            .values()
+            .iter()
+            .map(|index| {
+                sequence.get(*index as usize).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "Index out of bounds: {} for sequence of length {}",
+                            index,
+                            sequence.len()
+                        ),
+                        location!(),
+                    )
+                })
+            })
+            .collect(),
+        ReadBatchParams::Range(range) => {
+            let sequence = sequence.slice(
+                range.start,
+                range.end - range.start,
+            );
+            Ok(sequence.iter().collect())
+        }
+        ReadBatchParams::RangeFull => Ok(sequence.iter().collect()),
+        ReadBatchParams::RangeTo(to) => {
+            let len = to.end;
+            let sequence = sequence.slice(0, len);
+            Ok(sequence.iter().collect())
+        }
+        ReadBatchParams::RangeFrom(from) => {
+            let sequence = sequence.slice(
+                from.start,
+                sequence.len() as usize - from.start,
+            );
+            Ok(sequence.iter().collect())
+        }
     }
 }
 
@@ -266,5 +476,56 @@ mod test {
         let mut sequence = RowIdSequence::from(0..10);
         sequence.delete(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert_eq!(sequence.0, vec![U64Segment::Range(0..0)]);
+    }
+
+    #[test]
+    fn test_row_id_sequence_rechunk() {
+        fn assert_rechunked(
+            input: Vec<RowIdSequence>,
+            chunk_sizes: Vec<u64>,
+            expected: Vec<RowIdSequence>,
+        ) {
+            let chunked = rechunk_sequences(input, chunk_sizes).unwrap();
+            assert_eq!(chunked, expected);
+        }
+
+        // Small pieces to larger ones
+        let many_segments = vec![
+            RowIdSequence(vec![U64Segment::Range(0..5), U64Segment::Range(35..40)]),
+            RowIdSequence::from(10..18),
+            RowIdSequence::from(18..28),
+            RowIdSequence::from(28..30),
+        ];
+        let fewer_segments = vec![
+            RowIdSequence(vec![U64Segment::Range(0..5), U64Segment::Range(35..40)]),
+            RowIdSequence::from(10..30),
+        ];
+        assert_rechunked(
+            many_segments.clone(),
+            fewer_segments.iter().map(|seq| seq.len()).collect(),
+            fewer_segments.clone(),
+        );
+
+        // Large pieces to smaller ones
+        assert_rechunked(
+            fewer_segments.clone(),
+            many_segments.iter().map(|seq| seq.len()).collect(),
+            many_segments.clone(),
+        );
+
+        // Equal pieces
+        assert_rechunked(
+            many_segments.clone(),
+            many_segments.iter().map(|seq| seq.len()).collect(),
+            many_segments.clone(),
+        );
+
+        // Too few segments -> error
+        let result = rechunk_sequences(many_segments.clone(), vec![100]);
+        assert!(result.is_err());
+
+        // Too many segments -> error
+        let result = rechunk_sequences(many_segments.clone(), vec![5]);
+        assert!(result.is_err());
     }
 }

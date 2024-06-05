@@ -3,14 +3,69 @@
 
 use super::Dataset;
 use crate::{Error, Result};
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use snafu::{location, Location};
 use std::sync::Arc;
 
 use lance_table::{
-    format::RowIdMeta,
-    rowids::{read_row_ids, RowIdIndex},
+    format::{Fragment, RowIdMeta},
+    rowids::{read_row_ids, RowIdIndex, RowIdSequence},
 };
+
+/// Load a row id sequence from the given dataset and fragment.
+pub async fn load_row_id_sequence(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<Arc<RowIdSequence>> {
+    // Virtual path to prevent collisions in the cache.
+    let path = dataset.base.child(fragment.id.to_string()).child("row_ids");
+    match &fragment.row_id_meta {
+        None => Err(Error::Internal {
+            message: "Missing row id meta".into(),
+            location: location!(),
+        }),
+        Some(RowIdMeta::Inline(data)) => {
+            dataset
+                .session
+                .file_metadata_cache
+                .get_or_insert(&path, |_path| async { read_row_ids(data) })
+                .await
+        }
+        Some(RowIdMeta::External(file_slice)) => {
+            dataset
+                .session
+                .file_metadata_cache
+                .get_or_insert(&path, |_path| async {
+                    let path = dataset.base.child(file_slice.path.as_str());
+                    let range = file_slice.offset as usize
+                        ..(file_slice.offset as usize + file_slice.size as usize);
+                    let data = dataset
+                        .object_store
+                        .open(&path)
+                        .await?
+                        .get_range(range)
+                        .await?;
+                    read_row_ids(&data)
+                })
+                .await
+        }
+    }
+}
+
+/// Load row id sequences from the given dataset and fragments.
+///
+/// Returned as a vector of (fragment_id, sequence) pairs. These are not
+/// guaranteed to be in the same order as the input fragments.
+pub fn load_row_id_sequences<'a>(
+    dataset: &'a Dataset,
+    fragments: &'a [Fragment],
+) -> impl Stream<Item = Result<(u32, Arc<RowIdSequence>)>> + 'a {
+    futures::stream::iter(fragments)
+        .map(|fragment| {
+            load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
+        })
+        .buffer_unordered(num_cpus::get())
+}
 
 // TODO: remove allow unused once we start using this in query and take paths.
 #[allow(unused)]
@@ -28,58 +83,9 @@ pub async fn get_row_id_index(dataset: &Dataset) -> Result<Arc<lance_table::rowi
 }
 
 async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::RowIdIndex> {
-    let mut num_external = 0;
-    for fragment in dataset.manifest.fragments.iter() {
-        match fragment.row_id_meta {
-            Some(RowIdMeta::External(_)) => num_external += 1,
-            None => {
-                return Err(Error::Internal {
-                    message: "Missing row id meta".into(),
-                    location: location!(),
-                })
-            }
-            _ => {}
-        }
-    }
-
-    let mut external_files = Vec::with_capacity(num_external);
-    let mut inline_files = Vec::with_capacity(dataset.manifest.fragments.len() - num_external);
-    for fragment in dataset.manifest.fragments.iter() {
-        match &fragment.row_id_meta {
-            Some(RowIdMeta::External(file_slice)) => {
-                external_files.push((fragment.id as u32, file_slice))
-            }
-            Some(RowIdMeta::Inline(row_ids)) => inline_files.push((fragment.id as u32, row_ids)),
-            _ => {}
-        }
-    }
-
-    let mut sequences = Vec::with_capacity(dataset.manifest.fragments.len());
-    futures::stream::iter(external_files)
-        .map(|(id, file_slice)| async move {
-            let path = dataset.base.child(file_slice.path.as_str());
-            let range =
-                file_slice.offset as usize..(file_slice.offset as usize + file_slice.size as usize);
-            let data = dataset
-                .object_store
-                .open(&path)
-                .await?
-                .get_range(range)
-                .await?;
-            let sequence = read_row_ids(&data)?;
-            Ok::<_, Error>((id, sequence))
-        })
-        .buffer_unordered(num_cpus::get())
-        .try_for_each(|(id, sequence)| {
-            sequences.push((id, sequence));
-            futures::future::ready(Ok(()))
-        })
+    let sequences = load_row_id_sequences(dataset, &dataset.manifest.fragments)
+        .try_collect::<Vec<_>>()
         .await?;
-
-    for (id, row_ids) in inline_files {
-        let sequence = read_row_ids(row_ids)?;
-        sequences.push((id, sequence));
-    }
 
     let index = RowIdIndex::new(&sequences)?;
 
@@ -88,21 +94,35 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 
 #[cfg(test)]
 mod test {
-    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
+    use std::ops::Range;
+
+    use crate::dataset::{
+        builder::DatasetBuilder, optimize::compact_files, UpdateBuilder, WriteMode, WriteParams,
+    };
 
     use super::*;
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::Future;
     use lance_core::utils::address::RowAddress;
 
-    #[tokio::test]
-    async fn test_empty_dataset_rowids() {
+    fn sequence_batch(values: Range<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             DataType::Int32,
             false,
         )]));
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(values))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_empty_dataset_rowids() {
+        let schema = sequence_batch(0..0).schema();
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
@@ -120,18 +140,9 @@ mod test {
 
     #[tokio::test]
     async fn test_new_row_ids() {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
         let num_rows = 25u64;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )
-        .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let batch = sequence_batch(0..num_rows as i32);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
             max_rows_per_file: 10,
@@ -160,19 +171,10 @@ mod test {
     #[tokio::test]
     async fn test_row_ids_overwrite() {
         // Validate we don't re-use after overwriting
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
         let num_rows = 10u64;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )
-        .unwrap();
+        let batch = sequence_batch(0..num_rows as i32);
 
-        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
             ..Default::default()
@@ -185,7 +187,7 @@ mod test {
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
 
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             mode: WriteMode::Overwrite,
             ..Default::default()
@@ -203,21 +205,50 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_row_ids_append() {
+        // Validate we handle row ids well when appending concurrently.
+        fn write_batch<'a>(uri: &'a str, start: &mut i32) -> impl Future<Output = Result<()>> + 'a {
+            let batch = sequence_batch(*start..(*start + 10));
+            *start += 10;
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let write_params = WriteParams {
+                enable_move_stable_row_ids: true,
+                mode: WriteMode::Append,
+                ..Default::default()
+            };
+            async move {
+                let _ = Dataset::write(reader, uri, Some(write_params)).await?;
+                Ok(())
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = temp_dir.path().to_str().unwrap();
+        let mut start = 0;
+        // Just do one first to create the dataset.
+        write_batch(tmp_path, &mut start).await.unwrap();
+        // Now do the rest concurrently.
+        let futures = (0..5)
+            .map(|_| write_batch(tmp_path, &mut start))
+            .collect::<Vec<_>>();
+        futures::future::try_join_all(futures).await.unwrap();
+
+        let dataset = DatasetBuilder::from_uri(tmp_path).load().await.unwrap();
+
+        assert_eq!(dataset.manifest().next_row_id, 60);
+
+        let index = get_row_id_index(&dataset).await.unwrap();
+        assert!(index.get(0).is_some());
+        assert!(index.get(60).is_none());
+    }
+
+    #[tokio::test]
     async fn test_row_ids_update() {
         // Updated fragments get fresh row ids.
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
         let num_rows = 5u64;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )
-        .unwrap();
+        let batch = sequence_batch(0..num_rows as i32);
 
-        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
             ..Default::default()
@@ -247,7 +278,52 @@ mod test {
         assert_eq!(index.get(5), Some(RowAddress::new_from_parts(1, 0)));
     }
 
-    // TODO: compaction does the right thing
+    async fn compactable_dataset() -> Dataset {
+        let batch = sequence_batch(0..100_i32);
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                enable_move_stable_row_ids: true,
+                max_rows_per_file: 10, // 10 files
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
 
-    // TODO: test scan with row id produces correct values.
+    #[tokio::test]
+    async fn test_take_after_compaction() {
+        let mut dataset = compactable_dataset().await;
+
+        let indices = &[0, 45, 99];
+        let expected = dataset.take_rows(indices, dataset.schema()).await.unwrap();
+
+        let _ = compact_files(&mut dataset, Default::default(), None)
+            .await
+            .unwrap();
+
+        let actual = dataset.take_rows(indices, dataset.schema()).await.unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_scan_after_compaction() {
+        let mut dataset = compactable_dataset().await;
+
+        let expected = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+
+        let _ = compact_files(&mut dataset, Default::default(), None)
+            .await
+            .unwrap();
+
+        let actual = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+
+        // Data including row ids should be the same.
+        assert_eq!(expected, actual);
+    }
+
+    // TODO: query / scan / take after deletion, compaction, then deletion
 }

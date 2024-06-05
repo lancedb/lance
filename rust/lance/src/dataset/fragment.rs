@@ -20,8 +20,8 @@ use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::ROW_ID_FIELD;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_encoding::decoder::DecoderMiddlewareChain;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
@@ -31,6 +31,7 @@ use lance_io::scheduler::ScanScheduler;
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
+use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
     wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
     RowIdAndDeletesConfig,
@@ -40,6 +41,7 @@ use snafu::{location, Location};
 use self::write::FragmentCreateBuilder;
 
 use super::hash_joiner::HashJoiner;
+use super::rowids::load_row_id_sequence;
 use super::scanner::Scanner;
 use super::updater::Updater;
 use super::WriteParams;
@@ -1167,6 +1169,9 @@ pub struct FragmentReader {
     /// True if we should generate a row id for the output
     with_row_id: bool,
 
+    /// True if we should generate a row address column in output
+    with_row_addr: bool,
+
     /// If true, deleted rows will be set to null, which is fast
     /// If false, deleted rows will be removed from the batch, requiring a copy
     make_deletions_null: bool,
@@ -1436,6 +1441,7 @@ impl FragmentReader {
                 params: file_params,
                 deletion_vector: self.deletion_vec.clone(),
                 with_row_id: self.with_row_id,
+                with_row_addr: self.with_row_addr,
                 make_deletions_null: self.make_deletions_null,
                 total_num_rows: first_reader.len() as u32,
             },
