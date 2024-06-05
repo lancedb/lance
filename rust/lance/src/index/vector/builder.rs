@@ -103,14 +103,10 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         // step 3. build sub index
         let mut partition_sizes = Vec::with_capacity(self.ivf_params.num_partitions);
         for &partition in &partition_build_order {
-            let partition_data = reader
-                .read_partition(partition)
-                .await?
-                .ok_or(Error::io(
-                    format!("partition {} is empty", partition).as_str(),
-                    location!(),
-                ))?
-                .peekable();
+            let partition_data = reader.read_partition(partition).await?.ok_or(Error::io(
+                format!("partition {} is empty", partition).as_str(),
+                location!(),
+            ))?;
             let batches = partition_data.try_collect::<Vec<_>>().await?;
             let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
 
@@ -253,7 +249,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
                     FileReader::try_open(scheduler.open_file(&storage_part_path).await?, None)
                         .await?;
                 let batches = reader
-                    .read_stream(ReadBatchParams::RangeFull, storage_size as u32, 1)?
+                    .read_stream(ReadBatchParams::RangeFull, u32::MAX, 1)?
                     .try_collect::<Vec<_>>()
                     .await?;
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
@@ -277,8 +273,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
                     FileReader::try_open(scheduler.open_file(&index_part_path).await?, None)
                         .await?;
                 let batches = reader
-                    .read_stream(ReadBatchParams::RangeFull, storage_size as u32, 1)?
-                    .peekable()
+                    .read_stream(ReadBatchParams::RangeFull, u32::MAX, 1)?
                     .try_collect::<Vec<_>>()
                     .await?;
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
