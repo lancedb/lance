@@ -172,7 +172,7 @@ impl DeepSizeOf for ScalarQuantizationStorage {
 }
 
 impl ScalarQuantizationStorage {
-    pub fn new(
+    pub fn try_new(
         num_bits: u16,
         distance_type: DistanceType,
         bounds: Range<f64>,
@@ -249,7 +249,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         let schema = reader.schema();
         let batch = reader.read_range(range, schema).await?;
 
-        Self::new(
+        Self::try_new(
             metadata.num_bits,
             distance_type,
             metadata.bounds.clone(),
@@ -278,7 +278,7 @@ impl VectorStore for ScalarQuantizationStorage {
             })?;
         let metadata: ScalarQuantizationMetadata = serde_json::from_str(metadata_json)?;
 
-        Self::new(metadata.num_bits, distance_type, metadata.bounds, batch)
+        Self::try_new(metadata.num_bits, distance_type, metadata.bounds, batch)
     }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
@@ -472,7 +472,7 @@ mod tests {
         let first_batch = create_record_batch(0..100);
 
         let storage =
-            ScalarQuantizationStorage::new(8, DistanceType::L2, -0.7..0.7, first_batch).unwrap();
+            ScalarQuantizationStorage::try_new(8, DistanceType::L2, -0.7..0.7, first_batch).unwrap();
 
         assert_eq!(storage.len(), 100);
 
