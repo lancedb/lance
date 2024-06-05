@@ -463,7 +463,7 @@ mod tests {
         const DIM: usize = 64;
 
         let mut rng = rand::thread_rng();
-        let row_ids = UInt64Array::from_iter_values(row_ids.clone().into_iter());
+        let row_ids = UInt64Array::from_iter_values(row_ids.clone());
         let sq_code =
             UInt8Array::from_iter_values(repeat_with(|| rng.gen::<u8>()).take(row_ids.len() * DIM));
         let code_arr = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();
