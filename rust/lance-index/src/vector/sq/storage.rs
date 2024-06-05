@@ -432,21 +432,24 @@ impl<'a> DistCalculator for SQDistCalculator<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::iter::repeat_with;
+
     use super::*;
 
     use arrow_array::FixedSizeListArray;
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_testing::datagen::generate_random_array;
     use rand::prelude::*;
 
-    #[test]
-    fn test_get_chunks() {
+    fn create_record_batch(row_ids: Range<u64>) -> RecordBatch {
         const DIM: usize = 64;
 
         let mut rng = rand::thread_rng();
-        let row_ids = UInt64Array::from_iter_values(0..100);
-        let sq_code = UInt8Array::from_iter_values((0..100 * DIM).map(|_| rng.gen::<u8>()));
-        let fsl = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();
+        let row_ids = UInt64Array::from_iter_values(row_ids.clone().into_iter());
+        let sq_code =
+            UInt8Array::from_iter_values(repeat_with(|| rng.gen::<u8>()).take(row_ids.len() * DIM));
+        let code_arr = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
@@ -459,10 +462,17 @@ mod tests {
                 false,
             ),
         ]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(fsl)]).unwrap();
+        RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(code_arr)]).unwrap()
+    }
+
+    #[test]
+    fn test_get_chunks() {
+        const DIM: usize = 64;
+
+        let first_batch = create_record_batch(0..100);
 
         let storage =
-            ScalarQuantizationStorage::new(8, DistanceType::L2, -0.7..0.7, batch).unwrap();
+            ScalarQuantizationStorage::new(8, DistanceType::L2, -0.7..0.7, first_batch).unwrap();
 
         assert_eq!(storage.len(), 100);
 
@@ -472,5 +482,30 @@ mod tests {
 
         let (offset, _) = storage.chunk(50);
         assert_eq!(*offset, 0);
+
+        let row_ids = UInt64Array::from_iter_values(100..250);
+        let vector_data = generate_random_array(row_ids.len() * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(vector_data, DIM as i32).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+
+        let second_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(fsl)]).unwrap();
+        let storage = storage.append_batch(second_batch, "vector").unwrap();
+
+        assert_eq!(storage.len(), 250);
+        let (offset, chunk) = storage.chunk(112);
+        assert_eq!(*offset, 100);
+        assert_eq!(chunk.row_id(10), 110);
     }
 }

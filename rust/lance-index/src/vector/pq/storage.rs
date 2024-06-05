@@ -7,7 +7,6 @@
 
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
-use arrow::compute::concat_batches;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
@@ -501,11 +500,8 @@ impl VectorStore for ProductQuantizationStorage {
         Ok([self.batch.clone().with_schema(schema.into())?].into_iter())
     }
 
-    fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
-        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
-        let mut storage = self.clone();
-        storage.batch = new_batch;
-        Ok(storage)
+    fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+        unimplemented!()
     }
 
     fn schema(&self) -> &SchemaRef {
