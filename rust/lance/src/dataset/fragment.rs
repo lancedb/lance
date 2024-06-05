@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{NullArray, RecordBatch, RecordBatchReader, UInt32Array, UInt64Array};
+use arrow_array::{
+    NullArray, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
@@ -1367,9 +1369,7 @@ impl FragmentReader {
         } else {
             // If we are selecting no columns, we can assume we are just getting
             // the row ids. If this is the case, we need to generate an empty
-            // batch with the correct number of rows. This simplest way I've found
-            // is to create a batch with a single column of nulls and then project
-            // that column away.
+            // batch with the correct number of rows.
             let expected_rows = params
                 .clone()
                 .into()
@@ -1377,19 +1377,10 @@ impl FragmentReader {
                 .unwrap()
                 .to_offsets()?
                 .len();
-            // The null array doesn't require any stack allocated buffers, so it is lightweight.
-            let dummy_array = Arc::new(NullArray::new(expected_rows));
-            vec![RecordBatch::try_new(
-                Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                    "dummy",
-                    DataType::Null,
-                    false,
-                )])),
-                vec![dummy_array],
-            )
-            .unwrap()
-            .project(&[])
-            .unwrap()]
+            vec![RecordBatch::from(StructArray::new_empty_fields(
+                expected_rows,
+                None,
+            ))]
         };
 
         let params = params.into();
