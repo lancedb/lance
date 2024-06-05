@@ -3,6 +3,7 @@
 
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
+use arrow::compute::concat_batches;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
@@ -130,11 +131,13 @@ impl SQStorageChunk {
         self.batch.schema_ref()
     }
 
+    #[inline]
     fn row_id(&self, id: u32) -> u64 {
         self.row_ids.value(id as usize)
     }
 
     /// Get a slice of SQ code for id
+    #[inline]
     fn sq_code_slice(&self, id: u32) -> &[u8] {
         assert!(id < self.len() as u32);
         &self.sq_codes.values()[id as usize * self.dim..(id + 1) as usize * self.dim]
@@ -233,6 +236,21 @@ impl ScalarQuantizationStorage {
 
         Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata).await
     }
+
+    fn optimize(self) -> Result<Self> {
+        if self.len() <= SQ_CHUNK_CAPACITY {
+            Ok(self)
+        } else {
+            let mut new = self.clone();
+            let batch = concat_batches(
+                self.chunks[0].schema(),
+                self.chunks.iter().map(|c| &c.batch),
+            )?;
+            new.offsets = vec![0, batch.num_rows() as u32];
+            new.chunks = vec![SQStorageChunk::new(batch)?];
+            Ok(new)
+        }
+    }
 }
 
 #[async_trait]
@@ -328,7 +346,7 @@ impl VectorStore for ScalarQuantizationStorage {
         storage.offsets.push(offset + new_chunk.len() as u32);
         storage.chunks.push(new_chunk);
 
-        Ok(storage)
+        storage.optimize()
     }
 
     fn schema(&self) -> &SchemaRef {

@@ -65,33 +65,26 @@ fn create_sq_batch(row_id_range: Range<u64>, dim: usize) -> RecordBatch {
 fn bench_storge(c: &mut Criterion) {
     let mut rng = rand::thread_rng();
 
-    c.bench_function("ScalarQuantizationStorage,chunks=1x10K", |b| {
-        let batch = create_sq_batch(0..10240, 128);
-        let storage =
-            ScalarQuantizationStorage::try_new(8, DistanceType::L2, -1.0..1.0, [batch]).unwrap();
-        let total = storage.len();
-        b.iter(|| {
-            let a = rng.gen_range(0..total as u32);
-            let b = rng.gen_range(0..total as u32);
-            storage.distance_between(a, b)
-        });
-    });
-
-    c.bench_function("ScalarQuantizationStorage,chunks=1024x10K", |b| {
-        let storage = ScalarQuantizationStorage::try_new(
-            8,
-            DistanceType::L2,
-            -1.0..1.0,
-            repeat_with(|| create_sq_batch(0..10240, 128)).take(1024),
-        )
-        .unwrap();
-        let total = storage.len();
-        b.iter(|| {
-            let a = rng.gen_range(0..total as u32);
-            let b = rng.gen_range(0..total as u32);
-            storage.distance_between(a, b)
-        });
-    });
+    for num_chunks in [1, 32, 128, 1024] {
+        c.bench_function(
+            format!("ScalarQuantizationStorage,chunks={}x10K", num_chunks).as_str(),
+            |b| {
+                let storage = ScalarQuantizationStorage::try_new(
+                    8,
+                    DistanceType::L2,
+                    -1.0..1.0,
+                    repeat_with(|| create_sq_batch(0..10240, 512)).take(num_chunks),
+                )
+                .unwrap();
+                let total = storage.len();
+                b.iter(|| {
+                    let a = rng.gen_range(0..total as u32);
+                    let b = rng.gen_range(0..total as u32);
+                    storage.distance_between(a, b)
+                });
+            },
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
