@@ -114,7 +114,7 @@ moka = "0.11"
 num-traits = "0.2"
 num_cpus = "1.0"
 object_store = { version = "0.9.0" }
-parquet = "49.0"
+parquet = "51.0"
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
