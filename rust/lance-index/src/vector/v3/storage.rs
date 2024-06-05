@@ -7,7 +7,7 @@ use arrow::compute::concat_batches;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use deepsize::DeepSizeOf;
-use futures::prelude::stream::{StreamExt, TryStreamExt};
+use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use lance_file::v2::reader::FileReader;
@@ -129,7 +129,6 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        // self.reader.deep_size_of_children(context)
         self.quantizer.deep_size_of_children(context)
             + self.metadata.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
@@ -204,7 +203,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let batches = self
             .reader
             .read_stream(ReadBatchParams::Range(range), 4096, 16)?
-            .peekable()
             .try_collect::<Vec<_>>()
             .await?;
         let schema = Arc::new(self.reader.schema().as_ref().into());

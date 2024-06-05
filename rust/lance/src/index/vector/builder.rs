@@ -243,7 +243,6 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         // maintain the IVF partitions
         let mut storage_ivf = IvfData::empty();
         let mut index_ivf = IvfData::with_centroids(Arc::new(centroids));
-        // let mut partitions_metadata = Vec::with_capacity(self.ivf_params.num_partitions);
         let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), 64);
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
             if storage_size == 0 {
@@ -255,7 +254,6 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
                         .await?;
                 let batches = reader
                     .read_stream(ReadBatchParams::RangeFull, storage_size as u32, 1)?
-                    .peekable()
                     .try_collect::<Vec<_>>()
                     .await?;
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
