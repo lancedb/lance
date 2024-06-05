@@ -35,19 +35,19 @@ use crate::Dataset;
 pub struct TestDatasetGenerator {
     seed: Option<u64>,
     data: Vec<RecordBatch>,
-    use_experimental_writer: bool,
+    use_legacy_format: bool,
 }
 
 impl TestDatasetGenerator {
     /// Create a new dataset generator with the given data.
     ///
     /// Each batch will become a separate fragment in the dataset.
-    pub fn new(data: Vec<RecordBatch>, use_experimental_writer: bool) -> Self {
+    pub fn new(data: Vec<RecordBatch>, use_legacy_format: bool) -> Self {
         assert!(!data.is_empty());
         Self {
             data,
             seed: None,
-            use_experimental_writer,
+            use_legacy_format,
         }
     }
 
@@ -195,7 +195,7 @@ impl TestDatasetGenerator {
             let sub_frag = FragmentCreateBuilder::new(uri)
                 .schema(&file_schema)
                 .write_params(&WriteParams {
-                    use_experimental_writer: self.use_experimental_writer,
+                    use_legacy_format: self.use_legacy_format,
                     ..Default::default()
                 })
                 .write(reader, None)
@@ -231,6 +231,7 @@ impl TestDatasetGenerator {
             id: 0,
             files,
             deletion_file: None,
+            row_id_meta: None,
             physical_rows: Some(batch.num_rows()),
         }
     }
@@ -402,7 +403,7 @@ mod tests {
 
     #[rstest]
     #[test]
-    fn test_make_schema(#[values(false, true)] use_experimental_writer: bool) {
+    fn test_make_schema(#[values(false, true)] use_legacy_format: bool) {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new(
@@ -420,7 +421,7 @@ mod tests {
         ]));
         let data = vec![RecordBatch::new_empty(arrow_schema.clone())];
 
-        let generator = TestDatasetGenerator::new(data, use_experimental_writer);
+        let generator = TestDatasetGenerator::new(data, use_legacy_format);
         let schema = generator.make_schema(&mut rand::thread_rng());
 
         let roundtripped_schema = ArrowSchema::from(&schema);
@@ -444,7 +445,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_make_fragment(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_make_fragment(#[values(false, true)] use_legacy_format: bool) {
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let struct_fields: ArrowFields = vec![
@@ -474,7 +475,7 @@ mod tests {
         )
         .unwrap();
 
-        let generator = TestDatasetGenerator::new(vec![data.clone()], use_experimental_writer);
+        let generator = TestDatasetGenerator::new(vec![data.clone()], use_legacy_format);
         let mut rng = rand::thread_rng();
         for _ in 1..50 {
             let schema = generator.make_schema(&mut rng);
@@ -506,7 +507,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_make_hostile(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_make_hostile(#[values(false, true)] use_legacy_format: bool) {
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -536,7 +537,7 @@ mod tests {
         ];
 
         let seed = 42;
-        let generator = TestDatasetGenerator::new(data.clone(), use_experimental_writer).seed(seed);
+        let generator = TestDatasetGenerator::new(data.clone(), use_legacy_format).seed(seed);
 
         let path = tmp_dir.path().join("ds1");
         let dataset = generator.make_hostile(path.to_str().unwrap()).await;
@@ -558,7 +559,7 @@ mod tests {
                 .map(|rb| rb.project(&projection).unwrap())
                 .collect::<Vec<RecordBatch>>();
 
-            let generator = TestDatasetGenerator::new(data.clone(), use_experimental_writer);
+            let generator = TestDatasetGenerator::new(data.clone(), use_legacy_format);
             // Sample a few
             for i in 1..20 {
                 let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));

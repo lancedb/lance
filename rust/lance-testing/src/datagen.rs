@@ -146,7 +146,7 @@ impl BatchGenerator {
         self
     }
 
-    pub fn batch(&mut self, num_rows: i32) -> impl RecordBatchReader {
+    fn gen_batch(&mut self, num_rows: u32) -> RecordBatch {
         let mut fields = Vec::with_capacity(self.generators.len());
         let mut arrays = Vec::with_capacity(self.generators.len());
         for (field_index, gen) in self.generators.iter_mut().enumerate() {
@@ -157,8 +157,21 @@ impl BatchGenerator {
             arrays.push(arr);
         }
         let schema = Arc::new(ArrowSchema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
-        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone())
+        RecordBatch::try_new(schema.clone(), arrays).unwrap()
+    }
+
+    pub fn batch(&mut self, num_rows: i32) -> impl RecordBatchReader {
+        let batch = self.gen_batch(num_rows as u32);
+        let schema = batch.schema();
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema)
+    }
+
+    pub fn batches(&mut self, num_batches: u32, rows_per_batch: u32) -> impl RecordBatchReader {
+        let batches = (0..num_batches)
+            .map(|_| self.gen_batch(rows_per_batch))
+            .collect::<Vec<_>>();
+        let schema = batches[0].schema();
+        RecordBatchIterator::new(batches.into_iter().map(Ok), schema)
     }
 }
 

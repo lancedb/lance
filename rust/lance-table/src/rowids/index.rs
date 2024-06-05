@@ -3,6 +3,7 @@
 
 use std::ops::RangeInclusive;
 
+use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
@@ -54,6 +55,20 @@ impl RowIdIndex {
         let pos = row_id_segment.position(row_id)?;
         let address = address_segment.get(pos)?;
         Some(RowAddress::new_from_id(address))
+    }
+}
+
+impl DeepSizeOf for RowIdIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.0
+            .iter()
+            .map(|(_, (row_id_segment, address_segment))| {
+                (2 * std::mem::size_of::<u64>())
+                    + std::mem::size_of::<(U64Segment, U64Segment)>()
+                    + row_id_segment.deep_size_of_children(context)
+                    + address_segment.deep_size_of_children(context)
+            })
+            .sum()
     }
 }
 

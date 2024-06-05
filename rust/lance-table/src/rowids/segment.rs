@@ -3,6 +3,8 @@
 
 use std::ops::{Range, RangeInclusive};
 
+use deepsize::DeepSizeOf;
+
 use super::{bitmap::Bitmap, encoded_array::EncodedU64Array};
 
 /// Different ways to represent a sequence of distinct u64s.
@@ -59,6 +61,18 @@ pub enum U64Segment {
     SortedArray(EncodedU64Array),
     /// An array of row ids, that is not sorted.
     Array(EncodedU64Array),
+}
+
+impl DeepSizeOf for U64Segment {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        match self {
+            Self::Range(_) => 0,
+            Self::RangeWithHoles { holes, .. } => holes.deep_size_of_children(context),
+            Self::RangeWithBitmap { bitmap, .. } => bitmap.deep_size_of_children(context),
+            Self::SortedArray(array) => array.deep_size_of_children(context),
+            Self::Array(array) => array.deep_size_of_children(context),
+        }
+    }
 }
 
 /// Statistics about a segment of u64s.

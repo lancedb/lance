@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, ops::Range, sync::Arc};
 
 use arrow_array::{
     new_null_array,
@@ -28,89 +28,177 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo,
-        PhysicalPageDecoder, PhysicalPageScheduler, SchedulerContext,
+        DecodeArrayTask, FieldScheduler, LogicalPageDecoder, NextDecodeTask, PageInfo,
+        PageScheduler, PhysicalPageDecoder, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{ArrayEncodingStrategy, EncodeTask, EncodedPage, FieldEncoder},
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
 
-/// A page scheduler for primitive fields
+#[derive(Debug)]
+struct PrimitivePage {
+    scheduler: Box<dyn PageScheduler>,
+    num_rows: u32,
+}
+
+/// A field scheduler for primitive fields
 ///
-/// This maps to exactly one physical page and it assumes that the top-level
-/// encoding of the page is "basic".  The basic encoding decodes into an
+/// This maps to exactly one column and it assumes that the top-level
+/// encoding of each page is "basic".  The basic encoding decodes into an
 /// optional buffer of validity and a fixed-width buffer of values
 /// which is exactly what we need to create a primitive array.
 ///
 /// Note: we consider booleans and fixed-size-lists of primitive types to be
 /// primitive types.  This is slightly different than arrow-rs's definition
 #[derive(Debug)]
-pub struct PrimitivePageScheduler {
+pub struct PrimitiveFieldScheduler {
     data_type: DataType,
-    physical_decoder: Box<dyn PhysicalPageScheduler>,
-    num_rows: u32,
+    page_schedulers: Vec<PrimitivePage>,
+    num_rows: u64,
 }
 
-impl PrimitivePageScheduler {
-    pub fn new(data_type: DataType, page: Arc<PageInfo>, buffers: ColumnBuffers) -> Self {
-        let page_buffers = PageBuffers {
-            column_buffers: buffers,
-            positions_and_sizes: &page.buffer_offsets_and_sizes,
-        };
+impl PrimitiveFieldScheduler {
+    pub fn new(data_type: DataType, pages: Arc<[PageInfo]>, buffers: ColumnBuffers) -> Self {
+        let page_schedulers = pages
+            .iter()
+            .map(|page| {
+                let page_buffers = PageBuffers {
+                    column_buffers: buffers,
+                    positions_and_sizes: &page.buffer_offsets_and_sizes,
+                };
+                let scheduler = decoder_from_array_encoding(&page.encoding, &page_buffers);
+                PrimitivePage {
+                    scheduler,
+                    num_rows: page.num_rows,
+                }
+            })
+            .collect::<Vec<_>>();
+        let num_rows = page_schedulers.iter().map(|p| p.num_rows as u64).sum();
         Self {
             data_type,
-            physical_decoder: decoder_from_array_encoding(&page.encoding, &page_buffers),
-            num_rows: page.num_rows,
+            page_schedulers,
+            num_rows,
         }
     }
 }
 
-impl LogicalPageScheduler for PrimitivePageScheduler {
-    fn num_rows(&self) -> u32 {
-        self.num_rows
-    }
+#[derive(Debug)]
+struct PrimitiveFieldSchedulingJob<'a> {
+    scheduler: &'a PrimitiveFieldScheduler,
+    ranges: Vec<Range<u64>>,
+    page_idx: usize,
+    range_idx: usize,
+    range_offset: u64,
+    global_row_offset: u64,
+}
 
-    fn schedule_ranges(
-        &self,
-        ranges: &[std::ops::Range<u32>],
+impl<'a> PrimitiveFieldSchedulingJob<'a> {
+    pub fn new(scheduler: &'a PrimitiveFieldScheduler, ranges: Vec<Range<u64>>) -> Self {
+        Self {
+            scheduler,
+            ranges,
+            page_idx: 0,
+            range_idx: 0,
+            range_offset: 0,
+            global_row_offset: 0,
+        }
+    }
+}
+
+impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
+    fn schedule_next(
+        &mut self,
         context: &mut SchedulerContext,
         top_level_row: u64,
-    ) -> Result<()> {
-        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
+    ) -> Result<ScheduledScanLine> {
+        debug_assert!(self.range_idx < self.ranges.len());
+        // Get our current range
+        let mut range = self.ranges[self.range_idx].clone();
+        range.start += self.range_offset;
+
+        let mut cur_page = &self.scheduler.page_schedulers[self.page_idx];
+        trace!(
+            "Current range is {:?} and current page has {} rows",
+            range,
+            cur_page.num_rows
+        );
+        // Skip entire pages until we have some overlap with our next range
+        while cur_page.num_rows as u64 + self.global_row_offset <= range.start {
+            self.global_row_offset += cur_page.num_rows as u64;
+            self.page_idx += 1;
+            trace!("Skipping entire page of {} rows", cur_page.num_rows);
+            cur_page = &self.scheduler.page_schedulers[self.page_idx];
+        }
+
+        // Now the cur_page has overlap with range.  Continue looping through ranges
+        // until we find a range that exceeds the current page
+
+        let mut ranges_in_page = Vec::new();
+        while cur_page.num_rows as u64 + self.global_row_offset > range.start {
+            range.start = range.start.max(self.global_row_offset);
+            let start_in_page = range.start - self.global_row_offset;
+            let end_in_page = start_in_page + (range.end - range.start);
+            let end_in_page = end_in_page.min(cur_page.num_rows as u64) as u32;
+            let last_in_range = (end_in_page as u64 + self.global_row_offset) >= range.end;
+
+            ranges_in_page.push(start_in_page as u32..end_in_page);
+            if last_in_range {
+                self.range_idx += 1;
+                if self.range_idx == self.ranges.len() {
+                    break;
+                }
+                range = self.ranges[self.range_idx].clone();
+            } else {
+                break;
+            }
+        }
+
+        let num_rows_in_next = ranges_in_page.iter().map(|r| r.end - r.start).sum();
+        trace!(
+            "Scheduling {} rows across {} ranges from page with {} rows",
+            num_rows_in_next,
+            ranges_in_page.len(),
+            cur_page.num_rows
+        );
+
+        self.global_row_offset += cur_page.num_rows as u64;
+        self.page_idx += 1;
+
         let physical_decoder =
-            self.physical_decoder
-                .schedule_ranges(ranges, context.io(), top_level_row);
+            cur_page
+                .scheduler
+                .schedule_ranges(&ranges_in_page, context.io(), top_level_row);
 
         let logical_decoder = PrimitiveFieldDecoder {
-            data_type: self.data_type.clone(),
+            data_type: self.scheduler.data_type.clone(),
             unloaded_physical_decoder: Some(physical_decoder),
             physical_decoder: None,
             rows_drained: 0,
-            num_rows,
+            num_rows: num_rows_in_next,
         };
 
-        context.emit(Box::new(logical_decoder));
-        Ok(())
+        let decoder = Box::new(logical_decoder);
+        let decoder_ready = context.locate_decoder(decoder);
+        Ok(ScheduledScanLine {
+            decoders: vec![decoder_ready],
+            rows_scheduled: num_rows_in_next,
+        })
+    }
+}
+
+impl FieldScheduler for PrimitiveFieldScheduler {
+    fn num_rows(&self) -> u64 {
+        self.num_rows
     }
 
-    fn schedule_take(
-        &self,
-        indices: &[u32],
-        context: &mut SchedulerContext,
-        top_level_row: u64,
-    ) -> Result<()> {
-        trace!(
-            "Scheduling take of {} indices from physical page",
-            indices.len()
-        );
-        self.schedule_ranges(
-            &indices
-                .iter()
-                .map(|&idx| idx..(idx + 1))
-                .collect::<Vec<_>>(),
-            context,
-            top_level_row,
-        )
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Box<dyn SchedulingJob + 'a>> {
+        Ok(Box::new(PrimitiveFieldSchedulingJob::new(
+            self,
+            ranges.to_vec(),
+        )))
     }
 }
 
