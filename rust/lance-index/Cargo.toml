@@ -78,3 +78,7 @@ harness = false
 [[bench]]
 name = "hnsw"
 harness = false
+
+[[bench]]
+name = "sq"
+harness = false

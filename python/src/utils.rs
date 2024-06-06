@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use arrow::compute::concat;
+use arrow::compute::{concat, concat_batches};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{
     cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array, UInt64Array,
@@ -28,8 +28,10 @@ use lance::{
 };
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
-use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::{
+    hnsw::{builder::HnswBuildParams, HNSW},
+    v3::storage::VectorStore,
+};
 use lance_linalg::kmeans::compute_partitions;
 use lance_linalg::{
     distance::DistanceType,
@@ -237,5 +239,11 @@ pub fn build_sq_storage(
         lance_index::vector::sq::ScalarQuantizer::with_bounds(8, dim, lower_bound..upper_bound);
     let storage = sq::build_sq_storage(DistanceType::L2, row_ids, vectors, quantizer)
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
-    storage.batch().clone().to_pyarrow(py)
+    let batches = storage
+        .to_batches()
+        .map_err(|e| PyIOError::new_err(e.to_string()))?
+        .collect::<Vec<_>>();
+    let batch = concat_batches(&batches[0].schema(), &batches)
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    batch.to_pyarrow(py)
 }

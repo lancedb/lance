@@ -9,10 +9,11 @@ use crate::vector::quantizer::QuantizerStorage;
 use crate::vector::utils::prefetch_arrow_array;
 use crate::vector::v3::storage::{DistCalculator, VectorStore};
 use arrow::array::AsArray;
+use arrow::compute::concat_batches;
 use arrow::datatypes::UInt64Type;
 use arrow_array::{types::Float32Type, RecordBatch};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt64Array};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, SchemaRef};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
@@ -30,7 +31,7 @@ pub struct FlatStorage {
     distance_type: DistanceType,
 
     // helper fields
-    row_ids: Arc<UInt64Array>,
+    pub(super) row_ids: Arc<UInt64Array>,
     vectors: Arc<FixedSizeListArray>,
 }
 
@@ -81,10 +82,7 @@ impl FlatStorage {
 impl VectorStore for FlatStorage {
     type DistanceCalculator<'a> = FlatDistanceCal;
 
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
-    where
-        Self: Sized,
-    {
+    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
@@ -113,8 +111,20 @@ impl VectorStore for FlatStorage {
         })
     }
 
-    fn to_batch(&self) -> Result<RecordBatch> {
-        Ok(self.batch.clone())
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
+        Ok([self.batch.clone()].into_iter())
+    }
+
+    fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+        // TODO: use chunked storage
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let mut storage = self.clone();
+        storage.batch = new_batch;
+        Ok(storage)
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        self.batch.schema_ref()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -125,12 +135,16 @@ impl VectorStore for FlatStorage {
         self.vectors.len()
     }
 
-    fn row_ids(&self) -> &[u64] {
-        self.row_ids.values()
+    fn distance_type(&self) -> DistanceType {
+        self.distance_type
     }
 
-    fn metric_type(&self) -> DistanceType {
-        self.distance_type
+    fn row_id(&self, id: u32) -> u64 {
+        self.row_ids.values()[id as usize]
+    }
+
+    fn row_ids(&self) -> impl Iterator<Item = &u64> {
+        self.row_ids.values().iter()
     }
 
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {

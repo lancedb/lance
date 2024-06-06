@@ -147,7 +147,7 @@ pub trait QuantizerMetadata: Clone + Sized + DeepSizeOf {
 }
 
 #[async_trait::async_trait]
-pub trait QuantizerStorage: Clone + Sized + DeepSizeOf {
+pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
     type Metadata: QuantizerMetadata;
 
     async fn load_partition(

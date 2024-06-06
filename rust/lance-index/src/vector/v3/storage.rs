@@ -4,16 +4,20 @@
 use std::any::Any;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::Field;
+use arrow_schema::{Field, SchemaRef};
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{DistanceType, MetricType};
+use lance_linalg::distance::DistanceType;
 use num_traits::Num;
 use snafu::{location, Location};
 
 use crate::vector::quantizer::Quantization;
 
-/// WARNING: Internal API,  API stability is not guaranteed
+/// <section class="warning">
+///  Internal API
+///
+///  API stability is not guaranteed
+/// </section>
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
     fn prefetch(&self, _id: u32) {}
@@ -21,25 +25,29 @@ pub trait DistCalculator {
 
 /// Vector Storage is the abstraction to store the vectors.
 ///
-/// It can be in-memory raw vectors or on disk PQ code.
+/// It can be in-memory or on-disk, raw vector or quantized vectors.
 ///
 /// It abstracts away the logic to compute the distance between vectors.
 ///
 /// TODO: should we rename this to "VectorDistance"?;
 ///
-/// WARNING: Internal API,  API stability is not guaranteed
-pub trait VectorStore: Send + Sync {
+/// <section class="warning">
+///  Internal API
+///
+///  API stability is not guaranteed
+/// </section>
+pub trait VectorStore: Send + Sync + Sized {
     type DistanceCalculator<'a>: DistCalculator
     where
         Self: 'a;
 
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
-    where
-        Self: Sized;
-
-    fn to_batch(&self) -> Result<RecordBatch>;
+    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>;
 
     fn as_any(&self) -> &dyn Any;
+
+    fn schema(&self) -> &SchemaRef;
+
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>>;
 
     fn len(&self) -> usize;
 
@@ -48,10 +56,17 @@ pub trait VectorStore: Send + Sync {
         self.len() == 0
     }
 
-    fn row_ids(&self) -> &[u64];
+    /// Return [DistanceType].
+    fn distance_type(&self) -> DistanceType;
 
-    /// Return the metric type of the vectors.
-    fn metric_type(&self) -> MetricType;
+    /// Get the lance ROW ID from one vector.
+    fn row_id(&self, id: u32) -> u64;
+
+    fn row_ids(&self) -> impl Iterator<Item = &u64>;
+
+    /// Append Raw [RecordBatch] into the Storage.
+    /// The storage implement will perform quantization if necessary.
+    fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
