@@ -4,7 +4,7 @@
 //! Flat Vector Index.
 //!
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -15,14 +15,17 @@ use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
-use crate::vector::{
-    graph::{OrderedFloat, OrderedNode},
-    quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
-    v3::{
-        storage::{DistCalculator, VectorStore},
-        subindex::{IvfSubIndex, PreFilter},
+use crate::{
+    prefilter::PreFilter,
+    vector::{
+        graph::{OrderedFloat, OrderedNode},
+        quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
+        v3::{
+            storage::{DistCalculator, VectorStore},
+            subindex::IvfSubIndex,
+        },
+        Query, DIST_COL,
     },
-    Query, DIST_COL,
 };
 
 use super::storage::{FlatStorage, FLAT_COLUMN};
@@ -66,11 +69,15 @@ impl IvfSubIndex for FlatIndex {
         k: usize,
         _params: Self::QueryParams,
         storage: &impl VectorStore,
-        prefilter: Arc<impl PreFilter>,
+        prefilter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator(query);
+        let filtered_row_ids = prefilter
+            .filter_row_ids((0..storage.len() as u64).collect_vec().as_slice())
+            .into_iter()
+            .collect::<HashSet<_>>();
         let (row_ids, dists): (Vec<u64>, Vec<f32>) = (0..storage.len())
-            .filter(|&id| !prefilter.should_drop(storage.row_ids()[id]))
+            .filter(|&id| !filtered_row_ids.contains(&storage.row_ids()[id]))
             .map(|id| OrderedNode {
                 id: id as u32,
                 dist: OrderedFloat(dist_calc.distance(id as u32)),

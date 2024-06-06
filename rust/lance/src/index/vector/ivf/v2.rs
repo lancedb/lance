@@ -184,7 +184,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
         &self,
         partition_id: usize,
         query: &Query,
-        pre_filter: Arc<PreFilter>,
+        pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true).await?;
 
@@ -268,7 +268,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<I, 
 impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'static> VectorIndex
     for IVFIndex<I, Q>
 {
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
         if self.distance_type == DistanceType::Cosine {
             let key = normalize_arrow(&query.key)?;
