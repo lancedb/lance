@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 pub mod builder;
-pub mod hnsw;
 pub mod ivf;
 pub mod pq;
 pub mod sq;
@@ -26,7 +25,10 @@ use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizerImpl;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::{
-    hnsw::builder::HnswBuildParams,
+    hnsw::{
+        builder::HnswBuildParams,
+        index::{HNSWIndex, HNSWIndexOptions},
+    },
     ivf::IvfBuildParams,
     pq::PQBuildParams,
     sq::{builder::SQBuildParams, ScalarQuantizer},
@@ -41,7 +43,6 @@ use tracing::instrument;
 use utils::get_vector_dim;
 use uuid::Uuid;
 
-use self::hnsw::{HNSWIndex, HNSWIndexOptions};
 use self::{ivf::*, pq::PQIndex};
 
 use super::{pb, DatasetIndexInternalExt, IndexParams};

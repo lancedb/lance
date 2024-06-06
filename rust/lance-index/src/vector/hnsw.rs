@@ -6,17 +6,20 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-pub mod builder;
 use arrow_schema::{DataType, Field};
-pub use builder::HNSW;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
-
 use super::graph::{OrderedFloat, OrderedNode};
 use super::storage::VectorStore;
+
+pub mod builder;
+pub mod index;
+
+pub use builder::HNSW;
+pub use index::HNSWIndex;
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
