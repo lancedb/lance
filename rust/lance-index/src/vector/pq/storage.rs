@@ -406,7 +406,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
         );
 
         let schema = reader.schema();
-        let batch = reader.read_range(range, schema, None).await?;
+        let batch = reader.read_range(range, schema).await?;
 
         Self::new(
             codebook,

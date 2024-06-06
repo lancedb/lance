@@ -834,7 +834,7 @@ mod tests {
 
     use arrow_array::{types::Float64Type, RecordBatch, RecordBatchReader};
     use arrow_schema::{ArrowError, DataType, Field, Fields, Schema as ArrowSchema};
-    use futures::StreamExt;
+    use futures::{prelude::stream::TryStreamExt, StreamExt};
     use lance_arrow::RecordBatchExt;
     use lance_core::datatypes::Schema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
@@ -1142,5 +1142,26 @@ mod tests {
             })),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_read_all() {
+        let fs = FsFixture::default();
+        let (_, data) = create_some_file(&fs.object_store, &fs.tmp_path).await;
+        let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
+
+        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_reader = FileReader::try_open(file_scheduler.clone(), None)
+            .await
+            .unwrap();
+
+        let batches = file_reader
+            .read_stream(lance_io::ReadBatchParams::RangeFull, total_rows as u32, 16)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), total_rows);
     }
 }

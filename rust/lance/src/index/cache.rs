@@ -4,11 +4,9 @@
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_index::scalar::ScalarIndex;
+use lance_index::{scalar::ScalarIndex, vector::VectorIndex};
 use lance_table::format::Index;
 use moka::sync::{Cache, ConcurrentCacheExt};
-
-use super::vector::VectorIndex;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

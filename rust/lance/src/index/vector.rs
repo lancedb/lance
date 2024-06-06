@@ -24,10 +24,14 @@ use lance_file::reader::FileReader;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizerImpl;
-use lance_index::vector::sq::builder::SQBuildParams;
-use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::shuffler::IvfShuffler;
-use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
+use lance_index::vector::{
+    hnsw::builder::HnswBuildParams,
+    ivf::IvfBuildParams,
+    pq::PQBuildParams,
+    sq::{builder::SQBuildParams, ScalarQuantizer},
+    VectorIndex,
+};
 use lance_index::{IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;

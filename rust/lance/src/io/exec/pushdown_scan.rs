@@ -668,6 +668,7 @@ mod test {
     use arrow_select::concat::concat_batches;
     use datafusion::prelude::{lit, Column, SessionContext};
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
+    use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     use crate::{datafusion::logical_expr::tests::ExprExt, dataset::WriteParams};
@@ -1448,7 +1449,7 @@ mod test {
             let ints = result["int"].as_primitive::<Int32Type>();
             let expected =
                 Int32Array::from_iter_values(expected_int.into_iter().filter(|x| x < &max_value));
-            assert_eq!(ints, &expected);
+            assert_eq!(ints, &expected, "Failed with max_value = {}", max_value);
 
             let floats = result["float"].as_primitive::<Float32Type>();
             let expected = Float32Array::from_iter_values(

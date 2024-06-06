@@ -46,7 +46,7 @@ use lance_index::{
         },
         pq::{PQBuildParams, ProductQuantizer},
         sq::{builder::SQBuildParams, ScalarQuantizer},
-        Query, DIST_COL,
+        Query, VectorIndex, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -81,7 +81,6 @@ use super::{
     hnsw::HNSWIndex,
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
-    VectorIndex,
 };
 use crate::{dataset::builder::DatasetBuilder, index::vector::sq::build_sq_model};
 use crate::{
@@ -220,7 +219,7 @@ impl IVFIndex {
         &self,
         partition_id: usize,
         query: &Query,
-        pre_filter: Arc<PreFilter>,
+        pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true).await?;
 
@@ -681,7 +680,7 @@ impl Index for IVFIndex {
 #[async_trait]
 impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
         if self.metric_type == MetricType::Cosine {
             let key = normalize_arrow(&query.key)?;
@@ -1701,6 +1700,7 @@ mod tests {
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
 
+    use crate::index::prefilter::DatasetPreFilter;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
     const DIM: usize = 32;
@@ -1870,7 +1870,7 @@ mod tests {
         async fn check_index<F: Fn(u64) -> Option<u64>>(
             &mut self,
             index: &IVFIndex,
-            prefilter: Arc<PreFilter>,
+            prefilter: Arc<dyn PreFilter>,
             ids_to_test: &[u64],
             row_id_map: F,
         ) {
@@ -2080,7 +2080,7 @@ mod tests {
             fragment_bitmap: None,
         };
 
-        let prefilter = Arc::new(PreFilter::new(dataset.clone(), &[index_meta], None));
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);

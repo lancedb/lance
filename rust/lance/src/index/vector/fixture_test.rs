@@ -28,7 +28,7 @@ mod test {
     use super::super::VectorIndex;
     use crate::{
         index::{
-            prefilter::PreFilter,
+            prefilter::{DatasetPreFilter, PreFilter},
             vector::ivf::{IVFIndex, Ivf},
         },
         session::Session,
@@ -80,7 +80,11 @@ mod test {
 
     #[async_trait]
     impl VectorIndex for ResidualCheckMockIndex {
-        async fn search(&self, query: &Query, _pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+        async fn search(
+            &self,
+            query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+        ) -> Result<RecordBatch> {
             let key: &Float32Array = query.key.as_primitive();
             assert_eq!(key.len(), self.assert_query_value.len());
             for (i, &v) in key.iter().zip(self.assert_query_value.iter()) {
@@ -206,7 +210,7 @@ mod test {
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
             idx.search(
                 &q,
-                Arc::new(PreFilter {
+                Arc::new(DatasetPreFilter {
                     deleted_ids: None,
                     filtered_ids: None,
                     final_mask: Mutex::new(OnceCell::new()),
