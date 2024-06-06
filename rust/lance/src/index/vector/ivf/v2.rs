@@ -24,10 +24,8 @@ use lance_file::v2::reader::FileReader;
 use lance_index::{
     pb,
     vector::{
-        ivf::storage::IVF_METADATA_KEY,
-        quantizer::Quantization,
-        v3::{storage::IvfQuantizationStorage, subindex::IvfSubIndex, DISTANCE_TYPE_KEY},
-        Query, DIST_COL,
+        ivf::storage::IVF_METADATA_KEY, quantizer::Quantization, storage::IvfQuantizationStorage,
+        v3::subindex::IvfSubIndex, Query, DISTANCE_TYPE_KEY, DIST_COL,
     },
     Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };

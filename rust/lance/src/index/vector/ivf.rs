@@ -30,14 +30,10 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::vector::{
-    hnsw::HNSW,
-    quantizer::{Quantization, QuantizationMetadata, Quantizer},
-};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
-        hnsw::builder::HnswBuildParams,
+        hnsw::{builder::HnswBuildParams, HNSWIndex, HNSW},
         ivf::{
             builder::load_precomputed_partitions,
             shuffler::shuffle_dataset,
@@ -45,6 +41,7 @@ use lance_index::{
             IvfBuildParams,
         },
         pq::{PQBuildParams, ProductQuantizer},
+        quantizer::{Quantization, QuantizationMetadata, Quantizer},
         sq::{builder::SQBuildParams, ScalarQuantizer},
         Query, VectorIndex, DIST_COL,
     },
@@ -78,7 +75,6 @@ use uuid::Uuid;
 use self::io::write_hnsw_quantization_index_partitions;
 
 use super::{
-    hnsw::HNSWIndex,
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
 };

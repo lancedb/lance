@@ -11,7 +11,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::ROW_ID;
 use lance_index::vector::{
-    sq::storage::ScalarQuantizationStorage, v3::storage::VectorStore, SQ_CODE_COLUMN,
+    sq::storage::ScalarQuantizationStorage, storage::VectorStore, SQ_CODE_COLUMN,
 };
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array;

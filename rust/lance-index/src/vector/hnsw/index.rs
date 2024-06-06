@@ -13,18 +13,6 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
-use lance_index::vector::{hnsw::HNSW, quantizer::Quantizer};
-use lance_index::{
-    vector::{
-        graph::NEIGHBORS_FIELD,
-        hnsw::{HnswMetadata, VECTOR_ID_FIELD},
-        ivf::storage::IVF_PARTITION_KEY,
-        quantizer::{IvfQuantizationStorage, Quantization},
-        v3::storage::VectorStore,
-        Query,
-    },
-    Index, IndexType,
-};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
@@ -33,19 +21,26 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use super::VectorIndex;
-use crate::index::prefilter::PreFilter;
-use crate::RESULT_SCHEMA;
-
-pub mod builder;
+use crate::prefilter::PreFilter;
+use crate::{
+    vector::{
+        graph::NEIGHBORS_FIELD,
+        hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
+        ivf::storage::IVF_PARTITION_KEY,
+        quantizer::{IvfQuantizationStorage, Quantization, Quantizer},
+        storage::VectorStore,
+        Query, VectorIndex, VECTOR_RESULT_SCHEMA,
+    },
+    Index, IndexType,
+};
 
 #[derive(Clone, DeepSizeOf)]
-pub(crate) struct HNSWIndexOptions {
+pub struct HNSWIndexOptions {
     pub use_residual: bool,
 }
 
 #[derive(Clone, DeepSizeOf)]
-pub(crate) struct HNSWIndex<Q: Quantization> {
+pub struct HNSWIndex<Q: Quantization> {
     distance_type: DistanceType,
 
     // Some(T) if the index is loaded, None otherwise
@@ -150,7 +145,7 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
 impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
-        let schema = RESULT_SCHEMA.clone();
+        let schema = VECTOR_RESULT_SCHEMA.clone();
 
         let hnsw = self.hnsw.as_ref().ok_or(Error::Index {
             message: "HNSW index not loaded".to_string(),

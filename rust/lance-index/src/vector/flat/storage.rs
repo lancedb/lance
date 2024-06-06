@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use crate::vector::quantizer::QuantizerStorage;
+use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::utils::prefetch_arrow_array;
-use crate::vector::v3::storage::{DistCalculator, VectorStore};
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
 use arrow::datatypes::UInt64Type;

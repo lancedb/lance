@@ -7,9 +7,8 @@ use arrow_array::{ArrayRef, RecordBatch};
 use deepsize::DeepSizeOf;
 use lance_core::Result;
 
+use crate::vector::storage::VectorStore;
 use crate::{prefilter::PreFilter, vector::Query};
-
-use super::storage::VectorStore;
 
 pub const SUB_INDEX_METADATA_KEY: &str = "sub_index_metadata";
 

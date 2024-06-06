@@ -12,7 +12,7 @@ use lance_arrow::ArrowFloatType;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
-use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::format::SelfDescribingFileReader;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
@@ -33,7 +33,7 @@ use super::{
         storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage},
         ScalarQuantizer,
     },
-    v3::storage::VectorStore,
+    storage::VectorStore,
 };
 use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
@@ -66,6 +66,11 @@ impl std::fmt::Display for QuantizationType {
     }
 }
 
+/// Quantization Method.
+///
+/// <section class="warning">
+/// Internal use only. End-user does not use this directly.
+/// </section>
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Quantizer {
     Flat(FlatQuantizer),
@@ -157,7 +162,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
     async fn load_partition(
         reader: &FileReader,
         range: std::ops::Range<usize>,
-        metric_type: MetricType,
+        distance_type: DistanceType,
         metadata: &Self::Metadata,
     ) -> Result<Self>;
 }
@@ -335,11 +340,11 @@ where
     }
 }
 
-/// Loader to load partitioned PQ storage from disk.
+/// Loader to load partitioned [VectorStore] from disk.
 pub struct IvfQuantizationStorage<Q: Quantization> {
     reader: FileReader,
 
-    metric_type: MetricType,
+    distance_type: DistanceType,
     quantizer: Quantizer,
     metadata: Q::Metadata,
 
@@ -359,7 +364,7 @@ impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {
     fn clone(&self) -> Self {
         Self {
             reader: self.reader.clone(),
-            metric_type: self.metric_type,
+            distance_type: self.distance_type,
             quantizer: self.quantizer.clone(),
             metadata: self.metadata.clone(),
             ivf: self.ivf.clone(),
@@ -391,15 +396,15 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 message: format!("Failed to parse index metadata: {}", metadata_str),
                 location: location!(),
             })?;
-        let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
+        let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
         let ivf_data = IvfData::load(&reader).await?;
 
         let metadata = Q::Metadata::load(&reader).await?;
-        let quantizer = Q::from_metadata(&metadata, metric_type)?;
+        let quantizer = Q::from_metadata(&metadata, distance_type)?;
         Ok(Self {
             reader,
-            metric_type,
+            distance_type,
             quantizer,
             metadata,
             ivf: ivf_data,
@@ -419,8 +424,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
+    /// Load one partition of vector storage.
+    ///
+    /// # Parameters
+    /// - `part_id`, partition id
+    ///
+    ///
     pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
-        Q::Storage::load_partition(&self.reader, range, self.metric_type, &self.metadata).await
+        Q::Storage::load_partition(&self.reader, range, self.distance_type, &self.metadata).await
     }
 }

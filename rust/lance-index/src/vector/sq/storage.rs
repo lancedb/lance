@@ -24,8 +24,8 @@ use snafu::{location, Location};
 use crate::{
     vector::{
         quantizer::{QuantizerMetadata, QuantizerStorage},
+        storage::{DistCalculator, VectorStore},
         transform::Transformer,
-        v3::storage::{DistCalculator, VectorStore},
         SQ_CODE_COLUMN,
     },
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
