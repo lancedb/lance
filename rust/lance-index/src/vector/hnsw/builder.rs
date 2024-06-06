@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use super::super::graph::beam_search;
 use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
 use crate::scalar::IndexWriter;
+use crate::vector::flat::storage::FlatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::greedy_search;
 use crate::vector::graph::{
@@ -102,6 +103,15 @@ impl HnswBuildParams {
     pub fn parallel_limit(mut self, limit: usize) -> Self {
         self.parallel_limit = Some(limit);
         self
+    }
+
+    pub async fn build(self, data: ArrayRef) -> Result<HNSW> {
+        // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
+        let vec_store = Arc::new(FlatStorage::new(
+            data.as_fixed_size_list().clone(),
+            DistanceType::L2,
+        ));
+        HNSW::build_with_storage(DistanceType::L2, self, vec_store).await
     }
 }
 

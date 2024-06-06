@@ -45,7 +45,7 @@ use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
-use crate::index::vector::{hnsw::builder::build_hnsw_model, sq::build_sq_storage};
+use crate::index::vector::sq::build_sq_storage;
 use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
 
@@ -511,11 +511,11 @@ async fn build_hnsw_quantization_partition(
 }
 
 async fn build_and_write_hnsw(
-    hnsw_params: HnswBuildParams,
+    params: HnswBuildParams,
     vectors: Arc<dyn Array>,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
-    let hnsw = build_hnsw_model(hnsw_params, vectors).await?;
+    let hnsw = params.build(vectors).await?;
     let length = hnsw.write(&mut writer).await?;
     Result::Ok(length)
 }

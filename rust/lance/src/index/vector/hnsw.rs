@@ -37,8 +37,6 @@ use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::RESULT_SCHEMA;
 
-pub mod builder;
-
 #[derive(Clone, DeepSizeOf)]
 pub(crate) struct HNSWIndexOptions {
     pub use_residual: bool,
