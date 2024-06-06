@@ -24,7 +24,7 @@ use crate::vector::PART_ID_COLUMN;
 
 #[async_trait::async_trait]
 /// A reader that can read the shuffled partitions.
-pub trait ShuffleReader {
+pub trait ShuffleReader: Send + Sync {
     /// Read a partition by partition_id
     /// will return Ok(None) if partition_size is 0
     /// check reader.partiton_size(partition_id) before calling this function
@@ -40,7 +40,7 @@ pub trait ShuffleReader {
 #[async_trait::async_trait]
 /// A shuffler that can shuffle the incoming stream of record batches into IVF partitions.
 /// Returns a IvfShuffleReader that can be used to read the shuffled partitions.
-pub trait Shuffler {
+pub trait Shuffler: Send + Sync {
     /// Shuffle the incoming stream of record batches into IVF partitions.
     /// Returns a IvfShuffleReader that can be used to read the shuffled partitions.
     async fn shuffle(

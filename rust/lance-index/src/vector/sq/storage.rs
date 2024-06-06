@@ -35,7 +35,7 @@ use super::{scale_to_u8, ScalarQuantizer};
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScalarQuantizationMetadata {
     pub dim: usize,
     pub num_bits: u16,

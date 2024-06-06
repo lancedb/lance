@@ -188,10 +188,16 @@ pub struct FlatDistanceCal {
 impl DistCalculator for FlatDistanceCal {
     #[inline]
     fn distance(&self, id: u32) -> f32 {
-        let vector = self.vectors.slice(id as usize, 1);
-        self.distance_type.arrow_batch_func()(&self.query, &vector)
-            .unwrap()
-            .value(0)
+        match self.vectors.value_type() {
+            DataType::Float32 => {
+                let vector = self.vectors.value(id as usize);
+                self.distance_type.func()(
+                    self.query.as_primitive::<Float32Type>().values(),
+                    vector.as_primitive::<Float32Type>().values(),
+                )
+            }
+            _ => unimplemented!(),
+        }
     }
 
     #[inline]

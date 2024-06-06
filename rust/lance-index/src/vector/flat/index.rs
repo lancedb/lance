@@ -4,7 +4,7 @@
 //! Flat Vector Index.
 //!
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -13,17 +13,19 @@ use itertools::Itertools;
 use lance_core::{Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
-use num_traits::Num;
 use serde::{Deserialize, Serialize};
 
-use crate::vector::{
-    graph::{OrderedFloat, OrderedNode},
-    quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
-    v3::{
-        storage::{DistCalculator, VectorStore},
-        subindex::{IvfSubIndex, PreFilter},
+use crate::{
+    prefilter::PreFilter,
+    vector::{
+        graph::{OrderedFloat, OrderedNode},
+        quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
+        v3::{
+            storage::{DistCalculator, VectorStore},
+            subindex::IvfSubIndex,
+        },
+        Query, DIST_COL,
     },
-    DIST_COL,
 };
 
 use super::storage::{FlatStorage, FLAT_COLUMN};
@@ -40,25 +42,42 @@ lazy_static::lazy_static! {
     ]).into();
 }
 
+#[derive(Default)]
+pub struct FlatQueryParams {}
+
+impl From<&Query> for FlatQueryParams {
+    fn from(_: &Query) -> Self {
+        Self {}
+    }
+}
+
 impl IvfSubIndex for FlatIndex {
-    type QueryParams = ();
+    type QueryParams = FlatQueryParams;
     type BuildParams = ();
+
+    fn use_residual() -> bool {
+        false
+    }
 
     fn name(&self) -> &str {
         "FLAT"
     }
 
-    fn search<T: Num>(
+    fn search(
         &self,
-        query: &[T],
+        query: ArrayRef,
         k: usize,
         _params: Self::QueryParams,
         storage: &impl VectorStore,
-        prefilter: Arc<impl PreFilter>,
+        prefilter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
-        let dist_calc = storage.dist_calculator_from_native(query);
+        let dist_calc = storage.dist_calculator(query);
+        let filtered_row_ids = prefilter
+            .filter_row_ids(Box::new(storage.row_ids()))
+            .into_iter()
+            .collect::<HashSet<_>>();
         let (row_ids, dists): (Vec<u64>, Vec<f32>) = (0..storage.len())
-            .filter(|&id| !prefilter.should_drop(storage.row_id(id as u32)))
+            .filter(|&id| !filtered_row_ids.contains(&storage.row_id(id as u32)))
             .map(|id| OrderedNode {
                 id: id as u32,
                 dist: OrderedFloat(dist_calc.distance(id as u32)),
@@ -90,7 +109,7 @@ impl IvfSubIndex for FlatIndex {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        Schema::empty().into()
+        Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
     }
 
     fn to_batch(&self) -> Result<RecordBatch> {
@@ -149,7 +168,7 @@ impl Quantization for FlatQuantizer {
         Ok(serde_json::to_value(metadata)?)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         "flat"
     }
 

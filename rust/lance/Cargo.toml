@@ -43,6 +43,7 @@ dashmap = "5"
 deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
+hex.workspace = true
 itertools.workspace = true
 object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 aws-credential-types.workspace = true

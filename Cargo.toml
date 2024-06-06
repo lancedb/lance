@@ -79,6 +79,7 @@ half = { "version" = "2.4.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
+hex = "0.4"
 bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"
@@ -87,7 +88,11 @@ chrono = { version = "0.4.25", default-features = false, features = [
     "std",
     "now",
 ] }
-criterion = { version = "0.5", features = ["async", "async_tokio", "html_reports"] }
+criterion = { version = "0.5", features = [
+    "async",
+    "async_tokio",
+    "html_reports",
+] }
 crossbeam-queue = "0.3"
 datafusion = { version = "37.1", default-features = false, features = [
     "array_expressions",

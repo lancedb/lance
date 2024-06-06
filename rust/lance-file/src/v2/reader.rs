@@ -784,8 +784,8 @@ impl FileReader {
         self.read_stream_projected(params, batch_size, batch_readahead, &self.base_projection)
     }
 
-    pub fn schema(&self) -> Arc<Schema> {
-        self.metadata.file_schema.clone()
+    pub fn schema(&self) -> &Arc<Schema> {
+        &self.metadata.file_schema
     }
 }
 
