@@ -64,7 +64,8 @@ fn create_sq_batch(row_id_range: Range<u64>, dim: usize) -> RecordBatch {
     batch.drop_column("vector").unwrap()
 }
 
-fn bench_storge(c: &mut Criterion) {
+#[allow(dead_code)]
+pub fn bench_storage(c: &mut Criterion) {
     let mut rng = rand::thread_rng();
 
     const TOTAL: usize = 8 * 1024 * 1024; // 8M rows
@@ -98,7 +99,7 @@ criterion_group!(
         .measurement_time(Duration::from_secs(10))
         .sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_storge);
+    targets = bench_storage);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
@@ -107,6 +108,6 @@ criterion_group!(
     config = Criterion::default()
         .measurement_time(Duration::from_secs(10))
         .sample_size(10);
-    targets = bench_storge);
+    targets = bench_storage);
 
 criterion_main!(benches);
