@@ -20,8 +20,8 @@ use std::{ops::Range, sync::Arc};
 use super::pb;
 use crate::pb::Tensor;
 
-#[warn(dead_code)]
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
     match array.data_type() {
         DataType::FixedSizeList(_, _) => {
