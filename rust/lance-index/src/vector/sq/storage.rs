@@ -276,7 +276,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
             metadata.num_bits,
             distance_type,
             metadata.bounds.clone(),
-            [batch].into_iter(),
+            [batch],
         )
     }
 }
