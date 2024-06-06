@@ -125,14 +125,12 @@ impl FileReader {
 
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
         let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len()), location!()))?;
-        let buffers = self
-            .scheduler
-            .submit_request(
-                vec![buffer_desc.position..buffer_desc.position + buffer_desc.size],
+        self.scheduler
+            .submit_single(
+                buffer_desc.position..buffer_desc.position + buffer_desc.size,
                 0,
             )
-            .await?;
-        Ok(buffers.into_iter().next().unwrap())
+            .await
     }
 
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {

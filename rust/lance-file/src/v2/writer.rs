@@ -309,7 +309,7 @@ impl FileWriter {
         self.writer.write_all(&file_descriptor_bytes).await?;
         let mut gbo_table = Vec::with_capacity(1 + self.global_buffers.len());
         gbo_table.push((file_descriptor_position, file_descriptor_len));
-        gbo_table.extend(self.global_buffers.drain(..));
+        gbo_table.append(&mut self.global_buffers);
         Ok(gbo_table)
     }
 
