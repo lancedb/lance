@@ -150,8 +150,8 @@ pub trait QuantizerMetadata:
     async fn load(reader: &FileReader) -> Result<Self>;
 }
 
-#[async_trait]
-pub trait QuantizerStorage: Clone + Sized + DeepSizeOf {
+#[async_trait::async_trait]
+pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
     type Metadata: QuantizerMetadata;
 
     async fn load_partition(

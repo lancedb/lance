@@ -327,7 +327,7 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         })
     }
 
-    fn row_ids(&self) -> &[u64] {
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 

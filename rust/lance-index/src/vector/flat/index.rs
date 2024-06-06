@@ -73,11 +73,11 @@ impl IvfSubIndex for FlatIndex {
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator(query);
         let filtered_row_ids = prefilter
-            .filter_row_ids((0..storage.len() as u64).collect_vec().as_slice())
+            .filter_row_ids(Box::new(storage.row_ids()))
             .into_iter()
             .collect::<HashSet<_>>();
         let (row_ids, dists): (Vec<u64>, Vec<f32>) = (0..storage.len())
-            .filter(|&id| !filtered_row_ids.contains(&storage.row_ids()[id]))
+            .filter(|&id| !filtered_row_ids.contains(&storage.row_id(id as u32)))
             .map(|id| OrderedNode {
                 id: id as u32,
                 dist: OrderedFloat(dist_calc.distance(id as u32)),
@@ -88,7 +88,7 @@ impl IvfSubIndex for FlatIndex {
                 |OrderedNode {
                      id,
                      dist: OrderedFloat(dist),
-                 }| (storage.row_ids()[id as usize], dist),
+                 }| (storage.row_id(id), dist),
             )
             .unzip();
 

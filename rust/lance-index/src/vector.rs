@@ -144,7 +144,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     }
 
     /// Return the IDs of rows in the index.
-    fn row_ids(&self) -> &[u64];
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_>;
 
     /// Remap the index according to mapping
     ///

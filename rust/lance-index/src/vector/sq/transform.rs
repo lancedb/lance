@@ -3,41 +3,41 @@
 
 use std::{
     fmt::{Debug, Formatter},
-    marker::PhantomData,
     sync::Arc,
 };
 
-use arrow_array::RecordBatch;
-use arrow_schema::Field;
+use arrow::array::AsArray;
+use arrow_array::{
+    types::{Float16Type, Float32Type, Float64Type},
+    RecordBatch,
+};
+use arrow_schema::{DataType, Field};
 use snafu::{location, Location};
 
 use crate::vector::transform::Transformer;
 
-use lance_arrow::{ArrowFloatType, RecordBatchExt};
+use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 
 use super::ScalarQuantizer;
 
-pub struct SQTransformer<T: ArrowFloatType> {
+pub struct SQTransformer {
     quantizer: ScalarQuantizer,
     input_column: String,
     output_column: String,
-
-    _mark: PhantomData<fn() -> T>,
 }
 
-impl<T: ArrowFloatType> SQTransformer<T> {
+impl SQTransformer {
     pub fn new(quantizer: ScalarQuantizer, input_column: String, output_column: String) -> Self {
         Self {
             quantizer,
             input_column,
             output_column,
-            _mark: PhantomData,
         }
     }
 }
 
-impl<T: ArrowFloatType> Debug for SQTransformer<T> {
+impl Debug for SQTransformer {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -47,9 +47,8 @@ impl<T: ArrowFloatType> Debug for SQTransformer<T> {
     }
 }
 
-#[async_trait::async_trait]
-impl<T: ArrowFloatType> Transformer for SQTransformer<T> {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+impl Transformer for SQTransformer {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let input = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::Index {
@@ -61,7 +60,22 @@ impl<T: ArrowFloatType> Transformer for SQTransformer<T> {
             })?;
         let batch = batch.drop_column(&self.input_column)?;
 
-        let sq_code = self.quantizer.transform::<T>(input)?;
+        let fsl = input.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: "input column is not vector type".to_string(),
+            location: location!(),
+        })?;
+        let sq_code = match fsl.value_type() {
+            DataType::Float16 => self.quantizer.transform::<Float16Type>(input)?,
+            DataType::Float32 => self.quantizer.transform::<Float32Type>(input)?,
+            DataType::Float64 => self.quantizer.transform::<Float64Type>(input)?,
+            _ => {
+                return Err(Error::Index {
+                    message: format!("unsupported data type: {}", fsl.value_type()),
+                    location: location!(),
+                })
+            }
+        };
+
         let sq_field = Field::new(&self.output_column, sq_code.data_type().clone(), false);
         let batch = batch.try_with_column(sq_field, Arc::new(sq_code))?;
         Ok(batch)
