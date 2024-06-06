@@ -123,6 +123,18 @@ impl FileReader {
         &self.metadata
     }
 
+    pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
+        let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len()), location!()))?;
+        let buffers = self
+            .scheduler
+            .submit_request(
+                vec![buffer_desc.position..buffer_desc.position + buffer_desc.size],
+                0,
+            )
+            .await?;
+        Ok(buffers.into_iter().next().unwrap())
+    }
+
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
         let file_size = scheduler.reader().size().await? as u64;
         let begin = if file_size < scheduler.reader().block_size() as u64 {
@@ -834,6 +846,7 @@ mod tests {
 
     use arrow_array::{types::Float64Type, RecordBatch, RecordBatchReader};
     use arrow_schema::{ArrowError, DataType, Field, Fields, Schema as ArrowSchema};
+    use bytes::Bytes;
     use futures::{prelude::stream::TryStreamExt, StreamExt};
     use lance_arrow::RecordBatchExt;
     use lance_core::datatypes::Schema;
@@ -1163,5 +1176,45 @@ mod tests {
             .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), total_rows);
+    }
+
+    #[tokio::test]
+    async fn test_global_buffers() {
+        let fs = FsFixture::default();
+
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![Field::new(
+                "foo",
+                DataType::Int32,
+                true,
+            )]))
+            .unwrap();
+
+        let mut file_writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.tmp_path.to_string(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let test_bytes = Bytes::from_static(b"hello");
+
+        let buf_index = file_writer
+            .add_global_buffer(test_bytes.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(buf_index, 1);
+
+        file_writer.finish().await.unwrap();
+
+        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_reader = FileReader::try_open(file_scheduler.clone(), None)
+            .await
+            .unwrap();
+
+        let buf = file_reader.read_global_buffer(1).await.unwrap();
+        assert_eq!(buf, test_bytes);
     }
 }
