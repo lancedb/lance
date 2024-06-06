@@ -44,8 +44,8 @@ pub const SQ_CODE_COLUMN: &str = "__sq_code";
 lazy_static! {
     pub static ref VECTOR_RESULT_SCHEMA: arrow_schema::SchemaRef =
         arrow_schema::SchemaRef::new(arrow_schema::Schema::new(vec![
-            ROW_ID_FIELD.clone(),
             Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
+            ROW_ID_FIELD.clone(),
         ]));
 }
 
