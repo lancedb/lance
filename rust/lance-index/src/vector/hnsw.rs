@@ -54,10 +54,10 @@ fn select_neighbors_heuristic(
         return candidates.iter().cloned().collect_vec();
     }
     let mut candidates = candidates.to_vec();
-    candidates.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
+    candidates.sort_unstable_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
-    for u in candidates.iter().rev() {
+    for u in candidates.iter() {
         if results.len() >= k {
             break;
         }
