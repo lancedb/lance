@@ -41,24 +41,11 @@ pub struct HnswMetadata {
     pub level_offsets: Option<Vec<usize>>,
 }
 
-/// Select neighbors from the ordered candidate list.
-///
-/// Algorithm 3 in the HNSW paper.
-///
-/// WARNING: Internal API,  API stability is not guaranteed
-pub fn select_neighbors(
-    orderd_candidates: &[OrderedNode],
-    k: usize,
-) -> impl Iterator<Item = &OrderedNode> + '_ {
-    orderd_candidates.iter().take(k)
-}
-
 /// Algorithm 4 in the HNSW paper.
 ///
-/// NOTE: the result is not ordered
-///
-/// WARNING: Internal API,  API stability is not guaranteed
-pub fn select_neighbors_heuristic(
+/// # NOTE
+/// The results are not ordered.
+fn select_neighbors_heuristic(
     storage: &impl VectorStore,
     candidates: &[OrderedNode],
     k: usize,
