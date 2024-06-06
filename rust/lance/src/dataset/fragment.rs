@@ -1014,7 +1014,7 @@ impl FileFragment {
         if let Some(columns) = columns {
             schema = schema.project(columns)?;
         }
-        // If there is no projection, we are least need to read the row addresses
+        // If there is no projection, we at least need to read the row addresses
         let with_row_addr = schema.fields.is_empty();
         let reader = self.open(&schema, false, with_row_addr);
         let deletion_vector = read_deletion_file(

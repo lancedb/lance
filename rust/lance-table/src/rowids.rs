@@ -214,6 +214,14 @@ impl RowIdSequence {
     }
 
     pub fn slice(&self, offset: usize, len: usize) -> RowIdSeqSlice<'_> {
+        if len == 0 {
+            return RowIdSeqSlice {
+                segments: &[],
+                offset_start: 0,
+                offset_last: 0,
+            };
+        }
+
         // Find the starting position
         let mut offset_start = offset;
         let mut segment_offset = 0;
@@ -245,6 +253,9 @@ impl RowIdSequence {
         }
     }
 
+    /// Get the row id at the given index.
+    ///
+    /// If the index is out of bounds, this will return None.
     pub fn get(&self, index: usize) -> Option<u64> {
         let mut offset = 0;
         for segment in &self.0 {
@@ -272,9 +283,9 @@ impl<'a> RowIdSeqSlice<'a> {
     pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         let mut known_size = self.segments.iter().map(|segment| segment.len()).sum();
         known_size -= self.offset_start;
-        known_size -= self.segments.last().unwrap().len() - self.offset_last;
+        known_size -= self.segments.last().map(|s| s.len()).unwrap_or_default() - self.offset_last;
 
-        let end = self.segments.len() - 1;
+        let end = self.segments.len().saturating_sub(1);
         self.segments
             .iter()
             .enumerate()
@@ -330,9 +341,8 @@ pub fn rechunk_sequences(
             let remaining_in_segment = segment_iter
                 .peek()
                 .map_or(0, |segment| segment.len() as u64 - segment_offset);
-            use std::cmp::Ordering::*;
             match (remaining_in_segment.cmp(&remaining), remaining_in_segment) {
-                (Greater, _) => {
+                (std::cmp::Ordering::Greater, _) => {
                     // Can only push part of the segment, we are done with this chunk.
                     let segment = segment_iter
                         .peek()
@@ -391,6 +401,7 @@ pub fn select_row_ids<'a>(
     };
 
     match offsets {
+        // TODO: Optimize this if indices are sorted, which is a common case.
         ReadBatchParams::Indices(indices) => indices
             .values()
             .iter()
@@ -524,6 +535,13 @@ mod test {
                 assert_eq!(claimed_size, actual.len()); // Correct size hint
             }
         }
+    }
+
+    #[test]
+    fn test_row_id_slice_empty() {
+        let sequence = RowIdSequence::from(0..10);
+        let slice = sequence.slice(10, 0);
+        assert_eq!(slice.iter().collect::<Vec<_>>(), Vec::<u64>::new());
     }
 
     #[test]

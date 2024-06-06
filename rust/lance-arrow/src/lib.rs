@@ -456,7 +456,6 @@ impl RecordBatchExt for RecordBatch {
     }
 
     fn project_by_schema(&self, schema: &Schema) -> Result<Self> {
-        // TODO: test can project by empty schema
         let struct_array: StructArray = self.clone().into();
         self.try_new_from_struct_array(project(&struct_array, schema.fields())?)
     }
