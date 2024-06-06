@@ -37,7 +37,7 @@ use crate::vector::graph::greedy_search;
 use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
-use crate::vector::v3::storage::{DistCalculator, VectorStore};
+use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::DIST_COL;
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 

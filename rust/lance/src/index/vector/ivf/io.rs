@@ -27,7 +27,7 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::{
     quantizer::{Quantization, Quantizer},
     sq::ScalarQuantizer,
-    v3::storage::VectorStore,
+    storage::VectorStore,
 };
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::encodings::plain::PlainEncoder;

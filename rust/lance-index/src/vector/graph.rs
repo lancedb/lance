@@ -17,7 +17,7 @@ pub mod builder;
 
 use crate::vector::DIST_COL;
 
-use crate::vector::v3::storage::DistCalculator;
+use crate::vector::storage::DistCalculator;
 
 pub(crate) const NEIGHBORS_COL: &str = "__neighbors";
 

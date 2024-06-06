@@ -20,7 +20,7 @@ use lance_index::{
         hnsw::{HnswMetadata, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization},
-        v3::storage::VectorStore,
+        storage::VectorStore,
         Query,
     },
     Index, IndexType,

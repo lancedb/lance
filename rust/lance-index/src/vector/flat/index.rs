@@ -20,10 +20,8 @@ use crate::{
     vector::{
         graph::{OrderedFloat, OrderedNode},
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
-        v3::{
-            storage::{DistCalculator, VectorStore},
-            subindex::IvfSubIndex,
-        },
+        storage::{DistCalculator, VectorStore},
+        v3::subindex::IvfSubIndex,
         Query, DIST_COL,
     },
 };

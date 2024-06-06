@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use self::builder::HnswBuildParams;
 
 use super::graph::{OrderedFloat, OrderedNode};
-use super::v3::storage::VectorStore;
+use super::storage::VectorStore;
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
