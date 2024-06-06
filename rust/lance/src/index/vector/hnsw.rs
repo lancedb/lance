@@ -171,7 +171,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         } else {
             pre_filter.wait_for_ready().await?;
 
-            let indices = pre_filter.filter_row_ids(storage.row_ids());
+            let indices = pre_filter.filter_row_ids(Box::new(storage.row_ids()));
             Some(
                 RoaringBitmap::from_sorted_iter(indices.into_iter().map(|i| i as u32)).map_err(
                     |e| Error::Index {

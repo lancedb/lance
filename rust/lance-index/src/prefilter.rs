@@ -40,5 +40,5 @@ pub trait PreFilter: Send + Sync {
     /// also known as a selection vector.
     ///
     /// This method must be called after `wait_for_ready`
-    fn filter_row_ids<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64>;
+    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64>;
 }

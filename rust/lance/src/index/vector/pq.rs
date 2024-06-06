@@ -106,7 +106,7 @@ impl PQIndex {
         row_ids: Arc<UInt64Array>,
         num_sub_vectors: i32,
     ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
-        let indices_to_keep = pre_filter.filter_row_ids(row_ids.values().iter());
+        let indices_to_keep = pre_filter.filter_row_ids(Box::new(row_ids.values().iter()));
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
