@@ -244,8 +244,8 @@ pub fn apply_row_id_and_deletes(
     let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
     let _enter = span.enter();
     let deletion_mask = deletion_vector.and_then(|v| {
-        let row_ids: &[u64] = row_ids.as_ref().unwrap().values();
-        v.build_predicate(row_ids.iter())
+        let row_addrs: &[u64] = row_addrs.as_ref().unwrap().values();
+        v.build_predicate(row_addrs.iter())
     });
 
     let batch = if config.with_row_id {

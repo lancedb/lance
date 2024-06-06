@@ -100,10 +100,10 @@ mod test {
 
     use super::*;
 
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
-    use lance_core::utils::address::RowAddress;
+    use lance_core::{utils::address::RowAddress, ROW_ADDR, ROW_ID};
 
     fn sequence_batch(values: Range<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -238,6 +238,106 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap();
         assert!(index.get(0).is_some());
         assert!(index.get(60).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scan_row_ids() {
+        // Write dataset with multiple files -> _rowid != _rowaddr
+        // Scan with and without each.;
+        let batch = sequence_batch(0..6);
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_move_stable_row_ids: true,
+            max_rows_per_file: 2,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        for with_row_id in [true, false] {
+            for with_row_address in &[true, false] {
+                for projection in &[vec![], vec!["id"]] {
+                    if !with_row_id && !with_row_address && projection.is_empty() {
+                        continue;
+                    }
+
+                    let mut scan = dataset.scan();
+                    if with_row_id {
+                        scan.with_row_id();
+                    }
+                    if *with_row_address {
+                        scan.with_row_address();
+                    }
+                    let scan = scan.project(projection).unwrap();
+                    let result = scan.try_into_batch().await.unwrap();
+
+                    if with_row_id {
+                        let row_ids = result[ROW_ID]
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap();
+                        let expected = vec![0, 1, 2, 3, 4, 5].into();
+                        assert_eq!(row_ids, &expected);
+                    }
+
+                    if *with_row_address {
+                        let row_addrs = result[ROW_ADDR]
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap();
+                        let expected =
+                            vec![0, 1, 1 << 32, (1 << 32) + 1, 2 << 32, (2 << 32) + 1].into();
+                        assert_eq!(row_addrs, &expected);
+                    }
+
+                    if !projection.is_empty() {
+                        let ids = result["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+                        let expected = vec![0, 1, 2, 3, 4, 5].into();
+                        assert_eq!(ids, &expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_delete_with_row_ids() {
+        let batch = sequence_batch(0..6);
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_move_stable_row_ids: true,
+            max_rows_per_file: 2,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        dataset.delete("id = 3 or id = 4").await.unwrap();
+
+        let mut scan = dataset.scan();
+        scan.with_row_id().with_row_address();
+        let result = scan.try_into_batch().await.unwrap();
+
+        let row_ids = result[ROW_ID]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let expected = vec![0, 1, 2, 5].into();
+        assert_eq!(row_ids, &expected);
+
+        let row_addrs = result[ROW_ADDR]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let expected = vec![0, 1, 1 << 32, (2 << 32) + 1].into();
+        assert_eq!(row_addrs, &expected);
     }
 
     #[tokio::test]
