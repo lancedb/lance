@@ -185,6 +185,8 @@ pub struct FlatDistanceCal<'a> {
 
 impl<'a> FlatDistanceCal<'a> {
     fn new(vectors: &'a FixedSizeListArray, query: ArrayRef, distance_type: DistanceType) -> Self {
+        // Gained sigificant performance improvement by using strong typed primtive slice.
+        // TODO: to support other data types other than `f32`, make FlatDistanceCal a generic struct.
         let flat_array = vectors.values().as_primitive::<Float32Type>();
         let dimension = vectors.value_length() as usize;
         Self {
