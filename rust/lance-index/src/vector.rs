@@ -6,11 +6,13 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::Field;
 use async_trait::async_trait;
-use lance_core::Result;
+use lance_core::{Result, ROW_ID_FIELD};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
+use lazy_static::lazy_static;
 
 pub mod bq;
 pub mod flat;
@@ -22,6 +24,7 @@ pub mod pq;
 pub mod quantizer;
 pub mod residual;
 pub mod sq;
+pub mod storage;
 pub mod transform;
 pub mod utils;
 pub mod v3;
@@ -31,11 +34,20 @@ use crate::{prefilter::PreFilter, Index};
 pub use residual::RESIDUAL_COLUMN;
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
+pub const DIST_COL: &str = "_distance";
+pub const DISTANCE_TYPE_KEY: &str = "distance_type";
+pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
+pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const SQ_CODE_COLUMN: &str = "__sq_code";
-pub const PART_ID_COLUMN: &str = "__ivf_part_id";
-pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
-pub const DIST_COL: &str = "_distance";
+
+lazy_static! {
+    pub static ref VECTOR_RESULT_SCHEMA: arrow_schema::SchemaRef =
+        arrow_schema::SchemaRef::new(arrow_schema::Schema::new(vec![
+            Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
+            ROW_ID_FIELD.clone(),
+        ]));
+}
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]

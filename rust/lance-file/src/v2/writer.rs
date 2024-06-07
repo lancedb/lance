@@ -77,6 +77,7 @@ pub struct FileWriter {
     field_id_to_column_indices: Vec<(i32, i32)>,
     num_columns: u32,
     rows_written: u64,
+    global_buffers: Vec<(u64, u64)>,
 }
 
 fn initial_column_metadata() -> pbfile::ColumnMetadata {
@@ -131,6 +132,7 @@ impl FileWriter {
             num_columns,
             rows_written: 0,
             field_id_to_column_indices: encoder.field_id_to_column_index,
+            global_buffers: Vec::new(),
         })
     }
 
@@ -305,7 +307,10 @@ impl FileWriter {
         let file_descriptor_len = file_descriptor_bytes.len() as u64;
         let file_descriptor_position = self.writer.tell().await? as u64;
         self.writer.write_all(&file_descriptor_bytes).await?;
-        Ok(vec![(file_descriptor_position, file_descriptor_len)])
+        let mut gbo_table = Vec::with_capacity(1 + self.global_buffers.len());
+        gbo_table.push((file_descriptor_position, file_descriptor_len));
+        gbo_table.append(&mut self.global_buffers);
+        Ok(gbo_table)
     }
 
     /// Add a metadata entry to the schema
@@ -315,6 +320,19 @@ impl FileWriter {
     /// must be called before `finish` is called.
     pub fn add_schema_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.schema.metadata.insert(key.into(), value.into());
+    }
+
+    /// Adds a global buffer to the file
+    ///
+    /// The global buffer can contain any arbitrary bytes.  It will be written to the disk
+    /// immediately.  This method returns the index of the global buffer (this will always
+    /// start at 1 and increment by 1 each time this method is called)
+    pub async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
+        let position = self.writer.tell().await? as u64;
+        let len = buffer.len() as u64;
+        self.writer.write_all(&buffer).await?;
+        self.global_buffers.push((position, len));
+        Ok(self.global_buffers.len() as u32)
     }
 
     /// Finishes writing the file

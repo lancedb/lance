@@ -22,16 +22,12 @@ use arrow_array::{
 };
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use lance::{
-    datatypes::Schema,
-    index::vector::{hnsw::builder::*, sq},
-    io::ObjectStore,
-};
+use lance::{datatypes::Schema, index::vector::sq, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HNSW},
-    v3::storage::VectorStore,
+    storage::VectorStore,
 };
 use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_linalg::{
@@ -184,7 +180,7 @@ impl Hnsw {
 
         let hnsw = RT
             .runtime
-            .block_on(build_hnsw_model(params, vectors.clone()))
+            .block_on(params.build(vectors.clone()))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self { hnsw, vectors })
     }

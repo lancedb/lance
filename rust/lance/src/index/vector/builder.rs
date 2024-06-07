@@ -16,13 +16,13 @@ use lance_index::{
             IvfBuildParams,
         },
         quantizer::Quantization,
+        storage::{StorageBuilder, VectorStore},
         transform::Transformer,
         v3::{
             shuffler::{ShuffleReader, Shuffler},
-            storage::{StorageBuilder, VectorStore},
             subindex::IvfSubIndex,
-            DISTANCE_TYPE_KEY,
         },
+        DISTANCE_TYPE_KEY,
     },
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };

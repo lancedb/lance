@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Vector Storage, holding (quantized) vectors and providing distance calculation.
+
 use std::{any::Any, sync::Arc};
 
 use arrow::compute::concat_batches;
