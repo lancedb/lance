@@ -31,7 +31,7 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
-use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
@@ -164,6 +164,9 @@ pub struct Scanner {
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
 
+    /// Scan the dataset with a meta column: "_rowaddr"
+    with_row_address: bool,
+
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -204,6 +207,7 @@ impl Scanner {
             nearest: None,
             use_stats: true,
             with_row_id: false,
+            with_row_address: false,
             ordered: true,
             fragments: None,
         }
@@ -557,6 +561,12 @@ impl Scanner {
         self
     }
 
+    /// Instruct the scanner to return the `_rowaddr` meta column from the dataset.
+    pub fn with_row_address(&mut self) -> &mut Self {
+        self.with_row_address = true;
+        self
+    }
+
     /// Set whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -587,6 +597,10 @@ impl Scanner {
 
         if self.with_row_id {
             extra_columns.push(ROW_ID_FIELD.clone());
+        }
+
+        if self.with_row_address {
+            extra_columns.push(ROW_ADDR_FIELD.clone());
         }
 
         let schema = if !extra_columns.is_empty() {
@@ -663,6 +677,11 @@ impl Scanner {
         if self.with_row_id {
             let row_id_expr = expressions::col(ROW_ID, &physical_schema)?;
             output_expr.push((row_id_expr, ROW_ID.to_string()));
+        }
+
+        if self.with_row_address {
+            let row_addr_expr = expressions::col(ROW_ADDR, &physical_schema)?;
+            output_expr.push((row_addr_expr, ROW_ADDR.to_string()));
         }
 
         Ok(output_expr)
@@ -797,7 +816,7 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.phyical_columns.fields.is_empty() && !self.with_row_id {
+        if self.phyical_columns.fields.is_empty() && !self.with_row_id && !self.with_row_address {
             return Err(Error::InvalidInput {
                 source:
                     "no columns were selected and with_row_id is false, there is nothing to scan"
@@ -896,7 +915,7 @@ impl Scanner {
                     } else {
                         Arc::new(self.phyical_columns.clone())
                     };
-                    self.scan(with_row_id, false, schema)
+                    self.scan(with_row_id, self.with_row_address, false, schema)
                 }
             }
         };
@@ -1074,7 +1093,7 @@ impl Scanner {
                 self.scalar_indexed_scan(&vector_scan_projection, index_query)
                     .await?
             } else {
-                self.scan(true, true, vector_scan_projection)
+                self.scan(true, false, true, vector_scan_projection)
             };
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 let planner = Planner::new(plan.schema());
@@ -1110,6 +1129,7 @@ impl Scanner {
             // than the scalar indices anyways
             let mut scan_node = self.scan_fragments(
                 true,
+                false,
                 true,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),
@@ -1242,6 +1262,7 @@ impl Scanner {
             let new_data_scan = self.scan_fragments(
                 true,
                 false,
+                false,
                 Arc::new(schema.clone()),
                 missing_frags.into(),
                 false,
@@ -1276,6 +1297,7 @@ impl Scanner {
     pub(crate) fn scan(
         &self,
         with_row_id: bool,
+        with_row_address: bool,
         with_make_deletions_null: bool,
         projection: Arc<Schema>,
     ) -> Arc<dyn ExecutionPlan> {
@@ -1292,6 +1314,7 @@ impl Scanner {
         };
         self.scan_fragments(
             with_row_id,
+            with_row_address,
             with_make_deletions_null,
             projection,
             fragments,
@@ -1302,6 +1325,7 @@ impl Scanner {
     fn scan_fragments(
         &self,
         with_row_id: bool,
+        with_row_address: bool,
         with_make_deletions_null: bool,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
@@ -1315,6 +1339,7 @@ impl Scanner {
             self.batch_readahead,
             self.fragment_readahead,
             with_row_id,
+            with_row_address,
             with_make_deletions_null,
             ordered,
         ))
@@ -1329,6 +1354,7 @@ impl Scanner {
             batch_readahead: self.batch_readahead,
             fragment_readahead: self.fragment_readahead,
             with_row_id: self.with_row_id,
+            with_row_address: self.with_row_address,
             make_deletions_null,
             ordered_output: self.ordered,
         };
@@ -1395,7 +1421,7 @@ impl Scanner {
                 // of the filter columns to determine the valid row ids.
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-                let filter_input = self.scan(true, true, filter_schema);
+                let filter_input = self.scan(true, false, true, filter_schema);
                 let planner = Planner::new(filter_input.schema());
                 let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
                 let filtered_row_ids =
@@ -3736,7 +3762,7 @@ mod test {
             assert_plan_equals(
                 &dataset.dataset,
                 |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
-                "LancePushdownScan: uri=..., projection=[s], predicate=i > Int32(10) AND i < Int32(20), row_id=false, ordered=true"
+                "LancePushdownScan: uri=..., projection=[s], predicate=i > Int32(10) AND i < Int32(20), row_id=false, row_addr=false, ordered=true"
             ).await?;
         }
 
@@ -3750,15 +3776,14 @@ mod test {
             "Projection: fields=[s]
   Take: columns=\"i, _rowid, s\"
     FilterExec: i@0 > 10 AND i@0 < 20
-      LanceScan: uri..., projection=[i], row_id=true, ordered=true",
+      LanceScan: uri..., projection=[i], row_id=true, row_addr=false, ordered=true",
         )
         .await?;
 
         assert_plan_equals(
             &dataset.dataset,
             |scan| Ok(scan.project(&["s"])?.with_row_id().scan_in_order(false)),
-            "Projection: fields=[s, _rowid]
-  LanceScan: uri=..., projection=[s], row_id=true, ordered=false",
+            "LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3771,7 +3796,7 @@ mod test {
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
     KNNFlat: k=5 metric=l2
-      LanceScan: uri=..., projection=[vec], row_id=true, ordered=false",
+      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3809,7 +3834,7 @@ mod test {
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
     KNNFlat: k=13 metric=l2
-      LanceScan: uri=..., projection=[vec], row_id=true, ordered=false",
+      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3848,7 +3873,7 @@ mod test {
       ANNSubIndex: name=..., k=17, deltas=1
         ANNIvfPartition: uuid=..., nprobes=1, deltas=1
         FilterExec: i@0 > 10
-          LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
+          LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3865,7 +3890,7 @@ mod test {
         UnionExec
           Projection: fields=[_distance, _rowid, vec]
             KNNFlat: k=5 metric=l2
-              LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
+              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
               ANNSubIndex: name=..., k=5, deltas=1
@@ -3886,7 +3911,7 @@ mod test {
             UnionExec
               Projection: fields=[_distance, _rowid, vec]
                 KNNFlat: k=5 metric=l2
-                  LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
+                  LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
               Take: columns=\"_distance, _rowid, vec\"
                 SortExec: TopK(fetch=5), expr=...
                   ANNSubIndex: name=..., k=5, deltas=1
@@ -3913,13 +3938,13 @@ mod test {
           Projection: fields=[_distance, _rowid, vec]
             KNNFlat: k=5 metric=l2
               FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
+                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
               ANNSubIndex: name=..., k=5, deltas=1
                 ANNIvfPartition: uuid=..., nprobes=1, deltas=1
                 FilterExec: i@0 > 10
-                  LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
+                  LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3964,7 +3989,7 @@ mod test {
           Projection: fields=[_distance, _rowid, vec]
             KNNFlat: k=5 metric=l2
               FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
+                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
               ANNSubIndex: name=..., k=5, deltas=1
@@ -3991,7 +4016,7 @@ mod test {
           Projection: fields=[_distance, _rowid, vec]
             KNNFlat: k=5 metric=l2
               FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
+                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=5), expr=...
               ANNSubIndex: name=..., k=5, deltas=1
@@ -4022,7 +4047,7 @@ mod test {
         MaterializeIndex: query=i > 10
       Projection: fields=[_rowid, s]
         FilterExec: i@1 > 10
-          LanceScan: uri=..., projection=[s, i], row_id=true, ordered=false",
+          LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -4042,7 +4067,7 @@ mod test {
           MaterializeIndex: query=i > 10
         Projection: fields=[_rowid, s]
           FilterExec: i@1 > 10
-            LanceScan: uri=..., projection=[s, i], row_id=true, ordered=false",
+            LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 

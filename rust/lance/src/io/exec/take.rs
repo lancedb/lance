@@ -382,6 +382,7 @@ mod tests {
             4,
             true,
             false,
+            false,
             true,
         ));
         let take_exec = TakeExec::try_new(dataset, input, extra_schema, 10).unwrap();
@@ -414,6 +415,7 @@ mod tests {
             10,
             4,
             true,
+            false,
             false,
             true,
         ));
@@ -448,6 +450,7 @@ mod tests {
             4,
             false,
             false,
+            false,
             true,
         ));
         assert!(TakeExec::try_new(dataset, input, extra_schema, 10).is_err());
@@ -465,6 +468,7 @@ mod tests {
             10,
             4,
             true,
+            false,
             false,
             true,
         ));
