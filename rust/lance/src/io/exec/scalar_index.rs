@@ -27,12 +27,13 @@ use lance_index::{
     },
     DatasetIndexExt,
 };
-use lance_table::format::Fragment;
+use lance_table::{format::Fragment, rowids::RowIdIndex};
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tracing::{debug_span, instrument};
 
 use crate::{
+    dataset::get_row_id_index,
     index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
     Dataset,
 };
@@ -94,7 +95,8 @@ impl ScalarIndexExec {
     }
 
     async fn do_execute(expr: ScalarIndexExpr, dataset: Arc<Dataset>) -> Result<RecordBatch> {
-        let query_result = expr.evaluate(dataset.as_ref()).await?;
+        let row_id_index = get_row_id_index(dataset.as_ref()).await?;
+        let query_result = expr.evaluate(dataset.as_ref(), &row_id_index).await?;
         let query_result_arr = query_result.into_arrow()?;
         Ok(RecordBatch::try_new(
             SCALAR_INDEX_SCHEMA.clone(),
@@ -195,6 +197,7 @@ impl MapIndexExec {
         column_name: String,
         dataset: Arc<Dataset>,
         deletion_mask: Option<Arc<RowAddressTreeMap>>,
+        row_id_index: Option<Arc<RowIdIndex>>,
         batch: RecordBatch,
     ) -> datafusion::error::Result<RecordBatch> {
         let index_vals = batch.column(0);
@@ -202,7 +205,7 @@ impl MapIndexExec {
             .map(|idx| ScalarValue::try_from_array(index_vals, idx))
             .collect::<datafusion::error::Result<Vec<_>>>()?;
         let query = ScalarIndexExpr::Query(column_name.clone(), ScalarQuery::IsIn(index_vals));
-        let row_addresses = query.evaluate(dataset.as_ref()).await?;
+        let row_addresses = query.evaluate(dataset.as_ref(), &row_id_index).await?;
         debug_assert!(row_addresses.block_list.is_none());
         if let Some(allow_list) = row_addresses.allow_list {
             let allow_list =
@@ -246,11 +249,13 @@ impl MapIndexExec {
         } else {
             None
         };
+        let row_id_index = get_row_id_index(dataset.as_ref()).await?;
         Ok(input.and_then(move |res| {
             let column_name = column_name.clone();
             let dataset = dataset.clone();
             let deletion_mask = deletion_mask.clone();
-            Self::map_batch(column_name, dataset, deletion_mask, res)
+            let row_id_index = row_id_index.clone();
+            Self::map_batch(column_name, dataset, deletion_mask, row_id_index, res)
         }))
     }
 }
@@ -302,7 +307,6 @@ lazy_static::lazy_static! {
     pub static ref MATERIALIZE_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
 }
 
-// TODO: should it return row ids, addresses, or be configurable?
 /// An execution node that performs a scalar index search and materializes the mask into row ids
 ///
 /// First, the index is searched to determine the mask that should be applied.  Then, we take the
@@ -390,8 +394,9 @@ impl MaterializeIndexExec {
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
     ) -> Result<RecordBatch> {
+        let row_id_index = get_row_id_index(dataset.as_ref()).await?;
         // TODO: multiple batches, stream without materializing all row ids in memory
-        let mask = expr.evaluate(dataset.as_ref());
+        let mask = expr.evaluate(dataset.as_ref(), &row_id_index);
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
             let fragment_bitmap =
@@ -408,10 +413,11 @@ impl MaterializeIndexExec {
             mask.await?
         };
         let span = debug_span!("make_ids");
+        // TODO: how do we efficiently return row ids when the mask is in terms of row addresses?
         let ids = span.in_scope(|| match (mask.allow_list, mask.block_list) {
             (None, None) => FragIdIter::new(fragments).collect::<Vec<_>>(),
             (Some(mut allow_list), None) => {
-                allow_list.remove_fragments(fragments.iter().map(|frag| frag.id as u32));
+                allow_list.retain_fragments(fragments.iter().map(|frag| frag.id as u32));
                 if let Some(allow_list_iter) = allow_list.row_addresses() {
                     allow_list_iter.map(u64::from).collect::<Vec<_>>()
                 } else {
@@ -424,7 +430,7 @@ impl MaterializeIndexExec {
                 .filter(|row_id| !block_list.contains(*row_id))
                 .collect(),
             (Some(mut allow_list), Some(block_list)) => {
-                allow_list.remove_fragments(fragments.iter().map(|frag| frag.id as u32));
+                allow_list.retain_fragments(fragments.iter().map(|frag| frag.id as u32));
                 if let Some(allow_list_iter) = allow_list.row_addresses() {
                     allow_list_iter
                         .filter_map(|addr| {

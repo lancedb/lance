@@ -1434,12 +1434,7 @@ impl Scanner {
             (_, _, false) => PreFilterSource::None,
         };
 
-        let row_id_index = if self.dataset.manifest.uses_move_stable_row_ids() {
-            let index = get_row_id_index(&self.dataset).await?;
-            Some(index)
-        } else {
-            None
-        };
+        let row_id_index = get_row_id_index(&self.dataset).await?;
 
         let inner_fanout_search = new_knn_exec(
             self.dataset.clone(),
@@ -2201,8 +2196,11 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_refine_factor(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+    async fn test_refine_factor(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
@@ -3186,7 +3184,7 @@ mod test {
     }
 
     impl ScalarIndexTestFixture {
-        async fn new(use_legacy_format: bool) -> Self {
+        async fn new(use_legacy_format: bool, use_stable_row_ids: bool) -> Self {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
@@ -3212,6 +3210,7 @@ mod test {
                 Some(WriteParams {
                     max_rows_per_file: 500,
                     use_legacy_format,
+                    enable_move_stable_row_ids: use_stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -3378,6 +3377,7 @@ mod test {
             scan.prefilter(true);
 
             let plan = scan.explain_plan(true).await.unwrap();
+            dbg!(&plan);
             let batch = scan.try_into_batch().await.unwrap();
 
             if params.use_projection {
@@ -3584,8 +3584,11 @@ mod test {
     // different configurations to ensure that we get consistent results
     #[rstest]
     #[tokio::test]
-    async fn test_secondary_index_scans(#[values(false, true)] use_legacy_format: bool) {
-        let fixture = ScalarIndexTestFixture::new(use_legacy_format).await;
+    async fn test_secondary_index_scans(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] use_stable_row_ids: bool,
+    ) {
+        let fixture = ScalarIndexTestFixture::new(use_legacy_format, use_stable_row_ids).await;
 
         for use_index in [false, true] {
             for use_projection in [false, true] {
@@ -3594,11 +3597,13 @@ mod test {
                         // Don't test compaction in conjuction with deletion and new data, it's too
                         // many combinations with no clear benefit.  Feel free to update if there is
                         // a need
-                        let compaction_choices = if use_deleted_data || use_new_data {
-                            vec![false]
-                        } else {
-                            vec![false, true]
-                        };
+                        // TODO: enable compaction for stable row id once supported.
+                        let compaction_choices =
+                            if use_deleted_data || use_new_data || use_stable_row_ids {
+                                vec![false]
+                            } else {
+                                vec![false, true]
+                            };
                         for use_compaction in compaction_choices {
                             let updated_choices =
                                 if use_deleted_data || use_new_data || use_compaction {

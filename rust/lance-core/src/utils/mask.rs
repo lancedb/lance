@@ -350,7 +350,7 @@ impl RowAddressTreeMap {
         }
     }
 
-    pub fn remove_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
+    pub fn retain_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
         let frag_id_set = frag_ids.into_iter().collect::<HashSet<_>>();
         self.inner
             .retain(|frag_id, _| frag_id_set.contains(frag_id));

@@ -15,6 +15,7 @@ use lance_core::{
     Result,
 };
 use lance_datafusion::expr::safe_coerce_scalar;
+use lance_table::rowids::RowIdIndex;
 use tracing::instrument;
 
 use super::{ScalarIndex, ScalarQuery};
@@ -216,28 +217,41 @@ impl ScalarIndexExpr {
     /// any situations where the session cache has been disabled.
     #[async_recursion]
     #[instrument(level = "debug", skip_all)]
-    pub async fn evaluate(&self, index_loader: &dyn ScalarIndexLoader) -> Result<RowAddressMask> {
+    pub async fn evaluate(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        row_id_index: &Option<Arc<RowIdIndex>>,
+    ) -> Result<RowAddressMask> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate(index_loader).await?;
+                let result = inner.evaluate(index_loader, row_id_index).await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader);
-                let rhs_result = rhs.evaluate(index_loader);
+                let lhs_result = lhs.evaluate(index_loader, row_id_index);
+                let rhs_result = rhs.evaluate(index_loader, row_id_index);
                 let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
                 Ok(lhs_result? & rhs_result?)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader);
-                let rhs_result = rhs.evaluate(index_loader);
+                let lhs_result = lhs.evaluate(index_loader, row_id_index);
+                let rhs_result = rhs.evaluate(index_loader, row_id_index);
                 let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
                 Ok(lhs_result? | rhs_result?)
             }
             Self::Query(column, query) => {
                 let index = index_loader.load_index(column).await?;
-                let allow_list = index.search(query).await?;
-                let allow_list = RowAddressTreeMap::from_iter(allow_list.values().iter());
+                let matching_row_ids = index.search(query).await?;
+                // These need to be converted into row addresses
+                let allow_list = if let Some(row_id_index) = row_id_index {
+                    let ids = matching_row_ids
+                        .values()
+                        .iter()
+                        .filter_map(|row_id| row_id_index.get(*row_id).map(u64::from));
+                    RowAddressTreeMap::from_iter(ids)
+                } else {
+                    RowAddressTreeMap::from_iter(matching_row_ids.values().iter())
+                };
                 Ok(RowAddressMask {
                     block_list: None,
                     allow_list: Some(allow_list),

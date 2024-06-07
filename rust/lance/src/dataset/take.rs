@@ -141,12 +141,10 @@ pub async fn take_rows(
         return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
     }
 
-    let row_addrs = if dataset.manifest.uses_move_stable_row_ids() {
-        // Need to map the row ids to addresses
-        let index = get_row_id_index(dataset).await?;
+    let row_addrs = if let Some(row_id_index) = get_row_id_index(dataset).await? {
         let addresses = row_ids
             .iter()
-            .filter_map(|id| index.get(*id).map(|address| address.into()))
+            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
             .collect::<Vec<_>>();
         Cow::Owned(addresses)
     } else {

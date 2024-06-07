@@ -67,6 +67,7 @@ use lance_table::feature_flags::{
     apply_feature_flags, can_read_dataset, can_write_dataset, should_use_legacy_format,
     FLAG_USE_V2_FORMAT,
 };
+pub(crate) use rowids::get_row_id_index;
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -2318,7 +2319,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_create_scalar_index(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_create_scalar_index(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] use_stable_row_id: bool,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2329,6 +2333,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 use_legacy_format,
+                enable_move_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )
@@ -2404,7 +2409,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_merge(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_merge(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] use_stable_row_id: bool,
+    ) {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, false),
             ArrowField::new("x", DataType::Float32, false),
@@ -2432,6 +2440,7 @@ mod tests {
         let write_params = WriteParams {
             mode: WriteMode::Append,
             use_legacy_format,
+            enable_move_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
 
@@ -2521,7 +2530,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_large_merge(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_large_merge(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] use_stable_row_id: bool,
+    ) {
         // Tests a merge that spans multiple batches within files
 
         // This test also tests "null filling" when merging (e.g. when keys do not match
@@ -2540,6 +2552,7 @@ mod tests {
             use_legacy_format,
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
+            enable_move_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         Dataset::write(data, test_uri, Some(write_params.clone()))
@@ -2854,7 +2867,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_search_empty_after_delete(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_search_empty_after_delete(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] use_stable_row_id: bool,
+    ) {
         // Create a table
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "vec",
@@ -2883,6 +2899,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 use_legacy_format,
+                enable_move_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )

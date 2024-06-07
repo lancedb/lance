@@ -67,17 +67,24 @@ pub fn load_row_id_sequences<'a>(
         .buffer_unordered(num_cpus::get())
 }
 
-pub async fn get_row_id_index(dataset: &Dataset) -> Result<Arc<lance_table::rowids::RowIdIndex>> {
-    // The path here isn't real, it's just used to prevent collisions in the cache.
-    let path = dataset
-        .base
-        .child("row_ids")
-        .child(dataset.manifest.version.to_string());
-    dataset
-        .session
-        .file_metadata_cache
-        .get_or_insert(&path, |_path| async { load_row_id_index(dataset).await })
-        .await
+pub async fn get_row_id_index(
+    dataset: &Dataset,
+) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
+    if dataset.manifest.uses_move_stable_row_ids() {
+        // The path here isn't real, it's just used to prevent collisions in the cache.
+        let path = dataset
+            .base
+            .child("row_ids")
+            .child(dataset.manifest.version.to_string());
+        let index = dataset
+            .session
+            .file_metadata_cache
+            .get_or_insert(&path, |_path| async { load_row_id_index(dataset).await })
+            .await?;
+        Ok(Some(index))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::RowIdIndex> {
@@ -128,7 +135,7 @@ mod test {
             .await
             .unwrap();
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
 
         assert_eq!(dataset.manifest().next_row_id, 0);
@@ -148,7 +155,7 @@ mod test {
             .await
             .unwrap();
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
 
         let found_addresses = (0..num_rows)
             .map(|i| index.get(i).unwrap())
@@ -195,7 +202,7 @@ mod test {
         // Overwriting should NOT reset the row id counter.
         assert_eq!(dataset.manifest().next_row_id, 2 * num_rows);
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
         assert!(index.get(num_rows).is_some());
     }
@@ -233,7 +240,7 @@ mod test {
 
         assert_eq!(dataset.manifest().next_row_id, 60);
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_some());
         assert!(index.get(60).is_none());
     }
@@ -366,7 +373,7 @@ mod test {
             .await
             .unwrap();
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_some());
         // Old address is still there.
         assert_eq!(index.get(3), Some(RowAddress::new_from_parts(0, 3)));
