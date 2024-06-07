@@ -85,9 +85,7 @@ fn initial_column_metadata() -> pbfile::ColumnMetadata {
         pages: Vec::new(),
         buffer_offsets: Vec::new(),
         buffer_sizes: Vec::new(),
-        encoding: Some(pbfile::Encoding {
-            location: Some(pbfile::encoding::Location::None(())),
-        }),
+        encoding: None,
     }
 }
 
@@ -335,6 +333,53 @@ impl FileWriter {
         Ok(self.global_buffers.len() as u32)
     }
 
+    async fn finish_writers(&mut self) -> Result<()> {
+        let mut col_idx = 0;
+        for mut writer in std::mem::take(&mut self.column_writers) {
+            let columns = writer.finish().await?;
+            debug_assert_eq!(
+                columns.len(),
+                writer.num_columns() as usize,
+                "Expected {} columns from column at index {} and got {}",
+                writer.num_columns(),
+                col_idx,
+                columns.len()
+            );
+            for column in columns {
+                for page in column.final_pages {
+                    self.write_page(page).await?;
+                }
+                let column_metadata = &mut self.column_metadata[col_idx];
+                let mut buffer_pos = self.writer.tell().await? as u64;
+                for buffer in column.column_buffers {
+                    column_metadata.buffer_offsets.push(buffer_pos);
+                    let mut size = 0;
+                    for part in buffer.parts {
+                        self.writer.write_all(&part).await?;
+                        size += part.len() as u64;
+                    }
+                    buffer_pos += size;
+                    column_metadata.buffer_sizes.push(size);
+                }
+                let encoded_encoding = Any::from_msg(&column.encoding)?.encode_to_vec();
+                column_metadata.encoding = Some(pbfile::Encoding {
+                    location: Some(pbfile::encoding::Location::Direct(pbfile::DirectEncoding {
+                        encoding: encoded_encoding,
+                    })),
+                });
+                col_idx += 1;
+            }
+        }
+        if col_idx != self.column_metadata.len() {
+            panic!(
+                "Column writers finished with {} columns but we expected {}",
+                col_idx,
+                self.column_metadata.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Finishes writing the file
     ///
     /// This method will wait until all data has been flushed to the file.  Then it
@@ -355,7 +400,8 @@ impl FileWriter {
             .collect::<FuturesUnordered<_>>();
         self.write_pages(encoding_tasks).await?;
 
-        // 2. write the column metadata buffers (coming soon)
+        self.finish_writers().await?;
+
         // 3. write global buffers (we write the schema here)
         let global_buffer_offsets = self.write_global_buffers().await?;
         let num_global_buffers = global_buffer_offsets.len() as u32;
@@ -429,18 +475,16 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
     // Estimating 1MiB for file footer
     let mut data = BytesMut::with_capacity(batch.data.len() + 1024 * 1024);
     data.put(batch.data.clone());
-    // Write column metadata buffers
-    let column_metadata_buffers_start = data.len() as u64;
     // write global buffers (we write the schema here)
-    let global_buffers_start = data.len() as u64;
     let global_buffers = if write_schema {
+        let schema_start = data.len() as u64;
         let lance_schema = lance_core::datatypes::Schema::try_from(batch.schema.as_ref())?;
         let descriptor = FileWriter::make_file_descriptor(&lance_schema, batch.num_rows)?;
         let descriptor_bytes = descriptor.encode_to_vec();
         let descriptor_len = descriptor_bytes.len() as u64;
         data.put(descriptor_bytes.as_slice());
 
-        vec![(global_buffers_start, descriptor_len)]
+        vec![(schema_start, descriptor_len)]
     } else {
         vec![]
     };
@@ -475,16 +519,19 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
             .collect::<Result<Vec<_>>>()?;
         let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
             col.buffer_offsets_and_sizes.iter().cloned().unzip();
+        let encoded_col_encoding = Any::from_msg(&col.encoding)?.encode_to_vec();
         let column = pbfile::ColumnMetadata {
             pages,
             buffer_offsets,
             buffer_sizes,
             encoding: Some(pbfile::Encoding {
-                location: Some(pbfile::encoding::Location::None(())),
+                location: Some(pbfile::encoding::Location::Direct(pbfile::DirectEncoding {
+                    encoding: encoded_col_encoding,
+                })),
             }),
         };
         let column_bytes = column.encode_to_vec();
-        col_metadata_positions.push((position, data.len() as u64));
+        col_metadata_positions.push((position, column_bytes.len() as u64));
         data.put(column_bytes.as_slice());
     }
     // Write column metadata offsets table
@@ -502,8 +549,6 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
     }
 
     // write the footer
-    data.put_u64_le(column_metadata_buffers_start);
-    data.put_u64_le(global_buffers_start);
     data.put_u64_le(col_metadata_start);
     data.put_u64_le(cmo_table_start);
     data.put_u64_le(gbo_table_start);
