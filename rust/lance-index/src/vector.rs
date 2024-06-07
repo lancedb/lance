@@ -6,7 +6,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use lance_core::{Result, ROW_ID_FIELD};
