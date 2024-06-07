@@ -561,11 +561,12 @@ impl FileReader {
             .zip(projection.column_indices.iter())
         {
             let mut starting_column = *starting_column as usize;
-            self.collect_columns(&field, &mut starting_column, &mut column_infos)?;
+            self.collect_columns(field, &mut starting_column, &mut column_infos)?;
         }
         Ok(column_infos)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn do_read_range(
         column_infos: Vec<Arc<ColumnInfo>>,
         scheduler: Arc<dyn EncodingsIo>,
@@ -606,7 +607,7 @@ impl FileReader {
         Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream())
     }
 
-    fn read_range<'a>(
+    fn read_range(
         &self,
         range: Range<u64>,
         batch_size: u32,
@@ -933,7 +934,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
         let page_table = FileReader::meta_to_col_infos(&column_metadatas);
 
-        Ok(EncodedBatch {
+        Ok(Self {
             data: bytes,
             num_rows: page_table
                 .first()
@@ -968,7 +969,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let schema_start = gbo_table[0].position as usize;
         let schema_size = gbo_table[0].size as usize;
 
-        let schema_bytes = bytes.slice(schema_start..(schema_start + schema_size) as usize);
+        let schema_bytes = bytes.slice(schema_start..(schema_start + schema_size));
         let (_, schema) = FileReader::decode_schema(schema_bytes)?;
 
         // Next, read the metadata for the columns
@@ -981,7 +982,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
         let page_table = FileReader::meta_to_col_infos(&column_metadatas);
 
-        Ok(EncodedBatch {
+        Ok(Self {
             data: bytes,
             num_rows: page_table
                 .first()
@@ -1214,7 +1215,7 @@ pub mod tests {
                 )
                 .unwrap();
 
-            let projection_arrow = ArrowSchema::try_from(projection.schema.as_ref()).unwrap();
+            let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
             verify_expected(
                 &data,
                 batch_stream,
@@ -1243,7 +1244,7 @@ pub mod tests {
                 )
                 .unwrap();
 
-            let projection_arrow = ArrowSchema::try_from(projection.schema.as_ref()).unwrap();
+            let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
             verify_expected(
                 &data,
                 batch_stream,

@@ -370,7 +370,7 @@ impl FileWriter {
                 col_idx += 1;
             }
         }
-        if col_idx as usize != self.column_metadata.len() {
+        if col_idx != self.column_metadata.len() {
             panic!(
                 "Column writers finished with {} columns but we expected {}",
                 col_idx,

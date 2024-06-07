@@ -111,7 +111,7 @@ impl<F: Fn(u64) -> bool> ZoneMapsFilter<F> {
 ///
 /// This method converts that into a datafusion expression
 fn path_to_expr(path: &VecDeque<u32>) -> Expr {
-    let mut parts_iter = path.into_iter().map(|path_num| path_num.to_string());
+    let mut parts_iter = path.iter().map(|path_num| path_num.to_string());
     let mut expr = col(parts_iter.next().unwrap());
     for part in parts_iter {
         expr = expr.field(part);
@@ -193,7 +193,7 @@ impl ZoneMapsFieldScheduler {
             schema,
             pushdown_buffers,
             zone_guarantees: Arc::default(),
-            rows_per_zone: rows_per_zone,
+            rows_per_zone,
             num_rows,
         }
     }
@@ -598,7 +598,7 @@ mod tests {
 
         let decoder_middleware = DecoderMiddlewareChain::new()
             .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
+            .add_strategy(Arc::new(CoreFieldDecoderStrategy));
 
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
 
@@ -612,7 +612,7 @@ mod tests {
 
         let decoder_middleware = DecoderMiddlewareChain::new()
             .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
+            .add_strategy(Arc::new(CoreFieldDecoderStrategy));
 
         let result = count_lance_file(
             &fs,
@@ -632,7 +632,7 @@ mod tests {
 
         let decoder_middleware = DecoderMiddlewareChain::new()
             .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
+            .add_strategy(Arc::new(CoreFieldDecoderStrategy));
 
         let result = count_lance_file(
             &fs,
