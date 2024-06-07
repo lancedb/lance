@@ -526,7 +526,12 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
+    use crate::v2::reader::FileReader;
     use crate::v2::writer::{FileWriter, FileWriterOptions};
+
+    use lance_io::scheduler::ScanScheduler;
+
+    use futures::StreamExt;
 
     #[tokio::test]
     async fn test_basic_write() {
@@ -601,5 +606,28 @@ mod tests {
         }
 
         file_writer.finish().await.unwrap();
+
+        // let fs = FsFixture::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let fs_scheduler = ScanScheduler::new(object_store.clone(), 8);
+        let file_scheduler = fs_scheduler.open_file(&tmp_path).await.unwrap();
+
+        let file_reader = FileReader::try_open(file_scheduler, None).await.unwrap();
+        let schema = file_reader.schema();
+        println!("Schema - {:?}", schema);
+
+        let mut batch_stream = file_reader
+            .read_stream(lance_io::ReadBatchParams::RangeFull, 1024, 16)
+            .unwrap();
+
+        // print length of batch stream
+        let mut num_batches = 0;
+        // print batches in stream
+        while let Some(batch) = batch_stream.next().await {
+            num_batches += 1;
+            println!("{:?}", batch);
+        }
+
+        println!("Number of batches: {}", num_batches);
     }
 }

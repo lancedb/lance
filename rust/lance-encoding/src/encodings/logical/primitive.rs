@@ -14,9 +14,10 @@ use arrow_array::{
         TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
         TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray, StringArray
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray,
+    StringArray,
 };
-use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
@@ -59,6 +60,7 @@ pub struct PrimitiveFieldScheduler {
 
 impl PrimitiveFieldScheduler {
     pub fn new(data_type: DataType, pages: Arc<[PageInfo]>, buffers: ColumnBuffers) -> Self {
+        println!("Creating new PrimitiveFieldScheduler");
         let page_schedulers = pages
             .iter()
             .map(|page| {
@@ -202,12 +204,28 @@ impl FieldScheduler for PrimitiveFieldScheduler {
     }
 }
 
-struct PrimitiveFieldDecoder {
+pub struct PrimitiveFieldDecoder {
     data_type: DataType,
     unloaded_physical_decoder: Option<BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>>,
     physical_decoder: Option<Arc<dyn PhysicalPageDecoder>>,
     num_rows: u32,
     rows_drained: u32,
+}
+
+impl PrimitiveFieldDecoder {
+    pub fn new_from_data(
+        physical_decoder: Arc<dyn PhysicalPageDecoder>,
+        data_type: DataType,
+        num_rows: u32,
+    ) -> Self {
+        Self {
+            data_type,
+            unloaded_physical_decoder: None,
+            physical_decoder: Some(physical_decoder),
+            num_rows,
+            rows_drained: 0,
+        }
+    }
 }
 
 impl Debug for PrimitiveFieldDecoder {
@@ -245,6 +263,11 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
             return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));
         }
 
+        capacities
+            .clone()
+            .into_iter()
+            .for_each(|buf| println!("Buffer length Initial {:?}", buf.0));
+
         // At this point we know the size needed for each buffer
         let mut bufs = capacities
             .into_iter()
@@ -258,6 +281,10 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
                 }
             })
             .collect::<Vec<_>>();
+
+        bufs.clone()
+            .into_iter()
+            .for_each(|buf| println!("Buffer length {:?}", buf.capacity()));
 
         // Go ahead and fill the validity / values buffers
         self.physical_decoder
@@ -472,12 +499,53 @@ impl PrimitiveFieldDecodeTask {
             }
             DataType::Utf8 => {
                 // get offsets_buffer (indices) from buffer
+                println!("Buffers length: {:?}", buffers.len());
+                let mut buffer_iter = buffers.into_iter();
+                let indices_buffer = buffer_iter.next().unwrap().freeze();
+                let indices_buffer = Buffer::from_bytes(indices_buffer.into());
+                let indices_buffer = ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize);
 
-                // get values_buffer (bytes) from buffer
+                let indices_array = Arc::new(
+                    PrimitiveArray::<Int32Type>::new(indices_buffer, None)
+                        .with_data_type(DataType::Int32),
+                );
+
+                let mut vec_buffer = indices_array.values().to_vec();
+                vec_buffer.insert(0, 0);
+                let new_buffer = Buffer::from_slice_ref(&vec_buffer);
+                let indices_buffer = ScalarBuffer::<i32>::new(new_buffer, 0, num_rows as usize + 1);
+
+                let offsets = OffsetBuffer::new(indices_buffer.clone());
+
+                let indices_array = Arc::new(
+                    PrimitiveArray::<Int32Type>::new(indices_buffer.clone(), None)
+                        .with_data_type(DataType::Int32),
+                );
+
+                println!("Indices: {:?}", indices_array);
+
+                // TODO - decoding the bytes creates 2 buffers, the first one is empty, probably due to nulls.
+                let _waste_buffer = buffer_iter.next().unwrap();
+
+                let bytes_buffer = buffer_iter.next().unwrap().freeze();
+                let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
+                let bytes_buffer_len = bytes_buffer.len();
+                let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
+
+                let bytes_array = Arc::new(
+                    PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
+                        .with_data_type(DataType::UInt8),
+                );
+
+                println!("Bytes: {:?}", bytes_array);
+
+                // let final_str_arr = StringArray::new(offsets, bytes_array.values().into(), None);
+                // println!("Final String Array: {:?}", final_str_arr);
 
                 Ok(Arc::new(StringArray::new(
-                    offsets_buffer, // indices
-                    values_buffer, // bytes
+                    offsets, // indices
+                    bytes_array.values().into(),
+                    None, // bytes
                 )))
             }
             _ => Err(Error::io(

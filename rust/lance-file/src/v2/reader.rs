@@ -34,6 +34,7 @@ use crate::{
 };
 
 use super::io::LanceEncodingsIo;
+use arrow_schema::DataType;
 
 // For now, we don't use global buffers for anything other than schema.  If we
 // use these later we should make them lazily loaded and then cached once loaded.
@@ -557,7 +558,7 @@ impl FileReader {
     ) -> Result<()> {
         column_infos.push(self.metadata.column_infos[*column_idx].clone());
         *column_idx += 1;
-        if field.data_type().is_binary_like() {
+        if (field.data_type().is_binary_like()) && (field.data_type() != DataType::Utf8) {
             // These types are 2 columns in a lance file but a single field id in a lance schema
             column_infos.push(self.metadata.column_infos[*column_idx].clone());
             *column_idx += 1;

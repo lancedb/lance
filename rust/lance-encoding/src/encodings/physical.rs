@@ -6,8 +6,8 @@ use crate::{decoder::PageScheduler, format::pb};
 
 use self::value::parse_compression_scheme;
 use self::{
-    basic::BasicPageScheduler, bitmap::DenseBitmapScheduler, fixed_size_list::FixedListScheduler,
-    value::ValuePageScheduler, binary::BinaryPageScheduler,
+    basic::BasicPageScheduler, binary::BinaryPageScheduler, bitmap::DenseBitmapScheduler,
+    fixed_size_list::FixedListScheduler, value::ValuePageScheduler,
 };
 
 pub mod basic;
@@ -120,9 +120,10 @@ pub fn decoder_from_array_encoding(
 
             let indices_scheduler = decoder_from_array_encoding(indices_encoding, buffers);
             let bytes_scheduler = decoder_from_array_encoding(bytes_encoding, buffers);
+            println!("Creating new BinaryPageScheduler");
             Box::new(BinaryPageScheduler::new(
                 indices_scheduler,
-                bytes_scheduler,
+                bytes_scheduler.into(),
             ))
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column

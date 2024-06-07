@@ -313,7 +313,10 @@ impl DecodeBatchScheduler {
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) | DataType::Utf8 => true,
+                DataType::Boolean
+                | DataType::Null
+                | DataType::FixedSizeBinary(_)
+                | DataType::Utf8 => true,
                 DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
                 _ => false,
             }
@@ -851,6 +854,7 @@ pub trait PhysicalPageDecoder: Send + Sync {
 /// be shared in follow-up I/O tasks.
 ///
 /// See [`crate::decoder`] for more information
+
 pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     /// Schedules a batch of I/O to load the data needed for the requested ranges
     ///
