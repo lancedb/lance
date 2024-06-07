@@ -544,7 +544,7 @@ pub async fn encode_batch(
     Ok(EncodedBatch {
         data: data_buffer.freeze(),
         page_table,
-        schema: schema,
+        schema,
         num_rows: batch.num_rows() as u64,
     })
 }

@@ -70,7 +70,7 @@ async fn test_decode(
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
-        &column_infos,
+        column_infos,
         &Vec::new(),
         num_rows,
         &DecoderMiddlewareChain::default(),
@@ -219,7 +219,7 @@ impl SimulatedWriter {
     fn write_buffer(&mut self, buffer: EncodedBuffer) -> (u64, u64) {
         let offset = self.encoded_data.len() as u64;
         for part in buffer.parts.iter() {
-            self.encoded_data.extend_from_slice(&part);
+            self.encoded_data.extend_from_slice(part);
         }
         let size = self.encoded_data.len() as u64 - offset;
         (offset, size)

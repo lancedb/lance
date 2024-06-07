@@ -323,7 +323,7 @@ impl Default for DecoderMiddlewareChain {
         Self {
             chain: Default::default(),
         }
-        .add(Arc::new(CoreFieldDecoderStrategy))
+        .add_strategy(Arc::new(CoreFieldDecoderStrategy))
     }
 }
 
@@ -334,7 +334,7 @@ impl DecoderMiddlewareChain {
     }
 
     /// Adds a decoder to the end of the chain
-    pub fn add(mut self, decoder: Arc<dyn FieldDecoderStrategy>) -> Self {
+    pub fn add_strategy(mut self, decoder: Arc<dyn FieldDecoderStrategy>) -> Self {
         self.chain.push(decoder);
         self
     }
@@ -366,6 +366,11 @@ pub struct DecoderMiddlewareChainCursor<'a> {
     cur_idx: usize,
 }
 
+pub type ChosenFieldScheduler<'a> = (
+    DecoderMiddlewareChainCursor<'a>,
+    BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
+);
+
 impl<'a> DecoderMiddlewareChainCursor<'a> {
     /// Returns the current path into the field being decoded
     pub fn current_path(&self) -> &VecDeque<u32> {
@@ -374,7 +379,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
 
     /// Returns the I/O service which can be used to grab column metadata
     pub fn io(&self) -> &Arc<dyn EncodingsIo> {
-        &self.io
+        self.io
     }
 
     /// Delegates responsibilty to the next encoder in the chain
@@ -388,10 +393,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
         field: &Field,
         column_infos: &mut VecDeque<ColumnInfo>,
         buffers: FileBuffers,
-    ) -> Result<(
-        DecoderMiddlewareChainCursor<'a>,
-        BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
-    )> {
+    ) -> Result<ChosenFieldScheduler<'a>> {
         if self.cur_idx >= self.chain.chain.len() {
             return Err(Error::invalid_input(
                 "The user requested field {:?} from column {:?} but no decoders were registered to handle it",
@@ -416,10 +418,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
         field: &Field,
         column_infos: &mut VecDeque<ColumnInfo>,
         buffers: FileBuffers,
-    ) -> Result<(
-        DecoderMiddlewareChainCursor<'a>,
-        BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
-    )> {
+    ) -> Result<ChosenFieldScheduler<'a>> {
         self.cur_idx = 0;
         self.next(field, column_infos, buffers)
     }
@@ -433,10 +432,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
         field: &Field,
         column_infos: &mut VecDeque<ColumnInfo>,
         buffers: FileBuffers,
-    ) -> Result<(
-        DecoderMiddlewareChainCursor<'a>,
-        BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
-    )> {
+    ) -> Result<ChosenFieldScheduler<'a>> {
         self.path.push_back(child_idx);
         self.cur_idx = 0;
         self.next(field, column_infos, buffers)
@@ -448,10 +444,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
         field: &Field,
         column_infos: &mut VecDeque<ColumnInfo>,
         buffers: FileBuffers,
-    ) -> Result<(
-        DecoderMiddlewareChainCursor<'a>,
-        BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
-    )> {
+    ) -> Result<ChosenFieldScheduler<'a>> {
         self.path.clear();
         self.cur_idx = 0;
         self.next(field, column_infos, buffers)
@@ -521,10 +514,7 @@ pub trait FieldDecoderStrategy: Send + Sync + std::fmt::Debug {
         column_infos: &mut VecDeque<ColumnInfo>,
         buffers: FileBuffers,
         chain: DecoderMiddlewareChainCursor<'a>,
-    ) -> Result<(
-        DecoderMiddlewareChainCursor<'a>,
-        BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
-    )>;
+    ) -> Result<ChosenFieldScheduler<'a>>;
 }
 
 /// The core decoder strategy handles all the various Arrow types
@@ -611,10 +601,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
         column_infos: &mut VecDeque<ColumnInfo>,
         buffers: FileBuffers,
         chain: DecoderMiddlewareChainCursor<'a>,
-    ) -> Result<(
-        DecoderMiddlewareChainCursor<'a>,
-        BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
-    )> {
+    ) -> Result<ChosenFieldScheduler<'a>> {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
             let primitive_col = column_infos.pop_front().unwrap();
@@ -844,8 +831,8 @@ impl DecodeBatchScheduler {
 
         let mut context = SchedulerContext::new(io);
         let maybe_root_job = self.root_scheduler.schedule_ranges(ranges, filter);
-        if maybe_root_job.is_err() {
-            schedule_action(Err(maybe_root_job.unwrap_err()));
+        if let Err(schedule_ranges_err) = maybe_root_job {
+            schedule_action(Err(schedule_ranges_err));
             return;
         }
         let mut root_job = maybe_root_job.unwrap();
@@ -854,8 +841,8 @@ impl DecodeBatchScheduler {
         trace!("Scheduled ranges refined to {} rows", rows_to_schedule);
         while rows_to_schedule > 0 {
             let maybe_next_scan_line = root_job.schedule_next(&mut context, num_rows_scheduled);
-            if maybe_next_scan_line.is_err() {
-                schedule_action(Err(maybe_next_scan_line.unwrap_err()));
+            if let Err(schedule_next_err) = maybe_next_scan_line {
+                schedule_action(Err(schedule_next_err));
                 return;
             }
             let next_scan_line = maybe_next_scan_line.unwrap();
@@ -885,7 +872,7 @@ impl DecodeBatchScheduler {
     ) -> Result<Vec<DecoderMessage>> {
         let mut decode_messages = Vec::new();
         self.do_schedule_ranges(ranges, filter, io, |msg| decode_messages.push(msg));
-        Ok(decode_messages.into_iter().collect::<Result<Vec<_>>>()?)
+        decode_messages.into_iter().collect::<Result<Vec<_>>>()
     }
 
     /// Schedules the load of a multiple ranges of rows
