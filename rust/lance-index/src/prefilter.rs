@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use async_trait::async_trait;
-use lance_core::utils::mask::RowIdMask;
+use lance_core::utils::mask::RowAddressMask;
 use lance_core::Result;
 
 /// A trait to be implemented by anything supplying a prefilter row id mask
@@ -10,7 +10,7 @@ use lance_core::Result;
 /// This trait is for internal use only and has no stability guarantees.
 #[async_trait]
 pub trait FilterLoader: Send + 'static {
-    async fn load(self: Box<Self>) -> Result<RowIdMask>;
+    async fn load(self: Box<Self>) -> Result<RowAddressMask>;
 }
 
 /// Filter out row ids that we know are not relevant to the query.

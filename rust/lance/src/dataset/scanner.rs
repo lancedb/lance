@@ -42,6 +42,7 @@ use log::debug;
 use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
+use super::rowids::get_row_id_index;
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
@@ -1433,7 +1434,20 @@ impl Scanner {
             (_, _, false) => PreFilterSource::None,
         };
 
-        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
+        let row_id_index = if self.dataset.manifest.uses_move_stable_row_ids() {
+            let index = get_row_id_index(&self.dataset).await?;
+            Some(index)
+        } else {
+            None
+        };
+
+        let inner_fanout_search = new_knn_exec(
+            self.dataset.clone(),
+            index,
+            q,
+            prefilter_source,
+            row_id_index,
+        )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -1556,7 +1570,7 @@ pub mod test_dataset {
     }
 
     impl TestVectorDataset {
-        pub async fn new(use_legacy_format: bool) -> Result<Self> {
+        pub async fn new(use_legacy_format: bool, stable_row_ids: bool) -> Result<Self> {
             let tmp_dir = tempdir()?;
             let path = tmp_dir.path().to_str().unwrap();
 
@@ -1602,7 +1616,9 @@ pub mod test_dataset {
 
             let params = WriteParams {
                 max_rows_per_group: 10,
+                max_rows_per_file: 200,
                 use_legacy_format,
+                enable_move_stable_row_ids: stable_row_ids,
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1802,7 +1818,7 @@ mod test {
 
     #[tokio::test]
     async fn test_filter_parsing() -> Result<()> {
-        let test_ds = TestVectorDataset::new(true).await?;
+        let test_ds = TestVectorDataset::new(true, false).await?;
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -1836,7 +1852,7 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_limit(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await?;
+        let test_ds = TestVectorDataset::new(use_legacy_format, false).await?;
         let dataset = &test_ds.dataset;
 
         let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
@@ -1853,9 +1869,14 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_nodes(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_knn_nodes(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         for build_index in &[true, false] {
-            let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+            let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+                .await
+                .unwrap();
             if *build_index {
                 test_ds.make_vector_index().await.unwrap();
             }
@@ -1908,8 +1929,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_new_data(#[values(false, true)] use_legacy_format: bool) {
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_new_data(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -1988,8 +2014,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_prefilter(#[values(false, true)] use_legacy_format: bool) {
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_prefilter(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         let dataset = &test_ds.dataset;
 
@@ -2045,11 +2076,16 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_filter_new_data(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_knn_filter_new_data(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         // This test verifies that a filter (prefilter or postfilter) gets applied to the flat KNN results
         // in a combined KNN scan (a scan that combines results from an indexed ANN with an unindexed flat
         // search of new data)
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -2109,8 +2145,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_filter(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_filter(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2161,7 +2202,9 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_refine_factor(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2247,7 +2290,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
         // This test doesn't make sense for v2 files, there is no way to get an out-of-order scan
-        let test_ds = TestVectorDataset::new(/*use_legacy_format=*/ true)
+        let test_ds = TestVectorDataset::new(/*use_legacy_format=*/ true, false)
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
@@ -2508,7 +2551,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_ann_prefilter(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_ann_prefilter(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2530,6 +2576,8 @@ mod test {
 
         let write_params = WriteParams {
             use_legacy_format,
+            max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
+            enable_move_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2774,7 +2822,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_ann_with_deletion(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_ann_with_deletion(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
@@ -2817,6 +2868,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     use_legacy_format,
+                    enable_move_stable_row_ids: stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -3789,7 +3841,7 @@ mod test {
     #[tokio::test]
     async fn test_plans(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
         // Create a vector dataset
-        let mut dataset = TestVectorDataset::new(use_legacy_format).await?;
+        let mut dataset = TestVectorDataset::new(use_legacy_format, false).await?;
 
         // Scans
         // ---------------------------------------------------------------------

@@ -17,10 +17,11 @@ use futures::stream;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use lance_core::utils::mask::RowIdMask;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddressMask;
+use lance_core::utils::mask::RowAddressTreeMap;
 use lance_table::format::Fragment;
 use lance_table::format::Index;
+use lance_table::rowids::RowIdIndex;
 use roaring::RoaringBitmap;
 use tracing::instrument;
 use tracing::Instrument;
@@ -42,10 +43,11 @@ pub struct DatasetPreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await
     // these tasks only when we've done as much work as we can without them.
-    pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowIdTreeMap>>>>,
-    pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
+    pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowAddressTreeMap>>>>,
+    pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowAddressMask>>>,
     // When the tasks are finished this is the combined filter
-    pub(super) final_mask: Mutex<OnceCell<RowIdMask>>,
+    pub(super) final_mask: Mutex<OnceCell<RowAddressMask>>,
+    pub(super) row_id_index: Option<Arc<RowIdIndex>>,
 }
 
 impl DatasetPreFilter {
@@ -53,6 +55,7 @@ impl DatasetPreFilter {
         dataset: Arc<Dataset>,
         indices: &[Index],
         filter: Option<Box<dyn FilterLoader>>,
+        row_id_index: Option<Arc<RowIdIndex>>,
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
         if indices.iter().any(|idx| idx.fragment_bitmap.is_none()) {
@@ -70,6 +73,17 @@ impl DatasetPreFilter {
             deleted_ids,
             filtered_ids,
             final_mask: Mutex::new(OnceCell::new()),
+            row_id_index,
+        }
+    }
+
+    /// Map a row id to a row address.
+    fn row_id_to_address(&self, row_id: u64) -> Option<u64> {
+        if let Some(row_id_index) = &self.row_id_index {
+            row_id_index.get(row_id).map(|addr| addr.into())
+        } else {
+            // If there's no index, we can assume the ids are addresses.
+            Some(row_id)
         }
     }
 
@@ -78,7 +92,7 @@ impl DatasetPreFilter {
         dataset: Arc<Dataset>,
         missing_frags: Vec<u32>,
         frags_with_deletion_files: Vec<u32>,
-    ) -> Result<Arc<RowIdTreeMap>> {
+    ) -> Result<Arc<RowAddressTreeMap>> {
         let fragments = dataset.get_fragments();
         let frag_map: Arc<HashMap<u32, &FileFragment>> = Arc::new(HashMap::from_iter(
             fragments.iter().map(|frag| (frag.id() as u32, frag)),
@@ -101,7 +115,7 @@ impl DatasetPreFilter {
         let mut frag_id_deletion_vectors =
             stream::iter(frag_id_deletion_vectors).buffer_unordered(num_cpus::get());
 
-        let mut deleted_ids = RowIdTreeMap::new();
+        let mut deleted_ids = RowAddressTreeMap::new();
         while let Some((id, deletion_vector)) = frag_id_deletion_vectors.try_next().await? {
             deleted_ids.insert_bitmap(id, deletion_vector);
         }
@@ -119,7 +133,7 @@ impl DatasetPreFilter {
     pub fn create_deletion_mask(
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
-    ) -> Option<BoxFuture<'static, Result<Arc<RowIdTreeMap>>>> {
+    ) -> Option<BoxFuture<'static, Result<Arc<RowAddressTreeMap>>>> {
         let mut missing_frags = Vec::new();
         let mut frags_with_deletion_files = Vec::new();
         let frag_map: HashMap<u32, &Fragment> = HashMap::from_iter(
@@ -167,7 +181,7 @@ impl PreFilter for DatasetPreFilter {
         }
         let final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_init(|| {
-            let mut combined = RowIdMask::default();
+            let mut combined = RowAddressMask::default();
             if let Some(filtered_ids) = &self.filtered_ids {
                 combined = combined & filtered_ids.get_ready();
             }
@@ -192,9 +206,13 @@ impl PreFilter for DatasetPreFilter {
     #[instrument(level = "debug", skip_all)]
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
         let final_mask = self.final_mask.lock().unwrap();
+        // TODO: can we optimize this?
+        let row_addrs = row_ids
+            .enumerate()
+            .filter_map(|(idx, &id)| self.row_id_to_address(id).map(|addr| (idx, addr)));
         final_mask
             .get()
             .expect("filter_row_ids called without call to wait_for_ready")
-            .selected_indices(row_ids)
+            .selected_indices(row_addrs)
     }
 }

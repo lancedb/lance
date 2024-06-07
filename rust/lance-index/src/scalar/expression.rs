@@ -11,7 +11,7 @@ use datafusion_expr::{expr::InList, Between, BinaryExpr, Expr, Operator};
 
 use futures::join;
 use lance_core::{
-    utils::mask::{RowIdMask, RowIdTreeMap},
+    utils::mask::{RowAddressMask, RowAddressTreeMap},
     Result,
 };
 use lance_datafusion::expr::safe_coerce_scalar;
@@ -216,7 +216,7 @@ impl ScalarIndexExpr {
     /// any situations where the session cache has been disabled.
     #[async_recursion]
     #[instrument(level = "debug", skip_all)]
-    pub async fn evaluate(&self, index_loader: &dyn ScalarIndexLoader) -> Result<RowIdMask> {
+    pub async fn evaluate(&self, index_loader: &dyn ScalarIndexLoader) -> Result<RowAddressMask> {
         match self {
             Self::Not(inner) => {
                 let result = inner.evaluate(index_loader).await?;
@@ -237,8 +237,8 @@ impl ScalarIndexExpr {
             Self::Query(column, query) => {
                 let index = index_loader.load_index(column).await?;
                 let allow_list = index.search(query).await?;
-                let allow_list = RowIdTreeMap::from_iter(allow_list.values().iter());
-                Ok(RowIdMask {
+                let allow_list = RowAddressTreeMap::from_iter(allow_list.values().iter());
+                Ok(RowAddressMask {
                     block_list: None,
                     allow_list: Some(allow_list),
                 })

@@ -465,7 +465,9 @@ mod test {
     #[tokio::test]
     async fn test_take_rows_out_of_bound(#[values(false, true)] use_legacy_format: bool) {
         // a dataset with 1 fragment and 400 rows
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+            .await
+            .unwrap();
         let ds = test_ds.dataset;
 
         // take the last row of first fragment

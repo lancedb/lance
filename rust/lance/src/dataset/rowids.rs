@@ -67,8 +67,6 @@ pub fn load_row_id_sequences<'a>(
         .buffer_unordered(num_cpus::get())
 }
 
-// TODO: remove allow unused once we start using this in query and take paths.
-#[allow(unused)]
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Arc<lance_table::rowids::RowIdIndex>> {
     // The path here isn't real, it's just used to prevent collisions in the cache.
     let path = dataset

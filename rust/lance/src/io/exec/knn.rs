@@ -26,13 +26,14 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
+use lance_core::utils::mask::{RowAddressMask, RowAddressTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
+use lance_table::rowids::RowIdIndex;
 use log::warn;
 use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
@@ -44,11 +45,13 @@ use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
+use lance_arrow::*;
 
 /// KNN node for post-filtering.
 pub struct KNNFlatStream {
     rx: Receiver<DataFusionResult<RecordBatch>>,
     bg_thread: Option<JoinHandle<()>>,
+    output_schema: SchemaRef,
 }
 
 impl KNNFlatStream {
@@ -61,6 +64,18 @@ impl KNNFlatStream {
 
     fn from_stream(stream: impl RecordBatchStream + 'static, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
+
+        // flat_search() appends a distance column to the input schema. The input
+        // may already have a distance column (possibly in the wrong position), so
+        // we need to remove it before adding a new one.
+        let mut output_schema = stream.schema().as_ref().clone();
+        if output_schema.column_with_name(DIST_COL).is_some() {
+            output_schema = output_schema.without_column(DIST_COL);
+        }
+        output_schema = output_schema
+            .try_with_column(Field::new(DIST_COL, DataType::Float32, true))
+            .unwrap();
+        let output_schema = Arc::new(output_schema);
 
         let q = query.clone();
         let bg_thread = tokio::spawn(
@@ -90,6 +105,7 @@ impl KNNFlatStream {
         Self {
             rx,
             bg_thread: Some(bg_thread),
+            output_schema,
         }
     }
 }
@@ -125,10 +141,7 @@ impl Stream for KNNFlatStream {
 
 impl DFRecordBatchStream for KNNFlatStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new(DIST_COL, DataType::Float32, true),
-            ROW_ID_FIELD.clone(),
-        ]))
+        self.output_schema.clone()
     }
 }
 
@@ -274,24 +287,42 @@ impl ExecutionPlan for KNNFlatExec {
 }
 
 // Utility to convert an input (containing row ids) into a prefilter
-struct FilteredRowIdsToPrefilter(SendableRecordBatchStream);
+struct FilteredRowIdsToPrefilter {
+    input: SendableRecordBatchStream,
+    row_id_index: Option<Arc<RowIdIndex>>,
+}
 
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
-        let mut allow_list = RowIdTreeMap::new();
-        while let Some(batch) = self.0.next().await {
+    async fn load(mut self: Box<Self>) -> Result<RowAddressMask> {
+        let mut allow_list = RowAddressTreeMap::new();
+        while let Some(batch) = self.input.next().await {
             let batch = batch?;
             let row_ids = batch.column_by_name(ROW_ID).expect(
                 "input batch missing row id column even though it is in the schema for the stream",
             );
-            let row_ids = row_ids
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("row id column in input batch had incorrect type");
-            allow_list.extend(row_ids.iter().flatten())
+            let row_addrs: Box<dyn Iterator<Item = u64>> = if let Some(index) = &self.row_id_index {
+                Box::new(
+                    row_ids
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .expect("row id column in input batch had incorrect type")
+                        .iter()
+                        .filter_map(|id| id.and_then(|id| index.get(id).map(|addr| addr.into()))),
+                )
+            } else {
+                Box::new(
+                    row_ids
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .expect("row id column in input batch had incorrect type")
+                        .iter()
+                        .flatten(),
+                )
+            };
+            allow_list.extend(row_addrs)
         }
-        Ok(RowIdMask::from_allowed(allow_list))
+        Ok(RowAddressMask::from_allowed(allow_list))
     }
 }
 
@@ -300,7 +331,7 @@ struct SelectionVectorToPrefilter(SendableRecordBatchStream);
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
+    async fn load(mut self: Box<Self>) -> Result<RowAddressMask> {
         let batch = self
             .0
             .try_next()
@@ -310,7 +341,7 @@ impl FilterLoader for SelectionVectorToPrefilter {
                 location: location!(),
             })
             .unwrap();
-        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
+        RowAddressMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
             Error::Internal {
                 message: format!(
                     "Expected selection vector input to yield binary arrays but got {}",
@@ -324,8 +355,8 @@ impl FilterLoader for SelectionVectorToPrefilter {
 
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {
-    /// The prefilter input is an array of row ids that match the filter condition
-    FilteredRowIds(Arc<dyn ExecutionPlan>),
+    /// The prefilter input is an array of row addresses that match the filter condition
+    FilteredRowIds(Arc<dyn ExecutionPlan>), // TODO: should this be addresses?
     /// The prefilter input is a selection vector from an index query
     ScalarIndexQuery(Arc<dyn ExecutionPlan>),
     /// There is no prefilter
@@ -349,6 +380,7 @@ pub fn new_knn_exec(
     indices: &[Index],
     query: &Query,
     prefilter_source: PreFilterSource,
+    row_id_index: Option<Arc<RowIdIndex>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
@@ -362,6 +394,7 @@ pub fn new_knn_exec(
         Arc::new(indices.to_vec()),
         query.clone(),
         prefilter_source,
+        row_id_index,
     )?;
 
     Ok(Arc::new(sub_index))
@@ -542,6 +575,8 @@ pub struct ANNIvfSubIndexExec {
 
     /// Datafusion Plan Properties
     properties: PlanProperties,
+
+    row_id_index: Option<Arc<RowIdIndex>>,
 }
 
 impl ANNIvfSubIndexExec {
@@ -551,6 +586,7 @@ impl ANNIvfSubIndexExec {
         indices: Arc<Vec<Index>>,
         query: Query,
         prefilter_source: PreFilterSource,
+        row_id_index: Option<Arc<RowIdIndex>>,
     ) -> Result<Self> {
         if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
             return Err(Error::Index {
@@ -573,6 +609,7 @@ impl ANNIvfSubIndexExec {
             query,
             prefilter_source,
             properties,
+            row_id_index,
         })
     }
 }
@@ -677,6 +714,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             })
             .try_flatten();
 
+        let row_id_index = self.row_id_index.clone();
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema.clone(),
             per_index_stream
@@ -693,12 +732,16 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         .unwrap()
                         .clone();
 
+                    let row_id_index = row_id_index.clone();
+
                     async move {
                         let prefilter_loader = match &prefilter_source {
                             PreFilterSource::FilteredRowIds(src_node) => {
                                 let stream = src_node.execute(partition, context.clone())?;
-                                Some(Box::new(FilteredRowIdsToPrefilter(stream))
-                                    as Box<dyn FilterLoader>)
+                                Some(Box::new(FilteredRowIdsToPrefilter {
+                                    input: stream,
+                                    row_id_index: row_id_index.clone(),
+                                }) as Box<dyn FilterLoader>)
                             }
                             PreFilterSource::ScalarIndexQuery(src_node) => {
                                 let stream = src_node.execute(partition, context.clone())?;
@@ -711,6 +754,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             ds.clone(),
                             &[index_meta],
                             prefilter_loader,
+                            row_id_index,
                         ));
 
                         let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
@@ -777,7 +821,6 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
-    use crate::arrow::*;
     use crate::dataset::WriteParams;
     use crate::io::exec::testing::TestingExec;
 
