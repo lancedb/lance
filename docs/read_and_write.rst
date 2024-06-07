@@ -469,10 +469,11 @@ During compaction, Lance can also remove deleted rows. Rewritten fragments will
 not have deletion files. This can improve scan performance since the soft deleted
 rows don't have to be skipped during the scan.
 
-When files are rewritten, the original row ids are invalidated. This means the
+When files are rewritten, the original row addresses are invalidated. This means the
 affected files are no longer part of any ANN index if they were before. Because
 of this, it's recommended to rewrite files before re-building indices.
 
+.. TODO: remove this last comment once move-stable row ids are default.
 
 Object Store Configuration
 --------------------------

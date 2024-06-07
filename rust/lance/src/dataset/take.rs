@@ -172,7 +172,7 @@ pub async fn take_rows(
             )
         })?;
 
-        let reader = fragment.open(projection.as_ref(), false).await?;
+        let reader = fragment.open(projection.as_ref(), false, false).await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_id_meta.sorted {
         // Don't need to re-arrange data, just concatenate

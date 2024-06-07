@@ -18,10 +18,9 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::ROW_ID_FIELD;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_encoding::decoder::DecoderMiddlewareChain;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
@@ -31,6 +30,7 @@ use lance_io::scheduler::ScanScheduler;
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
+use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
     wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
     RowIdAndDeletesConfig,
@@ -40,6 +40,7 @@ use snafu::{location, Location};
 use self::write::FragmentCreateBuilder;
 
 use super::hash_joiner::HashJoiner;
+use super::rowids::load_row_id_sequence;
 use super::scanner::Scanner;
 use super::updater::Updater;
 use super::WriteParams;
@@ -431,16 +432,33 @@ impl FileFragment {
     /// Parameters
     /// - `projection`: The projection schema.
     /// - `with_row_id`: If true, the row id will be included in the output.
+    /// - `with_row_address`: If true, the row address will be included in the output.
     ///
     /// `projection` may be an empty schema only if `with_row_id` is true. In that
     /// case, the reader will only be generating row ids.
-    pub async fn open(&self, projection: &Schema, with_row_id: bool) -> Result<FragmentReader> {
-        let open_files = self.open_readers(projection, with_row_id);
+    pub async fn open(
+        &self,
+        projection: &Schema,
+        with_row_id: bool,
+        with_row_address: bool,
+    ) -> Result<FragmentReader> {
+        let open_files = self.open_readers(projection, with_row_id, with_row_address);
         let deletion_vec_load =
             self.load_deletion_vector(&self.dataset.object_store, &self.metadata);
-        let (opened_files, deletion_vec) = join!(open_files, deletion_vec_load);
+
+        let row_id_load = if self.dataset.manifest.uses_move_stable_row_ids() {
+            futures::future::Either::Left(
+                load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
+            )
+        } else {
+            futures::future::Either::Right(futures::future::ready(Ok(None)))
+        };
+
+        let (opened_files, deletion_vec, row_id_sequence) =
+            join!(open_files, deletion_vec_load, row_id_load);
         let opened_files = opened_files?;
         let deletion_vec = deletion_vec?;
+        let row_id_sequence = row_id_sequence?;
 
         if opened_files.is_empty() {
             return Err(Error::io(
@@ -456,6 +474,7 @@ impl FileFragment {
         let mut reader = FragmentReader::try_new(
             self.id(),
             deletion_vec,
+            row_id_sequence,
             opened_files,
             ArrowSchema::from(projection),
             self.count_rows().await?,
@@ -464,6 +483,10 @@ impl FileFragment {
         if with_row_id {
             reader.with_row_id();
         }
+        if with_row_address {
+            reader.with_row_address();
+        }
+
         Ok(reader)
     }
 
@@ -476,6 +499,7 @@ impl FileFragment {
         data_file: &DataFile,
         projection: Option<&Schema>,
         with_row_id: bool,
+        with_row_address: bool,
     ) -> Result<Option<(Box<dyn GenericFileReader>, Arc<Schema>)>> {
         let full_schema = self.dataset.schema();
         // The data file may contain fields that are not part of the dataset any longer, remove those
@@ -486,7 +510,7 @@ impl FileFragment {
 
         if data_file.is_legacy_file() {
             let max_field_id = data_file.fields.iter().max().unwrap();
-            if with_row_id || !schema_per_file.fields.is_empty() {
+            if with_row_id || with_row_address || !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
                 let reader = FileReader::try_new_with_fragment_id(
@@ -543,12 +567,14 @@ impl FileFragment {
         &self,
         projection: &Schema,
         with_row_id: bool,
+        with_row_address: bool,
     ) -> Result<Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>> {
         let mut opened_files = vec![];
         for (i, data_file) in self.metadata.files.iter().enumerate() {
-            let with_row_id = with_row_id && i == 0;
+            // TODO: do we still need to do this?
+            let with_row_id = (with_row_id || with_row_address) && i == 0;
             if let Some((reader, schema)) = self
-                .open_reader(data_file, Some(projection), with_row_id)
+                .open_reader(data_file, Some(projection), with_row_id, with_row_address)
                 .await?
             {
                 opened_files.push((reader, schema));
@@ -643,7 +669,7 @@ impl FileFragment {
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
         let (reader, _) = self
-            .open_reader(some_file, None, false)
+            .open_reader(some_file, None, false, false)
             .await?
             .ok_or_else(|| Error::Internal {
                 message: format!(
@@ -737,7 +763,7 @@ impl FileFragment {
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
             let (reader, _) = self
-                .open_reader(data_file, None, false)
+                .open_reader(data_file, None, false, false)
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(
@@ -812,8 +838,8 @@ impl FileFragment {
                 }
             }
 
-            for row_id in deletion_vector {
-                if row_id >= *expected_length as u32 {
+            for offset in deletion_vector {
+                if offset >= *expected_length as u32 {
                     let deletion_file_meta = self.metadata.deletion_file.as_ref().unwrap();
                     return Err(Error::corrupt_file(
                         deletion_file_path(
@@ -821,7 +847,7 @@ impl FileFragment {
                             self.metadata.id,
                             deletion_file_meta,
                         ),
-                        format!("deletion vector contains row id that is out of range. Row id: {} Fragment length: {}", row_id, expected_length),
+                        format!("deletion vector contains an offset that is out of range. Offset: {} Fragment length: {}", offset, expected_length),
                         location!(),
                     ));
                 }
@@ -933,7 +959,8 @@ impl FileFragment {
         projection: &Schema,
         with_row_id: bool,
     ) -> Result<RecordBatch> {
-        let reader = self.open(projection, with_row_id).await?;
+        // TODO: support taking row addresses
+        let reader = self.open(projection, with_row_id, false).await?;
 
         if row_ids.len() > 1 && Self::row_ids_contiguous(row_ids) {
             let range = (row_ids[0] as usize)..(row_ids[row_ids.len() - 1] as usize + 1);
@@ -987,9 +1014,9 @@ impl FileFragment {
         if let Some(columns) = columns {
             schema = schema.project(columns)?;
         }
-        // If there is no projection, we are least need to read the row id
-        let with_row_id = schema.fields.is_empty();
-        let reader = self.open(&schema, with_row_id);
+        // If there is no projection, we at least need to read the row addresses
+        let with_row_addr = schema.fields.is_empty();
+        let reader = self.open(&schema, false, with_row_addr);
         let deletion_vector = read_deletion_file(
             &self.dataset.base,
             &self.metadata,
@@ -1032,7 +1059,7 @@ impl FileFragment {
 
         let starting_length = deletion_vector.len();
 
-        // scan with predicate and row ids
+        // scan with predicate and row addresses
         let mut scanner = self.scan();
 
         let predicate_lower = predicate.trim().to_lowercase();
@@ -1043,7 +1070,7 @@ impl FileFragment {
         }
 
         scanner
-            .with_row_id()
+            .with_row_address()
             .filter(predicate)?
             .project::<&str>(&[])?;
 
@@ -1060,18 +1087,18 @@ impl FileFragment {
             }
         }
 
-        // As we get row ids, add them into our deletion vector
+        // As we get row addrs, add them into our deletion vector
         scanner
             .try_into_stream()
             .await?
             .try_for_each(|batch| {
-                let array = batch[ROW_ID].clone();
+                let array = batch[ROW_ADDR].clone();
                 let int_array: &UInt64Array = as_primitive_array(array.as_ref());
 
-                // _row_id is global, not within fragment level. The high bits
+                // _rowaddr is global, not within fragment level. The high bits
                 // are the fragment_id, the low bits are the row_id within the
                 // fragment.
-                let local_row_ids = int_array.iter().map(|v| v.unwrap() as u32);
+                let local_row_ids = int_array.values().iter().map(|v| *v as u32);
 
                 deletion_vector.extend(local_row_ids);
                 futures::future::ready(Ok(()))
@@ -1161,11 +1188,19 @@ pub struct FragmentReader {
     /// The deleted row IDs
     deletion_vec: Option<Arc<DeletionVector>>,
 
+    /// The row id sequence
+    ///
+    /// Only populated if the move-stable row id feature is enabled.
+    row_id_sequence: Option<Arc<RowIdSequence>>,
+
     /// ID of the fragment
     fragment_id: usize,
 
     /// True if we should generate a row id for the output
     with_row_id: bool,
+
+    /// True if we should generate a row address column in output
+    with_row_addr: bool,
 
     /// If true, deleted rows will be set to null, which is fast
     /// If false, deleted rows will be removed from the batch, requiring a copy
@@ -1189,8 +1224,10 @@ impl Clone for FragmentReader {
                 .collect::<Vec<_>>(),
             output_schema: self.output_schema.clone(),
             deletion_vec: self.deletion_vec.clone(),
+            row_id_sequence: self.row_id_sequence.clone(),
             fragment_id: self.fragment_id,
             with_row_id: self.with_row_id,
+            with_row_addr: self.with_row_addr,
             make_deletions_null: self.make_deletions_null,
             num_rows: self.num_rows,
         }
@@ -1222,6 +1259,7 @@ impl FragmentReader {
     fn try_new(
         fragment_id: usize,
         deletion_vec: Option<Arc<DeletionVector>>,
+        row_id_sequence: Option<Arc<RowIdSequence>>,
         readers: Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>,
         output_schema: ArrowSchema,
         num_rows: usize,
@@ -1256,8 +1294,10 @@ impl FragmentReader {
             readers,
             output_schema,
             deletion_vec,
+            row_id_sequence,
             fragment_id,
             with_row_id: false,
+            with_row_addr: false,
             make_deletions_null: false,
             num_rows,
         })
@@ -1269,6 +1309,15 @@ impl FragmentReader {
             .output_schema
             .try_with_column(ROW_ID_FIELD.clone())
             .expect("Table already has a column named _rowid");
+        self
+    }
+
+    pub(crate) fn with_row_address(&mut self) -> &mut Self {
+        self.with_row_addr = true;
+        self.output_schema = self
+            .output_schema
+            .try_with_column(ROW_ADDR_FIELD.clone())
+            .expect("Table already has a column named _rowaddr");
         self
     }
 
@@ -1435,7 +1484,9 @@ impl FragmentReader {
             &RowIdAndDeletesConfig {
                 params: file_params,
                 deletion_vector: self.deletion_vec.clone(),
+                row_id_sequence: self.row_id_sequence.clone(),
                 with_row_id: self.with_row_id,
+                with_row_addr: self.with_row_addr,
                 make_deletions_null: self.make_deletions_null,
                 total_num_rows: first_reader.len() as u32,
             },
@@ -1445,6 +1496,9 @@ impl FragmentReader {
             let mut output_schema = ArrowSchema::from(projection);
             if self.with_row_id {
                 output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone())?;
+            }
+            if self.with_row_addr {
+                output_schema = output_schema.try_with_column(ROW_ADDR_FIELD.clone())?;
             }
             output_schema
         };
@@ -1471,78 +1525,67 @@ impl FragmentReader {
                 location!(),
             ));
         }
-        // If just the row id there is no need to actually read any data
+        // If just the row id or address there is no need to actually read any data
         // and we don't need to involve the readers at all.
         //
-        // TODO: This is somewhat redundant at the moment.  The `wrap_with_row_id_and_delete`
-        // function can handle empty (zero column) batches.  However, the v1 reader will
-        // not emit such batches and so we need this path.
+        // The v1 reader does not support reading batches with zero columns, so
+        // we need this as a separate code path.
+        // In these cases, we can just emit batches with zero columns and rely
+        // on `wrap_with_row_id_and_delete` to add the row id or address column.
         //
         // We could potentially delete the support for no-columns in the wrap function or
         // we can delete this path once we migrate away from any support of v1.
-        if self.with_row_id && self.output_schema.fields.len() == 1 {
-            let mut offsets = params
+        let merged = if self.with_row_addr as usize + self.with_row_id as usize
+            == self.output_schema.fields.len()
+        {
+            let selected_rows = params
                 .slice(0, total_num_rows as usize)
                 .unwrap()
                 .to_offsets()
-                .unwrap();
-            if let Some(deletion_vector) = self.deletion_vec.as_ref() {
-                // TODO: More efficient set subtraction
-                offsets = UInt32Array::from_iter_values(
-                    offsets
-                        .values()
-                        .iter()
-                        .copied()
-                        .filter(|row_offset| !deletion_vector.contains(*row_offset)),
-                );
-            }
-            let row_ids: Vec<u64> = offsets
-                .values()
-                .iter()
-                .map(|row_id| {
-                    u64::from(RowAddress::new_from_parts(self.fragment_id as u32, *row_id))
-                })
-                .collect();
-            let num_intact_rows = row_ids.len() as u32;
-            let row_ids_array = UInt64Array::from(row_ids);
-            let row_id_schema = Arc::new(self.output_schema.clone());
-            let tasks = (0..num_intact_rows)
+                .unwrap()
+                .len();
+            let tasks = (0..selected_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {
-                    let length = batch_size.min(num_intact_rows - offset);
-                    let array = Arc::new(row_ids_array.slice(offset as usize, length as usize));
-                    let batch = RecordBatch::try_new(row_id_schema.clone(), vec![array]);
-                    std::future::ready(batch.map_err(Error::from)).boxed()
+                    let num_rows = (batch_size as usize).min(selected_rows - offset);
+                    let batch = RecordBatch::from(StructArray::new_empty_fields(num_rows, None));
+                    ReadBatchTask {
+                        task: std::future::ready(Ok(batch)).boxed(),
+                        num_rows: num_rows as u32,
+                    }
                 });
-            return Ok(stream::iter(tasks).boxed());
-        }
-        // Read each data file, these reads should produce streams of equal sized
-        // tasks.  In other words, if we get 3 tasks of 20 rows and then a task
-        // of 10 rows from one data file we should get the same from the other.
-        let read_streams = self
-            .readers
-            .iter()
-            .filter_map(|(reader, schema)| {
-                // Normally we filter out empty readers in the open_readers method
-                // However, we will keep the first empty reader to use for row id
-                // purposes on some legacy paths and so we need to filter that out
-                // here.
-                if schema.fields.is_empty() {
-                    None
-                } else {
-                    Some(read_fn(reader.as_ref(), schema))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Merge the streams, this merges the generated batches
-        let merged = lance_table::utils::stream::merge_streams(read_streams);
+            stream::iter(tasks).boxed()
+        } else {
+            // Read each data file, these reads should produce streams of equal sized
+            // tasks.  In other words, if we get 3 tasks of 20 rows and then a task
+            // of 10 rows from one data file we should get the same from the other.
+            let read_streams = self
+                .readers
+                .iter()
+                .filter_map(|(reader, schema)| {
+                    // Normally we filter out empty readers in the open_readers method
+                    // However, we will keep the first empty reader to use for row id
+                    // purposes on some legacy paths and so we need to filter that out
+                    // here.
+                    if schema.fields.is_empty() {
+                        None
+                    } else {
+                        Some(read_fn(reader.as_ref(), schema))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Merge the streams, this merges the generated batches
+            lance_table::utils::stream::merge_streams(read_streams)
+        };
 
         // Add the row id column (if needed) and delete rows (if a deletion
         // vector is present).
         let config = RowIdAndDeletesConfig {
             deletion_vector: self.deletion_vec.clone(),
+            row_id_sequence: self.row_id_sequence.clone(),
             make_deletions_null: self.make_deletions_null,
             with_row_id: self.with_row_id,
+            with_row_addr: self.with_row_addr,
             params,
             total_num_rows,
         };
@@ -1631,6 +1674,7 @@ mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::ROW_ID;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
@@ -1797,7 +1841,10 @@ mod tests {
         assert_eq!(fragment.metadata.num_rows().unwrap(), 20);
 
         for with_row_id in [false, true] {
-            let reader = fragment.open(fragment.schema(), with_row_id).await.unwrap();
+            let reader = fragment
+                .open(fragment.schema(), with_row_id, false)
+                .await
+                .unwrap();
             for valid_range in [0..40, 20..40] {
                 reader
                     .read_range(valid_range, 100)
@@ -1821,7 +1868,7 @@ mod tests {
         dataset.delete("i >= 0 and i < 15").await.unwrap();
 
         let fragment = &dataset.get_fragments()[0];
-        let mut reader = fragment.open(dataset.schema(), true).await.unwrap();
+        let mut reader = fragment.open(dataset.schema(), true, false).await.unwrap();
         reader.with_make_deletions_null();
 
         // Since the first batch is all deleted, it will return an empty batch.
@@ -2320,7 +2367,7 @@ mod tests {
             .get_fragments()
             .first()
             .unwrap()
-            .open(dataset.schema(), false)
+            .open(dataset.schema(), false, false)
             .await?;
         let actual_data = reader.take_as_batch(&[0, 1, 2]).await?;
         assert_eq!(expected_data.slice(0, 3), actual_data);
@@ -2369,7 +2416,7 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         let reader = fragment
-            .open(&dataset.schema().project::<&str>(&[])?, true)
+            .open(&dataset.schema().project::<&str>(&[])?, true, false)
             .await?;
         let batch = reader.legacy_read_range_as_batch(0..20).await?;
 
@@ -2381,7 +2428,7 @@ mod tests {
 
         // We should get error if we pass empty schema and with_row_id false
         let res = fragment
-            .open(&dataset.schema().project::<&str>(&[])?, false)
+            .open(&dataset.schema().project::<&str>(&[])?, false, false)
             .await;
         assert!(matches!(res, Err(Error::IO { .. })));
 
