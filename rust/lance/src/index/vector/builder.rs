@@ -286,10 +286,10 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         let mut storage_writer = storage_writer.unwrap();
         let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
         storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
-        storage_writer.add_schema_metadata(
-            IVF_METADATA_KEY,
-            hex::encode(storage_ivf_pb.encode_to_vec()),
-        );
+        let ivf_buffer_pos = storage_writer
+            .add_global_buffer(storage_ivf_pb.encode_to_vec().into())
+            .await?;
+        storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         storage_writer.add_schema_metadata(
             Q::metadata_key(),
             self.quantizer.metadata(None)?.to_string(),
@@ -297,8 +297,10 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
 
         let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
         index_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
-        index_writer
-            .add_schema_metadata(IVF_METADATA_KEY, hex::encode(index_ivf_pb.encode_to_vec()));
+        let ivf_buffer_pos = index_writer
+            .add_global_buffer(index_ivf_pb.encode_to_vec().into())
+            .await?;
+        index_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
 
         storage_writer.finish().await?;
         index_writer.finish().await?;

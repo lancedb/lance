@@ -28,7 +28,6 @@ datafusion.workspace = true
 deepsize.workspace = true
 futures.workspace = true
 half.workspace = true
-hex.workspace = true
 itertools.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true

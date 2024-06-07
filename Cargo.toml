@@ -79,7 +79,6 @@ half = { "version" = "2.4.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
-hex = "0.4"
 bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"

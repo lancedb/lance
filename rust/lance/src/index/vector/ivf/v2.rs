@@ -105,18 +105,21 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
                 .as_str(),
         )?;
 
-        let ivf_pb_bytes =
-            hex::decode(index_reader.schema().metadata.get(IVF_METADATA_KEY).ok_or(
-                Error::Index {
-                    message: format!("{} not found", IVF_METADATA_KEY),
-                    location: location!(),
-                },
-            )?)
+        let ivf_pos = index_reader
+            .schema()
+            .metadata
+            .get(IVF_METADATA_KEY)
+            .ok_or(Error::Index {
+                message: format!("{} not found", IVF_METADATA_KEY),
+                location: location!(),
+            })?
+            .parse()
             .map_err(|e| Error::Index {
-                message: format!("Failed to decode IVF metadata: {}", e),
+                message: format!("Failed to decode IVF position: {}", e),
                 location: location!(),
             })?;
-        let ivf = Ivf::try_from(&pb::Ivf::decode(ivf_pb_bytes.as_ref())?)?;
+        let ivf_pb_bytes = index_reader.read_global_buffer(ivf_pos).await?;
+        let ivf = Ivf::try_from(&pb::Ivf::decode(ivf_pb_bytes)?)?;
 
         let storage_reader = FileReader::try_open(
             scheduler
