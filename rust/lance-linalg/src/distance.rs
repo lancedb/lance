@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_array::{Array, Float32Array};
 use arrow_schema::ArrowError;
 
 pub mod cosine;
@@ -22,6 +22,7 @@ pub mod norm_l2;
 pub use cosine::*;
 use deepsize::DeepSizeOf;
 pub use dot::*;
+use hamming::hamming_distance_arrow_batch;
 pub use l2::*;
 pub use norm_l2::*;
 
@@ -43,7 +44,7 @@ pub type MetricType = DistanceType;
 
 pub type DistanceFunc<T> = fn(&[T], &[T]) -> f32;
 pub type BatchDistanceFunc = fn(&[f32], &[f32], usize) -> Arc<Float32Array>;
-pub type ArrowBatchDistanceFunc = fn(&dyn Array, &FixedSizeListArray) -> Result<Arc<Float32Array>>;
+pub type ArrowBatchDistanceFunc = fn(&dyn Array, &dyn Array) -> Result<Arc<Float32Array>>;
 
 impl DistanceType {
     /// Compute the distance from one vector to a batch of vectors.
@@ -54,7 +55,7 @@ impl DistanceType {
             Self::L2 => l2_distance_arrow_batch,
             Self::Cosine => cosine_distance_arrow_batch,
             Self::Dot => dot_distance_arrow_batch,
-            Self::Hamming => todo!(),
+            Self::Hamming => hamming_distance_arrow_batch,
         }
     }
 

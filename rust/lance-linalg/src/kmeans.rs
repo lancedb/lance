@@ -8,7 +8,6 @@
 //! ``Cosine`` distance are calculated by normalizing the vectors to unit length,
 //! and run ``l2`` distance on the unit vectors.
 //!
-
 use std::collections::HashMap;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
@@ -23,12 +22,13 @@ use arrow_array::{ArrowNumericType, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
 use bitvec::prelude::*;
+use lance_arrow::ArrowFloatType;
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
 
-use crate::distance::hamming::hamming;
+use crate::distance::hamming::{hamming, hamming_distance_batch};
 use crate::distance::{dot_distance_batch, DistanceType};
 use crate::kernels::argmax;
 use crate::{
@@ -170,7 +170,7 @@ fn hist_stddev(k: usize, membership: &[Option<u32>]) -> f32 {
         .sqrt()
 }
 
-trait KMeansAlgo<T: Num> {
+pub trait KMeansAlgo<T: Num> {
     /// Recompute the membership of each vector.
     ///
     /// Parameters:
@@ -194,9 +194,9 @@ trait KMeansAlgo<T: Num> {
     ) -> KMeans;
 }
 
-struct KMeansAlgoFloat<T: ArrowNumericType>
+pub struct KMeansAlgoFloat<T: ArrowNumericType>
 where
-    T::Native: Float + Num,
+    T::Native: Num,
 {
     phantom_data: std::marker::PhantomData<T>,
 }
@@ -297,7 +297,7 @@ where
     }
 }
 
-struct KModeAlgo {}
+pub struct KModeAlgo {}
 
 impl KMeansAlgo<u8> for KModeAlgo {
     fn compute_membership_and_loss(
@@ -578,24 +578,30 @@ pub fn kmeans_find_partitions_arrow_array(
     }
 
     match (centroids.value_type(), query.data_type()) {
-        (DataType::Float16, DataType::Float16) => Ok(kmeans_find_partitions(
+        (DataType::Float16, DataType::Float16) => kmeans_find_partitions_float::<Float16Type>(
             centroids.values().as_primitive::<Float16Type>().values(),
             query.as_primitive::<Float16Type>().values(),
             nprobes,
             distance_type,
-        )?),
-        (DataType::Float32, DataType::Float32) => Ok(kmeans_find_partitions(
+        ),
+        (DataType::Float32, DataType::Float32) => kmeans_find_partitions_float::<Float32Type>(
             centroids.values().as_primitive::<Float32Type>().values(),
             query.as_primitive::<Float32Type>().values(),
             nprobes,
             distance_type,
-        )?),
-        (DataType::Float64, DataType::Float64) => Ok(kmeans_find_partitions(
+        ),
+        (DataType::Float64, DataType::Float64) => kmeans_find_partitions_float::<Float64Type>(
             centroids.values().as_primitive::<Float64Type>().values(),
             query.as_primitive::<Float64Type>().values(),
             nprobes,
             distance_type,
-        )?),
+        ),
+        (DataType::UInt8, DataType::UInt8) => kmeans_find_partitions_binary(
+            centroids.values().as_primitive::<UInt8Type>().values(),
+            query.as_primitive::<UInt8Type>().values(),
+            nprobes,
+            distance_type,
+        ),
         _ => Err(ArrowError::InvalidArgumentError(format!(
             "Centroids and vectors have different types: {} != {}",
             centroids.value_type(),
@@ -615,15 +621,39 @@ pub fn kmeans_find_partitions_arrow_array(
 /// This function allows to conduct kmeans search without constructing
 /// `Arrow Array` or `Vec<Float>` types.
 ///
-pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
-    centroids: &[T],
-    query: &[T],
+pub fn kmeans_find_partitions_float<T: ArrowFloatType>(
+    centroids: &[T::Native],
+    query: &[T::Native],
+    nprobes: usize,
+    distance_type: DistanceType,
+) -> Result<UInt32Array>
+where
+    T::Native: Float + L2 + Dot,
+{
+    let dists: Vec<f32> = match distance_type {
+        DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
+        DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
+        _ => {
+            panic!(
+                "KMeans::find_partitions: {} is not supported",
+                distance_type
+            );
+        }
+    };
+
+    // TODO: use heap to just keep nprobes smallest values.
+    let dists_arr = Float32Array::from(dists);
+    sort_to_indices(&dists_arr, None, Some(nprobes))
+}
+
+pub fn kmeans_find_partitions_binary(
+    centroids: &[u8],
+    query: &[u8],
     nprobes: usize,
     distance_type: DistanceType,
 ) -> Result<UInt32Array> {
     let dists: Vec<f32> = match distance_type {
-        DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
-        DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
+        DistanceType::Hamming => hamming_distance_batch(query, centroids, query.len()).collect(),
         _ => {
             panic!(
                 "KMeans::find_partitions: {} is not supported",
@@ -648,27 +678,48 @@ pub fn compute_partitions_arrow_array(
             "Centroids and vectors have different dimensions".to_string(),
         ));
     }
-    match (centroids.value_type(), vectors.value_type()) {
-        (DataType::Float16, DataType::Float16) => Ok(compute_partitions(
-            centroids.values().as_primitive::<Float16Type>().values(),
-            vectors.values().as_primitive::<Float16Type>().values(),
+    if centroids.value_type() != vectors.value_type() {
+        return Err(ArrowError::InvalidArgumentError(
+            "Centroids and vectors have different types".to_string(),
+        ));
+    }
+
+    match centroids.value_type() {
+        DataType::Float16 => Ok(compute_partitions::<
+            Float16Type,
+            KMeansAlgoFloat<Float16Type>,
+        >(
+            centroids.values().as_primitive(),
+            vectors.values().as_primitive(),
             centroids.value_length(),
             distance_type,
         )),
-        (DataType::Float32, DataType::Float32) => Ok(compute_partitions(
-            centroids.values().as_primitive::<Float32Type>().values(),
-            vectors.values().as_primitive::<Float32Type>().values(),
+        DataType::Float32 => Ok(compute_partitions::<
+            Float32Type,
+            KMeansAlgoFloat<Float32Type>,
+        >(
+            centroids.values().as_primitive(),
+            vectors.values().as_primitive(),
             centroids.value_length(),
             distance_type,
         )),
-        (DataType::Float64, DataType::Float64) => Ok(compute_partitions(
-            centroids.values().as_primitive::<Float64Type>().values(),
-            vectors.values().as_primitive::<Float64Type>().values(),
+        DataType::Float64 => Ok(compute_partitions::<
+            Float64Type,
+            KMeansAlgoFloat<Float64Type>,
+        >(
+            centroids.values().as_primitive(),
+            vectors.values().as_primitive(),
+            centroids.value_length(),
+            distance_type,
+        )),
+        DataType::UInt8 => Ok(compute_partitions::<UInt8Type, KModeAlgo>(
+            centroids.values().as_primitive(),
+            vectors.values().as_primitive(),
             centroids.value_length(),
             distance_type,
         )),
         _ => Err(ArrowError::InvalidArgumentError(
-            "Centroids and vectors have different types".to_string(),
+            "Centroids and vectors have unsupported types".to_string(),
         )),
     }
 }
@@ -676,29 +727,23 @@ pub fn compute_partitions_arrow_array(
 /// Compute partition ID of each vector in the KMeans.
 ///
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.
-pub fn compute_partitions<T: Float + L2 + Dot + Sync>(
-    centroids: &[T],
-    vectors: &[T],
+pub fn compute_partitions<T: ArrowNumericType, K: KMeansAlgo<T::Native>>(
+    centroids: &PrimitiveArray<T>,
+    vectors: &PrimitiveArray<T>,
     dimension: impl AsPrimitive<usize>,
     distance_type: DistanceType,
-) -> Vec<Option<u32>> {
+) -> Vec<Option<u32>>
+where
+    T::Native: Num,
+{
     let dimension = dimension.as_();
-    vectors
-        .par_chunks(dimension)
-        .map(|vec| {
-            argmin_value(match distance_type {
-                DistanceType::L2 => l2_distance_batch(vec, centroids, dimension),
-                DistanceType::Dot => dot_distance_batch(vec, centroids, dimension),
-                _ => {
-                    panic!(
-                        "KMeans::find_partitions: {} is not supported",
-                        distance_type
-                    );
-                }
-            })
-            .map(|(idx, _)| idx)
-        })
-        .collect::<Vec<_>>()
+    let (membership, _) = K::compute_membership_and_loss(
+        centroids.values(),
+        vectors.values(),
+        dimension,
+        distance_type,
+    );
+    membership
 }
 
 #[cfg(test)]
@@ -742,7 +787,12 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let actual = compute_partitions(centroids.values(), data.values(), DIM, DistanceType::L2);
+        let actual = compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+            &centroids,
+            &data,
+            DIM,
+            DistanceType::L2,
+        );
         assert_eq!(expected, actual);
     }
 
@@ -772,11 +822,16 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
 
-        compute_partitions::<f32>(centroids.values(), values.values(), DIM, DistanceType::L2)
-            .iter()
-            .for_each(|cd| {
-                assert!(cd.is_none());
-            });
+        compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+            &centroids,
+            &values,
+            DIM,
+            DistanceType::L2,
+        )
+        .iter()
+        .for_each(|cd| {
+            assert!(cd.is_none());
+        });
     }
 
     #[tokio::test]

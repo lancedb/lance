@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow_array::{
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array,
+    Array, Float32Array,
 };
 use arrow_schema::DataType;
 use half::{bf16, f16};
@@ -226,24 +226,23 @@ pub fn l2_distance_batch<'a, T: L2>(
 
 fn do_l2_distance_arrow_batch<T: ArrowFloatType>(
     from: &T::ArrayType,
-    to: &FixedSizeListArray,
+    to: &dyn Array,
 ) -> Result<Arc<Float32Array>>
 where
     T::Native: L2,
 {
-    let dimension = to.value_length() as usize;
+    let dimension = from.len();
     debug_assert_eq!(from.len(), dimension);
 
     // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values =
-        to.values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::ComputeError(format!(
-                "Cannot downcast to the same type: {} != {}",
-                T::FLOAT_TYPE,
-                to.value_type()
-            )))?;
+    let to_values = to
+        .as_any()
+        .downcast_ref::<T::ArrayType>()
+        .ok_or(Error::ComputeError(format!(
+            "Cannot downcast to the same type: {} != {}",
+            T::FLOAT_TYPE,
+            to.data_type()
+        )))?;
     let dists = l2_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
 
     Ok(Arc::new(Float32Array::new(
@@ -264,10 +263,7 @@ where
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn l2_distance_arrow_batch(
-    from: &dyn Array,
-    to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>> {
+pub fn l2_distance_arrow_batch(from: &dyn Array, to: &dyn Array) -> Result<Arc<Float32Array>> {
     match *from.data_type() {
         DataType::Float16 => do_l2_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
         DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
@@ -284,6 +280,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
+    use arrow_array::FixedSizeListArray;
     use num_traits::ToPrimitive;
     use proptest::prelude::*;
 

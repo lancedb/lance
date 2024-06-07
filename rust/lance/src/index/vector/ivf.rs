@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_struct_array, AsArray},
@@ -54,12 +55,9 @@ use lance_io::{
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
+use lance_linalg::kernels::{normalize_arrow, normalize_fsl};
 use lance_linalg::{
-    distance::Normalize,
-    kernels::{normalize_arrow, normalize_fsl},
-};
-use lance_linalg::{
-    distance::{DistanceType, Dot, MetricType, L2},
+    distance::{DistanceType, MetricType},
     MatrixView,
 };
 use log::{debug, info};
@@ -209,34 +207,6 @@ impl IVFIndex {
         } else {
             Ok(query.clone())
         }
-    }
-
-    pub(crate) async fn search_in_partition(
-        &self,
-        partition_id: usize,
-        query: &Query,
-        pre_filter: Arc<dyn PreFilter>,
-    ) -> Result<RecordBatch> {
-        let part_index = self.load_partition(partition_id, true).await?;
-
-        let query = self.preprocess_query(partition_id, query)?;
-        let batch = part_index.search(&query, pre_filter).await?;
-        Ok(batch)
-    }
-
-    /// find the IVF partitions ids given the query vector.
-    ///
-    /// Internal API with no stability guarantees.
-    ///
-    /// Assumes the query vector is normalized if the metric type is cosine.
-    pub fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
-        let mt = if self.metric_type == MetricType::Cosine {
-            MetricType::L2
-        } else {
-            self.metric_type
-        };
-
-        self.ivf.find_partitions(&query.key, query.nprobes, mt)
     }
 }
 
@@ -711,6 +681,19 @@ impl VectorIndex for IVFIndex {
         Ok(as_struct_array(&taken_distances).into())
     }
 
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        let part_index = self.load_partition(partition_id, true).await?;
+
+        let query = self.preprocess_query(partition_id, query)?;
+        let batch = part_index.search(&query, pre_filter).await?;
+        Ok(batch)
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
@@ -733,6 +716,21 @@ impl VectorIndex for IVFIndex {
             message: "Flat index does not support load".to_string(),
             location: location!(),
         })
+    }
+
+    /// find the IVF partitions ids given the query vector.
+    ///
+    /// Internal API with no stability guarantees.
+    ///
+    /// Assumes the query vector is normalized if the metric type is cosine.
+    fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+        let mt = if self.metric_type == MetricType::Cosine {
+            MetricType::L2
+        } else {
+            self.metric_type
+        };
+
+        self.ivf.find_partitions(&query.key, query.nprobes, mt)
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
@@ -1611,28 +1609,75 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-async fn do_train_ivf_model<T: ArrowFloatType + 'static>(
-    data: &T::ArrayType,
+async fn do_train_ivf_model(
+    data: &FixedSizeListArray,
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
-) -> Result<Ivf>
-where
-    T::Native: Dot + L2 + Normalize,
-{
+) -> Result<Ivf> {
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
-    let centroids = lance_index::vector::kmeans::train_kmeans::<T>(
-        data,
-        dimension,
-        params.num_partitions,
-        params.max_iters as u32,
-        REDOS,
-        rng,
-        metric_type,
-        params.sample_rate,
-    )
-    .await?;
+    let centroids = match data.value_type() {
+        DataType::Float16 => {
+            lance_index::vector::kmeans::train_kmeans_v2::<Float16Type>(
+                data.values().as_primitive(),
+                dimension,
+                params.num_partitions,
+                params.max_iters as u32,
+                REDOS,
+                rng,
+                metric_type,
+                params.sample_rate,
+            )
+            .await?
+        }
+        DataType::Float32 => {
+            lance_index::vector::kmeans::train_kmeans_v2::<Float32Type>(
+                data.values().as_primitive(),
+                dimension,
+                params.num_partitions,
+                params.max_iters as u32,
+                REDOS,
+                rng,
+                metric_type,
+                params.sample_rate,
+            )
+            .await?
+        }
+        DataType::Float64 => {
+            lance_index::vector::kmeans::train_kmeans_v2::<Float64Type>(
+                data.values().as_primitive(),
+                dimension,
+                params.num_partitions,
+                params.max_iters as u32,
+                REDOS,
+                rng,
+                metric_type,
+                params.sample_rate,
+            )
+            .await?
+        }
+        DataType::UInt8 => {
+            lance_index::vector::kmeans::train_kmeans_v2::<UInt8Type>(
+                data.values().as_primitive(),
+                dimension,
+                params.num_partitions,
+                params.max_iters as u32,
+                REDOS,
+                rng,
+                metric_type,
+                params.sample_rate,
+            )
+            .await?
+        }
+        _ => {
+            return Err(Error::Index {
+                message: "Unsupported data type".to_string(),
+                location: location!(),
+            })
+        }
+    };
+
     Ok(Ivf::new(FixedSizeListArray::try_new_from_values(
         centroids,
         dimension as i32,
@@ -1649,29 +1694,8 @@ async fn train_ivf_model(
         distance_type != DistanceType::Cosine,
         "Cosine metric should be done by normalized L2 distance",
     );
-    let values = data.values();
     let dim = data.value_length() as usize;
-    match (values.data_type(), distance_type) {
-        (DataType::Float16, _) => {
-            do_train_ivf_model::<Float16Type>(values.as_primitive(), dim, distance_type, params)
-                .await
-        }
-        (DataType::Float32, _) => {
-            do_train_ivf_model::<Float32Type>(values.as_primitive(), dim, distance_type, params)
-                .await
-        }
-        (DataType::Float64, _) => {
-            do_train_ivf_model::<Float64Type>(values.as_primitive(), dim, distance_type, params)
-                .await
-        }
-        // (DataType::UInt8, DistanceType::Hamming) => {
-        //     do_train_ivf_model::<UInt8Type>(values.as_primitive(), dim, distance_type, params).await
-        // }
-        _ => Err(Error::Index {
-            message: "Unsupported data type".to_string(),
-            location: location!(),
-        }),
-    }
+    do_train_ivf_model(data, dim, distance_type, params).await
 }
 
 #[cfg(test)]
@@ -1683,8 +1707,9 @@ mod tests {
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
-    use arrow_array::{RecordBatchIterator, RecordBatchReader, UInt64Array};
+    use arrow_array::{Float16Array, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::Field;
+    use half::prelude::f16;
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
@@ -2341,7 +2366,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float16Array::from_iter_values(repeat(f16::from_f32(0.5)).take(DIM)),
                 5,
             )
             .unwrap()
@@ -2409,7 +2434,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float16Array::from_iter_values(repeat(f16::from_f32(0.5)).take(DIM)),
                 5,
             )
             .unwrap()

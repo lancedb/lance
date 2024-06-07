@@ -57,6 +57,7 @@ futures.workspace = true
 uuid.workspace = true
 arrow.workspace = true
 num_cpus.workspace = true
+num-traits.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion.workspace = true
 datafusion-functions.workspace = true

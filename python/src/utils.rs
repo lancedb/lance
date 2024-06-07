@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use arrow::compute::{concat, concat_batches};
+use arrow::datatypes::Float32Type;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{
     cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array, UInt64Array,
@@ -28,7 +29,7 @@ use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HNSW},
     storage::VectorStore,
 };
-use lance_linalg::kmeans::compute_partitions;
+use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_linalg::{
     distance::DistanceType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
@@ -109,9 +110,12 @@ impl KMeans {
         };
         let values: Arc<Float32Array> = fixed_size_arr.values().as_primitive().clone().into();
         let centroids: &Float32Array = kmeans.centroids.as_primitive();
-        let cluster_ids = UInt32Array::from(compute_partitions(
-            centroids.values(),
-            values.values(),
+        let cluster_ids = UInt32Array::from(compute_partitions::<
+            Float32Type,
+            KMeansAlgoFloat<Float32Type>,
+        >(
+            centroids,
+            values.as_ref(),
             kmeans.dimension,
             kmeans.distance_type,
         ));

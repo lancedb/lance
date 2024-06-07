@@ -178,21 +178,6 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
         Ok(part_index)
     }
 
-    async fn search_in_partition(
-        &self,
-        partition_id: usize,
-        query: &Query,
-        pre_filter: Arc<dyn PreFilter>,
-    ) -> Result<RecordBatch> {
-        let part_index = self.load_partition(partition_id, true).await?;
-
-        let query = self.preprocess_query(partition_id, query)?;
-        let storage = self.storage.load_partition(partition_id).await?;
-        let param = (&query).into();
-        pre_filter.wait_for_ready().await?;
-        part_index.search(query.key, query.k, param, &storage, pre_filter)
-    }
-
     /// preprocess the query vector given the partition id.
     ///
     /// Internal API with no stability guarantees.
@@ -206,16 +191,6 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
         } else {
             Ok(query.clone())
         }
-    }
-
-    pub fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
-        let dt = if self.distance_type == DistanceType::Cosine {
-            DistanceType::L2
-        } else {
-            self.distance_type
-        };
-
-        self.ivf.find_partitions(&query.key, query.nprobes, dt)
     }
 }
 
@@ -267,6 +242,7 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
     for IVFIndex<I, Q>
 {
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+        pre_filter.wait_for_ready().await?;
         let mut query = query.clone();
         if self.distance_type == DistanceType::Cosine {
             let key = normalize_arrow(&query.key)?;
@@ -301,6 +277,21 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         Ok(as_struct_array(&taken_distances).into())
     }
 
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        let part_index = self.load_partition(partition_id, true).await?;
+
+        let query = self.preprocess_query(partition_id, query)?;
+        let storage = self.storage.load_partition(partition_id).await?;
+        let param = (&query).into();
+        pre_filter.wait_for_ready().await?;
+        part_index.search(query.key, query.k, param, &storage, pre_filter)
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
@@ -311,6 +302,16 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
 
     fn check_can_remap(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+        let dt = if self.distance_type == DistanceType::Cosine {
+            DistanceType::L2
+        } else {
+            self.distance_type
+        };
+
+        self.ivf.find_partitions(&query.key, query.nprobes, dt)
     }
 
     async fn load(
@@ -349,21 +350,34 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, ops::Range, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        ops::Range,
+        sync::Arc,
+    };
 
-    use arrow::{array::AsArray, datatypes::Float32Type};
-    use arrow_array::{Array, FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow::{
+        array::AsArray,
+        datatypes::{ArrowPrimitiveType, Float32Type, UInt64Type, UInt8Type},
+    };
+    use arrow_array::{
+        Array, FixedSizeListArray, PrimitiveArray, RecordBatch, RecordBatchIterator,
+    };
     use arrow_schema::{DataType, Field, Schema};
+    use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
+    use lance_core::ROW_ID;
     use lance_index::DatasetIndexExt;
     use lance_linalg::distance::DistanceType;
-    use lance_testing::datagen::generate_random_array_with_range;
+    use lance_testing::datagen::{
+        generate_random_array_with_range, generate_random_u8_array_with_range,
+    };
     use tempfile::tempdir;
 
     use crate::{index::vector::VectorIndexParams, Dataset};
 
-    const DIM: usize = 32;
+    const DIM: usize = 512 / 8;
 
     async fn generate_test_dataset(
         test_uri: &str,
@@ -392,20 +406,43 @@ mod tests {
         (dataset, array)
     }
 
-    #[allow(dead_code)]
-    fn ground_truth(
+    async fn generate_u8_test_dataset(
+        test_uri: &str,
+        range: Range<u8>,
+    ) -> (Dataset, Arc<FixedSizeListArray>) {
+        let vectors = generate_random_u8_array_with_range(5_000 * DIM, range);
+        let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
+            .into_iter()
+            .collect();
+
+        let schema: Arc<_> = Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                DIM as i32,
+            ),
+            true,
+        )])
+        .with_metadata(metadata)
+        .into();
+        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        (dataset, array)
+    }
+
+    fn ground_truth<T: ArrowPrimitiveType>(
         vectors: &FixedSizeListArray,
-        query: &[f32],
+        query: &PrimitiveArray<T>,
         k: usize,
         distance_type: DistanceType,
     ) -> Vec<(f32, u64)> {
         let mut dists = vec![];
         for i in 0..vectors.len() {
-            let dist = distance_type.func()(
-                query,
-                vectors.value(i).as_primitive::<Float32Type>().values(),
-            );
-            dists.push((dist, i as u64));
+            let dist = distance_type.arrow_batch_func()(query, vectors.value(i).as_ref()).unwrap();
+            dists.push((dist.value(0), i as u64));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         dists.truncate(k);
@@ -418,7 +455,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
         let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
-        let nlist = 16;
+        let nlist = 128;
         let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
         dataset
             .create_index(
@@ -478,5 +515,83 @@ mod tests {
         //     results,
         //     gt,
         // );
+    }
+
+    #[tokio::test]
+    async fn test_build_ivf_flat_hamming() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, vectors) = generate_u8_test_dataset(test_uri, 0..255).await;
+
+        let nlist = 4;
+        let params = VectorIndexParams::ivf_flat(nlist, DistanceType::Hamming);
+        dataset
+            .create_index(
+                &["vector"],
+                lance_index::IndexType::Vector,
+                None,
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        let k = 100;
+        let result = dataset
+            .scan()
+            .nearest("vector", query.as_primitive::<UInt8Type>(), k)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let row_ids = result
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        let dists = result
+            .column_by_name("_distance")
+            .unwrap()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        let results = dists
+            .into_iter()
+            .zip(row_ids.into_iter())
+            .collect::<Vec<_>>();
+        let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
+
+        let gt = ground_truth(
+            &vectors,
+            query.as_primitive::<UInt8Type>(),
+            k,
+            DistanceType::Hamming,
+        );
+        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+
+        let mut int_result_dist = results.iter().map(|r| r.0 as u32).collect::<Vec<_>>();
+        let int_dis = gt.iter().map(|r| r.0 as u32).collect::<Vec<_>>();
+        let mut recall_cnt = 0;
+        for dis in int_dis.iter() {
+            if let Some((pos, _)) = int_result_dist.iter().find_position(|&r| *r == *dis) {
+                int_result_dist.remove(pos);
+                recall_cnt += 1;
+            }
+        }
+
+        let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
+        assert!(
+            recall >= 0.9,
+            "recall: {}, dis_recall: {}\n results: {:?}\n\ngt: {:?}",
+            recall,
+            recall_cnt as f32 / k as f32,
+            results,
+            gt,
+        );
     }
 }

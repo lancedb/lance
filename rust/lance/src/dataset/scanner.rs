@@ -6,7 +6,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow::datatypes::ArrowPrimitiveType;
+use arrow_array::Float32Array;
+use arrow_array::{Array, Int64Array, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -30,7 +32,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
-use lance_arrow::floats::{coerce_float_vector, FloatType};
+use lance_arrow::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_index::vector::{Query, DIST_COL};
@@ -422,7 +424,12 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+    pub fn nearest<T: ArrowPrimitiveType>(
+        &mut self,
+        column: &str,
+        q: &PrimitiveArray<T>,
+        k: usize,
+    ) -> Result<&mut Self> {
         self.ensure_not_fragment_scan()?;
 
         if k == 0 {
@@ -439,10 +446,15 @@ impl Scanner {
             format!("Column {} not found", column),
             location!(),
         ))?;
-        let key = match field.data_type() {
+        let key: Box<dyn Array> = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
-                if dt.data_type().is_floating() {
-                    coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
+                if dt.data_type() == q.data_type() {
+                    Box::new(q.clone())
+                } else if dt.data_type().is_floating() && *q.data_type() == DataType::Float32 {
+                    coerce_float_vector(
+                        q.as_any().downcast_ref::<Float32Array>().unwrap(),
+                        FloatType::try_from(dt.data_type())?,
+                    )?
                 } else {
                     return Err(Error::io(
                         format!(
@@ -1006,7 +1018,9 @@ impl Scanner {
         let schema = self.dataset.schema();
         if let Some(field) = schema.field(&q.column) {
             match field.data_type() {
-                DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
+                DataType::FixedSizeList(subfield, _)
+                    if subfield.data_type().is_floating()
+                        || *subfield.data_type() == DataType::UInt8 => {}
                 _ => {
                     return Err(Error::io(
                         format!(
@@ -1504,7 +1518,9 @@ pub mod test_dataset {
 
     use std::vec;
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+    };
     use arrow_schema::ArrowError;
     use lance_index::IndexType;
     use tempfile::{tempdir, TempDir};
@@ -1649,8 +1665,8 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
-        RecordBatchIterator, StringArray, StructArray,
+        ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Int32Array, LargeStringArray,
+        PrimitiveArray, RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_select::take;
@@ -1962,8 +1978,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_prefilter(#[values(false, true)] use_legacy_format: bool) {
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_prefilter(#[values(false, true)] use_experimental_writer: bool) {
+        let mut test_ds = TestVectorDataset::new(use_experimental_writer)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         let dataset = &test_ds.dataset;
 
