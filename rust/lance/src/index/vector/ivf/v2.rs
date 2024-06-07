@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, StreamExt, TryStreamExt};
 use lance_core::{cache::DEFAULT_INDEX_CACHE_SIZE, Error, Result};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::reader::FileReader;
 use lance_index::{
     pb,
@@ -91,6 +92,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
                 .open_file(&index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME))
                 .await?,
             None,
+            DecoderMiddlewareChain::default(),
         )
         .await?;
         let distance_type = DistanceType::try_from(
@@ -127,6 +129,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
                 )
                 .await?,
             None,
+            DecoderMiddlewareChain::default(),
         )
         .await?;
         let storage = IvfQuantizationStorage::open(storage_reader).await?;
@@ -163,7 +166,12 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
             let length = self.ivf.lengths[partition_id] as usize;
             let batches = self
                 .reader
-                .read_stream(ReadBatchParams::Range(offset..offset + length), 4096, 16)?
+                .read_stream(
+                    ReadBatchParams::Range(offset..offset + length),
+                    4096,
+                    16,
+                    FilterExpression::no_filter(),
+                )?
                 .peekable()
                 .try_collect::<Vec<_>>()
                 .await?;

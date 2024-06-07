@@ -17,8 +17,8 @@ use log::trace;
 
 use crate::{
     decoder::{
-        DecodeArrayTask, DecoderReady, FieldScheduler, LogicalPageDecoder, NextDecodeTask,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
+        NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{CoreArrayEncodingStrategy, EncodeTask, FieldEncoder},
 };
@@ -56,6 +56,10 @@ impl<'a> SchedulingJob for BinarySchedulingJob<'a> {
             rows_scheduled: inner_scan.rows_scheduled,
         })
     }
+
+    fn num_rows(&self) -> u64 {
+        self.inner.num_rows()
+    }
 }
 
 /// A logical scheduler for utf8/binary pages which assumes the data are encoded as List<u8>
@@ -79,9 +83,10 @@ impl FieldScheduler for BinaryFieldScheduler {
     fn schedule_ranges<'a>(
         &'a self,
         ranges: &[std::ops::Range<u64>],
+        filter: &FilterExpression,
     ) -> Result<Box<dyn SchedulingJob + 'a>> {
         trace!("Scheduling binary for {} ranges", ranges.len());
-        let varbin_job = self.varbin_scheduler.schedule_ranges(ranges)?;
+        let varbin_job = self.varbin_scheduler.schedule_ranges(ranges, filter)?;
         Ok(Box::new(BinarySchedulingJob {
             scheduler: self,
             inner: varbin_job,
@@ -252,6 +257,10 @@ impl FieldEncoder for BinaryFieldEncoder {
 
     fn num_columns(&self) -> u32 {
         2
+    }
+
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        self.varbin_encoder.finish()
     }
 }
 

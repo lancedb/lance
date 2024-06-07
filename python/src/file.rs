@@ -19,6 +19,7 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{
     reader::{BufferDescriptor, CachedFileMetadata, FileReader},
     writer::{FileWriter, FileWriterOptions},
@@ -270,7 +271,9 @@ impl LanceFileReader {
             .unwrap_or(8);
         let scheduler = ScanScheduler::new(Arc::new(object_store), io_parallelism);
         let file = scheduler.open_file(&path).await.infer_error()?;
-        let inner = FileReader::try_open(file, None).await.infer_error()?;
+        let inner = FileReader::try_open(file, None, DecoderMiddlewareChain::default())
+            .await
+            .infer_error()?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -306,7 +309,12 @@ impl LanceFileReader {
         let inner = self.inner.clone();
         let _guard = RT.runtime.enter();
         let stream = inner
-            .read_stream(params, batch_size, batch_readahead)
+            .read_stream(
+                params,
+                batch_size,
+                batch_readahead,
+                FilterExpression::no_filter(),
+            )
             .infer_error()?;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
     }

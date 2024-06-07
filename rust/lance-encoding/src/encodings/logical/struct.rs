@@ -15,10 +15,10 @@ use snafu::{location, Location};
 
 use crate::{
     decoder::{
-        DecodeArrayTask, DecoderReady, FieldScheduler, LogicalPageDecoder, NextDecodeTask,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
+        NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
+    encoder::{EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
     format::pb,
 };
 use lance_core::{Error, Result};
@@ -142,6 +142,10 @@ impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
             rows_scheduled: struct_rows_scheduled,
         })
     }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
 }
 
 /// A scheduler for structs
@@ -174,28 +178,20 @@ impl SimpleStructScheduler {
             num_rows,
         }
     }
-
-    pub fn new_root_decoder_ranges(&self, ranges: &[Range<u64>]) -> SimpleStructDecoder {
-        let rows_to_read = ranges
-            .iter()
-            .map(|range| range.end - range.start)
-            .sum::<u64>();
-        SimpleStructDecoder::new(self.child_fields.clone(), rows_to_read)
-    }
-
-    pub fn new_root_decoder_indices(&self, indices: &[u64]) -> SimpleStructDecoder {
-        SimpleStructDecoder::new(self.child_fields.clone(), indices.len() as u64)
-    }
 }
 
 impl FieldScheduler for SimpleStructScheduler {
-    fn schedule_ranges<'a>(&'a self, ranges: &[Range<u64>]) -> Result<Box<dyn SchedulingJob + 'a>> {
-        let num_rows = ranges.iter().map(|range| range.end - range.start).sum();
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[Range<u64>],
+        filter: &FilterExpression,
+    ) -> Result<Box<dyn SchedulingJob + 'a>> {
         let child_schedulers = self
             .children
             .iter()
-            .map(|child| child.schedule_ranges(ranges))
+            .map(|child| child.schedule_ranges(ranges, filter))
             .collect::<Result<Vec<_>>>()?;
+        let num_rows = child_schedulers[0].num_rows();
         Ok(Box::new(SimpleStructSchedulerJob::new(
             self,
             child_schedulers,
@@ -349,7 +345,7 @@ pub struct SimpleStructDecoder {
 }
 
 impl SimpleStructDecoder {
-    fn new(child_fields: Fields, num_rows: u64) -> Self {
+    pub fn new(child_fields: Fields, num_rows: u64) -> Self {
         let data_type = DataType::Struct(child_fields.clone());
         Self {
             children: child_fields
@@ -561,6 +557,19 @@ impl FieldEncoder for StructFieldEncoder {
             .map(|child| child.num_columns())
             .sum::<u32>()
             + 1
+    }
+
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        async move {
+            let mut columns = Vec::new();
+            // Add a column for the struct header
+            columns.push(EncodedColumn::default());
+            for child in self.children.iter_mut() {
+                columns.extend(child.finish().await?);
+            }
+            Ok(columns)
+        }
+        .boxed()
     }
 }
 

@@ -103,6 +103,7 @@ datafusion-functions = { version = "37.1", features = ["regex_expressions"] }
 datafusion-sql = "37.1"
 datafusion-expr = "37.1"
 datafusion-execution = "37.1"
+datafusion-optimizer = "37.1"
 datafusion-physical-expr = { version = "37.1", features = [
     "regex_expressions",
 ] }
