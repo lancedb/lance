@@ -150,7 +150,7 @@ impl L2 for f16 {
 impl L2 for f32 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        l2_scalar::<Self, Self, 32>(x, y)
+        l2_scalar::<Self, Self, 16>(x, y)
     }
 
     fn l2_batch<'a>(
