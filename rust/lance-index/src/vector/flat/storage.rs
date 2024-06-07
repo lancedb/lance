@@ -10,9 +10,10 @@ use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::utils::do_prefetch;
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
-use arrow::datatypes::UInt64Type;
-use arrow_array::{types::Float32Type, RecordBatch};
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt64Array};
+use arrow_array::{
+    types::{Float32Type, UInt64Type},
+    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array,
+};
 use arrow_schema::{DataType, SchemaRef};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
@@ -179,7 +180,7 @@ pub struct FlatDistanceCal<'a> {
     vectors: &'a [f32],
     query: Vec<f32>,
     dimension: usize,
-    distance_type: DistanceType,
+    distance_fn: fn(&[f32], &[f32]) -> f32,
 }
 
 impl<'a> FlatDistanceCal<'a> {
@@ -190,7 +191,7 @@ impl<'a> FlatDistanceCal<'a> {
             vectors: flat_array.values(),
             query: query.as_primitive::<Float32Type>().values().to_vec(),
             dimension,
-            distance_type,
+            distance_fn: distance_type.func(),
         }
     }
 
@@ -204,7 +205,7 @@ impl DistCalculator for FlatDistanceCal<'_> {
     #[inline]
     fn distance(&self, id: u32) -> f32 {
         let vector = self.get_vector(id);
-        self.distance_type.func()(&self.query, vector)
+        (self.distance_fn)(&self.query, vector)
     }
 
     #[inline]
