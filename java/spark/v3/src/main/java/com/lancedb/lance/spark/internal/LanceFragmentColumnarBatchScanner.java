@@ -41,6 +41,10 @@ public class LanceFragmentColumnarBatchScanner implements AutoCloseable {
   }
 
   public boolean loadNextBatch() throws IOException {
+    // Batch close must be earlier than load next batch
+    if (currentColumnarBatch != null) {
+      currentColumnarBatch.close();
+    }
     if (arrowReader.loadNextBatch()) {
       VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
       currentColumnarBatch = new ColumnarBatch(root.getFieldVectors().stream()
@@ -59,6 +63,9 @@ public class LanceFragmentColumnarBatchScanner implements AutoCloseable {
 
   @Override
   public void close() throws IOException {
+    if (currentColumnarBatch != null) {
+      currentColumnarBatch.close();
+    }
     if (currentColumnarBatch != null) {
       currentColumnarBatch.close();
     }

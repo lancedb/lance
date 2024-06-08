@@ -53,9 +53,6 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
 
   private boolean loadNextBatchFromCurrentReader() throws IOException {
     if (fragmentReader != null && fragmentReader.loadNextBatch()) {
-      if (currentBatch != null) {
-        currentBatch.close();
-      }
       currentBatch = fragmentReader.getCurrentBatch();
       return true;
     }
@@ -69,9 +66,6 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
 
   @Override
   public void close() throws IOException {
-    if (currentBatch != null) {
-      currentBatch.close();
-    }
     if (fragmentReader != null) {
       try {
         fragmentReader.close();

@@ -32,6 +32,8 @@ import org.apache.spark.sql.sources.StringContains;
 import org.apache.spark.sql.sources.StringEndsWith;
 import org.apache.spark.sql.sources.StringStartsWith;
 
+import java.sql.Date;
+import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -55,53 +57,6 @@ public class FilterPushDown {
         .map(filter -> "(" + filter + ")")
         .collect(Collectors.joining(" AND "));
     return Optional.of(whereClause);
-  }
-
-  private static Optional<String> compileFilter(Filter filter) {
-    if (filter instanceof GreaterThan) {
-      GreaterThan f = (GreaterThan) filter;
-      return Optional.of(f.attribute() + " > " + f.value());
-    } else if (filter instanceof LessThan) {
-      LessThan f = (LessThan) filter;
-      return Optional.of(f.attribute() + " < " + f.value());
-    } else if (filter instanceof LessThanOrEqual) {
-      LessThanOrEqual f = (LessThanOrEqual) filter;
-      return Optional.of(f.attribute() + " <= " + f.value());
-    } else if (filter instanceof GreaterThanOrEqual) {
-      GreaterThanOrEqual f = (GreaterThanOrEqual) filter;
-      return Optional.of(f.attribute() + " >= " + f.value());
-    } else if (filter instanceof EqualTo) {
-      EqualTo f = (EqualTo) filter;
-      return Optional.of(f.attribute() + " == " + f.value());
-    } else if (filter instanceof Or) {
-      Or f = (Or) filter;
-      Optional<String> left = compileFilter(f.left());
-      Optional<String> right = compileFilter(f.right());
-      if (left.isEmpty()) return right;
-      if (right.isEmpty()) return left;
-      return Optional.of(String.format("(%s) OR (%s)", left.get(), right.get()));
-    } else if (filter instanceof And) {
-      And f = (And) filter;
-      Optional<String> left = compileFilter(f.left());
-      Optional<String> right = compileFilter(f.right());
-      if (left.isEmpty()) return right;
-      if (right.isEmpty()) return left;
-      return Optional.of(String.format("(%s) AND (%s)",
-          left.get(), right.get()));
-    } else if (filter instanceof IsNull) {
-      IsNull f = (IsNull) filter;
-      return Optional.of(String.format("%s IS NULL", f.attribute()));
-    } else if (filter instanceof  IsNotNull) {
-      IsNotNull f = (IsNotNull) filter;
-      return Optional.of(String.format("%s IS NOT NULL", f.attribute()));
-    } else if (filter instanceof Not) {
-      Not f = (Not) filter;
-      Optional<String> child = compileFilter(f.child());
-      if (child.isEmpty()) return child;
-      return Optional.of(String.format("NOT (%s)", child.get()));
-    }
-
-    return Optional.empty();
   }
 
   /**
@@ -162,6 +117,71 @@ public class FilterPushDown {
       return isFilterSupported(f.left()) && isFilterSupported(f.right());
     } else {
       return false;
+    }
+  }
+
+  private static Optional<String> compileFilter(Filter filter) {
+    if (filter instanceof GreaterThan) {
+      GreaterThan f = (GreaterThan) filter;
+      return Optional.of(f.attribute() + " > " + compileValue(f.value()));
+    } else if (filter instanceof LessThan) {
+      LessThan f = (LessThan) filter;
+      return Optional.of(f.attribute() + " < " + compileValue(f.value()));
+    } else if (filter instanceof LessThanOrEqual) {
+      LessThanOrEqual f = (LessThanOrEqual) filter;
+      return Optional.of(f.attribute() + " <= " + compileValue(f.value()));
+    } else if (filter instanceof GreaterThanOrEqual) {
+      GreaterThanOrEqual f = (GreaterThanOrEqual) filter;
+      return Optional.of(f.attribute() + " >= " + compileValue(f.value()));
+    } else if (filter instanceof EqualTo) {
+      EqualTo f = (EqualTo) filter;
+      return Optional.of(f.attribute() + " == " + compileValue(f.value()));
+    } else if (filter instanceof Or) {
+      Or f = (Or) filter;
+      Optional<String> left = compileFilter(f.left());
+      Optional<String> right = compileFilter(f.right());
+      if (left.isEmpty()) return right;
+      if (right.isEmpty()) return left;
+      return Optional.of(String.format("(%s) OR (%s)", left.get(), right.get()));
+    } else if (filter instanceof And) {
+      And f = (And) filter;
+      Optional<String> left = compileFilter(f.left());
+      Optional<String> right = compileFilter(f.right());
+      if (left.isEmpty()) return right;
+      if (right.isEmpty()) return left;
+      return Optional.of(String.format("(%s) AND (%s)",
+          left.get(), right.get()));
+    } else if (filter instanceof IsNull) {
+      IsNull f = (IsNull) filter;
+      return Optional.of(String.format("%s IS NULL", f.attribute()));
+    } else if (filter instanceof  IsNotNull) {
+      IsNotNull f = (IsNotNull) filter;
+      return Optional.of(String.format("%s IS NOT NULL", f.attribute()));
+    } else if (filter instanceof Not) {
+      Not f = (Not) filter;
+      Optional<String> child = compileFilter(f.child());
+      if (child.isEmpty()) return child;
+      return Optional.of(String.format("NOT (%s)", child.get()));
+    }
+
+    return Optional.empty();
+  }
+
+  private static String compileValue(Object value) {
+    if (value instanceof String || value instanceof Timestamp || value instanceof Date) {
+      return "'" + value + "'";
+    } else if (value instanceof Object[]) {
+      Object[] array = (Object[]) value;
+      StringBuilder sb = new StringBuilder();
+      for (Object obj : array) {
+        if (sb.length() > 0) {
+          sb.append(", ");
+        }
+        sb.append(compileValue(obj));
+      }
+      return sb.toString();
+    } else {
+      return value.toString();
     }
   }
 }

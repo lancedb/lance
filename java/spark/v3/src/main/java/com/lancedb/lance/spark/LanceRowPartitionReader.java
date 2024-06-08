@@ -44,9 +44,6 @@ public class LanceRowPartitionReader implements PartitionReader<InternalRow> {
     }
     // Read from next batch
     if (reader.next()) {
-      if (currentBatch != null) {
-        currentBatch.close();
-      }
       currentBatch = reader.get();
       currentRows = currentBatch.rowIterator();
       if (currentRows != null && currentRows.hasNext()) {
@@ -64,9 +61,6 @@ public class LanceRowPartitionReader implements PartitionReader<InternalRow> {
 
   @Override
   public void close() throws IOException {
-    if (currentBatch != null) {
-      currentBatch.close();
-    }
     reader.close();
   }
 }

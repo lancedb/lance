@@ -58,6 +58,7 @@ public class FilterTest {
   @Test
   void testFilters() throws Exception {
     testFilter("id == 10", 1);
+    testFilter("id == 10", 1);
     testFilter("id != 10", 39);
     testFilter("id > 10", 29);
     testFilter("id >= 10", 30);
@@ -88,6 +89,11 @@ public class FilterTest {
     testFilter("name LIKE '%son%' AND name LIKE '%0'", 4);
     testFilter("name LIKE '%son%' AND name LIKE '%1'", 4);
     testFilter("name LIKE 'Person 1%' AND name LIKE '%1'", 2);
+
+    testFilter("(name IS NOT NULL) AND (name == 'Person 1')", 1);
+    testFilter("(name IS NOT NULL) AND (name == 'Person')", 0);
+    // Not supported, bug?, LanceError(IO): Schema error: No field named person. Valid fields are id, name.
+    // testFilter("(name IS NOT NULL) AND (name == Person)", 0);
 
     // Not supported
     // testFilter("\"id\" == 10", 1);
