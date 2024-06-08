@@ -472,17 +472,20 @@ impl HNSW {
                 })?
                 .as_list::<i32>();
 
-            for ((node, neighbors), distances) in
-                ids.iter().zip(neighbors.iter()).zip(distances.iter())
+            for ((&node, neighbors), distances) in ids
+                .values()
+                .iter()
+                .zip(neighbors.iter())
+                .zip(distances.iter())
             {
-                let node = node.unwrap();
                 let neighbors = neighbors.as_ref().unwrap().as_primitive::<UInt32Type>();
                 let distances = distances.as_ref().unwrap().as_primitive::<Float32Type>();
 
                 nodes[node as usize].level_neighbors_ranked[level] = neighbors
+                    .values()
                     .iter()
-                    .zip(distances.iter())
-                    .map(|(n, dist)| OrderedNode::new(n.unwrap(), OrderedFloat(dist.unwrap())))
+                    .zip(distances.values().iter())
+                    .map(|(&n, &dist)| OrderedNode::new(n, OrderedFloat(dist)))
                     .collect();
                 nodes[node as usize].update_from_ranked_neighbors(level as u16);
             }
