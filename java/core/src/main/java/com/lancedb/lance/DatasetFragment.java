@@ -17,7 +17,6 @@ package com.lancedb.lance;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import java.util.Arrays;
-import java.util.List;
 import org.apache.arrow.util.Preconditions;
 
 /**

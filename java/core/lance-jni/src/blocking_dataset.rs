@@ -348,9 +348,8 @@ fn inner_import_ffi_schema(
         Schema::from(dataset.inner.schema())
     };
 
-    let c_schema = FFI_ArrowSchema::try_from(&schema)?;
-    let out_c_schema = unsafe { &mut *(arrow_schema_addr as *mut FFI_ArrowSchema) };
-    let _old = std::mem::replace(out_c_schema, c_schema);
+    let ffi_schema = FFI_ArrowSchema::try_from(&schema)?;
+    unsafe { std::ptr::write_unaligned(arrow_schema_addr as *mut FFI_ArrowSchema, ffi_schema) }
     Ok(())
 }
 
