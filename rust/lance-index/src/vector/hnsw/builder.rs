@@ -325,7 +325,7 @@ impl HNSW {
     }
 
     // Write levels' nodes, and returns the offset of each level.
-    pub async fn write_levels(
+    async fn write_levels(
         &self,
         writer: &mut FileWriter<ManifestDescribing>,
     ) -> Result<Vec<usize>> {
