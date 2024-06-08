@@ -30,6 +30,7 @@ public class LanceDataSource implements TableProvider, DataSourceRegister {
 
   @Override
   public StructType inferSchema(CaseInsensitiveStringMap options) {
+    // Given options help identify a table, no schema filter is passed in
     return LanceReader.getSchema(LanceConfig.from(options));
   }
 
