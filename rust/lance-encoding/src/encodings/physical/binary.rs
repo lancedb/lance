@@ -4,7 +4,10 @@
 use core::panic;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt32Type;
 use arrow_array::{
+    builder::{ArrayBuilder, Int32Builder, UInt8Builder},
     Array, ArrayRef, Int32Array, StringArray, UInt32Array, UInt8Array,
 };
 use futures::{future::BoxFuture, FutureExt};
@@ -23,7 +26,6 @@ use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 // use arrow_cast::cast::cast;
 use arrow_schema::DataType;
 use lance_core::Result;
-
 
 #[derive(Debug)]
 pub struct BinaryPageScheduler {
@@ -51,11 +53,28 @@ impl PageScheduler for BinaryPageScheduler {
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         println!("Inside BinaryPageScheduler");
+
+        // if user wants rows a..b, or range a..b+1
+        // Case 1: if a != 0, we need indices a-1..b inclusive
+        // Case 2: if a = 0, we need indices 0..b inclusive
+
+        let indices_ranges = ranges
+            .iter()
+            .map(|range| {
+                if range.start != 0 {
+                    (range.start - 1)..range.end
+                } else {
+                    0..range.end
+                }
+            })
+            .collect::<Vec<std::ops::Range<u32>>>();
+
         let indices_page_decoder =
             self.indices_scheduler
-                .schedule_ranges(&ranges, scheduler, top_level_row);
+                .schedule_ranges(&indices_ranges, scheduler, top_level_row);
 
         let ranges = ranges.to_vec();
+        println!("Ranges: {:?}", ranges);
         let copy_scheduler = scheduler.clone();
         let copy_bytes_scheduler = Arc::clone(&self.bytes_scheduler);
 
@@ -64,8 +83,12 @@ impl PageScheduler for BinaryPageScheduler {
             let indices_page_decoder = indices_page_decoder.await?;
             let indices: Arc<dyn PhysicalPageDecoder> = Arc::from(indices_page_decoder);
 
-            // assuming ranges is in sorted order
-            let indices_num_rows = ranges[ranges.len() - 1].end - ranges[0].start;
+            let indices_num_rows = indices_ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum();
+            // let indices_num_rows = ranges[ranges.len() - 1].end - ranges[0].start;
+            println!("Indices num rows: {:?}", indices_num_rows);
             let mut primitive_wrapper =
                 PrimitiveFieldDecoder::new_from_data(indices, DataType::UInt32, indices_num_rows);
             let drained_task = primitive_wrapper.drain(indices_num_rows)?;
@@ -73,38 +96,38 @@ impl PageScheduler for BinaryPageScheduler {
 
             let decoded_indices = indices_decode_task.decode()?;
             println!("Decoded indices: {:?}", decoded_indices);
+            let indices_array = decoded_indices.as_primitive::<UInt32Type>();
 
             let mut net_bytes = 0;
             let mut bytes_ranges: Vec<std::ops::Range<u32>> = Vec::new();
 
-            // want rows 0-2, 4-6. Or rows 0, 1, 4, 5.
+            // want range [1..3] or rows 1, 2
             //      0        1        2        3       4        5
             // "abcd", "hello", "abcd", "apple", "hello", "abcd"
             //   4,        9,     13,      18,      23,     27
-            // row i = indices[i-1] -> indices[i]. Except when i = 0, then it's 0 -> indices[i].
-            // Bytes for row[i] = indices[i] - indices[i-1]
-            // rows a -> b. a != 0. inclusive.
-            // Bytes = indices[b] - indices[a]
-            // rows a -> b. a = 0. inclusive.
-            // Bytes = indices[b]
+            // decoded indices = [4, 9, 13]
+            // if we wanted rows 0..3 even then the decoded indices would be the same as above.
+            // But then len(indices) = len(range), so we know that we want row 0 as well.
+            // Normally len(indices) = len(range) + 1
+            // So, non-zero case (a != 0): net bytes for range a->b, inclusive = indices[b] - indices[a-1]
+            // Zero case: net bytes for range 0->b, inclusive = indices[b]
+
+            // want range [1..2] or row 1
+            // want indices [1]
 
             ranges.iter().for_each(|range| {
-                let end_index = usize::try_from(range.end).unwrap() - 1;
-                let start_index = usize::try_from(range.start).unwrap();
+                let end_index = usize::try_from(range.end).unwrap() - 1; // range.end=2, end_index=1
+                let start_index = usize::try_from(range.start).unwrap(); // range.start=1, start_index=1
 
-                if let Some(indices_array) = decoded_indices.as_any().downcast_ref::<UInt32Array>()
-                {
-                    if start_index == 0 {
-                        let offset_end = indices_array.value(end_index);
-                        net_bytes += offset_end;
-                        bytes_ranges.push(0..(offset_end + 1));
-                    } else {
-                        let offset_start = indices_array.value(start_index);
-                        let offset_end = indices_array.value(end_index);
-                        net_bytes += offset_end - offset_start;
-                        bytes_ranges.push(offset_start..(offset_end + 1));
-                    }
-                }
+                let offset_start = if start_index == 0 {
+                    0
+                } else {
+                    indices_array.value(start_index - 1) // indices[1] = 9
+                };
+
+                let offset_end = indices_array.value(end_index); // indices[2] = 13
+                net_bytes += offset_end - offset_start;
+                bytes_ranges.push(offset_start..(offset_end + 1));
             });
 
             println!("Net bytes: {:?}", net_bytes);
@@ -261,52 +284,59 @@ impl BinaryEncoder {
 }
 
 // Returns indices arrays from string arrays
-// These arrays are padded with a 0 at the beginning
 fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
-    let index_arrays: Vec<ArrayRef> = arrays
-        .iter()
-        .filter_map(|arr| {
-            if let Some(string_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                println!("String array: {:?}", string_arr);
-                let offsets = string_arr.value_offsets().to_vec();
+    let mut indices_builder = Int32Builder::new();
+    let mut last_offset = 0;
+    arrays.iter().for_each(|arr| {
+        let string_arr = arrow_array::cast::as_string_array(arr);
+        println!("String array: {:?}", string_arr);
+        let mut offsets = string_arr.value_offsets().to_vec();
+        offsets = offsets[1..].to_vec();
+        println!("Offsets: {:?}", offsets);
 
-                // Not using UInt64, since the range values during decoding expect u32's 
-                let mut new_int_arr = Int32Array::from(offsets);
-                new_int_arr = new_int_arr.slice(1, new_int_arr.len() - 1);
-                // match cast(&new_int_arr, &DataType::UInt64) {
-                //     Ok(res) => Some(Arc::new(res) as ArrayRef),
-                //     Err(_) => panic!("Failed to cast to uint64"),
-                // }
-                Some(Arc::new(new_int_arr) as ArrayRef)
-            } else {
-                panic!("Failed to downcast data to string array");
-            }
-        })
-        .collect();
+        if indices_builder.len() == 0 {
+            last_offset = offsets[offsets.len() - 1];
+        } else {
+            offsets = offsets
+                .iter()
+                .map(|offset| offset + last_offset)
+                .collect::<Vec<i32>>();
+            last_offset = offsets[offsets.len() - 1];
+        }
 
-    index_arrays
+        let new_int_arr = Int32Array::from(offsets);
+        indices_builder.append_slice(new_int_arr.values());
+
+        // match cast(&new_int_arr, &DataType::UInt64) {
+        //     Ok(res) => Some(Arc::new(res) as ArrayRef),
+        //     Err(_) => panic!("Failed to cast to uint64"),
+        // }
+        // Some(Arc::new(new_int_arr) as ArrayRef)
+    });
+
+    let final_array: ArrayRef = Arc::new(indices_builder.finish()) as ArrayRef;
+
+    vec![final_array]
 }
 
 fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
-    let byte_arrays: Vec<ArrayRef> = arrays
-        .iter()
-        .filter_map(|arr| {
-            if let Some(string_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                let values = string_arr.values().to_vec();
-                let bytes_arr = Arc::new(UInt8Array::from(values)) as ArrayRef;
-                Some(bytes_arr)
-            } else {
-                panic!("Failed to downcast data to string array");
-            }
-        })
-        .collect();
+    let mut bytes_builder = UInt8Builder::new();
+    arrays.iter().for_each(|arr| {
+        let string_arr = arrow_array::cast::as_string_array(arr);
+        let values = string_arr.values().to_vec();
+        bytes_builder.append_slice(&values);
+        // let bytes_arr = Arc::new(UInt8Array::from(values)) as ArrayRef;
+        // Some(bytes_arr)
+    });
 
-    byte_arrays
+    let final_array = Arc::new(bytes_builder.finish()) as ArrayRef;
+
+    vec![final_array]
 }
 
 impl ArrayEncoder for BinaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let (null_count, row_count) = arrays
+        let (null_count, _row_count) = arrays
             .iter()
             .map(|arr| (arr.null_count() as u32, arr.len() as u32))
             .fold((0, 0), |acc, val| (acc.0 + val.0, acc.1 + val.1));

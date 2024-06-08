@@ -14,10 +14,9 @@ use arrow_array::{
         TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
         TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray,
-    StringArray,
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray, StringArray,
 };
-use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
@@ -290,6 +289,7 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
         self.physical_decoder
             .decode_into(self.rows_to_skip, self.rows_to_take, &mut bufs)?;
 
+        println!("rows to take: {:?}", self.rows_to_take);
         // Convert the two buffers into an Arrow array
         Self::primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)
     }
@@ -319,6 +319,7 @@ impl PrimitiveFieldDecodeTask {
 
         let data_buffer = buffer_iter.next().unwrap().freeze();
         let data_buffer = Buffer::from_bytes(data_buffer.into());
+        println!("buffer length: {:?}", data_buffer.len());
         let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
 
         // The with_data_type is needed here to recover the parameters for types like Decimal/Timestamp
@@ -501,19 +502,15 @@ impl PrimitiveFieldDecodeTask {
                 // get offsets_buffer (indices) from buffer
                 println!("Buffers length: {:?}", buffers.len());
                 let mut buffer_iter = buffers.into_iter();
-                let indices_buffer = buffer_iter.next().unwrap().freeze();
-                let indices_buffer = Buffer::from_bytes(indices_buffer.into());
-                let indices_buffer = ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize);
+                let indices_bytes = buffer_iter.next().unwrap().freeze();
+                let indices_buffer = Buffer::from_bytes(indices_bytes.into());
+                let indices_bytes_arr = indices_buffer.as_slice();
 
-                let indices_array = Arc::new(
-                    PrimitiveArray::<Int32Type>::new(indices_buffer, None)
-                        .with_data_type(DataType::Int32),
-                );
-
-                let mut vec_buffer = indices_array.values().to_vec();
-                vec_buffer.insert(0, 0);
-                let new_buffer = Buffer::from_slice_ref(&vec_buffer);
-                let indices_buffer = ScalarBuffer::<i32>::new(new_buffer, 0, num_rows as usize + 1);
+                let mut indices_buffer = MutableBuffer::new(num_rows as usize + 1);
+                indices_buffer.push(0);
+                indices_buffer.extend_from_slice(indices_bytes_arr);
+                let indices_buffer =
+                    ScalarBuffer::<i32>::new(indices_buffer.into(), 0, num_rows as usize + 1);
 
                 let offsets = OffsetBuffer::new(indices_buffer.clone());
 

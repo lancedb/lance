@@ -521,14 +521,16 @@ mod tests {
     use arrow_array::{
         types::Float64Type, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field};
+    use lance_core::datatypes::Schema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
-    use crate::v2::reader::FileReader;
+    use crate::v2::reader::{FileReader, ReaderProjection};
     use crate::v2::writer::{FileWriter, FileWriterOptions};
 
+    use arrow_schema::Schema as ArrowSchema;
     use lance_io::scheduler::ScanScheduler;
 
     use futures::StreamExt;
@@ -573,22 +575,28 @@ mod tests {
         let obj_store = Arc::new(ObjectStore::local());
         let writer = obj_store.create(&tmp_path).await.unwrap();
 
-        let schema = Arc::new(Schema::new(vec![
+        let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("key", DataType::UInt32, false),
             Field::new("strings", DataType::Utf8, false),
         ]));
 
-        let batch = RecordBatch::try_new(
+        let batch1 = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(StringArray::from(vec![
-                    "abcd", "hello", "abcd", "apple", "hello", "abcd",
-                ])),
+                Arc::new(UInt32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["abcd", "hello", "abcd"])),
             ],
         );
 
-        let batches = vec![batch];
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 5, 6])),
+                Arc::new(StringArray::from(vec!["apple", "hello", "abcd"])),
+            ],
+        );
+
+        let batches = vec![batch1, batch2];
         let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
 
         let mut file_writer = FileWriter::try_new(
@@ -613,12 +621,12 @@ mod tests {
         let file_scheduler = fs_scheduler.open_file(&tmp_path).await.unwrap();
 
         let file_reader = FileReader::try_open(file_scheduler, None).await.unwrap();
-        let schema = file_reader.schema();
-        println!("Schema - {:?}", schema);
 
-        let mut batch_stream = file_reader
-            .read_stream(lance_io::ReadBatchParams::RangeFull, 1024, 16)
-            .unwrap();
+        let row_indices_vec = vec![1, 4];
+        let row_indices = UInt32Array::from(row_indices_vec);
+        let read_params = lance_io::ReadBatchParams::from(row_indices);
+        // let read_params = lance_io::ReadBatchParams::RangeFull;
+        let mut batch_stream = file_reader.read_stream(read_params, 1024, 16).unwrap();
 
         // print length of batch stream
         let mut num_batches = 0;
