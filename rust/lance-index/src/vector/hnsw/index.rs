@@ -5,7 +5,7 @@ use std::{
     any::Any,
     collections::HashMap,
     fmt::{Debug, Formatter},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
@@ -39,13 +39,13 @@ pub struct HNSWIndexOptions {
     pub use_residual: bool,
 }
 
-#[derive(Clone, DeepSizeOf)]
+#[derive(DeepSizeOf)]
 pub struct HNSWIndex<Q: Quantization> {
     distance_type: DistanceType,
 
     // Some(T) if the index is loaded, None otherwise
     hnsw: Option<HNSW>,
-    storage: Option<Arc<Q::Storage>>,
+    storage: RwLock<Option<Arc<Q::Storage>>>,
 
     // TODO: move these into IVFIndex after the refactor is complete
     partition_storage: IvfQuantizationStorage<Q>,
@@ -81,7 +81,7 @@ impl<Q: Quantization> HNSWIndex<Q> {
         Ok(Self {
             distance_type,
             hnsw: None,
-            storage: None,
+            storage: RwLock::new(None),
             partition_storage: ivf_store,
             partition_metadata,
             options,
@@ -152,10 +152,16 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             location: location!(),
         })?;
 
-        let storage = self.storage.as_ref().ok_or(Error::Index {
-            message: "vector storage not loaded".to_string(),
-            location: location!(),
-        })?;
+        let storage = {
+            let read_lock = self.storage.read().unwrap();
+            read_lock
+                .as_ref()
+                .ok_or(Error::Index {
+                    message: "vector storage not loaded".to_string(),
+                    location: location!(),
+                })?
+                .clone()
+        };
 
         if hnsw.is_empty() {
             return Ok(RecordBatch::new_empty(schema));
@@ -241,7 +247,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         Ok(Box::new(Self {
             distance_type: self.distance_type,
             hnsw: Some(hnsw),
-            storage: Some(storage),
+            storage: RwLock::new(Some(storage)),
             partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),
@@ -271,7 +277,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         Ok(Box::new(Self {
             distance_type: self.distance_type,
             hnsw: Some(hnsw),
-            storage: Some(storage),
+            storage: Some(storage).into(),
             partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),
@@ -279,7 +285,10 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
-        Box::new(self.storage.as_ref().unwrap().row_ids())
+        // let read_lock = self.storage.read().unwrap();
+        // let storage = read_lock.as_ref().unwrap().clone();
+        // Box::new(storage.row_ids())
+        todo!()
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

@@ -5,7 +5,6 @@ use std::{ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
-
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::*;
@@ -14,6 +13,7 @@ use num_traits::*;
 use snafu::{location, Location};
 
 pub mod builder;
+pub mod io;
 pub mod storage;
 pub mod transform;
 
@@ -146,6 +146,7 @@ pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: Range
         })
         .collect_vec()
 }
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{Float16Type, Float32Type, Float64Type};

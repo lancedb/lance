@@ -20,21 +20,23 @@ use lance_core::Error;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
-use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
-use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::{
+    hnsw::{
+        build_and_write_hnsw,
+        builder::{HnswBuildParams, HNSW_METADATA_KEY},
+        HnswMetadata,
+    },
     quantizer::{Quantization, Quantizer},
-    sq::ScalarQuantizer,
-    storage::VectorStore,
+    sq::io::build_and_write_sq_storage,
 };
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
-use lance_linalg::distance::{DistanceType, MetricType};
+use lance_linalg::distance::MetricType;
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
@@ -45,7 +47,6 @@ use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
-use crate::index::vector::sq::build_sq_storage;
 use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
 
@@ -496,7 +497,6 @@ async fn build_hnsw_quantization_partition(
             pq,
             aux_writer.unwrap(),
         )),
-
         Quantizer::Scalar(sq) => tokio::spawn(build_and_write_sq_storage(
             metric_type,
             row_ids,
@@ -508,16 +508,6 @@ async fn build_hnsw_quantization_partition(
 
     futures::join!(build_hnsw, build_store).0?;
     Ok(num_rows)
-}
-
-async fn build_and_write_hnsw(
-    params: HnswBuildParams,
-    vectors: Arc<dyn Array>,
-    mut writer: FileWriter<ManifestDescribing>,
-) -> Result<usize> {
-    let hnsw = params.build(vectors).await?;
-    let length = hnsw.write(&mut writer).await?;
-    Result::Ok(length)
 }
 
 async fn build_and_write_pq_storage(
@@ -534,26 +524,6 @@ async fn build_and_write_pq_storage(
     .await?;
 
     writer.write_record_batch(storage.batch().clone()).await?;
-    writer.finish().await?;
-    Ok(())
-}
-
-async fn build_and_write_sq_storage(
-    distance_type: DistanceType,
-    row_ids: Arc<dyn Array>,
-    vectors: Arc<dyn Array>,
-    sq: ScalarQuantizer,
-    mut writer: FileWriter<ManifestDescribing>,
-) -> Result<()> {
-    let storage = spawn_cpu(move || {
-        let storage = build_sq_storage(distance_type, row_ids, vectors, sq)?;
-        Ok(storage)
-    })
-    .await?;
-
-    for batch in storage.to_batches()? {
-        writer.write_record_batch(batch.clone()).await?;
-    }
     writer.finish().await?;
     Ok(())
 }
