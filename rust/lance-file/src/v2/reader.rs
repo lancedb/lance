@@ -1011,7 +1011,7 @@ pub mod tests {
     use bytes::Bytes;
     use futures::{prelude::stream::TryStreamExt, StreamExt};
     use lance_arrow::RecordBatchExt;
-    use lance_core::datatypes::Schema;
+    use lance_core::{datatypes::Schema, utils::testing::EnvVarGuard};
     use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
     use lance_encoding::{
         decoder::{decode_batch, DecoderMiddlewareChain, FilterExpression},
@@ -1287,32 +1287,6 @@ pub mod tests {
         )
         .await
         .is_err());
-    }
-
-    struct EnvVarGuard {
-        key: String,
-        original_value: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn new(key: &str, new_value: &str) -> Self {
-            let original_value = std::env::var(key).ok();
-            std::env::set_var(key, new_value);
-            Self {
-                key: key.to_string(),
-                original_value,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(ref value) = self.original_value {
-                std::env::set_var(&self.key, value);
-            } else {
-                std::env::remove_var(&self.key);
-            }
-        }
     }
 
     #[test_log::test(tokio::test)]

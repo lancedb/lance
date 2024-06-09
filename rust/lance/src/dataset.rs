@@ -1315,6 +1315,7 @@ mod tests {
 
     use arrow::array::as_struct_array;
     use arrow::compute::concat_batches;
+    use arrow::datatypes::UInt32Type;
     use arrow_array::{
         builder::StringDictionaryBuilder, cast::as_string_array, types::Int32Type, ArrayRef,
         DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
@@ -1326,8 +1327,10 @@ mod tests {
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+    use lance_core::utils::testing::{flaky_store, EnvVarGuard};
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_io::object_store::WrappingObjectStore;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::WriterVersion;
@@ -3414,6 +3417,68 @@ mod tests {
         assert!(res.is_err());
 
         assert!(!dataset_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_retry_handling() {
+        // Bump up the retry count to avoid failing the test due to flaky store
+        let _retry_count_guard = EnvVarGuard::new("LANCE_RETRY_COUNT", "30");
+        let os = Arc::new(object_store::memory::InMemory::new());
+        let flaky = flaky_store(os);
+        #[derive(Debug)]
+        struct Wrapper {
+            store: Arc<dyn object_store::ObjectStore>,
+        }
+        impl WrappingObjectStore for Wrapper {
+            fn wrap(
+                &self,
+                _: Arc<dyn object_store::ObjectStore>,
+            ) -> Arc<dyn object_store::ObjectStore> {
+                self.store.clone()
+            }
+        }
+        for _ in 0..10 {
+            let some_data = lance_datagen::gen()
+                .anon_col(lance_datagen::array::rand::<UInt32Type>())
+                .into_reader_rows(RowCount::from(100), BatchCount::from(10));
+            Dataset::write(
+                some_data,
+                "memory://some_dataset",
+                Some(WriteParams {
+                    store_params: Some(ObjectStoreParams {
+                        object_store_wrapper: Some(Arc::new(Wrapper {
+                            store: flaky.clone(),
+                        })),
+                        ..Default::default()
+                    }),
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let dataset = DatasetBuilder::from_uri("memory://some_dataset")
+                .with_read_params(ReadParams {
+                    store_options: Some(ObjectStoreParams {
+                        object_store_wrapper: Some(Arc::new(Wrapper {
+                            store: flaky.clone(),
+                        })),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .load()
+                .await
+                .unwrap();
+            dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

@@ -489,7 +489,7 @@ mod tests {
             let times_map = self.last_modified_times.clone();
             policy.set_before_policy(
                 "record_file_time",
-                Arc::new(move |_, path| {
+                Box::new(move |_, path| {
                     let mut times_map = times_map.lock().unwrap();
                     times_map.insert(path.clone(), utc_now());
                     Ok(())
@@ -625,7 +625,7 @@ mod tests {
             let mut policy = self.mock_store.policy.lock().unwrap();
             policy.set_before_policy(
                 "block_commit",
-                Arc::new(|op, _| -> Result<()> {
+                Box::new(|op, _| -> Result<()> {
                     if op.contains("copy") {
                         return Err(Error::Internal {
                             message: "Copy blocked".to_string(),
@@ -641,7 +641,7 @@ mod tests {
             let mut policy = self.mock_store.policy.lock().unwrap();
             policy.set_before_policy(
                 "block_delete_manifest",
-                Arc::new(|op, path| -> Result<()> {
+                Box::new(|op, path| -> Result<()> {
                     if op.contains("delete") && path.extension() == Some("manifest") {
                         Err(Error::Internal {
                             message: "Delete manifest blocked".to_string(),

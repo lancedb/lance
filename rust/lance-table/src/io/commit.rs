@@ -32,6 +32,7 @@ use futures::{
     stream::BoxStream,
     StreamExt, TryStreamExt,
 };
+use lance_io::utils::do_with_retry;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::{location, Location};
 use url::Url;
@@ -102,10 +103,9 @@ async fn current_manifest_path(
     }
 
     // We use `list_with_delimiter` to avoid listing the contents of child directories.
-    let manifest_files = object_store
-        .inner
-        .list_with_delimiter(Some(&base.child(VERSIONS_DIR)))
-        .await?;
+    let versions_dir = base.child(VERSIONS_DIR);
+    let manifest_files =
+        do_with_retry(|| object_store.inner.list_with_delimiter(Some(&versions_dir))).await?;
 
     let current = manifest_files
         .objects
@@ -234,11 +234,10 @@ async fn write_latest_manifest(
 ) -> Result<()> {
     let latest_path = latest_manifest_path(base_path);
     let staging_path = make_staging_manifest_path(from_path)?;
-    object_store
-        .copy(from_path, &staging_path)
+    do_with_retry(|| object_store.copy(from_path, &staging_path))
         .await
         .map_err(|err| CommitError::OtherError(err.into()))?;
-    object_store.rename(&staging_path, &latest_path).await?;
+    do_with_retry(|| object_store.rename(&staging_path, &latest_path)).await?;
     Ok(())
 }
 
@@ -678,7 +677,9 @@ impl CommitHandler for RenameCommitHandler {
         // Write the manifest to the temporary path
         manifest_writer(object_store, manifest, indices, &tmp_path).await?;
 
-        let res = match object_store.rename_if_not_exists(&tmp_path, &path).await {
+        let rename_res =
+            do_with_retry(|| object_store.rename_if_not_exists(&tmp_path, &path)).await;
+        let res = match rename_res {
             Ok(_) => Ok(()),
             Err(ObjectStoreError::AlreadyExists { .. }) => {
                 // Another transaction has already been committed
@@ -688,7 +689,7 @@ impl CommitHandler for RenameCommitHandler {
                 return Err(CommitError::CommitConflict);
             }
             Err(e) => {
-                // Something else went wrong
+                // Something else went wrong, don't retry here, we've already retried
                 return Err(CommitError::OtherError(e.into()));
             }
         };

@@ -25,6 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use lance_io::utils::do_with_retry;
 use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest, WriterVersion};
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
 use lance_table::io::deletion::read_deletion_file;
@@ -56,7 +57,7 @@ async fn read_transaction_file(
     transaction_file: &str,
 ) -> Result<Transaction> {
     let path = base_path.child("_transactions").child(transaction_file);
-    let result = object_store.inner.get(&path).await?;
+    let result = do_with_retry(|| object_store.inner.get(&path)).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
     transaction.try_into()
@@ -73,7 +74,7 @@ async fn write_transaction_file(
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
-    object_store.inner.put(&path, buf.into()).await?;
+    object_store.put(&path, &buf).await?;
 
     Ok(file_name)
 }
