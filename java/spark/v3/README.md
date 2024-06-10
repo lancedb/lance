@@ -23,12 +23,12 @@ Operating System: Linux x86 or macOS
 
 For Scala 2.12
 ```
-wget https://spark-lance-artifacts.s3.amazonaws.com/lance-spark-v3-2.12-0.0.3-jar-with-dependencies.jar
+wget https://spark-lance-artifacts.s3.amazonaws.com/lance-spark-v3-2.12-0.0.1-jar-with-dependencies.jar
 ```
 
 For Scala 2.13
 ```
-wget https://spark-lance-artifacts.s3.amazonaws.com/lance-spark-v3-2.13-0.0.3-jar-with-dependencies.jar
+wget https://spark-lance-artifacts.s3.amazonaws.com/lance-spark-v3-2.13-0.0.1-jar-with-dependencies.jar
 ```
 
 ## Quick Start
