@@ -277,6 +277,7 @@ pub struct Dataset {
 
 #[pymethods]
 impl Dataset {
+    #[allow(clippy::too_many_arguments)]
     #[new]
     fn new(
         uri: String,
