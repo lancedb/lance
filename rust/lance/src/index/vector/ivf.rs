@@ -505,6 +505,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     // Write the metadata of quantizer
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
+        Quantizer::BinFlat(_) => None,
         Quantizer::Product(pq) => {
             let mat = MatrixView::<Float32Type>::new(
                 Arc::new(
@@ -1538,6 +1539,7 @@ async fn write_ivf_hnsw_file(
     // For PQ, we need to store the codebook
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
+        Quantizer::BinFlat(_) => None,
         Quantizer::Product(pq) => {
             let mat = MatrixView::<Float32Type>::new(
                 Arc::new(

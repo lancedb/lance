@@ -30,6 +30,7 @@ use lance_index::{
     },
     Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
+use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader, ReadBatchParams,
 };
@@ -95,17 +96,19 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
             DecoderMiddlewareChain::default(),
         )
         .await?;
-        let distance_type = DistanceType::try_from(
+
+        let index_metadata: IndexMetadata = serde_json::from_str(
             index_reader
                 .schema()
                 .metadata
-                .get(DISTANCE_TYPE_KEY)
+                .get(INDEX_METADATA_SCHEMA_KEY)
                 .ok_or(Error::Index {
                     message: format!("{} not found", DISTANCE_TYPE_KEY),
                     location: location!(),
                 })?
                 .as_str(),
         )?;
+        let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
         let ivf_pb_bytes =
             hex::decode(index_reader.schema().metadata.get(IVF_METADATA_KEY).ok_or(

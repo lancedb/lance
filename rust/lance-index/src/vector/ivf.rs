@@ -57,6 +57,7 @@ pub fn new_ivf_with_quantizer(
 ) -> Result<Ivf> {
     match quantizer {
         Quantizer::Flat(_) => Ok(Ivf::new_flat(centroids, metric_type, vector_column, range)),
+        Quantizer::BinFlat(_) => Ok(Ivf::new_flat(centroids, metric_type, vector_column, range)),
         Quantizer::Product(pq) => Ok(Ivf::with_pq(
             centroids,
             metric_type,

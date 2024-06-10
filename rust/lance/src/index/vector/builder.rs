@@ -27,6 +27,7 @@ use lance_index::{
     },
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
+use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStreamAdapter,
     ReadBatchParams,
@@ -313,6 +314,14 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         );
 
         let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
+        let index_metadata = IndexMetadata {
+            index_type: self.sub_index.name().to_string(),
+            distance_type: self.distance_type.to_string(),
+        };
+        index_writer.add_schema_metadata(
+            INDEX_METADATA_SCHEMA_KEY,
+            serde_json::to_string(&index_metadata)?,
+        );
         index_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
         index_writer
             .add_schema_metadata(IVF_METADATA_KEY, hex::encode(index_ivf_pb.encode_to_vec()));
