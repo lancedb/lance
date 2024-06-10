@@ -21,6 +21,7 @@ use super::pb;
 use crate::pb::Tensor;
 
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
     match array.data_type() {
         DataType::FixedSizeList(_, _) => {
@@ -51,7 +52,7 @@ pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
 }
 
 #[inline]
-fn do_prefetch<T>(ptrs: Range<*const T>) {
+pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
     // TODO use rust intrinsics instead of x86 intrinsics
     // TODO finish this
     unsafe {

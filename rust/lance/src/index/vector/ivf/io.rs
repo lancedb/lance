@@ -24,14 +24,17 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::quantizer::{Quantization as _, Quantizer};
-use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::{
+    quantizer::{Quantization, Quantizer},
+    sq::ScalarQuantizer,
+    storage::VectorStore,
+};
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::{DistanceType, MetricType};
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
@@ -42,7 +45,7 @@ use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
-use crate::index::vector::{hnsw::builder::build_hnsw_model, sq::build_sq_storage};
+use crate::index::vector::sq::build_sq_storage;
 use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
 
@@ -308,9 +311,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         if let Some(&previous_indices) = existing_indices.as_ref() {
             for &idx in previous_indices.iter() {
                 let sub_index = idx.load_partition(part_id, true).await?;
-                let row_ids = Arc::new(UInt64Array::from_iter_values(
-                    sub_index.row_ids().iter().cloned(),
-                ));
+                let row_ids = Arc::new(UInt64Array::from_iter_values(sub_index.row_ids().cloned()));
                 row_id_array.push(row_ids);
             }
         }
@@ -406,7 +407,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                     batch_id as i32,
                     ReadBatchParams::RangeFull,
                     part_reader.schema(),
-                    None,
                 )
             })
             .buffered(num_cpus::get())
@@ -431,7 +431,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                         batch_id as i32,
                         ReadBatchParams::RangeFull,
                         aux_part_reader.schema(),
-                        None,
                     )
                 })
                 .buffered(num_cpus::get())
@@ -512,11 +511,11 @@ async fn build_hnsw_quantization_partition(
 }
 
 async fn build_and_write_hnsw(
-    hnsw_params: HnswBuildParams,
+    params: HnswBuildParams,
     vectors: Arc<dyn Array>,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
-    let hnsw = build_hnsw_model(hnsw_params, vectors).await?;
+    let hnsw = params.build(vectors).await?;
     let length = hnsw.write(&mut writer).await?;
     Result::Ok(length)
 }
@@ -540,19 +539,21 @@ async fn build_and_write_pq_storage(
 }
 
 async fn build_and_write_sq_storage(
-    metric_type: MetricType,
+    distance_type: DistanceType,
     row_ids: Arc<dyn Array>,
     vectors: Arc<dyn Array>,
     sq: ScalarQuantizer,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<()> {
     let storage = spawn_cpu(move || {
-        let storage = build_sq_storage(metric_type, row_ids, vectors, sq)?;
+        let storage = build_sq_storage(distance_type, row_ids, vectors, sq)?;
         Ok(storage)
     })
     .await?;
 
-    writer.write_record_batch(storage.batch().clone()).await?;
+    for batch in storage.to_batches()? {
+        writer.write_record_batch(batch.clone()).await?;
+    }
     writer.finish().await?;
     Ok(())
 }

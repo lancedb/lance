@@ -32,12 +32,13 @@ use serde::{Deserialize, Serialize};
 use super::super::graph::beam_search;
 use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
 use crate::scalar::IndexWriter;
+use crate::vector::flat::storage::FlatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::greedy_search;
 use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
-use crate::vector::v3::storage::{DistCalculator, VectorStore};
+use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::DIST_COL;
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
@@ -103,6 +104,15 @@ impl HnswBuildParams {
         self.parallel_limit = Some(limit);
         self
     }
+
+    pub async fn build(self, data: ArrayRef) -> Result<HNSW> {
+        // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
+        let vec_store = Arc::new(FlatStorage::new(
+            data.as_fixed_size_list().clone(),
+            DistanceType::L2,
+        ));
+        HNSW::build_with_storage(DistanceType::L2, self, vec_store).await
+    }
 }
 
 /// Build a HNSW graph.
@@ -114,7 +124,7 @@ impl HnswBuildParams {
 /// Each node in the graph has a global ID which is the index on the base layer.
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSW {
-    inner: Arc<HNSWBuilderInner>,
+    inner: Arc<HnswBuilder>,
 }
 
 impl Debug for HNSW {
@@ -159,7 +169,7 @@ impl HNSW {
         params: HnswBuildParams,
         storage: Arc<impl VectorStore + 'static>,
     ) -> Result<Self> {
-        let inner = HNSWBuilderInner::with_params(distance_type, params, storage.as_ref());
+        let inner = HnswBuilder::with_params(distance_type, params, storage.as_ref());
         let hnsw = Self {
             inner: Arc::new(inner),
         };
@@ -426,7 +436,7 @@ impl HNSW {
             .map(|i| {
                 let start = range.start + level_offsets[i];
                 let end = range.start + level_offsets[i + 1];
-                reader.read_range(start..end, reader.schema(), None)
+                reader.read_range(start..end, reader.schema())
             })
             .buffered(num_cpus::get())
             .try_collect()
@@ -484,7 +494,7 @@ impl HNSW {
                 .push(VisitedGenerator::new(0))
                 .unwrap();
         }
-        let inner = HNSWBuilderInner {
+        let inner = HnswBuilder {
             distance_type,
             params: metadata.params,
             nodes: Arc::new(nodes.into_iter().map(RwLock::new).collect()),
@@ -499,7 +509,7 @@ impl HNSW {
     }
 }
 
-struct HNSWBuilderInner {
+struct HnswBuilder {
     distance_type: DistanceType,
     params: HnswBuildParams,
 
@@ -511,7 +521,7 @@ struct HNSWBuilderInner {
     visited_generator_queue: Arc<ArrayQueue<VisitedGenerator>>,
 }
 
-impl DeepSizeOf for HNSWBuilderInner {
+impl DeepSizeOf for HnswBuilder {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.distance_type.deep_size_of_children(context)
             + self.params.deep_size_of_children(context)
@@ -521,16 +531,16 @@ impl DeepSizeOf for HNSWBuilderInner {
     }
 }
 
-impl HNSWBuilderInner {
-    pub fn max_level(&self) -> u16 {
+impl HnswBuilder {
+    fn max_level(&self) -> u16 {
         self.params.max_level
     }
 
-    pub fn num_nodes(&self, level: usize) -> usize {
+    fn num_nodes(&self, level: usize) -> usize {
         self.level_count[level].load(Ordering::Relaxed)
     }
 
-    pub fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
+    fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
         self.nodes.clone()
     }
 

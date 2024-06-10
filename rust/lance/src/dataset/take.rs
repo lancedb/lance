@@ -172,7 +172,7 @@ pub async fn take_rows(
             )
         })?;
 
-        let reader = fragment.open(projection.as_ref(), false).await?;
+        let reader = fragment.open(projection.as_ref(), false, false).await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_id_meta.sorted {
         // Don't need to re-arrange data, just concatenate
@@ -373,7 +373,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_take(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_take(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempfile::tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -398,7 +398,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -445,11 +445,9 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_take_rows_out_of_bound(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_take_rows_out_of_bound(#[values(false, true)] use_legacy_format: bool) {
         // a dataset with 1 fragment and 400 rows
-        let test_ds = TestVectorDataset::new(use_experimental_writer)
-            .await
-            .unwrap();
+        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
         let ds = test_ds.dataset;
 
         // take the last row of first fragment
@@ -486,7 +484,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_take_rows(#[values(false, true)] use_experimental_writer: bool) {
+    async fn test_take_rows(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempfile::tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -511,7 +509,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -568,7 +566,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn take_scan_dataset(#[values(false, true)] use_experimental_writer: bool) {
+    async fn take_scan_dataset(#[values(false, true)] use_legacy_format: bool) {
         use arrow::datatypes::Int32Type;
         use arrow_array::Float32Array;
 
@@ -590,7 +588,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 2,
-            use_experimental_writer,
+            use_legacy_format,
             ..Default::default()
         };
 

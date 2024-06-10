@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::encodings::physical::value::CompressionScheme;
-use crate::{decoder::PhysicalPageScheduler, format::pb};
+use crate::{decoder::PageScheduler, format::pb};
 
 use self::value::parse_compression_scheme;
 use self::{
@@ -19,21 +19,21 @@ pub mod value;
 /// These contain the file buffers shared across the entire file
 #[derive(Clone, Copy, Debug)]
 pub struct FileBuffers<'a> {
-    pub positions_and_sizes: &'a Vec<(u64, u64)>,
+    pub positions_and_sizes: &'a [(u64, u64)],
 }
 
 /// These contain the file buffers and also buffers specific to a column
 #[derive(Clone, Copy, Debug)]
 pub struct ColumnBuffers<'a, 'b> {
     pub file_buffers: FileBuffers<'a>,
-    pub positions_and_sizes: &'b Vec<(u64, u64)>,
+    pub positions_and_sizes: &'b [(u64, u64)],
 }
 
 /// These contain the file & column buffers and also buffers specific to a page
 #[derive(Clone, Copy, Debug)]
 pub struct PageBuffers<'a, 'b, 'c> {
     pub column_buffers: ColumnBuffers<'a, 'b>,
-    pub positions_and_sizes: &'c Vec<(u64, u64)>,
+    pub positions_and_sizes: &'c [(u64, u64)],
 }
 
 // Translate a protobuf buffer description into a position in the file.  This could be a page
@@ -51,10 +51,7 @@ fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> (u64, u64) {
 }
 
 /// Convert a protobuf buffer encoding into a physical page scheduler
-fn get_buffer_decoder(
-    encoding: &pb::Flat,
-    buffers: &PageBuffers,
-) -> Box<dyn PhysicalPageScheduler> {
+fn get_buffer_decoder(encoding: &pb::Flat, buffers: &PageBuffers) -> Box<dyn PageScheduler> {
     let (buffer_offset, buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
     let compression_scheme = if encoding.compression.is_none() {
         CompressionScheme::None
@@ -81,7 +78,7 @@ fn get_buffer_decoder(
 pub fn decoder_from_array_encoding(
     encoding: &pb::ArrayEncoding,
     buffers: &PageBuffers,
-) -> Box<dyn PhysicalPageScheduler> {
+) -> Box<dyn PageScheduler> {
     match encoding.array_encoding.as_ref().unwrap() {
         pb::array_encoding::ArrayEncoding::Nullable(basic) => {
             match basic.nullability.as_ref().unwrap() {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use arrow_buffer::BooleanBufferBuilder;
 use bytes::{Bytes, BytesMut};
@@ -11,7 +11,7 @@ use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
+    decoder::{PageScheduler, PhysicalPageDecoder},
     EncodingsIo,
 };
 
@@ -30,11 +30,11 @@ impl DenseBitmapScheduler {
     }
 }
 
-impl PhysicalPageScheduler for DenseBitmapScheduler {
+impl PageScheduler for DenseBitmapScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u32>],
-        scheduler: &dyn EncodingsIo,
+        scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let mut min = u64::MAX;

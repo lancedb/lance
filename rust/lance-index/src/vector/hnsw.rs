@@ -6,17 +6,20 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-pub mod builder;
 use arrow_schema::{DataType, Field};
-pub use builder::HNSW;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
-
 use super::graph::{OrderedFloat, OrderedNode};
-use super::v3::storage::VectorStore;
+use super::storage::{DistCalculator, VectorStore};
+
+pub mod builder;
+pub mod index;
+
+pub use builder::HNSW;
+pub use index::HNSWIndex;
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
@@ -38,24 +41,11 @@ pub struct HnswMetadata {
     pub level_offsets: Option<Vec<usize>>,
 }
 
-/// Select neighbors from the ordered candidate list.
-///
-/// Algorithm 3 in the HNSW paper.
-///
-/// WARNING: Internal API,  API stability is not guaranteed
-pub fn select_neighbors(
-    orderd_candidates: &[OrderedNode],
-    k: usize,
-) -> impl Iterator<Item = &OrderedNode> + '_ {
-    orderd_candidates.iter().take(k)
-}
-
 /// Algorithm 4 in the HNSW paper.
 ///
-/// NOTE: the result is not ordered
-///
-/// WARNING: Internal API,  API stability is not guaranteed
-pub fn select_neighbors_heuristic(
+/// # NOTE
+/// The results are not ordered.
+fn select_neighbors_heuristic(
     storage: &impl VectorStore,
     candidates: &[OrderedNode],
     k: usize,
@@ -64,18 +54,21 @@ pub fn select_neighbors_heuristic(
         return candidates.iter().cloned().collect_vec();
     }
     let mut candidates = candidates.to_vec();
-    candidates.sort_unstable_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap());
+    candidates.sort_unstable_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
-    while !candidates.is_empty() && results.len() < k {
-        let u = candidates.pop().unwrap();
+    for u in candidates.iter() {
+        if results.len() >= k {
+            break;
+        }
+        let dist_cal = storage.dist_calculator_from_id(u.id);
 
         if results.is_empty()
             || results
                 .iter()
-                .all(|v| u.dist < OrderedFloat(storage.distance_between(u.id, v.id)))
+                .all(|v| u.dist < OrderedFloat(dist_cal.distance(v.id)))
         {
-            results.push(u);
+            results.push(u.clone());
         }
     }
     results

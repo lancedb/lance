@@ -1171,10 +1171,8 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(maybe_nbytes) = get_dict_opt::<usize>(options, "max_bytes_per_file")? {
             p.max_bytes_per_file = maybe_nbytes;
         }
-        if let Some(use_experimental_writer) =
-            get_dict_opt::<bool>(options, "use_experimental_writer")?
-        {
-            p.use_experimental_writer = use_experimental_writer;
+        if let Some(use_legacy_format) = get_dict_opt::<bool>(options, "use_legacy_format")? {
+            p.use_legacy_format = use_legacy_format;
         }
         if let Some(progress) = get_dict_opt::<PyObject>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));

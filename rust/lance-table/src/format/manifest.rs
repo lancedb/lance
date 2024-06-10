@@ -252,6 +252,11 @@ impl Manifest {
 
         fragments
     }
+
+    /// Whether the dataset uses move-stable row ids.
+    pub fn uses_move_stable_row_ids(&self) -> bool {
+        self.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

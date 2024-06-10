@@ -73,8 +73,8 @@ impl RowIdMask {
     }
 
     /// Return the indices of the input row ids that were valid
-    pub fn selected_indices(&self, row_ids: &[u64]) -> Vec<u64> {
-        let enumerated_ids = row_ids.iter().enumerate();
+    pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
+        let enumerated_ids = row_ids.enumerate();
         match (&self.block_list, &self.allow_list) {
             (Some(block_list), Some(allow_list)) => {
                 // Only take rows that are both in the allow list and not in the block list

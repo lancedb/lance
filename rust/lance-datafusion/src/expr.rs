@@ -413,6 +413,60 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
     }
 }
 
+/// Convert a DF Expr into a Substrait ExtendedExpressions message
+#[cfg(feature = "substrait")]
+pub fn encode_substrait(expr: Expr, schema: Arc<Schema>) -> Result<Vec<u8>> {
+    use datafusion::logical_expr::{builder::LogicalTableSource, logical_plan, LogicalPlan};
+    use datafusion_substrait::substrait::proto::{plan_rel, ExpressionReference, NamedStruct};
+
+    let table_source = Arc::new(LogicalTableSource::new(schema.clone()));
+
+    // DF doesn't handled ExtendedExpressions and so we need to create
+    // a dummy plan with a single filter node
+    let plan = LogicalPlan::Filter(logical_plan::Filter::try_new(
+        expr,
+        Arc::new(LogicalPlan::TableScan(logical_plan::TableScan::try_new(
+            "dummy",
+            table_source,
+            None,
+            vec![],
+            None,
+        )?)),
+    )?);
+
+    let session_context = SessionContext::new();
+
+    let substrait_plan =
+        datafusion_substrait::logical_plan::producer::to_substrait_plan(&plan, &session_context)?;
+
+    if let Some(plan_rel::RelType::Root(root)) = &substrait_plan.relations[0].rel_type {
+        if let Some(rel::RelType::Filter(filt)) = &root.input.as_ref().unwrap().rel_type {
+            let expr = filt.condition.as_ref().unwrap().clone();
+            let schema = NamedStruct {
+                names: schema.fields().iter().map(|f| f.name().clone()).collect(),
+                r#struct: None,
+            };
+            let envelope = ExtendedExpression {
+                advanced_extensions: substrait_plan.advanced_extensions.clone(),
+                base_schema: Some(schema),
+                expected_type_urls: substrait_plan.expected_type_urls.clone(),
+                extension_uris: substrait_plan.extension_uris.clone(),
+                extensions: substrait_plan.extensions.clone(),
+                referred_expr: vec![ExpressionReference {
+                    output_names: vec![],
+                    expr_type: Some(ExprType::Expression(*expr)),
+                }],
+                version: substrait_plan.version.clone(),
+            };
+            Ok(envelope.encode_to_vec())
+        } else {
+            unreachable!()
+        }
+    } else {
+        unreachable!()
+    }
+}
+
 /// Convert a Substrait ExtendedExpressions message into a DF Expr
 ///
 /// The ExtendedExpressions message must contain a single scalar expression

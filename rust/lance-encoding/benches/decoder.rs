@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, TimeUnit};
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance_encoding::encoder::{encode_batch, CoreFieldEncodingStrategy};
+use lance_encoding::{
+    decoder::{DecoderMiddlewareChain, FilterExpression},
+    encoder::{encode_batch, CoreFieldEncodingStrategy},
+};
 
 const PRIMITIVE_TYPES: &[DataType] = &[
     DataType::Date32,
@@ -55,17 +58,28 @@ fn bench_decode(c: &mut Criterion) {
             .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
             .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024))
             .unwrap();
+        let lance_schema =
+            Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
         let input_bytes = data.get_array_memory_size();
         group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
         let encoding_strategy = CoreFieldEncodingStrategy::default();
         let encoded = rt
-            .block_on(encode_batch(&data, &encoding_strategy, 1024 * 1024))
+            .block_on(encode_batch(
+                &data,
+                lance_schema,
+                &encoding_strategy,
+                1024 * 1024,
+            ))
             .unwrap();
         let func_name = format!("{:?}", data_type).to_lowercase();
         group.bench_function(func_name, |b| {
             b.iter(|| {
                 let batch = rt
-                    .block_on(lance_encoding::decoder::decode_batch(&encoded))
+                    .block_on(lance_encoding::decoder::decode_batch(
+                        &encoded,
+                        &FilterExpression::no_filter(),
+                        &DecoderMiddlewareChain::default(),
+                    ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
             })
@@ -83,17 +97,28 @@ fn bench_decode_fsl(c: &mut Criterion) {
             )))
             .into_batch_rows(lance_datagen::RowCount::from(1024))
             .unwrap();
+        let lance_schema =
+            Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
         let input_bytes = data.get_array_memory_size();
         group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
         let encoding_strategy = CoreFieldEncodingStrategy::default();
         let encoded = rt
-            .block_on(encode_batch(&data, &encoding_strategy, 1024 * 1024))
+            .block_on(encode_batch(
+                &data,
+                lance_schema,
+                &encoding_strategy,
+                1024 * 1024,
+            ))
             .unwrap();
         let func_name = format!("{:?}", data_type).to_lowercase();
         group.bench_function(func_name, |b| {
             b.iter(|| {
                 let batch = rt
-                    .block_on(lance_encoding::decoder::decode_batch(&encoded))
+                    .block_on(lance_encoding::decoder::decode_batch(
+                        &encoded,
+                        &FilterExpression::no_filter(),
+                        &DecoderMiddlewareChain::default(),
+                    ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
             })

@@ -20,6 +20,7 @@ lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-datagen = { workspace = true }
+lance-encoding = { workspace = true }
 lance-file = { workspace = true }
 lance-io = { workspace = true }
 lance-linalg = { workspace = true }
@@ -43,6 +44,7 @@ dashmap = "5"
 deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
+hex.workspace = true
 itertools.workspace = true
 object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 aws-credential-types.workspace = true
