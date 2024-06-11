@@ -11,7 +11,6 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use bitvec::vec::BitVec;
 use deepsize::DeepSizeOf;
-use lance_core::Result;
 
 pub mod builder;
 
@@ -234,7 +233,7 @@ pub fn beam_search(
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
     prefetch_distance: Option<usize>,
     visited_generator: &mut VisitedGenerator,
-) -> Result<Vec<OrderedNode>> {
+) -> Vec<OrderedNode> {
     let mut visited = visited_generator.generate(graph.len());
     //let mut visited: HashSet<_> = HashSet::with_capacity(k);
     let mut candidates = BinaryHeap::with_capacity(k);
@@ -309,7 +308,7 @@ pub fn beam_search(
         };
     }
 
-    Ok(results.into_sorted_vec())
+    results.into_sorted_vec()
 }
 
 /// Greedy search over a graph
@@ -334,7 +333,7 @@ pub fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
     dist_calc: &impl DistCalculator,
-) -> Result<OrderedNode> {
+) -> OrderedNode {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
     loop {
@@ -358,7 +357,7 @@ pub fn greedy_search(
         }
     }
 
-    Ok(OrderedNode::new(current, closest_dist.into()))
+    OrderedNode::new(current, closest_dist.into())
 }
 
 #[cfg(test)]

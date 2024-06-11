@@ -102,8 +102,11 @@ impl IvfSubIndex for FlatIndex {
         Ok(Self {})
     }
 
-    fn index_vectors(&self, _: &impl VectorStore, _: Self::BuildParams) -> Result<()> {
-        Ok(())
+    fn index_vectors(_: &impl VectorStore, _: Self::BuildParams) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(Self {})
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {

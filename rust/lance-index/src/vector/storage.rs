@@ -53,7 +53,7 @@ pub trait DistCalculator {
 ///
 ///  API stability is not guaranteed
 /// </section>
-pub trait VectorStore: Send + Sync + Sized {
+pub trait VectorStore: Send + Sync + Sized + Clone {
     type DistanceCalculator<'a>: DistCalculator
     where
         Self: 'a;

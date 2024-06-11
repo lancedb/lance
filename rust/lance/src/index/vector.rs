@@ -519,6 +519,7 @@ pub(crate) async fn open_vector_index_v2(
             let options = HNSWIndexOptions {
                 use_residual: false,
             };
+
             let hnsw = HNSWIndex::<ScalarQuantizer>::try_new(
                 distance_type,
                 reader.object_reader.clone(),

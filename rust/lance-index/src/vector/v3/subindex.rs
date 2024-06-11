@@ -14,7 +14,7 @@ pub const SUB_INDEX_METADATA_KEY: &str = "sub_index_metadata";
 
 /// A sub index for IVF index
 pub trait IvfSubIndex: Send + Sync + DeepSizeOf {
-    type QueryParams: Send + Sync + Default + for<'a> From<&'a Query>;
+    type QueryParams: Send + Sync + for<'a> From<&'a Query>;
     type BuildParams: Clone;
 
     /// Load the sub index from a record batch with a single row
@@ -42,7 +42,9 @@ pub trait IvfSubIndex: Send + Sync + DeepSizeOf {
     ) -> Result<RecordBatch>;
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
-    fn index_vectors(&self, storage: &impl VectorStore, params: Self::BuildParams) -> Result<()>;
+    fn index_vectors(storage: &impl VectorStore, params: Self::BuildParams) -> Result<Self>
+    where
+        Self: Sized;
 
     /// Return the schema of the sub index
     fn schema(&self) -> arrow_schema::SchemaRef;

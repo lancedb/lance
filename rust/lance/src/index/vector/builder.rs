@@ -204,12 +204,10 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         let storage_len = writer.finish().await? as usize;
 
         // build the sub index, with in-memory storage
-        self.sub_index
-            .index_vectors(&storage, self.sub_index_params.clone())?;
-
+        let sub_index = S::index_vectors(&storage, self.sub_index_params.clone())?;
         let path = self.temp_dir.child(format!("index_part{}", part_id));
         let writer = object_store.create(&path).await?;
-        let index_batch = self.sub_index.to_batch()?;
+        let index_batch = sub_index.to_batch()?;
         let mut writer = FileWriter::try_new(
             writer,
             path.to_string(),
