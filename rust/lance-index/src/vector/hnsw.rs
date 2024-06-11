@@ -6,9 +6,13 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
+use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field};
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_core::Result;
+use lance_file::writer::FileWriter;
+use lance_table::io::manifest::ManifestDescribing;
 use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
@@ -72,4 +76,15 @@ fn select_neighbors_heuristic(
         }
     }
     results
+}
+
+/// Build and Write HNSW graph to a file.
+pub async fn build_and_write_hnsw(
+    params: HnswBuildParams,
+    vectors: ArrayRef,
+    mut writer: FileWriter<ManifestDescribing>,
+) -> Result<usize> {
+    let hnsw = params.build(vectors).await?;
+    let length = hnsw.write(&mut writer).await?;
+    Result::Ok(length)
 }
