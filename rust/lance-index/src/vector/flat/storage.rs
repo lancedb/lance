@@ -232,7 +232,7 @@ impl IntFlatStorage {
 }
 
 impl VectorStore for IntFlatStorage {
-    type DistanceCalculator<'a> = FloatFlatDistanceCal<'a>;
+    type DistanceCalculator<'a> = IntFlatDistanceCal<'a>;
 
     fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
         let row_ids = Arc::new(
@@ -300,11 +300,11 @@ impl VectorStore for IntFlatStorage {
     }
 
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        FloatFlatDistanceCal::new(self.vectors.as_ref(), query, self.distance_type)
+        IntFlatDistanceCal::new(self.vectors.as_ref(), query, self.distance_type)
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
-        FloatFlatDistanceCal::new(
+        IntFlatDistanceCal::new(
             self.vectors.as_ref(),
             self.vectors.value(id as usize),
             self.distance_type,
