@@ -217,7 +217,7 @@ public class Dataset implements Closeable {
   /**
    * Count the number of rows in the dataset.
    *
-   * @return num of rows.
+   * @return num of rows
    */
   public int countRows() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
