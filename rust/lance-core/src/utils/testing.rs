@@ -3,7 +3,7 @@
 
 //! Testing utilities
 
-use crate::Result;
+use crate::{Error, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{Duration, TimeDelta};
@@ -14,7 +14,9 @@ use object_store::{
     Error as OSError, GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore,
     PutOptions, PutResult, Result as OSResult,
 };
-use std::collections::HashMap;
+use rand::Rng;
+use snafu::{location, Location};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::future;
 use std::ops::Range;
@@ -23,14 +25,14 @@ use tokio::io::AsyncWrite;
 
 // A policy function takes in the name of the operation (e.g. "put") and the location
 // that is being accessed / modified and returns an optional error.
-pub trait PolicyFnT: Fn(&str, &Path) -> Result<()> + Send + Sync {}
-impl<F> PolicyFnT for F where F: Fn(&str, &Path) -> Result<()> + Send + Sync {}
+pub trait PolicyFnT: FnMut(&str, &Path) -> Result<()> + Send + Sync {}
+impl<F> PolicyFnT for F where F: FnMut(&str, &Path) -> Result<()> + Send + Sync {}
 impl Debug for dyn PolicyFnT {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PolicyFn")
     }
 }
-type PolicyFn = Arc<dyn PolicyFnT>;
+type PolicyFn = Box<dyn PolicyFnT>;
 
 // These policy functions receive (and optionally transform) an ObjectMeta
 // They apply to functions that list file info
@@ -100,8 +102,8 @@ impl ProxyObjectStore {
     }
 
     fn before_method(&self, method: &str, location: &Path) -> OSResult<()> {
-        let policy = self.policy.lock().unwrap();
-        for policy in policy.before_policies.values() {
+        let mut policy = self.policy.lock().unwrap();
+        for policy in policy.before_policies.values_mut() {
             policy(method, location).map_err(OSError::from)?;
         }
         Ok(())
@@ -180,6 +182,10 @@ impl ObjectStore for ProxyObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+        match self.before_method("list", prefix.unwrap_or(&Path::default())) {
+            Ok(()) => {}
+            Err(e) => return futures::stream::once(future::ready(Err(e))).boxed(),
+        }
         self.target
             .list(prefix)
             .and_then(|meta| future::ready(self.transform_meta("list", meta)))
@@ -187,6 +193,7 @@ impl ObjectStore for ProxyObjectStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.before_method("list_with_delimieter", prefix.unwrap_or(&Path::default()))?;
         self.target.list_with_delimiter(prefix).await
     }
 
@@ -204,6 +211,36 @@ impl ObjectStore for ProxyObjectStore {
         self.before_method("copy_if_not_exists", from)?;
         self.target.copy_if_not_exists(from, to).await
     }
+}
+
+/// Creates an object store that fails every other call
+///
+/// Can be used to test retry handling
+pub fn flaky_store(inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+    let allowed_ops = HashSet::<&str>::from_iter(vec!["delete"]);
+    let mut policy = ProxyObjectStorePolicy::new();
+    policy.set_before_policy(
+        "maybe_fail",
+        Box::new(move |op, loc| {
+            if allowed_ops.contains(op) {
+                return Ok(());
+            }
+            if rand::thread_rng().gen_bool(0.5) {
+                Err(Error::Internal {
+                    message: format!(
+                        "{} {}: {:#?}",
+                        op,
+                        loc,
+                        std::backtrace::Backtrace::force_capture()
+                    ),
+                    location: location!(),
+                })
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    Arc::new(ProxyObjectStore::new(inner, Arc::new(Mutex::new(policy))))
 }
 
 // Regrettably, the system clock is a process-wide global. That means that tests running
@@ -242,5 +279,31 @@ impl<'a> Drop for MockClock<'a> {
     fn drop(&mut self) {
         // Reset the clock to the epoch
         mock_instant::MockClock::set_system_time(TimeDelta::try_days(0).unwrap().to_std().unwrap());
+    }
+}
+
+pub struct EnvVarGuard {
+    key: String,
+    original_value: Option<String>,
+}
+
+impl EnvVarGuard {
+    pub fn new(key: &str, new_value: &str) -> Self {
+        let original_value = std::env::var(key).ok();
+        std::env::set_var(key, new_value);
+        Self {
+            key: key.to_string(),
+            original_value,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(ref value) = self.original_value {
+            std::env::set_var(&self.key, value);
+        } else {
+            std::env::remove_var(&self.key);
+        }
     }
 }

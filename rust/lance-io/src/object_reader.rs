@@ -7,13 +7,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
-use futures::future::BoxFuture;
 use lance_core::Result;
 use object_store::{path::Path, ObjectStore};
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
-use crate::traits::Reader;
+use crate::{traits::Reader, utils::do_with_retry};
 
 /// Object Reader
 ///
@@ -52,27 +51,6 @@ impl CloudObjectReader {
             block_size,
         })
     }
-
-    // Retries for the initial request are handled by object store, but
-    // there are no retries for failures that occur during the streaming
-    // of the response body. Thus we add an outer retry loop here.
-    async fn do_with_retry<'a, O>(
-        &self,
-        f: impl Fn() -> BoxFuture<'a, std::result::Result<O, object_store::Error>>,
-    ) -> object_store::Result<O> {
-        let mut retries = 3;
-        loop {
-            match f().await {
-                Ok(val) => return Ok(val),
-                Err(err) => {
-                    if retries == 0 {
-                        return Err(err);
-                    }
-                    retries -= 1;
-                }
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -89,9 +67,7 @@ impl Reader for CloudObjectReader {
     async fn size(&self) -> object_store::Result<usize> {
         self.size
             .get_or_try_init(|| async move {
-                let meta = self
-                    .do_with_retry(|| self.object_store.head(&self.path))
-                    .await?;
+                let meta = do_with_retry(|| self.object_store.head(&self.path)).await?;
                 Ok(meta.size)
             })
             .await
@@ -100,7 +76,6 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes> {
-        self.do_with_retry(|| self.object_store.get_range(&self.path, range.clone()))
-            .await
+        do_with_retry(|| self.object_store.get_range(&self.path, range.clone())).await
     }
 }

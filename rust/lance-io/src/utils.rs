@@ -10,7 +10,9 @@ use arrow_array::{
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use lance_arrow::*;
+use object_store::Error as OSError;
 use prost::Message;
 use snafu::{location, Location};
 
@@ -174,6 +176,34 @@ pub fn read_struct_from_buf<
 ) -> Result<T> {
     let msg: M = read_message_from_buf(buf)?;
     T::try_from(msg)
+}
+
+fn get_retry_count() -> usize {
+    std::env::var("LANCE_RETRY_COUNT")
+        .unwrap_or("3".to_string())
+        .parse()
+        .unwrap_or(3)
+}
+
+// Retries for the initial request are handled by object store, but
+// the object store is often too conservative and doesn't retry certain
+// types of errors. Thus we add an outer retry loop here.
+pub async fn do_with_retry<'a, O>(
+    f: impl Fn() -> BoxFuture<'a, std::result::Result<O, object_store::Error>>,
+) -> object_store::Result<O> {
+    let mut retries = get_retry_count();
+    loop {
+        let res = f().await;
+        match &res {
+            Err(OSError::Generic { .. }) | Err(OSError::JoinError { .. }) => {
+                if retries == 0 {
+                    return res;
+                }
+                retries -= 1;
+            }
+            _ => return res,
+        }
+    }
 }
 
 #[cfg(test)]

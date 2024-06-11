@@ -13,6 +13,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use lance_core::{Error, Result};
 
 use crate::traits::Writer;
+use crate::utils::do_with_retry;
 
 /// AsyncWrite with the capability to tell the position the data is written.
 ///
@@ -31,13 +32,15 @@ pub struct ObjectWriter {
 
 impl ObjectWriter {
     pub async fn new(object_store: &dyn ObjectStore, path: &Path) -> Result<Self> {
-        let (multipart_id, writer) = object_store.put_multipart(path).await.map_err(|e| {
-            Error::io(
-                format!("failed to create object writer for {}: {}", path, e),
-                // and wrap it in here.
-                location!(),
-            )
-        })?;
+        let (multipart_id, writer) = do_with_retry(|| object_store.put_multipart(path))
+            .await
+            .map_err(|e| {
+                Error::io(
+                    format!("failed to create object writer for {}: {}", path, e),
+                    // and wrap it in here.
+                    location!(),
+                )
+            })?;
 
         Ok(Self {
             writer,
