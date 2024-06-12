@@ -260,10 +260,11 @@ impl HNSW {
             distance_type: self.inner.distance_type.to_string(),
         });
 
-        let metadata = HashMap::from_iter(vec![(
+        let mut metadata = batch.schema_ref().metadata().clone();
+        metadata.insert(
             INDEX_METADATA_SCHEMA_KEY.to_string(),
             index_metadata.to_string(),
-        )]);
+        );
         writer.write_record_batch(batch).await?;
         writer.finish_with_metadata(&metadata).await?;
         Ok(num_rows)
@@ -292,7 +293,6 @@ impl HNSW {
     pub async fn load_partition(
         reader: &FileReader,
         range: std::ops::Range<usize>,
-        _: DistanceType,
         vector_storage: Arc<impl VectorStore + 'static>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
@@ -301,6 +301,12 @@ impl HNSW {
         }
 
         let batch = reader.read_range(range, reader.schema()).await?;
+        let mut schema = batch.schema_ref().as_ref().clone();
+        schema.metadata.insert(
+            HNSW_METADATA_KEY.to_string(),
+            serde_json::to_string(&metadata)?,
+        );
+        let batch = batch.with_schema(schema.into())?;
         IvfSubIndex::load(batch)
     }
 }

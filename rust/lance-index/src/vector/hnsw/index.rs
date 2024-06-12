@@ -41,8 +41,6 @@ pub struct HNSWIndexOptions {
 
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSWIndex<Q: Quantization> {
-    distance_type: DistanceType,
-
     // Some(T) if the index is loaded, None otherwise
     hnsw: Option<HNSW>,
     storage: Option<Arc<Q::Storage>>,
@@ -62,7 +60,6 @@ impl<Q: Quantization> Debug for HNSWIndex<Q> {
 
 impl<Q: Quantization> HNSWIndex<Q> {
     pub async fn try_new(
-        distance_type: DistanceType,
         reader: Arc<dyn Reader>,
         aux_reader: Arc<dyn Reader>,
         options: HNSWIndexOptions,
@@ -79,7 +76,6 @@ impl<Q: Quantization> HNSWIndex<Q> {
 
         let ivf_store = IvfQuantizationStorage::open(aux_reader).await?;
         Ok(Self {
-            distance_type,
             hnsw: None,
             storage: None,
             partition_storage: ivf_store,
@@ -123,7 +119,7 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
             "index_type": "HNSW",
-            "distance_type": self.metric_type().to_string(),
+            "distance_type": self.partition_storage.distance_type().to_string(),
         }))
     }
 
@@ -239,7 +235,6 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         let hnsw = HNSW::load(&reader, storage.clone()).await?;
 
         Ok(Box::new(Self {
-            distance_type: self.distance_type,
             hnsw: Some(hnsw),
             storage: Some(storage),
             partition_storage: self.partition_storage.clone(),
@@ -259,17 +254,11 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
 
         let metadata = self.get_partition_metadata(partition_id)?;
         let storage = Arc::new(self.partition_storage.load_partition(partition_id).await?);
-        let hnsw = HNSW::load_partition(
-            &reader,
-            offset..offset + length,
-            self.metric_type(),
-            storage.clone(),
-            metadata,
-        )
-        .await?;
+        let hnsw =
+            HNSW::load_partition(&reader, offset..offset + length, storage.clone(), metadata)
+                .await?;
 
         Ok(Box::new(Self {
-            distance_type: self.distance_type,
             hnsw: Some(hnsw),
             storage: Some(storage),
             partition_storage: self.partition_storage.clone(),
@@ -290,6 +279,6 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     }
 
     fn metric_type(&self) -> DistanceType {
-        self.distance_type
+        self.partition_storage.distance_type()
     }
 }

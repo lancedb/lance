@@ -489,7 +489,6 @@ pub(crate) async fn open_vector_index_v2(
             let ivf_data = IvfData::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizerImpl<Float32Type>>::try_new(
-                distance_type,
                 reader.object_reader.clone(),
                 aux_reader.into(),
                 options,
@@ -521,7 +520,6 @@ pub(crate) async fn open_vector_index_v2(
             };
 
             let hnsw = HNSWIndex::<ScalarQuantizer>::try_new(
-                distance_type,
                 reader.object_reader.clone(),
                 aux_reader.into(),
                 options,
