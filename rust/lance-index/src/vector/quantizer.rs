@@ -19,7 +19,7 @@ use snafu::{location, Location};
 
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
-use super::flat::index::FlatQuantizer;
+use super::flat::index::{BinFlatQuantizer, FlatQuantizer};
 use super::pq::storage::PQ_METADTA_KEY;
 use super::pq::ProductQuantizer;
 use super::sq::storage::SQ_METADATA_KEY;
@@ -74,6 +74,7 @@ impl std::fmt::Display for QuantizationType {
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Quantizer {
     Flat(FlatQuantizer),
+    BinFlat(BinFlatQuantizer),
     Product(Arc<dyn ProductQuantizer>),
     Scalar(ScalarQuantizer),
 }
@@ -82,6 +83,7 @@ impl Quantizer {
     pub fn code_dim(&self) -> usize {
         match self {
             Self::Flat(fq) => fq.code_dim(),
+            Self::BinFlat(bfq) => bfq.code_dim(),
             Self::Product(pq) => pq.num_sub_vectors(),
             Self::Scalar(sq) => sq.dim,
         }
@@ -90,6 +92,7 @@ impl Quantizer {
     pub fn column(&self) -> &'static str {
         match self {
             Self::Flat(fq) => fq.column(),
+            Self::BinFlat(bfq) => bfq.column(),
             Self::Product(pq) => pq.column(),
             Self::Scalar(sq) => sq.column(),
         }
@@ -98,6 +101,7 @@ impl Quantizer {
     pub fn metadata_key(&self) -> &'static str {
         match self {
             Self::Flat(_) => FlatQuantizer::metadata_key(),
+            Self::BinFlat(_) => FlatQuantizer::metadata_key(),
             Self::Product(_) => ProductQuantizerImpl::<Float32Type>::metadata_key(),
             Self::Scalar(_) => ScalarQuantizer::metadata_key(),
         }
@@ -106,6 +110,7 @@ impl Quantizer {
     pub fn quantization_type(&self) -> QuantizationType {
         match self {
             Self::Flat(fq) => fq.quantization_type(),
+            Self::BinFlat(bfq) => bfq.quantization_type(),
             Self::Product(pq) => pq.quantization_type(),
             Self::Scalar(sq) => sq.quantization_type(),
         }
@@ -114,6 +119,7 @@ impl Quantizer {
     pub fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
         match self {
             Self::Flat(fq) => fq.metadata(args),
+            Self::BinFlat(bfq) => bfq.metadata(args),
             Self::Product(pq) => pq.metadata(args),
             Self::Scalar(sq) => sq.metadata(args),
         }

@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-use super::storage::{FlatStorage, FLAT_COLUMN};
+use super::storage::{FloatFlatStorage, FLAT_COLUMN};
 
 /// A Flat index is any index that stores no metadata, and
 /// during query, it simply scans over the storage and returns the top k results
@@ -141,7 +141,7 @@ impl FlatQuantizer {
 
 impl Quantization for FlatQuantizer {
     type Metadata = FlatMetadata;
-    type Storage = FlatStorage;
+    type Storage = FloatFlatStorage;
 
     fn code_dim(&self) -> usize {
         self.dim
@@ -182,5 +182,63 @@ impl Quantization for FlatQuantizer {
 impl From<FlatQuantizer> for Quantizer {
     fn from(value: FlatQuantizer) -> Self {
         Self::Flat(value)
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct BinFlatQuantizer {
+    dim: usize,
+    distance_type: DistanceType,
+}
+
+impl BinFlatQuantizer {
+    pub fn new(dim: usize, distance_type: DistanceType) -> Self {
+        Self { dim, distance_type }
+    }
+}
+
+impl Quantization for BinFlatQuantizer {
+    type Metadata = FlatMetadata;
+    type Storage = FloatFlatStorage;
+
+    fn code_dim(&self) -> usize {
+        self.dim
+    }
+
+    fn column(&self) -> &'static str {
+        FLAT_COLUMN
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::BinFlat(Self {
+            dim: metadata.dim,
+            distance_type,
+        }))
+    }
+
+    fn metadata(
+        &self,
+        _: Option<crate::vector::quantizer::QuantizationMetadata>,
+    ) -> Result<serde_json::Value> {
+        let metadata = FlatMetadata { dim: self.dim };
+        Ok(serde_json::to_value(metadata)?)
+    }
+
+    fn metadata_key() -> &'static str {
+        "flat"
+    }
+
+    fn quantization_type(&self) -> QuantizationType {
+        QuantizationType::Flat
+    }
+
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        Ok(vectors.slice(0, vectors.len()))
+    }
+}
+
+impl From<BinFlatQuantizer> for Quantizer {
+    fn from(value: BinFlatQuantizer) -> Self {
+        Self::BinFlat(value)
     }
 }

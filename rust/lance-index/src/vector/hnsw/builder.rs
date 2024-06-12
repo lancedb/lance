@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use super::super::graph::beam_search;
 use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
 use crate::scalar::IndexWriter;
-use crate::vector::flat::storage::FlatStorage;
+use crate::vector::flat::storage::FloatFlatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::greedy_search;
 use crate::vector::graph::{
@@ -107,7 +107,7 @@ impl HnswBuildParams {
 
     pub async fn build(self, data: ArrayRef) -> Result<HNSW> {
         // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
-        let vec_store = Arc::new(FlatStorage::new(
+        let vec_store = Arc::new(FloatFlatStorage::new(
             data.as_fixed_size_list().clone(),
             DistanceType::L2,
         ));
@@ -779,7 +779,7 @@ mod tests {
     use object_store::path::Path;
 
     use crate::vector::{
-        flat::storage::FlatStorage,
+        flat::storage::FloatFlatStorage,
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
         hnsw::{builder::HnswBuildParams, HNSW, VECTOR_ID_FIELD},
     };
@@ -791,7 +791,7 @@ mod tests {
         const NUM_EDGES: usize = 20;
         let data = generate_random_array(TOTAL * DIM);
         let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
-        let store = Arc::new(FlatStorage::new(fsl.clone(), DistanceType::L2));
+        let store = Arc::new(FloatFlatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::build_with_storage(
             DistanceType::L2,
             HnswBuildParams::default()
