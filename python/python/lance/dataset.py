@@ -1526,7 +1526,7 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
         self._ds.create_index(column, index_type, name, replace, kwargs)
-        return LanceDataset(self.uri, index_cache_size=index_cache_size)
+        return self
 
     def session(self) -> Session:
         """
