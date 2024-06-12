@@ -20,6 +20,7 @@ mod schema;
 use crate::{Error, Result};
 pub use field::Encoding;
 pub use field::Field;
+pub use field::NullabilityComparison;
 pub use field::SchemaCompareOptions;
 pub use schema::Schema;
 

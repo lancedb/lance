@@ -25,6 +25,17 @@ use snafu::{location, Location};
 use super::{Dictionary, LogicalType};
 use crate::{Error, Result};
 
+#[derive(Debug, Default)]
+pub enum NullabilityComparison {
+    // If the nullabilities don't match then the fields don't match
+    #[default]
+    Strict,
+    // If the expected schema is nullable then a non-nullable version of the field is allowed
+    OneWay,
+    // Nullability is ignored when comparing fields
+    Ignore,
+}
+
 #[derive(Default)]
 pub struct SchemaCompareOptions {
     /// Should the metadata be compared (default false)
@@ -33,6 +44,9 @@ pub struct SchemaCompareOptions {
     pub compare_dictionary: bool,
     /// Should the field ids be compared (default false)
     pub compare_field_ids: bool,
+    /// If the expected schema is nullable then is a non-nullable
+    /// version of the field allowed (default False)
+    pub compare_nullability: NullabilityComparison,
 }
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
@@ -133,7 +147,7 @@ impl Field {
                 self_name, expected.logical_type, self.logical_type
             ));
         }
-        if self.nullable != expected.nullable {
+        if !Self::compare_nullability(expected.nullable, self.nullable, options) {
             differences.push(format!(
                 "`{}` should have nullable={} but nullable={}",
                 self_name, expected.nullable, self.nullable
@@ -223,13 +237,25 @@ impl Field {
         }
     }
 
+    pub fn compare_nullability(
+        expected_nullability: bool,
+        actual_nullability: bool,
+        options: &SchemaCompareOptions,
+    ) -> bool {
+        match options.compare_nullability {
+            NullabilityComparison::Strict => expected_nullability == actual_nullability,
+            NullabilityComparison::OneWay => expected_nullability || !actual_nullability,
+            NullabilityComparison::Ignore => true,
+        }
+    }
+
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
         if self.children.len() != expected.children.len() {
             false
         } else {
             self.name == expected.name
                 && self.logical_type == expected.logical_type
-                && self.nullable == expected.nullable
+                && Self::compare_nullability(expected.nullable, self.nullable, options)
                 && self.children.len() == expected.children.len()
                 && self
                     .children
@@ -1214,5 +1240,37 @@ mod tests {
             no_id.explain_difference(&expected, &compare_ids),
             Some("`a` should have id 0 but id was -1".to_string())
         );
+    }
+
+    #[test]
+    pub fn test_nullability_comparison() {
+        let f1 = Field::try_from(&ArrowField::new("a", DataType::Int32, true)).unwrap();
+        let f2 = Field::try_from(&ArrowField::new("a", DataType::Int32, false)).unwrap();
+
+        // By default, nullability difference is not allowed
+        assert!(!f1.compare_with_options(&f2, &SchemaCompareOptions::default()));
+
+        let ignore_nullability = SchemaCompareOptions {
+            compare_nullability: NullabilityComparison::Ignore,
+            ..Default::default()
+        };
+        let oneway_nullability = SchemaCompareOptions {
+            compare_nullability: NullabilityComparison::OneWay,
+            ..Default::default()
+        };
+        let strict_nullability = SchemaCompareOptions {
+            compare_nullability: NullabilityComparison::Strict,
+            ..Default::default()
+        };
+
+        // By default, nullability difference is not allowed
+        assert!(!f1.compare_with_options(&f2, &strict_nullability));
+        assert!(!f2.compare_with_options(&f1, &strict_nullability));
+        // One way nullability will allow the difference if expected is nullable
+        assert!(!f1.compare_with_options(&f2, &oneway_nullability));
+        assert!(f2.compare_with_options(&f1, &oneway_nullability));
+        // Finally, ignore will ignore
+        assert!(f1.compare_with_options(&f2, &ignore_nullability));
+        assert!(f2.compare_with_options(&f1, &ignore_nullability));
     }
 }
