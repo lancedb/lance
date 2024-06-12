@@ -36,6 +36,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: java/core/lance-jni
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
       - name: Run cargo fmt
         run: cargo fmt --check
       - name: Rust Clippy
