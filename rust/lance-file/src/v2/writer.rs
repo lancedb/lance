@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 
+use arrow_data::ArrayData;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::{Error, Result};
 use lance_encoding::encoder::{
     BatchEncoder, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch, EncodedPage, FieldEncoder,
@@ -208,6 +209,25 @@ impl FileWriter {
         Ok(())
     }
 
+    fn verify_field_nullability(&self, arr: &ArrayData, field: &Field) -> Result<()> {
+        if !field.nullable && arr.null_count() > 0 {
+            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+        }
+
+        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
+            self.verify_field_nullability(child_arr, child_field)?;
+        }
+
+        Ok(())
+    }
+
+    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
+        for (col, field) in batch.columns().iter().zip(self.schema.fields.iter()) {
+            self.verify_field_nullability(&col.to_data(), field)?;
+        }
+        Ok(())
+    }
+
     /// Schedule a batch of data to be written to the file
     ///
     /// Note: the future returned by this method may complete before the data has been fully
@@ -217,6 +237,7 @@ impl FileWriter {
             "write_batch called with {} bytes of data",
             batch.get_array_memory_size()
         );
+        self.verify_nullability_constraints(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
