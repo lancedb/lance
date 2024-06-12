@@ -172,16 +172,20 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .as_str(),
         )?;
 
-        let ivf_pb_bytes =
-            hex::decode(schema.metadata.get(IVF_METADATA_KEY).ok_or(Error::Index {
+        let ivf_pos = schema
+            .metadata
+            .get(IVF_METADATA_KEY)
+            .ok_or(Error::Index {
                 message: format!("{} not found", IVF_METADATA_KEY),
                 location: location!(),
-            })?)
+            })?
+            .parse()
             .map_err(|e| Error::Index {
                 message: format!("Failed to decode IVF metadata: {}", e),
                 location: location!(),
             })?;
-        let ivf = IvfData::try_from(pb::Ivf::decode(ivf_pb_bytes.as_ref())?)?;
+        let ivf_bytes = reader.read_global_buffer(ivf_pos).await?;
+        let ivf = IvfData::try_from(pb::Ivf::decode(ivf_bytes)?)?;
 
         let quantizer_metadata: Q::Metadata = serde_json::from_str(
             schema

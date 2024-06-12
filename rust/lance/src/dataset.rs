@@ -287,25 +287,22 @@ impl Dataset {
             path: manifest_file,
             size: None,
         };
+        let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
             self.uri.clone(),
-            &manifest_location,
+            manifest,
             self.session.clone(),
             self.commit_handler.clone(),
         )
         .await
     }
 
-    async fn checkout_manifest(
-        object_store: Arc<ObjectStore>,
-        base_path: Path,
-        uri: String,
+    async fn load_manifest(
+        object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
-        session: Arc<Session>,
-        commit_handler: Arc<dyn CommitHandler>,
-    ) -> Result<Self> {
+    ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
             object_store
                 .open_with_size(&manifest_location.path, size as usize)
@@ -343,10 +340,10 @@ impl Dataset {
         let mut manifest = if manifest_size - offset <= last_block.len() {
             let message_len = LittleEndian::read_u32(&last_block[offset..offset + 4]) as usize;
             let message_data = &last_block[offset + 4..offset + 4 + message_len];
-            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)?
+            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
         } else {
-            read_struct(object_reader.as_ref(), offset).await?
-        };
+            read_struct(object_reader.as_ref(), offset).await
+        }?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
@@ -361,6 +358,18 @@ impl Dataset {
         }
 
         populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+
+        Ok(manifest)
+    }
+
+    async fn checkout_manifest(
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        uri: String,
+        manifest: Manifest,
+        session: Arc<Session>,
+        commit_handler: Arc<dyn CommitHandler>,
+    ) -> Result<Self> {
         Ok(Self {
             object_store,
             base: base_path,

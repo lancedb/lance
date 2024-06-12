@@ -161,6 +161,7 @@ class LanceDataset(pa.dataset.Dataset):
         metadata_cache_size: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        serialized_manifest: Optional[bytes] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -172,17 +173,26 @@ class LanceDataset(pa.dataset.Dataset):
             metadata_cache_size,
             commit_lock,
             storage_options,
+            serialized_manifest,
         )
 
+    @classmethod
+    def __deserialize__(cls, uri: str, version: int, manifest: bytes):
+        return cls(uri, version, serialized_manifest=manifest)
+
     def __reduce__(self):
-        return LanceDataset, (self.uri, self._ds.version())
+        return type(self).__deserialize__, (
+            self.uri,
+            self._ds.version(),
+            self._ds.serialized_manifest(),
+        )
 
     def __getstate__(self):
-        return self.uri, self._ds.version()
+        return self.uri, self._ds.version(), self._ds.serialized_manifest()
 
     def __setstate__(self, state):
-        self._uri, version = state
-        self._ds = _Dataset(self._uri, version)
+        self._uri, version, manifest = state
+        self._ds = _Dataset(self._uri, version, manifest=manifest)
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
