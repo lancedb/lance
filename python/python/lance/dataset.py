@@ -1142,6 +1142,18 @@ class LanceDataset(pa.dataset.Dataset):
             td_to_micros(older_than), delete_unverified
         )
 
+    def tags(self) -> dict[str, int]:
+        raise NotImplementedError
+
+    def checkout_tag(self, tag: str) -> "LanceDataset":
+        raise NotImplementedError
+
+    def create_tag(self, tag: str, version: int) -> None:
+        raise NotImplementedError
+
+    def delete_tag(self, tag: str) -> None:
+        raise NotImplementedError
+
     def create_scalar_index(
         self,
         column: str,
