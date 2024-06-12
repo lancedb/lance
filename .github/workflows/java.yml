@@ -41,11 +41,12 @@ jobs:
       - name: Rust Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-  build-and-test:
+  build-and-test-java:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
         java-version: [8, 11, 17]
+    name: Build and Test with Java ${{ matrix.java-version }}
     defaults:
       run:
         working-directory: ./java
