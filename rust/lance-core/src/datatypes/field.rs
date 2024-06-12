@@ -83,7 +83,7 @@ impl Field {
 
     pub fn has_dictionary_types(&self) -> bool {
         matches!(self.data_type(), DataType::Dictionary(_, _))
-            || self.children.iter().any(Field::has_dictionary_types)
+            || self.children.iter().any(Self::has_dictionary_types)
     }
 
     fn explain_differences(

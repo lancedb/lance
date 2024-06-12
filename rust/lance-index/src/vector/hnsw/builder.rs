@@ -10,7 +10,7 @@ use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
-use lance_file::reader::FileReader;
+
 use lance_file::writer::FileWriter;
 use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
@@ -166,7 +166,7 @@ impl HNSW {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn search(
+    pub fn search_inner(
         &self,
         query: ArrayRef,
         k: usize,
@@ -212,7 +212,7 @@ impl HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let result = self.search(
+        let result = self.search_inner(
             query,
             k,
             ef,
@@ -268,46 +268,6 @@ impl HNSW {
         writer.write_record_batch(batch).await?;
         writer.finish_with_metadata(&metadata).await?;
         Ok(num_rows)
-    }
-
-    /// Load the HNSW graph from a [FileReader].
-    ///
-    /// Parameters
-    /// ----------
-    /// - *reader*: the file reader to read the graph from.
-    /// - *vector_storage*: A preloaded [VectorStorage] storage.
-    pub async fn load(reader: &FileReader, _: Arc<impl VectorStore + 'static>) -> Result<Self> {
-        let batch = reader.read_range(0..reader.len(), reader.schema()).await?;
-        IvfSubIndex::load(batch)
-    }
-
-    /// Load a partition of HNSW
-    ///
-    /// Parameters
-    /// ----------
-    /// - *reader*: the file reader to read the graph from.
-    /// - *range*: the row range of the partition.
-    /// - *metric_type*: the metric type of the index.
-    /// - *vector_storage*: A preloaded [VectorStorage] storage.
-    /// - *metadata*: the metadata of the HNSW.
-    pub async fn load_partition(
-        reader: &FileReader,
-        range: std::ops::Range<usize>,
-        vector_storage: Arc<impl VectorStore + 'static>,
-        metadata: HnswMetadata,
-    ) -> Result<Self> {
-        if range.is_empty() {
-            return Self::index_vectors(vector_storage.as_ref(), metadata.params);
-        }
-
-        let batch = reader.read_range(range, reader.schema()).await?;
-        let mut schema = batch.schema_ref().as_ref().clone();
-        schema.metadata.insert(
-            HNSW_METADATA_KEY.to_string(),
-            serde_json::to_string(&metadata)?,
-        );
-        let batch = batch.with_schema(schema.into())?;
-        IvfSubIndex::load(batch)
     }
 }
 
@@ -824,6 +784,11 @@ impl IvfSubIndex for HNSW {
             batches.push(batch);
         }
 
+        let index_metadata = json!(IndexMetadata {
+            index_type: HNSW_TYPE.to_string(),
+            distance_type: self.inner.distance_type.to_string(),
+        });
+
         let mut metadata = self.metadata();
         metadata.level_offsets = Some(level_offsets);
         let metadata = serde_json::to_string(&metadata)?;
@@ -831,10 +796,13 @@ impl IvfSubIndex for HNSW {
             .schema()
             .as_ref()
             .clone()
-            .with_metadata(HashMap::from_iter(vec![(
-                HNSW_METADATA_KEY.to_string(),
-                metadata,
-            )]));
+            .with_metadata(HashMap::from_iter(vec![
+                (
+                    INDEX_METADATA_SCHEMA_KEY.to_string(),
+                    index_metadata.to_string(),
+                ),
+                (HNSW_METADATA_KEY.to_string(), metadata),
+            ]));
         let batch = concat_batches(&self.schema(), batches.iter())?;
         let batch = batch.with_schema(Arc::new(schema))?;
         Ok(batch)
@@ -858,6 +826,7 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use object_store::path::Path;
 
+    use crate::scalar::IndexWriter;
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
         flat::storage::FlatStorage,
@@ -893,11 +862,19 @@ mod tests {
         let mut writer =
             FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default()).unwrap();
         builder.write(&mut writer).await.unwrap();
+        let batch = builder.to_batch().unwrap();
+        let metadata = batch.schema_ref().metadata().clone();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish_with_metadata(&metadata).await.unwrap();
 
         let reader = FileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
-        let loaded_builder = HNSW::load(&reader, store.clone()).await.unwrap();
+        let batch = reader
+            .read_range(0..reader.len(), reader.schema())
+            .await
+            .unwrap();
+        let loaded_hnsw = HNSW::load(batch).unwrap();
 
         let query = fsl.value(0);
         let k = 10;
@@ -905,7 +882,7 @@ mod tests {
         let builder_results = builder
             .search_basic(query.clone(), k, ef, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded_builder
+        let loaded_results = loaded_hnsw
             .search_basic(query, k, ef, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);

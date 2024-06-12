@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
@@ -22,6 +22,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::prefilter::PreFilter;
+use crate::vector::v3::subindex::IvfSubIndex;
 use crate::{
     vector::{
         graph::NEIGHBORS_FIELD,
@@ -29,10 +30,12 @@ use crate::{
         ivf::storage::IVF_PARTITION_KEY,
         quantizer::{IvfQuantizationStorage, Quantization, Quantizer},
         storage::VectorStore,
-        Query, VectorIndex, VECTOR_RESULT_SCHEMA,
+        Query, VectorIndex,
     },
     Index, IndexType,
 };
+
+use super::builder::HNSW_METADATA_KEY;
 
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSWIndexOptions {
@@ -141,8 +144,6 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
 impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
-        let schema = VECTOR_RESULT_SCHEMA.clone();
-
         let hnsw = self.hnsw.as_ref().ok_or(Error::Index {
             message: "HNSW index not loaded".to_string(),
             location: location!(),
@@ -153,47 +154,16 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             location: location!(),
         })?;
 
-        if hnsw.is_empty() {
-            return Ok(RecordBatch::new_empty(schema));
-        }
-
-        let bitmap = if pre_filter.is_empty() {
-            None
-        } else {
-            pre_filter.wait_for_ready().await?;
-
-            let indices = pre_filter.filter_row_ids(Box::new(storage.row_ids()));
-            Some(
-                RoaringBitmap::from_sorted_iter(indices.into_iter().map(|i| i as u32)).map_err(
-                    |e| Error::Index {
-                        message: format!("Error creating RoaringBitmap: {}", e),
-                        location: location!(),
-                    },
-                )?,
-            )
-        };
-
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
         let k = query.k * refine_factor;
-        let ef = query.ef.unwrap_or(k + k / 2);
-        if ef < k {
-            return Err(Error::Index {
-                message: "ef must be greater than or equal to k".to_string(),
-                location: location!(),
-            });
-        }
 
-        let results = hnsw.search_basic(query.key.clone(), k, ef, bitmap, storage.as_ref())?;
-
-        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| storage.row_id(x.id)));
-        let distances = Arc::new(Float32Array::from_iter_values(
-            results.iter().map(|x| x.dist.0),
-        ));
-
-        Ok(RecordBatch::try_new(
-            schema,
-            vec![distances, Arc::new(row_ids)],
-        )?)
+        hnsw.search(
+            query.key.clone(),
+            k,
+            query.into(),
+            storage.as_ref(),
+            pre_filter,
+        )
     }
 
     fn is_loadable(&self) -> bool {
@@ -232,7 +202,8 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         .await?;
 
         let storage = Arc::new(self.partition_storage.load_partition(0).await?);
-        let hnsw = HNSW::load(&reader, storage.clone()).await?;
+        let batch = reader.read_range(0..reader.len(), reader.schema()).await?;
+        let hnsw = HNSW::load(batch)?;
 
         Ok(Box::new(Self {
             hnsw: Some(hnsw),
@@ -254,9 +225,16 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
 
         let metadata = self.get_partition_metadata(partition_id)?;
         let storage = Arc::new(self.partition_storage.load_partition(partition_id).await?);
-        let hnsw =
-            HNSW::load_partition(&reader, offset..offset + length, storage.clone(), metadata)
-                .await?;
+        let batch = reader
+            .read_range(offset..offset + length, reader.schema())
+            .await?;
+        let mut schema = batch.schema_ref().as_ref().clone();
+        schema.metadata.insert(
+            HNSW_METADATA_KEY.to_string(),
+            serde_json::to_string(&metadata)?,
+        );
+        let batch = batch.with_schema(schema.into())?;
+        let hnsw = HNSW::load(batch)?;
 
         Ok(Box::new(Self {
             hnsw: Some(hnsw),
