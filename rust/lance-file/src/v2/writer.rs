@@ -209,13 +209,13 @@ impl FileWriter {
         Ok(())
     }
 
-    fn verify_field_nullability(&self, arr: &ArrayData, field: &Field) -> Result<()> {
+    fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
             return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
-            self.verify_field_nullability(child_arr, child_field)?;
+            Self::verify_field_nullability(child_arr, child_field)?;
         }
 
         Ok(())
@@ -223,7 +223,7 @@ impl FileWriter {
 
     fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
         for (col, field) in batch.columns().iter().zip(self.schema.fields.iter()) {
-            self.verify_field_nullability(&col.to_data(), field)?;
+            Self::verify_field_nullability(&col.to_data(), field)?;
         }
         Ok(())
     }
