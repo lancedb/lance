@@ -24,7 +24,10 @@ pub trait IvfSubIndex: Send + Sync + DeepSizeOf {
 
     fn use_residual() -> bool;
 
-    fn name(&self) -> &str;
+    fn name() -> &'static str;
+
+    /// Return the schema of the sub index
+    fn schema() -> arrow_schema::SchemaRef;
 
     /// Search the sub index for nearest neighbors.
     /// # Arguments:
@@ -45,9 +48,6 @@ pub trait IvfSubIndex: Send + Sync + DeepSizeOf {
     fn index_vectors(storage: &impl VectorStore, params: Self::BuildParams) -> Result<Self>
     where
         Self: Sized;
-
-    /// Return the schema of the sub index
-    fn schema(&self) -> arrow_schema::SchemaRef;
 
     /// Encode the sub index into a record batch
     fn to_batch(&self) -> Result<RecordBatch>;

@@ -49,7 +49,6 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     shuffler: Arc<dyn Shuffler>,
     ivf_params: IvfBuildParams,
     sub_index_params: S::BuildParams,
-    sub_index: S,
     quantizer: Q,
     temp_dir: Path,
 }
@@ -64,7 +63,6 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         shuffler: Box<dyn Shuffler>,
         ivf_params: IvfBuildParams,
         sub_index_params: S::BuildParams,
-        sub_index: S,
         quantizer: Q,
     ) -> Result<Self> {
         let temp_dir = TempDir::new()?;
@@ -77,7 +75,6 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
             shuffler: shuffler.into(),
             ivf_params,
             sub_index_params,
-            sub_index,
             quantizer,
             temp_dir,
         })
@@ -185,7 +182,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
 
         // build quantized vector storage
         let storage = StorageBuilder::new(
-            self.column.clone(),
+            self.quantizer.column().to_owned(),
             self.distance_type,
             self.quantizer.clone(),
         )
@@ -232,7 +229,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         let mut index_writer = FileWriter::try_new(
             self.dataset.object_store().create(&index_path).await?,
             index_path.to_string(),
-            self.sub_index.schema().as_ref().try_into()?,
+            S::schema().as_ref().try_into()?,
             Default::default(),
         )?;
 
@@ -331,6 +328,9 @@ mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::hnsw::HNSW;
+    
     use lance_index::vector::{
         flat::index::{FlatIndex, FlatQuantizer},
         ivf::IvfBuildParams,
@@ -387,9 +387,8 @@ mod tests {
             ivf_params.num_partitions,
         );
 
-        let flat_index = FlatIndex::default();
         let fq = FlatQuantizer::new(DIM, DistanceType::L2);
-        let builder = super::IvfIndexBuilder::new(
+        let builder = super::IvfIndexBuilder::<FlatIndex, _>::new(
             dataset,
             "vector".to_owned(),
             index_dir,
@@ -397,11 +396,41 @@ mod tests {
             Box::new(shuffler),
             ivf_params,
             (),
-            flat_index,
             fq,
         )
         .unwrap();
 
+        builder.build().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_build_ivf_hnsw() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let index_dir = tempdir().unwrap();
+        let index_dir = Path::from(index_dir.path().to_str().unwrap());
+        let shuffler = IvfShuffler::new(
+            dataset.object_store().clone(),
+            index_dir.child("shuffled"),
+            ivf_params.num_partitions,
+        );
+
+        let fq = FlatQuantizer::new(DIM, DistanceType::L2);
+        let builder = super::IvfIndexBuilder::<HNSW, _>::new(
+            dataset,
+            "vector".to_owned(),
+            index_dir,
+            DistanceType::L2,
+            Box::new(shuffler),
+            ivf_params,
+            hnsw_params,
+            fq,
+        )
+        .unwrap();
         builder.build().await.unwrap();
     }
 }

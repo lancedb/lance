@@ -30,6 +30,7 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
+use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
@@ -465,7 +466,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         .collect::<Result<Vec<_>>>()?;
 
     // Prepare the HNSW writer
-    let schema = lance_core::datatypes::Schema::try_from(&HNSW::schema())?;
+    let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
@@ -1494,7 +1495,7 @@ async fn write_ivf_hnsw_file(
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let writer = object_store.create(&path).await?;
 
-    let schema = lance_core::datatypes::Schema::try_from(&HNSW::schema())?;
+    let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,

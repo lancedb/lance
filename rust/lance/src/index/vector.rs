@@ -79,6 +79,20 @@ impl VectorIndexParams {
         }
     }
 
+    // IVF_HNSW index
+    pub fn ivf_hnsw(
+        num_partitions: usize,
+        distance_type: DistanceType,
+        hnsw_params: HnswBuildParams,
+    ) -> Self {
+        let ivf_params = IvfBuildParams::new(num_partitions);
+        let stages = vec![StageParams::Ivf(ivf_params), StageParams::Hnsw(hnsw_params)];
+        Self {
+            stages,
+            metric_type: distance_type,
+        }
+    }
+
     /// Create index parameters for `IVF_PQ` index.
     ///
     /// Parameters
@@ -246,9 +260,8 @@ pub(crate) async fn build_vector_index(
             path,
             ivf_params.num_partitions,
         );
-        let flat_index = FlatIndex::default();
         let quantizer = FlatQuantizer::new(dim, params.metric_type);
-        IvfIndexBuilder::new(
+        IvfIndexBuilder::<FlatIndex, _>::new(
             dataset.clone(),
             column.to_owned(),
             dataset.indices_dir().child(uuid),
@@ -256,7 +269,6 @@ pub(crate) async fn build_vector_index(
             Box::new(shuffler),
             ivf_params.clone(),
             (),
-            flat_index,
             quantizer,
         )?
         .build()

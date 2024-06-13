@@ -367,6 +367,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
 
+    
     use lance_index::DatasetIndexExt;
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::generate_random_array_with_range;

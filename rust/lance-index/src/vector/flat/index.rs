@@ -57,8 +57,12 @@ impl IvfSubIndex for FlatIndex {
         false
     }
 
-    fn name(&self) -> &str {
+    fn name() -> &'static str {
         "FLAT"
+    }
+
+    fn schema() -> arrow_schema::SchemaRef {
+        Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
     }
 
     fn search(
@@ -107,10 +111,6 @@ impl IvfSubIndex for FlatIndex {
         Self: Sized,
     {
         Ok(Self {})
-    }
-
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
     }
 
     fn to_batch(&self) -> Result<RecordBatch> {

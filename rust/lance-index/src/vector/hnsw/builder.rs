@@ -252,14 +252,6 @@ impl HNSW {
             level_offsets,
         }
     }
-
-    pub fn schema() -> arrow_schema::Schema {
-        arrow_schema::Schema::new(vec![
-            VECTOR_ID_FIELD.clone(),
-            NEIGHBORS_FIELD.clone(),
-            DISTS_FIELD.clone(),
-        ])
-    }
 }
 
 struct HnswBuilder {
@@ -629,8 +621,18 @@ impl IvfSubIndex for HNSW {
         false
     }
 
-    fn name(&self) -> &str {
+    fn name() -> &'static str {
         HNSW_TYPE
+    }
+
+    /// Return the schema of the sub index
+    fn schema() -> arrow_schema::SchemaRef {
+        arrow_schema::Schema::new(vec![
+            VECTOR_ID_FIELD.clone(),
+            NEIGHBORS_FIELD.clone(),
+            DISTS_FIELD.clone(),
+        ])
+        .into()
     }
 
     fn search(
@@ -722,11 +724,6 @@ impl IvfSubIndex for HNSW {
         Ok(hnsw)
     }
 
-    /// Return the schema of the sub index
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        Self::schema().into()
-    }
-
     /// Encode the sub index into a record batch
     fn to_batch(&self) -> Result<RecordBatch> {
         let mut vector_id_builder = UInt32Builder::with_capacity(self.len());
@@ -751,7 +748,7 @@ impl IvfSubIndex for HNSW {
             }
 
             let batch = RecordBatch::try_new(
-                self.schema(),
+                Self::schema(),
                 vec![
                     Arc::new(vector_id_builder.finish()),
                     Arc::new(neighbors_builder.finish()),
@@ -768,8 +765,7 @@ impl IvfSubIndex for HNSW {
 
         let metadata = self.metadata();
         let metadata = serde_json::to_string(&metadata)?;
-        let schema = self
-            .schema()
+        let schema = Self::schema()
             .as_ref()
             .clone()
             .with_metadata(HashMap::from_iter(vec![
@@ -779,7 +775,7 @@ impl IvfSubIndex for HNSW {
                 ),
                 (HNSW_METADATA_KEY.to_string(), metadata),
             ]));
-        let batch = concat_batches(&self.schema(), batches.iter())?;
+        let batch = concat_batches(&Self::schema(), batches.iter())?;
         let batch = batch.with_schema(Arc::new(schema))?;
         Ok(batch)
     }
