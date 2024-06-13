@@ -11,9 +11,7 @@ use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 
-use lance_file::writer::FileWriter;
 use lance_linalg::distance::DistanceType;
-use lance_table::io::manifest::ManifestDescribing;
 use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use roaring::RoaringBitmap;
 use serde_json::json;
@@ -21,6 +19,7 @@ use snafu::{location, Location};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::iter;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -32,7 +31,6 @@ use serde::{Deserialize, Serialize};
 use super::super::graph::beam_search;
 use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
 use crate::prefilter::PreFilter;
-use crate::scalar::IndexWriter;
 use crate::vector::flat::storage::FlatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::greedy_search;
@@ -234,10 +232,24 @@ impl HNSW {
 
     /// Returns the metadata of this [`HNSW`].
     pub fn metadata(&self) -> HnswMetadata {
+        // calculate the offsets of each level,
+        // start from 0
+        let level_offsets = self
+            .inner
+            .level_count
+            .iter()
+            .chain(iter::once(&AtomicUsize::new(0)))
+            .scan(0, |state, x| {
+                let start = *state;
+                *state += x.load(Ordering::Relaxed);
+                Some(start)
+            })
+            .collect();
+
         HnswMetadata {
             entry_point: self.inner.entry_point,
             params: self.inner.params.clone(),
-            level_offsets: None,
+            level_offsets,
         }
     }
 
@@ -247,27 +259,6 @@ impl HNSW {
             NEIGHBORS_FIELD.clone(),
             DISTS_FIELD.clone(),
         ])
-    }
-
-    /// Write the HNSW graph to a Lance file.
-    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
-        // this contains only the hnsw metadata but not the index metadata
-        let batch = self.to_batch()?;
-        let num_rows = batch.num_rows();
-
-        let index_metadata = json!(IndexMetadata {
-            index_type: HNSW_TYPE.to_string(),
-            distance_type: self.inner.distance_type.to_string(),
-        });
-
-        let mut metadata = batch.schema_ref().metadata().clone();
-        metadata.insert(
-            INDEX_METADATA_SCHEMA_KEY.to_string(),
-            index_metadata.to_string(),
-        );
-        writer.write_record_batch(batch).await?;
-        writer.finish_with_metadata(&metadata).await?;
-        Ok(num_rows)
     }
 }
 
@@ -315,10 +306,9 @@ impl HnswBuilder {
         let len = storage.len();
         let max_level = params.max_level;
 
-        let mut level_count = Vec::with_capacity(max_level as usize);
-        for _ in 0..max_level {
-            level_count.push(AtomicUsize::new(0));
-        }
+        let level_count = (0..max_level)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>();
 
         let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get() * 2));
         for _ in 0..(num_cpus::get() * 2) {
@@ -562,12 +552,8 @@ impl IvfSubIndex for HNSW {
                 })?;
         let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata)?;
 
-        let level_offsets = hnsw_metadata.level_offsets.ok_or(Error::Index {
-            message: "level offsets not found in the metadata".to_string(),
-            location: location!(),
-        })?;
-
-        let levels: Vec<_> = level_offsets
+        let levels: Vec<_> = hnsw_metadata
+            .level_offsets
             .iter()
             .tuple_windows()
             .map(|(start, end)| data.slice(*start, end - start))
@@ -726,6 +712,7 @@ impl IvfSubIndex for HNSW {
             .max(1);
         log::info!("Building HNSW graph with parallel_limit={}", parallel_limit);
         let chunk_size = (storage.len() - 1).div_ceil(parallel_limit);
+        hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
         (1..storage.len())
             .into_par_iter()
             .chunks(chunk_size)
@@ -736,6 +723,8 @@ impl IvfSubIndex for HNSW {
                         .insert(node as u32, &mut visited_generator, storage);
                 }
             });
+
+        assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
         Ok(hnsw)
     }
 
@@ -746,10 +735,6 @@ impl IvfSubIndex for HNSW {
 
     /// Encode the sub index into a record batch
     fn to_batch(&self) -> Result<RecordBatch> {
-        let mut level_offsets = Vec::with_capacity(self.max_level() as usize + 1);
-        level_offsets.push(0);
-        let mut num_rows = 0;
-
         let mut vector_id_builder = UInt32Builder::with_capacity(self.len());
         let mut neighbors_builder = ListBuilder::with_capacity(UInt32Builder::new(), self.len());
         let mut distances_builder =
@@ -779,8 +764,6 @@ impl IvfSubIndex for HNSW {
                     Arc::new(distances_builder.finish()),
                 ],
             )?;
-            num_rows += batch.num_rows();
-            level_offsets.push(num_rows);
             batches.push(batch);
         }
 
@@ -789,8 +772,7 @@ impl IvfSubIndex for HNSW {
             distance_type: self.inner.distance_type.to_string(),
         });
 
-        let mut metadata = self.metadata();
-        metadata.level_offsets = Some(level_offsets);
+        let metadata = self.metadata();
         let metadata = serde_json::to_string(&metadata)?;
         let schema = self
             .schema()
@@ -823,6 +805,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::DistanceType;
     use lance_table::format::SelfDescribingFileReader;
+    use lance_table::io::manifest::ManifestDescribing;
     use lance_testing::datagen::generate_random_array;
     use object_store::path::Path;
 
@@ -859,9 +842,12 @@ mod tests {
             DISTS_FIELD.clone(),
         ]);
         let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
-        let mut writer =
-            FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default()).unwrap();
-        builder.write(&mut writer).await.unwrap();
+        let mut writer = FileWriter::<ManifestDescribing>::with_object_writer(
+            writer,
+            schema,
+            &FileWriterOptions::default(),
+        )
+        .unwrap();
         let batch = builder.to_batch().unwrap();
         let metadata = batch.schema_ref().metadata().clone();
         writer.write_record_batch(batch).await.unwrap();

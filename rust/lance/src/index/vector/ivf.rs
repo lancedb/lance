@@ -2664,7 +2664,7 @@ mod tests {
         let ivf_params =
             IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
 
-        let distance_type = MetricType::L2;
+        let distance_type = DistanceType::L2;
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
@@ -2717,7 +2717,7 @@ mod tests {
             .to_vec();
 
         let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, DistanceType::L2);
+        let gt = ground_truth(&mat, query.values(), k, distance_type);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();

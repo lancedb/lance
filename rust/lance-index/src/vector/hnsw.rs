@@ -34,11 +34,23 @@ lazy_static::lazy_static! {
     pub static ref VECTOR_ID_FIELD: Field = Field::new(VECTOR_ID_COL, DataType::UInt32, true);
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswMetadata {
     pub entry_point: u32,
     pub params: HnswBuildParams,
-    pub level_offsets: Option<Vec<usize>>,
+    pub level_offsets: Vec<usize>,
+}
+
+impl Default for HnswMetadata {
+    fn default() -> Self {
+        let params = HnswBuildParams::default();
+        let level_offsets = vec![0; params.max_level as usize];
+        Self {
+            entry_point: 0,
+            params,
+            level_offsets,
+        }
+    }
 }
 
 /// Algorithm 4 in the HNSW paper.
