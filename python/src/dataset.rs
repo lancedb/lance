@@ -940,6 +940,22 @@ impl Dataset {
         })
     }
 
+    fn tags(&self) -> PyDict {
+        unimplemented!("not implemented yet");
+    }
+
+    fn checkout_tag(&self, tag: String) -> PyResult<Self> {
+        unimplemented!("not implemented yet");
+    }
+
+    fn create_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
+        unimplemented!("not implemented yet");
+    }
+
+    fn delete_tag(&mut self, tag: String) -> PyResult<()> {
+        unimplemented!("not implemented yet");
+    }
+
     #[pyo3(signature = (**kwargs))]
     fn optimize_indices(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
