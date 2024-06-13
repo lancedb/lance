@@ -182,7 +182,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
 
         // build quantized vector storage
         let storage = StorageBuilder::new(
-            self.quantizer.column().to_owned(),
+            self.column.clone(),
             self.distance_type,
             self.quantizer.clone(),
         )
@@ -331,7 +331,6 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::hnsw::HNSW;
 
-    use lance_index::vector::pq::ProductQuantizerImpl;
     use lance_index::vector::{
         flat::index::{FlatIndex, FlatQuantizer},
         ivf::IvfBuildParams,
