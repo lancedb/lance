@@ -1143,16 +1143,35 @@ class LanceDataset(pa.dataset.Dataset):
         )
 
     def tags(self) -> dict[str, int]:
-        raise NotImplementedError
+        """
+        Return all tags in this dataset.
+        """
+        return self._ds.tags()
 
     def checkout_tag(self, tag: str) -> "LanceDataset":
-        raise NotImplementedError
+        """
+        Load the version of the dataset associated with the given tag.
+
+        Unlike the :func:`dataset` constructor, this will re-use the
+        current cache.
+        This is a no-op if the dataset is already at the version associated with the given tag.
+        """
+        ds = copy.copy(self)
+        if ds.tags()[tag] != ds.version:
+            ds._ds = self._ds.checkout_tag(tag)
+        return ds
 
     def create_tag(self, tag: str, version: int) -> None:
-        raise NotImplementedError
+        """
+        Create a tag for a given dataset version.
+        """
+        self._ds.create_tag(tag, version)
 
     def delete_tag(self, tag: str) -> None:
-        raise NotImplementedError
+        """
+        Delete tag from the dataset.
+        """
+        self._ds.delete_tag(tag)
 
     def create_scalar_index(
         self,
