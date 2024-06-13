@@ -940,12 +940,21 @@ impl Dataset {
         })
     }
 
-    fn tags(&self) -> PyDict {
+    fn tags(self_: PyRef<'_, Self>) -> PyDict {
         unimplemented!("not implemented yet");
     }
 
     fn checkout_tag(&self, tag: String) -> PyResult<Self> {
-        unimplemented!("not implemented yet");
+        let ds = RT
+            .block_on(None, self.ds.checkout_tag(tag))?
+            .map_err(|err| match err {
+                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri: self.uri.clone(),
+        })
     }
 
     fn create_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
