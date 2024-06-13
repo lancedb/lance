@@ -21,9 +21,12 @@ use arrow_array::{
 };
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use lance::Result;
 use lance::{datatypes::Schema, index::vector::sq, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
+use lance_index::scalar::IndexWriter;
+use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HNSW},
     storage::VectorStore,
@@ -191,14 +194,20 @@ impl Hnsw {
                 FileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     &path,
-                    Schema::try_from(&HNSW::schema())
+                    Schema::try_from(HNSW::schema().as_ref())
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                     &Default::default(),
                 ),
             )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        RT.block_on(Some(py), self.hnsw.write(&mut writer))?
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        RT.block_on(Some(py), async {
+            let batch = self.hnsw.to_batch()?;
+            let metadata = batch.schema_ref().metadata().clone();
+            writer.write_record_batch(batch).await?;
+            writer.finish_with_metadata(&metadata).await?;
+            Result::Ok(())
+        })?
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(())
     }
 

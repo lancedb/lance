@@ -24,6 +24,7 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{
     quantizer::{Quantization, Quantizer},
     sq::ScalarQuantizer,
@@ -515,9 +516,10 @@ async fn build_and_write_hnsw(
     vectors: Arc<dyn Array>,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
-    let hnsw = params.build(vectors).await?;
-    let length = hnsw.write(&mut writer).await?;
-    Result::Ok(length)
+    let batch = params.build(vectors).await?.to_batch()?;
+    let metadata = batch.schema_ref().metadata().clone();
+    writer.write_record_batch(batch).await?;
+    writer.finish_with_metadata(&metadata).await
 }
 
 async fn build_and_write_pq_storage(

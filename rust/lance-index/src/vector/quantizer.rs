@@ -411,6 +411,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         })
     }
 
+    pub fn distance_type(&self) -> DistanceType {
+        self.distance_type
+    }
+
     pub fn quantizer(&self) -> &Quantizer {
         &self.quantizer
     }
