@@ -559,27 +559,9 @@ impl IvfSubIndex for HNSW {
             nodes.push(GraphBuilderNode::new(i as u32, levels.len()));
         }
         for (level, batch) in levels.into_iter().enumerate() {
-            let ids = batch
-                .column_by_name(VECTOR_ID_COL)
-                .ok_or(Error::Index {
-                    message: format!("{} column not found in HNSW file", VECTOR_ID_COL),
-                    location: location!(),
-                })?
-                .as_primitive::<UInt32Type>();
-            let neighbors = batch
-                .column_by_name(NEIGHBORS_COL)
-                .ok_or(Error::Index {
-                    message: format!("{} column not found in HNSW file", NEIGHBORS_COL),
-                    location: location!(),
-                })?
-                .as_list::<i32>();
-            let distances = batch
-                .column_by_name(DIST_COL)
-                .ok_or(Error::Index {
-                    message: format!("{} column not found in HNSW file", DIST_COL),
-                    location: location!(),
-                })?
-                .as_list::<i32>();
+            let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
+            let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
+            let distances = batch[DIST_COL].as_list::<i32>();
 
             for ((node, neighbors), distances) in
                 ids.iter().zip(neighbors.iter()).zip(distances.iter())
