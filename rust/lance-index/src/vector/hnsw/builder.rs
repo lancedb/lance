@@ -12,7 +12,7 @@ use deepsize::DeepSizeOf;
 use itertools::Itertools;
 
 use lance_linalg::distance::DistanceType;
-use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::{location, Location};
@@ -711,18 +711,12 @@ impl IvfSubIndex for HNSW {
             .unwrap_or_else(num_cpus::get)
             .max(1);
         log::info!("Building HNSW graph with parallel_limit={}", parallel_limit);
-        let chunk_size = (storage.len() - 1).div_ceil(parallel_limit);
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
-        (1..storage.len())
-            .into_par_iter()
-            .chunks(chunk_size)
-            .for_each(|chunk| {
-                let mut visited_generator = VisitedGenerator::new(len);
-                for node in chunk.into_iter() {
-                    hnsw.inner
-                        .insert(node as u32, &mut visited_generator, storage);
-                }
-            });
+        (1..storage.len()).into_par_iter().for_each(|node| {
+            let mut visited_generator = VisitedGenerator::new(len);
+            hnsw.inner
+                .insert(node as u32, &mut visited_generator, storage);
+        });
 
         assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
         Ok(hnsw)
