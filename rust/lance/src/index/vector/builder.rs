@@ -330,7 +330,8 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::hnsw::HNSW;
-    
+
+    use lance_index::vector::pq::ProductQuantizerImpl;
     use lance_index::vector::{
         flat::index::{FlatIndex, FlatQuantizer},
         ivf::IvfBuildParams,
@@ -420,6 +421,37 @@ mod tests {
         );
 
         let fq = FlatQuantizer::new(DIM, DistanceType::L2);
+        let builder = super::IvfIndexBuilder::<HNSW, _>::new(
+            dataset,
+            "vector".to_owned(),
+            index_dir,
+            DistanceType::L2,
+            Box::new(shuffler),
+            ivf_params,
+            hnsw_params,
+            fq,
+        )
+        .unwrap();
+        builder.build().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_build_ivf_hnsw_pq() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let index_dir = tempdir().unwrap();
+        let index_dir = Path::from(index_dir.path().to_str().unwrap());
+        let shuffler = IvfShuffler::new(
+            dataset.object_store().clone(),
+            index_dir.child("shuffled"),
+            ivf_params.num_partitions,
+        );
+
+        let pq = ProductQuantizerImpl::new(DIM, DistanceType::L2);
         let builder = super::IvfIndexBuilder::<HNSW, _>::new(
             dataset,
             "vector".to_owned(),
