@@ -6,6 +6,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
@@ -74,25 +75,44 @@ impl IvfSubIndex for FlatIndex {
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator(query);
-        let filtered_row_ids = prefilter
-            .filter_row_ids(Box::new(storage.row_ids()))
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let (row_ids, dists): (Vec<u64>, Vec<f32>) = (0..storage.len())
-            .filter(|&id| !filtered_row_ids.contains(&storage.row_id(id as u32)))
-            .map(|id| OrderedNode {
-                id: id as u32,
-                dist: OrderedFloat(dist_calc.distance(id as u32)),
-            })
-            .sorted_unstable()
-            .take(k)
-            .map(
-                |OrderedNode {
-                     id,
-                     dist: OrderedFloat(dist),
-                 }| (storage.row_id(id), dist),
-            )
-            .unzip();
+
+        let (row_ids, dists): (Vec<u64>, Vec<f32>) = match prefilter.is_empty() {
+            true => (0..storage.len())
+                .map(|id| OrderedNode {
+                    id: id as u32,
+                    dist: OrderedFloat(dist_calc.distance(id as u32)),
+                })
+                .sorted_unstable()
+                .take(k)
+                .map(
+                    |OrderedNode {
+                         id,
+                         dist: OrderedFloat(dist),
+                     }| (storage.row_id(id), dist),
+                )
+                .unzip(),
+            false => {
+                let filtered_row_ids = prefilter
+                    .filter_row_ids(Box::new(storage.row_ids()))
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                (0..storage.len())
+                    .filter(|&id| !filtered_row_ids.contains(&storage.row_id(id as u32)))
+                    .map(|id| OrderedNode {
+                        id: id as u32,
+                        dist: OrderedFloat(dist_calc.distance(id as u32)),
+                    })
+                    .sorted_unstable()
+                    .take(k)
+                    .map(
+                        |OrderedNode {
+                             id,
+                             dist: OrderedFloat(dist),
+                         }| (storage.row_id(id), dist),
+                    )
+                    .unzip()
+            }
+        };
 
         let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
 
@@ -143,8 +163,14 @@ impl FlatQuantizer {
 }
 
 impl Quantization for FlatQuantizer {
+    type BuildParams = ();
     type Metadata = FlatMetadata;
     type Storage = FlatStorage;
+
+    fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        let dim = data.as_fixed_size_list().value_length();
+        Ok(Self::new(dim as usize, distance_type))
+    }
 
     fn code_dim(&self) -> usize {
         self.dim

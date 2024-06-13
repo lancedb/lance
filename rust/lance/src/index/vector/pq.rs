@@ -6,6 +6,7 @@ use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::UInt32Array;
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
@@ -209,6 +210,19 @@ impl VectorIndex for PQIndex {
             Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
         })
         .await
+    }
+
+    fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        unimplemented!("only for IVF")
+    }
+
+    async fn search_in_partition(
+        &self,
+        _: usize,
+        _: &Query,
+        _: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        unimplemented!("only for IVF")
     }
 
     fn is_loadable(&self) -> bool {

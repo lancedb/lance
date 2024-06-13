@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
@@ -22,7 +22,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::prefilter::PreFilter;
-use crate::vector::v3::subindex::IvfSubIndex;
+use crate::vector::v3::subindex::{IvfSubIndex, SUB_INDEX_METADATA_KEY};
 use crate::{
     vector::{
         graph::NEIGHBORS_FIELD,
@@ -34,8 +34,6 @@ use crate::{
     },
     Index, IndexType,
 };
-
-use super::builder::HNSW_METADATA_KEY;
 
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSWIndexOptions {
@@ -166,6 +164,19 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         )
     }
 
+    fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        unimplemented!("only for IVF")
+    }
+
+    async fn search_in_partition(
+        &self,
+        _: usize,
+        _: &Query,
+        _: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        unimplemented!("only for IVF")
+    }
+
     fn is_loadable(&self) -> bool {
         true
     }
@@ -230,7 +241,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             .await?;
         let mut schema = batch.schema_ref().as_ref().clone();
         schema.metadata.insert(
-            HNSW_METADATA_KEY.to_string(),
+            SUB_INDEX_METADATA_KEY.to_string(),
             serde_json::to_string(&metadata)?,
         );
         let batch = batch.with_schema(schema.into())?;

@@ -14,7 +14,7 @@ mod test {
 
     use approx::assert_relative_eq;
     use arrow::array::AsArray;
-    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use deepsize::{Context, DeepSizeOf};
@@ -91,6 +91,19 @@ mod test {
                 assert_relative_eq!(v, i.unwrap());
             }
             Ok(self.ret_val.clone())
+        }
+
+        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+            unimplemented!("only for IVF")
+        }
+
+        async fn search_in_partition(
+            &self,
+            _: usize,
+            _: &Query,
+            _: Arc<dyn PreFilter>,
+        ) -> Result<RecordBatch> {
+            unimplemented!("only for IVF")
         }
 
         fn is_loadable(&self) -> bool {

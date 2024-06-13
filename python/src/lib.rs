@@ -68,7 +68,6 @@ pub(crate) mod utils;
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::{cleanup_partial_writes, write_fragments};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
-use crate::utils::build_sq_storage;
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
@@ -142,7 +141,6 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
-    m.add_wrapped(wrap_pyfunction!(build_sq_storage))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;

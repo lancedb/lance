@@ -23,7 +23,7 @@ use crate::{
     pb,
     vector::{
         ivf::storage::{IvfData, IVF_METADATA_KEY},
-        quantizer::{Quantization, Quantizer},
+        quantizer::Quantization,
     },
     INDEX_METADATA_SCHEMA_KEY,
 };
@@ -39,6 +39,8 @@ pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
     fn prefetch(&self, _id: u32) {}
 }
+
+pub const STORAGE_METADATA_KEY: &str = "storage_metadata";
 
 /// Vector Storage is the abstraction to store the vectors.
 ///
@@ -129,36 +131,37 @@ impl<Q: Quantization> StorageBuilder<Q> {
             ),
             code_array,
         )?;
+        let batch = batch.add_metadata(
+            STORAGE_METADATA_KEY.to_owned(),
+            self.quantizer.metadata(None)?.to_string(),
+        )?;
         Q::Storage::try_from_batch(batch, self.distance_type)
     }
 }
 
 /// Loader to load partitioned PQ storage from disk.
 #[derive(Debug)]
-pub struct IvfQuantizationStorage<Q: Quantization> {
+pub struct IvfQuantizationStorage {
     reader: FileReader,
 
     distance_type: DistanceType,
-    quantizer: Quantizer,
-    metadata: Q::Metadata,
+    metadata: Vec<String>,
 
     ivf: IvfData,
 }
 
-impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
+impl DeepSizeOf for IvfQuantizationStorage {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.quantizer.deep_size_of_children(context)
-            + self.metadata.deep_size_of_children(context)
-            + self.ivf.deep_size_of_children(context)
+        self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
     }
 }
 
 #[allow(dead_code)]
-impl<Q: Quantization> IvfQuantizationStorage<Q> {
+impl IvfQuantizationStorage {
     /// Open a Loader.
     ///
     ///
-    pub async fn open(reader: FileReader) -> Result<Self> {
+    pub async fn try_new(reader: FileReader) -> Result<Self> {
         let schema = reader.schema();
 
         let distance_type = DistanceType::try_from(
@@ -187,32 +190,22 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let ivf_bytes = reader.read_global_buffer(ivf_pos).await?;
         let ivf = IvfData::try_from(pb::Ivf::decode(ivf_bytes)?)?;
 
-        let quantizer_metadata: Q::Metadata = serde_json::from_str(
+        let metadata: Vec<String> = serde_json::from_str(
             schema
                 .metadata
-                .get(Q::metadata_key())
+                .get(STORAGE_METADATA_KEY)
                 .ok_or(Error::Index {
-                    message: format!("{} not found", Q::metadata_key()),
+                    message: format!("{} not found", STORAGE_METADATA_KEY),
                     location: location!(),
                 })?
                 .as_str(),
         )?;
-        let quantizer = Q::from_metadata(&quantizer_metadata, distance_type)?;
         Ok(Self {
             reader,
             distance_type,
-            quantizer,
-            metadata: quantizer_metadata,
+            metadata,
             ivf,
         })
-    }
-
-    pub fn quantizer(&self) -> &Quantizer {
-        &self.quantizer
-    }
-
-    pub fn metadata(&self) -> &Q::Metadata {
-        &self.metadata
     }
 
     /// Get the number of partitions in the storage.
@@ -220,7 +213,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
-    pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
+    pub async fn load_partition<Q: Quantization>(&self, part_id: usize) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
         let batches = self
             .reader
@@ -234,6 +227,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .await?;
         let schema = Arc::new(self.reader.schema().as_ref().into());
         let batch = concat_batches(&schema, batches.iter())?;
+        let batch = batch.add_metadata(
+            STORAGE_METADATA_KEY.to_owned(),
+            self.metadata[part_id].clone(),
+        )?;
         Q::Storage::try_from_batch(batch, self.distance_type)
     }
 }

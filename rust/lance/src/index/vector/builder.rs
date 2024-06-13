@@ -9,6 +9,9 @@ use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
+use lance_index::vector::quantizer::QuantizerBuildParams;
+use lance_index::vector::storage::STORAGE_METADATA_KEY;
+use lance_index::vector::v3::subindex::SUB_INDEX_METADATA_KEY;
 use lance_index::{
     pb,
     vector::{
@@ -27,11 +30,13 @@ use lance_index::{
     },
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
+use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStreamAdapter,
     ReadBatchParams,
 };
 use lance_linalg::distance::DistanceType;
+use log::info;
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
@@ -49,7 +54,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     shuffler: Arc<dyn Shuffler>,
     ivf_params: IvfBuildParams,
     sub_index_params: S::BuildParams,
-    quantizer: Q,
+    quantizer_params: Q::BuildParams,
     temp_dir: Path,
 }
 
@@ -63,7 +68,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         shuffler: Box<dyn Shuffler>,
         ivf_params: IvfBuildParams,
         sub_index_params: S::BuildParams,
-        quantizer: Q,
+        quantizer_params: Q::BuildParams,
     ) -> Result<Self> {
         let temp_dir = TempDir::new()?;
         let temp_dir = Path::from(temp_dir.path().to_str().unwrap());
@@ -75,17 +80,20 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
             shuffler: shuffler.into(),
             ivf_params,
             sub_index_params,
-            quantizer,
+            quantizer_params,
             temp_dir,
         })
     }
 
     pub async fn build(&self) -> Result<()> {
-        // step 1. train IVF
+        // step 1. train IVF & quantizer
         let ivf = self.load_or_build_ivf().await?;
+        let quantizer = self.load_or_build_quantizer().await?;
 
         // step 2. shuffle data
-        let reader = self.shuffle_data(ivf.centroids.clone()).await?;
+        let reader = self
+            .shuffle_data(ivf.centroids.clone(), quantizer.clone())
+            .await?;
         let partition_build_order = (0..self.ivf_params.num_partitions)
             .map(|partition_id| reader.partiton_size(partition_id))
             .collect::<Result<Vec<_>>>()?
@@ -99,17 +107,26 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
             .collect::<Vec<_>>();
 
         // step 3. build sub index
-        let mut partition_sizes = Vec::with_capacity(self.ivf_params.num_partitions);
+        let mut partition_sizes = vec![(0, 0); self.ivf_params.num_partitions];
         for &partition in &partition_build_order {
-            let partition_data = reader.read_partition(partition).await?.ok_or(Error::io(
-                format!("partition {} is empty", partition).as_str(),
-                location!(),
-            ))?;
-            let batches = partition_data.try_collect::<Vec<_>>().await?;
-            let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+            match reader.partiton_size(partition)? {
+                0 => continue,
+                _ => {
+                    let partition_data =
+                        reader.read_partition(partition).await?.ok_or(Error::io(
+                            format!("partition {} is empty", partition).as_str(),
+                            location!(),
+                        ))?;
+                    let batches = partition_data.try_collect::<Vec<_>>().await?;
+                    let batch =
+                        arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
 
-            let sizes = self.build_partition(partition, &batch).await?;
-            partition_sizes.push(sizes);
+                    let sizes = self
+                        .build_partition(partition, &batch, quantizer.clone())
+                        .await?;
+                    partition_sizes[partition] = sizes;
+                }
+            }
         }
 
         // step 4. merge all partitions
@@ -133,12 +150,51 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         // TODO: load ivf model
     }
 
-    async fn shuffle_data(&self, centroids: FixedSizeListArray) -> Result<Box<dyn ShuffleReader>> {
+    async fn load_or_build_quantizer(&self) -> Result<Q> {
+        let sample_size_hint = self.quantizer_params.sample_size();
+
+        let start = std::time::Instant::now();
+        info!(
+            "loading training data for quantizer. sample size: {}",
+            sample_size_hint
+        );
+        let training_data =
+            utils::maybe_sample_training_data(&self.dataset, &self.column, sample_size_hint)
+                .await?;
+        info!(
+            "Finished loading training data in {:02} seconds",
+            start.elapsed().as_secs_f32()
+        );
+
+        // If metric type is cosine, normalize the training data, and after this point,
+        // treat the metric type as L2.
+        let (training_data, dt) = if self.distance_type == DistanceType::Cosine {
+            let training_data = lance_linalg::kernels::normalize_fsl(&training_data)?;
+            (training_data, DistanceType::L2)
+        } else {
+            (training_data, self.distance_type)
+        };
+
+        info!("Start to train quantizer");
+        let start = std::time::Instant::now();
+        let quantizer = Q::build(&training_data, dt, &self.quantizer_params)?;
+        info!(
+            "Trained quantizer in {:02} seconds",
+            start.elapsed().as_secs_f32()
+        );
+        Ok(quantizer)
+    }
+
+    async fn shuffle_data(
+        &self,
+        centroids: FixedSizeListArray,
+        quantizer: Q,
+    ) -> Result<Box<dyn ShuffleReader>> {
         let transformer = Arc::new(lance_index::vector::ivf::new_ivf_with_quantizer(
             centroids,
             self.distance_type,
             &self.column,
-            self.quantizer.clone().into(),
+            quantizer.into(),
             Some(0..self.ivf_params.num_partitions as u32),
         )?);
 
@@ -177,16 +233,17 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
             .await
     }
 
-    async fn build_partition(&self, part_id: usize, batch: &RecordBatch) -> Result<(usize, usize)> {
+    async fn build_partition(
+        &self,
+        part_id: usize,
+        batch: &RecordBatch,
+        quantizer: Q,
+    ) -> Result<(usize, usize)> {
         let object_store = ObjectStore::local();
 
         // build quantized vector storage
-        let storage = StorageBuilder::new(
-            self.column.clone(),
-            self.distance_type,
-            self.quantizer.clone(),
-        )
-        .build(batch)?;
+        let storage =
+            StorageBuilder::new(self.column.clone(), self.distance_type, quantizer).build(batch)?;
         let path = self.temp_dir.child(format!("storage_part{}", part_id));
         let writer = object_store.create(&path).await?;
         let mut writer = FileWriter::try_new(
@@ -236,10 +293,13 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         // maintain the IVF partitions
         let mut storage_ivf = IvfData::empty();
         let mut index_ivf = IvfData::with_centroids(Arc::new(centroids));
+        let mut partition_storage_metadata = Vec::with_capacity(partition_sizes.len());
+        let mut partition_index_metadata = Vec::with_capacity(partition_sizes.len());
         let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), 64);
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
             if storage_size == 0 {
-                storage_ivf.add_partition(0)
+                storage_ivf.add_partition(0);
+                partition_storage_metadata.push(String::new());
             } else {
                 let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
                 let reader = FileReader::try_open(
@@ -268,10 +328,19 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
                 }
                 storage_writer.as_mut().unwrap().write_batch(&batch).await?;
                 storage_ivf.add_partition(batch.num_rows() as u32);
+                partition_storage_metadata.push(
+                    reader
+                        .schema()
+                        .metadata
+                        .get(STORAGE_METADATA_KEY)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
             }
 
             if index_size == 0 {
-                index_ivf.add_partition(0)
+                index_ivf.add_partition(0);
+                partition_index_metadata.push(String::new());
             } else {
                 let index_part_path = self.temp_dir.child(format!("index_part{}", part_id));
                 let reader = FileReader::try_open(
@@ -292,6 +361,14 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
                 index_writer.write_batch(&batch).await?;
                 index_ivf.add_partition(batch.num_rows() as u32);
+                partition_index_metadata.push(
+                    reader
+                        .schema()
+                        .metadata
+                        .get(SUB_INDEX_METADATA_KEY)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
             }
         }
 
@@ -303,16 +380,27 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
             .await?;
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         storage_writer.add_schema_metadata(
-            Q::metadata_key(),
-            self.quantizer.metadata(None)?.to_string(),
+            STORAGE_METADATA_KEY,
+            serde_json::to_string(&partition_storage_metadata)?,
         );
 
         let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
-        index_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
+        let index_metadata = IndexMetadata {
+            index_type: S::name().to_string(),
+            distance_type: self.distance_type.to_string(),
+        };
+        index_writer.add_schema_metadata(
+            INDEX_METADATA_SCHEMA_KEY,
+            serde_json::to_string(&index_metadata)?,
+        );
         let ivf_buffer_pos = index_writer
             .add_global_buffer(index_ivf_pb.encode_to_vec().into())
             .await?;
         index_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+        index_writer.add_schema_metadata(
+            SUB_INDEX_METADATA_KEY,
+            serde_json::to_string(&partition_index_metadata)?,
+        );
 
         storage_writer.finish().await?;
         index_writer.finish().await?;
@@ -331,6 +419,8 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::hnsw::HNSW;
 
+    use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::{
         flat::index::{FlatIndex, FlatQuantizer},
         ivf::IvfBuildParams,
@@ -387,8 +477,7 @@ mod tests {
             ivf_params.num_partitions,
         );
 
-        let fq = FlatQuantizer::new(DIM, DistanceType::L2);
-        let builder = super::IvfIndexBuilder::<FlatIndex, _>::new(
+        let builder = super::IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
             dataset,
             "vector".to_owned(),
             index_dir,
@@ -396,7 +485,7 @@ mod tests {
             Box::new(shuffler),
             ivf_params,
             (),
-            fq,
+            (),
         )
         .unwrap();
 
@@ -404,13 +493,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_ivf_hnsw() {
+    async fn test_build_ivf_hnsw_sq() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let (dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
+        let sq_params = SQBuildParams::default();
         let index_dir = tempdir().unwrap();
         let index_dir = Path::from(index_dir.path().to_str().unwrap());
         let shuffler = IvfShuffler::new(
@@ -419,8 +509,7 @@ mod tests {
             ivf_params.num_partitions,
         );
 
-        let fq = FlatQuantizer::new(DIM, DistanceType::L2);
-        let builder = super::IvfIndexBuilder::<HNSW, _>::new(
+        let builder = super::IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
             dataset,
             "vector".to_owned(),
             index_dir,
@@ -428,7 +517,7 @@ mod tests {
             Box::new(shuffler),
             ivf_params,
             hnsw_params,
-            fq,
+            sq_params,
         )
         .unwrap();
         builder.build().await.unwrap();

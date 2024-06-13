@@ -22,7 +22,6 @@ use crate::vector::{
     transform::Transformer,
 };
 
-use super::transform::DropColumn;
 use super::{quantizer::Quantizer, residual::compute_residual};
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
@@ -213,9 +212,6 @@ impl Ivf {
             )));
         }
 
-        // For SQ we will transofrm the vector to SQ code while building the index,
-        // so simply drop the vector column now.
-        transforms.push(Arc::new(DropColumn::new(vector_column)));
         Self {
             centroids,
             distance_type: metric_type,

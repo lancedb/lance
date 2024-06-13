@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::ops::Range;
 
 use arrow::compute::concat_batches;
 use arrow_array::{
@@ -21,6 +21,7 @@ use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
+use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     vector::{
         quantizer::{QuantizerMetadata, QuantizerStorage},
@@ -294,7 +295,7 @@ impl VectorStore for ScalarQuantizationStorage {
         let metadata_json = batch
             .schema_ref()
             .metadata()
-            .get("metadata")
+            .get(STORAGE_METADATA_KEY)
             .ok_or(Error::Schema {
                 message: "metadata not found".to_string(),
                 location: location!(),
@@ -305,27 +306,7 @@ impl VectorStore for ScalarQuantizationStorage {
     }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
-        let metadata = ScalarQuantizationMetadata {
-            dim: self.chunks[0].dim(),
-            num_bits: self.quantizer.num_bits,
-            bounds: self.quantizer.bounds.clone(),
-        };
-        let metadata_json = serde_json::to_string(&metadata)?;
-        let metadata = HashMap::from_iter(vec![("metadata".to_owned(), metadata_json)]);
-
-        let schema = self.chunks[0]
-            .schema()
-            .as_ref()
-            .clone()
-            .with_metadata(metadata);
-        let schema = Arc::new(schema);
-        Ok(self.chunks.iter().map(move |chunk| {
-            chunk
-                .batch
-                .clone()
-                .with_schema(schema.clone())
-                .expect("attach schema")
-        }))
+        Ok(self.chunks.iter().map(|c| c.batch.clone()))
     }
 
     fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self> {
@@ -452,6 +433,7 @@ mod tests {
     use super::*;
 
     use std::iter::repeat_with;
+    use std::sync::Arc;
 
     use arrow_array::FixedSizeListArray;
     use arrow_schema::{DataType, Field, Schema};

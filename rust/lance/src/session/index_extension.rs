@@ -65,7 +65,7 @@ mod test {
         sync::{atomic::AtomicBool, Arc},
     };
 
-    use arrow_array::RecordBatch;
+    use arrow_array::{RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use deepsize::DeepSizeOf;
     use lance_file::writer::{FileWriter, FileWriterOptions};
@@ -116,6 +116,19 @@ mod test {
     #[async_trait::async_trait]
     impl VectorIndex for MockIndex {
         async fn search(&self, _: &Query, _: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+            todo!("panic")
+        }
+
+        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+            todo!("panic")
+        }
+
+        async fn search_in_partition(
+            &self,
+            _: usize,
+            _: &Query,
+            _: Arc<dyn PreFilter>,
+        ) -> Result<RecordBatch> {
             todo!("panic")
         }
 

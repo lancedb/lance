@@ -43,7 +43,7 @@ use lance_index::{
         },
         pq::{PQBuildParams, ProductQuantizer},
         quantizer::{Quantization, QuantizationMetadata, Quantizer},
-        sq::{builder::SQBuildParams, ScalarQuantizer},
+        sq::ScalarQuantizer,
         Query, VectorIndex, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
@@ -79,7 +79,7 @@ use super::{
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
 };
-use crate::{dataset::builder::DatasetBuilder, index::vector::sq::build_sq_model};
+use crate::dataset::builder::DatasetBuilder;
 use crate::{
     dataset::Dataset,
     index::{
@@ -210,34 +210,6 @@ impl IVFIndex {
         } else {
             Ok(query.clone())
         }
-    }
-
-    pub(crate) async fn search_in_partition(
-        &self,
-        partition_id: usize,
-        query: &Query,
-        pre_filter: Arc<dyn PreFilter>,
-    ) -> Result<RecordBatch> {
-        let part_index = self.load_partition(partition_id, true).await?;
-
-        let query = self.preprocess_query(partition_id, query)?;
-        let batch = part_index.search(&query, pre_filter).await?;
-        Ok(batch)
-    }
-
-    /// find the IVF partitions ids given the query vector.
-    ///
-    /// Internal API with no stability guarantees.
-    ///
-    /// Assumes the query vector is normalized if the metric type is cosine.
-    pub fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
-        let mt = if self.metric_type == MetricType::Cosine {
-            MetricType::L2
-        } else {
-            self.metric_type
-        };
-
-        self.ivf.find_partitions(&query.key, query.nprobes, mt)
     }
 }
 
@@ -712,6 +684,34 @@ impl VectorIndex for IVFIndex {
         Ok(as_struct_array(&taken_distances).into())
     }
 
+    /// find the IVF partitions ids given the query vector.
+    ///
+    /// Internal API with no stability guarantees.
+    ///
+    /// Assumes the query vector is normalized if the metric type is cosine.
+    fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+        let mt = if self.metric_type == MetricType::Cosine {
+            MetricType::L2
+        } else {
+            self.metric_type
+        };
+
+        self.ivf.find_partitions(&query.key, query.nprobes, mt)
+    }
+
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        let part_index = self.load_partition(partition_id, true).await?;
+
+        let query = self.preprocess_query(partition_id, query)?;
+        let batch = part_index.search(&query, pre_filter).await?;
+        Ok(batch)
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
@@ -1122,40 +1122,6 @@ async fn build_ivf_model_and_pq(
     Ok((ivf_model, pq))
 }
 
-async fn build_ivf_model_and_sq(
-    dataset: &Dataset,
-    column: &str,
-    metric_type: MetricType,
-    ivf_params: &IvfBuildParams,
-    sq_params: &SQBuildParams,
-) -> Result<(Ivf, ScalarQuantizer)> {
-    sanity_check_ivf_params(ivf_params)?;
-
-    info!(
-        "Building vector index: IVF{},SQ{}, metric={}",
-        ivf_params.num_partitions, sq_params.num_bits, metric_type,
-    );
-
-    let field = sanity_check(dataset, column)?;
-    let dim = if let DataType::FixedSizeList(_, d) = field.data_type() {
-        d as usize
-    } else {
-        return Err(Error::Index {
-            message: format!(
-                "VectorIndex requires the column data type to be fixed size list of floats, got {}",
-                field.data_type()
-            ),
-            location: location!(),
-        });
-    };
-
-    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
-
-    let sq = build_sq_model(dataset, column, metric_type, sq_params).await?;
-
-    Ok((ivf_model, sq))
-}
-
 async fn scan_index_field_stream(
     dataset: &Dataset,
     column: &str,
@@ -1239,41 +1205,6 @@ pub async fn build_ivf_hnsw_pq_index(
         &[],
         ivf_model,
         Quantizer::Product(pq),
-        metric_type,
-        hnsw_params,
-        stream,
-        precomputed_partitions,
-        ivf_params.shuffle_partition_batches,
-        ivf_params.shuffle_partition_concurrency,
-        ivf_params.precomputed_shuffle_buffers.clone(),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn build_ivf_hnsw_sq_index(
-    dataset: &Dataset,
-    column: &str,
-    index_name: &str,
-    uuid: &str,
-    metric_type: MetricType,
-    ivf_params: &IvfBuildParams,
-    hnsw_params: &HnswBuildParams,
-    sq_params: &SQBuildParams,
-) -> Result<()> {
-    let (ivf_model, sq) =
-        build_ivf_model_and_sq(dataset, column, metric_type, ivf_params, sq_params).await?;
-    let stream = scan_index_field_stream(dataset, column).await?;
-    let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
-
-    write_ivf_hnsw_file(
-        dataset,
-        column,
-        index_name,
-        uuid,
-        &[],
-        ivf_model,
-        Quantizer::Scalar(sq),
         metric_type,
         hnsw_params,
         stream,
@@ -1689,6 +1620,7 @@ mod tests {
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
@@ -2560,82 +2492,6 @@ mod tests {
 
         let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
         let gt = ground_truth(&mat, query.values(), k, DistanceType::L2);
-
-        let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
-        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
-
-        let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
-        assert!(
-            recall >= 0.9,
-            "recall: {}\n results: {:?}\n\ngt: {:?}",
-            recall,
-            results,
-            gt,
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_ivf_hnsw_sq() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let nlist = 4;
-        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
-
-        let ivf_params = IvfBuildParams::new(nlist);
-        let sq_params = SQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
-        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::Cosine,
-            ivf_params,
-            hnsw_params,
-            sq_params,
-        );
-
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
-
-        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
-        let query = vector_array.value(0);
-        let query = query.as_primitive::<Float32Type>();
-        let k = 100;
-        let results = dataset
-            .scan()
-            .with_row_id()
-            .nearest("vector", query, k)
-            .unwrap()
-            .nprobs(nlist)
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(1, results.len());
-        assert_eq!(k, results[0].num_rows());
-
-        let row_ids = results[0]
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .iter()
-            .map(|v| v.unwrap() as u32)
-            .collect::<Vec<_>>();
-        let dists = results[0]
-            .column_by_name("_distance")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-
-        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, DistanceType::Cosine);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();

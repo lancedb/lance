@@ -38,7 +38,7 @@ use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
-use crate::vector::v3::subindex::IvfSubIndex;
+use crate::vector::v3::subindex::{IvfSubIndex, SUB_INDEX_METADATA_KEY};
 use crate::vector::{Query, DIST_COL, VECTOR_RESULT_SCHEMA};
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
@@ -534,15 +534,15 @@ impl IvfSubIndex for HNSW {
         let index_metadata: IndexMetadata = serde_json::from_str(index_metadata)?;
         let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-        let hnsw_metadata =
-            data.schema_ref()
-                .metadata()
-                .get(HNSW_METADATA_KEY)
-                .ok_or(Error::Index {
-                    message: format!("{} not found", HNSW_METADATA_KEY),
-                    location: location!(),
-                })?;
-        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata)?;
+        let hnsw_metadata = data
+            .schema_ref()
+            .metadata()
+            .get(SUB_INDEX_METADATA_KEY)
+            .ok_or(Error::Index {
+                message: format!("{} not found", HNSW_METADATA_KEY),
+                location: location!(),
+            })?;
+        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata).unwrap_or_default();
 
         let levels: Vec<_> = hnsw_metadata
             .level_offsets
@@ -755,7 +755,7 @@ impl IvfSubIndex for HNSW {
                     INDEX_METADATA_SCHEMA_KEY.to_string(),
                     index_metadata.to_string(),
                 ),
-                (HNSW_METADATA_KEY.to_string(), metadata),
+                (SUB_INDEX_METADATA_KEY.to_string(), metadata),
             ]));
         let batch = concat_batches(&Self::schema(), batches.iter())?;
         let batch = batch.with_schema(Arc::new(schema))?;

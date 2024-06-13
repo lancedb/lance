@@ -10,7 +10,6 @@ use std::{any::Any, collections::HashMap};
 pub mod builder;
 pub mod ivf;
 pub mod pq;
-pub mod sq;
 mod traits;
 mod utils;
 
@@ -21,6 +20,7 @@ use arrow::datatypes::Float32Type;
 use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizerImpl;
 use lance_index::vector::v3::shuffler::IvfShuffler;
@@ -40,7 +40,6 @@ use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
 use snafu::{location, Location};
 use tracing::instrument;
-use utils::get_vector_dim;
 use uuid::Uuid;
 
 use self::{ivf::*, pq::PQIndex};
@@ -237,7 +236,6 @@ pub(crate) async fn build_vector_index(
     params: &VectorIndexParams,
 ) -> Result<()> {
     let stages = &params.stages;
-    let dim = get_vector_dim(dataset, column)?;
 
     if stages.is_empty() {
         return Err(Error::Index {
@@ -260,8 +258,7 @@ pub(crate) async fn build_vector_index(
             path,
             ivf_params.num_partitions,
         );
-        let quantizer = FlatQuantizer::new(dim, params.metric_type);
-        IvfIndexBuilder::<FlatIndex, _>::new(
+        IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
             dataset.clone(),
             column.to_owned(),
             dataset.indices_dir().child(uuid),
@@ -269,7 +266,7 @@ pub(crate) async fn build_vector_index(
             Box::new(shuffler),
             ivf_params.clone(),
             (),
-            quantizer,
+            (),
         )?
         .build()
         .await?;
@@ -313,6 +310,14 @@ pub(crate) async fn build_vector_index(
             });
         };
 
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().to_str().unwrap().into();
+        let shuffler = IvfShuffler::new(
+            dataset.object_store().clone(),
+            path,
+            ivf_params.num_partitions,
+        );
+
         // with quantization
         if len > 2 {
             match stages.last().unwrap() {
@@ -330,17 +335,18 @@ pub(crate) async fn build_vector_index(
                     .await?
                 }
                 StageParams::SQ(sq_params) => {
-                    build_ivf_hnsw_sq_index(
-                        dataset,
-                        column,
-                        name,
-                        uuid,
+                    IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+                        dataset.clone(),
+                        column.to_owned(),
+                        dataset.indices_dir().child(uuid),
                         params.metric_type,
-                        ivf_params,
-                        hnsw_params,
-                        sq_params,
-                    )
-                    .await?
+                        Box::new(shuffler),
+                        ivf_params.clone(),
+                        hnsw_params.clone(),
+                        sq_params.clone(),
+                    )?
+                    .build()
+                    .await?;
                 }
                 _ => {
                     return Err(Error::Index {

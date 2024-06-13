@@ -24,18 +24,14 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::quantizer::{Quantization, Quantizer};
 use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_index::vector::{
-    quantizer::{Quantization, Quantizer},
-    sq::ScalarQuantizer,
-    storage::VectorStore,
-};
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
-use lance_linalg::distance::{DistanceType, MetricType};
+use lance_linalg::distance::MetricType;
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
@@ -46,7 +42,7 @@ use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
-use crate::index::vector::sq::build_sq_storage;
+
 use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
 
@@ -498,13 +494,7 @@ async fn build_hnsw_quantization_partition(
             aux_writer.unwrap(),
         )),
 
-        Quantizer::Scalar(sq) => tokio::spawn(build_and_write_sq_storage(
-            metric_type,
-            row_ids,
-            vectors,
-            sq,
-            aux_writer.unwrap(),
-        )),
+        _ => unreachable!("IVF_HNSW_SQ has been moved to v2 index builder"),
     };
 
     futures::join!(build_hnsw, build_store).0?;
@@ -536,26 +526,6 @@ async fn build_and_write_pq_storage(
     .await?;
 
     writer.write_record_batch(storage.batch().clone()).await?;
-    writer.finish().await?;
-    Ok(())
-}
-
-async fn build_and_write_sq_storage(
-    distance_type: DistanceType,
-    row_ids: Arc<dyn Array>,
-    vectors: Arc<dyn Array>,
-    sq: ScalarQuantizer,
-    mut writer: FileWriter<ManifestDescribing>,
-) -> Result<()> {
-    let storage = spawn_cpu(move || {
-        let storage = build_sq_storage(distance_type, row_ids, vectors, sq)?;
-        Ok(storage)
-    })
-    .await?;
-
-    for batch in storage.to_batches()? {
-        writer.write_record_batch(batch.clone()).await?;
-    }
     writer.finish().await?;
     Ok(())
 }

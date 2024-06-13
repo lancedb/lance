@@ -4,8 +4,10 @@
 use core::fmt;
 use std::sync::Arc;
 
-use arrow::datatypes::Float32Type;
+use arrow::array::AsArray;
+use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array};
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_arrow::ArrowFloatType;
@@ -22,6 +24,7 @@ use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 use super::flat::index::FlatQuantizer;
 use super::pq::storage::PQ_METADTA_KEY;
 use super::pq::ProductQuantizer;
+use super::sq::builder::SQBuildParams;
 use super::sq::storage::SQ_METADATA_KEY;
 use super::{
     ivf::storage::IvfData,
@@ -38,9 +41,15 @@ use super::{
 use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
 pub trait Quantization: Send + Sync + DeepSizeOf + Into<Quantizer> {
+    type BuildParams: QuantizerBuildParams;
     type Metadata: QuantizerMetadata + Send + Sync;
     type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore;
 
+    fn build(
+        data: &dyn Array,
+        distance_type: DistanceType,
+        params: &Self::BuildParams,
+    ) -> Result<Self>;
     fn code_dim(&self) -> usize;
     fn column(&self) -> &'static str;
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef>;
@@ -63,6 +72,16 @@ impl std::fmt::Display for QuantizationType {
             Self::Product => write!(f, "PQ"),
             Self::Scalar => write!(f, "SQ"),
         }
+    }
+}
+
+pub trait QuantizerBuildParams {
+    fn sample_size(&self) -> usize;
+}
+
+impl QuantizerBuildParams for () {
+    fn sample_size(&self) -> usize {
+        0
     }
 }
 
@@ -168,8 +187,41 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
 }
 
 impl Quantization for ScalarQuantizer {
+    type BuildParams = SQBuildParams;
     type Metadata = ScalarQuantizationMetadata;
     type Storage = ScalarQuantizationStorage;
+
+    fn build(data: &dyn Array, _: DistanceType, params: &Self::BuildParams) -> Result<Self> {
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "SQ builder: input is not a FixedSizeList: {}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
+
+        match fsl.value_type() {
+            DataType::Float16 => {
+                quantizer.update_bounds::<Float16Type>(fsl)?;
+            }
+            DataType::Float32 => {
+                quantizer.update_bounds::<Float32Type>(fsl)?;
+            }
+            DataType::Float64 => {
+                quantizer.update_bounds::<Float64Type>(fsl)?;
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!("SQ builder: unsupported data type: {}", fsl.value_type()),
+                    location: location!(),
+                })
+            }
+        }
+
+        Ok(quantizer)
+    }
 
     fn code_dim(&self) -> usize {
         self.dim
@@ -180,8 +232,15 @@ impl Quantization for ScalarQuantizer {
     }
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
-        let code_array = self.transform::<Float32Type>(vectors)?;
-        Ok(code_array)
+        match vectors.as_fixed_size_list().value_type() {
+            DataType::Float16 => self.transform::<Float16Type>(vectors),
+            DataType::Float32 => self.transform::<Float32Type>(vectors),
+            DataType::Float64 => self.transform::<Float64Type>(vectors),
+            value_type => Err(Error::invalid_input(
+                format!("unsupported data type {} for scalar quantizer", value_type),
+                location!(),
+            )),
+        }
     }
 
     fn metadata_key() -> &'static str {
@@ -210,8 +269,13 @@ impl Quantization for ScalarQuantizer {
 }
 
 impl Quantization for Arc<dyn ProductQuantizer> {
+    type BuildParams = ();
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
+
+    fn build(_: &dyn Array, _: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        unimplemented!("ProductQuantizer cannot be built with new index builder")
+    }
 
     fn code_dim(&self) -> usize {
         self.num_sub_vectors()
@@ -278,8 +342,13 @@ impl<T: ArrowFloatType + 'static> Quantization for ProductQuantizerImpl<T>
 where
     T::Native: Dot + L2,
 {
+    type BuildParams = ();
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
+
+    fn build(_: &dyn Array, _: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        unimplemented!("ProductQuantizer cannot be built with new index builder")
+    }
 
     fn code_dim(&self) -> usize {
         self.num_sub_vectors()
