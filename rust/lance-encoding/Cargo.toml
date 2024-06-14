@@ -31,6 +31,8 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zstd.workspace = true
+rand = "0.8.4"
+rand_xoshiro = "0.6.0"
 
 [dev-dependencies]
 rand.workspace = true
