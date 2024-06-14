@@ -132,7 +132,7 @@ impl Updater {
             &self.fragment.dataset().object_store,
             &schema,
             &self.fragment.dataset().base,
-            !is_legacy,
+            is_legacy,
         )
         .await
     }

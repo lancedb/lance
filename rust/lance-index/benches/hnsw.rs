@@ -10,6 +10,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use arrow_array::{types::Float32Type, FixedSizeListArray};
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_index::vector::v3::subindex::IvfSubIndex;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
@@ -37,13 +38,9 @@ fn bench_hnsw(c: &mut Criterion) {
         format!("create_hnsw({TOTAL}x{DIMENSION},levels=6)").as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
-                let hnsw = HNSW::build_with_storage(
-                    DistanceType::L2,
-                    HnswBuildParams::default().max_level(6),
-                    vectors.clone(),
-                )
-                .await
-                .unwrap();
+                let hnsw =
+                    HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default().max_level(6))
+                        .unwrap();
                 let uids: HashSet<u32> = hnsw
                     .search_basic(query.clone(), K, 300, None, vectors.as_ref())
                     .unwrap()
@@ -56,13 +53,8 @@ fn bench_hnsw(c: &mut Criterion) {
         },
     );
 
-    let hnsw = rt
-        .block_on(HNSW::build_with_storage(
-            DistanceType::L2,
-            HnswBuildParams::default().max_level(6),
-            vectors.clone(),
-        ))
-        .unwrap();
+    let hnsw =
+        HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default().max_level(6)).unwrap();
     c.bench_function(
         format!("search_hnsw{TOTAL}x{DIMENSION}, levels=6").as_str(),
         |b| {

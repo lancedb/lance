@@ -142,6 +142,10 @@ impl Schema {
         }
     }
 
+    pub fn has_dictionary_types(&self) -> bool {
+        self.fields.iter().any(|f| f.has_dictionary_types())
+    }
+
     pub fn check_compatible(&self, expected: &Self, options: &SchemaCompareOptions) -> Result<()> {
         if !self.compare_with_options(expected, options) {
             let difference = self.explain_difference(expected, options);

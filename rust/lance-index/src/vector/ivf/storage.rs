@@ -19,7 +19,6 @@ use crate::pb::Ivf as PbIvf;
 pub const IVF_METADATA_KEY: &str = "lance:ivf";
 pub const IVF_PARTITION_KEY: &str = "lance:ivf:partition";
 
-#[warn(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct IvfData {
     /// Centroids of the IVF indices. Can be empty.

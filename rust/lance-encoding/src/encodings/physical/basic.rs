@@ -9,7 +9,7 @@ use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 
 use crate::{
-    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
+    decoder::{PageScheduler, PhysicalPageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
@@ -45,14 +45,14 @@ impl DataNullStatus {
 
 #[derive(Debug)]
 struct DataSchedulers {
-    validity: Box<dyn PhysicalPageScheduler>,
-    values: Box<dyn PhysicalPageScheduler>,
+    validity: Box<dyn PageScheduler>,
+    values: Box<dyn PageScheduler>,
 }
 
 #[derive(Debug)]
 enum SchedulerNullStatus {
     // Values only
-    None(Box<dyn PhysicalPageScheduler>),
+    None(Box<dyn PageScheduler>),
     // Validity and values
     Some(DataSchedulers),
     // Neither validity nor values
@@ -60,7 +60,7 @@ enum SchedulerNullStatus {
 }
 
 impl SchedulerNullStatus {
-    fn values_scheduler(&self) -> Option<&dyn PhysicalPageScheduler> {
+    fn values_scheduler(&self) -> Option<&dyn PageScheduler> {
         match self {
             Self::All => None,
             Self::None(values) => Some(values.as_ref()),
@@ -88,8 +88,8 @@ pub struct BasicPageScheduler {
 impl BasicPageScheduler {
     /// Creates a new instance that expects a validity bitmap
     pub fn new_nullable(
-        validity_decoder: Box<dyn PhysicalPageScheduler>,
-        values_decoder: Box<dyn PhysicalPageScheduler>,
+        validity_decoder: Box<dyn PageScheduler>,
+        values_decoder: Box<dyn PageScheduler>,
     ) -> Self {
         Self {
             mode: SchedulerNullStatus::Some(DataSchedulers {
@@ -100,7 +100,7 @@ impl BasicPageScheduler {
     }
 
     /// Create a new instance that does not need a validity bitmap because no item is null
-    pub fn new_non_nullable(values_decoder: Box<dyn PhysicalPageScheduler>) -> Self {
+    pub fn new_non_nullable(values_decoder: Box<dyn PageScheduler>) -> Self {
         Self {
             mode: SchedulerNullStatus::None(values_decoder),
         }
@@ -118,11 +118,11 @@ impl BasicPageScheduler {
     }
 }
 
-impl PhysicalPageScheduler for BasicPageScheduler {
+impl PageScheduler for BasicPageScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[std::ops::Range<u32>],
-        scheduler: &dyn EncodingsIo,
+        scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let validity_future = match &self.mode {

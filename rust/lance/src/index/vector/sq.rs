@@ -64,11 +64,12 @@ pub fn build_sq_storage(
     let code_column = sq.transform::<Float32Type>(vectors.as_ref())?;
     std::mem::drop(vectors);
 
-    let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
+    let batch = RecordBatch::try_from_iter_with_nullable(vec![
         (ROW_ID, row_ids, true),
         (sq.column(), code_column, false),
     ])?;
-    let store = ScalarQuantizationStorage::new(sq.num_bits(), metric_type, sq.bounds(), pq_batch)?;
+    let store =
+        ScalarQuantizationStorage::try_new(sq.num_bits(), metric_type, sq.bounds(), [batch])?;
 
     Ok(store)
 }

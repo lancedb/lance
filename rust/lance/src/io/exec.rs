@@ -5,7 +5,7 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
-mod knn;
+pub(crate) mod knn;
 mod optimizer;
 mod planner;
 mod projection;
@@ -17,7 +17,7 @@ mod take;
 pub mod testing;
 pub mod utils;
 
-pub use knn::*;
+pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNFlatExec, PreFilterSource};
 pub use planner::{FilterPlan, Planner};
 pub use projection::ProjectionExec;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};

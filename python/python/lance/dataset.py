@@ -161,6 +161,7 @@ class LanceDataset(pa.dataset.Dataset):
         metadata_cache_size: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        serialized_manifest: Optional[bytes] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -172,17 +173,26 @@ class LanceDataset(pa.dataset.Dataset):
             metadata_cache_size,
             commit_lock,
             storage_options,
+            serialized_manifest,
         )
 
+    @classmethod
+    def __deserialize__(cls, uri: str, version: int, manifest: bytes):
+        return cls(uri, version, serialized_manifest=manifest)
+
     def __reduce__(self):
-        return LanceDataset, (self.uri, self._ds.version())
+        return type(self).__deserialize__, (
+            self.uri,
+            self._ds.version(),
+            self._ds.serialized_manifest(),
+        )
 
     def __getstate__(self):
-        return self.uri, self._ds.version()
+        return self.uri, self._ds.version(), self._ds.serialized_manifest()
 
     def __setstate__(self, state):
-        self._uri, version = state
-        self._ds = _Dataset(self._uri, version)
+        self._uri, version, manifest = state
+        self._ds = _Dataset(self._uri, version, manifest=manifest)
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
@@ -399,7 +409,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool, default False
             Run filter before the vector search.
         with_row_id: bool, default False
-            Return physical row ID.
+            Return row ID.
         use_stats: bool, default True
             Use stats pushdown during filters.
 
@@ -1516,7 +1526,7 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
         self._ds.create_index(column, index_type, name, replace, kwargs)
-        return LanceDataset(self.uri, index_cache_size=index_cache_size)
+        return self
 
     def session(self) -> Session:
         """
@@ -2046,7 +2056,7 @@ class ScannerBuilder:
         return self
 
     def with_row_id(self, with_row_id: bool = True) -> ScannerBuilder:
-        """Enable returns with physical row IDs."""
+        """Enable returns with row IDs."""
         self._with_row_id = with_row_id
         return self
 
@@ -2385,7 +2395,7 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    use_experimental_writer: bool = False,
+    use_legacy_format: bool = True,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2425,9 +2435,9 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    use_experimental_writer : optional, bool
-        Use the Lance v2 writer to write Lance v2 files.  This is not recommended
-        at this time as there are several known limitations in the v2 writer.
+    use_legacy_format : optional, bool, default True
+        Use the Lance v1 writer to write Lance v1 files.  The default is currently
+        True but will change as we roll out the v2 format.
     """
     if _check_for_hugging_face(data_obj):
         # Huggingface datasets
@@ -2449,7 +2459,7 @@ def write_dataset(
         "max_bytes_per_file": max_bytes_per_file,
         "progress": progress,
         "storage_options": storage_options,
-        "use_experimental_writer": use_experimental_writer,
+        "use_legacy_format": use_legacy_format,
     }
 
     if commit_lock:

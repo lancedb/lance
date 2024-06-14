@@ -6,9 +6,9 @@ use std::sync::Arc;
 use deepsize::DeepSizeOf;
 use lance_core::Result;
 use lance_file::reader::FileReader;
-use lance_index::{IndexParams, IndexType};
+use lance_index::{vector::VectorIndex, IndexParams, IndexType};
 
-use crate::{index::vector::VectorIndex, Dataset};
+use crate::Dataset;
 
 pub trait IndexExtension: Send + Sync + DeepSizeOf {
     fn index_type(&self) -> IndexType;
@@ -115,7 +115,7 @@ mod test {
 
     #[async_trait::async_trait]
     impl VectorIndex for MockIndex {
-        async fn search(&self, _: &Query, _: Arc<PreFilter>) -> Result<RecordBatch> {
+        async fn search(&self, _: &Query, _: Arc<dyn PreFilter>) -> Result<RecordBatch> {
             todo!("panic")
         }
 
@@ -140,7 +140,7 @@ mod test {
             todo!("panic")
         }
 
-        fn row_ids(&self) -> &[u64] {
+        fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
             todo!("panic")
         }
 
@@ -267,13 +267,9 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_vector_index_extension_roundtrip(
-        #[values(false, true)] use_experimental_writer: bool,
-    ) {
+    async fn test_vector_index_extension_roundtrip(#[values(false, true)] use_legacy_format: bool) {
         // make dataset and index that is not supported natively
-        let test_ds = TestVectorDataset::new(use_experimental_writer)
-            .await
-            .unwrap();
+        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
         let idx = test_ds.dataset.load_indices().await.unwrap();
         assert_eq!(idx.len(), 0);
 

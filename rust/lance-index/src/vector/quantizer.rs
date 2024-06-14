@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use core::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::Float32Type;
@@ -11,8 +12,9 @@ use lance_arrow::ArrowFloatType;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
-use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::format::SelfDescribingFileReader;
+use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
@@ -31,18 +33,18 @@ use super::{
         storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage},
         ScalarQuantizer,
     },
-    v3::storage::VectorStore,
+    storage::VectorStore,
 };
 use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
-pub trait Quantization: DeepSizeOf + Into<Quantizer> {
+pub trait Quantization: Send + Sync + DeepSizeOf + Into<Quantizer> {
     type Metadata: QuantizerMetadata + Send + Sync;
     type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore;
 
     fn code_dim(&self) -> usize;
     fn column(&self) -> &'static str;
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef>;
-    fn metadata_key(&self) -> &'static str;
+    fn metadata_key() -> &'static str;
     fn quantization_type(&self) -> QuantizationType;
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value>;
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer>;
@@ -64,6 +66,11 @@ impl std::fmt::Display for QuantizationType {
     }
 }
 
+/// Quantization Method.
+///
+/// <section class="warning">
+/// Internal use only. End-user does not use this directly.
+/// </section>
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Quantizer {
     Flat(FlatQuantizer),
@@ -90,9 +97,9 @@ impl Quantizer {
 
     pub fn metadata_key(&self) -> &'static str {
         match self {
-            Self::Flat(fq) => fq.metadata_key(),
-            Self::Product(pq) => pq.metadata_key(),
-            Self::Scalar(sq) => sq.metadata_key(),
+            Self::Flat(_) => FlatQuantizer::metadata_key(),
+            Self::Product(_) => ProductQuantizerImpl::<Float32Type>::metadata_key(),
+            Self::Scalar(_) => ScalarQuantizer::metadata_key(),
         }
     }
 
@@ -142,18 +149,20 @@ pub struct QuantizationMetadata {
 }
 
 #[async_trait]
-pub trait QuantizerMetadata: Clone + Sized + DeepSizeOf {
+pub trait QuantizerMetadata:
+    fmt::Debug + Clone + Sized + DeepSizeOf + for<'a> Deserialize<'a> + Serialize
+{
     async fn load(reader: &FileReader) -> Result<Self>;
 }
 
 #[async_trait::async_trait]
-pub trait QuantizerStorage: Clone + Sized + DeepSizeOf {
+pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
     type Metadata: QuantizerMetadata;
 
     async fn load_partition(
         reader: &FileReader,
         range: std::ops::Range<usize>,
-        metric_type: MetricType,
+        distance_type: DistanceType,
         metadata: &Self::Metadata,
     ) -> Result<Self>;
 }
@@ -175,7 +184,7 @@ impl Quantization for ScalarQuantizer {
         Ok(code_array)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         SQ_METADATA_KEY
     }
 
@@ -217,7 +226,7 @@ impl Quantization for Arc<dyn ProductQuantizer> {
         Ok(code_array)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         PQ_METADTA_KEY
     }
 
@@ -285,7 +294,7 @@ where
         Ok(code_array)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         PQ_METADTA_KEY
     }
 
@@ -331,11 +340,11 @@ where
     }
 }
 
-/// Loader to load partitioned PQ storage from disk.
+/// Loader to load partitioned [VectorStore] from disk.
 pub struct IvfQuantizationStorage<Q: Quantization> {
     reader: FileReader,
 
-    metric_type: MetricType,
+    distance_type: DistanceType,
     quantizer: Quantizer,
     metadata: Q::Metadata,
 
@@ -355,7 +364,7 @@ impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {
     fn clone(&self) -> Self {
         Self {
             reader: self.reader.clone(),
-            metric_type: self.metric_type,
+            distance_type: self.distance_type,
             quantizer: self.quantizer.clone(),
             metadata: self.metadata.clone(),
             ivf: self.ivf.clone(),
@@ -387,19 +396,23 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 message: format!("Failed to parse index metadata: {}", metadata_str),
                 location: location!(),
             })?;
-        let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
+        let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
         let ivf_data = IvfData::load(&reader).await?;
 
         let metadata = Q::Metadata::load(&reader).await?;
-        let quantizer = Q::from_metadata(&metadata, metric_type)?;
+        let quantizer = Q::from_metadata(&metadata, distance_type)?;
         Ok(Self {
             reader,
-            metric_type,
+            distance_type,
             quantizer,
             metadata,
             ivf: ivf_data,
         })
+    }
+
+    pub fn distance_type(&self) -> DistanceType {
+        self.distance_type
     }
 
     pub fn quantizer(&self) -> &Quantizer {
@@ -415,8 +428,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
+    /// Load one partition of vector storage.
+    ///
+    /// # Parameters
+    /// - `part_id`, partition id
+    ///
+    ///
     pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
-        Q::Storage::load_partition(&self.reader, range, self.metric_type, &self.metadata).await
+        Q::Storage::load_partition(&self.reader, range, self.distance_type, &self.metadata).await
     }
 }

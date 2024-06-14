@@ -15,6 +15,7 @@ use snafu::{location, Location};
 
 pub mod builder;
 pub mod storage;
+pub mod transform;
 
 /// Scalar Quantization, optimized for [Apache Arrow] buffer memory layout.
 ///

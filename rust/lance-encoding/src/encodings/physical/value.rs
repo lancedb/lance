@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
+    decoder::{PageScheduler, PhysicalPageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
@@ -79,11 +79,11 @@ impl ValuePageScheduler {
     }
 }
 
-impl PhysicalPageScheduler for ValuePageScheduler {
+impl PageScheduler for ValuePageScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[std::ops::Range<u32>],
-        scheduler: &dyn EncodingsIo,
+        scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let (mut min, mut max) = (u64::MAX, 0);

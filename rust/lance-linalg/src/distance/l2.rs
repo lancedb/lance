@@ -150,7 +150,9 @@ impl L2 for f16 {
 impl L2 for f32 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        l2_scalar::<Self, Self, 32>(x, y)
+        // 16 = 512 (avx512) / 8 bits / 4 (sizeof(f32))
+        // See https://github.com/lancedb/lance/pull/2450.
+        l2_scalar::<Self, Self, 16>(x, y)
     }
 
     fn l2_batch<'a>(

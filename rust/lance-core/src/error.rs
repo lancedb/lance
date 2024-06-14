@@ -82,6 +82,8 @@ pub enum Error {
     },
     #[snafu(display("Cloned error: {message}, {location}"))]
     Cloned { message: String, location: Location },
+    #[snafu(display("Query Execution error: {message}, {location}"))]
+    Execution { message: String, location: Location },
 }
 
 impl Error {

@@ -42,7 +42,12 @@ def test_iter_over_dataset(tmp_path):
 
     # test when sample size is greater than max_takes
     torch_ds = LanceDataset(
-        ds, batch_size=256, samples=4096, columns=["ids", "vec"], cache=True
+        ds,
+        batch_size=256,
+        samples=4096,
+        columns=["ids", "vec"],
+        cache=True,
+        batch_readahead=2,
     )
 
     total_rows = 0

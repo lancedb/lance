@@ -6,8 +6,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::cast::AsArray;
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow::datatypes::UInt32Type;
+use arrow_array::StringArray;
+use arrow_array::{
+    builder::{ListBuilder, UInt32Builder},
+    cast::AsArray,
+    RecordBatch, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::stats::Precision;
@@ -18,12 +23,19 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_plan::{ExecutionMode, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::stream::repeat_with;
+use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use itertools::Itertools;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{flat::flat_search, Query, DIST_COL};
+use lance_index::vector::{
+    flat::flat_search, Query, VectorIndex, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
+};
 use lance_io::stream::RecordBatchStream;
+use lance_linalg::distance::DistanceType;
+use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
+use log::warn;
 use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -31,7 +43,8 @@ use tracing::{instrument, Instrument};
 
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
-use crate::index::prefilter::{FilterLoader, PreFilter};
+use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
+use crate::index::vector::ivf::IVFIndex;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 
@@ -122,6 +135,32 @@ impl DFRecordBatchStream for KNNFlatStream {
     }
 }
 
+/// Check vector column exists and has the correct data type.
+fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
+    let field = schema.field_with_name(column).map_err(|_| {
+        Error::io(
+            format!("Query column '{}' not found in input schema", column),
+            location!(),
+        )
+    })?;
+    match field.data_type() {
+        DataType::FixedSizeList(list_field, _)
+            if matches!(
+                list_field.data_type(),
+                DataType::UInt8 | DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) => Ok(()),
+        _ => {
+           Err(Error::io(
+                format!(
+                    "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
+                    column, field.data_type()
+                ),
+                location!(),
+            ))
+        }
+    }
+}
+
 /// [ExecutionPlan] for Flat KNN (bruteforce) search.
 ///
 /// Preconditions:
@@ -159,27 +198,7 @@ impl KNNFlatExec {
     /// Returns an error if the preconditions are not met.
     pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
         let schema = input.schema();
-        let field = schema.field_with_name(&query.column).map_err(|_| {
-            Error::io(
-                format!(
-                    "KNNFlatExec node: query column {} not found in input schema",
-                    query.column
-                ),
-                location!(),
-            )
-        })?;
-        match field.data_type() {
-            DataType::FixedSizeList(list_field, _) if list_field.data_type().is_floating() => {}
-            _ => {
-                return Err(Error::io(
-                    format!(
-                        "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
-                        query.column, field.data_type()
-                    ),
-                    location!(),
-                ));
-            }
-        }
+        check_vector_column(&schema, &query.column)?;
 
         let mut fields = schema.fields().to_vec();
         if schema.field_with_name(DIST_COL).is_err() {
@@ -297,44 +316,7 @@ impl FilterLoader for SelectionVectorToPrefilter {
     }
 }
 
-fn knn_index_stream(
-    query: Query,
-    dataset: Arc<Dataset>,
-    index_meta: Vec<Index>,
-    allow_list_input: Option<Box<dyn FilterLoader>>,
-) -> impl DFRecordBatchStream {
-    let pre_filter = Arc::new(PreFilter::new(
-        dataset.clone(),
-        &index_meta,
-        allow_list_input,
-    ));
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(DIST_COL, DataType::Float32, true),
-        ROW_ID_FIELD.clone(),
-    ]));
-
-    let s = stream::iter(index_meta)
-        .zip(stream::repeat((
-            dataset.clone(),
-            pre_filter.clone(),
-            query.clone(),
-        )))
-        .map(|(idx, (ds, pre_filter, query))| async move {
-            let index = ds
-                .open_vector_index(&query.column, &idx.uuid.to_string())
-                .await?;
-            index.search(&query, pre_filter.clone()).await
-        })
-        .buffer_unordered(num_cpus::get())
-        .map(|r| {
-            r.map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
-        })
-        .boxed();
-    RecordBatchStreamAdapter::new(schema, s)
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PreFilterSource {
     /// The prefilter input is an array of row ids that match the filter condition
     FilteredRowIds(Arc<dyn ExecutionPlan>),
@@ -349,30 +331,257 @@ lazy_static::lazy_static! {
         Field::new(DIST_COL, DataType::Float32, true),
         ROW_ID_FIELD.clone(),
     ]));
+
+    static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new(PART_ID_COLUMN, DataType::List(Field::new("item", DataType::UInt32, false).into()), false),
+        Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
+    ]));
 }
 
-/// [ExecutionPlan] for KNNIndex node.
-#[derive(Debug)]
-pub struct KNNIndexExec {
-    /// Dataset to read from.
+pub fn new_knn_exec(
     dataset: Arc<Dataset>,
-    /// Prefiltering input
+    indices: &[Index],
+    query: &Query,
     prefilter_source: PreFilterSource,
-    /// The index metadata
-    indices: Vec<Index>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let ivf_node = ANNIvfPartitionExec::try_new(
+        dataset.clone(),
+        indices.iter().map(|idx| idx.uuid.to_string()).collect_vec(),
+        query.clone(),
+    )?;
+
+    let sub_index = ANNIvfSubIndexExec::try_new(
+        Arc::new(ivf_node),
+        dataset,
+        Arc::new(indices.to_vec()),
+        query.clone(),
+        prefilter_source,
+    )?;
+
+    Ok(Arc::new(sub_index))
+}
+
+/// [ExecutionPlan] to execute the find the closest IVF partitions.
+///
+/// It searches the partition IDs using the input query.
+///
+/// It allows to search multiple delta indices in parallel, and returns a
+/// single RecordBatch, where each row contains the partition IDs and the delta index
+/// `uuid`:
+///
+/// ```text
+/// {
+///    "__ivf_part_id": List<UInt32>,
+///    "__index_uuid": String,
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ANNIvfPartitionExec {
+    dataset: Arc<Dataset>,
+
     /// The vector query to execute.
     query: Query,
-    /// The datafusion plan properties
+
+    /// The UUIDs of the indices to search.
+    index_uuids: Vec<String>,
+
     properties: PlanProperties,
 }
 
-impl DisplayAs for KNNIndexExec {
+impl ANNIvfPartitionExec {
+    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<String>, query: Query) -> Result<Self> {
+        let dataset_schema = dataset.schema();
+        check_vector_column(&dataset_schema.into(), &query.column)?;
+        if index_uuids.is_empty() {
+            return Err(Error::Execution {
+                message: "ANNIVFPartitionExec node: no index found for query".to_string(),
+                location: location!(),
+            });
+        }
+
+        let schema = KNN_PARTITION_SCHEMA.clone();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::RoundRobinBatch(1),
+            ExecutionMode::Bounded,
+        );
+
+        Ok(Self {
+            dataset,
+            query,
+            index_uuids,
+            properties,
+        })
+    }
+}
+
+impl DisplayAs for ANNIvfPartitionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "KNNIndex: name={}, k={}, deltas={}",
+                    "ANNIvfPartition: uuid={}, nprobes={}, deltas={}",
+                    self.index_uuids[0],
+                    self.query.nprobes,
+                    self.index_uuids.len()
+                )
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for ANNIvfPartitionExec {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        KNN_PARTITION_SCHEMA.clone()
+    }
+
+    fn statistics(&self) -> DataFusionResult<Statistics> {
+        Ok(Statistics {
+            num_rows: Precision::Exact(self.query.nprobes),
+            ..Statistics::new_unknown(self.schema().as_ref())
+        })
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        warn!("ANNIVFPartitionExec: with_new_children called, but no children to replace");
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let query = self.query.clone();
+        let ds = self.dataset.clone();
+
+        let stream = stream::iter(self.index_uuids.clone())
+            .map(move |uuid| {
+                let query = query.clone();
+                let ds = ds.clone();
+
+                async move {
+                    let raw_index = ds.open_vector_index(&query.column, &uuid).await?;
+                    let index = raw_index.as_any().downcast_ref::<IVFIndex>().ok_or(
+                        DataFusionError::Execution(
+                            "ANNIVFPartitionExec: index is not a IVF type".to_string(),
+                        ),
+                    )?;
+
+                    let mut query = query.clone();
+                    if index.metric_type() == DistanceType::Cosine {
+                        let key = normalize_arrow(&query.key)?;
+                        query.key = key;
+                    };
+
+                    let partitions = index.find_partitions(&query).map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to find partitions: {}", e))
+                    })?;
+
+                    let mut list_builder = ListBuilder::new(UInt32Builder::new())
+                        .with_field(Field::new("item", DataType::UInt32, false));
+                    list_builder.append_value(partitions.iter());
+                    let partition_col = list_builder.finish();
+                    let uuid_col = StringArray::from(vec![uuid.as_str()]);
+                    let batch = RecordBatch::try_new(
+                        KNN_PARTITION_SCHEMA.clone(),
+                        vec![Arc::new(partition_col), Arc::new(uuid_col)],
+                    )?;
+                    Ok::<_, DataFusionError>(batch)
+                }
+            })
+            .buffered(self.index_uuids.len());
+        let schema = self.schema();
+        Ok(
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
+                as SendableRecordBatchStream,
+        )
+    }
+}
+
+/// Datafusion [ExecutionPlan] to run search on IVF partitions.
+///
+/// A IVF-{PQ/SQ/HNSW} query plan is:
+///
+/// ```text
+/// AnnSubIndexExec: k=10
+///   AnnPartitionExec: nprobes=20
+/// ```
+#[derive(Debug)]
+pub struct ANNIvfSubIndexExec {
+    /// Inner input source node.
+    input: Arc<dyn ExecutionPlan>,
+
+    dataset: Arc<Dataset>,
+
+    indices: Arc<Vec<Index>>,
+
+    /// Vector Query.
+    query: Query,
+
+    /// Prefiltering input
+    prefilter_source: PreFilterSource,
+
+    /// Datafusion Plan Properties
+    properties: PlanProperties,
+}
+
+impl ANNIvfSubIndexExec {
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        indices: Arc<Vec<Index>>,
+        query: Query,
+        prefilter_source: PreFilterSource,
+    ) -> Result<Self> {
+        if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
+            return Err(Error::Index {
+                message: format!(
+                    "ANNSubIndexExec node: input schema does not have \"{}\" column",
+                    PART_ID_COLUMN
+                ),
+                location: location!(),
+            });
+        }
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            ExecutionMode::Bounded,
+        );
+        Ok(Self {
+            input,
+            dataset,
+            indices,
+            query,
+            prefilter_source,
+            properties,
+        })
+    }
+}
+
+impl DisplayAs for ANNIvfSubIndexExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "ANNSubIndex: name={}, k={}, deltas={}",
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                     self.indices.len()
@@ -382,48 +591,7 @@ impl DisplayAs for KNNIndexExec {
     }
 }
 
-impl KNNIndexExec {
-    /// Create a new [KNNIndexExec].
-    pub fn try_new(
-        dataset: Arc<Dataset>,
-        indices: &[Index],
-        query: &Query,
-        prefilter_source: PreFilterSource,
-    ) -> Result<Self> {
-        if indices.is_empty() {
-            return Err(Error::io(
-                "KNNIndexExec node: no index found for query".to_string(),
-                location!(),
-            ));
-        }
-        let schema = dataset.schema();
-        if schema.field(query.column.as_str()).is_none() {
-            return Err(Error::io(
-                format!(
-                    "KNNIndexExec node: query column {} does not exist in dataset.",
-                    query.column
-                ),
-                location!(),
-            ));
-        };
-
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
-            Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
-        );
-
-        Ok(Self {
-            dataset,
-            indices: indices.to_vec(),
-            query: query.clone(),
-            prefilter_source,
-            properties,
-        })
-    }
-}
-
-impl ExecutionPlan for KNNIndexExec {
+impl ExecutionPlan for ANNIvfSubIndexExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -434,9 +602,9 @@ impl ExecutionPlan for KNNIndexExec {
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
-            PreFilterSource::None => vec![],
-            PreFilterSource::FilteredRowIds(src) => vec![src.clone()],
-            PreFilterSource::ScalarIndexQuery(src) => vec![src.clone()],
+            PreFilterSource::None => vec![self.input.clone()],
+            PreFilterSource::FilteredRowIds(src) => vec![self.input.clone(), src.clone()],
+            PreFilterSource::ScalarIndexQuery(src) => vec![self.input.clone(), src.clone()],
         }
     }
 
@@ -452,30 +620,131 @@ impl ExecutionPlan for KNNIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
-        let prefilter_loader = match &self.prefilter_source {
-            PreFilterSource::FilteredRowIds(src_node) => {
-                let stream = src_node.execute(partition, context)?;
-                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
-            }
-            PreFilterSource::ScalarIndexQuery(src_node) => {
-                let stream = src_node.execute(partition, context)?;
-                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
-            }
-            PreFilterSource::None => None,
-        };
+        let input_stream = self.input.execute(partition, context.clone())?;
 
-        Ok(Box::pin(knn_index_stream(
-            self.query.clone(),
-            self.dataset.clone(),
-            self.indices.clone(),
-            prefilter_loader,
+        let schema = self.schema();
+        let query = self.query.clone();
+        let ds = self.dataset.clone();
+        let column = self.query.column.clone();
+        let indices = self.indices.clone();
+        let prefilter_source = self.prefilter_source.clone();
+
+        // Per-delta-index stream:
+        //   Stream<(parttitions, index uuid)>
+        let per_index_stream = input_stream
+            .and_then(move |batch| {
+                let part_id_col = batch
+                    .column_by_name(PART_ID_COLUMN)
+                    .expect("ANNSubIndexExec: input missing part_id column");
+                let part_id_arr = part_id_col.as_list::<i32>().clone();
+                let index_uuid_col = batch
+                    .column_by_name(INDEX_UUID_COLUMN)
+                    .expect("ANNSubIndexExec: input missing index_uuid column");
+                let index_uuid = index_uuid_col.as_string::<i32>().clone();
+
+                let plan = part_id_arr
+                    .iter()
+                    .zip(index_uuid.iter())
+                    .map(|(part_id, uuid)| {
+                        // TODO: eliminate exceesive copying here to fight with lifetime.
+                        let partitions = part_id
+                            .unwrap()
+                            .as_primitive::<UInt32Type>()
+                            .values()
+                            .to_vec();
+                        let uuid = uuid.unwrap().to_string();
+                        Ok((partitions, uuid))
+                    })
+                    .collect_vec();
+                async move { Ok(stream::iter(plan)) }
+            })
+            .try_flatten();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            per_index_stream
+                .and_then(move |(part_ids, index_uuid)| {
+                    let ds = ds.clone();
+                    let column = column.clone();
+                    let indices = indices.clone();
+                    let context = context.clone();
+                    let prefilter_source = prefilter_source.clone();
+
+                    let index_meta = indices
+                        .iter()
+                        .find(|idx| idx.uuid.to_string() == index_uuid)
+                        .unwrap()
+                        .clone();
+
+                    async move {
+                        let prefilter_loader = match &prefilter_source {
+                            PreFilterSource::FilteredRowIds(src_node) => {
+                                let stream = src_node.execute(partition, context.clone())?;
+                                Some(Box::new(FilteredRowIdsToPrefilter(stream))
+                                    as Box<dyn FilterLoader>)
+                            }
+                            PreFilterSource::ScalarIndexQuery(src_node) => {
+                                let stream = src_node.execute(partition, context.clone())?;
+                                Some(Box::new(SelectionVectorToPrefilter(stream))
+                                    as Box<dyn FilterLoader>)
+                            }
+                            PreFilterSource::None => None,
+                        };
+                        let pre_filter = Arc::new(DatasetPreFilter::new(
+                            ds.clone(),
+                            &[index_meta],
+                            prefilter_loader,
+                        ));
+
+                        let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
+
+                        Ok::<_, DataFusionError>(
+                            stream::iter(part_ids)
+                                .zip(repeat_with(move || (raw_index.clone(), pre_filter.clone())))
+                                .map(Ok::<_, DataFusionError>),
+                        )
+                    }
+                })
+                .try_flatten()
+                .map(move |result| {
+                    let query = query.clone();
+                    async move {
+                        let (part_id, (raw_index, pre_filter)) = result?;
+
+                        let index = raw_index.as_any().downcast_ref::<IVFIndex>().ok_or(
+                            DataFusionError::Execution(
+                                "ANNSubIndexExec: sub-index is not a IVF type".to_string(),
+                            ),
+                        )?;
+
+                        let mut query = query.clone();
+                        if index.metric_type() == DistanceType::Cosine {
+                            let key = normalize_arrow(&query.key)?;
+                            query.key = key;
+                        };
+
+                        index
+                            .search_in_partition(part_id as usize, &query, pre_filter)
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to calculate KNN: {}",
+                                    e
+                                ))
+                            })
+                            .await
+                    }
+                })
+                .buffered(num_cpus::get())
+                .boxed(),
         )))
     }
 
     fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
         Ok(Statistics {
             num_rows: Precision::Exact(
-                self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+                self.query.k
+                    * self.query.refine_factor.unwrap_or(1) as usize
+                    * self.input.statistics()?.num_rows.get_value().unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         })

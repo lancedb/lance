@@ -53,16 +53,18 @@ macro_rules! ok_or_throw_with_return {
 mod blocking_dataset;
 mod blocking_scanner;
 pub mod error;
-mod ffi;
+pub mod ffi;
 mod fragment;
-mod traits;
-mod utils;
+pub mod traits;
+pub mod utils;
+pub use error::Error;
 pub use error::Result;
+pub use ffi::JNIEnvExt;
 
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
+    pub static ref RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
