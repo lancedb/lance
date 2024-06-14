@@ -101,7 +101,7 @@ pub(super) async fn build_hnsw_partitions(
     metric_type: MetricType,
     hnsw_params: &HnswBuildParams,
     part_range: Range<u32>,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
@@ -120,13 +120,6 @@ pub(super) async fn build_hnsw_partitions(
         });
     }
 
-    if metric_type == MetricType::Dot {
-        return Err(Error::Index {
-            message: "HNSW index does not support dot product distance".to_string(),
-            location: location!(),
-        });
-    }
-
     let ivf_model = lance_index::vector::ivf::new_ivf_with_quantizer(
         ivf.centroids.clone(),
         metric_type,
@@ -139,7 +132,7 @@ pub(super) async fn build_hnsw_partitions(
         data,
         column,
         ivf_model.into(),
-        precomputed_partitons,
+        precomputed_partitions,
         ivf.num_partitions() as u32,
         shuffle_partition_batches,
         shuffle_partition_concurrency,
