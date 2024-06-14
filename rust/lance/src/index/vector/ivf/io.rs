@@ -20,7 +20,7 @@ use lance_core::Error;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
-use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
+use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizer;
@@ -413,7 +413,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         ivf.add_partition(offset, (writer.len() - offset) as u32);
         hnsw_metadata.push(serde_json::from_str(
-            part_reader.schema().metadata[HNSW_METADATA_KEY].as_str(),
+            part_reader.schema().metadata[HNSW::metadata_key()].as_str(),
         )?);
         std::mem::drop(part_reader);
         object_store.delete(part_file).await?;

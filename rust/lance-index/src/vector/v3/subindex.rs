@@ -9,9 +9,6 @@ use lance_core::Result;
 
 use crate::vector::storage::VectorStore;
 use crate::{prefilter::PreFilter, vector::Query};
-
-pub const SUB_INDEX_METADATA_KEY: &str = "sub_index_metadata";
-
 /// A sub index for IVF index
 pub trait IvfSubIndex: Send + Sync + DeepSizeOf {
     type QueryParams: Send + Sync + for<'a> From<&'a Query>;
@@ -25,6 +22,8 @@ pub trait IvfSubIndex: Send + Sync + DeepSizeOf {
     fn use_residual() -> bool;
 
     fn name() -> &'static str;
+
+    fn metadata_key() -> &'static str;
 
     /// Return the schema of the sub index
     fn schema() -> arrow_schema::SchemaRef;

@@ -38,11 +38,9 @@ use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
-use crate::vector::v3::subindex::{IvfSubIndex, SUB_INDEX_METADATA_KEY};
+use crate::vector::v3::subindex::IvfSubIndex;
 use crate::vector::{Query, DIST_COL, VECTOR_RESULT_SCHEMA};
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
-
-pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
@@ -537,9 +535,9 @@ impl IvfSubIndex for HNSW {
         let hnsw_metadata = data
             .schema_ref()
             .metadata()
-            .get(SUB_INDEX_METADATA_KEY)
+            .get(Self::metadata_key())
             .ok_or(Error::Index {
-                message: format!("{} not found", HNSW_METADATA_KEY),
+                message: format!("{} not found", Self::metadata_key()),
                 location: location!(),
             })?;
         let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata).unwrap_or_default();
@@ -605,6 +603,10 @@ impl IvfSubIndex for HNSW {
 
     fn name() -> &'static str {
         HNSW_TYPE
+    }
+
+    fn metadata_key() -> &'static str {
+        "lance:hnsw"
     }
 
     /// Return the schema of the sub index
@@ -752,10 +754,10 @@ impl IvfSubIndex for HNSW {
             .clone()
             .with_metadata(HashMap::from_iter(vec![
                 (
-                    INDEX_METADATA_SCHEMA_KEY.to_string(),
+                    INDEX_METADATA_SCHEMA_KEY.to_owned(),
                     index_metadata.to_string(),
                 ),
-                (SUB_INDEX_METADATA_KEY.to_string(), metadata),
+                (Self::metadata_key().to_owned(), metadata),
             ]));
         let batch = concat_batches(&Self::schema(), batches.iter())?;
         let batch = batch.with_schema(Arc::new(schema))?;

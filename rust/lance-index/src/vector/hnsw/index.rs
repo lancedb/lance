@@ -22,7 +22,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::prefilter::PreFilter;
-use crate::vector::v3::subindex::{IvfSubIndex, SUB_INDEX_METADATA_KEY};
+use crate::vector::v3::subindex::IvfSubIndex;
 use crate::{
     vector::{
         graph::NEIGHBORS_FIELD,
@@ -241,7 +241,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             .await?;
         let mut schema = batch.schema_ref().as_ref().clone();
         schema.metadata.insert(
-            SUB_INDEX_METADATA_KEY.to_string(),
+            HNSW::metadata_key().to_owned(),
             serde_json::to_string(&metadata)?,
         );
         let batch = batch.with_schema(schema.into())?;

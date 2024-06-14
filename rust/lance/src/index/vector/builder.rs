@@ -11,7 +11,6 @@ use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_index::vector::quantizer::QuantizerBuildParams;
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
-use lance_index::vector::v3::subindex::SUB_INDEX_METADATA_KEY;
 use lance_index::{
     pb,
     vector::{
@@ -130,7 +129,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         }
 
         // step 4. merge all partitions
-        self.merge_partitions(ivf.centroids, partition_sizes)
+        self.merge_partitions(ivf.centroids, quantizer, partition_sizes)
             .await?;
 
         Ok(())
@@ -277,6 +276,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
     async fn merge_partitions(
         &self,
         centroids: FixedSizeListArray,
+        quantizer: Q,
         partition_sizes: Vec<(usize, usize)>,
     ) -> Result<()> {
         // prepare the final writers
@@ -299,7 +299,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
             if storage_size == 0 {
                 storage_ivf.add_partition(0);
-                partition_storage_metadata.push(String::new());
+                partition_storage_metadata.push(quantizer.metadata(None)?.to_string());
             } else {
                 let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
                 let reader = FileReader::try_open(
@@ -365,7 +365,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
                     reader
                         .schema()
                         .metadata
-                        .get(SUB_INDEX_METADATA_KEY)
+                        .get(S::metadata_key())
                         .cloned()
                         .unwrap_or_default(),
                 );
@@ -398,7 +398,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
             .await?;
         index_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         index_writer.add_schema_metadata(
-            SUB_INDEX_METADATA_KEY,
+            S::metadata_key(),
             serde_json::to_string(&partition_index_metadata)?,
         );
 

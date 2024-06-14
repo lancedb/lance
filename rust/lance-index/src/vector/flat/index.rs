@@ -62,6 +62,10 @@ impl IvfSubIndex for FlatIndex {
         "FLAT"
     }
 
+    fn metadata_key() -> &'static str {
+        "lance:flat"
+    }
+
     fn schema() -> arrow_schema::SchemaRef {
         Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
     }

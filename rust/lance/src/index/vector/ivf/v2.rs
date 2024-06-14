@@ -24,8 +24,6 @@ use lance_arrow::RecordBatchExt;
 use lance_core::{cache::DEFAULT_INDEX_CACHE_SIZE, Error, Result};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::reader::FileReader;
-use lance_index::vector::v3::subindex::SUB_INDEX_METADATA_KEY;
-use lance_index::vector::VECTOR_RESULT_SCHEMA;
 use lance_index::{
     pb,
     vector::{
@@ -135,9 +133,9 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
         let sub_index_metadata = index_reader
             .schema()
             .metadata
-            .get(SUB_INDEX_METADATA_KEY)
+            .get(I::metadata_key())
             .ok_or(Error::Index {
-                message: format!("{} not found", SUB_INDEX_METADATA_KEY),
+                message: format!("{} not found", I::metadata_key()),
                 location: location!(),
             })?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
@@ -206,7 +204,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
                 }
             };
             let batch = batch.add_metadata(
-                SUB_INDEX_METADATA_KEY.to_owned(),
+                I::metadata_key().to_owned(),
                 self.sub_index_metadata[partition_id].clone(),
             )?;
             let idx = Arc::new(I::load(batch)?);
@@ -333,18 +331,13 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         query: &Query,
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
-        match self.ivf.lengths[partition_id] {
-            0 => Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone())),
-            _ => {
-                let part_index = self.load_partition(partition_id, true).await?;
+        let part_index = self.load_partition(partition_id, true).await?;
 
-                let query = self.preprocess_query(partition_id, query)?;
-                let storage = self.storage.load_partition::<Q>(partition_id).await?;
-                let param = (&query).into();
-                pre_filter.wait_for_ready().await?;
-                part_index.search(query.key, query.k, param, &storage, pre_filter)
-            }
-        }
+        let query = self.preprocess_query(partition_id, query)?;
+        let storage = self.storage.load_partition::<Q>(partition_id).await?;
+        let param = (&query).into();
+        pre_filter.wait_for_ready().await?;
+        part_index.search(query.key, query.k, param, &storage, pre_filter)
     }
 
     fn is_loadable(&self) -> bool {
