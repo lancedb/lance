@@ -94,7 +94,7 @@ mod kernel {
     extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
         pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
@@ -111,7 +111,7 @@ impl Dot for f16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_suppport = "avx512",
+                kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512 => unsafe {
@@ -186,6 +186,17 @@ impl Dot for f64 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         dot_scalar::<Self, Self, 8>(x, y) as f32
+    }
+}
+
+impl Dot for u8 {
+    #[inline]
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
+        // TODO: this is not optimized for auto vectorization yet.
+        x.iter()
+            .zip(y.iter())
+            .map(|(&x_i, &y_i)| x_i as u32 * y_i as u32)
+            .sum::<u32>() as f32
     }
 }
 

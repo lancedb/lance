@@ -2574,8 +2574,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_create_ivf_hnsw_sq() {
+    async fn test_create_ivf_hnsw_sq(distance_type: DistanceType) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2586,7 +2585,7 @@ mod tests {
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::Cosine,
+            distance_type,
             ivf_params,
             hnsw_params,
             sq_params,
@@ -2635,7 +2634,7 @@ mod tests {
             .to_vec();
 
         let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, DistanceType::Cosine);
+        let gt = ground_truth(&mat, query.values(), k, distance_type);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
@@ -2648,6 +2647,16 @@ mod tests {
             results,
             gt,
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq_cosine() {
+        test_create_ivf_hnsw_sq(DistanceType::Cosine).await
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq_dot() {
+        test_create_ivf_hnsw_sq(DistanceType::Dot).await
     }
 
     #[tokio::test]
