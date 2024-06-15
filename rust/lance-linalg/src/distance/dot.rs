@@ -111,7 +111,7 @@ impl Dot for f16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_suppport = "avx512",
+                kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512 => unsafe {
