@@ -94,7 +94,7 @@ mod kernel {
     extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
         pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
