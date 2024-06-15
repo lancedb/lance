@@ -1250,6 +1250,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_cache_size: Optional[int] = None,
         shuffle_partition_batches: Optional[int] = None,
         shuffle_partition_concurrency: Optional[int] = None,
+        # experimental parameters
+        ivf_centroids_file: Optional[str] = None,
+        precomputed_partiton_dataset: Optional[str] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1427,6 +1430,20 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Only {valid_index_types} index types supported. " f"Got {index_type}"
             )
         if index_type.startswith("IVF"):
+            if (ivf_centroids is not None) and (ivf_centroids_file is not None):
+                raise ValueError(
+                    "ivf_centroids and ivf_centroids_file"
+                    " cannot be provided at the same time"
+                )
+
+            if ivf_centroids_file is not None:
+                from pyarrow.fs import FileSystem
+
+                fs, path = FileSystem.from_uri(ivf_centroids_file)
+                with fs.open_input_file(path) as f:
+                    ivf_centroids = np.load(f)
+                num_partitions = ivf_centroids.shape[0]
+
             if num_partitions is None:
                 raise ValueError(
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
@@ -1439,6 +1456,24 @@ class LanceDataset(pa.dataset.Dataset):
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
             kwargs["num_partitions"] = num_partitions
+
+            if (precomputed_partiton_dataset is not None) and (ivf_centroids is None):
+                raise ValueError(
+                    "ivf_centroids must be provided when"
+                    " precomputed_partiton_dataset is provided"
+                )
+            if precomputed_partiton_dataset is not None:
+                precomputed_ds = LanceDataset(precomputed_partiton_dataset)
+                if len(precomputed_ds.get_fragments()) != 1:
+                    raise ValueError(
+                        "precomputed_partiton_dataset must have only one fragment"
+                    )
+                files = precomputed_ds.get_fragments()[0].data_files()
+                if len(files) != 1:
+                    raise ValueError(
+                        "precomputed_partiton_dataset must have only one files"
+                    )
+                kwargs["precomputed_partitions_file"] = precomputed_partiton_dataset
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids

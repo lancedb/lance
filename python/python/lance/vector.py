@@ -275,4 +275,6 @@ def compute_partitions(
     files = ds.get_fragments()[0].data_files()
     assert len(files) == 1
 
+    logging.info("Saved recomputed partitions to %s", spill_uri.absolute())
+
     return str(spill_uri)
