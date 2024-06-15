@@ -309,6 +309,11 @@ impl Dataset {
         .await
     }
 
+    /// Check out the specified tagged version of this dataset
+    pub async fn checkout_tag(&self, tag: String) -> Result<Self> {
+        !unimplemented!("not implemented yet")
+    }
+
     async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
@@ -1084,6 +1089,22 @@ impl Dataset {
             .await
     }
 
+    pub async fn create_tag(&mut self, tag: &str, version: u64) -> Result<()> {
+        let versions = self.versions().await;
+        if !versions?.iter().any(|v| v.version == version) {
+            return Err(Error::VersionNotFound {
+                message: format!("version {} does not exist", version),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn delete_tag(&mut self, tag: &str) -> Result<()> {
+        Err(Error::TagNotFound {
+            message: format!("tag {} does not exist", tag),
+        })
+    }
+
     pub(crate) fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
@@ -1143,6 +1164,11 @@ impl Dataset {
         versions.sort_by_key(|v| v.version);
 
         Ok(versions)
+    }
+
+    /// Get all tags.
+    pub async fn tags(&self) -> Result<HashMap<String, u64>> {
+        Ok(HashMap::<String, u64>::new())
     }
 
     /// Get the latest version of the dataset
@@ -2845,6 +2871,61 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(dataset.count_fragments(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_tag(#[values(false, true)] use_legacy_format: bool) {
+        // TODO: use a fixture instead to share table creation with test_restore?
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                use_legacy_format,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.version, 1);
+        let original_manifest = dataset.manifest.clone();
+
+        // delete some rows
+        dataset.delete("i > 50").await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        assert_eq!(dataset.tags().await.unwrap().len(), 0);
+
+        let bad_tag_creation = dataset.create_tag("v3", 3).await;
+        assert_eq!(
+            bad_tag_creation.err().unwrap().to_string(),
+            "Version not found error: version 3 does not exist"
+        );
+
+        let bad_tag_deletion = dataset.delete_tag("v3").await;
+        assert_eq!(
+            bad_tag_deletion.err().unwrap().to_string(),
+            "Tag not found error: tag v3 does not exist"
+        );
+
+        dataset.create_tag("v1", 1).await;
+
+        // assert_eq!(dataset.tags().await.unwrap().len(), 1);
     }
 
     #[rstest]

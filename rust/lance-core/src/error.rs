@@ -84,6 +84,10 @@ pub enum Error {
     Cloned { message: String, location: Location },
     #[snafu(display("Query Execution error: {message}, {location}"))]
     Execution { message: String, location: Location },
+    #[snafu(display("Tag not found error: {message}"))]
+    TagNotFound { message: String },
+    #[snafu(display("Version not found error: {message}"))]
+    VersionNotFound { message: String },
 }
 
 impl Error {
