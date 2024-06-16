@@ -14,7 +14,7 @@ use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_table::format::{DataFile, Fragment};
+use lance_table::format::{pb, DataFile, Fragment};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -26,6 +26,7 @@ use crate::Dataset;
 
 use super::builder::DatasetBuilder;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
+use super::refs::Refs;
 use super::DATA_DIR;
 
 pub mod merge_insert;
@@ -267,6 +268,20 @@ pub async fn write_fragments_internal(
     }
 
     Ok(fragments)
+}
+
+pub async fn write_new_refs_file(
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    mut params: WriteParams,
+) -> Result<()> {
+    let path = base_dir.child("_refs");
+
+    let message = pb::Refs::from(Refs::new());
+    let buf = message.encode_to_vec();
+    object_store.inner.put(&path, buf.into()).await?;
+
+    Ok(())
 }
 
 #[async_trait::async_trait]

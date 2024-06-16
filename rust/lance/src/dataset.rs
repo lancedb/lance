@@ -55,7 +55,7 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
-use self::write::write_fragments_internal;
+use self::write::{write_fragments_internal, write_new_refs_file};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
@@ -490,6 +490,11 @@ impl Dataset {
         }
 
         let object_store = Arc::new(object_store);
+
+        if matches!(params.mode, WriteMode::Create) {
+            write_new_refs_file(object_store.clone(), &base, params.clone()).await?;
+        }
+
         let fragments = write_fragments_internal(
             dataset.as_ref(),
             object_store.clone(),
