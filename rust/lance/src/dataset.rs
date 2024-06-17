@@ -11,7 +11,7 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -1233,6 +1233,17 @@ impl Dataset {
     /// then call `cleanup_files` to remove the old files.
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
         schema_evolution::drop_columns(self, columns).await
+    }
+}
+
+#[async_trait::async_trait]
+impl DatasetTakeRows for Dataset {
+    fn schema(&self) -> &Schema {
+        Self::schema(self)
+    }
+
+    async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
+        Self::take_rows(self, row_ids, projection).await
     }
 }
 

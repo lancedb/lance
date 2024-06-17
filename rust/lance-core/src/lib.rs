@@ -4,6 +4,7 @@
 use arrow_schema::{DataType, Field as ArrowField};
 
 pub mod cache;
+pub mod traits;
 pub mod datatypes;
 pub mod error;
 pub mod utils;
