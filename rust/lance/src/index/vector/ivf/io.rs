@@ -564,6 +564,7 @@ mod tests {
     use super::*;
 
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
+    use crate::Dataset;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
     use lance_index::IndexType;
