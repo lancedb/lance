@@ -678,7 +678,7 @@ impl CommitHandler for RenameCommitHandler {
         // Write the manifest to the temporary path
         manifest_writer(object_store, manifest, indices, &tmp_path).await?;
 
-        let res = match object_store.rename_if_not_exists(&tmp_path, &path).await {
+        let res = match dbg!(object_store.rename_if_not_exists(&tmp_path, &path).await) {
             Ok(_) => Ok(()),
             Err(ObjectStoreError::AlreadyExists { .. }) => {
                 // Another transaction has already been committed

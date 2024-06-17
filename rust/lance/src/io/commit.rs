@@ -378,8 +378,10 @@ pub(crate) async fn commit_transaction(
     // First, get all transactions since read_version
     let mut other_transactions = Vec::new();
     let mut version = transaction.read_version;
+    println!("Read version: {}", version);
     loop {
         version += 1;
+        println!("Trying version {}", version);
         match dataset.checkout_version(version).await {
             Ok(next_dataset) => {
                 let other_txn = if let Some(txn_file) = &next_dataset.manifest.transaction_file {
@@ -391,6 +393,7 @@ pub(crate) async fn commit_transaction(
                 dataset = next_dataset;
             }
             Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. }) => {
+                println!("Not found!");
                 break;
             }
             Err(e) => {
@@ -402,6 +405,7 @@ pub(crate) async fn commit_transaction(
     let mut target_version = version;
 
     // If any of them conflict with the transaction, return an error
+    println!("Checking other versions");
     for (version_offset, other_transaction) in other_transactions.iter().enumerate() {
         let other_version = transaction.read_version + version_offset as u64 + 1;
         check_transaction(transaction, other_version, other_transaction)?;

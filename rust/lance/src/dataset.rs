@@ -287,7 +287,9 @@ impl Dataset {
             path: manifest_file,
             size: None,
         };
+        println!("Loading manifest from {:?}", manifest_location);
         let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
+        println!("Checking out manifest from {:?}", manifest_location);
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
