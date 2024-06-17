@@ -7,3 +7,4 @@ Examples
    Creating text dataset for LLM training using Lance <./llm_dataset_creation.rst>
    Training LLMs using a Lance text dataset <./llm_training.rst>
    Reading and writing a Lance dataset in Rust <./write_read_dataset.rst>
+   Training Multi-Modal models using a Lance dataset <./clip_training.rst>
