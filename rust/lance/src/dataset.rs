@@ -11,7 +11,7 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -451,6 +451,9 @@ impl Dataset {
                     &m.schema,
                     &SchemaCompareOptions {
                         compare_dictionary: true,
+                        // array nullability is checked later, using actual data instead
+                        // of the schema
+                        compare_nullability: NullabilityComparison::Ignore,
                         ..Default::default()
                     },
                 )?;
