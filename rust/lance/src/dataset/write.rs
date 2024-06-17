@@ -9,15 +9,17 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
+use lance_file::format::{pbrefsfile, MAJOR_VERSION, MINOR_VERSION_NEXT};
+use lance_file::refs::Refs;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_table::format::{pb, DataFile, Fragment};
+use lance_table::format::{DataFile, Fragment};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
+use prost::Message;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -26,7 +28,6 @@ use crate::Dataset;
 
 use super::builder::DatasetBuilder;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
-use super::refs::Refs;
 use super::DATA_DIR;
 
 pub mod merge_insert;
@@ -277,7 +278,7 @@ pub async fn write_new_refs_file(
 ) -> Result<()> {
     let path = base_dir.child("_refs");
 
-    let message = pb::Refs::from(Refs::new());
+    let message = pbrefsfile::Refs::from(&Refs::new());
     let buf = message.encode_to_vec();
     object_store.inner.put(&path, buf.into()).await?;
 

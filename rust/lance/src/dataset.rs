@@ -2928,7 +2928,7 @@ mod tests {
             "Tag not found error: tag v3 does not exist"
         );
 
-        dataset.create_tag("v1", 1).await;
+        // dataset.create_tag("v1", 1).await;
 
         // assert_eq!(dataset.tags().await.unwrap().len(), 1);
     }

@@ -940,7 +940,7 @@ impl Dataset {
         })
     }
 
-    fn tags(self_: PyRef<'_, Self>) -> PyDict {
+    fn tags(self_: PyRef<'_, Self>) -> PyObject {
         unimplemented!("not implemented yet");
     }
 
