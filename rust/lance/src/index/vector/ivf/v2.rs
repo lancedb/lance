@@ -24,6 +24,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::{cache::DEFAULT_INDEX_CACHE_SIZE, Error, Result};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::reader::FileReader;
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::{
     pb,
     vector::{
@@ -44,19 +45,20 @@ use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tracing::instrument;
 
+use crate::index::vector::builder::IvfIndexBuilder;
 use crate::{
     index::{vector::VectorIndex, PreFilter},
     session::Session,
 };
 
-use super::{centroids_to_vectors, Ivf, IvfIndexPartitionStatistics, IvfIndexStatistics};
+use super::{centroids_to_vectors, IvfIndexPartitionStatistics, IvfIndexStatistics};
 /// IVF Index.
 #[derive(Debug)]
 pub struct IVFIndex<I: IvfSubIndex + 'static, Q: Quantization> {
     uuid: String,
 
     /// Ivf model
-    ivf: Ivf,
+    ivf: IvfModel,
 
     reader: FileReader,
     sub_index_metadata: Vec<String>,
@@ -173,19 +175,17 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
         let part_index = if let Some(part_idx) = self.sub_index_cache.get(&cache_key) {
             part_idx
         } else {
-            if partition_id >= self.ivf.lengths.len() {
+            if partition_id >= self.ivf.num_partitions() {
                 return Err(Error::Index {
                     message: format!(
                         "partition id {} is out of range of {} partitions",
                         partition_id,
-                        self.ivf.lengths.len()
+                        self.ivf.num_partitions()
                     ),
                     location: location!(),
                 });
             }
 
-            let offset = self.ivf.offsets[partition_id];
-            let length = self.ivf.lengths[partition_id] as usize;
             let schema = Arc::new(self.reader.schema().as_ref().into());
             let batch = match length {
                 0 => RecordBatch::new_empty(schema),
@@ -193,7 +193,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
                     let batches = self
                         .reader
                         .read_stream(
-                            ReadBatchParams::Range(offset..offset + length),
+                            ReadBatchParams::Range(self.ivf.row_range(partition_id)),
                             u32::MAX,
                             1,
                             FilterExpression::no_filter(),
@@ -242,16 +242,19 @@ impl<I: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<I, 
         self
     }
 
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Ok(self)
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::Vector
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        let partitions_statistics = self
-            .ivf
-            .lengths
-            .iter()
-            .map(|&len| IvfIndexPartitionStatistics { size: len })
+        let partitions_statistics = (0..self.ivf.num_partitions())
+            .map(|&part_id| IvfIndexPartitionStatistics {
+                size: self.ivf.partition_size(part_id),
+            })
             .collect::<Vec<_>>();
 
         let centroid_vecs = centroids_to_vectors(&self.ivf.centroids)?;
@@ -325,6 +328,19 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         self.ivf.find_partitions(&query.key, query.nprobes, dt)
     }
 
+    // async fn append(&self, batches: Vec<RecordBatch>) -> Result<()> {
+    //     IvfIndexBuilder::new(
+    //         dataset,
+    //         column,
+    //         index_dir,
+    //         distance_type,
+    //         shuffler,
+    //         ivf_params,
+    //         sub_index_params,
+    //         quantizer_params,
+    //     )
+    // }
+
     async fn search_in_partition(
         &self,
         partition_id: usize,
@@ -383,6 +399,10 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
 
     fn metric_type(&self) -> DistanceType {
         self.distance_type
+    }
+
+    fn ivf_model(&self) -> pb::IvfModel {
+        self.ivf.clone().into()
     }
 }
 

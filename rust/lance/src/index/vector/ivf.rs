@@ -30,7 +30,12 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
+use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::quantizer::QuantizationType;
+use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::IvfSubIndex;
+use lance_index::vector::SubIndexType;
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
@@ -38,7 +43,7 @@ use lance_index::{
         ivf::{
             builder::load_precomputed_partitions,
             shuffler::shuffle_dataset,
-            storage::{IvfData, IVF_PARTITION_KEY},
+            storage::{Ivf, IVF_PARTITION_KEY},
             IvfBuildParams,
         },
         pq::{PQBuildParams, ProductQuantizer},
@@ -75,6 +80,7 @@ use uuid::Uuid;
 
 use self::io::write_hnsw_quantization_index_partitions;
 
+use super::builder::IvfIndexBuilder;
 use super::{
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
@@ -249,9 +255,105 @@ pub(crate) async fn optimize_vector_indices(
         .as_any()
         .downcast_ref::<IVFIndex>()
         .ok_or(Error::Index {
-            message: "optimizing vector index: first index is not IVF".to_string(),
+            message: "optimizing vector index: the first index isn't IVF".to_string(),
             location: location!(),
         })?;
+
+    let merged = if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
+        optimize_ivf_pq_indices(
+            first_idx,
+            pq_index,
+            vector_column,
+            unindexed,
+            existing_indices,
+            options,
+            writer,
+            dataset.version().version,
+        )
+        .await?
+    } else if let Some(hnsw_sq) = first_idx
+        .sub_index
+        .as_any()
+        .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
+    {
+        let aux_file = dataset
+            .indices_dir()
+            .child(new_uuid.to_string())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        let aux_writer = object_store.create(&aux_file).await?;
+        optimize_ivf_hnsw_indices(
+            dataset,
+            first_idx,
+            hnsw_sq,
+            vector_column,
+            unindexed,
+            existing_indices,
+            options,
+            writer,
+            aux_writer,
+        )
+        .await?
+    } else {
+        return Err(Error::Index {
+            message: "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
+            location: location!(),
+        });
+    };
+
+    Ok((new_uuid, merged))
+}
+
+pub(crate) async fn optimize_vector_indices_v2(
+    dataset: &Dataset,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    vector_column: &str,
+    existing_indices: &[Arc<dyn Index>],
+    options: &OptimizeOptions,
+) -> Result<(Uuid, usize)> {
+    // Senity check the indices
+    if existing_indices.is_empty() {
+        return Err(Error::Index {
+            message: "optimizing vector index: no existing index found".to_string(),
+            location: location!(),
+        });
+    }
+    let existing_indices = existing_indices
+        .into_iter()
+        .map(|idx| idx.as_vector_index())
+        .collect::<Result<Vec<_>>>()?;
+
+    let new_uuid = Uuid::new_v4();
+    let object_store = dataset.object_store();
+    let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+    let ivf_model = existing_indices[0].ivf_model();
+    let quantizer = existing_indices[0].quantizer();
+    let distance_type = existing_indices[0].metric_type();
+    let num_partitions = existing_indices[0].num_partitions();
+
+    let temp_dir = tempfile::tempdir()?;
+    let temp_dir = temp_dir.path().to_str().unwrap().into();
+    let shuffler = IvfShuffler::new(object_store, temp_dir, num_partitions);
+    match existing_indices[0].index_type() {
+        (SubIndexType::Flat, QuantizationType::Flat) => {
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                None,
+                None,
+                (),
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.into())
+            .shuffle_data()
+        }
+
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {}
+    }
+
+    let first_idx = existing_indices[0];
 
     let merged = if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
         optimize_ivf_pq_indices(
@@ -312,7 +414,7 @@ async fn optimize_ivf_pq_indices(
     let dim = first_idx.ivf.dimension();
 
     // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
-    let ivf = lance_index::vector::ivf::Ivf::with_pq(
+    let ivf = lance_index::vector::ivf::IvfTransformer::with_pq(
         first_idx.ivf.centroids.clone(),
         metric_type,
         vector_column,
@@ -392,7 +494,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 ) -> Result<usize> {
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
-    let ivf = lance_index::vector::ivf::new_ivf_with_quantizer(
+    let ivf = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
         first_idx.ivf.centroids.clone(),
         distance_type,
         vector_column,
@@ -401,7 +503,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     )?;
 
     // Shuffled un-indexed data with partition.
-    let shuffled = if let Some(stream) = unindexed {
+    let unindexed_data = if let Some(stream) = unindexed {
         Some(
             shuffle_dataset(
                 stream,
@@ -521,7 +623,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         Some(&mut aux_writer),
         &mut ivf_mut,
         quantizer,
-        shuffled,
+        unindexed_data,
         Some(&indices_to_merge),
     )
     .await?;
@@ -530,12 +632,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let hnsw_metadata_json = json!(hnsw_metadata);
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
-    // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::with_centroids(Arc::new(ivf_mut.centroids.clone()));
-    for length in ivf_mut.lengths {
-        ivf_data.add_partition(length);
-    }
-    ivf_data.write(&mut writer).await?;
+    ivf_mut.write(&mut writer).await?;
     writer.finish().await?;
 
     // Write the aux file
@@ -607,6 +704,10 @@ impl Index for IVFIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Ok(self)
     }
 
     fn index_type(&self) -> IndexType {
@@ -833,112 +934,6 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 },
             })),
         })
-    }
-}
-/// Ivf Model
-#[derive(Debug, Clone)]
-pub(crate) struct Ivf {
-    /// Centroids of each partition.
-    ///
-    /// It is a 2-D `(num_partitions * dimension)` of vector array.
-    pub(crate) centroids: FixedSizeListArray,
-
-    /// Offset of each partition in the file.
-    offsets: Vec<usize>,
-
-    /// Number of vectors in each partition.
-    lengths: Vec<u32>,
-}
-
-impl Ivf {
-    pub(super) fn new(centroids: FixedSizeListArray) -> Self {
-        Self {
-            centroids,
-            offsets: vec![],
-            lengths: vec![],
-        }
-    }
-
-    /// Ivf model dimension.
-    pub(super) fn dimension(&self) -> usize {
-        self.centroids.value_length() as usize
-    }
-
-    /// Number of IVF partitions.
-    fn num_partitions(&self) -> usize {
-        self.centroids.len()
-    }
-
-    /// Use the query vector to find `nprobes` closest partitions.
-    fn find_partitions(
-        &self,
-        query: &dyn Array,
-        nprobes: usize,
-        metric_type: MetricType,
-    ) -> Result<UInt32Array> {
-        let internal =
-            lance_index::vector::ivf::new_ivf(self.centroids.clone(), metric_type, vec![]);
-        internal.find_partitions(query, nprobes)
-    }
-
-    /// Add the offset and length of one partition.
-    pub(super) fn add_partition(&mut self, offset: usize, len: u32) {
-        self.offsets.push(offset);
-        self.lengths.push(len);
-    }
-}
-
-/// Convert IvfModel to protobuf.
-impl TryFrom<&Ivf> for pb::Ivf {
-    type Error = Error;
-
-    fn try_from(ivf: &Ivf) -> Result<Self> {
-        if ivf.offsets.len() != ivf.centroids.len() {
-            return Err(Error::io(
-                "Ivf model has not been populated".to_string(),
-                location!(),
-            ));
-        }
-        Ok(Self {
-            centroids: vec![],
-            offsets: ivf.offsets.iter().map(|o| *o as u64).collect(),
-            lengths: ivf.lengths.clone(),
-            centroids_tensor: Some((&ivf.centroids).try_into()?),
-        })
-    }
-}
-
-/// Convert IvfModel to protobuf.
-impl TryFrom<&pb::Ivf> for Ivf {
-    type Error = Error;
-
-    fn try_from(proto: &pb::Ivf) -> Result<Self> {
-        let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
-            debug!("Ivf: loading IVF centroids from index format v2");
-            FixedSizeListArray::try_from(tensor)?
-        } else {
-            debug!("Ivf: loading IVF centroids from index format v1");
-            // For backward-compatibility
-            let f32_centroids = Float32Array::from(proto.centroids.clone());
-            let dimension = f32_centroids.len() / proto.lengths.len();
-            FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?
-        };
-
-        let mut ivf = Self {
-            centroids,
-            offsets: proto.offsets.iter().map(|o| *o as usize).collect(),
-            lengths: proto.lengths.clone(),
-        };
-
-        if ivf.offsets.is_empty() && !ivf.lengths.is_empty() {
-            let mut offset = 0;
-            for len in &ivf.lengths {
-                ivf.offsets.push(offset);
-                offset += *len as usize;
-            }
-        }
-
-        Ok(ivf)
     }
 }
 
@@ -1529,12 +1524,7 @@ async fn write_ivf_hnsw_file(
     let hnsw_metadata_json = json!(hnsw_metadata);
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
-    // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::with_centroids(Arc::new(ivf.centroids.clone()));
-    for length in ivf.lengths {
-        ivf_data.add_partition(length);
-    }
-    ivf_data.write(&mut writer).await?;
+    ivf.write(&mut writer).await?;
     writer.finish().await?;
 
     // Write the aux file

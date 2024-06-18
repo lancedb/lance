@@ -2,13 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Range;
-use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::{Array, FixedSizeListArray, UInt32Array};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
+use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -19,51 +19,91 @@ use crate::pb::Ivf as PbIvf;
 pub const IVF_METADATA_KEY: &str = "lance:ivf";
 pub const IVF_PARTITION_KEY: &str = "lance:ivf:partition";
 
+/// Ivf Model
 #[derive(Debug, Clone, PartialEq)]
-pub struct IvfData {
-    /// Centroids of the IVF indices. Can be empty.
-    centroids: Option<Arc<FixedSizeListArray>>,
+pub struct IvfModel {
+    /// Centroids of each partition.
+    ///
+    /// It is a 2-D `(num_partitions * dimension)` of vector array.
+    pub centroids: Option<FixedSizeListArray>,
 
-    /// Length of each partition.
+    /// Offset of each partition in the file.
+    offsets: Vec<usize>,
+
+    /// Number of vectors in each partition.
     lengths: Vec<u32>,
-
-    /// pre-computed row offset for each partition, do not persist.
-    partition_row_offsets: Vec<usize>,
 }
 
-impl DeepSizeOf for IvfData {
+impl DeepSizeOf for IvfModel {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.centroids
-            .as_ref()
             .map(|centroids| centroids.get_array_memory_size())
-            .unwrap_or(0)
+            .unwrap_or_default()
             + self.lengths.deep_size_of_children(context)
-            + self.partition_row_offsets.deep_size_of_children(context)
+            + self.offsets.deep_size_of_children(context)
     }
 }
 
-/// The IVF metadata stored in the Lance Schema
-#[derive(Serialize, Deserialize, Debug)]
-struct IvfMetadata {
-    // The file position to store the protobuf binary of IVF metadata.
-    pb_position: usize,
-}
-
-impl IvfData {
+impl IvfModel {
     pub fn empty() -> Self {
         Self {
             centroids: None,
-            lengths: vec![],
-            partition_row_offsets: vec![0],
+            offsets: vec![],
+            lengths: vec![0],
         }
     }
 
-    pub fn with_centroids(centroids: Arc<FixedSizeListArray>) -> Self {
+    pub fn new(centroids: FixedSizeListArray) -> Self {
         Self {
             centroids: Some(centroids),
-            lengths: vec![],
-            partition_row_offsets: vec![0],
+            offsets: vec![],
+            lengths: vec![0],
         }
+    }
+
+    /// Ivf model dimension.
+    pub fn dimension(&self) -> usize {
+        self.centroids
+            .as_ref()
+            .map(|c| c.value_length() as usize)
+            .unwrap_or(0)
+    }
+
+    /// Number of IVF partitions.
+    pub fn num_partitions(&self) -> usize {
+        self.centroids.as_ref().map(|c| c.len()).unwrap_or(0)
+    }
+
+    pub fn partition_size(&self, part: usize) -> usize {
+        self.lengths[part + 1] as usize
+    }
+
+    /// Use the query vector to find `nprobes` closest partitions.
+    pub fn find_partitions(
+        &self,
+        query: &dyn Array,
+        nprobes: usize,
+        distance_type: DistanceType,
+    ) -> Result<UInt32Array> {
+        let internal = crate::vector::ivf::new_ivf_transformer(
+            self.centroids.clone().unwrap(),
+            distance_type,
+            vec![],
+        );
+        internal.find_partitions(query, nprobes)
+    }
+
+    /// Add the offset and length of one partition.
+    pub fn add_partition(&mut self, len: u32) {
+        self.offsets
+            .push(self.lengths.last().cloned().unwrap_or_default() as usize);
+        self.lengths.push(len);
+    }
+
+    pub fn row_range(&self, partition: usize) -> Range<usize> {
+        let start = self.offsets.get(partition).cloned().unwrap_or_default();
+        let end = self.offsets.get(partition + 1).cloned().unwrap_or_default();
+        start..end
     }
 
     pub async fn load(reader: &FileReader) -> Result<Self> {
@@ -94,37 +134,32 @@ impl IvfData {
         writer.add_metadata(IVF_METADATA_KEY, &serde_json::to_string(&ivf_metadata)?);
         Ok(())
     }
+}
 
-    pub fn add_partition(&mut self, num_rows: u32) {
-        self.lengths.push(num_rows);
-        let last_offset = self.partition_row_offsets.last().copied().unwrap_or(0);
-        self.partition_row_offsets
-            .push(last_offset + num_rows as usize);
-    }
+/// Convert IvfModel to protobuf.
+impl TryFrom<&IvfModel> for PbIvf {
+    type Error = Error;
 
-    pub fn has_centroids(&self) -> bool {
-        self.centroids.is_some()
-    }
+    fn try_from(ivf: &IvfModel) -> Result<Self> {
+        let lengths = ivf.lengths.clone();
 
-    pub fn num_partitions(&self) -> usize {
-        self.lengths.len()
-    }
-
-    /// Range of the rows for one partition.
-    pub fn row_range(&self, partition: usize) -> Range<usize> {
-        let start = self.partition_row_offsets[partition];
-        let end = self.partition_row_offsets[partition + 1];
-        start..end
+        Ok(Self {
+            centroids: vec![], // Deprecated
+            lengths,
+            offsets: vec![], // Deprecated
+            centroids_tensor: ivf.centroids.as_ref().map(|c| c.try_into()).transpose()?,
+        })
     }
 }
 
-impl TryFrom<PbIvf> for IvfData {
+/// Convert IvfModel to protobuf.
+impl TryFrom<PbIvf> for IvfModel {
     type Error = Error;
 
     fn try_from(proto: PbIvf) -> Result<Self> {
         let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
             debug!("Ivf: loading IVF centroids from index format v2");
-            Some(Arc::new(FixedSizeListArray::try_from(tensor)?))
+            Some(FixedSizeListArray::try_from(tensor)?)
         } else {
             None
         };
@@ -141,33 +176,23 @@ impl TryFrom<PbIvf> for IvfData {
             });
         Ok(Self {
             centroids,
+            offsets: offsets.collect(),
             lengths: proto.lengths.clone(),
-            partition_row_offsets: offsets.collect(),
         })
     }
 }
 
-impl TryFrom<&IvfData> for PbIvf {
-    type Error = Error;
-
-    fn try_from(meta: &IvfData) -> Result<Self> {
-        let lengths = meta.lengths.clone();
-
-        Ok(Self {
-            centroids: vec![], // Deprecated
-            lengths,
-            offsets: vec![], // Deprecated
-            centroids_tensor: meta
-                .centroids
-                .as_ref()
-                .map(|c| c.as_ref().try_into())
-                .transpose()?,
-        })
-    }
+/// The IVF metadata stored in the Lance Schema
+#[derive(Serialize, Deserialize, Debug)]
+struct IvfMetadata {
+    // The file position to store the protobuf binary of IVF metadata.
+    pb_position: usize,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow_array::{Float32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
@@ -179,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_ivf_find_rows() {
-        let mut ivf = IvfData::empty();
+        let mut ivf = IvfModel::empty();
         ivf.add_partition(20);
         ivf.add_partition(50);
 
@@ -189,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_and_load() {
-        let mut ivf = IvfData::empty();
+        let mut ivf = IvfModel::empty();
         ivf.add_partition(20);
         ivf.add_partition(50);
 
@@ -219,7 +244,7 @@ mod tests {
             .unwrap();
         assert!(reader.schema().metadata.contains_key(IVF_METADATA_KEY));
 
-        let ivf2 = IvfData::load(&reader).await.unwrap();
+        let ivf2 = IvfModel::load(&reader).await.unwrap();
         assert_eq!(ivf, ivf2);
         assert_eq!(ivf2.num_partitions(), 2);
     }

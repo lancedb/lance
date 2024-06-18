@@ -21,7 +21,6 @@ use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
-use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizerImpl;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::{
@@ -264,8 +263,8 @@ pub(crate) async fn build_vector_index(
             dataset.indices_dir().child(uuid),
             params.metric_type,
             Box::new(shuffler),
-            ivf_params.clone(),
-            (),
+            Some(ivf_params.clone()),
+            Some(()),
             (),
         )?
         .build()
@@ -341,9 +340,9 @@ pub(crate) async fn build_vector_index(
                         dataset.indices_dir().child(uuid),
                         params.metric_type,
                         Box::new(shuffler),
-                        ivf_params.clone(),
+                        Some(ivf_params.clone()),
+                        Some(sq_params.clone()),
                         hnsw_params.clone(),
-                        sq_params.clone(),
                     )?
                     .build()
                     .await?;
@@ -504,7 +503,7 @@ pub(crate) async fn open_vector_index_v2(
                 .child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
-            let ivf_data = IvfData::load(&reader).await?;
+            let ivf_data = Ivf::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizerImpl<Float32Type>>::try_new(
                 reader.object_reader.clone(),
@@ -532,7 +531,7 @@ pub(crate) async fn open_vector_index_v2(
                 .child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
-            let ivf_data = IvfData::load(&reader).await?;
+            let ivf_data = Ivf::load(&reader).await?;
             let options = HNSWIndexOptions {
                 use_residual: false,
             };

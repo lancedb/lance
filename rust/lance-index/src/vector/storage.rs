@@ -22,7 +22,7 @@ use snafu::{location, Location};
 use crate::{
     pb,
     vector::{
-        ivf::storage::{IvfData, IVF_METADATA_KEY},
+        ivf::storage::{IvfModel, IVF_METADATA_KEY},
         quantizer::Quantization,
     },
     INDEX_METADATA_SCHEMA_KEY,
@@ -147,7 +147,7 @@ pub struct IvfQuantizationStorage {
     distance_type: DistanceType,
     metadata: Vec<String>,
 
-    ivf: IvfData,
+    ivf: IvfModel,
 }
 
 impl DeepSizeOf for IvfQuantizationStorage {
@@ -188,7 +188,7 @@ impl IvfQuantizationStorage {
                 location: location!(),
             })?;
         let ivf_bytes = reader.read_global_buffer(ivf_pos).await?;
-        let ivf = IvfData::try_from(pb::Ivf::decode(ivf_bytes)?)?;
+        let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_bytes)?)?;
 
         let metadata: Vec<String> = serde_json::from_str(
             schema

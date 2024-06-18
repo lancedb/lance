@@ -36,7 +36,7 @@ use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
     vector::{
-        ivf::storage::IvfData,
+        ivf::storage::IvfModel,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         storage::{DistCalculator, VectorStore},
@@ -119,7 +119,7 @@ pub async fn write_parted_product_quantizations(
     )
     .await?;
 
-    let mut ivf_data = IvfData::empty();
+    let mut ivf_data = IvfModel::empty();
     for storage in peek {
         let num_rows = storage.write_partition(&mut writer).await?;
         ivf_data.add_partition(num_rows as u32);

@@ -22,7 +22,7 @@ use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
-use lance_index::vector::ivf::storage::IvfData;
+use lance_index::vector::ivf::storage::Ivf;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{Quantization, Quantizer};
 use lance_index::vector::v3::subindex::IvfSubIndex;
@@ -252,7 +252,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     quantizer: Quantizer,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
-) -> Result<(Vec<HnswMetadata>, IvfData)> {
+) -> Result<(Vec<HnswMetadata>, Ivf)> {
     let dataset = Arc::new(dataset.clone());
     let column = Arc::new(column.to_owned());
     let hnsw_params = Arc::new(hnsw_params.clone());
@@ -381,7 +381,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }));
     }
 
-    let mut aux_ivf = IvfData::empty();
+    let mut aux_ivf = Ivf::empty();
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     for (part_id, task) in tasks.into_iter().enumerate() {
         let offset = writer.len();

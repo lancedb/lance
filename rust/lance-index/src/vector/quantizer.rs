@@ -27,7 +27,7 @@ use super::pq::ProductQuantizer;
 use super::sq::builder::SQBuildParams;
 use super::sq::storage::SQ_METADATA_KEY;
 use super::{
-    ivf::storage::IvfData,
+    ivf::storage::IvfModel,
     pq::{
         storage::{ProductQuantizationMetadata, ProductQuantizationStorage},
         ProductQuantizerImpl,
@@ -417,7 +417,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     quantizer: Quantizer,
     metadata: Q::Metadata,
 
-    ivf: IvfData,
+    ivf: IvfModel,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -467,7 +467,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             })?;
         let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-        let ivf_data = IvfData::load(&reader).await?;
+        let ivf_data = IvfModel::load(&reader).await?;
 
         let metadata = Q::Metadata::load(&reader).await?;
         let quantizer = Q::from_metadata(&metadata, distance_type)?;

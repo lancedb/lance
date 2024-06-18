@@ -15,7 +15,7 @@ use tracing::instrument;
 use lance_core::{Error, Result, ROW_ID};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
-    ivf::{shuffler::shuffle_dataset, storage::IvfData},
+    ivf::{shuffler::shuffle_dataset, storage::Ivf},
     pq::ProductQuantizer,
 };
 use lance_io::{stream::RecordBatchStream, traits::Writer};
@@ -60,7 +60,7 @@ pub(super) async fn build_partitions(
         });
     }
 
-    let ivf_model = lance_index::vector::ivf::Ivf::with_pq(
+    let ivf_model = lance_index::vector::ivf::IvfTransformer::with_pq(
         ivf.centroids.clone(),
         metric_type,
         column,
@@ -105,7 +105,7 @@ pub(super) async fn build_hnsw_partitions(
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
-) -> Result<(Vec<HnswMetadata>, IvfData)> {
+) -> Result<(Vec<HnswMetadata>, Ivf)> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
         return Err(Error::Schema {
@@ -127,7 +127,7 @@ pub(super) async fn build_hnsw_partitions(
         });
     }
 
-    let ivf_model = lance_index::vector::ivf::new_ivf_with_quantizer(
+    let ivf_model = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
         ivf.centroids.clone(),
         metric_type,
         column,
