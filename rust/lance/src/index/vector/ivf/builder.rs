@@ -12,7 +12,7 @@ use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
     ivf::{shuffler::shuffle_dataset, storage::IvfData},
@@ -21,10 +21,7 @@ use lance_index::vector::{
 use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::MetricType;
 
-use crate::{
-    index::vector::ivf::{io::write_pq_partitions, Ivf},
-    Dataset,
-};
+use crate::index::vector::ivf::{io::write_pq_partitions, Ivf};
 
 use super::io::write_hnsw_quantization_index_partitions;
 
@@ -91,7 +88,7 @@ pub(super) async fn build_partitions(
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip(writer, auxiliary_writer, data, ivf, quantizer))]
 pub(super) async fn build_hnsw_partitions(
-    dataset: &Dataset,
+    dataset: Arc<dyn DatasetTakeRows>,
     writer: &mut FileWriter<ManifestDescribing>,
     auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
     data: impl RecordBatchStream + Unpin + 'static,

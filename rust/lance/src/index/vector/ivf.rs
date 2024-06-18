@@ -25,7 +25,7 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::{datatypes::Field, Error, Result, ROW_ID_FIELD};
+use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
 use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
@@ -251,7 +251,7 @@ impl std::fmt::Debug for IVFIndex {
 ///
 /// Returns (new_uuid, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
-    dataset: &Dataset,
+    dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
@@ -304,7 +304,7 @@ pub(crate) async fn optimize_vector_indices(
             .child(INDEX_AUXILIARY_FILE_NAME);
         let aux_writer = object_store.create(&aux_file).await?;
         optimize_ivf_hnsw_indices(
-            dataset,
+            Arc::new(dataset),
             first_idx,
             hnsw_sq,
             vector_column,
@@ -408,7 +408,7 @@ async fn optimize_ivf_pq_indices(
 
 #[allow(clippy::too_many_arguments)]
 async fn optimize_ivf_hnsw_indices<Q: Quantization>(
-    dataset: &Dataset,
+    dataset: Arc<dyn DatasetTakeRows>,
     first_idx: &IVFIndex,
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
@@ -1576,7 +1576,7 @@ async fn write_ivf_hnsw_file(
     let num_partitions = ivf.num_partitions() as u32;
 
     let (hnsw_metadata, aux_ivf) = builder::build_hnsw_partitions(
-        dataset,
+        Arc::new(dataset.clone()),
         &mut writer,
         Some(&mut aux_writer),
         stream,
