@@ -80,7 +80,7 @@ impl IvfModel {
     }
 
     pub fn partition_size(&self, part: usize) -> usize {
-        self.lengths[part + 1] as usize
+        self.lengths[part] as usize
     }
 
     /// Use the query vector to find `nprobes` closest partitions.

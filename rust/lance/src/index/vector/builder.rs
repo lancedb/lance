@@ -233,7 +233,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
             .with_row_id()
             .try_into_stream()
             .await?;
-        self.shuffle_data(stream, &[]).await?;
+        self.shuffle_data(stream).await?;
         Ok(())
     }
 
@@ -243,7 +243,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
     pub async fn shuffle_data(
         &mut self,
         data: impl RecordBatchStream + Unpin + 'static,
-        existing_indices: &[&IVFIndex<S, Q>],
     ) -> Result<&mut Self> {
         let ivf = self.ivf.as_ref().ok_or(Error::invalid_input(
             "IVF not set before shuffle data",
@@ -280,22 +279,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
             None => panic!("no data"),
         };
 
-        let mut existing_data = HashMap::new();
-        for part_id in 0..ivf.num_partitions() {
-            let mut batches = Vec::with_capacity(existing_indices.len());
-            for index in existing_indices {
-                let part_data = index.load_partition_storage(part_id).await?;
-                batches.extend(part_data.to_batches()?);
-            }
-            existing_data.insert(part_id, batches);
-        }
-
         self.shuffle_reader = Some(
             self.shuffler
-                .shuffle(
-                    Box::new(RecordBatchStreamAdapter::new(schema, transformed_stream)),
-                    existing_data,
-                )
+                .shuffle(Box::new(RecordBatchStreamAdapter::new(
+                    schema,
+                    transformed_stream,
+                )))
                 .await?,
         );
 

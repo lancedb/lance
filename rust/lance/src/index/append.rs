@@ -103,15 +103,13 @@ pub async fn merge_indices<'a>(
             Ok((new_uuid, 1))
         }
         IndexType::Vector => {
-            let new_data_stream = if unindexed.is_empty() {
-                None
-            } else {
+            let new_data_stream = {
                 let mut scanner = dataset.scan();
                 scanner
                     .with_fragments(unindexed)
                     .with_row_id()
                     .project(&[&column.name])?;
-                Some(scanner.try_into_stream().await?)
+                scanner.try_into_stream().await?
             };
 
             optimize_vector_indices(

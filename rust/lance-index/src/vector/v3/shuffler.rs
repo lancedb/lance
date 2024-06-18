@@ -4,7 +4,6 @@
 //! Shuffler is a component that takes a stream of record batches and shuffles them into
 //! the corresponding IVF partitions.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::{array::AsArray, compute::sort_to_indices};
@@ -48,7 +47,6 @@ pub trait Shuffler: Send + Sync {
     async fn shuffle(
         &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
-        existing_data: HashMap<usize, Vec<RecordBatch>>,
     ) -> Result<Box<dyn ShuffleReader>>;
 }
 
@@ -82,7 +80,6 @@ impl Shuffler for IvfShuffler {
     async fn shuffle(
         &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
-        existing_data: HashMap<usize, Vec<RecordBatch>>,
     ) -> Result<Box<dyn ShuffleReader>> {
         let mut writers: Vec<FileWriter> = vec![];
         let mut partition_sizes = vec![0; self.num_partitions];
@@ -192,12 +189,6 @@ impl Shuffler for IvfShuffler {
 
                 partition_buffers.iter_mut().for_each(|b| b.clear());
             }
-        }
-
-        // extend with existing data
-        for (part_id, batches) in existing_data.into_iter() {
-            let part_batches = &mut partition_buffers[part_id];
-            part_batches.extend(batches);
         }
 
         // final flush

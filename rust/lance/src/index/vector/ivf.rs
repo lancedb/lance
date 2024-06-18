@@ -231,7 +231,7 @@ impl std::fmt::Debug for IVFIndex {
 /// Returns (new_uuid, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
     dataset: Dataset,
-    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    unindexed: impl RecordBatchStream + Unpin + 'static,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
@@ -242,6 +242,19 @@ pub(crate) async fn optimize_vector_indices(
             message: "optimizing vector index: no existing index found".to_string(),
             location: location!(),
         });
+    }
+
+    // try cast to v1 IVFIndex,
+    // fallback to v2 IVFIndex if it's not v1 IVFIndex
+    if !existing_indices[0].as_any().is::<IVFIndex>() {
+        return optimize_vector_indices_v2(
+            &dataset,
+            unindexed,
+            vector_column,
+            existing_indices,
+            options,
+        )
+        .await;
     }
 
     let new_uuid = Uuid::new_v4();
@@ -425,7 +438,7 @@ async fn optimize_ivf_pq_indices(
     first_idx: &IVFIndex,
     pq_index: &PQIndex,
     vector_column: &str,
-    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    unindexed: impl RecordBatchStream + Unpin + 'static,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
     mut writer: ObjectWriter,
@@ -444,10 +457,10 @@ async fn optimize_ivf_pq_indices(
     );
 
     // Shuffled un-indexed data with partition.
-    let shuffled = if let Some(stream) = unindexed {
+    let shuffled = if unindexed.size_hint().0 > 0 {
         Some(
             shuffle_dataset(
-                stream,
+                unindexed,
                 vector_column,
                 ivf.into(),
                 None,
@@ -507,7 +520,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     first_idx: &IVFIndex,
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
-    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    unindexed: impl RecordBatchStream + Unpin + 'static,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
     writer: ObjectWriter,
@@ -524,10 +537,10 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     )?;
 
     // Shuffled un-indexed data with partition.
-    let unindexed_data = if let Some(stream) = unindexed {
+    let unindexed_data = if unindexed.size_hint().0 > 0 {
         Some(
             shuffle_dataset(
-                stream,
+                unindexed,
                 vector_column,
                 Arc::new(ivf),
                 None,
