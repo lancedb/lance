@@ -1,6 +1,6 @@
 
+const FSST_MAGIC: u64 = 0x46535354 << 32; // "FSST"
 const FSST_ESC: u8 = 255;
-const _FSST_LEN_BITS: u16 = 12;
 const FSST_CODE_BITS: u16 = 9;
 // first 256 codes [0,255] are pseudo codes: escaped bytes
 const FSST_CODE_BASE: u16 = 256;
@@ -11,7 +11,7 @@ const FSST_CODE_MASK: u16 = FSST_CODE_MAX - 1;
 // we construct FSST symbol tables using a random sample of about 16KB (1<<14) 
 const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
-const _FSST_SAMPLELINE: usize = 512;
+const FSST_LEAST_INPUT_SIZE: usize = 8 * 1024 * 1024;   // 8MB 
 
 const FSST_ICL_FREE: u32 = (8 << 28) | ((FSST_CODE_MASK as u32) << 16);
 
@@ -25,12 +25,11 @@ const MAX_SYMBOL_LENGTH: usize = 8;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::collections::HashSet;
+use std::io;
 use std::ptr;
-use std::rc::Rc;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use lance_core::Result;
 
 fn fsst_unaligned_load_unchecked(v: *const u8) -> u64 {
     unsafe { ptr::read_unaligned(v as *const u64) }
@@ -157,7 +156,7 @@ impl PartialEq for QSymbol {
 impl Ord for QSymbol {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.gain.cmp(&other.gain)
-            .then_with(|| other.symbol.val.cmp(&self.symbol.val)) // first order by gain, then by symbol.val alphabetically
+            .then_with(|| other.symbol.val.cmp(&self.symbol.val)) 
     }
 }
 
@@ -417,7 +416,6 @@ impl SymbolTable {
 
         for i in 0..self.hash_tab_size {
             if self.hash_tab[i].icl < FSST_ICL_FREE as u64{
-                println!("in finalize, inserted a symbol longer than 2, symbol: {}", self.symbols[new_code[(self.hash_tab[i].code() & 0xFF) as usize] as usize]);
                 self.hash_tab[i] = self.symbols[new_code[(self.hash_tab[i].code() & 0xFF) as usize] as usize];
             }
         }
@@ -491,7 +489,7 @@ fn make_sample(strs: &[u8], offsets: &[i32]) -> (Vec<u8>, Vec<i32>) {
     return (sample, sample_offsets);
 }
 
-fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> Box<SymbolTable> {
+fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<SymbolTable>> {
     let mut st = SymbolTable::new();
     let mut best_table = SymbolTable::new();
     let mut best_gain = -(FSST_SAMPLEMAXSZ as i32); // worst case (everything exception)
@@ -518,11 +516,10 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> Box<SymbolTable> {
         let mut counters = Counters::new();
 
         for i in 1..offsets.len() {
-            /* 
             // this is commented out during development
-            if sample_frac < 128 && rnd128(i) > sample_frac {
+            if sample_frac < 128 && _rnd128(i) > sample_frac {
                 continue;
-            }*/
+            }
             if offsets[i] == offsets[i-1] {
                 continue;
             }
@@ -649,10 +646,13 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> Box<SymbolTable> {
         make_table(&mut st, &mut this_counter, frac);
     }
     best_table.finalize(); // renumber codes for more efficient compression
-    return Box::new(best_table);
+    if best_table.n_symbols == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Fsst failed to build symbol table"));
+    }
+    return Ok(Box::new(best_table));
 }    
 
-fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) {
+fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> io::Result<()>{
     let suffix_lim = st.suffix_lim;
     let byte_lim = st.n_symbols - st.len_histo[0] as u16;
     let mut out_curr = *out_pos;
@@ -710,9 +710,10 @@ fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u
     out_offsets.resize(offsets.len(), 0); // shrink to actual size
     *out_pos = out_curr;
     *out_offsets_len = offsets.len();
+    Ok(())
 }
 
-fn decompress_bulk(st: &SymbolTable, compressed_strs: &[u8], offsets: &[i32], out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> Result<()> {
+fn decompress_bulk(st: &SymbolTable, compressed_strs: &[u8], offsets: &[i32], out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> io::Result<()> {
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
         let mut prev_esc = false;
         while in_curr < in_end {
@@ -749,7 +750,7 @@ fn decompress_bulk(st: &SymbolTable, compressed_strs: &[u8], offsets: &[i32], ou
     Ok(())
 }
 
-fn decompress_bulk2(symbols: &[Symbol], compressed_strs: &[u8], offsets: &[i32], in_curr: &mut usize, out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> Result<()> {
+fn decompress_bulk2(symbols: &[Symbol], compressed_strs: &[u8], offsets: &[i32], _in_curr: &mut usize, out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> io::Result<()> {
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
         let mut prev_esc = false;
         while in_curr < in_end {
@@ -786,32 +787,46 @@ fn decompress_bulk2(symbols: &[Symbol], compressed_strs: &[u8], offsets: &[i32],
     Ok(())
 }
 
+// use a struct so we can have many implementations based on cpu type
 struct FsstEncoder {
     symbol_table: Box<SymbolTable>,
+    // when in_buf is less than FSST_LEAST_INPUT_SIZE, we simply copy the input to the output 
+    encoder_switch: bool, 
 }
 
 impl FsstEncoder {
     fn new() -> Self {
         Self {
             symbol_table: Box::new(SymbolTable::new()),
+            encoder_switch: false,
         }
     }
-    fn init(&mut self, input_buf: &[u8], input_offsets_buf: &[i32]) {
-        let (sample, sample_offsets) = make_sample(input_buf, input_offsets_buf);
-        let st = build_symbol_table(sample, sample_offsets);
-        println!("in FsstEncoder::init function, st.n_symbols: {}", st.n_symbols);
+
+    fn init(&mut self, in_buf: &[u8], in_offsets_buf: &[i32], out_buf: &Vec<u8>, _out_offsets_buf: &Vec<i32>) -> io::Result<()> {
+        if in_buf.len() < FSST_LEAST_INPUT_SIZE {
+            return Ok(());
+        }
+
+        // currently, we make sure the compress output buffer has the same size as the input buffer,
+        // because I don't know a good way to estimate this yet
+        if in_buf.len() > out_buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "output buffer too small for FSST encoder"));
+        }
+
+        self.encoder_switch = true;
+        let (sample, sample_offsets) = make_sample(in_buf, in_offsets_buf);
+        let st = build_symbol_table(sample, sample_offsets)?;
         self.symbol_table = st;
+        Ok(())
     }
 
-    fn export(&self, out_buf: &mut Vec<u8>, out_pos: &mut usize) {
+    fn export(&self, out_buf: &mut Vec<u8>, out_pos: &mut usize) -> io::Result<()> {
         let st = &self.symbol_table;
 
-        // assert out_buf size
-        assert!(out_buf.len() >= *out_pos + std::mem::size_of::<u64>() + 8 + std::mem::size_of::<u64>() * st.n_symbols as usize);
-
-        let st_info: u64 = ((st.suffix_lim & FSST_CODE_BASE) as u64) << 16 |
-                                    ((st.terminator & FSST_CODE_BASE) as u64) << 8 | 
-                                    ((st.n_symbols & FSST_CODE_BASE) as u64);
+        let st_info: u64 = FSST_MAGIC |  
+                            ((st.suffix_lim & FSST_CODE_BASE) as u64) << 16 |
+                            ((st.terminator & FSST_CODE_BASE) as u64) << 8 | 
+                            ((st.n_symbols & FSST_CODE_BASE) as u64);
 
         let st_info_bytes = st_info.to_ne_bytes();
         out_buf[*out_pos..*out_pos + st_info_bytes.len()].copy_from_slice(&st_info_bytes);
@@ -831,25 +846,34 @@ impl FsstEncoder {
             out_buf[*out_pos..*out_pos + s_icl.len()].copy_from_slice(&s_icl);
             *out_pos += s_icl.len();
         }
-        println!("st.n_symbols: {}", st.n_symbols);
+        Ok(())
     }
 
 
-    fn compress(&mut self, input_buf: &[u8], input_offsets_buf: &[i32], output_buf: &mut Vec<u8>, output_offsets_buf: &mut Vec<i32>) {
+    fn compress(&mut self, in_buf: &[u8], in_offsets_buf: &[i32], out_buf: &mut Vec<u8>, out_offsets_buf: &mut Vec<i32>) -> io::Result<()> {
+        self.init(&in_buf, &in_offsets_buf, &out_buf, &out_offsets_buf)?;
+
+        // if the input buffer is less than FSST_LEAST_INPUT_SIZE, we simply copy the input to the output
+        if self.encoder_switch == false {
+            out_buf.resize(in_buf.len(), 0);
+            out_buf.copy_from_slice(in_buf);
+            out_offsets_buf.resize(in_offsets_buf.len(), 0);
+            out_offsets_buf.copy_from_slice(in_offsets_buf);
+            return Ok(());
+        }
         let mut out_pos = 0;
-        self.init(&input_buf, &input_offsets_buf);
-        println!("self.symbol_table.n_symbols after calling self.init(): {}", self.symbol_table.n_symbols);
-        self.export(output_buf, &mut out_pos);
-        println!("out_pos: {}", out_pos);
+        self.export(out_buf, &mut out_pos)?;
         let mut out_offsets_len = 0;
-        compress_bulk(&self.symbol_table, input_buf, input_offsets_buf, output_buf, output_offsets_buf, &mut out_pos, &mut out_offsets_len);
+        compress_bulk(&self.symbol_table, in_buf, in_offsets_buf, out_buf, out_offsets_buf, &mut out_pos, &mut out_offsets_len)?;
+        Ok(())
     }
 }
 
+// use a struct so we can have many implementations based on cpu type
 struct FsstDecoder {
     len_histo: [u8; 8],
-    // this can be further optimized, as stymbols.icl is not needed in decompression
     symbols: [Symbol; 256],
+    decoder_switch: bool,
 }
 
 const FSST_CORRUPT: u64 = 32774747032022883; // 7-byte number in little endian containing "corrupt"
@@ -859,11 +883,24 @@ impl FsstDecoder {
         Self {
             len_histo: [0; 8],
             symbols: [s; 256],
+            decoder_switch: false,
         }
     }
-    fn init(&mut self, in_buf: &[u8], in_pos: &mut usize) {
-        // currently st_info is not used in the decoder
-        // let st_info = u64::from_ne_bytes(in_buf[*in_pos..*in_pos + 8].try_into().unwrap());
+    fn init(&mut self, in_buf: &[u8], in_pos: &mut usize, out_buf: &Vec<u8>, _out_offsets_buf: &Vec<i32>) -> io::Result<()> {
+        if in_buf.len() < FSST_LEAST_INPUT_SIZE {
+            return Ok(());
+        }
+
+        // currently, we make sure the out_buf is at least 3 times the size of the in_buf, 
+        // because I don't know a good way to estimate this
+        if in_buf.len() * 3 > out_buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "output buffer too small for FSST decoder"));
+        }
+        self.decoder_switch = true;
+        let st_info = u64::from_ne_bytes(in_buf[*in_pos..*in_pos + 8].try_into().unwrap());
+        if st_info & FSST_MAGIC != FSST_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "the input buffer is not a valid FSST compressed data"));
+        }
         *in_pos += 8;
         let mut len_histo = [0; 8];
         len_histo.copy_from_slice(&in_buf[*in_pos..*in_pos + 8]);
@@ -888,34 +925,43 @@ impl FsstDecoder {
         for i in 0..256 {
             println!("self.symbols[{}]: {:?}", i, self.symbols[i]);
         }
+        Ok(())
     }
 
-    fn decompress(&mut self, input_buf: &[u8], input_offsets_buf: &[i32], output_buf: &mut Vec<u8>, output_offsets_buf: &mut Vec<i32>) {
+    fn decompress(&mut self, in_buf: &[u8], in_offsets_buf: &[i32], out_buf: &mut Vec<u8>, out_offsets_buf: &mut Vec<i32>) -> io::Result<()> {
         let mut in_pos = 0;
-        self.init(input_buf, &mut in_pos);
+        self.init(in_buf, &mut in_pos, &out_buf, &out_offsets_buf)?;
+
+        if self.decoder_switch == false {
+            out_buf.resize(in_buf.len(), 0);
+            out_buf.copy_from_slice(in_buf);
+            out_offsets_buf.resize(in_offsets_buf.len(), 0);
+            out_offsets_buf.copy_from_slice(in_offsets_buf);
+            return Ok(());
+        }
+
         let mut out_pos = 0;
         let mut out_offsets_len = 0;
-        decompress_bulk2(&self.symbols, input_buf, input_offsets_buf, &mut in_pos, output_buf, output_offsets_buf, &mut out_pos, &mut out_offsets_len).unwrap();
+        decompress_bulk2(&self.symbols, in_buf, in_offsets_buf, &mut in_pos, out_buf, out_offsets_buf, &mut out_pos, &mut out_offsets_len)?;
+        Ok(())
     }
 }
 
 
-pub fn fsst_compress(_input_buf: &[u8], _input_offsets_buf: &[i32], _output_buf: &mut Vec<u8>, _output_offsets_buf: &mut Vec<i32>) -> Result<()> {
+pub fn fsst_compress(_input_buf: &[u8], _input_offsets_buf: &[i32], _output_buf: &mut Vec<u8>, _output_offsets_buf: &mut Vec<i32>) -> io::Result<()> {
     Ok(())
 }
 
-pub fn fsst_decompress(_input_buf: &[u8], _input_offsets_buf: &[i32], _output_buf: &mut Vec<u8>, _output_offsets_buf: &mut Vec<i32>) -> Result<()> {
+pub fn fsst_decompress(_input_buf: &[u8], _input_offsets_buf: &[i32], _output_buf: &mut Vec<u8>, _output_offsets_buf: &mut Vec<i32>) -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use arrow_array::StringArray;
-    use lance_datagen::ByteCount;
-    use rand_xoshiro;
     use rand::Rng;
 
-    use crate::{encoder, encodings::compression_algo::fsst::*};
+    use crate::encodings::compression_algo::fsst::*;
 
     const TEST_PARAGRAPH: &str = "ACT I. Scene I.
     Elsinore. A platform before the Castle.
@@ -1173,7 +1219,7 @@ mod tests {
         for file_path in file_paths {
             let input = read_random_16_m_chunk(file_path).unwrap();
             let (sample_input, sample_offsets) = make_sample(input.values(), input.value_offsets());
-            let st = *build_symbol_table(sample_input, sample_offsets);
+            let st = *build_symbol_table(sample_input, sample_offsets).unwrap();
             println!("{}", st);
         }
     }
@@ -1376,13 +1422,13 @@ mod tests {
             for _ in 0..test_num {
                 let input = read_random_16_m_chunk(file_path).unwrap();
                 let (sample_input, sample_offsets) = make_sample(input.values(), input.value_offsets());
-                let st = *build_symbol_table(sample_input, sample_offsets);
+                let st = *build_symbol_table(sample_input, sample_offsets).unwrap();
                 //println!("symbol table: {}", st);
                 let mut compress_output_buffer: Vec<u8> = vec![0; 16 * 1024 * 1024 * 2]; // 16MB * 2
                 let mut compress_offset_buffer: Vec<i32> = vec![0; 16 * 1024 * 1024 * 2];
                 let mut compress_out_buf_pos = 0;
                 let mut compress_out_offsets_len = 0;
-                compress_bulk(&st, input.values(), input.value_offsets(), &mut compress_output_buffer, &mut compress_offset_buffer, &mut compress_out_buf_pos, &mut compress_out_offsets_len);
+                compress_bulk(&st, input.values(), input.value_offsets(), &mut compress_output_buffer, &mut compress_offset_buffer, &mut compress_out_buf_pos, &mut compress_out_offsets_len).unwrap();
                 assert!(compress_out_offsets_len == input.value_offsets().to_vec().len());
                 //println!("compress_out_buf_pos: {:?}", compress_out_buf_pos);
                 //println!("input.values().len(): {:?}", input.values().len());
@@ -1414,28 +1460,29 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_fsst() {
-        let test_num = 1;
+        let test_num = 5;
         let file_paths = [
-            "/Users/x/first_column_fulldocs.tsv",
+            //"/Users/x/first_column_fulldocs.tsv",
             "/Users/x/second_column_fulldocs.tsv",
-            "/Users/x/third_column_fulldocs.tsv",
+            //"/Users/x/third_column_fulldocs.tsv",
         ];
         for file_path in file_paths {
             let mut compression_ratio_sum: f64 = 0.0;
             for _ in 0..test_num {
                 let input = read_random_32_m_chunk(file_path).unwrap();
                 let mut encoder = FsstEncoder::new();
-                let mut compress_output_buffer: Vec<u8> = vec![0; 32 * 1024 * 1024]; 
-                let mut compress_offset_buffer: Vec<i32> = vec![0; 32 * 1024 * 1024];
-                encoder.compress(input.values(), input.value_offsets(), &mut compress_output_buffer, & mut compress_offset_buffer);
+                let mut compress_output_buffer: Vec<u8> = vec![0; 32 * 1024 * 1024 + 8096]; 
+                let mut compress_offset_buffer: Vec<i32> = vec![0; 32 * 1024 * 1024 + 8096];
+                encoder.compress(input.values(), input.value_offsets(), &mut compress_output_buffer, & mut compress_offset_buffer).unwrap();
                 //println!("compress_output_buffer.len(): {}", compress_output_buffer.len());
                 //println!("compree_offset_buffer.len(): {}", compress_offset_buffer.len());
                 let this_compression_ratio = input.values().len() as f64 / compress_output_buffer.len() as f64;
                 println!("this_compression_ratio: {:?}", this_compression_ratio);
                 let mut decoder = FsstDecoder::new();
-                let mut decompress_output_buffer: Vec<u8> = vec![0; 32 * 1024 * 1024]; 
-                let mut decompress_offset_buffer: Vec<i32> = vec![0; 32 * 1024 * 1024];
-                decoder.decompress(&compress_output_buffer, &compress_offset_buffer, &mut decompress_output_buffer, &mut decompress_offset_buffer);
+                let mut decompress_output_buffer: Vec<u8> = vec![0; 3 * compress_output_buffer.len() + 8096]; 
+                //let mut decompress_output_buffer: Vec<u8> = vec![0; 32 * 1024 * 1024 + 8096]; 
+                let mut decompress_offset_buffer: Vec<i32> = vec![0; 32 * 1024 * 1024 + 8096];
+                decoder.decompress(&compress_output_buffer, &compress_offset_buffer, &mut decompress_output_buffer, &mut decompress_offset_buffer).unwrap();
                 println!("decompress_output_buffer.len(): {}", decompress_output_buffer.len());
                 println!("input.values().len(): {}", input.values().len());
                 assert!(decompress_offset_buffer.len() == input.value_offsets().to_vec().len());
@@ -1454,7 +1501,7 @@ mod tests {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    fn read_random_16_m_chunk(file_path: &str) -> Result<StringArray> {
+    fn read_random_16_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error> {
         let file = File::open(file_path)?;
         let reader = BufReader::new(file);
     
@@ -1462,26 +1509,21 @@ mod tests {
         let num_lines = lines.len();
     
         let mut rng = rand::thread_rng();
-        let start_line = rng.gen_range(0..num_lines);
+        let mut curr_line = rng.gen_range(0..num_lines);
     
         let chunk_size = 16 * 1024 * 1024; // 16MB
-        let mut result = String::new();
         let mut size = 0;
-
-        for line in lines[start_line..].iter() {
-            size += line.len();
-            if size > chunk_size {
-                break;
-            }
-            result.push_str(line);
-            result.push('\n');
+        let mut result_lines = vec![];
+        while size + lines[curr_line].len() < chunk_size {
+            result_lines.push(lines[curr_line].clone());
+            size += lines[curr_line].len();
+            curr_line += 1;
+            curr_line %= num_lines;
         }
     
-        let words: Vec<&str> = result.lines().collect();
-        Ok(StringArray::from(words))
+        Ok(StringArray::from(result_lines))
     }
-
-    fn read_random_32_m_chunk(file_path: &str) -> Result<StringArray> {
+    fn read_random_32_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error> {
         let file = File::open(file_path)?;
         let reader = BufReader::new(file);
     
@@ -1489,22 +1531,19 @@ mod tests {
         let num_lines = lines.len();
     
         let mut rng = rand::thread_rng();
-        let start_line = rng.gen_range(0..num_lines);
+        let mut curr_line = rng.gen_range(0..num_lines);
+        println!("curr_line: {}", curr_line);
     
-        let chunk_size = 32 * 1024 * 1024; // 16MB
-        let mut result = String::new();
+        let chunk_size = 32 * 1024 * 1024; // 32MB
         let mut size = 0;
-
-        for line in lines[start_line..].iter() {
-            size += line.len();
-            if size > chunk_size {
-                break;
-            }
-            result.push_str(line);
-            result.push('\n');
+        let mut result_lines = vec![];
+        while size + lines[curr_line].len() < chunk_size {
+            result_lines.push(lines[curr_line].clone());
+            size += lines[curr_line].len();
+            curr_line += 1;
+            curr_line %= num_lines;
         }
     
-        let words: Vec<&str> = result.lines().collect();
-        Ok(StringArray::from(words))
+        Ok(StringArray::from(result_lines))
     }
 }
