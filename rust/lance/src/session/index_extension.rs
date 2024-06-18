@@ -69,6 +69,9 @@ mod test {
     use arrow_schema::Schema;
     use deepsize::DeepSizeOf;
     use lance_file::writer::{FileWriter, FileWriterOptions};
+    use lance_index::vector::ivf::storage::IvfModel;
+    use lance_index::vector::quantizer::{QuantizationType, Quantizer};
+    use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
         vector::{hnsw::VECTOR_ID_FIELD, Query},
         DatasetIndexExt, Index, IndexMetadata, IndexType, INDEX_FILE_NAME,
@@ -98,6 +101,10 @@ mod test {
 
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
+        }
+
+        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+            Ok(self)
         }
 
         fn statistics(&self) -> Result<serde_json::Value> {
@@ -159,6 +166,18 @@ mod test {
 
         fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
             Ok(())
+        }
+
+        fn ivf_model(&self) -> IvfModel {
+            todo!("panic")
+        }
+        fn quantizer(&self) -> Quantizer {
+            todo!("panic")
+        }
+
+        /// the index type of this vector index.
+        fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+            todo!("panic")
         }
 
         fn metric_type(&self) -> MetricType {

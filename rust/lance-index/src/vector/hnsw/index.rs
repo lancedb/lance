@@ -22,7 +22,9 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::prefilter::PreFilter;
-use crate::vector::v3::subindex::IvfSubIndex;
+use crate::vector::ivf::storage::IvfModel;
+use crate::vector::quantizer::QuantizationType;
+use crate::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use crate::{
     vector::{
         graph::NEIGHBORS_FIELD,
@@ -114,6 +116,11 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    /// Cast to [VectorIndex]
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+        Ok(self)
     }
 
     /// Retrieve index statistics as a JSON Value
@@ -265,6 +272,21 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             message: "Remapping HNSW in this way not supported".to_string(),
             location: location!(),
         })
+    }
+
+    fn ivf_model(&self) -> IvfModel {
+        unimplemented!("only for IVF")
+    }
+
+    fn quantizer(&self) -> Quantizer {
+        self.partition_storage.quantizer().clone()
+    }
+
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+        (
+            SubIndexType::Hnsw,
+            self.partition_storage.quantizer().quantization_type(),
+        )
     }
 
     fn metric_type(&self) -> DistanceType {

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use core::fmt;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -40,7 +41,7 @@ use super::{
 };
 use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
-pub trait Quantization: Send + Sync + DeepSizeOf + Into<Quantizer> {
+pub trait Quantization: Send + Sync + Debug + DeepSizeOf + Into<Quantizer> {
     type BuildParams: QuantizerBuildParams;
     type Metadata: QuantizerMetadata + Send + Sync;
     type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore;
@@ -54,7 +55,7 @@ pub trait Quantization: Send + Sync + DeepSizeOf + Into<Quantizer> {
     fn column(&self) -> &'static str;
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef>;
     fn metadata_key() -> &'static str;
-    fn quantization_type(&self) -> QuantizationType;
+    fn quantization_type() -> QuantizationType;
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value>;
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer>;
 }
@@ -124,9 +125,9 @@ impl Quantizer {
 
     pub fn quantization_type(&self) -> QuantizationType {
         match self {
-            Self::Flat(fq) => fq.quantization_type(),
-            Self::Product(pq) => pq.quantization_type(),
-            Self::Scalar(sq) => sq.quantization_type(),
+            Self::Flat(_) => QuantizationType::Flat,
+            Self::Product(_) => QuantizationType::Product,
+            Self::Scalar(_) => QuantizationType::Scalar,
         }
     }
 
@@ -247,7 +248,7 @@ impl Quantization for ScalarQuantizer {
         SQ_METADATA_KEY
     }
 
-    fn quantization_type(&self) -> QuantizationType {
+    fn quantization_type() -> QuantizationType {
         QuantizationType::Scalar
     }
 
@@ -294,7 +295,7 @@ impl Quantization for Arc<dyn ProductQuantizer> {
         PQ_METADTA_KEY
     }
 
-    fn quantization_type(&self) -> QuantizationType {
+    fn quantization_type() -> QuantizationType {
         QuantizationType::Product
     }
 
@@ -367,7 +368,7 @@ where
         PQ_METADTA_KEY
     }
 
-    fn quantization_type(&self) -> QuantizationType {
+    fn quantization_type() -> QuantizationType {
         QuantizationType::Product
     }
 

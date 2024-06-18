@@ -21,6 +21,7 @@ use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizerImpl;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::{
@@ -74,20 +75,6 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
-        }
-    }
-
-    // IVF_HNSW index
-    pub fn ivf_hnsw(
-        num_partitions: usize,
-        distance_type: DistanceType,
-        hnsw_params: HnswBuildParams,
-    ) -> Self {
-        let ivf_params = IvfBuildParams::new(num_partitions);
-        let stages = vec![StageParams::Ivf(ivf_params), StageParams::Hnsw(hnsw_params)];
-        Self {
-            stages,
-            metric_type: distance_type,
         }
     }
 
@@ -436,7 +423,7 @@ pub(crate) async fn open_vector_index(
                         location: location!(),
                     });
                 }
-                let ivf = Ivf::try_from(ivf_pb)?;
+                let ivf = IvfModel::try_from(ivf_pb.to_owned())?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
                     dataset.session.clone(),
                     uuid,
@@ -503,7 +490,7 @@ pub(crate) async fn open_vector_index_v2(
                 .child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
-            let ivf_data = Ivf::load(&reader).await?;
+            let ivf_data = IvfModel::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizerImpl<Float32Type>>::try_new(
                 reader.object_reader.clone(),
@@ -512,7 +499,7 @@ pub(crate) async fn open_vector_index_v2(
             )
             .await?;
             let pb_ivf = pb::Ivf::try_from(&ivf_data)?;
-            let ivf = Ivf::try_from(&pb_ivf)?;
+            let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
                 dataset.session.clone(),
@@ -531,7 +518,7 @@ pub(crate) async fn open_vector_index_v2(
                 .child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
-            let ivf_data = Ivf::load(&reader).await?;
+            let ivf_data = IvfModel::load(&reader).await?;
             let options = HNSWIndexOptions {
                 use_residual: false,
             };
@@ -543,7 +530,7 @@ pub(crate) async fn open_vector_index_v2(
             )
             .await?;
             let pb_ivf = pb::Ivf::try_from(&ivf_data)?;
-            let ivf = Ivf::try_from(&pb_ivf)?;
+            let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
                 dataset.session.clone(),

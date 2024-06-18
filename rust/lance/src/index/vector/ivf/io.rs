@@ -23,7 +23,7 @@ use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
-use lance_index::vector::ivf::storage::{Ivf, IvfModel};
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{Quantization, Quantizer};
 use lance_index::vector::v3::subindex::IvfSubIndex;
@@ -32,7 +32,7 @@ use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::{DistanceType, MetricType};
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
@@ -41,7 +41,7 @@ use snafu::{location, Location};
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
-use super::{IVFIndex, Ivf};
+use super::IVFIndex;
 use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
 
@@ -143,7 +143,7 @@ async fn merge_streams(
 /// TODO: migrate this function to `lance-index` crate.
 pub(super) async fn write_pq_partitions(
     writer: &mut dyn Writer,
-    ivf: &mut Ivf,
+    ivf: &mut IvfModel,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<()> {
@@ -224,7 +224,7 @@ pub(super) async fn write_pq_partitions(
         .await?;
 
         let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
-        ivf.add_partition(writer.tell().await?, total_records as u32);
+        ivf.add_partition_with_offset(writer.tell().await?, total_records as u32);
         if total_records > 0 {
             let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             PlainEncoder::write(writer, &pq_refs).await?;
@@ -249,7 +249,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     hnsw_params: &HnswBuildParams,
     writer: &mut FileWriter<ManifestDescribing>,
     mut auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
-    ivf: &mut Ivf,
+    ivf: &mut IvfModel,
     quantizer: Quantizer,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
@@ -380,14 +380,14 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }));
     }
 
-    let mut aux_ivf = Ivf::empty();
+    let mut aux_ivf = IvfModel::empty();
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     for (part_id, task) in tasks.into_iter().enumerate() {
         let offset = writer.len();
         let num_rows = task.await??;
 
         if num_rows == 0 {
-            ivf.add_partition(offset, 0);
+            ivf.add_partition(0);
             aux_ivf.add_partition(0);
             hnsw_metadata.push(HnswMetadata::default());
             continue;
@@ -410,7 +410,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             .await?;
         writer.write(&batches).await?;
 
-        ivf.add_partition(offset, (writer.len() - offset) as u32);
+        ivf.add_partition((writer.len() - offset) as u32);
         hnsw_metadata.push(serde_json::from_str(
             part_reader.schema().metadata[HNSW::metadata_key()].as_str(),
         )?);

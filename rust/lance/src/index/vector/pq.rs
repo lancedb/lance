@@ -19,8 +19,10 @@ use deepsize::DeepSizeOf;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::ProductQuantizationStorage;
-use lance_index::vector::quantizer::Quantization;
+use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
+use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     vector::{pq::ProductQuantizer, Query, DIST_COL},
     Index, IndexType,
@@ -37,7 +39,6 @@ use tracing::{instrument, span, Level};
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
 use lance_linalg::kernels::normalize_fsl;
 
-use super::ivf::Ivf;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
@@ -131,6 +132,10 @@ impl Index for PQIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+        Ok(self)
     }
 
     fn index_type(&self) -> IndexType {
@@ -303,6 +308,18 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
+    fn ivf_model(&self) -> IvfModel {
+        unimplemented!("only for IVF")
+    }
+    fn quantizer(&self) -> Quantizer {
+        unimplemented!("only for IVF")
+    }
+
+    /// the index type of this vector index.
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+        (SubIndexType::Flat, QuantizationType::Product)
+    }
+
     fn metric_type(&self) -> MetricType {
         self.metric_type
     }
@@ -323,7 +340,7 @@ pub(super) async fn build_pq_model(
     dim: usize,
     metric_type: MetricType,
     params: &PQBuildParams,
-    ivf: Option<&Ivf>,
+    ivf: Option<&IvfModel>,
 ) -> Result<Arc<dyn ProductQuantizer>> {
     if let Some(codebook) = &params.codebook {
         let mt = if metric_type == MetricType::Cosine {
@@ -396,7 +413,7 @@ pub(super) async fn build_pq_model(
         //
         // TODO: consolidate IVF models to `lance_index`.
         let ivf2 = lance_index::vector::ivf::new_ivf_transformer(
-            ivf.centroids.clone(),
+            ivf.centroids.clone().unwrap(),
             MetricType::L2,
             vec![],
         );
@@ -488,7 +505,7 @@ mod tests {
 
         let centroids = generate_random_array_with_range(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf = Ivf::new(fsl);
+        let ivf = IvfModel::new(fsl);
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
             .await
@@ -552,7 +569,7 @@ mod tests {
         let row = vectors.slice(0, 1);
 
         let ivf2 = lance_index::vector::ivf::new_ivf_transformer(
-            ivf.centroids.clone(),
+            ivf.centroids.clone().unwrap(),
             MetricType::L2,
             vec![],
         );

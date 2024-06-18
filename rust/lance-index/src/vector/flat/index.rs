@@ -204,7 +204,7 @@ impl Quantization for FlatQuantizer {
         "flat"
     }
 
-    fn quantization_type(&self) -> QuantizationType {
+    fn quantization_type() -> QuantizationType {
         QuantizationType::Flat
     }
 

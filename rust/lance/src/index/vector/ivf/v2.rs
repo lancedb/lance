@@ -24,7 +24,12 @@ use lance_arrow::RecordBatchExt;
 use lance_core::{cache::DEFAULT_INDEX_CACHE_SIZE, Error, Result};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::reader::FileReader;
+use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::quantizer::{QuantizationType, Quantizer};
+use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     pb,
     vector::{
@@ -45,7 +50,6 @@ use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use crate::index::vector::builder::IvfIndexBuilder;
 use crate::{
     index::{vector::VectorIndex, PreFilter},
     session::Session,
@@ -54,7 +58,7 @@ use crate::{
 use super::{centroids_to_vectors, IvfIndexPartitionStatistics, IvfIndexStatistics};
 /// IVF Index.
 #[derive(Debug)]
-pub struct IVFIndex<I: IvfSubIndex + 'static, Q: Quantization> {
+pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization> {
     uuid: String,
 
     /// Ivf model
@@ -65,7 +69,7 @@ pub struct IVFIndex<I: IvfSubIndex + 'static, Q: Quantization> {
     storage: IvfQuantizationStorage,
 
     /// Index in each partition.
-    sub_index_cache: Cache<String, Arc<I>>,
+    sub_index_cache: Cache<String, Arc<S>>,
 
     distance_type: DistanceType,
 
@@ -78,14 +82,14 @@ pub struct IVFIndex<I: IvfSubIndex + 'static, Q: Quantization> {
     _marker: PhantomData<Q>,
 }
 
-impl<I: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<I, Q> {
+impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.uuid.deep_size_of_children(context) + self.storage.deep_size_of_children(context)
         // Skipping session since it is a weak ref
     }
 }
 
-impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
+impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// Create a new IVF index.
     pub(crate) async fn try_new(
         object_store: Arc<ObjectStore>,
@@ -130,14 +134,14 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
                 location: location!(),
             })?;
         let ivf_pb_bytes = index_reader.read_global_buffer(ivf_pos).await?;
-        let ivf = Ivf::try_from(&pb::Ivf::decode(ivf_pb_bytes)?)?;
+        let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_pb_bytes)?)?;
 
         let sub_index_metadata = index_reader
             .schema()
             .metadata
-            .get(I::metadata_key())
+            .get(S::metadata_key())
             .ok_or(Error::Index {
-                message: format!("{} not found", I::metadata_key()),
+                message: format!("{} not found", S::metadata_key()),
                 location: location!(),
             })?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
@@ -170,7 +174,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn load_partition(&self, partition_id: usize, write_cache: bool) -> Result<Arc<I>> {
+    pub async fn load_partition(&self, partition_id: usize, write_cache: bool) -> Result<Arc<S>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
         let part_index = if let Some(part_idx) = self.sub_index_cache.get(&cache_key) {
             part_idx
@@ -187,7 +191,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
             }
 
             let schema = Arc::new(self.reader.schema().as_ref().into());
-            let batch = match length {
+            let batch = match self.reader.metadata().num_rows {
                 0 => RecordBatch::new_empty(schema),
                 _ => {
                     let batches = self
@@ -204,24 +208,35 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
                 }
             };
             let batch = batch.add_metadata(
-                I::metadata_key().to_owned(),
+                S::metadata_key().to_owned(),
                 self.sub_index_metadata[partition_id].clone(),
             )?;
-            let idx = Arc::new(I::load(batch)?);
+            let idx = Arc::new(S::load(batch)?);
             if write_cache {
                 self.sub_index_cache.insert(cache_key.clone(), idx.clone());
             }
             idx
         };
+
         Ok(part_index)
+    }
+
+    pub async fn load_partition_storage(&self, partition_id: usize) -> Result<Q::Storage> {
+        self.storage.load_partition::<Q>(partition_id).await
     }
 
     /// preprocess the query vector given the partition id.
     ///
     /// Internal API with no stability guarantees.
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
-        if I::use_residual() {
-            let partition_centroids = self.ivf.centroids.value(partition_id);
+        if S::use_residual() {
+            let partition_centroids =
+                self.ivf
+                    .centroid(partition_id)
+                    .ok_or_else(|| Error::Index {
+                        message: format!("partition centroid {} does not exist", partition_id),
+                        location: location!(),
+                    })?;
             let residual_key = sub(&query.key, &partition_centroids)?;
             let mut part_query = query.clone();
             part_query.key = residual_key;
@@ -233,7 +248,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization> IVFIndex<I, Q> {
 }
 
 #[async_trait]
-impl<I: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<I, Q> {
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, Q> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -242,7 +257,7 @@ impl<I: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<I, 
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
         Ok(self)
     }
 
@@ -252,12 +267,12 @@ impl<I: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<I, 
 
     fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = (0..self.ivf.num_partitions())
-            .map(|&part_id| IvfIndexPartitionStatistics {
-                size: self.ivf.partition_size(part_id),
+            .map(|part_id| IvfIndexPartitionStatistics {
+                size: self.ivf.partition_size(part_id) as u32,
             })
             .collect::<Vec<_>>();
 
-        let centroid_vecs = centroids_to_vectors(&self.ivf.centroids)?;
+        let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
 
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type: "IVF".to_string(),
@@ -279,8 +294,8 @@ impl<I: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<I, 
 }
 
 #[async_trait]
-impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'static> VectorIndex
-    for IVFIndex<I, Q>
+impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'static> VectorIndex
+    for IVFIndex<S, Q>
 {
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         pre_filter.wait_for_ready().await?;
@@ -348,12 +363,12 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true).await?;
+        let part_storage = self.load_partition_storage(partition_id).await?;
 
         let query = self.preprocess_query(partition_id, query)?;
-        let storage = self.storage.load_partition::<Q>(partition_id).await?;
         let param = (&query).into();
         pre_filter.wait_for_ready().await?;
-        part_index.search(query.key, query.k, param, &storage, pre_filter)
+        part_index.search(query.key, query.k, param, &part_storage, pre_filter)
     }
 
     fn is_loadable(&self) -> bool {
@@ -397,14 +412,26 @@ impl<I: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         })
     }
 
+    fn ivf_model(&self) -> IvfModel {
+        self.ivf.clone()
+    }
+
+    fn quantizer(&self) -> Quantizer {
+        self.storage.quantizer::<Q>().unwrap()
+    }
+
+    /// the index type of this vector index.
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+        (S::name().try_into().unwrap(), Q::quantization_type())
+    }
+
     fn metric_type(&self) -> DistanceType {
         self.distance_type
     }
-
-    fn ivf_model(&self) -> pb::IvfModel {
-        self.ivf.clone().into()
-    }
 }
+
+pub type IvfFlatIndex = IVFIndex<FlatIndex, FlatQuantizer>;
+pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
 
 #[cfg(test)]
 mod tests {
@@ -418,8 +445,10 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
 
     use lance_core::ROW_ID;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
-    use lance_index::DatasetIndexExt;
+    use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::generate_random_array_with_range;
     use tempfile::tempdir;
@@ -542,27 +571,25 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_build_ivf_hnsw_sq() {
+    async fn test_create_ivf_hnsw_sq(distance_type: DistanceType) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
+
+        let nlist = 4;
         let (mut dataset, vectors) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
-        let nlist = 16;
+        let ivf_params = IvfBuildParams::new(nlist);
+        let sq_params = SQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            DistanceType::L2,
-            IvfBuildParams::new(nlist),
-            Default::default(),
-            Default::default(),
+            distance_type,
+            ivf_params,
+            hnsw_params,
+            sq_params,
         );
+
         dataset
-            .create_index(
-                &["vector"],
-                lance_index::IndexType::Vector,
-                None,
-                &params,
-                true,
-            )
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
 
@@ -606,11 +633,21 @@ mod tests {
 
         let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 0.9,
+            recall >= 1.0,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,
             gt,
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq_cosine() {
+        test_create_ivf_hnsw_sq(DistanceType::Cosine).await
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq_dot() {
+        test_create_ivf_hnsw_sq(DistanceType::Dot).await
     }
 }

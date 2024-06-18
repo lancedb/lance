@@ -14,8 +14,8 @@ use lance_core::{Result, ROW_ID_FIELD};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lazy_static::lazy_static;
-use quantizer::{Quantization, QuantizationType, Quantizer};
-use v3::subindex::IvfSubIndex;
+use quantizer::{QuantizationType, Quantizer};
+use v3::subindex::SubIndexType;
 
 pub mod bq;
 pub mod flat;
@@ -191,19 +191,5 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     fn quantizer(&self) -> Quantizer;
 
     /// the index type of this vector index.
-    fn index_type(&self) -> (SubIndexType, QuantizationType);
-}
-
-pub enum SubIndexType {
-    Flat,
-    Hnsw,
-}
-
-impl std::fmt::Display for SubIndexType {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Self::Flat => write!(f, "{}", flat::index::FlatIndex::name()),
-            Self::Hnsw => write!(f, "{}", hnsw::builder::HNSW::name()),
-        }
-    }
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
 }

@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use arrow_array::{Array, FixedSizeListArray, UInt32Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt32Array};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
@@ -28,15 +28,16 @@ pub struct IvfModel {
     pub centroids: Option<FixedSizeListArray>,
 
     /// Offset of each partition in the file.
-    offsets: Vec<usize>,
+    pub offsets: Vec<usize>,
 
     /// Number of vectors in each partition.
-    lengths: Vec<u32>,
+    pub lengths: Vec<u32>,
 }
 
 impl DeepSizeOf for IvfModel {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.centroids
+            .as_ref()
             .map(|centroids| centroids.get_array_memory_size())
             .unwrap_or_default()
             + self.lengths.deep_size_of_children(context)
@@ -49,7 +50,7 @@ impl IvfModel {
         Self {
             centroids: None,
             offsets: vec![],
-            lengths: vec![0],
+            lengths: vec![],
         }
     }
 
@@ -57,8 +58,12 @@ impl IvfModel {
         Self {
             centroids: Some(centroids),
             offsets: vec![],
-            lengths: vec![0],
+            lengths: vec![],
         }
+    }
+
+    pub fn centroid(&self, partition: usize) -> Option<ArrayRef> {
+        self.centroids.as_ref().map(|c| c.value(partition))
     }
 
     /// Ivf model dimension.
@@ -97,6 +102,13 @@ impl IvfModel {
     pub fn add_partition(&mut self, len: u32) {
         self.offsets
             .push(self.lengths.last().cloned().unwrap_or_default() as usize);
+        self.lengths.push(len);
+    }
+
+    /// Add the offset and length of one partition with the given offset.
+    /// this is used for old index format of IVF_PQ.
+    pub fn add_partition_with_offset(&mut self, offset: usize, len: u32) {
+        self.offsets.push(offset);
         self.lengths.push(len);
     }
 

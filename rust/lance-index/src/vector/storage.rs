@@ -28,6 +28,7 @@ use crate::{
     INDEX_METADATA_SCHEMA_KEY,
 };
 
+use super::quantizer::Quantizer;
 use super::DISTANCE_TYPE_KEY;
 
 /// <section class="warning">
@@ -206,6 +207,11 @@ impl IvfQuantizationStorage {
             metadata,
             ivf,
         })
+    }
+
+    pub fn quantizer<Q: Quantization>(&self) -> Result<Quantizer> {
+        let metadata = serde_json::from_str(&self.metadata[0])?;
+        Q::from_metadata(&metadata, self.distance_type)
     }
 
     /// Get the number of partitions in the storage.
