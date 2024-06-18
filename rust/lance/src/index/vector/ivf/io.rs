@@ -52,7 +52,7 @@ use crate::{dataset::ROW_ID, Dataset};
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 lazy_static::lazy_static! {
-    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = num_cpus::get();
+    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = 1;
 }
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
