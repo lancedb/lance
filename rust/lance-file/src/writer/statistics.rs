@@ -1314,8 +1314,8 @@ mod tests {
     fn test_collect_float_stats() {
         // NaN values are ignored in statistics
         let arrays: Vec<ArrayRef> = vec![
-            Arc::new(Float32Array::from(vec![4.0f32, 3.0, std::f32::NAN, 2.0])),
-            Arc::new(Float32Array::from(vec![-10.0f32, 3.0, 5.0, std::f32::NAN])),
+            Arc::new(Float32Array::from(vec![4.0f32, 3.0, f32::NAN, 2.0])),
+            Arc::new(Float32Array::from(vec![-10.0f32, 3.0, 5.0, f32::NAN])),
         ];
         let array_refs = arrays.iter().collect::<Vec<_>>();
         let stats = collect_statistics(&array_refs);
@@ -1361,9 +1361,9 @@ mod tests {
         // If all values are NaN, min and max are -Inf and Inf respectively,
         // NaN values don't count towards null count.
         let arrays: Vec<ArrayRef> = vec![Arc::new(Float64Array::from(vec![
-            std::f64::NAN,
-            std::f64::NAN,
-            std::f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
         ]))];
         let array_refs = arrays.iter().collect::<Vec<_>>();
         let stats = collect_statistics(&array_refs);
@@ -1677,8 +1677,8 @@ mod tests {
         });
         builder.append(StatisticsRow {
             null_count: 0,
-            min_value: ScalarValue::Int32(Some(std::i32::MIN)),
-            max_value: ScalarValue::Int32(Some(std::i32::MAX)),
+            min_value: ScalarValue::Int32(Some(i32::MIN)),
+            max_value: ScalarValue::Int32(Some(i32::MAX)),
         });
 
         // If we try to finish at this point, it will error since we don't have
@@ -1697,8 +1697,8 @@ mod tests {
         });
         builder.append(StatisticsRow {
             null_count: 0,
-            min_value: ScalarValue::Int32(Some(std::i32::MIN)),
-            max_value: ScalarValue::Int32(Some(std::i32::MAX)),
+            min_value: ScalarValue::Int32(Some(i32::MIN)),
+            max_value: ScalarValue::Int32(Some(i32::MAX)),
         });
 
         // Collect stats for b
@@ -1751,11 +1751,11 @@ mod tests {
                     ),
                     (
                         Arc::new(ArrowField::new("min_value", DataType::Int32, true)),
-                        Arc::new(Int32Array::from(vec![1, std::i32::MIN])) as ArrayRef,
+                        Arc::new(Int32Array::from(vec![1, i32::MIN])) as ArrayRef,
                     ),
                     (
                         Arc::new(ArrowField::new("max_value", DataType::Int32, true)),
-                        Arc::new(Int32Array::from(vec![3, std::i32::MAX])) as ArrayRef,
+                        Arc::new(Int32Array::from(vec![3, i32::MAX])) as ArrayRef,
                     ),
                 ])),
                 Arc::new(StructArray::from(vec![
@@ -2005,11 +2005,11 @@ mod tests {
             ScalarValue::UInt32(Some(1)),
             ScalarValue::UInt64(Some(1)),
             ScalarValue::Float32(Some(1.0)),
-            ScalarValue::Float32(Some(std::f32::INFINITY)),
-            ScalarValue::Float32(Some(std::f32::NEG_INFINITY)),
+            ScalarValue::Float32(Some(f32::INFINITY)),
+            ScalarValue::Float32(Some(f32::NEG_INFINITY)),
             ScalarValue::Float64(Some(1.0)),
-            ScalarValue::Float64(Some(std::f64::INFINITY)),
-            ScalarValue::Float64(Some(std::f64::NEG_INFINITY)),
+            ScalarValue::Float64(Some(f64::INFINITY)),
+            ScalarValue::Float64(Some(f64::NEG_INFINITY)),
             ScalarValue::Utf8(Some("foo".to_string())),
             ScalarValue::Utf8(Some("a".repeat(BINARY_PREFIX_LENGTH))),
             ScalarValue::Binary(Some(vec![0_u8; BINARY_PREFIX_LENGTH])),
