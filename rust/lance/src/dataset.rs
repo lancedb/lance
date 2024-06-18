@@ -44,6 +44,7 @@ pub mod progress;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
+mod tag;
 mod take;
 pub mod transaction;
 pub mod updater;
@@ -54,8 +55,9 @@ use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
+use self::tag::Tag;
 use self::transaction::{Operation, Transaction};
-use self::write::{write_fragments_internal, write_new_refs_file};
+use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
@@ -490,11 +492,6 @@ impl Dataset {
         }
 
         let object_store = Arc::new(object_store);
-
-        if matches!(params.mode, WriteMode::Create) {
-            write_new_refs_file(object_store.clone(), &base, params.clone()).await?;
-        }
-
         let fragments = write_fragments_internal(
             dataset.as_ref(),
             object_store.clone(),
@@ -1172,8 +1169,19 @@ impl Dataset {
     }
 
     /// Get all tags.
-    pub async fn tags(&self) -> Result<HashMap<String, u64>> {
-        Ok(HashMap::<String, u64>::new())
+    pub async fn tags(&self) -> Result<Vec<Tag>> {
+        let tag_names = self.object_store().read_dir("tags").await.unwrap();
+        let mut tags = Vec::<Tag>::new();
+
+        for n in tag_names.iter() {
+            tags.push(Tag {
+                name: n.to_owned(),
+                version: 1,
+                manifest_size: 0,
+            })
+        }
+
+        Ok(tags)
     }
 
     /// Get the latest version of the dataset
