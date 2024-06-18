@@ -94,10 +94,14 @@ mod kernel {
     extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
         pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn dot_f16_lsx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn dot_f16_lasx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
@@ -111,7 +115,7 @@ impl Dot for f16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_suppport = "avx512",
+                kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512 => unsafe {
@@ -120,6 +124,14 @@ impl Dot for f16 {
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx2 => unsafe {
                 kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                kernel::dot_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                kernel::dot_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             _ => dot_scalar::<Self, f32, 16>(x, y),
         }
@@ -186,6 +198,17 @@ impl Dot for f64 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         dot_scalar::<Self, Self, 8>(x, y) as f32
+    }
+}
+
+impl Dot for u8 {
+    #[inline]
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
+        // TODO: this is not optimized for auto vectorization yet.
+        x.iter()
+            .zip(y.iter())
+            .map(|(&x_i, &y_i)| x_i as u32 * y_i as u32)
+            .sum::<u32>() as f32
     }
 }
 

@@ -236,9 +236,18 @@ impl ExecutionPlan for KNNFlatExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "KNNFlatExec node must have exactly one child".to_string(),
+            ));
+        }
+
+        Ok(Arc::new(Self::try_new(
+            children.pop().expect("length checked"),
+            self.query.clone(),
+        )?))
     }
 
     fn execute(

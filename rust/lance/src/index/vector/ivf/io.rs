@@ -15,6 +15,7 @@ use futures::stream::Peekable;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
+use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::Error;
 use lance_file::reader::FileReader;
@@ -22,7 +23,7 @@ use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
-use lance_index::vector::ivf::storage::Ivf;
+use lance_index::vector::ivf::storage::{Ivf, IvfModel};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{Quantization, Quantizer};
 use lance_index::vector::v3::subindex::IvfSubIndex;
@@ -41,10 +42,10 @@ use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
+use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
 
 use crate::Result;
-use crate::{dataset::ROW_ID, Dataset};
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 lazy_static::lazy_static! {
@@ -242,9 +243,9 @@ pub(super) async fn write_pq_partitions(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write_hnsw_quantization_index_partitions(
-    dataset: &Dataset,
+    dataset: Arc<dyn DatasetTakeRows>,
     column: &str,
-    metric_type: MetricType,
+    distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     writer: &mut FileWriter<ManifestDescribing>,
     mut auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
@@ -252,9 +253,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     quantizer: Quantizer,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
-) -> Result<(Vec<HnswMetadata>, Ivf)> {
-    let dataset = Arc::new(dataset.clone());
-    let column = Arc::new(column.to_owned());
+) -> Result<(Vec<HnswMetadata>, IvfModel)> {
     let hnsw_params = Arc::new(hnsw_params.clone());
 
     let mut streams_heap = BinaryHeap::new();
@@ -356,7 +355,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         };
 
         let dataset = dataset.clone();
-        let column = column.clone();
+        let column = column.to_owned();
         let hnsw_params = hnsw_params.clone();
         let quantizer = quantizer.clone();
         let sem = sem.clone();
@@ -366,8 +365,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             log::debug!("Building HNSW partition {}", part_id);
             let result = build_hnsw_quantization_partition(
                 dataset,
-                column,
-                metric_type,
+                &column,
+                distance_type,
                 hnsw_params,
                 part_writer,
                 aux_part_writer,
@@ -446,8 +445,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
 #[allow(clippy::too_many_arguments)]
 async fn build_hnsw_quantization_partition(
-    dataset: Arc<Dataset>,
-    column: Arc<String>,
+    dataset: Arc<dyn DatasetTakeRows>,
+    column: &str,
     metric_type: MetricType,
     hnsw_params: Arc<HnswBuildParams>,
     writer: FileWriter<ManifestDescribing>,
@@ -461,7 +460,7 @@ async fn build_hnsw_quantization_partition(
     std::mem::drop(row_ids_array);
     let num_rows = row_ids.len();
 
-    let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
+    let projection = Arc::new(dataset.schema().project(&[column])?);
     let mut vectors = dataset
         .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
         .await?
@@ -535,6 +534,7 @@ mod tests {
     use super::*;
 
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
+    use crate::Dataset;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
     use lance_index::IndexType;

@@ -15,7 +15,7 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::{l2_distance_uint_scalar, DistanceType};
+use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
@@ -285,10 +285,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
 impl VectorStore for ScalarQuantizationStorage {
     type DistanceCalculator<'a> = SQDistCalculator<'a>;
 
-    fn try_from_batch(
-        batch: RecordBatch,
-        distance_type: lance_linalg::distance::DistanceType,
-    ) -> Result<Self>
+    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
     where
         Self: Sized,
     {
@@ -375,10 +372,13 @@ impl VectorStore for ScalarQuantizationStorage {
     fn distance_between(&self, a: u32, b: u32) -> f32 {
         let (offset_a, chunk_a) = self.chunk(a);
         let (offset_b, chunk_b) = self.chunk(b);
-        l2_distance_uint_scalar(
-            chunk_a.sq_code_slice(a - offset_a),
-            chunk_b.sq_code_slice(b - offset_b),
-        )
+        let a_slice = chunk_a.sq_code_slice(a - offset_a);
+        let b_slice = chunk_b.sq_code_slice(b - offset_b);
+        match self.distance_type {
+            DistanceType::L2 | DistanceType::Cosine => l2_distance_uint_scalar(a_slice, b_slice),
+            DistanceType::Dot => dot_distance(a_slice, b_slice),
+            _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
+        }
     }
 }
 
@@ -402,7 +402,13 @@ impl<'a> DistCalculator for SQDistCalculator<'a> {
     fn distance(&self, id: u32) -> f32 {
         let (offset, chunk) = self.storage.chunk(id);
         let sq_code = chunk.sq_code_slice(id - offset);
-        l2_distance_uint_scalar(sq_code, &self.query_sq_code)
+        match self.storage.distance_type {
+            DistanceType::L2 | DistanceType::Cosine => {
+                l2_distance_uint_scalar(sq_code, &self.query_sq_code)
+            }
+            DistanceType::Dot => dot_distance(sq_code, &self.query_sq_code),
+            _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
+        }
     }
 
     #[allow(unused_variables)]
