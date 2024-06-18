@@ -331,6 +331,8 @@ impl IvfShuffler {
 
         info!("Shuffling into memory");
 
+        let mut num_processed = 0;
+
         for &ShuffleInput {
             file_idx,
             start,
@@ -341,17 +343,16 @@ impl IvfShuffler {
             let file_name = &self.unsorted_buffers[file_idx];
             let path = self.output_dir.child(file_name.as_str());
             let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
-            let total_batch = reader.num_batches();
 
             let mut stream = stream::iter(start..end)
                 .map(|i| reader.read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema()))
-                .buffered(16)
-                .enumerate();
+                .buffered(16);
 
-            while let Some((idx, batch)) = stream.next().await {
-                if idx % 100 == 0 {
-                    info!("Shuffle Progress {}/{}", idx, num_batches_to_sort);
+            while let Some(batch) = stream.next().await {
+                if num_processed % 100 == 0 {
+                    info!("Shuffle Progress {}/{}", num_processed, num_batches_to_sort);
                 }
+                num_processed += 1;
 
                 let batch = batch?;
 
