@@ -462,13 +462,7 @@ pub async fn commit_handler_from_url(
             }))
         }
         "gs" | "az" | "file" | "file-object-store" | "memory" => Ok(Arc::new(RenameCommitHandler)),
-
-        unknow_scheme => {
-            let err = lance_core::Error::from(object_store::Error::NotSupported {
-                source: format!("Unsupported URI scheme: {}", unknow_scheme).into(),
-            });
-            Err(err)
-        }
+        _ => Ok(Arc::new(UnsafeCommitHandler)),
     }
 }
 
