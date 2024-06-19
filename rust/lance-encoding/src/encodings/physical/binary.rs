@@ -384,14 +384,14 @@ impl ArrayEncoder for BinaryEncoder {
         } else {
             let index_arrays = get_indices_from_string_arrays(arrays);
             let encoded_indices = self.indices_encoder.encode(&index_arrays, buffer_index)?;
-            for arr in &index_arrays {
-                println!("indices: {:?}", arr);
-            }
+            // for arr in &index_arrays {
+            //     println!("indices: {:?}", arr);
+            // }
 
             let byte_arrays = get_bytes_from_string_arrays(arrays);
-            for arr in &byte_arrays {
-                println!("arr: {:?}", arr);
-            }
+            // for arr in &byte_arrays {
+            //     println!("arr: {:?}", arr);
+            // }
             let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
 
             let mut encoded_buffers = encoded_indices.buffers;
