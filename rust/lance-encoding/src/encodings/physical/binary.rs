@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
+// use arrow::compute::concat;
 use arrow_array::{
-    builder::{ArrayBuilder, Int32Builder, UInt8Builder},
-    Array, ArrayRef, Int32Array, StringArray, UInt32Array, UInt8Array,
+    builder::{ArrayBuilder, Int32Builder, UInt32Builder, UInt8Builder},
+    Array, ArrayRef, Int32Array, UInt32Array,
 };
-use futures::{future::BoxFuture, FutureExt};
+use futures::stream::StreamExt;
+use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt};
 // use rand::seq::index;
 
 use crate::{
@@ -23,19 +25,19 @@ use crate::{
 use crate::decoder::LogicalPageDecoder;
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
-// use arrow_cast::cast::cast;
+use arrow_array::PrimitiveArray;
 use arrow_schema::DataType;
 use lance_core::Result;
 
 #[derive(Debug)]
 pub struct BinaryPageScheduler {
-    indices_scheduler: Box<dyn PageScheduler>,
+    indices_scheduler: Arc<dyn PageScheduler>,
     bytes_scheduler: Arc<dyn PageScheduler>,
 }
 
 impl BinaryPageScheduler {
     pub fn new(
-        indices_scheduler: Box<dyn PageScheduler>,
+        indices_scheduler: Arc<dyn PageScheduler>,
         bytes_scheduler: Arc<dyn PageScheduler>,
     ) -> Self {
         Self {
@@ -52,90 +54,120 @@ impl PageScheduler for BinaryPageScheduler {
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
-        println!("Inside BinaryPageScheduler");
+        // println!("Inside BinaryPageScheduler");
 
-        // if user wants rows a..b, or range a..b+1
-        // Case 1: if a != 0, we need indices a-1..b inclusive
-        // Case 2: if a = 0, we need indices 0..b inclusive
-
+        // ranges corresponds to row ranges that the user wants to fetch.
+        // if user wants row range a..b
+        // Case 1: if a != 0, we need indices a-1..b to decode
+        // Case 2: if a = 0, we need indices 0..b to decode
         let indices_ranges = ranges
             .iter()
             .map(|range| {
                 if range.start != 0 {
-                    (range.start - 1)..range.end
+                    (range.start - 1)..(range.end)
                 } else {
-                    0..range.end
+                    0..(range.end)
                 }
             })
             .collect::<Vec<std::ops::Range<u32>>>();
 
-        let indices_page_decoder =
-            self.indices_scheduler
-                .schedule_ranges(&indices_ranges, scheduler, top_level_row);
+        let mut futures_ordered = FuturesOrdered::new();
+        for range in indices_ranges.iter() {
+            // println!("Range: {:?}", range);
+            let indices_page_decoder =
+                self.indices_scheduler
+                    .schedule_ranges(&[range.clone()], &scheduler, top_level_row);
+            futures_ordered.push_back(indices_page_decoder);
+        }
 
         let ranges = ranges.to_vec();
-        println!("Ranges: {:?}", ranges);
+        // println!("Ranges: {:?}", ranges);
         let copy_scheduler = scheduler.clone();
         let copy_bytes_scheduler = Arc::clone(&self.bytes_scheduler);
+        let copy_indices_ranges = indices_ranges.to_vec();
 
         async move {
-            println!("Started async move");
-            let indices_page_decoder = indices_page_decoder.await?;
-            let indices: Arc<dyn PhysicalPageDecoder> = Arc::from(indices_page_decoder);
+            // println!("Started async move");
 
-            let indices_num_rows = indices_ranges
-                .iter()
-                .map(|range| range.end - range.start)
-                .sum();
-            // let indices_num_rows = ranges[ranges.len() - 1].end - ranges[0].start;
-            println!("Indices num rows: {:?}", indices_num_rows);
-            let mut primitive_wrapper =
-                PrimitiveFieldDecoder::new_from_data(indices, DataType::UInt32, indices_num_rows);
-            let drained_task = primitive_wrapper.drain(indices_num_rows)?;
-            let indices_decode_task = drained_task.task;
-
-            let decoded_indices = indices_decode_task.decode()?;
-            println!("Decoded indices: {:?}", decoded_indices);
-            let indices_array = decoded_indices.as_primitive::<UInt32Type>();
-
-            let mut net_bytes = 0;
-            let mut bytes_ranges: Vec<std::ops::Range<u32>> = Vec::new();
-
-            // want range [1..3] or rows 1, 2
-            //      0        1        2        3       4        5
+            // For the following data:
             // "abcd", "hello", "abcd", "apple", "hello", "abcd"
             //   4,        9,     13,      18,      23,     27
-            // decoded indices = [4, 9, 13]
-            // if we wanted rows 0..3 even then the decoded indices would be the same as above.
-            // But then len(indices) = len(range), so we know that we want row 0 as well.
-            // Normally len(indices) = len(range) + 1
-            // So, non-zero case (a != 0): net bytes for range a->b, inclusive = indices[b] - indices[a-1]
-            // Zero case: net bytes for range 0->b, inclusive = indices[b]
+            // e.g. want to scan rows 0, 2, 4
+            // i.e. offsets are 4 | 9, 13 | 18, 23
+            // Normalization is required for decoding later on
+            // Normalize each part: 0, 4 | 0, 4 | 0, 5
+            // Remove leading zeros except first one: 0, 4 | 4 | 5
+            // Cumulative sum: 0, 4 | 8 | 13
+            // These are the normalized offsets stored in decoded_indices
+            // Rest of the workflow is continued later in BinaryPageDecoder
 
-            // want range [1..2] or row 1
-            // want indices [1]
+            let mut builder = UInt32Builder::new();
+            let mut bytes_ranges = Vec::new();
+            let mut curr_range_idx = 0;
+            let mut last = 0;
+            while let Some(indices_page_decoder) = futures_ordered.next().await {
+                let indices: Arc<dyn PhysicalPageDecoder> = Arc::from(indices_page_decoder?);
 
-            ranges.iter().for_each(|range| {
-                let end_index = usize::try_from(range.end).unwrap() - 1; // range.end=2, end_index=1
-                let start_index = usize::try_from(range.start).unwrap(); // range.start=1, start_index=1
+                // Build and run decode task for offsets
+                let curr_indices_range = copy_indices_ranges[curr_range_idx].clone();
+                let curr_row_range = ranges[curr_range_idx].clone();
+                let indices_num_rows = curr_indices_range.end - curr_indices_range.start;
+                let mut primitive_wrapper = PrimitiveFieldDecoder::new_from_data(
+                    indices,
+                    DataType::UInt32,
+                    indices_num_rows,
+                );
+                let drained_task = primitive_wrapper.drain(indices_num_rows)?;
+                let indices_decode_task = drained_task.task;
+                let decoded_part = indices_decode_task.decode()?;
 
-                let offset_start = if start_index == 0 {
-                    0
+                let indices_array = decoded_part.as_primitive::<UInt32Type>();
+                let mut indices_vec = indices_array.values().to_vec();
+
+                // Pad a zero at the start if the first row is requested
+                // This is because the offsets do not start with 0 by default
+                if curr_row_range.start == 0 {
+                    indices_vec.insert(0, 0);
+                }
+
+                // Normalize the indices as described above
+                let normalized_indices: PrimitiveArray<UInt32Type> = indices_vec
+                    .iter()
+                    .map(|x| x - indices_vec[0] + last)
+                    .collect();
+                last = normalized_indices.value(normalized_indices.len() - 1);
+                let normalized_vec = normalized_indices.values().to_vec();
+
+                // The first vector to be normalized should not have the leading zero removed
+                let truncated_vec = if curr_range_idx == 0 {
+                    normalized_vec.as_slice()
                 } else {
-                    indices_array.value(start_index - 1) // indices[1] = 9
+                    &normalized_vec[1..]
                 };
 
-                let offset_end = indices_array.value(end_index); // indices[2] = 13
-                net_bytes += offset_end - offset_start;
-                bytes_ranges.push(offset_start..(offset_end + 1));
-            });
+                builder.append_slice(truncated_vec);
 
-            println!("Net bytes: {:?}", net_bytes);
-            let bytes_ranges_slice = bytes_ranges.as_slice();
-            for range in bytes_ranges_slice {
-                println!("Bytes range: {:?}, {:?}", range.start, range.end);
+                // println!("Decoded part: {:?}", decoded_part);
+                // println!("Normalized part: {:?}", truncated_vec);
+
+                // get bytes range from the index range
+                let bytes_range = if curr_row_range.start != 0 {
+                    indices_array.value(0)..indices_array.value(indices_array.len() - 1)
+                } else {
+                    0..indices_array.value(indices_array.len() - 1)
+                };
+
+                // println!("Bytes range: {:?}", bytes_range);
+                bytes_ranges.push(bytes_range);
+                curr_range_idx += 1;
             }
 
+            let decoded_indices = Arc::new(builder.finish());
+            // println!("Decoded indices: {:?}", decoded_indices);
+
+            let bytes_ranges_slice = bytes_ranges.as_slice();
+
+            // Schedule the bytes for decoding
             let bytes_page_decoder = copy_bytes_scheduler.schedule_ranges(
                 bytes_ranges_slice,
                 &copy_scheduler,
@@ -158,32 +190,14 @@ struct BinaryPageDecoder {
     bytes_decoder: Box<dyn PhysicalPageDecoder>,
 }
 
-fn get_bytes_from_rows(
-    rows_to_skip: u32,
-    num_rows: u32,
-    offsets: &UInt32Array,
-) -> (u32, u32, UInt32Array) {
-    let bytes_to_skip;
-    let num_bytes;
-    let target_offsets;
-
-    if rows_to_skip == 0 {
-        target_offsets = offsets.slice(0, num_rows as usize);
-        bytes_to_skip = 0;
-        num_bytes = offsets.value(num_rows as usize - 1);
-    } else {
-        target_offsets = offsets.slice(
-            rows_to_skip.try_into().unwrap(),
-            num_rows.try_into().unwrap(),
-        ); // 4, 9
-        bytes_to_skip = offsets.value(rows_to_skip as usize);
-        num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;
-    }
-
-    (bytes_to_skip, num_bytes, target_offsets)
-}
-
 impl PhysicalPageDecoder for BinaryPageDecoder {
+    // Continuing the example from BinaryPageScheduler
+    // Suppose batch_size = 2. Then first, rows_to_skip=0, num_rows=2
+    // Need to scan 2 rows
+    // First row will be 4-0=4 bytes, second also 8-4=4 bytes.
+    // Allocate 8 bytes capacity.
+    // Next rows_to_skip=2, num_rows=1
+    // Skip 8 bytes. Allocate 5 bytes capacity.
     fn update_capacity(
         &self,
         rows_to_skip: u32,
@@ -191,60 +205,83 @@ impl PhysicalPageDecoder for BinaryPageDecoder {
         buffers: &mut [(u64, bool)],
         all_null: &mut bool,
     ) {
-        println!("Inside BinaryPageDecoder update_capacity");
-        println!("Rows to skip: {:?}, Num rows: {:?}", rows_to_skip, num_rows);
+        // println!("Inside BinaryPageDecoder update_capacity");
+        // println!("Rows to skip: {:?}, Num rows: {:?}", rows_to_skip, num_rows);
+
         let offsets = self
             .decoded_indices
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .unwrap(); // 4, 9, 13, 18, 23, 27
-        let (bytes_to_skip, num_bytes, _) = get_bytes_from_rows(rows_to_skip, num_rows, offsets);
+            .unwrap();
 
         // 32 bits or 4 bytes per value.
         buffers[0].0 = (num_rows as u64) * 4;
         buffers[0].1 = true;
 
-        println!(
-            "Capacity update: Bytes to skip: {:?}, Num bytes: {:?}",
-            bytes_to_skip, num_bytes
-        );
+        let bytes_to_skip = offsets.value(rows_to_skip as usize);
+        let num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;
+
+        // println!(
+        //     "Capacity update: Bytes to skip: {:?}, Num bytes: {:?}",
+        //     bytes_to_skip, num_bytes
+        // );
         self.bytes_decoder
             .update_capacity(bytes_to_skip, num_bytes, &mut buffers[1..], all_null);
+
+        // println!("Capacity updated");
     }
 
+    // Continuing from update_capacity:
+    // When rows_to_skip=2, num_rows=1
+    // The normalized offsets are [0, 4, 8, 13]
+    // We only need [8, 13] to decode in this case.
+    // These need to be normalized in order to build the string later
+    // So return [0, 5]
     fn decode_into(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
         dest_buffers: &mut [bytes::BytesMut],
     ) -> Result<()> {
-        println!("Rows to skip: {:?}, Num rows: {:?}", rows_to_skip, num_rows);
+        // println!("Rows to skip: {:?}, Num rows: {:?}", rows_to_skip, num_rows);
+
         let offsets = self
             .decoded_indices
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .unwrap(); // 4, 9, 13, 18, 23, 27
-        println!("Offsets: {:?}", offsets);
+            .unwrap();
 
-        let (bytes_to_skip, num_bytes, target_offsets) =
-            get_bytes_from_rows(rows_to_skip, num_rows, offsets);
+        // println!("Offsets: {:?}", offsets);
 
-        println!("Target offsets: {:?}", target_offsets);
-        println!(
-            "Bytes to skip: {:?}, Num bytes: {:?}",
-            bytes_to_skip, num_bytes
+        let bytes_to_skip = offsets.value(rows_to_skip as usize);
+        let num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;
+
+        let target_offsets = offsets.slice(
+            rows_to_skip.try_into().unwrap(),
+            (num_rows + 1).try_into().unwrap(),
         );
 
-        // copy target_offsets into dest_buffers[0]
-        let values = target_offsets.values();
+        // Normalize offsets
+        let target_vec = target_offsets.values();
+        let normalized_array: PrimitiveArray<UInt32Type> =
+            target_vec.iter().map(|x| x - target_vec[0]).collect();
+        let normalized_values = normalized_array.values();
+        // println!("Normalized values: {:?}", normalized_values);
+
         let byte_slice: &[u8] = unsafe {
             std::slice::from_raw_parts(
-                values.as_ptr() as *const u8,
-                values.len() * std::mem::size_of::<u32>(),
+                normalized_values.as_ptr() as *const u8,
+                normalized_values.len() * std::mem::size_of::<u32>(),
             )
         };
 
+        // copy target_offsets into dest_buffers[0]
         dest_buffers[0].extend_from_slice(byte_slice);
+
+        // Copy decoded bytes into dest_buffers[1..]
+        // Currently an empty null buffer is the first one
+        // The actual bytes are in the second buffer
+        // Including the indices this results in 3 buffers in total
         self.bytes_decoder
             .decode_into(bytes_to_skip, num_bytes, &mut dest_buffers[1..])?;
 
@@ -261,7 +298,6 @@ impl PhysicalPageDecoder for BinaryPageDecoder {
 
     fn num_buffers(&self) -> u32 {
         self.bytes_decoder.num_buffers() + 1
-        // 0
     }
 }
 
@@ -283,16 +319,17 @@ impl BinaryEncoder {
     }
 }
 
-// Returns indices arrays from string arrays
+// Creates indices arrays from string arrays
+// Strings are a vector of arrays corresponding to each record batch
+// Zero offset is removed from the start of the offsets array
+// The indices array is computed across all arrays in the vector
 fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
     let mut indices_builder = Int32Builder::new();
     let mut last_offset = 0;
     arrays.iter().for_each(|arr| {
         let string_arr = arrow_array::cast::as_string_array(arr);
-        println!("String array: {:?}", string_arr);
         let mut offsets = string_arr.value_offsets().to_vec();
         offsets = offsets[1..].to_vec();
-        println!("Offsets: {:?}", offsets);
 
         if indices_builder.len() == 0 {
             last_offset = offsets[offsets.len() - 1];
@@ -319,6 +356,7 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
     vec![final_array]
 }
 
+// Bytes computed across all string arrays, similar to indices above
 fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
     let mut bytes_builder = UInt8Builder::new();
     arrays.iter().for_each(|arr| {

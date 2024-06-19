@@ -122,7 +122,7 @@ pub fn decoder_from_array_encoding(
             let bytes_scheduler = decoder_from_array_encoding(bytes_encoding, buffers);
             println!("Creating new BinaryPageScheduler");
             Box::new(BinaryPageScheduler::new(
-                indices_scheduler,
+                indices_scheduler.into(),
                 bytes_scheduler.into(),
             ))
         }

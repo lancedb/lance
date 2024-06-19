@@ -16,7 +16,7 @@ use arrow_array::{
     },
     ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray, StringArray,
 };
-use arrow_buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
@@ -59,7 +59,6 @@ pub struct PrimitiveFieldScheduler {
 
 impl PrimitiveFieldScheduler {
     pub fn new(data_type: DataType, pages: Arc<[PageInfo]>, buffers: ColumnBuffers) -> Self {
-        println!("Creating new PrimitiveFieldScheduler");
         let page_schedulers = pages
             .iter()
             .map(|page| {
@@ -262,10 +261,10 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
             return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));
         }
 
-        capacities
-            .clone()
-            .into_iter()
-            .for_each(|buf| println!("Buffer length Initial {:?}", buf.0));
+        // capacities
+        //     .clone()
+        //     .into_iter()
+        //     .for_each(|buf| println!("Buffer length Initial {:?}", buf.0));
 
         // At this point we know the size needed for each buffer
         let mut bufs = capacities
@@ -281,15 +280,15 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
             })
             .collect::<Vec<_>>();
 
-        bufs.clone()
-            .into_iter()
-            .for_each(|buf| println!("Buffer length {:?}", buf.capacity()));
+        // bufs.clone()
+        //     .into_iter()
+        //     .for_each(|buf| println!("Buffer length {:?}", buf.capacity()));
 
         // Go ahead and fill the validity / values buffers
         self.physical_decoder
             .decode_into(self.rows_to_skip, self.rows_to_take, &mut bufs)?;
 
-        println!("rows to take: {:?}", self.rows_to_take);
+        // println!("rows to take: {:?}", self.rows_to_take);
         // Convert the two buffers into an Arrow array
         Self::primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)
     }
@@ -319,7 +318,6 @@ impl PrimitiveFieldDecodeTask {
 
         let data_buffer = buffer_iter.next().unwrap().freeze();
         let data_buffer = Buffer::from_bytes(data_buffer.into());
-        println!("buffer length: {:?}", data_buffer.len());
         let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
 
         // The with_data_type is needed here to recover the parameters for types like Decimal/Timestamp
@@ -499,30 +497,25 @@ impl PrimitiveFieldDecodeTask {
                 )))
             }
             DataType::Utf8 => {
-                // get offsets_buffer (indices) from buffer
-                println!("Buffers length: {:?}", buffers.len());
+                // iterate over buffers to get offsets and then bytes
                 let mut buffer_iter = buffers.into_iter();
                 let indices_bytes = buffer_iter.next().unwrap().freeze();
                 let indices_buffer = Buffer::from_bytes(indices_bytes.into());
-                let indices_bytes_arr = indices_buffer.as_slice();
-
-                let mut indices_buffer = MutableBuffer::new(num_rows as usize + 1);
-                indices_buffer.push(0);
-                indices_buffer.extend_from_slice(indices_bytes_arr);
                 let indices_buffer =
                     ScalarBuffer::<i32>::new(indices_buffer.into(), 0, num_rows as usize + 1);
 
                 let offsets = OffsetBuffer::new(indices_buffer.clone());
 
-                let indices_array = Arc::new(
-                    PrimitiveArray::<Int32Type>::new(indices_buffer.clone(), None)
-                        .with_data_type(DataType::Int32),
-                );
+                // let indices_array = Arc::new(
+                //     PrimitiveArray::<Int32Type>::new(indices_buffer.clone(), None)
+                //         .with_data_type(DataType::Int32),
+                // );
 
-                println!("Indices: {:?}", indices_array);
+                // println!("Indices: {:?}", indices_array);
 
-                // TODO - decoding the bytes creates 2 buffers, the first one is empty, probably due to nulls.
-                let _waste_buffer = buffer_iter.next().unwrap();
+                // TODO - add NULL support
+                // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
+                let _null_buffer = buffer_iter.next().unwrap();
 
                 let bytes_buffer = buffer_iter.next().unwrap().freeze();
                 let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
@@ -534,15 +527,14 @@ impl PrimitiveFieldDecodeTask {
                         .with_data_type(DataType::UInt8),
                 );
 
-                println!("Bytes: {:?}", bytes_array);
-
+                // println!("Bytes: {:?}", bytes_array);
                 // let final_str_arr = StringArray::new(offsets, bytes_array.values().into(), None);
                 // println!("Final String Array: {:?}", final_str_arr);
 
                 Ok(Arc::new(StringArray::new(
-                    offsets, // indices
+                    offsets,
                     bytes_array.values().into(),
-                    None, // bytes
+                    None,
                 )))
             }
             _ => Err(Error::io(
