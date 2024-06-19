@@ -1006,7 +1006,7 @@ pub mod tests {
 
     use arrow_array::{
         types::{Float64Type, Int32Type},
-        RecordBatch,
+        RecordBatch, StringArray, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use bytes::Bytes;
@@ -1018,8 +1018,11 @@ pub mod tests {
         decoder::{decode_batch, DecoderMiddlewareChain, FilterExpression},
         encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch},
     };
+    use lance_io::object_store::ObjectStore;
+    use lance_io::scheduler::ScanScheduler;
     use lance_io::stream::RecordBatchStream;
     use log::debug;
+    use object_store::path::Path;
 
     use crate::v2::{
         reader::{EncodedBatchReaderExt, FileReader, ReaderProjection},
@@ -1560,38 +1563,41 @@ pub mod tests {
         let fs_scheduler = ScanScheduler::new(object_store.clone(), 8);
         let file_scheduler = fs_scheduler.open_file(&tmp_path).await.unwrap();
 
-        let file_reader = FileReader::try_open(file_scheduler, None).await.unwrap();
+        let file_reader =
+            FileReader::try_open(file_scheduler, None, DecoderMiddlewareChain::default())
+                .await
+                .unwrap();
 
         for batch_size in [1, 2, 1024] {
             // Read different types of ranges from the file
             let (read_params, result_batches) = test_reading_rangefrom(schema.clone());
             let batch_stream = file_reader
-                .read_stream(read_params, batch_size, 16)
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
                 .unwrap();
             verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
             let (read_params, result_batches) = test_reading_rangeto(schema.clone());
             let batch_stream = file_reader
-                .read_stream(read_params, batch_size, 16)
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
                 .unwrap();
             verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
             let (read_params, result_batches) = test_reading_random_indices(schema.clone());
             let batch_stream = file_reader
-                .read_stream(read_params, batch_size, 16)
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
                 .unwrap();
             verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
             let (read_params, result_batches) = test_reading_partial_range(schema.clone());
             let batch_stream = file_reader
-                .read_stream(read_params, batch_size, 16)
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
                 .unwrap();
             verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
             let read_params = lance_io::ReadBatchParams::RangeFull;
             let result_batches = batches.clone();
             let batch_stream = file_reader
-                .read_stream(read_params, batch_size, 16)
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
                 .unwrap();
             verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
         }
