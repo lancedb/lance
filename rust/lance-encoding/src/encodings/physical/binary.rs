@@ -83,7 +83,7 @@ impl PageScheduler for BinaryPageScheduler {
         let ranges = ranges.to_vec();
         // println!("Ranges: {:?}", ranges);
         let copy_scheduler = scheduler.clone();
-        let copy_bytes_scheduler = Arc::clone(&self.bytes_scheduler);
+        let copy_bytes_scheduler = self.bytes_scheduler.clone();
         let copy_indices_ranges = indices_ranges.to_vec();
 
         async move {
