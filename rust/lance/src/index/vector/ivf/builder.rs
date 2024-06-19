@@ -12,7 +12,7 @@ use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
     ivf::{shuffler::shuffle_dataset, storage::IvfData},
@@ -21,10 +21,7 @@ use lance_index::vector::{
 use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::MetricType;
 
-use crate::{
-    index::vector::ivf::{io::write_pq_partitions, Ivf},
-    Dataset,
-};
+use crate::index::vector::ivf::{io::write_pq_partitions, Ivf};
 
 use super::io::write_hnsw_quantization_index_partitions;
 
@@ -91,7 +88,7 @@ pub(super) async fn build_partitions(
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip(writer, auxiliary_writer, data, ivf, quantizer))]
 pub(super) async fn build_hnsw_partitions(
-    dataset: &Dataset,
+    dataset: Arc<dyn DatasetTakeRows>,
     writer: &mut FileWriter<ManifestDescribing>,
     auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
     data: impl RecordBatchStream + Unpin + 'static,
@@ -101,7 +98,7 @@ pub(super) async fn build_hnsw_partitions(
     metric_type: MetricType,
     hnsw_params: &HnswBuildParams,
     part_range: Range<u32>,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
@@ -120,13 +117,6 @@ pub(super) async fn build_hnsw_partitions(
         });
     }
 
-    if metric_type == MetricType::Dot {
-        return Err(Error::Index {
-            message: "HNSW index does not support dot product distance".to_string(),
-            location: location!(),
-        });
-    }
-
     let ivf_model = lance_index::vector::ivf::new_ivf_with_quantizer(
         ivf.centroids.clone(),
         metric_type,
@@ -139,7 +129,7 @@ pub(super) async fn build_hnsw_partitions(
         data,
         column,
         ivf_model.into(),
-        precomputed_partitons,
+        precomputed_partitions,
         ivf.num_partitions() as u32,
         shuffle_partition_batches,
         shuffle_partition_concurrency,

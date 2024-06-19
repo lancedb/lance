@@ -14,22 +14,23 @@
 
 use std::sync::Arc;
 
-use arrow::compute::concat;
+use arrow::compute::{concat, concat_batches};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{
     cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array, UInt64Array,
 };
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use lance::{
-    datatypes::Schema,
-    index::vector::{hnsw::builder::*, sq},
-    io::ObjectStore,
-};
+use lance::Result;
+use lance::{datatypes::Schema, index::vector::sq, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
-use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_index::vector::hnsw::HNSW;
+use lance_index::scalar::IndexWriter;
+use lance_index::vector::v3::subindex::IvfSubIndex;
+use lance_index::vector::{
+    hnsw::{builder::HnswBuildParams, HNSW},
+    storage::VectorStore,
+};
 use lance_linalg::kmeans::compute_partitions;
 use lance_linalg::{
     distance::DistanceType,
@@ -178,7 +179,7 @@ impl Hnsw {
 
         let hnsw = RT
             .runtime
-            .block_on(build_hnsw_model(params, vectors.clone()))
+            .block_on(params.build(vectors.clone()))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self { hnsw, vectors })
     }
@@ -193,14 +194,20 @@ impl Hnsw {
                 FileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     &path,
-                    Schema::try_from(&HNSW::schema())
+                    Schema::try_from(HNSW::schema().as_ref())
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                     &Default::default(),
                 ),
             )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        RT.block_on(Some(py), self.hnsw.write(&mut writer))?
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        RT.block_on(Some(py), async {
+            let batch = self.hnsw.to_batch()?;
+            let metadata = batch.schema_ref().metadata().clone();
+            writer.write_record_batch(batch).await?;
+            writer.finish_with_metadata(&metadata).await?;
+            Result::Ok(())
+        })?
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(())
     }
 
@@ -237,5 +244,11 @@ pub fn build_sq_storage(
         lance_index::vector::sq::ScalarQuantizer::with_bounds(8, dim, lower_bound..upper_bound);
     let storage = sq::build_sq_storage(DistanceType::L2, row_ids, vectors, quantizer)
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
-    storage.batch().clone().to_pyarrow(py)
+    let batches = storage
+        .to_batches()
+        .map_err(|e| PyIOError::new_err(e.to_string()))?
+        .collect::<Vec<_>>();
+    let batch = concat_batches(&batches[0].schema(), &batches)
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    batch.to_pyarrow(py)
 }

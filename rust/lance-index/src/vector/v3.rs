@@ -2,5 +2,4 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod shuffler;
-pub mod storage;
 pub mod subindex;

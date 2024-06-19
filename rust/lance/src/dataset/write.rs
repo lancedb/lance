@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::{datatypes::Schema, Error, Result};
-use lance_datafusion::chunker::chunk_stream;
+use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2;
@@ -218,9 +218,11 @@ pub async fn write_fragments_internal(
     let mut buffered_reader = if params.use_legacy_format {
         chunk_stream(data, params.max_rows_per_group)
     } else {
-        // In v2 we don't care about group size but we do want to chunk
-        // by max_rows_per_file
-        chunk_stream(data, params.max_rows_per_file)
+        // In v2 we don't care about group size but we do want to break
+        // the stream on file boundaries
+        break_stream(data, params.max_rows_per_file)
+            .map_ok(|batch| vec![batch])
+            .boxed()
     };
 
     let writer_generator =
@@ -678,7 +680,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reader.num_batches(), 1);
-        let batch = reader.read_batch(0, .., &schema, None).await.unwrap();
+        let batch = reader.read_batch(0, .., &schema).await.unwrap();
         assert_eq!(batch, data);
     }
 }

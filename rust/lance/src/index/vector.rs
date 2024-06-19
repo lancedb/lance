@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 pub mod builder;
-pub mod hnsw;
 pub mod ivf;
 pub mod pq;
 pub mod sq;
@@ -19,21 +18,31 @@ mod utils;
 mod fixture_test;
 
 use arrow::datatypes::Float32Type;
+use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
+use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizerImpl;
-use lance_index::vector::sq::builder::SQBuildParams;
-use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
+use lance_index::vector::v3::shuffler::IvfShuffler;
+use lance_index::vector::{
+    hnsw::{
+        builder::HnswBuildParams,
+        index::{HNSWIndex, HNSWIndexOptions},
+    },
+    ivf::IvfBuildParams,
+    pq::PQBuildParams,
+    sq::{builder::SQBuildParams, ScalarQuantizer},
+    VectorIndex,
+};
 use lance_index::{IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
 use snafu::{location, Location};
 use tracing::instrument;
+use utils::get_vector_dim;
 use uuid::Uuid;
 
-use self::hnsw::{HNSWIndex, HNSWIndexOptions};
 use self::{ivf::*, pq::PQIndex};
 
 use super::{pb, DatasetIndexInternalExt, IndexParams};
@@ -61,6 +70,29 @@ pub struct VectorIndexParams {
 }
 
 impl VectorIndexParams {
+    pub fn ivf_flat(num_partitions: usize, metric_type: MetricType) -> Self {
+        let ivf_params = IvfBuildParams::new(num_partitions);
+        let stages = vec![StageParams::Ivf(ivf_params)];
+        Self {
+            stages,
+            metric_type,
+        }
+    }
+
+    // IVF_HNSW index
+    pub fn ivf_hnsw(
+        num_partitions: usize,
+        distance_type: DistanceType,
+        hnsw_params: HnswBuildParams,
+    ) -> Self {
+        let ivf_params = IvfBuildParams::new(num_partitions);
+        let stages = vec![StageParams::Ivf(ivf_params), StageParams::Hnsw(hnsw_params)];
+        Self {
+            stages,
+            metric_type: distance_type,
+        }
+    }
+
     /// Create index parameters for `IVF_PQ` index.
     ///
     /// Parameters
@@ -169,6 +201,14 @@ impl IndexParams for VectorIndexParams {
     }
 }
 
+fn is_ivf_flat(stages: &[StageParams]) -> bool {
+    if stages.len() != 1 {
+        return false;
+    }
+
+    matches!(&stages[0], StageParams::Ivf(_))
+}
+
 fn is_ivf_pq(stages: &[StageParams]) -> bool {
     if stages.len() < 2 {
         return false;
@@ -197,6 +237,7 @@ pub(crate) async fn build_vector_index(
     params: &VectorIndexParams,
 ) -> Result<()> {
     let stages = &params.stages;
+    let dim = get_vector_dim(dataset, column)?;
 
     if stages.is_empty() {
         return Err(Error::Index {
@@ -205,7 +246,34 @@ pub(crate) async fn build_vector_index(
         });
     };
 
-    if is_ivf_pq(stages) {
+    if is_ivf_flat(stages) {
+        let StageParams::Ivf(ivf_params) = &stages[0] else {
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
+            });
+        };
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().to_str().unwrap().into();
+        let shuffler = IvfShuffler::new(
+            dataset.object_store().clone(),
+            path,
+            ivf_params.num_partitions,
+        );
+        let quantizer = FlatQuantizer::new(dim, params.metric_type);
+        IvfIndexBuilder::<FlatIndex, _>::new(
+            dataset.clone(),
+            column.to_owned(),
+            dataset.indices_dir().child(uuid),
+            params.metric_type,
+            Box::new(shuffler),
+            ivf_params.clone(),
+            (),
+            quantizer,
+        )?
+        .build()
+        .await?;
+    } else if is_ivf_pq(stages) {
         // This is a IVF PQ index.
         let len = stages.len();
         let StageParams::Ivf(ivf_params) = &stages[len - 2] else {
@@ -433,7 +501,6 @@ pub(crate) async fn open_vector_index_v2(
             let ivf_data = IvfData::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizerImpl<Float32Type>>::try_new(
-                distance_type,
                 reader.object_reader.clone(),
                 aux_reader.into(),
                 options,
@@ -463,8 +530,8 @@ pub(crate) async fn open_vector_index_v2(
             let options = HNSWIndexOptions {
                 use_residual: false,
             };
+
             let hnsw = HNSWIndex::<ScalarQuantizer>::try_new(
-                distance_type,
                 reader.object_reader.clone(),
                 aux_reader.into(),
                 options,

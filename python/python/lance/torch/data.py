@@ -145,7 +145,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
         shard_granularity: Optional[Literal["fragment", "batch"]] = None,
-        batch_readehead: int = 16,
+        batch_readahead: int = 16,
         to_tensor_fn: Optional[
             callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
         ] = None,
@@ -199,7 +199,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.samples: Optional[int] = samples
         self.filter = filter
         self.with_row_id = with_row_id
-        self.batch_readahead = batch_readehead
+        self.batch_readahead = batch_readahead
         if to_tensor_fn is None:
             to_tensor_fn = _to_tensor
         self._to_tensor_fn = to_tensor_fn

@@ -9,7 +9,7 @@ use arrow_array::Array;
 
 use arrow_schema::DataType;
 use lance_core::{Error, Result};
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::DistanceType;
 use snafu::{location, Location};
 
 use super::ScalarQuantizer;
@@ -33,7 +33,7 @@ impl Default for SQBuildParams {
 }
 
 impl SQBuildParams {
-    pub fn build(&self, data: &dyn Array, _: MetricType) -> Result<ScalarQuantizer> {
+    pub fn build(&self, data: &dyn Array, _: DistanceType) -> Result<ScalarQuantizer> {
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
                 "SQ builder: input is not a FixedSizeList: {}",

@@ -28,7 +28,9 @@ use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
+use lance_index::vector::{
+    flat::flat_search, Query, VectorIndex, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
+};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
@@ -41,9 +43,8 @@ use tracing::{instrument, Instrument};
 
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
-use crate::index::prefilter::{FilterLoader, PreFilter};
+use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::ivf::IVFIndex;
-use crate::index::vector::VectorIndex;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 
@@ -238,9 +239,18 @@ impl ExecutionPlan for KNNFlatExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "KNNFlatExec node must have exactly one child".to_string(),
+            ));
+        }
+
+        Ok(Arc::new(Self::try_new(
+            children.pop().expect("length checked"),
+            self.query.clone(),
+        )?))
     }
 
     fn execute(
@@ -458,8 +468,9 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        warn!("ANNIVFPartitionExec: with_new_children called, but no children to replace");
-        Ok(self)
+        Err(DataFusionError::Internal(
+            "ANNIVFPartitionExec: with_new_children called, but no children to replace".to_string(),
+        ))
     }
 
     fn execute(
@@ -609,9 +620,24 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "ANNSubIndexExec node must have exactly one child".to_string(),
+            ));
+        }
+
+        let new_plan = Self {
+            input: children.pop().expect("length checked"),
+            dataset: self.dataset.clone(),
+            indices: self.indices.clone(),
+            query: self.query.clone(),
+            prefilter_source: self.prefilter_source.clone(),
+            properties: self.properties.clone(),
+        };
+
+        Ok(Arc::new(new_plan))
     }
 
     fn execute(
@@ -689,8 +715,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             }
                             PreFilterSource::None => None,
                         };
-                        let pre_filter =
-                            Arc::new(PreFilter::new(ds.clone(), &[index_meta], prefilter_loader));
+                        let pre_filter = Arc::new(DatasetPreFilter::new(
+                            ds.clone(),
+                            &[index_meta],
+                            prefilter_loader,
+                        ));
 
                         let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
 

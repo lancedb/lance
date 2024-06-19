@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package lance.encodings;
  
+import "google/protobuf/empty.proto";
+
 // This file contains a specification for encodings that can be used
 // to store and load Arrow data into a Lance file.
 //
@@ -193,4 +195,21 @@ message ArrayEncoding {
         SimpleStruct struct = 5;
         Binary binary = 6;
     }
+}
+
+// Wraps a column with a zone map index that can be used
+// to apply pushdown filters
+message ZoneIndex {
+  uint32 rows_per_zone = 1;
+  Buffer zone_map_buffer = 2;
+  ColumnEncoding inner = 3;
+}
+
+// Encodings that describe a column of values
+message ColumnEncoding {
+  oneof column_encoding {
+    // No special encoding, just column values
+    google.protobuf.Empty values = 1;
+    ZoneIndex zone_index = 2;
+  }
 }

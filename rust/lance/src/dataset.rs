@@ -11,7 +11,7 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -63,7 +63,10 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
-use lance_table::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
+use lance_table::feature_flags::{
+    apply_feature_flags, can_read_dataset, can_write_dataset, should_use_legacy_format,
+    FLAG_USE_V2_FORMAT,
+};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -284,25 +287,22 @@ impl Dataset {
             path: manifest_file,
             size: None,
         };
+        let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
             self.uri.clone(),
-            &manifest_location,
+            manifest,
             self.session.clone(),
             self.commit_handler.clone(),
         )
         .await
     }
 
-    async fn checkout_manifest(
-        object_store: Arc<ObjectStore>,
-        base_path: Path,
-        uri: String,
+    async fn load_manifest(
+        object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
-        session: Arc<Session>,
-        commit_handler: Arc<dyn CommitHandler>,
-    ) -> Result<Self> {
+    ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
             object_store
                 .open_with_size(&manifest_location.path, size as usize)
@@ -338,12 +338,15 @@ impl Dataset {
         // If manifest is in the last block, we can decode directly from memory.
         let manifest_size = object_reader.size().await?;
         let mut manifest = if manifest_size - offset <= last_block.len() {
-            let message_len = LittleEndian::read_u32(&last_block[offset..offset + 4]) as usize;
-            let message_data = &last_block[offset + 4..offset + 4 + message_len];
-            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)?
+            let manifest_len = manifest_size - offset;
+            let offset_in_block = last_block.len() - manifest_len;
+            let message_len =
+                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
+            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
         } else {
-            read_struct(object_reader.as_ref(), offset).await?
-        };
+            read_struct(object_reader.as_ref(), offset).await
+        }?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
@@ -358,6 +361,18 @@ impl Dataset {
         }
 
         populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+
+        Ok(manifest)
+    }
+
+    async fn checkout_manifest(
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        uri: String,
+        manifest: Manifest,
+        session: Arc<Session>,
+        commit_handler: Arc<dyn CommitHandler>,
+    ) -> Result<Self> {
         Ok(Self {
             object_store,
             base: base_path,
@@ -411,7 +426,6 @@ impl Dataset {
                 ..params
             };
         }
-        let params = params; // discard mut
 
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
@@ -440,8 +454,11 @@ impl Dataset {
                         ..Default::default()
                     },
                 )?;
+                params.use_legacy_format = should_use_legacy_format(m.writer_feature_flags);
             }
         }
+
+        let params = params; // discard mut
 
         if let Some(d) = dataset.as_ref() {
             if !can_write_dataset(d.manifest.writer_feature_flags) {
@@ -481,6 +498,7 @@ impl Dataset {
 
         let manifest_config = ManifestWriteConfig {
             use_move_stable_row_ids: params.enable_move_stable_row_ids,
+            use_legacy_format: Some(params.use_legacy_format),
             ..Default::default()
         };
         let manifest = if let Some(dataset) = &dataset {
@@ -1218,11 +1236,23 @@ impl Dataset {
     }
 }
 
+#[async_trait::async_trait]
+impl DatasetTakeRows for Dataset {
+    fn schema(&self) -> &Schema {
+        Self::schema(self)
+    }
+
+    async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
+        Self::take_rows(self, row_ids, projection).await
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,  // default true
-    timestamp: Option<SystemTime>, // default None
-    use_move_stable_row_ids: bool, // default false
+    auto_set_feature_flags: bool,    // default true
+    timestamp: Option<SystemTime>,   // default None
+    use_move_stable_row_ids: bool,   // default false
+    use_legacy_format: Option<bool>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -1231,6 +1261,7 @@ impl Default for ManifestWriteConfig {
             auto_set_feature_flags: true,
             timestamp: None,
             use_move_stable_row_ids: false,
+            use_legacy_format: None,
         }
     }
 }
@@ -1244,8 +1275,20 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<Index>>,
     config: &ManifestWriteConfig,
 ) -> std::result::Result<(), CommitError> {
+    let was_using_legacy = should_use_legacy_format(manifest.writer_feature_flags);
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest)?;
+    }
+    // For now, we don't auto-detect use_v2_format.  Instead, if the user
+    // asks for it, we set it.  Otherwise we use what was there before.
+    if let Some(use_legacy_format) = config.use_legacy_format {
+        if !use_legacy_format {
+            manifest.writer_feature_flags |= FLAG_USE_V2_FORMAT;
+        }
+    } else if was_using_legacy {
+        manifest.writer_feature_flags &= !FLAG_USE_V2_FORMAT;
+    } else {
+        manifest.writer_feature_flags |= FLAG_USE_V2_FORMAT;
     }
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -1300,7 +1343,7 @@ mod tests {
         DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
         RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
-    use arrow_array::{FixedSizeListArray, StructArray};
+    use arrow_array::{FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
@@ -1619,7 +1662,7 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
-            let reader = fragment.open(dataset.schema(), false).await.unwrap();
+            let reader = fragment.open(dataset.schema(), false, false).await.unwrap();
             // No group / batch concept in v2
             if use_legacy_format {
                 assert_eq!(reader.legacy_num_batches(), 10);
@@ -1633,6 +1676,8 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_write_manifest(#[values(false, true)] use_legacy_format: bool) {
+        use lance_table::feature_flags::FLAG_UNKNOWN;
+
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1670,7 +1715,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(manifest.writer_feature_flags, 0);
+        if !use_legacy_format {
+            assert_eq!(manifest.writer_feature_flags, FLAG_USE_V2_FORMAT);
+        }
         assert_eq!(manifest.reader_feature_flags, 0);
 
         // Create one with deletions
@@ -1698,8 +1745,8 @@ mod tests {
         );
 
         // Write with custom manifest
-        manifest.writer_feature_flags = 5; // Set another flag
-        manifest.reader_feature_flags = 5;
+        manifest.writer_feature_flags |= FLAG_UNKNOWN; // Set another flag
+        manifest.reader_feature_flags |= FLAG_UNKNOWN;
         manifest.version += 1;
         write_manifest_file(
             dataset.object_store(),
@@ -1711,6 +1758,7 @@ mod tests {
                 auto_set_feature_flags: false,
                 timestamp: None,
                 use_move_stable_row_ids: false,
+                use_legacy_format: None,
             },
         )
         .await
@@ -3389,6 +3437,38 @@ mod tests {
         assert!(res.is_err());
 
         assert!(!dataset_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_partially_fits() {
+        // This regresses a bug that occurred when the manifest file was over 4KiB but the manifest
+        // itself was less than 4KiB (due to a dictionary).  4KiB is important here because that's the
+        // block size we use when reading the "last block"
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let dictionary = Arc::new(StringArray::from_iter_values(
+            (0..1000).map(|i| i.to_string()),
+        ));
+        let indices = Int16Array::from_iter_values(0..1000);
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                Int16DictionaryArray::try_new(indices, dictionary.clone()).unwrap(),
+            )],
+        )
+        .unwrap()];
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(1000, dataset.count_rows(None).await.unwrap());
     }
 
     #[tokio::test]

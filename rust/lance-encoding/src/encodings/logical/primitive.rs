@@ -28,10 +28,11 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodeArrayTask, FieldScheduler, LogicalPageDecoder, NextDecodeTask, PageInfo,
-        PageScheduler, PhysicalPageDecoder, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, FieldScheduler, FilterExpression, LogicalPageDecoder, NextDecodeTask,
+        PageInfo, PageScheduler, PhysicalPageDecoder, ScheduledScanLine, SchedulerContext,
+        SchedulingJob,
     },
-    encoder::{ArrayEncodingStrategy, EncodeTask, EncodedPage, FieldEncoder},
+    encoder::{ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, FieldEncoder},
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
 
@@ -184,6 +185,10 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
             rows_scheduled: num_rows_in_next,
         })
     }
+
+    fn num_rows(&self) -> u64 {
+        self.ranges.iter().map(|r| r.end - r.start).sum()
+    }
 }
 
 impl FieldScheduler for PrimitiveFieldScheduler {
@@ -194,6 +199,8 @@ impl FieldScheduler for PrimitiveFieldScheduler {
     fn schedule_ranges<'a>(
         &'a self,
         ranges: &[std::ops::Range<u64>],
+        // TODO: Could potentially use filter to simplify decode, something of a micro-optimization probably
+        _filter: &FilterExpression,
     ) -> Result<Box<dyn SchedulingJob + 'a>> {
         Ok(Box::new(PrimitiveFieldSchedulingJob::new(
             self,
@@ -734,5 +741,9 @@ impl FieldEncoder for PrimitiveFieldEncoder {
 
     fn num_columns(&self) -> u32 {
         1
+    }
+
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        std::future::ready(Ok(vec![EncodedColumn::default()])).boxed()
     }
 }

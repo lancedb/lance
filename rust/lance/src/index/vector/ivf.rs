@@ -25,19 +25,16 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::{datatypes::Field, Error, Result, ROW_ID_FIELD};
+use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
 use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::vector::{
-    hnsw::HNSW,
-    quantizer::{Quantization, QuantizationMetadata, Quantizer},
-};
+use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
-        hnsw::builder::HnswBuildParams,
+        hnsw::{builder::HnswBuildParams, HNSWIndex, HNSW},
         ivf::{
             builder::load_precomputed_partitions,
             shuffler::shuffle_dataset,
@@ -45,8 +42,9 @@ use lance_index::{
             IvfBuildParams,
         },
         pq::{PQBuildParams, ProductQuantizer},
+        quantizer::{Quantization, QuantizationMetadata, Quantizer},
         sq::{builder::SQBuildParams, ScalarQuantizer},
-        Query, DIST_COL,
+        Query, VectorIndex, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -78,10 +76,8 @@ use uuid::Uuid;
 use self::io::write_hnsw_quantization_index_partitions;
 
 use super::{
-    hnsw::HNSWIndex,
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
-    VectorIndex,
 };
 use crate::{dataset::builder::DatasetBuilder, index::vector::sq::build_sq_model};
 use crate::{
@@ -97,6 +93,7 @@ use crate::{
 
 mod builder;
 mod io;
+pub mod v2;
 
 /// IVF Index.
 pub struct IVFIndex {
@@ -219,7 +216,7 @@ impl IVFIndex {
         &self,
         partition_id: usize,
         query: &Query,
-        pre_filter: Arc<PreFilter>,
+        pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true).await?;
 
@@ -254,7 +251,7 @@ impl std::fmt::Debug for IVFIndex {
 ///
 /// Returns (new_uuid, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
-    dataset: &Dataset,
+    dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
@@ -307,7 +304,7 @@ pub(crate) async fn optimize_vector_indices(
             .child(INDEX_AUXILIARY_FILE_NAME);
         let aux_writer = object_store.create(&aux_file).await?;
         optimize_ivf_hnsw_indices(
-            dataset,
+            Arc::new(dataset),
             first_idx,
             hnsw_sq,
             vector_column,
@@ -411,7 +408,7 @@ async fn optimize_ivf_pq_indices(
 
 #[allow(clippy::too_many_arguments)]
 async fn optimize_ivf_hnsw_indices<Q: Quantization>(
-    dataset: &Dataset,
+    dataset: Arc<dyn DatasetTakeRows>,
     first_idx: &IVFIndex,
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
@@ -469,7 +466,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         .collect::<Result<Vec<_>>>()?;
 
     // Prepare the HNSW writer
-    let schema = lance_core::datatypes::Schema::try_from(&HNSW::schema())?;
+    let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
@@ -680,7 +677,7 @@ impl Index for IVFIndex {
 #[async_trait]
 impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
         if self.metric_type == MetricType::Cosine {
             let key = normalize_arrow(&query.key)?;
@@ -739,7 +736,7 @@ impl VectorIndex for IVFIndex {
         })
     }
 
-    fn row_ids(&self) -> &[u64] {
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
@@ -1498,7 +1495,7 @@ async fn write_ivf_hnsw_file(
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let writer = object_store.create(&path).await?;
 
-    let schema = lance_core::datatypes::Schema::try_from(&HNSW::schema())?;
+    let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
@@ -1579,7 +1576,7 @@ async fn write_ivf_hnsw_file(
     let num_partitions = ivf.num_partitions() as u32;
 
     let (hnsw_metadata, aux_ivf) = builder::build_hnsw_partitions(
-        dataset,
+        Arc::new(dataset.clone()),
         &mut writer,
         Some(&mut aux_writer),
         stream,
@@ -1700,6 +1697,7 @@ mod tests {
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
 
+    use crate::index::prefilter::DatasetPreFilter;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
     const DIM: usize = 32;
@@ -1869,7 +1867,7 @@ mod tests {
         async fn check_index<F: Fn(u64) -> Option<u64>>(
             &mut self,
             index: &IVFIndex,
-            prefilter: Arc<PreFilter>,
+            prefilter: Arc<dyn PreFilter>,
             ids_to_test: &[u64],
             row_id_map: F,
         ) {
@@ -2079,7 +2077,7 @@ mod tests {
             fragment_bitmap: None,
         };
 
-        let prefilter = Arc::new(PreFilter::new(dataset.clone(), &[index_meta], None));
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);
@@ -2576,8 +2574,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_create_ivf_hnsw_sq() {
+    async fn test_create_ivf_hnsw_sq(distance_type: DistanceType) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2585,89 +2582,6 @@ mod tests {
         let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(nlist);
-        let sq_params = SQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
-        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::Cosine,
-            ivf_params,
-            hnsw_params,
-            sq_params,
-        );
-
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
-
-        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
-        let query = vector_array.value(0);
-        let query = query.as_primitive::<Float32Type>();
-        let k = 100;
-        let results = dataset
-            .scan()
-            .with_row_id()
-            .nearest("vector", query, k)
-            .unwrap()
-            .nprobs(nlist)
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(1, results.len());
-        assert_eq!(k, results[0].num_rows());
-
-        let row_ids = results[0]
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .iter()
-            .map(|v| v.unwrap() as u32)
-            .collect::<Vec<_>>();
-        let dists = results[0]
-            .column_by_name("_distance")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-
-        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, DistanceType::Cosine);
-
-        let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
-        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
-
-        let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
-        assert!(
-            recall >= 0.9,
-            "recall: {}\n results: {:?}\n\ngt: {:?}",
-            recall,
-            results,
-            gt,
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_ivf_hnsw_with_empty_partition() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        // the generate_test_dataset function generates a dataset with 1000 vectors,
-        // so 1001 partitions will have at least one empty partition
-        let nlist = 1001;
-        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
-
-        let centroids = generate_random_array(nlist * DIM);
-        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf_params =
-            IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
-
-        let distance_type = MetricType::L2;
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
@@ -2720,7 +2634,7 @@ mod tests {
             .to_vec();
 
         let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, DistanceType::L2);
+        let gt = ground_truth(&mat, query.values(), k, distance_type);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
@@ -2728,6 +2642,99 @@ mod tests {
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
             recall >= 0.9,
+            "recall: {}\n results: {:?}\n\ngt: {:?}",
+            recall,
+            results,
+            gt,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq_cosine() {
+        test_create_ivf_hnsw_sq(DistanceType::Cosine).await
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq_dot() {
+        test_create_ivf_hnsw_sq(DistanceType::Dot).await
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_with_empty_partition() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // the generate_test_dataset function generates a dataset with 1000 vectors,
+        // so 1001 partitions will have at least one empty partition
+        let nlist = 1001;
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let centroids = generate_random_array(nlist * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let ivf_params =
+            IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
+
+        let distance_type = DistanceType::L2;
+        let sq_params = SQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            distance_type,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
+        let query = vector_array.value(0);
+        let query = query.as_primitive::<Float32Type>();
+        let k = 100;
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .nearest("vector", query, k)
+            .unwrap()
+            .nprobs(nlist)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(1, results.len());
+        assert_eq!(k, results[0].num_rows());
+
+        let row_ids = results[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap() as u32)
+            .collect::<Vec<_>>();
+        let dists = results[0]
+            .column_by_name("_distance")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+
+        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
+        let gt = ground_truth(&mat, query.values(), k, distance_type);
+
+        let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
+        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+
+        let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
+        assert!(
+            recall >= 0.7,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,

@@ -15,6 +15,7 @@ use futures::stream::Peekable;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
+use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::Error;
 use lance_file::reader::FileReader;
@@ -24,14 +25,18 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::quantizer::{Quantization as _, Quantizer};
-use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::v3::subindex::IvfSubIndex;
+use lance_index::vector::{
+    quantizer::{Quantization, Quantizer},
+    sq::ScalarQuantizer,
+    storage::VectorStore,
+};
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::{DistanceType, MetricType};
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
@@ -41,10 +46,10 @@ use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
+use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
-use crate::index::vector::{hnsw::builder::build_hnsw_model, sq::build_sq_storage};
+use crate::index::vector::sq::build_sq_storage;
 use crate::Result;
-use crate::{dataset::ROW_ID, Dataset};
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 lazy_static::lazy_static! {
@@ -242,9 +247,9 @@ pub(super) async fn write_pq_partitions(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write_hnsw_quantization_index_partitions(
-    dataset: &Dataset,
+    dataset: Arc<dyn DatasetTakeRows>,
     column: &str,
-    metric_type: MetricType,
+    distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     writer: &mut FileWriter<ManifestDescribing>,
     mut auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
@@ -253,8 +258,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<(Vec<HnswMetadata>, IvfData)> {
-    let dataset = Arc::new(dataset.clone());
-    let column = Arc::new(column.to_owned());
     let hnsw_params = Arc::new(hnsw_params.clone());
 
     let mut streams_heap = BinaryHeap::new();
@@ -308,9 +311,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         if let Some(&previous_indices) = existing_indices.as_ref() {
             for &idx in previous_indices.iter() {
                 let sub_index = idx.load_partition(part_id, true).await?;
-                let row_ids = Arc::new(UInt64Array::from_iter_values(
-                    sub_index.row_ids().iter().cloned(),
-                ));
+                let row_ids = Arc::new(UInt64Array::from_iter_values(sub_index.row_ids().cloned()));
                 row_id_array.push(row_ids);
             }
         }
@@ -358,7 +359,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         };
 
         let dataset = dataset.clone();
-        let column = column.clone();
+        let column = column.to_owned();
         let hnsw_params = hnsw_params.clone();
         let quantizer = quantizer.clone();
         let sem = sem.clone();
@@ -368,8 +369,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             log::debug!("Building HNSW partition {}", part_id);
             let result = build_hnsw_quantization_partition(
                 dataset,
-                column,
-                metric_type,
+                &column,
+                distance_type,
                 hnsw_params,
                 part_writer,
                 aux_part_writer,
@@ -406,7 +407,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                     batch_id as i32,
                     ReadBatchParams::RangeFull,
                     part_reader.schema(),
-                    None,
                 )
             })
             .buffered(num_cpus::get())
@@ -431,7 +431,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                         batch_id as i32,
                         ReadBatchParams::RangeFull,
                         aux_part_reader.schema(),
-                        None,
                     )
                 })
                 .buffered(num_cpus::get())
@@ -450,8 +449,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
 #[allow(clippy::too_many_arguments)]
 async fn build_hnsw_quantization_partition(
-    dataset: Arc<Dataset>,
-    column: Arc<String>,
+    dataset: Arc<dyn DatasetTakeRows>,
+    column: &str,
     metric_type: MetricType,
     hnsw_params: Arc<HnswBuildParams>,
     writer: FileWriter<ManifestDescribing>,
@@ -465,7 +464,7 @@ async fn build_hnsw_quantization_partition(
     std::mem::drop(row_ids_array);
     let num_rows = row_ids.len();
 
-    let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
+    let projection = Arc::new(dataset.schema().project(&[column])?);
     let mut vectors = dataset
         .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
         .await?
@@ -512,13 +511,14 @@ async fn build_hnsw_quantization_partition(
 }
 
 async fn build_and_write_hnsw(
-    hnsw_params: HnswBuildParams,
+    params: HnswBuildParams,
     vectors: Arc<dyn Array>,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
-    let hnsw = build_hnsw_model(hnsw_params, vectors).await?;
-    let length = hnsw.write(&mut writer).await?;
-    Result::Ok(length)
+    let batch = params.build(vectors).await?.to_batch()?;
+    let metadata = batch.schema_ref().metadata().clone();
+    writer.write_record_batch(batch).await?;
+    writer.finish_with_metadata(&metadata).await
 }
 
 async fn build_and_write_pq_storage(
@@ -540,19 +540,21 @@ async fn build_and_write_pq_storage(
 }
 
 async fn build_and_write_sq_storage(
-    metric_type: MetricType,
+    distance_type: DistanceType,
     row_ids: Arc<dyn Array>,
     vectors: Arc<dyn Array>,
     sq: ScalarQuantizer,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<()> {
     let storage = spawn_cpu(move || {
-        let storage = build_sq_storage(metric_type, row_ids, vectors, sq)?;
+        let storage = build_sq_storage(distance_type, row_ids, vectors, sq)?;
         Ok(storage)
     })
     .await?;
 
-    writer.write_record_batch(storage.batch().clone()).await?;
+    for batch in storage.to_batches()? {
+        writer.write_record_batch(batch.clone()).await?;
+    }
     writer.finish().await?;
     Ok(())
 }
@@ -562,6 +564,7 @@ mod tests {
     use super::*;
 
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
+    use crate::Dataset;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
     use lance_index::IndexType;

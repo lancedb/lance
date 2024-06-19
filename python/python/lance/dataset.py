@@ -161,6 +161,7 @@ class LanceDataset(pa.dataset.Dataset):
         metadata_cache_size: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        serialized_manifest: Optional[bytes] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -172,17 +173,26 @@ class LanceDataset(pa.dataset.Dataset):
             metadata_cache_size,
             commit_lock,
             storage_options,
+            serialized_manifest,
         )
 
+    @classmethod
+    def __deserialize__(cls, uri: str, version: int, manifest: bytes):
+        return cls(uri, version, serialized_manifest=manifest)
+
     def __reduce__(self):
-        return LanceDataset, (self.uri, self._ds.version())
+        return type(self).__deserialize__, (
+            self.uri,
+            self._ds.version(),
+            self._ds.serialized_manifest(),
+        )
 
     def __getstate__(self):
-        return self.uri, self._ds.version()
+        return self.uri, self._ds.version(), self._ds.serialized_manifest()
 
     def __setstate__(self, state):
-        self._uri, version = state
-        self._ds = _Dataset(self._uri, version)
+        self._uri, version, manifest = state
+        self._ds = _Dataset(self._uri, version, manifest=manifest)
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
@@ -399,7 +409,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool, default False
             Run filter before the vector search.
         with_row_id: bool, default False
-            Return physical row ID.
+            Return row ID.
         use_stats: bool, default True
             Use stats pushdown during filters.
 
@@ -1240,6 +1250,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_cache_size: Optional[int] = None,
         shuffle_partition_batches: Optional[int] = None,
         shuffle_partition_concurrency: Optional[int] = None,
+        # experimental parameters
+        ivf_centroids_file: Optional[str] = None,
+        precomputed_partiton_dataset: Optional[str] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1417,6 +1430,20 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Only {valid_index_types} index types supported. " f"Got {index_type}"
             )
         if index_type.startswith("IVF"):
+            if (ivf_centroids is not None) and (ivf_centroids_file is not None):
+                raise ValueError(
+                    "ivf_centroids and ivf_centroids_file"
+                    " cannot be provided at the same time"
+                )
+
+            if ivf_centroids_file is not None:
+                from pyarrow.fs import FileSystem
+
+                fs, path = FileSystem.from_uri(ivf_centroids_file)
+                with fs.open_input_file(path) as f:
+                    ivf_centroids = np.load(f)
+                num_partitions = ivf_centroids.shape[0]
+
             if num_partitions is None:
                 raise ValueError(
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
@@ -1429,6 +1456,24 @@ class LanceDataset(pa.dataset.Dataset):
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
             kwargs["num_partitions"] = num_partitions
+
+            if (precomputed_partiton_dataset is not None) and (ivf_centroids is None):
+                raise ValueError(
+                    "ivf_centroids must be provided when"
+                    " precomputed_partiton_dataset is provided"
+                )
+            if precomputed_partiton_dataset is not None:
+                precomputed_ds = LanceDataset(precomputed_partiton_dataset)
+                if len(precomputed_ds.get_fragments()) != 1:
+                    raise ValueError(
+                        "precomputed_partiton_dataset must have only one fragment"
+                    )
+                files = precomputed_ds.get_fragments()[0].data_files()
+                if len(files) != 1:
+                    raise ValueError(
+                        "precomputed_partiton_dataset must have only one files"
+                    )
+                kwargs["precomputed_partitions_file"] = precomputed_partiton_dataset
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids
@@ -1516,7 +1561,7 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
         self._ds.create_index(column, index_type, name, replace, kwargs)
-        return LanceDataset(self.uri, index_cache_size=index_cache_size)
+        return self
 
     def session(self) -> Session:
         """
@@ -2046,7 +2091,7 @@ class ScannerBuilder:
         return self
 
     def with_row_id(self, with_row_id: bool = True) -> ScannerBuilder:
-        """Enable returns with physical row IDs."""
+        """Enable returns with row IDs."""
         self._with_row_id = with_row_id
         return self
 
