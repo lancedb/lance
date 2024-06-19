@@ -260,7 +260,12 @@ impl IvfShuffler {
             &Default::default(),
         )?;
 
+        let mut batches_processed = 0;
         while let Some(batch) = data.next().await {
+            if batches_processed % 1000 == 0 {
+                info!("Partition assignment progress {}/?", batches_processed);
+            }
+            batches_processed += 1;
             file_writer.write(&[batch?]).await?;
         }
 
