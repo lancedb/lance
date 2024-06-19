@@ -11,7 +11,7 @@ use datafusion_expr::{expr::InList, Between, BinaryExpr, Expr, Operator};
 
 use futures::join;
 use lance_core::{
-    utils::mask::{RowAddressMask, RowAddressTreeMap},
+    utils::mask::{RowAddressTreeMap, RowIdMask},
     Result,
 };
 use lance_datafusion::expr::safe_coerce_scalar;
@@ -221,7 +221,7 @@ impl ScalarIndexExpr {
         &self,
         index_loader: &dyn ScalarIndexLoader,
         row_id_index: &Option<Arc<RowIdIndex>>,
-    ) -> Result<RowAddressMask> {
+    ) -> Result<RowIdMask> {
         match self {
             Self::Not(inner) => {
                 let result = inner.evaluate(index_loader, row_id_index).await?;
@@ -252,7 +252,7 @@ impl ScalarIndexExpr {
                 } else {
                     RowAddressTreeMap::from_iter(matching_row_ids.values().iter())
                 };
-                Ok(RowAddressMask {
+                Ok(RowIdMask {
                     block_list: None,
                     allow_list: Some(allow_list),
                 })

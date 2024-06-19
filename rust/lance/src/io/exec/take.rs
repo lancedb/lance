@@ -116,7 +116,6 @@ impl Take {
             let rows = if extra.fields.is_empty() {
                 batch
             } else {
-                dbg!(row_ids.values());
                 let new_columns = dataset.take_rows(row_ids.values(), &extra).await?;
                 debug_assert_eq!(batch.num_rows(), new_columns.num_rows());
                 batch.merge(&new_columns)?

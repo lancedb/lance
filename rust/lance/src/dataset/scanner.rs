@@ -3377,7 +3377,6 @@ mod test {
             scan.prefilter(true);
 
             let plan = scan.explain_plan(true).await.unwrap();
-            dbg!(&plan);
             let batch = scan.try_into_batch().await.unwrap();
 
             if params.use_projection {

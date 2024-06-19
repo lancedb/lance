@@ -17,7 +17,7 @@ use datafusion::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{
-    utils::{address::RowAddress, mask::RowAddressTreeMap},
+    utils::{address::RowAddress, mask::RowIdMask},
     Error, Result, ROW_ID_FIELD,
 };
 use lance_index::{
@@ -196,7 +196,7 @@ impl MapIndexExec {
     async fn map_batch(
         column_name: String,
         dataset: Arc<Dataset>,
-        deletion_mask: Option<Arc<RowAddressTreeMap>>,
+        deletion_mask: Option<Arc<RowIdMask>>,
         row_id_index: Option<Arc<RowIdIndex>>,
         batch: RecordBatch,
     ) -> datafusion::error::Result<RecordBatch> {
@@ -205,9 +205,19 @@ impl MapIndexExec {
             .map(|idx| ScalarValue::try_from_array(index_vals, idx))
             .collect::<datafusion::error::Result<Vec<_>>>()?;
         let query = ScalarIndexExpr::Query(column_name.clone(), ScalarQuery::IsIn(index_vals));
-        let row_addresses = query.evaluate(dataset.as_ref(), &row_id_index).await?;
+        let mut row_addresses = query.evaluate(dataset.as_ref(), &row_id_index).await?;
+
+        if let Some(deletion_mask) = deletion_mask.as_ref() {
+            row_addresses = row_addresses & deletion_mask.as_ref().clone();
+        }
+
         debug_assert!(row_addresses.block_list.is_none());
-        if let Some(allow_list) = row_addresses.allow_list {
+        if let Some(mut allow_list) = row_addresses.allow_list {
+            // Flatten the allow list
+            if let Some(block_list) = row_addresses.block_list {
+                allow_list -= &block_list;
+            }
+
             let allow_list =
                 allow_list
                     .row_addresses()
@@ -215,11 +225,7 @@ impl MapIndexExec {
                         "IndexedLookupExec: row addresses didn't have an iterable allow list"
                             .into(),
                     ))?;
-            let mut allow_list = allow_list.map(u64::from).collect::<Vec<_>>();
-            if let Some(deletion_mask) = deletion_mask {
-                allow_list.retain(|row_id| !deletion_mask.contains(*row_id));
-            }
-            let allow_list = UInt64Array::from(allow_list);
+            let allow_list: UInt64Array = allow_list.map(u64::from).collect();
             Ok(RecordBatch::try_new(
                 INDEX_LOOKUP_SCHEMA.clone(),
                 vec![Arc::new(allow_list)],
@@ -408,7 +414,7 @@ impl MaterializeIndexExec {
         });
         let mask = if let Some(prefilter) = prefilter {
             let (mask, prefilter) = futures::try_join!(mask, prefilter)?;
-            mask.also_block((*prefilter).clone())
+            mask & (*prefilter).clone()
         } else {
             mask.await?
         };

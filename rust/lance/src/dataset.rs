@@ -40,7 +40,7 @@ mod hash_joiner;
 pub mod index;
 pub mod optimize;
 pub mod progress;
-mod rowids;
+pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
 mod take;
@@ -1278,7 +1278,7 @@ pub(crate) async fn write_manifest_file(
 ) -> std::result::Result<(), CommitError> {
     let was_using_legacy = should_use_legacy_format(manifest.writer_feature_flags);
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest)?;
+        apply_feature_flags(manifest, config.use_move_stable_row_ids)?;
     }
     // For now, we don't auto-detect use_v2_format.  Instead, if the user
     // asks for it, we set it.  Otherwise we use what was there before.

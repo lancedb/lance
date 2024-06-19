@@ -2023,7 +2023,6 @@ mod tests {
             dataset.clone(),
             &[index_meta],
             None,
-            None,
         ));
 
         let is_not_remapped = Some;

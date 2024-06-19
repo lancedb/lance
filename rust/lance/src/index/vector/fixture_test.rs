@@ -246,7 +246,6 @@ mod test {
                     deleted_ids: None,
                     filtered_ids: None,
                     final_mask: Mutex::new(OnceCell::new()),
-                    row_id_index: None,
                 }),
             )
             .await

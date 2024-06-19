@@ -26,7 +26,7 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::utils::mask::{RowAddressMask, RowAddressTreeMap};
+use lance_core::utils::mask::{RowAddressTreeMap, RowIdMask};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
 use lance_io::stream::RecordBatchStream;
@@ -294,7 +294,7 @@ struct FilteredRowIdsToPrefilter {
 
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowAddressMask> {
+    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
         let mut allow_list = RowAddressTreeMap::new();
         while let Some(batch) = self.input.next().await {
             let batch = batch?;
@@ -322,7 +322,7 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
             };
             allow_list.extend(row_addrs)
         }
-        Ok(RowAddressMask::from_allowed(allow_list))
+        Ok(RowIdMask::from_allowed(allow_list))
     }
 }
 
@@ -331,7 +331,7 @@ struct SelectionVectorToPrefilter(SendableRecordBatchStream);
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowAddressMask> {
+    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
         let batch = self
             .0
             .try_next()
@@ -341,7 +341,7 @@ impl FilterLoader for SelectionVectorToPrefilter {
                 location: location!(),
             })
             .unwrap();
-        RowAddressMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
+        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
             Error::Internal {
                 message: format!(
                     "Expected selection vector input to yield binary arrays but got {}",
@@ -754,7 +754,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             ds.clone(),
                             &[index_meta],
                             prefilter_loader,
-                            row_id_index,
                         ));
 
                         let raw_index = ds.open_vector_index(&column, &index_uuid).await?;

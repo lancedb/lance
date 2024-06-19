@@ -135,6 +135,8 @@ mod test {
             .await
             .unwrap();
 
+        assert!(dataset.manifest.uses_move_stable_row_ids());
+
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
 

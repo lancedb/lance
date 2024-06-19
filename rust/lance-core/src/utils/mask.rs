@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::ops::RangeBounds;
 use std::{collections::BTreeMap, io::Read};
 
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
@@ -14,23 +15,23 @@ use crate::Result;
 
 use super::address::RowAddress;
 
-/// A row address mask to select or deselect particular row address
+/// A row id mask to select or deselect particular row id
 ///
 /// If both the allow_list and the block_list are Some then the only selected
-/// row address are those that are in the allow_list but not in the block_list
+/// row id are those that are in the allow_list but not in the block_list
 /// (the block_list takes precedence)
 ///
 /// If both the allow_list and the block_list are None (the default) then
-/// all row address are selected
+/// all row id are selected
 #[derive(Clone, Debug, Default)]
-pub struct RowAddressMask {
+pub struct RowIdMask {
     /// If Some then only these row ids are selected
     pub allow_list: Option<RowAddressTreeMap>,
     /// If Some then these row ids are not selected.
     pub block_list: Option<RowAddressTreeMap>,
 }
 
-impl RowAddressMask {
+impl RowIdMask {
     // Create a mask allowing all rows, this is an alias for [default]
     pub fn all_rows() -> Self {
         Self::default()
@@ -60,42 +61,43 @@ impl RowAddressMask {
         }
     }
 
-    /// True if the row_addr is selected by the mask, false otherwise
-    pub fn selected(&self, row_addr: u64) -> bool {
+    /// True if the row_id is selected by the mask, false otherwise
+    pub fn selected(&self, row_id: u64) -> bool {
         match (&self.allow_list, &self.block_list) {
             (None, None) => true,
-            (Some(allow_list), None) => allow_list.contains(row_addr),
-            (None, Some(block_list)) => !block_list.contains(row_addr),
+            (Some(allow_list), None) => allow_list.contains(row_id),
+            (None, Some(block_list)) => !block_list.contains(row_id),
             (Some(allow_list), Some(block_list)) => {
-                allow_list.contains(row_addr) && !block_list.contains(row_addr)
+                allow_list.contains(row_id) && !block_list.contains(row_id)
             }
         }
     }
 
     /// Given an iterator of index and row address, return the indices of the
     /// input row addresses that were valid.
-    pub fn selected_indices(&self, row_addrs: impl Iterator<Item = (usize, u64)>) -> Vec<u64> {
+    pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
+        let enumerated_ids = row_ids.enumerate();
         match (&self.block_list, &self.allow_list) {
             (Some(block_list), Some(allow_list)) => {
                 // Only take rows that are both in the allow list and not in the block list
-                row_addrs
-                    .filter(|(_, row_addr)| {
-                        !block_list.contains(*row_addr) && allow_list.contains(*row_addr)
+                enumerated_ids
+                    .filter(|(_, row_id)| {
+                        !block_list.contains(**row_id) && allow_list.contains(**row_id)
                     })
                     .map(|(idx, _)| idx as u64)
                     .collect()
             }
             (Some(block_list), None) => {
                 // Take rows that are not in the block list
-                row_addrs
-                    .filter(|(_, row_addr)| !block_list.contains(*row_addr))
+                enumerated_ids
+                .filter(|(_, row_id)| !block_list.contains(**row_id))
                     .map(|(idx, _)| idx as u64)
                     .collect()
             }
             (None, Some(allow_list)) => {
                 // Take rows that are in the allow list
-                row_addrs
-                    .filter(|(_, row_addr)| allow_list.contains(*row_addr))
+                enumerated_ids
+                    .filter(|(_, row_id)| allow_list.contains(**row_id))
                     .map(|(idx, _)| idx as u64)
                     .collect()
             }
@@ -144,12 +146,12 @@ impl RowAddressMask {
 
     /// Convert a mask into an arrow array
     ///
-    /// A row address mask is not very arrow-compatible.  We can't make it a batch with
+    /// A row id mask is not very arrow-compatible.  We can't make it a batch with
     /// two columns because the block list and allow list will have different lengths.  Also,
     /// there is no Arrow type for compressed bitmaps.
     ///
     /// However, we need to shove it into some kind of Arrow container to pass it along the
-    /// datafusion stream.  Perhaps, in the future, we can add row address masks as first class
+    /// datafusion stream.  Perhaps, in the future, we can add row id masks as first class
     /// types in datafusion, and this can be passed along as a mask / selection vector.
     ///
     /// We serialize this as a variable length binary array with two items.  The first item
@@ -182,7 +184,7 @@ impl RowAddressMask {
         Ok(BinaryArray::try_new(offsets, values, Some(nulls))?)
     }
 
-    /// Deserialize a row address mask from Arrow
+    /// Deserialize a row id mask from Arrow
     pub fn from_arrow(array: &GenericBinaryArray<i32>) -> Result<Self> {
         let block_list = if array.is_null(0) {
             None
@@ -204,7 +206,7 @@ impl RowAddressMask {
     }
 }
 
-impl std::ops::Not for RowAddressMask {
+impl std::ops::Not for RowIdMask {
     type Output = Self;
 
     fn not(self) -> Self::Output {
@@ -215,7 +217,7 @@ impl std::ops::Not for RowAddressMask {
     }
 }
 
-impl std::ops::BitAnd for RowAddressMask {
+impl std::ops::BitAnd for RowIdMask {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self::Output {
@@ -238,7 +240,7 @@ impl std::ops::BitAnd for RowAddressMask {
     }
 }
 
-impl std::ops::BitOr for RowAddressMask {
+impl std::ops::BitOr for RowIdMask {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
@@ -328,6 +330,80 @@ impl RowAddressTreeMap {
         }
     }
 
+    /// Insert a single value into the set
+    ///
+    /// Returns true if the value was not already in the set.
+    ///
+    /// ```rust
+    /// use lance_core::utils::mask::RowAddressTreeMap;
+    ///
+    /// let mut set = RowAddressTreeMap::new();
+    /// assert_eq!(set.insert(10), true);
+    /// assert_eq!(set.insert(10), false);
+    /// assert_eq!(set.contains(10), true);
+    /// ```
+    pub fn insert(&mut self, value: u64) -> bool {
+        let fragment = (value >> 32) as u32;
+        let row_addr = value as u32;
+        match self.inner.get_mut(&fragment) {
+            None => {
+                let mut set = RoaringBitmap::new();
+                set.insert(row_addr);
+                self.inner.insert(fragment, RowAddrSelection::Partial(set));
+                true
+            }
+            Some(RowAddrSelection::Full) => false,
+            Some(RowAddrSelection::Partial(set)) => set.insert(row_addr),
+        }
+    }
+
+    /// Insert a range of values into the set
+    pub fn insert_range<R: RangeBounds<u64>>(&mut self, range: R) -> u64 {
+        let (mut start_high, start_low) = match range.start_bound() {
+            std::ops::Bound::Included(&start) => ((start >> 32) as u32, start as u32),
+            std::ops::Bound::Excluded(&start) => {
+                let start = start.saturating_add(1);
+                ((start >> 32) as u32, start as u32)
+            }
+            std::ops::Bound::Unbounded => (0, 0),
+        };
+
+        let (end_high, end_low) = match range.end_bound() {
+            std::ops::Bound::Included(&end) => {
+                let end = end.saturating_sub(1);
+                ((end >> 32) as u32, end as u32)
+            }
+            std::ops::Bound::Excluded(&end) => ((end >> 32) as u32, end as u32),
+            std::ops::Bound::Unbounded => (u32::MAX, u32::MAX),
+        };
+
+        let mut count = 0;
+
+        while start_high <= end_high {
+            let start = if start_high == end_high { start_low } else { 0 };
+            let end = if start_high == end_high {
+                end_low
+            } else {
+                u32::MAX
+            };
+            let fragment = start_high;
+            match self.inner.get_mut(&fragment) {
+                None => {
+                    let mut set = RoaringBitmap::new();
+                    count += set.insert_range(start..end);
+                    self.inner.insert(fragment, RowAddrSelection::Partial(set));
+                }
+                Some(RowAddrSelection::Full) => {}
+                Some(RowAddrSelection::Partial(set)) => {
+                    count += set.insert_range(start..end);
+                }
+            }
+            start_high += 1;
+        }
+
+        count
+    }
+
     /// Add a bitmap for a single fragment
     pub fn insert_bitmap(&mut self, fragment: u32, bitmap: RoaringBitmap) {
         self.inner
@@ -347,6 +423,27 @@ impl RowAddressTreeMap {
             None => false,
             Some(RowAddrSelection::Full) => true,
             Some(RowAddrSelection::Partial(fragment_set)) => fragment_set.contains(row_addr),
+        }
+    }
+
+    pub fn remove(&mut self, value: u64) -> bool {
+        let fragment = (value >> 32) as u32;
+        let row_addr = value as u32;
+        match self.inner.get_mut(&fragment) {
+            None => false,
+            Some(RowAddrSelection::Full) => {
+                let mut set = RoaringBitmap::full();
+                set.remove(row_addr);
+                self.inner.insert(fragment, RowAddrSelection::Partial(set));
+                true
+            }
+            Some(RowAddrSelection::Partial(fragment_set)) => {
+                let removed = fragment_set.remove(row_addr);
+                if fragment_set.is_empty() {
+                    self.inner.remove(&fragment);
+                }
+                removed
+            }
         }
     }
 
@@ -419,6 +516,13 @@ impl std::ops::BitOr<Self> for RowAddressTreeMap {
     type Output = Self;
 
     fn bitor(mut self, rhs: Self) -> Self::Output {
+        self |= rhs;
+        self
+    }
+}
+
+impl std::ops::BitOrAssign<Self> for RowAddressTreeMap {
+    fn bitor_assign(&mut self, rhs: Self) {
         for (fragment, rhs_set) in &rhs.inner {
             match self.inner.get_mut(fragment) {
                 None => {
@@ -434,7 +538,6 @@ impl std::ops::BitOr<Self> for RowAddressTreeMap {
                 }
             }
         }
-        self
     }
 }
 
@@ -468,6 +571,35 @@ impl std::ops::BitAnd<Self> for RowAddressTreeMap {
         });
 
         self
+    }
+}
+
+impl std::ops::SubAssign<&Self> for RowAddressTreeMap {
+    fn sub_assign(&mut self, rhs: &Self) {
+        for (fragment, rhs_set) in &rhs.inner {
+            match self.inner.get_mut(fragment) {
+                None => {}
+                Some(RowAddrSelection::Full) => {
+                    // If the fragment is already selected then there is nothing to do
+                    match rhs_set {
+                        RowAddrSelection::Full => {
+                            self.inner.remove(fragment);
+                        }
+                        RowAddrSelection::Partial(rhs_set) => {
+                            // This generally won't be hit.
+                            let mut set = RoaringBitmap::full();
+                            set -= rhs_set;
+                            self.inner.insert(*fragment, RowAddrSelection::Partial(set));
+                        }
+                    }
+                }
+                Some(RowAddrSelection::Partial(lhs_set)) => {
+                    if let RowAddrSelection::Partial(rhs_set) = rhs_set {
+                        *lhs_set -= rhs_set;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -536,28 +668,28 @@ mod tests {
 
     #[test]
     fn test_ops() {
-        let mask = RowAddressMask::default();
+        let mask = RowIdMask::default();
         assert!(mask.selected(1));
         assert!(mask.selected(5));
         let block_list = mask.also_block(RowAddressTreeMap::from_iter(&[0, 5, 15]));
         assert!(block_list.selected(1));
         assert!(!block_list.selected(5));
-        let allow_list = RowAddressMask::from_allowed(RowAddressTreeMap::from_iter(&[0, 2, 5]));
+        let allow_list = RowIdMask::from_allowed(RowAddressTreeMap::from_iter(&[0, 2, 5]));
         assert!(!allow_list.selected(1));
         assert!(allow_list.selected(5));
         let combined = block_list & allow_list;
         assert!(combined.selected(2));
         assert!(!combined.selected(0));
         assert!(!combined.selected(5));
-        let other = RowAddressMask::from_allowed(RowAddressTreeMap::from_iter(&[3]));
+        let other = RowIdMask::from_allowed(RowAddressTreeMap::from_iter(&[3]));
         let combined = combined | other;
         assert!(combined.selected(2));
         assert!(combined.selected(3));
         assert!(!combined.selected(0));
         assert!(!combined.selected(5));
 
-        let block_list = RowAddressMask::from_block(RowAddressTreeMap::from_iter(&[0]));
-        let allow_list = RowAddressMask::from_allowed(RowAddressTreeMap::from_iter(&[3]));
+        let block_list = RowIdMask::from_block(RowAddressTreeMap::from_iter(&[0]));
+        let allow_list = RowIdMask::from_allowed(RowAddressTreeMap::from_iter(&[3]));
         let combined = block_list | allow_list;
         assert!(combined.selected(1));
     }
