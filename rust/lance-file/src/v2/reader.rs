@@ -836,7 +836,7 @@ mod tests {
     use arrow_array::{types::Float64Type, RecordBatch, RecordBatchReader};
     use arrow_schema::{ArrowError, DataType, Field, Fields, Schema as ArrowSchema};
     use futures::StreamExt;
-    use lance_arrow::{RecordBatchExt};
+    use lance_arrow::RecordBatchExt;
     use lance_core::datatypes::Schema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_io::{
