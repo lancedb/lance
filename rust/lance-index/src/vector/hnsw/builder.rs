@@ -311,7 +311,7 @@ impl HnswBuilder {
         let mut builder = Self {
             distance_type,
             params,
-            nodes: Arc::new(Vec::with_capacity(0)),
+            nodes: Arc::new(Vec::new()),
             level_count,
             entry_point: 0,
             visited_generator_queue,
@@ -323,7 +323,9 @@ impl HnswBuilder {
 
         let mut nodes = Vec::with_capacity(len);
         {
-            nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
+            if len > 0 {
+                nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
+            }
             for i in 1..len {
                 nodes.push(RwLock::new(GraphBuilderNode::new(
                     i as u32,
@@ -683,9 +685,6 @@ impl IvfSubIndex for HNSW {
             hnsw.inner.params.m,
             hnsw.inner.params.ef_construction
         );
-        if storage.len() <= 1 {
-            return Ok(hnsw);
-        }
 
         let len = storage.len();
         let parallel_limit = hnsw
@@ -696,7 +695,7 @@ impl IvfSubIndex for HNSW {
             .max(1);
         log::info!("Building HNSW graph with parallel_limit={}", parallel_limit);
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
-        (1..storage.len()).into_par_iter().for_each(|node| {
+        (1..len).into_par_iter().for_each(|node| {
             let mut visited_generator = VisitedGenerator::new(len);
             hnsw.inner
                 .insert(node as u32, &mut visited_generator, storage);
@@ -717,7 +716,7 @@ impl IvfSubIndex for HNSW {
             let level = level as usize;
             for (id, node) in self.inner.nodes.iter().enumerate() {
                 let node = node.read().unwrap();
-                if level >= node.level_neighbors.len() || node.level_neighbors[level].is_empty() {
+                if level >= node.level_neighbors.len() {
                     continue;
                 }
                 let neighbors = node.level_neighbors[level].iter().map(|n| Some(*n));
