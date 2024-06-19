@@ -14,16 +14,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::compute::sort_to_indices;
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::compute::{concat_batches, sort_to_indices};
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
-use arrow_schema::Field;
+use arrow_array::{new_empty_array, ListArray, StructArray};
+use arrow_schema::{DataType, Field};
 use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::reader::FileReader;
+use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
+use lance_io::scheduler::ScanScheduler;
 use lance_io::stream::RecordBatchStream;
 use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
@@ -32,6 +37,7 @@ use log::info;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
+use tracing::debug_span;
 
 use crate::vector::ivf::Ivf;
 use crate::vector::transform::{KeepFiniteVectors, Transformer};
@@ -469,18 +475,59 @@ impl IvfShuffler {
                     "Chunk loaded into memory and sorted, writing to disk at {}",
                     path
                 );
-                let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
+                // We write out a List array where each list item is one centroid's worth
+                // of data
+                let strct_type = DataType::Struct(schema.fields.clone());
+                let strct_field = Arc::new(Field::new("item", strct_type.clone(), true));
+                let list_field = Arc::new(Field::new(
+                    "partitions",
+                    DataType::List(strct_field.clone()),
+                    false,
+                ));
+                let part_schema = Arc::new(arrow_schema::Schema::new(vec![list_field.clone()]));
+                let mut list_arrays = Vec::with_capacity(shuffled.len());
+                {
+                    let _span = debug_span!("arrowify_sorted_partitions");
+                    for part in shuffled.into_iter() {
+                        if part.is_empty() {
+                            list_arrays.push(ListArray::new(
+                                strct_field.clone(),
+                                OffsetBuffer::<i32>::new(ScalarBuffer::from(vec![0, 0])),
+                                new_empty_array(&strct_type),
+                                None,
+                            ));
+                        } else {
+                            let schema = part[0].schema();
+                            let combined = concat_batches(&schema, part.iter())?;
+                            let combined: StructArray = combined.into();
+                            list_arrays.push(ListArray::new(
+                                strct_field.clone(),
+                                OffsetBuffer::<i32>::new(ScalarBuffer::from(vec![
+                                    0,
+                                    combined.len() as i32,
+                                ])),
+                                Arc::new(combined),
+                                None,
+                            ));
+                        }
+                    }
+                }
+                let lance_schema = Schema::try_from(part_schema.as_ref())?;
+                let mut file_writer = lance_file::v2::writer::FileWriter::try_new(
                     writer,
-                    Schema::try_from(schema.as_ref())?,
-                    &Default::default(),
+                    path.to_string(),
+                    lance_schema,
+                    FileWriterOptions::default(),
                 )?;
 
-                for batches_and_idx in shuffled.into_iter().enumerate() {
-                    let (idx, batches) = batches_and_idx;
+                for partition_and_idx in list_arrays.into_iter().enumerate() {
+                    let (idx, partition) = partition_and_idx;
                     if idx % 1000 == 0 {
                         info!("Writing partition {}/{}", idx, self.num_partitions);
                     }
-                    file_writer.write(&batches).await?;
+                    let batch =
+                        RecordBatch::try_new(part_schema.clone(), vec![Arc::new(partition)])?;
+                    file_writer.write_batch(&batch).await?;
                 }
 
                 file_writer.finish().await?;
@@ -500,19 +547,39 @@ impl IvfShuffler {
         let mut streams = vec![];
 
         for file in files {
-            let object_store = ObjectStore::local();
+            let object_store = Arc::new(ObjectStore::local());
             let path = self.output_dir.child(file);
-            let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
-            let reader = Arc::new(reader);
+            let scan_scheduler = ScanScheduler::new(object_store, 16);
+            let file_scheduler = scan_scheduler.open_file(&path).await?;
+            let reader = lance_file::v2::reader::FileReader::try_open(
+                file_scheduler,
+                None,
+                DecoderMiddlewareChain::default(),
+            )
+            .await?;
+            let stream = reader
+                .read_stream(
+                    ReadBatchParams::RangeFull,
+                    1,
+                    32,
+                    FilterExpression::no_filter(),
+                )?
+                .and_then(|batch| {
+                    let list_array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .expect("ListArray expected");
+                    let struct_array = list_array
+                        .values()
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .expect("StructArray expected")
+                        .clone();
+                    let batch: RecordBatch = struct_array.into();
+                    std::future::ready(Ok(batch))
+                });
 
-            let stream = stream::iter(0..reader.num_batches())
-                .zip(stream::repeat(reader))
-                .map(|(i, reader)| async move {
-                    reader
-                        .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema())
-                        .await
-                })
-                .buffered(4);
             streams.push(stream);
         }
 

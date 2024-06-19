@@ -21,6 +21,7 @@ use prost::Message;
 use prost_types::Any;
 use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
+use tracing::instrument;
 
 use crate::datatypes::FieldsWithMeta;
 use crate::format::pb;
@@ -173,6 +174,7 @@ impl FileWriter {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn write_pages(
         &mut self,
         mut encoding_tasks: FuturesUnordered<EncodeTask>,
@@ -208,6 +210,28 @@ impl FileWriter {
         Ok(())
     }
 
+    #[instrument(skip_all)]
+    fn encode_batch(&mut self, batch: &RecordBatch) -> Result<Vec<Vec<EncodeTask>>> {
+        self.schema
+            .fields
+            .iter()
+            .zip(self.column_writers.iter_mut())
+            .map(|(field, column_writer)| {
+                let array = batch
+                    .column_by_name(&field.name)
+                    .ok_or(Error::InvalidInput {
+                        source: format!(
+                            "Cannot write batch.  The batch was missing the column `{}`",
+                            field.name
+                        )
+                        .into(),
+                        location: location!(),
+                    })?;
+                column_writer.maybe_encode(array.clone())
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     /// Schedule a batch of data to be written to the file
     ///
     /// Note: the future returned by this method may complete before the data has been fully
@@ -235,25 +259,8 @@ impl FileWriter {
         };
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
-        let encoding_tasks = self
-            .schema
-            .fields
-            .iter()
-            .zip(self.column_writers.iter_mut())
-            .map(|(field, column_writer)| {
-                let array = batch
-                    .column_by_name(&field.name)
-                    .ok_or(Error::InvalidInput {
-                        source: format!(
-                            "Cannot write batch.  The batch was missing the column `{}`",
-                            field.name
-                        )
-                        .into(),
-                        location: location!(),
-                    })?;
-                column_writer.maybe_encode(array.clone())
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let encoding_tasks = self.encode_batch(batch)?;
+
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
