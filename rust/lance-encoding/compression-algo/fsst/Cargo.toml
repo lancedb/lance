@@ -1,0 +1,21 @@
+[package]
+name = "fsst"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rand = "0.8.4"
+# this should be put in dev-dependencies, TODO: remove it here
+arrow = { version = "51.0.0", optional = false, features = ["prettyprint"] }
+
+[dev-dependencies]
+test-log.workspace = true
+tokio.workspace = true
+rand_xoshiro = "0.6.0"
+lance-datagen = { workspace = true }
+
+[[bin]]
+name = "benchmark"
+path = "examples/benchmark.rs"
