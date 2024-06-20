@@ -569,6 +569,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::datatypes::Schema;
     use lance_core::ROW_ID_FIELD;
 
     const DIM: usize = 32;
