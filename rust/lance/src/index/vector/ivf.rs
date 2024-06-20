@@ -231,7 +231,7 @@ impl std::fmt::Debug for IVFIndex {
 /// Returns (new_uuid, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
     dataset: Dataset,
-    unindexed: impl RecordBatchStream + Unpin + 'static,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
@@ -319,7 +319,7 @@ pub(crate) async fn optimize_vector_indices(
 
 pub(crate) async fn optimize_vector_indices_v2(
     dataset: &Dataset,
-    unindexed: impl RecordBatchStream + Unpin + 'static,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
@@ -419,7 +419,7 @@ async fn optimize_ivf_pq_indices(
     first_idx: &IVFIndex,
     pq_index: &PQIndex,
     vector_column: &str,
-    unindexed: impl RecordBatchStream + Unpin + 'static,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
     mut writer: ObjectWriter,
@@ -438,8 +438,8 @@ async fn optimize_ivf_pq_indices(
     );
 
     // Shuffled un-indexed data with partition.
-    let shuffled = if unindexed.size_hint().0 > 0 {
-        Some(
+    let shuffled = match unindexed {
+        Some(unindexed) => Some(
             shuffle_dataset(
                 unindexed,
                 vector_column,
@@ -451,9 +451,8 @@ async fn optimize_ivf_pq_indices(
                 None,
             )
             .await?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
 
     let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap());
@@ -501,7 +500,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     first_idx: &IVFIndex,
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
-    unindexed: impl RecordBatchStream + Unpin + 'static,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
     writer: ObjectWriter,
@@ -518,8 +517,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     )?;
 
     // Shuffled un-indexed data with partition.
-    let unindexed_data = if unindexed.size_hint().0 > 0 {
-        Some(
+    let unindexed_data = match unindexed {
+        Some(unindexed) => Some(
             shuffle_dataset(
                 unindexed,
                 vector_column,
@@ -531,9 +530,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
                 None,
             )
             .await?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
 
     let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap());

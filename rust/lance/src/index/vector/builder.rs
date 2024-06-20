@@ -236,7 +236,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             .with_row_id()
             .try_into_stream()
             .await?;
-        self.shuffle_data(stream).await?;
+        self.shuffle_data(Some(stream)).await?;
         Ok(())
     }
 
@@ -245,8 +245,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
     // the shuffled data will be with schema | ROW_ID | PART_ID | code_column |
     pub async fn shuffle_data(
         &mut self,
-        data: impl RecordBatchStream + Unpin + 'static,
+        data: Option<impl RecordBatchStream + Unpin + 'static>,
     ) -> Result<&mut Self> {
+        if data.is_none() {
+            return Ok(self);
+        }
+        let data = data.unwrap();
+
         let ivf = self.ivf.as_ref().ok_or(Error::invalid_input(
             "IVF not set before shuffle data",
             location!(),
