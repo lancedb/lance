@@ -101,8 +101,10 @@ impl IvfModel {
 
     /// Add the offset and length of one partition.
     pub fn add_partition(&mut self, len: u32) {
-        self.offsets
-            .push(self.lengths.last().cloned().unwrap_or_default() as usize);
+        self.offsets.push(
+            self.offsets.last().cloned().unwrap_or_default()
+                + self.lengths.last().cloned().unwrap_or_default() as usize,
+        );
         self.lengths.push(len);
     }
 

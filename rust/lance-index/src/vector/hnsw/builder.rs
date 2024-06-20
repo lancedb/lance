@@ -184,6 +184,7 @@ impl HNSW {
         }
 
         let bottom_level = HnswBottomView::new(nodes);
+        let mut visited = visited_generator.generate(storage.len());
         Ok(beam_search(
             &bottom_level,
             &ep,
@@ -191,7 +192,7 @@ impl HNSW {
             &dist_calc,
             bitset.as_ref(),
             prefetch_distance,
-            visited_generator,
+            &mut visited,
         )
         .into_iter()
         .take(k)
@@ -423,6 +424,7 @@ impl HnswBuilder {
         visited_generator: &mut VisitedGenerator,
     ) -> Vec<OrderedNode> {
         let cur_level = HnswLevelView::new(level, nodes);
+        let mut visited = visited_generator.generate(nodes.len());
         beam_search(
             &cur_level,
             ep,
@@ -430,7 +432,7 @@ impl HnswBuilder {
             dist_calc,
             None,
             self.params.prefetch_distance,
-            visited_generator,
+            &mut visited,
         )
     }
 
