@@ -43,18 +43,12 @@ use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
 use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
 use crate::index::vector::sq::build_sq_storage;
 use crate::Result;
-
-// TODO: make it configurable, limit by the number of CPU cores & memory
-lazy_static::lazy_static! {
-    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = 1;
-}
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(
@@ -296,8 +290,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let mut part_files = Vec::with_capacity(ivf.num_partitions());
     let mut aux_part_files = Vec::with_capacity(ivf.num_partitions());
     let tmp_part_dir = Path::from_filesystem_path(TempDir::new()?)?;
-    let mut tasks = Vec::with_capacity(ivf.num_partitions());
-    let sem = Arc::new(Semaphore::new(*HNSW_PARTITIONS_BUILD_PARALLEL));
+    let mut aux_ivf = IvfData::empty();
+    let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     for part_id in 0..ivf.num_partitions() {
         part_files.push(tmp_part_dir.child(format!("hnsw_part_{}", part_id)));
         aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));
@@ -331,8 +325,11 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         )
         .await?;
 
+        let offset = writer.len();
         if row_id_array.is_empty() {
-            tasks.push(tokio::spawn(async { Ok(0) }));
+            ivf.add_partition(offset, 0);
+            aux_ivf.add_partition(0);
+            hnsw_metadata.push(HnswMetadata::default());
             continue;
         }
 
@@ -358,46 +355,21 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             None => None,
         };
 
-        let dataset = dataset.clone();
-        let column = column.to_owned();
-        let hnsw_params = hnsw_params.clone();
-        let quantizer = quantizer.clone();
-        let sem = sem.clone();
-        tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore error");
+        log::debug!("Building HNSW partition {}", part_id);
+        let num_rows = build_hnsw_quantization_partition(
+            dataset.clone(),
+            column.clone(),
+            metric_type,
+            hnsw_params.clone(),
+            part_writer,
+            aux_part_writer,
+            quantizer.clone(),
+            row_id_array,
+            code_array,
+        )
+        .await?;
+        log::debug!("Finished building HNSW partition {}", part_id);
 
-            log::debug!("Building HNSW partition {}", part_id);
-            let result = build_hnsw_quantization_partition(
-                dataset,
-                &column,
-                distance_type,
-                hnsw_params,
-                part_writer,
-                aux_part_writer,
-                quantizer,
-                row_id_array,
-                code_array,
-            )
-            .await;
-            log::debug!("Finished building HNSW partition {}", part_id);
-            result
-        }));
-    }
-
-    let mut aux_ivf = IvfData::empty();
-    let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
-    for (part_id, task) in tasks.into_iter().enumerate() {
-        let offset = writer.len();
-        let num_rows = task.await??;
-
-        if num_rows == 0 {
-            ivf.add_partition(offset, 0);
-            aux_ivf.add_partition(0);
-            hnsw_metadata.push(HnswMetadata::default());
-            continue;
-        }
-
-        let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
             FileReader::try_new_self_described(&object_store, part_file, None).await?;
 
