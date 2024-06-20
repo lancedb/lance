@@ -103,11 +103,20 @@ impl HnswBuildParams {
         self
     }
 
-    pub async fn build(self, data: ArrayRef) -> Result<HNSW> {
-        // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
+    /// Build the HNSW index from the given data.
+    ///
+    /// # Parameters
+    /// - `data`: A FixedSizeList to build the HNSW.
+    /// - `distance_type`: The distance type to use.
+    pub async fn build(self, data: ArrayRef, distance_type: DistanceType) -> Result<HNSW> {
+        log::info!(
+            "Building HNSW index: distance_type: {}, params: {:#?}",
+            distance_type,
+            self
+        );
         let vec_store = Arc::new(FlatStorage::new(
             data.as_fixed_size_list().clone(),
-            DistanceType::L2,
+            distance_type,
         ));
         HNSW::index_vectors(vec_store.as_ref(), self)
     }
