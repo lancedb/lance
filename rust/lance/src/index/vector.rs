@@ -483,7 +483,10 @@ pub(crate) async fn open_vector_index_v2(
         .metadata
         .get(INDEX_METADATA_SCHEMA_KEY)
         .ok_or(Error::Index {
-            message: "Index Metadata not found".to_owned(),
+            message: format!(
+                "Open vector index v2: index metadata not found in file schema: {}",
+                INDEX_METADATA_SCHEMA_KEY
+            ),
             location: location!(),
         })?;
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
@@ -517,7 +520,6 @@ pub(crate) async fn open_vector_index_v2(
                 distance_type,
             )?)
         }
-
         "IVF_HNSW_SQ" => {
             let aux_path = dataset
                 .indices_dir()
