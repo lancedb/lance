@@ -124,14 +124,16 @@ impl<Q: Quantization> StorageBuilder<Q> {
             location: location!(),
         })?;
         let code_array = self.quantizer.quantize(vectors.as_ref())?;
-        let batch = batch.drop_column(&self.column)?.try_with_column(
-            Field::new(
-                self.quantizer.column(),
-                code_array.data_type().clone(),
-                true,
-            ),
-            code_array,
-        )?;
+        let batch = batch
+            .try_with_column(
+                Field::new(
+                    self.quantizer.column(),
+                    code_array.data_type().clone(),
+                    true,
+                ),
+                code_array,
+            )?
+            .drop_column(&self.column)?;
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
             self.quantizer.metadata(None)?.to_string(),
