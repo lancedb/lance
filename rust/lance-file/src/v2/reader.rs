@@ -529,14 +529,14 @@ impl FileReader {
         column_infos.push(self.metadata.column_infos[*column_idx].clone());
         *column_idx += 1;
 
-        if get_str_encoding_type() { // use str array encoding
+        if get_str_encoding_type() {
+            // use str array encoding
             if (field.data_type().is_binary_like()) && (field.data_type() != DataType::Utf8) {
                 // These types are 2 columns in a lance file but a single field id in a lance schema
                 column_infos.push(self.metadata.column_infos[*column_idx].clone());
                 *column_idx += 1;
             }
-        }
-        else {
+        } else {
             if field.data_type().is_binary_like() {
                 // These types are 2 columns in a lance file but a single field id in a lance schema
                 column_infos.push(self.metadata.column_infos[*column_idx].clone());
@@ -1528,7 +1528,6 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_string_array_encoding() {
-
         // set env var temporarily to test string array encoding
         let _env_guard = EnvVarGuard::new("LANCE_STR_ARRAY_ENCODING", "binary");
 

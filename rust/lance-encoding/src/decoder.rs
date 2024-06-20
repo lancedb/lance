@@ -230,6 +230,7 @@ use tokio::sync::mpsc::{self, unbounded_channel};
 use lance_core::{Error, Result};
 use tracing::instrument;
 
+use crate::encoder::get_str_encoding_type;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
@@ -238,7 +239,6 @@ use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructSched
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
 use crate::{BufferScheduler, EncodingsIo};
-use crate::encoder::get_str_encoding_type;
 
 /// Metadata describing a page in a file
 ///
@@ -559,13 +559,11 @@ impl CoreFieldDecoderStrategy {
                     DataType::Boolean
                     | DataType::Null
                     | DataType::FixedSizeBinary(_)
-                    | DataType::Utf8 
-                    => true,
+                    | DataType::Utf8 => true,
                     DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
                     _ => false,
                 }
-            }
-            else {
+            } else {
                 match data_type {
                     // DataType::is_primitive doesn't consider these primitive but we do
                     DataType::Boolean

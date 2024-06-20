@@ -55,7 +55,6 @@ impl PageScheduler for BinaryPageScheduler {
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
-
         // ranges corresponds to row ranges that the user wants to fetch.
         // if user wants row range a..b
         // Case 1: if a != 0, we need indices a-1..b to decode
@@ -225,7 +224,6 @@ impl PhysicalPageDecoder for BinaryPageDecoder {
         num_rows: u32,
         dest_buffers: &mut [bytes::BytesMut],
     ) -> Result<()> {
-
         let offsets = self
             .decoded_indices
             .as_any()
@@ -294,7 +292,7 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
     arrays.iter().for_each(|arr| {
         let string_arr = arrow_array::cast::as_string_array(arr);
         let offsets = string_arr.offsets().inner();
-        let mut offsets = offsets.slice(1, offsets.len()-1).to_vec();
+        let mut offsets = offsets.slice(1, offsets.len() - 1).to_vec();
 
         if indices_builder.len() == 0 {
             last_offset = offsets[offsets.len() - 1];
@@ -317,7 +315,6 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
 
 // Bytes computed across all string arrays, similar to indices above
 fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
-
     let mut bytes_builder = UInt8Builder::new();
     arrays.iter().for_each(|arr| {
         let string_arr = arrow_array::cast::as_string_array(arr);
@@ -341,7 +338,9 @@ impl ArrayEncoder for BinaryEncoder {
             panic!("Data contains null values, not currently supported for binary data.")
         } else {
             let index_array = get_indices_from_string_arrays(arrays);
-            let encoded_indices = self.indices_encoder.encode(&vec![index_array], buffer_index)?;
+            let encoded_indices = self
+                .indices_encoder
+                .encode(&vec![index_array], buffer_index)?;
 
             let byte_array = get_bytes_from_string_arrays(arrays);
             let encoded_bytes = self.bytes_encoder.encode(&vec![byte_array], buffer_index)?;
