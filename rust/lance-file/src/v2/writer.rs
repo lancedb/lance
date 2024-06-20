@@ -174,7 +174,7 @@ impl FileWriter {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip_all, level = "debug")]
     async fn write_pages(
         &mut self,
         mut encoding_tasks: FuturesUnordered<EncodeTask>,
@@ -210,7 +210,7 @@ impl FileWriter {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip_all, level = "debug")]
     fn encode_batch(&mut self, batch: &RecordBatch) -> Result<Vec<Vec<EncodeTask>>> {
         self.schema
             .fields

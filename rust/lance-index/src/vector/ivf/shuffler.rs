@@ -24,7 +24,7 @@ use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Ar
 use arrow_array::{FixedSizeListArray, ListArray, StructArray, UInt64Array, UInt8Array};
 use arrow_schema::{DataType, Field, Fields, SchemaRef};
 use futures::stream::repeat_with;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
@@ -347,6 +347,7 @@ pub async fn shuffle_dataset(
     Ok(stream)
 }
 
+#[derive(Clone)]
 pub struct IvfShuffler {
     unsorted_buffers: Vec<String>,
 
@@ -575,7 +576,8 @@ impl IvfShuffler {
             .zip(stream::repeat(num_batches))
             .map(|(i, num_batches)| {
                 let schema = schema.clone();
-                async move {
+                let this = self.clone();
+                tokio::spawn(async move {
                     let schema = schema.clone();
                     // first, calculate which files and ranges needs to be processed
                     let start = i;
@@ -616,10 +618,10 @@ impl IvfShuffler {
                     }
 
                     // second, count the number of rows in each partition
-                    let size_counts = self.count_partition_size(&input).await?;
+                    let size_counts = this.count_partition_size(&input).await?;
 
                     // third, shuffle the data into each partition
-                    let shuffled = self
+                    let shuffled = this
                         .shuffle_to_partitions(
                             schema.as_ref(),
                             &input,
@@ -631,7 +633,7 @@ impl IvfShuffler {
                     // finally, write the shuffled data to disk
                     let object_store = ObjectStore::local();
                     let output_file = format!("sorted_{}.lance", i);
-                    let path = self.output_dir.child(output_file.clone());
+                    let path = this.output_dir.child(output_file.clone());
                     let writer = object_store.create(&path).await?;
 
                     info!(
@@ -655,7 +657,7 @@ impl IvfShuffler {
                     for partition_and_idx in shuffled.into_iter().enumerate() {
                         let (idx, partition) = partition_and_idx;
                         if idx % 1000 == 0 {
-                            info!("Writing partition {}/{}", idx, self.num_partitions);
+                            info!("Writing partition {}/{}", idx, this.num_partitions);
                         }
                         let batch = RecordBatch::try_new(
                             sorted_file_schema.clone(),
@@ -667,7 +669,8 @@ impl IvfShuffler {
                     file_writer.finish().await?;
 
                     Ok(output_file) as Result<String>
-                }
+                })
+                .map(|join_res| join_res.unwrap())
             })
             .buffered(concurrent_jobs)
             .try_collect()
@@ -732,12 +735,13 @@ mod test {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;
     use lance_io::stream::RecordBatchStreamAdapter;
+    use rand::RngCore;
 
     use crate::vector::PQ_CODE_COLUMN;
 
     use super::*;
 
-    fn make_schema() -> Arc<arrow_schema::Schema> {
+    fn make_schema(pq_dim: u32) -> Arc<arrow_schema::Schema> {
         Arc::new(arrow_schema::Schema::new(vec![
             ROW_ID_FIELD.clone(),
             arrow_schema::Field::new(PART_ID_COLUMN, DataType::UInt32, true),
@@ -745,7 +749,7 @@ mod test {
                 PQ_CODE_COLUMN,
                 DataType::FixedSizeList(
                     Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
-                    32,
+                    pq_dim as i32,
                 ),
                 false,
             ),
@@ -755,7 +759,7 @@ mod test {
     fn make_stream_and_shuffler(
         include_empty_batches: bool,
     ) -> (impl RecordBatchStream, IvfShuffler) {
-        let schema = make_schema();
+        let schema = make_schema(32);
 
         let schema2 = schema.clone();
 
@@ -965,5 +969,82 @@ mod test {
         }
 
         assert_eq!(num_batches, 200);
+    }
+
+    fn make_big_stream_and_shuffler(
+        num_batches: u32,
+        num_partitions: u32,
+        pq_dim: u32,
+    ) -> (impl RecordBatchStream, IvfShuffler) {
+        let schema = make_schema(pq_dim);
+
+        let schema2 = schema.clone();
+
+        let stream = stream::iter(0..num_batches).map(move |idx| {
+            let mut rng = rand::thread_rng();
+            let row_ids = Arc::new(UInt64Array::from_iter(
+                (idx * 1024..(idx + 1) * 1024).map(u64::from),
+            ));
+
+            let part_id = Arc::new(UInt32Array::from_iter(
+                (idx * 1024..(idx + 1) * 1024).map(|_| rng.next_u32() % num_partitions),
+            ));
+
+            let values = Arc::new(UInt8Array::from_iter((0..pq_dim * 1024).map(|_| idx as u8)));
+            let pq_codes = Arc::new(
+                FixedSizeListArray::try_new_from_values(values as Arc<dyn Array>, pq_dim as i32)
+                    .unwrap(),
+            );
+
+            Ok(RecordBatch::try_new(schema2.clone(), vec![row_ids, part_id, pq_codes]).unwrap())
+        });
+
+        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
+
+        let shuffler = IvfShuffler::try_new(num_partitions, None).unwrap();
+
+        (stream, shuffler)
+    }
+
+    // Change NUM_BATCHES = 1000 * 1024 and NUM_PARTITIONS to 35000 to test 1B shuffle
+    const NUM_BATCHES: u32 = 1 * 100;
+    const NUM_PARTITIONS: u32 = 1000;
+    const PQ_DIM: u32 = 48;
+    const BATCHES_PER_PARTITION: u32 = 10200;
+    const NUM_CONCURRENT_JOBS: u32 = 16;
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_big_shuffle() {
+        let (stream, mut shuffler) =
+            make_big_stream_and_shuffler(NUM_BATCHES, NUM_PARTITIONS, PQ_DIM);
+
+        shuffler.write_unsorted_stream(stream).await.unwrap();
+        let partition_files = shuffler
+            .write_partitioned_shuffles(
+                BATCHES_PER_PARTITION as usize,
+                NUM_CONCURRENT_JOBS as usize,
+            )
+            .await
+            .unwrap();
+
+        let expected_num_part_files = NUM_BATCHES.div_ceil(BATCHES_PER_PARTITION);
+
+        assert_eq!(partition_files.len(), expected_num_part_files as usize);
+
+        let mut result_stream = shuffler
+            .load_partitioned_shuffles(partition_files)
+            .await
+            .unwrap();
+
+        let mut num_batches = 0;
+        result_stream.reverse();
+
+        while let Some(mut stream) = result_stream.pop() {
+            while let Some(_) = stream.next().await {
+                num_batches += 1
+            }
+        }
+
+        assert_eq!(num_batches, NUM_PARTITIONS * expected_num_part_files);
     }
 }
