@@ -238,6 +238,7 @@ use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructSched
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
 use crate::{BufferScheduler, EncodingsIo};
+use crate::encoder::get_str_encoding_type;
 
 /// Metadata describing a page in a file
 ///
@@ -552,14 +553,29 @@ impl CoreFieldDecoderStrategy {
         if data_type.is_primitive() {
             true
         } else {
-            match data_type {
-                // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean
-                | DataType::Null
-                | DataType::FixedSizeBinary(_)
-                | DataType::Utf8 => true,
-                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
-                _ => false,
+            if get_str_encoding_type() {
+                match data_type {
+                    // DataType::is_primitive doesn't consider these primitive but we do
+                    DataType::Boolean
+                    | DataType::Null
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::Utf8 
+                    => true,
+                    DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                    _ => false,
+                }
+            }
+            else {
+                match data_type {
+                    // DataType::is_primitive doesn't consider these primitive but we do
+                    DataType::Boolean
+                    | DataType::Null
+                    | DataType::FixedSizeBinary(_)
+                    // | DataType::Utf8 
+                    => true,
+                    DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                    _ => false,
+                }
             }
         }
     }
@@ -699,7 +715,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 .boxed();
                 Ok((chain, list_scheduler_fut))
             }
-            DataType::Binary | DataType::LargeBinary | DataType::LargeUtf8 => {
+            DataType::Utf8 | DataType::Binary | DataType::LargeBinary | DataType::LargeUtf8 => {
                 let list_type = if matches!(data_type, DataType::Utf8 | DataType::Binary) {
                     DataType::List(Arc::new(ArrowField::new("item", DataType::UInt8, true)))
                 } else {

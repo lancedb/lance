@@ -37,6 +37,8 @@ use crate::{
     format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION_NEXT},
 };
 
+use lance_encoding::encoder::get_str_encoding_type;
+
 use super::io::LanceEncodingsIo;
 use arrow_schema::DataType;
 
@@ -526,11 +528,22 @@ impl FileReader {
     ) -> Result<()> {
         column_infos.push(self.metadata.column_infos[*column_idx].clone());
         *column_idx += 1;
-        if (field.data_type().is_binary_like()) && (field.data_type() != DataType::Utf8) {
-            // These types are 2 columns in a lance file but a single field id in a lance schema
-            column_infos.push(self.metadata.column_infos[*column_idx].clone());
-            *column_idx += 1;
+
+        if get_str_encoding_type() { // use str array encoding
+            if (field.data_type().is_binary_like()) && (field.data_type() != DataType::Utf8) {
+                // These types are 2 columns in a lance file but a single field id in a lance schema
+                column_infos.push(self.metadata.column_infos[*column_idx].clone());
+                *column_idx += 1;
+            }
         }
+        else {
+            if field.data_type().is_binary_like() {
+                // These types are 2 columns in a lance file but a single field id in a lance schema
+                column_infos.push(self.metadata.column_infos[*column_idx].clone());
+                *column_idx += 1;
+            }
+        }
+
         for child in &field.children {
             self.collect_columns(child, column_idx, column_infos)?;
         }
@@ -1515,7 +1528,14 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_string_array_encoding() {
-        let tmp_path = Path::parse("/home/ubuntu/test/strings.lance").unwrap();
+
+        // set env var temporarily to test string array encoding
+        let _env_guard = EnvVarGuard::new("LANCE_STR_ARRAY_ENCODING", "binary");
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = Path::parse(tmp_path).unwrap();
+        let tmp_path = tmp_path.child("some_file.lance");
         let obj_store = Arc::new(ObjectStore::local());
         let writer = obj_store.create(&tmp_path).await.unwrap();
 

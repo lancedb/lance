@@ -28,6 +28,7 @@ use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 use arrow_array::PrimitiveArray;
 use arrow_schema::DataType;
 use lance_core::Result;
+use std::ops::Deref;
 
 #[derive(Debug)]
 pub struct BinaryPageScheduler {
@@ -54,7 +55,6 @@ impl PageScheduler for BinaryPageScheduler {
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
-        // println!("Inside BinaryPageScheduler");
 
         // ranges corresponds to row ranges that the user wants to fetch.
         // if user wants row range a..b
@@ -73,7 +73,6 @@ impl PageScheduler for BinaryPageScheduler {
 
         let mut futures_ordered = FuturesOrdered::new();
         for range in indices_ranges.iter() {
-            // println!("Range: {:?}", range);
             let indices_page_decoder =
                 self.indices_scheduler
                     .schedule_ranges(&[range.clone()], &scheduler, top_level_row);
@@ -81,14 +80,11 @@ impl PageScheduler for BinaryPageScheduler {
         }
 
         let ranges = ranges.to_vec();
-        // println!("Ranges: {:?}", ranges);
         let copy_scheduler = scheduler.clone();
         let copy_bytes_scheduler = self.bytes_scheduler.clone();
         let copy_indices_ranges = indices_ranges.to_vec();
 
         async move {
-            // println!("Started async move");
-
             // For the following data:
             // "abcd", "hello", "abcd", "apple", "hello", "abcd"
             //   4,        9,     13,      18,      23,     27
@@ -147,9 +143,6 @@ impl PageScheduler for BinaryPageScheduler {
 
                 builder.append_slice(truncated_vec);
 
-                // println!("Decoded part: {:?}", decoded_part);
-                // println!("Normalized part: {:?}", truncated_vec);
-
                 // get bytes range from the index range
                 let bytes_range = if curr_row_range.start != 0 {
                     indices_array.value(0)..indices_array.value(indices_array.len() - 1)
@@ -157,13 +150,11 @@ impl PageScheduler for BinaryPageScheduler {
                     0..indices_array.value(indices_array.len() - 1)
                 };
 
-                // println!("Bytes range: {:?}", bytes_range);
                 bytes_ranges.push(bytes_range);
                 curr_range_idx += 1;
             }
 
             let decoded_indices = Arc::new(builder.finish());
-            // println!("Decoded indices: {:?}", decoded_indices);
 
             let bytes_ranges_slice = bytes_ranges.as_slice();
 
@@ -205,9 +196,6 @@ impl PhysicalPageDecoder for BinaryPageDecoder {
         buffers: &mut [(u64, bool)],
         all_null: &mut bool,
     ) {
-        // println!("Inside BinaryPageDecoder update_capacity");
-        // println!("Rows to skip: {:?}, Num rows: {:?}", rows_to_skip, num_rows);
-
         let offsets = self
             .decoded_indices
             .as_any()
@@ -221,14 +209,8 @@ impl PhysicalPageDecoder for BinaryPageDecoder {
         let bytes_to_skip = offsets.value(rows_to_skip as usize);
         let num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;
 
-        // println!(
-        //     "Capacity update: Bytes to skip: {:?}, Num bytes: {:?}",
-        //     bytes_to_skip, num_bytes
-        // );
         self.bytes_decoder
             .update_capacity(bytes_to_skip, num_bytes, &mut buffers[1..], all_null);
-
-        // println!("Capacity updated");
     }
 
     // Continuing from update_capacity:
@@ -243,15 +225,12 @@ impl PhysicalPageDecoder for BinaryPageDecoder {
         num_rows: u32,
         dest_buffers: &mut [bytes::BytesMut],
     ) -> Result<()> {
-        // println!("Rows to skip: {:?}, Num rows: {:?}", rows_to_skip, num_rows);
 
         let offsets = self
             .decoded_indices
             .as_any()
             .downcast_ref::<UInt32Array>()
             .unwrap();
-
-        // println!("Offsets: {:?}", offsets);
 
         let bytes_to_skip = offsets.value(rows_to_skip as usize);
         let num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;
@@ -266,14 +245,8 @@ impl PhysicalPageDecoder for BinaryPageDecoder {
         let normalized_array: PrimitiveArray<UInt32Type> =
             target_vec.iter().map(|x| x - target_vec[0]).collect();
         let normalized_values = normalized_array.values();
-        // println!("Normalized values: {:?}", normalized_values);
 
-        let byte_slice: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                normalized_values.as_ptr() as *const u8,
-                normalized_values.len() * std::mem::size_of::<u32>(),
-            )
-        };
+        let byte_slice = normalized_values.inner().deref();
 
         // copy target_offsets into dest_buffers[0]
         dest_buffers[0].extend_from_slice(byte_slice);
@@ -284,14 +257,6 @@ impl PhysicalPageDecoder for BinaryPageDecoder {
         // Including the indices this results in 3 buffers in total
         self.bytes_decoder
             .decode_into(bytes_to_skip, num_bytes, &mut dest_buffers[1..])?;
-
-        // for i in 0..3 {
-        //     println!(
-        //         "length, capacity of buffer: {:?}, {:?} ",
-        //         dest_buffers[i].len(),
-        //         dest_buffers[i].capacity()
-        //     );
-        // }
 
         Ok(())
     }
@@ -323,13 +288,13 @@ impl BinaryEncoder {
 // Strings are a vector of arrays corresponding to each record batch
 // Zero offset is removed from the start of the offsets array
 // The indices array is computed across all arrays in the vector
-fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
+fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
     let mut indices_builder = Int32Builder::new();
     let mut last_offset = 0;
     arrays.iter().for_each(|arr| {
         let string_arr = arrow_array::cast::as_string_array(arr);
-        let mut offsets = string_arr.value_offsets().to_vec();
-        offsets = offsets[1..].to_vec();
+        let offsets = string_arr.offsets().inner();
+        let mut offsets = offsets.slice(1, offsets.len()-1).to_vec();
 
         if indices_builder.len() == 0 {
             last_offset = offsets[offsets.len() - 1];
@@ -343,33 +308,26 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
 
         let new_int_arr = Int32Array::from(offsets);
         indices_builder.append_slice(new_int_arr.values());
-
-        // match cast(&new_int_arr, &DataType::UInt64) {
-        //     Ok(res) => Some(Arc::new(res) as ArrayRef),
-        //     Err(_) => panic!("Failed to cast to uint64"),
-        // }
-        // Some(Arc::new(new_int_arr) as ArrayRef)
     });
 
     let final_array: ArrayRef = Arc::new(indices_builder.finish()) as ArrayRef;
 
-    vec![final_array]
+    final_array
 }
 
 // Bytes computed across all string arrays, similar to indices above
-fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
+fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
+
     let mut bytes_builder = UInt8Builder::new();
     arrays.iter().for_each(|arr| {
         let string_arr = arrow_array::cast::as_string_array(arr);
-        let values = string_arr.values().to_vec();
-        bytes_builder.append_slice(&values);
-        // let bytes_arr = Arc::new(UInt8Array::from(values)) as ArrayRef;
-        // Some(bytes_arr)
+        let values = string_arr.values();
+        bytes_builder.append_slice(values);
     });
 
     let final_array = Arc::new(bytes_builder.finish()) as ArrayRef;
 
-    vec![final_array]
+    final_array
 }
 
 impl ArrayEncoder for BinaryEncoder {
@@ -382,17 +340,11 @@ impl ArrayEncoder for BinaryEncoder {
         if null_count != 0 {
             panic!("Data contains null values, not currently supported for binary data.")
         } else {
-            let index_arrays = get_indices_from_string_arrays(arrays);
-            let encoded_indices = self.indices_encoder.encode(&index_arrays, buffer_index)?;
-            // for arr in &index_arrays {
-            //     println!("indices: {:?}", arr);
-            // }
+            let index_array = get_indices_from_string_arrays(arrays);
+            let encoded_indices = self.indices_encoder.encode(&vec![index_array], buffer_index)?;
 
-            let byte_arrays = get_bytes_from_string_arrays(arrays);
-            // for arr in &byte_arrays {
-            //     println!("arr: {:?}", arr);
-            // }
-            let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
+            let byte_array = get_bytes_from_string_arrays(arrays);
+            let encoded_bytes = self.bytes_encoder.encode(&vec![byte_array], buffer_index)?;
 
             let mut encoded_buffers = encoded_indices.buffers;
             encoded_buffers.extend(encoded_bytes.buffers);

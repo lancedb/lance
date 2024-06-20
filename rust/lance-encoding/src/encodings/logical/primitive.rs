@@ -268,11 +268,6 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
             return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));
         }
 
-        // capacities
-        //     .clone()
-        //     .into_iter()
-        //     .for_each(|buf| println!("Buffer length Initial {:?}", buf.0));
-
         // At this point we know the size needed for each buffer
         let mut bufs = capacities
             .into_iter()
@@ -287,15 +282,10 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
             })
             .collect::<Vec<_>>();
 
-        // bufs.clone()
-        //     .into_iter()
-        //     .for_each(|buf| println!("Buffer length {:?}", buf.capacity()));
-
         // Go ahead and fill the validity / values buffers
         self.physical_decoder
             .decode_into(self.rows_to_skip, self.rows_to_take, &mut bufs)?;
 
-        // println!("rows to take: {:?}", self.rows_to_take);
         // Convert the two buffers into an Arrow array
         Self::primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)
     }
@@ -513,13 +503,6 @@ impl PrimitiveFieldDecodeTask {
 
                 let offsets = OffsetBuffer::new(indices_buffer.clone());
 
-                // let indices_array = Arc::new(
-                //     PrimitiveArray::<Int32Type>::new(indices_buffer.clone(), None)
-                //         .with_data_type(DataType::Int32),
-                // );
-
-                // println!("Indices: {:?}", indices_array);
-
                 // TODO - add NULL support
                 // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
                 let _null_buffer = buffer_iter.next().unwrap();
@@ -533,10 +516,6 @@ impl PrimitiveFieldDecodeTask {
                     PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
                         .with_data_type(DataType::UInt8),
                 );
-
-                // println!("Bytes: {:?}", bytes_array);
-                // let final_str_arr = StringArray::new(offsets, bytes_array.values().into(), None);
-                // println!("Final String Array: {:?}", final_str_arr);
 
                 Ok(Arc::new(StringArray::new(
                     offsets,
