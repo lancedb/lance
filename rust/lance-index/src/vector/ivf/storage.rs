@@ -192,7 +192,7 @@ impl TryFrom<PbIvf> for IvfModel {
         assert_eq!(offsets.len(), proto.lengths.len());
         Ok(Self {
             centroids,
-            offsets: offsets,
+            offsets,
             lengths: proto.lengths.clone(),
         })
     }
