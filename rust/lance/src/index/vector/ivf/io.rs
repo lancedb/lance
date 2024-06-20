@@ -249,7 +249,6 @@ pub(super) async fn write_pq_partitions(
 pub(super) async fn write_hnsw_quantization_index_partitions(
     dataset: Arc<dyn DatasetTakeRows>,
     column: &str,
-    distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     writer: &mut FileWriter<ManifestDescribing>,
     mut auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
@@ -258,8 +257,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<(Vec<HnswMetadata>, IvfData)> {
-    let hnsw_params = Arc::new(hnsw_params.clone());
-
     let mut streams_heap = BinaryHeap::new();
     let mut new_streams = vec![];
     if let Some(streams) = streams {
@@ -370,7 +367,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             let result = build_hnsw_quantization_partition(
                 dataset,
                 &column,
-                distance_type,
                 hnsw_params,
                 part_writer,
                 aux_part_writer,
@@ -451,8 +447,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 async fn build_hnsw_quantization_partition(
     dataset: Arc<dyn DatasetTakeRows>,
     column: &str,
-    metric_type: MetricType,
-    hnsw_params: Arc<HnswBuildParams>,
+    mut hnsw_params: HnswBuildParams,
     writer: FileWriter<ManifestDescribing>,
     aux_writer: Option<FileWriter<ManifestDescribing>>,
     quantizer: Quantizer,
@@ -472,15 +467,12 @@ async fn build_hnsw_quantization_partition(
         .expect("row id column not found")
         .clone();
 
-    let mut metric_type = metric_type;
-    if metric_type == MetricType::Cosine {
+    if hnsw_params.distance_type == DistanceType::Cosine {
         // Normalize vectors for cosine similarity
         vectors =
             Arc::new(spawn_cpu(move || Ok(normalize_fsl(vectors.as_fixed_size_list())?)).await?);
-        metric_type = MetricType::L2;
+        hnsw_params = hnsw_params.distance_type(DistanceType::Cosine)
     }
-
-    let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), vectors.clone(), writer);
 
     let build_store = match quantizer {
         Quantizer::Flat(_) => {
@@ -490,7 +482,7 @@ async fn build_hnsw_quantization_partition(
             });
         }
         Quantizer::Product(pq) => tokio::spawn(build_and_write_pq_storage(
-            metric_type,
+            hnsw_params.distance_type,
             row_ids,
             code_array,
             pq,
@@ -498,13 +490,15 @@ async fn build_hnsw_quantization_partition(
         )),
 
         Quantizer::Scalar(sq) => tokio::spawn(build_and_write_sq_storage(
-            metric_type,
+            hnsw_params.distance_type,
             row_ids,
-            vectors,
+            vectors.clone(),
             sq,
             aux_writer.unwrap(),
         )),
     };
+
+    let build_hnsw = build_and_write_hnsw(hnsw_params, vectors, writer);
 
     let index_rows = futures::join!(build_hnsw, build_store).0?;
     assert!(

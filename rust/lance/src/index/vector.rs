@@ -312,6 +312,7 @@ pub(crate) async fn build_vector_index(
                 location: location!(),
             });
         };
+        let hnsw_params = (*hnsw_params).clone().distance_type(params.metric_type);
 
         // with quantization
         if len > 2 {
@@ -322,9 +323,8 @@ pub(crate) async fn build_vector_index(
                         column,
                         name,
                         uuid,
-                        params.metric_type,
                         ivf_params,
-                        hnsw_params,
+                        &hnsw_params,
                         pq_params,
                     )
                     .await?
@@ -335,9 +335,8 @@ pub(crate) async fn build_vector_index(
                         column,
                         name,
                         uuid,
-                        params.metric_type,
                         ivf_params,
-                        hnsw_params,
+                        &hnsw_params,
                         sq_params,
                     )
                     .await?

@@ -543,7 +543,6 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let (hnsw_metadata, aux_ivf) = write_hnsw_quantization_index_partitions(
         dataset,
         vector_column,
-        distance_type,
         hnsw_params,
         &mut writer,
         Some(&mut aux_writer),
@@ -1221,13 +1220,18 @@ pub async fn build_ivf_hnsw_pq_index(
     column: &str,
     index_name: &str,
     uuid: &str,
-    metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     hnsw_params: &HnswBuildParams,
     pq_params: &PQBuildParams,
 ) -> Result<()> {
-    let (ivf_model, pq) =
-        build_ivf_model_and_pq(dataset, column, metric_type, ivf_params, pq_params).await?;
+    let (ivf_model, pq) = build_ivf_model_and_pq(
+        dataset,
+        column,
+        hnsw_params.distance_type,
+        ivf_params,
+        pq_params,
+    )
+    .await?;
     let stream = scan_index_field_stream(dataset, column).await?;
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
@@ -1239,7 +1243,6 @@ pub async fn build_ivf_hnsw_pq_index(
         &[],
         ivf_model,
         Quantizer::Product(pq),
-        metric_type,
         hnsw_params,
         stream,
         precomputed_partitions,
@@ -1256,13 +1259,18 @@ pub async fn build_ivf_hnsw_sq_index(
     column: &str,
     index_name: &str,
     uuid: &str,
-    metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     hnsw_params: &HnswBuildParams,
     sq_params: &SQBuildParams,
 ) -> Result<()> {
-    let (ivf_model, sq) =
-        build_ivf_model_and_sq(dataset, column, metric_type, ivf_params, sq_params).await?;
+    let (ivf_model, sq) = build_ivf_model_and_sq(
+        dataset,
+        column,
+        hnsw_params.distance_type,
+        ivf_params,
+        sq_params,
+    )
+    .await?;
     let stream = scan_index_field_stream(dataset, column).await?;
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
@@ -1274,7 +1282,6 @@ pub async fn build_ivf_hnsw_sq_index(
         &[],
         ivf_model,
         Quantizer::Scalar(sq),
-        metric_type,
         hnsw_params,
         stream,
         precomputed_partitions,
@@ -1483,7 +1490,6 @@ async fn write_ivf_hnsw_file(
     _transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
     quantizer: Quantizer,
-    distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<HashMap<u64, u32>>,
@@ -1501,7 +1507,7 @@ async fn write_ivf_hnsw_file(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
             index_type: format!("IVF_HNSW_{}", quantizer.quantization_type()),
-            distance_type: distance_type.to_string(),
+            distance_type: hnsw_params.distance_type.to_string(),
         })
         .to_string()
         .as_str(),
@@ -1530,7 +1536,7 @@ async fn write_ivf_hnsw_file(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
             index_type: quantizer.quantization_type().to_string(),
-            distance_type: distance_type.to_string(),
+            distance_type: hnsw_params.distance_type.to_string(),
         })
         .to_string()
         .as_str(),
@@ -1583,7 +1589,6 @@ async fn write_ivf_hnsw_file(
         column,
         &mut ivf,
         quantizer,
-        distance_type,
         hnsw_params,
         0..num_partitions,
         precomputed_partitons,

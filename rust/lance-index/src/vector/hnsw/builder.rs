@@ -43,7 +43,7 @@ use crate::vector::{Query, DIST_COL, VECTOR_RESULT_SCHEMA};
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
 /// Parameters of building HNSW index
-#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf, Serialize, Deserialize)]
 pub struct HnswBuildParams {
     /// max level ofm
     pub max_level: u16,
@@ -59,6 +59,9 @@ pub struct HnswBuildParams {
 
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
+
+    /// Distance Type
+    pub distance_type: DistanceType,
 }
 
 impl Default for HnswBuildParams {
@@ -69,11 +72,18 @@ impl Default for HnswBuildParams {
             ef_construction: 150,
             parallel_limit: None,
             prefetch_distance: Some(2),
+            distance_type: DistanceType::L2,
         }
     }
 }
 
 impl HnswBuildParams {
+    /// Distance Type used to calculate distance between a pair of vectors.
+    pub fn distance_type(mut self, distance_type: DistanceType) -> Self {
+        self.distance_type = distance_type;
+        self
+    }
+
     /// The maximum level of the graph.
     /// The default value is `8`.
     pub fn max_level(mut self, max_level: u16) -> Self {
@@ -107,7 +117,7 @@ impl HnswBuildParams {
         // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
         let vec_store = Arc::new(FlatStorage::new(
             data.as_fixed_size_list().clone(),
-            DistanceType::L2,
+            self.distance_type,
         ));
         HNSW::index_vectors(vec_store.as_ref(), self)
     }

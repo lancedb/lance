@@ -95,7 +95,6 @@ pub(super) async fn build_hnsw_partitions(
     column: &str,
     ivf: &mut Ivf,
     quantizer: Quantizer,
-    metric_type: MetricType,
     hnsw_params: &HnswBuildParams,
     part_range: Range<u32>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
@@ -119,7 +118,7 @@ pub(super) async fn build_hnsw_partitions(
 
     let ivf_model = lance_index::vector::ivf::new_ivf_with_quantizer(
         ivf.centroids.clone(),
-        metric_type,
+        hnsw_params.distance_type,
         column,
         quantizer.clone(),
         Some(part_range),
@@ -140,7 +139,6 @@ pub(super) async fn build_hnsw_partitions(
     write_hnsw_quantization_index_partitions(
         dataset,
         column,
-        metric_type,
         hnsw_params,
         writer,
         auxiliary_writer,

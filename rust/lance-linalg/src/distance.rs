@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::ArrowError;
+use serde::{Deserialize, Serialize};
 
 pub mod cosine;
 pub mod dot;
@@ -29,7 +30,7 @@ pub use norm_l2::*;
 use crate::Result;
 
 /// Distance metrics type.
-#[derive(Debug, Copy, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Copy, Clone, PartialEq, DeepSizeOf, Serialize, Deserialize)]
 pub enum DistanceType {
     L2,
     Cosine,
