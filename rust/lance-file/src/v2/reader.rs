@@ -536,12 +536,10 @@ impl FileReader {
                 column_infos.push(self.metadata.column_infos[*column_idx].clone());
                 *column_idx += 1;
             }
-        } else {
-            if field.data_type().is_binary_like() {
-                // These types are 2 columns in a lance file but a single field id in a lance schema
-                column_infos.push(self.metadata.column_infos[*column_idx].clone());
-                *column_idx += 1;
-            }
+        } else if field.data_type().is_binary_like() {
+            // These types are 2 columns in a lance file but a single field id in a lance schema
+            column_infos.push(self.metadata.column_infos[*column_idx].clone());
+            *column_idx += 1;
         }
 
         for child in &field.children {

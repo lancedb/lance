@@ -499,7 +499,7 @@ impl PrimitiveFieldDecodeTask {
                 let indices_bytes = buffer_iter.next().unwrap().freeze();
                 let indices_buffer = Buffer::from_bytes(indices_bytes.into());
                 let indices_buffer =
-                    ScalarBuffer::<i32>::new(indices_buffer.into(), 0, num_rows as usize + 1);
+                    ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
 
                 let offsets = OffsetBuffer::new(indices_buffer.clone());
 

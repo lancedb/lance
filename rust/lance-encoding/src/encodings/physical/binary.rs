@@ -74,7 +74,7 @@ impl PageScheduler for BinaryPageScheduler {
         for range in indices_ranges.iter() {
             let indices_page_decoder =
                 self.indices_scheduler
-                    .schedule_ranges(&[range.clone()], &scheduler, top_level_row);
+                    .schedule_ranges(&[range.clone()], scheduler, top_level_row);
             futures_ordered.push_back(indices_page_decoder);
         }
 
