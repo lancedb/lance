@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -13,6 +12,7 @@ use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::quantizer::QuantizerBuildParams;
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
+use lance_index::vector::v3::shuffler::IvfShufflerReader;
 use lance_index::vector::VectorIndex;
 use lance_index::{
     pb,
@@ -45,7 +45,6 @@ use tempfile::TempDir;
 use crate::Dataset;
 
 use super::utils;
-use super::v2::IVFIndex;
 
 // Builder for IVF index
 // The builder will train the IVF model and quantizer, shuffle the dataset, and build the sub index
@@ -276,7 +275,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         let schema = match batch {
             Some(Ok(b)) => b.schema(),
             Some(Err(e)) => panic!("do this better: error reading first batch: {:?}", e),
-            None => panic!("no data"),
+            None => {
+                log::info!("no data to shuffle");
+                self.shuffle_reader = Some(Box::new(IvfShufflerReader::new(
+                    self.dataset.object_store().clone(),
+                    self.temp_dir.clone(),
+                    vec![0; ivf.num_partitions()],
+                )));
+                return Ok(self);
+            }
         };
 
         self.shuffle_reader = Some(
@@ -296,8 +303,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
             "IVF not set before building partitions",
             location!(),
         ))?;
+
         let reader = self.shuffle_reader.as_ref().ok_or(Error::invalid_input(
-            "must shuffle data before building partitions",
+            "shuffle reader not set before building partitions",
             location!(),
         ))?;
 
@@ -316,6 +324,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
         // step 3. build sub index
         let mut partition_sizes = vec![(0, 0); ivf.num_partitions()];
         for &partition in &partition_build_order {
+            // for existing_index in self.existing_indices.iter() {
+            //     let existing_index = existing_index
+            //         .as_any()
+            //         .downcast_ref::<IVFIndex<S, Q>>()
+            //         .ok_or(Error::invalid_input(
+            //             "existing index is not IVF index",
+            //             location!(),
+            //         ))?;
+            // }
+
             match reader.partiton_size(partition)? {
                 0 => continue,
                 _ => {

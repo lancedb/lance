@@ -359,19 +359,9 @@ pub(crate) async fn optimize_vector_indices_v2(
         existing_indices.len() - options.num_indices_to_merge
     };
     let indices_to_merge = existing_indices[start_pos..].to_vec();
+    let merged_num = indices_to_merge.len();
     match index_type {
         (SubIndexType::Flat, QuantizationType::Flat) => {
-            let indices = indices_to_merge
-                .iter()
-                .map(|idx| {
-                    idx.as_any()
-                        .downcast_ref::<v2::IvfFlatIndex>()
-                        .ok_or(Error::Index {
-                            message: "optimizing vector index: it is not a IVF index".to_string(),
-                            location: location!(),
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?;
             IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
@@ -382,24 +372,14 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
-            .shuffle_data(unindexed, indices.as_ref())
+            .with_existing_indices(indices_to_merge)
+            .shuffle_data(unindexed)
             .await?
             .build()
             .await?;
         }
 
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
-            let indices = indices_to_merge
-                .iter()
-                .map(|idx| {
-                    idx.as_any()
-                        .downcast_ref::<v2::IvfHnswSqIndex>()
-                        .ok_or(Error::Index {
-                            message: "optimizing vector index: it is not a IVF index".to_string(),
-                            location: location!(),
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?;
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
                 vector_column.to_owned(),
@@ -413,7 +393,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
-            .shuffle_data(unindexed, indices.as_ref())
+            .with_existing_indices(indices_to_merge)
+            .shuffle_data(unindexed)
             .await?
             .build()
             .await?;
@@ -430,7 +411,7 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
     }
 
-    Ok((new_uuid, indices_to_merge.len()))
+    Ok((new_uuid, merged_num))
 }
 
 #[allow(clippy::too_many_arguments)]

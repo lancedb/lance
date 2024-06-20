@@ -208,11 +208,11 @@ impl Shuffler for IvfShuffler {
             writer.finish().await?;
         }
 
-        Ok(Box::new(IvfShufflerReader {
-            object_store: self.object_store.clone(),
-            output_dir: self.output_dir.clone(),
+        Ok(Box::new(IvfShufflerReader::new(
+            self.object_store.clone(),
+            self.output_dir.clone(),
             partition_sizes,
-        }))
+        )))
     }
 }
 
@@ -220,6 +220,16 @@ pub struct IvfShufflerReader {
     object_store: ObjectStore,
     output_dir: Path,
     partition_sizes: Vec<usize>,
+}
+
+impl IvfShufflerReader {
+    pub fn new(object_store: ObjectStore, output_dir: Path, partition_sizes: Vec<usize>) -> Self {
+        Self {
+            object_store,
+            output_dir,
+            partition_sizes,
+        }
+    }
 }
 
 #[async_trait::async_trait]
