@@ -14,7 +14,6 @@ use itertools::Itertools;
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
-use serde_json::json;
 use snafu::{location, Location};
 use std::cmp::min;
 use std::collections::HashMap;
@@ -40,7 +39,8 @@ use crate::vector::graph::{
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
 use crate::vector::{Query, DIST_COL, VECTOR_RESULT_SCHEMA};
-use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+
+pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
@@ -127,12 +127,7 @@ pub struct HNSW {
 
 impl Debug for HNSW {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "HNSW(max_layers: {}, metric={})",
-            self.inner.max_level() as usize,
-            self.inner.distance_type,
-        )
+        write!(f, "HNSW(max_layers: {})", self.inner.max_level() as usize,)
     }
 }
 
@@ -155,10 +150,6 @@ impl HNSW {
 
     pub fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
         self.inner.nodes()
-    }
-
-    pub fn distance_type(&self) -> DistanceType {
-        self.inner.distance_type
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -253,7 +244,6 @@ impl HNSW {
 }
 
 struct HnswBuilder {
-    distance_type: DistanceType,
     params: HnswBuildParams,
 
     nodes: Arc<Vec<RwLock<GraphBuilderNode>>>,
@@ -266,8 +256,7 @@ struct HnswBuilder {
 
 impl DeepSizeOf for HnswBuilder {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.distance_type.deep_size_of_children(context)
-            + self.params.deep_size_of_children(context)
+        self.params.deep_size_of_children(context)
             + self.nodes.deep_size_of_children(context)
             + self.level_count.deep_size_of_children(context)
         // Skipping the visited_generator_queue
@@ -288,11 +277,7 @@ impl HnswBuilder {
     }
 
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
-    pub fn with_params(
-        distance_type: DistanceType,
-        params: HnswBuildParams,
-        storage: &impl VectorStore,
-    ) -> Self {
+    pub fn with_params(params: HnswBuildParams, storage: &impl VectorStore) -> Self {
         let len = storage.len();
         let max_level = params.max_level;
 
@@ -307,9 +292,8 @@ impl HnswBuilder {
                 .unwrap();
         }
         let mut builder = Self {
-            distance_type,
             params,
-            nodes: Arc::new(Vec::with_capacity(0)),
+            nodes: Arc::new(Vec::new()),
             level_count,
             entry_point: 0,
             visited_generator_queue,
@@ -321,7 +305,9 @@ impl HnswBuilder {
 
         let mut nodes = Vec::with_capacity(len);
         {
-            nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
+            if len > 0 {
+                nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
+            }
             for i in 1..len {
                 nodes.push(RwLock::new(GraphBuilderNode::new(
                     i as u32,
@@ -521,26 +507,15 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
-        let index_metadata = data
-            .schema_ref()
-            .metadata()
-            .get(INDEX_METADATA_SCHEMA_KEY)
-            .ok_or(Error::Index {
-                message: format!("{} not found", INDEX_METADATA_SCHEMA_KEY),
-                location: location!(),
-            })?;
-        let index_metadata: IndexMetadata = serde_json::from_str(index_metadata)?;
-        let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
-
-        let hnsw_metadata = data
-            .schema_ref()
-            .metadata()
-            .get(Self::metadata_key())
-            .ok_or(Error::Index {
-                message: format!("{} not found", Self::metadata_key()),
-                location: location!(),
-            })?;
-        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata).unwrap_or_default();
+        let hnsw_metadata =
+            data.schema_ref()
+                .metadata()
+                .get(HNSW_METADATA_KEY)
+                .ok_or(Error::Index {
+                    message: format!("{} not found", HNSW_METADATA_KEY),
+                    location: location!(),
+                })?;
+        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata)?;
 
         let levels: Vec<_> = hnsw_metadata
             .level_offsets
@@ -584,7 +559,6 @@ impl IvfSubIndex for HNSW {
                 .unwrap();
         }
         let inner = HnswBuilder {
-            distance_type,
             params: hnsw_metadata.params,
             nodes: Arc::new(nodes.into_iter().map(RwLock::new).collect()),
             level_count: level_count.into_iter().map(AtomicUsize::new).collect(),
@@ -672,22 +646,18 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
-        let inner = HnswBuilder::with_params(storage.distance_type(), params, storage);
+        let inner = HnswBuilder::with_params(params, storage);
         let hnsw = Self {
             inner: Arc::new(inner),
         };
 
         log::info!(
-            "Building HNSW graph: num={}, metric_type={}, max_levels={}, m={}, ef_construction={}",
+            "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}",
             storage.len(),
-            hnsw.inner.distance_type,
             hnsw.inner.params.max_level,
             hnsw.inner.params.m,
             hnsw.inner.params.ef_construction
         );
-        if storage.len() <= 1 {
-            return Ok(hnsw);
-        }
 
         let len = storage.len();
         let parallel_limit = hnsw
@@ -698,7 +668,7 @@ impl IvfSubIndex for HNSW {
             .max(1);
         log::info!("Building HNSW graph with parallel_limit={}", parallel_limit);
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
-        (1..storage.len()).into_par_iter().for_each(|node| {
+        (1..len).into_par_iter().for_each(|node| {
             let mut visited_generator = VisitedGenerator::new(len);
             hnsw.inner
                 .insert(node as u32, &mut visited_generator, storage);
@@ -719,7 +689,7 @@ impl IvfSubIndex for HNSW {
             let level = level as usize;
             for (id, node) in self.inner.nodes.iter().enumerate() {
                 let node = node.read().unwrap();
-                if level >= node.level_neighbors.len() || node.level_neighbors[level].is_empty() {
+                if level >= node.level_neighbors.len() {
                     continue;
                 }
                 let neighbors = node.level_neighbors[level].iter().map(|n| Some(*n));
@@ -742,23 +712,15 @@ impl IvfSubIndex for HNSW {
             batches.push(batch);
         }
 
-        let index_metadata = json!(IndexMetadata {
-            index_type: HNSW_TYPE.to_string(),
-            distance_type: self.inner.distance_type.to_string(),
-        });
-
         let metadata = self.metadata();
         let metadata = serde_json::to_string(&metadata)?;
         let schema = Self::schema()
             .as_ref()
             .clone()
-            .with_metadata(HashMap::from_iter(vec![
-                (
-                    INDEX_METADATA_SCHEMA_KEY.to_owned(),
-                    index_metadata.to_string(),
-                ),
-                (Self::metadata_key().to_owned(), metadata),
-            ]));
+            .with_metadata(HashMap::from_iter(vec![(
+                HNSW_METADATA_KEY.to_string(),
+                metadata,
+            )]));
         let batch = concat_batches(&Self::schema(), batches.iter())?;
         let batch = batch.with_schema(Arc::new(schema))?;
         Ok(batch)

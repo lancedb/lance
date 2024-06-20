@@ -30,7 +30,7 @@ use super::io::write_hnsw_quantization_index_partitions;
 ///
 ///
 #[allow(clippy::too_many_arguments)]
-#[instrument(level = "debug", skip(writer, data, ivf, pq))]
+#[instrument(level = "debug", skip_all)]
 pub(super) async fn build_partitions(
     writer: &mut dyn Writer,
     data: impl RecordBatchStream + Unpin + 'static,

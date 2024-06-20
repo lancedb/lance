@@ -465,8 +465,9 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        warn!("ANNIVFPartitionExec: with_new_children called, but no children to replace");
-        Ok(self)
+        Err(DataFusionError::Internal(
+            "ANNIVFPartitionExec: with_new_children called, but no children to replace".to_string(),
+        ))
     }
 
     fn execute(
@@ -611,9 +612,24 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "ANNSubIndexExec node must have exactly one child".to_string(),
+            ));
+        }
+
+        let new_plan = Self {
+            input: children.pop().expect("length checked"),
+            dataset: self.dataset.clone(),
+            indices: self.indices.clone(),
+            query: self.query.clone(),
+            prefilter_source: self.prefilter_source.clone(),
+            properties: self.properties.clone(),
+        };
+
+        Ok(Arc::new(new_plan))
     }
 
     fn execute(

@@ -496,7 +496,13 @@ async fn build_hnsw_quantization_partition(
         _ => unreachable!("IVF_HNSW_SQ has been moved to v2 index builder"),
     };
 
-    futures::join!(build_hnsw, build_store).0?;
+    let index_rows = futures::join!(build_hnsw, build_store).0?;
+    assert!(
+        index_rows >= num_rows,
+        "index rows {} must be greater than or equal to num rows {}",
+        index_rows,
+        num_rows
+    );
     Ok(num_rows)
 }
 
