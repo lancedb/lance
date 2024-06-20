@@ -230,10 +230,7 @@ fn get_compression_scheme() -> CompressionScheme {
 
 pub fn get_str_encoding_type() -> bool {
     let str_encoding = std::env::var("LANCE_STR_ARRAY_ENCODING").unwrap_or("none".to_string());
-    match str_encoding.as_str() {
-        "binary" => true,
-        _ => false,
-    }
+    matches!(str_encoding.as_str(), "binary")
 }
 
 impl CoreArrayEncodingStrategy {

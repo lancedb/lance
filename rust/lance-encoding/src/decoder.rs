@@ -552,28 +552,26 @@ impl CoreFieldDecoderStrategy {
     fn is_primitive(data_type: &DataType) -> bool {
         if data_type.is_primitive() {
             true
+        } else if get_str_encoding_type() {
+            match data_type {
+                // DataType::is_primitive doesn't consider these primitive but we do
+                DataType::Boolean
+                | DataType::Null
+                | DataType::FixedSizeBinary(_)
+                | DataType::Utf8 => true,
+                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                _ => false,
+            }
         } else {
-            if get_str_encoding_type() {
-                match data_type {
-                    // DataType::is_primitive doesn't consider these primitive but we do
-                    DataType::Boolean
-                    | DataType::Null
-                    | DataType::FixedSizeBinary(_)
-                    | DataType::Utf8 => true,
-                    DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
-                    _ => false,
-                }
-            } else {
-                match data_type {
-                    // DataType::is_primitive doesn't consider these primitive but we do
-                    DataType::Boolean
-                    | DataType::Null
-                    | DataType::FixedSizeBinary(_)
-                    // | DataType::Utf8 
-                    => true,
-                    DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
-                    _ => false,
-                }
+            match data_type {
+                // DataType::is_primitive doesn't consider these primitive but we do
+                DataType::Boolean
+                | DataType::Null
+                | DataType::FixedSizeBinary(_)
+                // | DataType::Utf8 
+                => true,
+                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                _ => false,
             }
         }
     }

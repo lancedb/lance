@@ -308,9 +308,7 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
         indices_builder.append_slice(new_int_arr.values());
     });
 
-    let final_array: ArrayRef = Arc::new(indices_builder.finish()) as ArrayRef;
-
-    final_array
+    Arc::new(indices_builder.finish()) as ArrayRef
 }
 
 // Bytes computed across all string arrays, similar to indices above
@@ -322,9 +320,7 @@ fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
         bytes_builder.append_slice(values);
     });
 
-    let final_array = Arc::new(bytes_builder.finish()) as ArrayRef;
-
-    final_array
+    Arc::new(bytes_builder.finish()) as ArrayRef
 }
 
 impl ArrayEncoder for BinaryEncoder {
@@ -338,12 +334,10 @@ impl ArrayEncoder for BinaryEncoder {
             panic!("Data contains null values, not currently supported for binary data.")
         } else {
             let index_array = get_indices_from_string_arrays(arrays);
-            let encoded_indices = self
-                .indices_encoder
-                .encode(&vec![index_array], buffer_index)?;
+            let encoded_indices = self.indices_encoder.encode(&[index_array], buffer_index)?;
 
             let byte_array = get_bytes_from_string_arrays(arrays);
-            let encoded_bytes = self.bytes_encoder.encode(&vec![byte_array], buffer_index)?;
+            let encoded_bytes = self.bytes_encoder.encode(&[byte_array], buffer_index)?;
 
             let mut encoded_buffers = encoded_indices.buffers;
             encoded_buffers.extend(encoded_bytes.buffers);
