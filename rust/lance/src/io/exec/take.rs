@@ -66,6 +66,7 @@ impl Take {
                     .buffered(batch_readahead)
                     .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
                     .try_for_each(|b| async {
+                        dbg!(&b);
                         if tx.send(Ok(b)).await.is_err() {
                         // If channel is closed, make sure we return an error to end the stream. 
                         return Err(DataFusionError::Internal(

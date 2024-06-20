@@ -545,6 +545,13 @@ impl std::ops::BitAnd<Self> for RowAddressTreeMap {
     type Output = Self;
 
     fn bitand(mut self, rhs: Self) -> Self::Output {
+        self &= rhs;
+        self
+    }
+}
+
+impl std::ops::BitAndAssign<Self> for RowAddressTreeMap {
+    fn bitand_assign(&mut self, rhs: Self) {
         // Remove fragment that aren't on the RHS
         self.inner
             .retain(|fragment, _| rhs.inner.contains_key(fragment));
@@ -569,8 +576,6 @@ impl std::ops::BitAnd<Self> for RowAddressTreeMap {
             RowAddrSelection::Partial(set) => !set.is_empty(),
             RowAddrSelection::Full => true,
         });
-
-        self
     }
 }
 

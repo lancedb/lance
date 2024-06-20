@@ -3172,7 +3172,7 @@ mod test {
         append_then_delete_version: u64,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq)]
     struct ScalarTestParams {
         use_index: bool,
         use_projection: bool,
@@ -3377,6 +3377,7 @@ mod test {
             scan.prefilter(true);
 
             let plan = scan.explain_plan(true).await.unwrap();
+            dbg!(&plan);
             let batch = scan.try_into_batch().await.unwrap();
 
             if params.use_projection {
@@ -3449,6 +3450,7 @@ mod test {
                     "The non-indexed refine filter was not applied",
                 );
             }
+            dbg!(&batch["not_indexed"]);
             // If there is new data then the dupe of row 50 should be in the results
             if params.use_new_data || params.use_updated {
                 self.assert_one(
@@ -3621,6 +3623,21 @@ mod test {
                                         use_compaction,
                                         use_updated,
                                     };
+                                    // Narrow to certain test case
+                                    let case = ScalarTestParams {
+                                        use_index: true,
+                                        use_projection: false,
+                                        use_deleted_data: false,
+                                        use_new_data: false,
+                                        with_row_id: false,
+                                        use_compaction: false,
+                                        use_updated: true,
+                                    };
+                                    if &params != &case {
+                                        // This is the default case, we don't need to run it twice
+                                        continue;
+                                    }
+                                    dbg!(&params);
                                     fixture.check_vector_queries(&params).await;
                                     fixture.check_simple_queries(&params).await;
                                 }

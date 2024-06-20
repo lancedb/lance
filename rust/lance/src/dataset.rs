@@ -67,7 +67,6 @@ use lance_table::feature_flags::{
     apply_feature_flags, can_read_dataset, can_write_dataset, should_use_legacy_format,
     FLAG_USE_V2_FORMAT,
 };
-pub(crate) use rowids::get_row_id_index;
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };

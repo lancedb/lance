@@ -238,7 +238,6 @@ impl PreFilter for DatasetPreFilter {
             combined
         });
 
-        dbg!(final_mask.get().as_ref());
         Ok(())
     }
 
