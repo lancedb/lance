@@ -17,7 +17,7 @@ use std::sync::Arc;
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::{concat_batches, sort_to_indices};
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
-use arrow_array::{new_empty_array, ListArray, StructArray};
+use arrow_array::{ListArray, StructArray};
 use arrow_schema::{DataType, Field};
 use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
