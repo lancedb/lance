@@ -355,7 +355,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             None => None,
         };
 
-        log::debug!("Building HNSW partition {}", part_id);
+        log::info!("Building HNSW partition {}", part_id);
         let num_rows = build_hnsw_quantization_partition(
             dataset.clone(),
             column,
@@ -368,7 +368,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             code_array,
         )
         .await?;
-        log::debug!("Finished building HNSW partition {}", part_id);
+        log::info!("Finished building HNSW partition {}", part_id);
 
         let part_reader =
             FileReader::try_new_self_described(&object_store, part_file, None).await?;
