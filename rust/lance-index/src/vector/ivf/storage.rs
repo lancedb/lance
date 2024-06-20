@@ -5,6 +5,7 @@ use std::ops::Range;
 
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt32Array};
 use deepsize::DeepSizeOf;
+use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
@@ -113,8 +114,8 @@ impl IvfModel {
     }
 
     pub fn row_range(&self, partition: usize) -> Range<usize> {
-        let start = self.offsets.get(partition).cloned().unwrap_or_default();
-        let end = self.offsets.get(partition + 1).cloned().unwrap_or_default();
+        let start = self.offsets[partition];
+        let end = start + self.lengths[partition] as usize;
         start..end
     }
 
@@ -179,16 +180,19 @@ impl TryFrom<PbIvf> for IvfModel {
         // v1 index format. It will be deprecated soon.
         //
         // This new offset uses the row offset in the lance file.
-        let offsets = [0]
+        let offsets = proto
+            .lengths
             .iter()
-            .chain(proto.lengths.iter())
             .scan(0_usize, |state, &x| {
+                let old = *state;
                 *state += x as usize;
-                Some(*state)
-            });
+                Some(old)
+            })
+            .collect_vec();
+        assert_eq!(offsets.len(), proto.lengths.len());
         Ok(Self {
             centroids,
-            offsets: offsets.collect(),
+            offsets: offsets,
             lengths: proto.lengths.clone(),
         })
     }

@@ -58,7 +58,7 @@ pub(super) async fn build_partitions(
         });
     }
 
-    let ivf_model = lance_index::vector::ivf::IvfTransformer::with_pq(
+    let ivf_transformer = lance_index::vector::ivf::IvfTransformer::with_pq(
         ivf.centroids.clone().unwrap(),
         metric_type,
         column,
@@ -69,7 +69,7 @@ pub(super) async fn build_partitions(
     let stream = shuffle_dataset(
         data,
         column,
-        ivf_model.into(),
+        ivf_transformer.into(),
         precomputed_partitons,
         ivf.num_partitions() as u32,
         shuffle_partition_batches,
