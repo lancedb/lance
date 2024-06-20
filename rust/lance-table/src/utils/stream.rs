@@ -196,11 +196,14 @@ pub fn apply_row_id_and_deletes(
         batch.num_columns() > 0 || config.with_row_id || config.with_row_addr || has_deletions
     );
 
-    let should_fetch_row_id = config.with_row_id || has_deletions;
+    // If row id sequence is None, then row id IS row address.
+    let should_fetch_row_addr = config.with_row_addr
+        || (config.with_row_id && config.row_id_sequence.is_none())
+        || has_deletions;
 
     let num_rows = batch.num_rows() as u32;
 
-    let row_addrs = if config.with_row_addr || should_fetch_row_id {
+    let row_addrs = if should_fetch_row_addr {
         let ids_in_batch = config
             .params
             .slice(batch_offset as usize, num_rows as usize)
@@ -218,7 +221,7 @@ pub fn apply_row_id_and_deletes(
         None
     };
 
-    let row_ids = if should_fetch_row_id {
+    let row_ids = if config.with_row_id {
         if let Some(row_id_sequence) = &config.row_id_sequence {
             let row_ids = row_id_sequence
                 .slice(batch_offset as usize, num_rows as usize)
