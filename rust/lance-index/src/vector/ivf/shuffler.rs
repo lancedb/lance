@@ -1007,7 +1007,7 @@ mod test {
     }
 
     // Change NUM_BATCHES = 1000 * 1024 and NUM_PARTITIONS to 35000 to test 1B shuffle
-    const NUM_BATCHES: u32 = 1 * 100;
+    const NUM_BATCHES: u32 = 100;
     const NUM_PARTITIONS: u32 = 1000;
     const PQ_DIM: u32 = 48;
     const BATCHES_PER_PARTITION: u32 = 10200;
@@ -1040,7 +1040,7 @@ mod test {
         result_stream.reverse();
 
         while let Some(mut stream) = result_stream.pop() {
-            while let Some(_) = stream.next().await {
+            while stream.next().await.is_some() {
                 num_batches += 1
             }
         }
