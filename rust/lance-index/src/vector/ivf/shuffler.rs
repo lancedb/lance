@@ -62,6 +62,7 @@ fn get_temp_dir() -> Result<Path> {
 /// After we sort a batch of data into partitions we append those slices into this builder.
 ///
 /// The builder is pre-allocated and so this extend operation should only be a memcpy
+#[derive(Debug)]
 struct PartitionBuilder {
     builder: StructBuilder,
 }
@@ -540,8 +541,13 @@ impl IvfShuffler {
                 let batch = batch.take(&indices)?;
 
                 let mut start = 0;
-                let mut prev_id = part_ids.value(0);
-                for (idx, part_id) in part_ids.values().iter().enumerate() {
+                let mut prev_id = dbg!(part_ids).value(0);
+                for (idx, part_id) in batch[PART_ID_COLUMN]
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .iter()
+                    .enumerate()
+                {
                     if *part_id != prev_id {
                         partitions_builder.extend(&batch.slice(start, idx - start));
                         start = idx;
