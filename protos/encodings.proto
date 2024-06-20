@@ -179,6 +179,12 @@ message Flat {
 // TODO: Struct validity bitmaps will be placed here.
 message SimpleStruct {}
 
+// An array encoding for binary fields
+message Binary {
+  ArrayEncoding indices = 1;
+  ArrayEncoding bytes = 2;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -187,6 +193,7 @@ message ArrayEncoding {
         FixedSizeList fixed_size_list = 3;
         List list = 4;
         SimpleStruct struct = 5;
+        Binary binary = 6;
     }
 }
 
