@@ -132,6 +132,18 @@ impl Debug for HNSW {
 }
 
 impl HNSW {
+    pub fn empty() -> Self {
+        Self {
+            inner: Arc::new(HnswBuilder {
+                params: HnswBuildParams::default(),
+                nodes: Arc::new(Vec::new()),
+                level_count: Vec::new(),
+                entry_point: 0,
+                visited_generator_queue: Arc::new(ArrayQueue::new(1)),
+            }),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.nodes.len()
     }
@@ -507,6 +519,10 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
+        if data.num_rows() == 0 {
+            return Ok(Self::empty());
+        }
+
         let hnsw_metadata =
             data.schema_ref()
                 .metadata()
@@ -515,7 +531,14 @@ impl IvfSubIndex for HNSW {
                     message: format!("{} not found", HNSW_METADATA_KEY),
                     location: location!(),
                 })?;
-        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata)?;
+        let hnsw_metadata: HnswMetadata =
+            serde_json::from_str(hnsw_metadata).map_err(|e| Error::Index {
+                message: format!(
+                    "Failed to decode HNSW metadata: {}, json: {}",
+                    e, hnsw_metadata
+                ),
+                location: location!(),
+            })?;
 
         let levels: Vec<_> = hnsw_metadata
             .level_offsets
