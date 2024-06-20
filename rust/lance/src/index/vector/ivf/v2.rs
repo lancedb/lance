@@ -476,7 +476,9 @@ mod tests {
         )])
         .with_metadata(metadata)
         .into();
-        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        let fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
+        let array = Arc::new(fsl);
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
