@@ -159,7 +159,7 @@ impl TryFrom<&IvfModel> for PbIvf {
         Ok(Self {
             centroids: vec![], // Deprecated
             lengths,
-            offsets: vec![], // Deprecated
+            offsets: ivf.offsets.iter().map(|x| *x as u64).collect(),
             centroids_tensor: ivf.centroids.as_ref().map(|c| c.try_into()).transpose()?,
         })
     }
@@ -180,15 +180,18 @@ impl TryFrom<PbIvf> for IvfModel {
         // v1 index format. It will be deprecated soon.
         //
         // This new offset uses the row offset in the lance file.
-        let offsets = proto
-            .lengths
-            .iter()
-            .scan(0_usize, |state, &x| {
-                let old = *state;
-                *state += x as usize;
-                Some(old)
-            })
-            .collect_vec();
+        let offsets = match proto.offsets.len() {
+            0 => proto
+                .lengths
+                .iter()
+                .scan(0_usize, |state, &x| {
+                    let old = *state;
+                    *state += x as usize;
+                    Some(old)
+                })
+                .collect_vec(),
+            _ => proto.offsets.iter().map(|x| *x as usize).collect(),
+        };
         assert_eq!(offsets.len(), proto.lengths.len());
         Ok(Self {
             centroids,
