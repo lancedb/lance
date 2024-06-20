@@ -136,7 +136,7 @@ impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
             self.rows_scheduled = self.children.peek().unwrap().rows_scheduled;
             context = scoped.pop();
         }
-        let struct_rows_scheduled = (self.rows_scheduled - old_rows_scheduled) as u32;
+        let struct_rows_scheduled = self.rows_scheduled - old_rows_scheduled;
         Ok(ScheduledScanLine {
             decoders,
             rows_scheduled: struct_rows_scheduled,
@@ -230,7 +230,7 @@ struct ChildState {
 struct CompositeDecodeTask {
     // One per child
     tasks: Vec<Box<dyn DecodeArrayTask>>,
-    num_rows: u32,
+    num_rows: u64,
     has_more: bool,
 }
 
@@ -273,7 +273,7 @@ impl ChildState {
         let mut remaining = num_rows.saturating_sub(self.rows_available);
         for next_decoder in &mut self.scheduled {
             if next_decoder.unawaited() > 0 {
-                let rows_to_wait = remaining.min(next_decoder.unawaited() as u64) as u32;
+                let rows_to_wait = remaining.min(next_decoder.unawaited() as u64);
                 trace!(
                     "Struct await an additional {} rows from the current page",
                     rows_to_wait
@@ -322,7 +322,7 @@ impl ChildState {
         };
         while remaining > 0 {
             let next = self.scheduled.front_mut().unwrap();
-            let rows_to_take = remaining.min(next.avail() as u64) as u32;
+            let rows_to_take = remaining.min(next.avail() as u64);
             let next_task = next.drain(rows_to_take)?;
             if next.avail() == 0 && next.unawaited() == 0 {
                 trace!("Completely drained page");
@@ -356,23 +356,6 @@ impl SimpleStructDecoder {
             child_fields,
             data_type,
         }
-    }
-
-    pub fn avail_u64(&self) -> u64 {
-        self.children
-            .iter()
-            .map(|c| c.rows_available)
-            .min()
-            .unwrap()
-    }
-
-    // Rows are unawaited if they are unawaited in any child column
-    pub fn unawaited_u64(&self) -> u64 {
-        self.children
-            .iter()
-            .map(|c| c.rows_unawaited)
-            .max()
-            .unwrap()
     }
 
     pub fn wait_u64(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
@@ -423,7 +406,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
         Ok(())
     }
 
-    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
+    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
         async move {
             for child in self.children.iter_mut() {
                 child.wait(num_rows as u64).await?;
@@ -433,7 +416,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
         .boxed()
     }
 
-    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         let child_tasks = self
             .children
             .iter_mut()
@@ -454,17 +437,21 @@ impl LogicalPageDecoder for SimpleStructDecoder {
     }
 
     // Rows are available only if they are available in every child column
-    fn avail(&self) -> u32 {
-        let avail = self.avail_u64();
-        debug_assert!(avail <= u32::MAX as u64);
-        avail as u32
+    fn avail(&self) -> u64 {
+        self.children
+            .iter()
+            .map(|c| c.rows_available)
+            .min()
+            .unwrap()
     }
 
     // Rows are unawaited if they are unawaited in any child column
-    fn unawaited(&self) -> u32 {
-        let unawaited = self.unawaited_u64();
-        debug_assert!(unawaited <= u32::MAX as u64);
-        unawaited as u32
+    fn unawaited(&self) -> u64 {
+        self.children
+            .iter()
+            .map(|c| c.rows_unawaited)
+            .max()
+            .unwrap()
     }
 
     fn data_type(&self) -> &DataType {
@@ -495,7 +482,7 @@ impl DecodeArrayTask for SimpleStructDecodeTask {
 pub struct StructFieldEncoder {
     children: Vec<Box<dyn FieldEncoder>>,
     column_index: u32,
-    num_rows_seen: u32,
+    num_rows_seen: u64,
 }
 
 impl StructFieldEncoder {
@@ -511,7 +498,7 @@ impl StructFieldEncoder {
 
 impl FieldEncoder for StructFieldEncoder {
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
-        self.num_rows_seen += array.len() as u32;
+        self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
         let child_tasks = self
             .children

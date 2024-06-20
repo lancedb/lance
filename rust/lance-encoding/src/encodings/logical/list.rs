@@ -146,7 +146,7 @@ impl ListRequestsIter {
     }
 
     // Given a page of offset data, grab the corresponding list requests
-    fn next(&mut self, mut num_offsets: u32) -> Vec<ListRequest> {
+    fn next(&mut self, mut num_offsets: u64) -> Vec<ListRequest> {
         let mut list_requests = Vec::new();
         while num_offsets > 0 {
             let req = self.list_requests.front_mut().unwrap();
@@ -156,7 +156,7 @@ impl ListRequestsIter {
                 debug_assert_ne!(num_offsets, 0);
             }
             if num_offsets as u64 >= req.num_lists {
-                num_offsets -= req.num_lists as u32;
+                num_offsets -= req.num_lists;
                 list_requests.push(self.list_requests.pop_front().unwrap());
             } else {
                 let sub_req = ListRequest {
@@ -430,7 +430,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         debug_assert!(list_reqs
             .iter()
             .all(|req| req.null_offset_adjustment == null_offset_adjustment));
-        let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>() as u32;
+        let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>();
         // offsets is a uint64 which is guaranteed to create one decoder on each call to schedule_next
         let next_offsets_decoder = next_offsets.decoders.into_iter().next().unwrap().decoder;
 
@@ -502,7 +502,7 @@ pub struct ListFieldScheduler {
 /// This is needed to construct the scheduler
 #[derive(Debug)]
 pub struct OffsetPageInfo {
-    pub offsets_in_page: u32,
+    pub offsets_in_page: u64,
     pub null_offset_adjustment: u64,
     pub num_items_referenced_by_page: u64,
 }
@@ -570,9 +570,9 @@ struct ListPageDecoder {
     offsets: Vec<u64>,
     validity: BooleanBuffer,
     item_decoder: Option<SimpleStructDecoder>,
-    lists_available: u32,
-    num_rows: u32,
-    rows_drained: u32,
+    lists_available: u64,
+    num_rows: u64,
+    rows_drained: u64,
     items_type: DataType,
     offset_type: DataType,
     data_type: DataType,
@@ -642,7 +642,7 @@ impl DecodeArrayTask for ListDecodeTask {
 }
 
 impl LogicalPageDecoder for ListPageDecoder {
-    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
+    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
         async move {
             // wait for the indirect I/O to finish, run the scheduler for the indirect
             // I/O and then wait for enough items to arrive
@@ -679,7 +679,7 @@ impl LogicalPageDecoder for ListPageDecoder {
                 self.offsets[offset_wait_start as usize + num_rows as usize] - item_start;
             if items_needed > 0 {
                 // First discount any already available items
-                let items_already_available = self.item_decoder.as_mut().unwrap().avail_u64();
+                let items_already_available = self.item_decoder.as_mut().unwrap().avail();
                 trace!(
                     "List's items decoder needs {} items and already has {} items available",
                     items_needed,
@@ -700,11 +700,11 @@ impl LogicalPageDecoder for ListPageDecoder {
         .boxed()
     }
 
-    fn unawaited(&self) -> u32 {
+    fn unawaited(&self) -> u64 {
         self.num_rows - self.lists_available - self.rows_drained
     }
 
-    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         self.lists_available -= num_rows;
         // We already have the offsets but need to drain the item pages
         let mut actual_num_rows = num_rows;
@@ -763,7 +763,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         })
     }
 
-    fn avail(&self) -> u32 {
+    fn avail(&self) -> u64 {
         self.lists_available
     }
 
@@ -878,7 +878,7 @@ impl ListOffsetsEncoder {
         tokio::task::spawn(async move {
             let num_rows =
                 offset_arrays.iter().map(|arr| arr.len()).sum::<usize>() - offset_arrays.len();
-            let num_rows = num_rows as u32;
+            let num_rows = num_rows as u64;
             let mut buffer_index = 0;
             let array = Self::do_encode(
                 offset_arrays,
@@ -1012,7 +1012,7 @@ impl ListOffsetsEncoder {
     fn do_encode_u64(
         offset_arrays: Vec<ArrayRef>,
         validity: Vec<Option<&BooleanArray>>,
-        num_offsets: u32,
+        num_offsets: u64,
         null_offset_adjustment: u64,
         buffer_index: &mut u32,
         inner_encoder: Arc<dyn ArrayEncoder>,
@@ -1035,7 +1035,7 @@ impl ListOffsetsEncoder {
         offset_arrays: Vec<ArrayRef>,
         validity_arrays: Vec<ArrayRef>,
         buffer_index: &mut u32,
-        num_offsets: u32,
+        num_offsets: u64,
         inner_encoder: Arc<dyn ArrayEncoder>,
     ) -> Result<EncodedArray> {
         let validity_arrays = validity_arrays

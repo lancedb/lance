@@ -37,8 +37,6 @@ use crate::{
     format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION_NEXT},
 };
 
-use lance_encoding::encoder::get_str_encoding_type;
-
 use super::io::LanceEncodingsIo;
 use arrow_schema::DataType;
 
@@ -529,14 +527,7 @@ impl FileReader {
         column_infos.push(self.metadata.column_infos[*column_idx].clone());
         *column_idx += 1;
 
-        if get_str_encoding_type() {
-            // use str array encoding
-            if (field.data_type().is_binary_like()) && (field.data_type() != DataType::Utf8) {
-                // These types are 2 columns in a lance file but a single field id in a lance schema
-                column_infos.push(self.metadata.column_infos[*column_idx].clone());
-                *column_idx += 1;
-            }
-        } else if field.data_type().is_binary_like() {
+        if (field.data_type().is_binary_like()) && (field.data_type() != DataType::Utf8) {
             // These types are 2 columns in a lance file but a single field id in a lance schema
             column_infos.push(self.metadata.column_infos[*column_idx].clone());
             *column_idx += 1;

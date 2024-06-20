@@ -105,11 +105,11 @@ pub struct BinaryPageDecoder {
 }
 
 impl LogicalPageDecoder for BinaryPageDecoder {
-    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
+    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
         self.inner.wait(num_rows)
     }
 
-    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         let inner_task = self.inner.drain(num_rows)?;
         Ok(NextDecodeTask {
             has_more: inner_task.has_more,
@@ -121,11 +121,11 @@ impl LogicalPageDecoder for BinaryPageDecoder {
         })
     }
 
-    fn unawaited(&self) -> u32 {
+    fn unawaited(&self) -> u64 {
         self.inner.unawaited()
     }
 
-    fn avail(&self) -> u32 {
+    fn avail(&self) -> u64 {
         self.inner.avail()
     }
 

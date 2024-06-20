@@ -39,7 +39,7 @@ use crate::{
 #[derive(Debug)]
 struct PrimitivePage {
     scheduler: Box<dyn PageScheduler>,
-    num_rows: u32,
+    num_rows: u64,
 }
 
 /// A field scheduler for primitive fields
@@ -139,10 +139,10 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
             range.start = range.start.max(self.global_row_offset);
             let start_in_page = range.start - self.global_row_offset;
             let end_in_page = start_in_page + (range.end - range.start);
-            let end_in_page = end_in_page.min(cur_page.num_rows as u64) as u32;
+            let end_in_page = end_in_page.min(cur_page.num_rows as u64);
             let last_in_range = (end_in_page as u64 + self.global_row_offset) >= range.end;
 
-            ranges_in_page.push(start_in_page as u32..end_in_page);
+            ranges_in_page.push(start_in_page..end_in_page);
             if last_in_range {
                 self.range_idx += 1;
                 if self.range_idx == self.ranges.len() {
@@ -213,15 +213,15 @@ pub struct PrimitiveFieldDecoder {
     data_type: DataType,
     unloaded_physical_decoder: Option<BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>>,
     physical_decoder: Option<Arc<dyn PrimitivePageDecoder>>,
-    num_rows: u32,
-    rows_drained: u32,
+    num_rows: u64,
+    rows_drained: u64,
 }
 
 impl PrimitiveFieldDecoder {
     pub fn new_from_data(
         physical_decoder: Arc<dyn PrimitivePageDecoder>,
         data_type: DataType,
-        num_rows: u32,
+        num_rows: u64,
     ) -> Self {
         Self {
             data_type,
@@ -244,8 +244,8 @@ impl Debug for PrimitiveFieldDecoder {
 }
 
 struct PrimitiveFieldDecodeTask {
-    rows_to_skip: u32,
-    rows_to_take: u32,
+    rows_to_skip: u64,
+    rows_to_take: u64,
     physical_decoder: Arc<dyn PrimitivePageDecoder>,
     data_type: DataType,
 }
@@ -276,7 +276,7 @@ impl PrimitiveFieldDecodeTask {
     // into a primitive array is pretty fundamental.
     fn new_primitive_array<T: ArrowPrimitiveType>(
         buffers: Vec<BytesMut>,
-        num_rows: u32,
+        num_rows: u64,
         data_type: &DataType,
     ) -> ArrayRef {
         let mut buffer_iter = buffers.into_iter();
@@ -302,7 +302,7 @@ impl PrimitiveFieldDecodeTask {
         )
     }
 
-    fn bytes_to_validity(bytes: BytesMut, num_rows: u32) -> Option<NullBuffer> {
+    fn bytes_to_validity(bytes: BytesMut, num_rows: u64) -> Option<NullBuffer> {
         if bytes.is_empty() {
             None
         } else {
@@ -318,7 +318,7 @@ impl PrimitiveFieldDecodeTask {
     fn primitive_array_from_buffers(
         data_type: &DataType,
         buffers: Vec<BytesMut>,
-        num_rows: u32,
+        num_rows: u64,
     ) -> Result<ArrayRef> {
         match data_type {
             DataType::Boolean => {
@@ -463,7 +463,7 @@ impl PrimitiveFieldDecodeTask {
                 let items_array = Self::primitive_array_from_buffers(
                     items.data_type(),
                     remaining_buffers,
-                    num_rows * (*dimension as u32),
+                    num_rows * (*dimension as u64),
                 )?;
                 Ok(Arc::new(FixedSizeListArray::new(
                     items.clone(),
@@ -475,6 +475,19 @@ impl PrimitiveFieldDecodeTask {
             DataType::Utf8 => {
                 // iterate over buffers to get offsets and then bytes
                 let mut buffer_iter = buffers.into_iter();
+
+                let null_buffer = buffer_iter.next().unwrap();
+                let null_buffer = if null_buffer.is_empty() {
+                    None
+                } else {
+                    let null_buffer = null_buffer.freeze().into();
+                    Some(NullBuffer::new(BooleanBuffer::new(
+                        Buffer::from_bytes(null_buffer),
+                        0,
+                        num_rows as usize,
+                    )))
+                };
+
                 let indices_bytes = buffer_iter.next().unwrap().freeze();
                 let indices_buffer = Buffer::from_bytes(indices_bytes.into());
                 let indices_buffer =
@@ -484,7 +497,7 @@ impl PrimitiveFieldDecodeTask {
 
                 // TODO - add NULL support
                 // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
-                let _null_buffer = buffer_iter.next().unwrap();
+                buffer_iter.next().unwrap();
 
                 let bytes_buffer = buffer_iter.next().unwrap().freeze();
                 let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
@@ -499,7 +512,7 @@ impl PrimitiveFieldDecodeTask {
                 Ok(Arc::new(StringArray::new(
                     offsets,
                     bytes_array.values().into(),
-                    None,
+                    null_buffer,
                 )))
             }
             _ => Err(Error::io(
@@ -516,7 +529,7 @@ impl PrimitiveFieldDecodeTask {
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
-    fn wait(&mut self, _: u32) -> BoxFuture<Result<()>> {
+    fn wait(&mut self, _: u64) -> BoxFuture<Result<()>> {
         async move {
             let physical_decoder = self.unloaded_physical_decoder.take().unwrap().await?;
             self.physical_decoder = Some(Arc::from(physical_decoder));
@@ -525,7 +538,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         .boxed()
     }
 
-    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         let rows_to_skip = self.rows_drained;
         let rows_to_take = num_rows;
 
@@ -545,7 +558,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         })
     }
 
-    fn unawaited(&self) -> u32 {
+    fn unawaited(&self) -> u64 {
         if self.unloaded_physical_decoder.is_some() {
             self.num_rows
         } else {
@@ -553,7 +566,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         }
     }
 
-    fn avail(&self) -> u32 {
+    fn avail(&self) -> u64 {
         if self.unloaded_physical_decoder.is_some() {
             0
         } else {
@@ -664,7 +677,7 @@ impl PrimitiveFieldEncoder {
         let column_idx = self.column_index;
 
         Ok(tokio::task::spawn(async move {
-            let num_rows = arrays.iter().map(|arr| arr.len() as u32).sum();
+            let num_rows = arrays.iter().map(|arr| arr.len() as u64).sum();
             let mut buffer_index = 0;
             let array = encoder.encode(&arrays, &mut buffer_index)?;
             Ok(EncodedPage {

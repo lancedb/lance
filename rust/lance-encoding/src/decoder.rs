@@ -230,7 +230,6 @@ use tokio::sync::mpsc::{self, unbounded_channel};
 use lance_core::{Error, Result};
 use tracing::instrument;
 
-use crate::encoder::get_str_encoding_type;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
@@ -246,7 +245,7 @@ use crate::{BufferScheduler, EncodingsIo};
 #[derive(Debug)]
 pub struct PageInfo {
     /// The number of rows in the page
-    pub num_rows: u32,
+    pub num_rows: u64,
     /// The encoding that explains the buffers in the page
     pub encoding: pb::ArrayEncoding,
     /// The offsets and sizes of the buffers in the file
@@ -552,24 +551,13 @@ impl CoreFieldDecoderStrategy {
     fn is_primitive(data_type: &DataType) -> bool {
         if data_type.is_primitive() {
             true
-        } else if get_str_encoding_type() {
-            match data_type {
-                // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean
-                | DataType::Null
-                | DataType::FixedSizeBinary(_)
-                | DataType::Utf8 => true,
-                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
-                _ => false,
-            }
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
                 DataType::Boolean
                 | DataType::Null
                 | DataType::FixedSizeBinary(_)
-                // | DataType::Utf8 
-                => true,
+                | DataType::Utf8 => true,
                 DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
                 _ => false,
             }
@@ -775,9 +763,9 @@ fn root_column(num_rows: u64) -> ColumnInfo {
     let root_pages = (0..num_root_pages)
         .map(|i| PageInfo {
             num_rows: if i == num_root_pages - 1 {
-                final_page_num_rows as u32
+                final_page_num_rows
             } else {
-                u32::MAX
+                u64::MAX
             },
             encoding: pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
@@ -1060,11 +1048,10 @@ impl BatchDecodeStream {
             return Ok(None);
         }
 
-        let mut to_take = self.rows_remaining.min(self.rows_per_batch as u64) as u32;
-        self.rows_remaining -= to_take as u64;
+        let mut to_take = self.rows_remaining.min(self.rows_per_batch as u64);
+        self.rows_remaining -= to_take;
 
-        let scheduled_need =
-            (self.rows_drained + to_take as u64).saturating_sub(self.rows_scheduled);
+        let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
         trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
@@ -1075,7 +1062,7 @@ impl BatchDecodeStream {
             let actually_scheduled = self.wait_for_scheduled(desired_scheduled).await?;
             if actually_scheduled < desired_scheduled {
                 let under_scheduled = desired_scheduled - actually_scheduled;
-                to_take -= under_scheduled as u32;
+                to_take -= under_scheduled;
             }
         }
 
@@ -1083,7 +1070,7 @@ impl BatchDecodeStream {
             return Ok(None);
         }
 
-        let avail = self.root_decoder.avail_u64();
+        let avail = self.root_decoder.avail();
         trace!("Top level page has {} rows already available", avail);
         if avail < to_take as u64 {
             trace!(
@@ -1125,7 +1112,12 @@ impl BatchDecodeStream {
             });
             next_task.map(|(task, num_rows)| {
                 let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
-                let next_task = ReadBatchTask { task, num_rows };
+                // This should be true since batch size is u32
+                debug_assert!(num_rows <= u32::MAX as u64);
+                let next_task = ReadBatchTask {
+                    task,
+                    num_rows: num_rows as u32,
+                };
                 (next_task, slf)
             })
         });
@@ -1178,8 +1170,8 @@ pub trait PrimitivePageDecoder: Send + Sync {
     /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
     fn decode(
         &self,
-        rows_to_skip: u32,
-        num_rows: u32,
+        rows_to_skip: u64,
+        num_rows: u64,
         all_null: &mut bool,
     ) -> Result<Vec<BytesMut>>;
     fn num_buffers(&self) -> u32;
@@ -1193,7 +1185,6 @@ pub trait PrimitivePageDecoder: Send + Sync {
 /// be shared in follow-up I/O tasks.
 ///
 /// See [`crate::decoder`] for more information
-
 pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     /// Schedules a batch of I/O to load the data needed for the requested ranges
     ///
@@ -1208,7 +1199,7 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     ///   scheduled.  This can be used to assign priority to I/O requests
     fn schedule_ranges(
         &self,
-        ranges: &[Range<u32>],
+        ranges: &[Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>;
@@ -1284,7 +1275,7 @@ impl SchedulerContext {
 
 #[derive(Debug)]
 pub struct ScheduledScanLine {
-    pub rows_scheduled: u32,
+    pub rows_scheduled: u64,
     pub decoders: Vec<DecoderReady>,
 }
 
@@ -1366,7 +1357,7 @@ pub struct NextDecodeTask {
     /// The decode task itself
     pub task: Box<dyn DecodeArrayTask>,
     /// The number of rows that will be created
-    pub num_rows: u32,
+    pub num_rows: u64,
     /// Whether or not the decoder that created this still has more rows to decode
     pub has_more: bool,
 }
@@ -1434,13 +1425,13 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
         })
     }
     /// Waits for enough data to be loaded to decode `num_rows` of data
-    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>>;
+    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>>;
     /// Creates a task to decode `num_rows` of data into an array
-    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask>;
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
     /// The number of rows that are in the page but haven't yet been "waited"
-    fn unawaited(&self) -> u32;
+    fn unawaited(&self) -> u64;
     /// The number of rows that have been "waited" but not yet decoded
-    fn avail(&self) -> u32;
+    fn avail(&self) -> u64;
     /// The data type of the decoded data
     fn data_type(&self) -> &DataType;
 }

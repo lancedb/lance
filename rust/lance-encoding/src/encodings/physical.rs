@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_schema::DataType;
+
 use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PageScheduler, format::pb};
 
@@ -124,6 +126,8 @@ pub fn decoder_from_array_encoding(
             Box::new(BinaryPageScheduler::new(
                 indices_scheduler.into(),
                 bytes_scheduler.into(),
+                DataType::Int32,
+                binary.null_adjustment,
             ))
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column

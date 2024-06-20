@@ -37,13 +37,13 @@ impl FixedListScheduler {
 impl PageScheduler for FixedListScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
+        ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let expanded_ranges = ranges
             .iter()
-            .map(|range| (range.start * self.dimension)..(range.end * self.dimension))
+            .map(|range| (range.start * self.dimension as u64)..(range.end * self.dimension as u64))
             .collect::<Vec<_>>();
         trace!(
             "Expanding {} fsl ranges across {}..{} to item ranges across {}..{}",
@@ -61,7 +61,7 @@ impl PageScheduler for FixedListScheduler {
             let items_decoder = inner_page_decoder.await?;
             Ok(Box::new(FixedListDecoder {
                 items_decoder,
-                dimension,
+                dimension: dimension as u64,
             }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
@@ -70,14 +70,14 @@ impl PageScheduler for FixedListScheduler {
 
 pub struct FixedListDecoder {
     items_decoder: Box<dyn PrimitivePageDecoder>,
-    dimension: u32,
+    dimension: u64,
 }
 
 impl PrimitivePageDecoder for FixedListDecoder {
     fn decode(
         &self,
-        rows_to_skip: u32,
-        num_rows: u32,
+        rows_to_skip: u64,
+        num_rows: u64,
         all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
         let rows_to_skip = rows_to_skip * self.dimension;
