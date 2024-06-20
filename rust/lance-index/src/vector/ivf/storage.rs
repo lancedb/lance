@@ -77,7 +77,10 @@ impl IvfModel {
 
     /// Number of IVF partitions.
     pub fn num_partitions(&self) -> usize {
-        self.centroids.as_ref().map(|c| c.len()).unwrap_or(0)
+        self.centroids
+            .as_ref()
+            .map(|c| c.len())
+            .unwrap_or_else(|| self.offsets.len())
     }
 
     pub fn partition_size(&self, part: usize) -> usize {
