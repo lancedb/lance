@@ -541,7 +541,7 @@ impl IvfShuffler {
                 let batch = batch.take(&indices)?;
 
                 let mut start = 0;
-                let mut prev_id = dbg!(part_ids).value(0);
+                let mut prev_id = part_ids.value(0);
                 for (idx, part_id) in batch[PART_ID_COLUMN]
                     .as_primitive::<UInt32Type>()
                     .values()
