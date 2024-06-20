@@ -358,8 +358,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         log::debug!("Building HNSW partition {}", part_id);
         let num_rows = build_hnsw_quantization_partition(
             dataset.clone(),
-            column.clone(),
-            metric_type,
+            column,
+            distance_type,
             hnsw_params.clone(),
             part_writer,
             aux_part_writer,
