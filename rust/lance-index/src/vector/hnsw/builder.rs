@@ -109,11 +109,6 @@ impl HnswBuildParams {
     /// - `data`: A FixedSizeList to build the HNSW.
     /// - `distance_type`: The distance type to use.
     pub async fn build(self, data: ArrayRef, distance_type: DistanceType) -> Result<HNSW> {
-        log::info!(
-            "Building HNSW index: distance_type: {}, params: {:#?}",
-            distance_type,
-            self
-        );
         let vec_store = Arc::new(FlatStorage::new(
             data.as_fixed_size_list().clone(),
             distance_type,
@@ -657,11 +652,12 @@ impl IvfSubIndex for HNSW {
         };
 
         log::info!(
-            "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}",
+            "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
             hnsw.inner.params.max_level,
             hnsw.inner.params.m,
-            hnsw.inner.params.ef_construction
+            hnsw.inner.params.ef_construction,
+            storage.distance_type(),
         );
 
         let len = storage.len();
