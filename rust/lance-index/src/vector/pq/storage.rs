@@ -17,7 +17,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
@@ -35,7 +35,6 @@ use super::{distance::build_distance_table_l2, num_centroids, ProductQuantizerIm
 use crate::{
     pb,
     vector::{
-        ivf::storage::IvfData,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         storage::{DistCalculator, VectorStore},
