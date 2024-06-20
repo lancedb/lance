@@ -42,7 +42,6 @@ use log::debug;
 use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
-use super::rowids::get_row_id_index;
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
@@ -1434,15 +1433,7 @@ impl Scanner {
             (_, _, false) => PreFilterSource::None,
         };
 
-        let row_id_index = get_row_id_index(&self.dataset).await?;
-
-        let inner_fanout_search = new_knn_exec(
-            self.dataset.clone(),
-            index,
-            q,
-            prefilter_source,
-            row_id_index,
-        )?;
+        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -3377,7 +3368,6 @@ mod test {
             scan.prefilter(true);
 
             let plan = scan.explain_plan(true).await.unwrap();
-            dbg!(&plan);
             let batch = scan.try_into_batch().await.unwrap();
 
             if params.use_projection {
@@ -3450,7 +3440,7 @@ mod test {
                     "The non-indexed refine filter was not applied",
                 );
             }
-            dbg!(&batch["not_indexed"]);
+
             // If there is new data then the dupe of row 50 should be in the results
             if params.use_new_data || params.use_updated {
                 self.assert_one(
@@ -3624,20 +3614,20 @@ mod test {
                                         use_updated,
                                     };
                                     // Narrow to certain test case
-                                    let case = ScalarTestParams {
-                                        use_index: true,
-                                        use_projection: false,
-                                        use_deleted_data: false,
-                                        use_new_data: false,
-                                        with_row_id: false,
-                                        use_compaction: false,
-                                        use_updated: true,
-                                    };
-                                    if &params != &case {
-                                        // This is the default case, we don't need to run it twice
-                                        continue;
-                                    }
-                                    dbg!(&params);
+                                    // let case = ScalarTestParams {
+                                    //     use_index: true,
+                                    //     use_projection: false,
+                                    //     use_deleted_data: false,
+                                    //     use_new_data: false,
+                                    //     with_row_id: false,
+                                    //     use_compaction: false,
+                                    //     use_updated: true,
+                                    // };
+                                    // if &params != &case {
+                                    //     // This is the default case, we don't need to run it twice
+                                    //     continue;
+                                    // }
+                                    // dbg!(&params);
                                     fixture.check_vector_queries(&params).await;
                                     fixture.check_simple_queries(&params).await;
                                 }

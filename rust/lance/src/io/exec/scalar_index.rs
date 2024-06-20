@@ -17,7 +17,10 @@ use datafusion::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{
-    utils::{address::RowAddress, mask::{RowAddressTreeMap, RowIdMask}},
+    utils::{
+        address::RowAddress,
+        mask::{RowAddressTreeMap, RowIdMask},
+    },
     Error, Result, ROW_ID_FIELD,
 };
 use lance_index::{
@@ -209,7 +212,6 @@ impl MapIndexExec {
             row_addresses = row_addresses & deletion_mask.as_ref().clone();
         }
 
-        debug_assert!(row_addresses.block_list.is_none());
         if let Some(mut allow_list) = row_addresses.allow_list {
             // Flatten the allow list
             if let Some(block_list) = row_addresses.block_list {
@@ -432,8 +434,7 @@ async fn row_ids_for_mask(
         (None, None) => {
             // Matches all row ids in the given fragments.
             if dataset.manifest.uses_move_stable_row_ids() {
-                let sequences = 
-                    load_row_id_sequences(&dataset, &fragments)
+                let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
                     .try_collect::<Vec<_>>()
                     .await?;
@@ -447,7 +448,7 @@ async fn row_ids_for_mask(
             } else {
                 Ok(FragIdIter::new(fragments).collect::<Vec<_>>())
             }
-        },
+        }
         (Some(mut allow_list), None) => {
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
@@ -463,8 +464,7 @@ async fn row_ids_for_mask(
         }
         (None, Some(block_list)) => {
             if dataset.manifest.uses_move_stable_row_ids() {
-                let sequences = 
-                    load_row_id_sequences(&dataset, &fragments)
+                let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
                     .try_collect::<Vec<_>>()
                     .await?;
@@ -473,7 +473,11 @@ async fn row_ids_for_mask(
                 capacity -= block_list.len().expect("unknown block list len") as usize;
                 let mut row_ids = Vec::with_capacity(capacity);
                 for sequence in sequences {
-                    row_ids.extend(sequence.iter().filter(|row_id| !block_list.contains(*row_id)));
+                    row_ids.extend(
+                        sequence
+                            .iter()
+                            .filter(|row_id| !block_list.contains(*row_id)),
+                    );
                 }
                 Ok(row_ids)
             } else {
@@ -481,7 +485,7 @@ async fn row_ids_for_mask(
                     .filter(|row_id| !block_list.contains(*row_id))
                     .collect())
             }
-        },
+        }
         (Some(mut allow_list), Some(block_list)) => {
             // We need to filter out irrelevant fragments as well.
             retain_fragments(&mut allow_list, fragments, dataset).await?;
@@ -501,9 +505,7 @@ async fn row_ids_for_mask(
                 // We shouldn't hit this branch if the row ids are stable.
                 debug_assert!(!dataset.manifest.uses_move_stable_row_ids());
                 Ok(FragIdIter::new(fragments)
-                    .filter(|row_id| {
-                        !block_list.contains(*row_id) && allow_list.contains(*row_id)
-                    })
+                    .filter(|row_id| !block_list.contains(*row_id) && allow_list.contains(*row_id))
                     .collect())
             }
         }
@@ -516,8 +518,7 @@ async fn retain_fragments(
     dataset: &Dataset,
 ) -> Result<()> {
     if dataset.manifest.uses_move_stable_row_ids() {
-        let fragment_ids = 
-            load_row_id_sequences(&dataset, &fragments)
+        let fragment_ids = load_row_id_sequences(dataset, fragments)
             .map_ok(|(_frag_id, sequence)| RowAddressTreeMap::from(sequence.as_ref()))
             .try_fold(RowAddressTreeMap::new(), |mut acc, tree| async {
                 acc |= tree;

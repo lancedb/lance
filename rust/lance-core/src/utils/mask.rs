@@ -90,7 +90,7 @@ impl RowIdMask {
             (Some(block_list), None) => {
                 // Take rows that are not in the block list
                 enumerated_ids
-                .filter(|(_, row_id)| !block_list.contains(**row_id))
+                    .filter(|(_, row_id)| !block_list.contains(**row_id))
                     .map(|(idx, _)| idx as u64)
                     .collect()
             }
@@ -598,11 +598,17 @@ impl std::ops::SubAssign<&Self> for RowAddressTreeMap {
                         }
                     }
                 }
-                Some(RowAddrSelection::Partial(lhs_set)) => {
-                    if let RowAddrSelection::Partial(rhs_set) = rhs_set {
-                        *lhs_set -= rhs_set;
+                Some(RowAddrSelection::Partial(lhs_set)) => match rhs_set {
+                    RowAddrSelection::Full => {
+                        self.inner.remove(fragment);
                     }
-                }
+                    RowAddrSelection::Partial(rhs_set) => {
+                        *lhs_set -= rhs_set;
+                        if lhs_set.is_empty() {
+                            self.inner.remove(fragment);
+                        }
+                    }
+                },
             }
         }
     }
