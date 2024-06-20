@@ -164,12 +164,12 @@ impl IvfTransformer {
             distance_type
         };
 
-        let ivf_transform = Arc::new(PartitionTransformer::new(
+        let partition_transform = Arc::new(PartitionTransformer::new(
             centroids.clone(),
             mt,
             vector_column,
         ));
-        transforms.push(ivf_transform.clone());
+        transforms.push(partition_transform.clone());
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -220,12 +220,12 @@ impl IvfTransformer {
             metric_type
         };
 
-        let ivf_transform = Arc::new(PartitionTransformer::new(
+        let partition_transformer = Arc::new(PartitionTransformer::new(
             centroids.clone(),
             mt,
             vector_column,
         ));
-        transforms.push(ivf_transform.clone());
+        transforms.push(partition_transformer.clone());
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(

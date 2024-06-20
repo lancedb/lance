@@ -558,7 +558,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         // arrow uses i32 for index, so we chunk the row ids to avoid large batch causing overflow
         let mut batches = Vec::new();
         for chunk in row_ids.chunks(object_store.block_size()) {
-            let batch = self.dataset.take_rows(&chunk, &projection).await?;
+            let batch = self.dataset.take_rows(chunk, &projection).await?;
             let batch = batch.try_with_column(
                 ROW_ID_FIELD.clone(),
                 Arc::new(UInt64Array::from(chunk.to_vec())),
