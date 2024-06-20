@@ -96,38 +96,6 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
     }
 }
 
-/// Write partition of PQ storage to disk.
-#[allow(dead_code)]
-pub async fn write_parted_product_quantizations(
-    object_store: &ObjectStore,
-    path: &Path,
-    partitions: Box<dyn Iterator<Item = ProductQuantizationStorage>>,
-) -> Result<()> {
-    let mut peek = partitions.peekable();
-    let first = peek.peek().ok_or(Error::Index {
-        message: "No partitions to write".to_string(),
-        location: location!(),
-    })?;
-    let schema = first.schema();
-    let lance_schema = Schema::try_from(schema.as_ref())?;
-    let mut writer = FileWriter::<ManifestDescribing>::try_new(
-        object_store,
-        path,
-        lance_schema,
-        &Default::default(), // TODO: support writer options.
-    )
-    .await?;
-
-    let mut ivf_data = IvfData::empty();
-    for storage in peek {
-        let num_rows = storage.write_partition(&mut writer).await?;
-        ivf_data.add_partition(num_rows as u32);
-    }
-    ivf_data.write(&mut writer).await?;
-
-    Ok(())
-}
-
 /// Product Quantization Storage
 ///
 /// It stores PQ code, as well as the row ID to the orignal vectors.
