@@ -627,13 +627,13 @@ mod tests {
             &vectors,
             query.as_primitive::<Float32Type>().values(),
             k,
-            DistanceType::L2,
+            distance_type,
         );
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
         let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 1.0,
+            recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,

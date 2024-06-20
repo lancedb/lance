@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use futures::prelude::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -10,6 +11,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
+use lance_index::vector::flat::storage::FlatStorage;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::quantizer::QuantizerBuildParams;
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
@@ -355,10 +357,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 }
             }
 
-            if batches.is_empty() {
+            let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            if num_rows == 0 {
                 continue;
             }
-            let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+            let mut batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+            if self.distance_type == DistanceType::Cosine {
+                let vectors = batch
+                    .column_by_name(&self.column)
+                    .ok_or(Error::invalid_input(
+                        format!("column {} not found", self.column).as_str(),
+                        location!(),
+                    ))?
+                    .as_fixed_size_list();
+                let vectors = lance_linalg::kernels::normalize_fsl(vectors)?;
+                batch = batch.replace_column_by_name(&self.column, Arc::new(vectors))?;
+            }
+
             let sizes = self.build_partition(partition, &batch).await?;
             partition_sizes[partition] = sizes;
         }
@@ -374,34 +389,40 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
 
         // build quantized vector storage
         let object_store = ObjectStore::local();
-        let storage =
-            StorageBuilder::new(self.column.clone(), self.distance_type, quantizer).build(batch)?;
-        let path = self.temp_dir.child(format!("storage_part{}", part_id));
-        let writer = object_store.create(&path).await?;
-        let mut writer = FileWriter::try_new(
-            writer,
-            path.to_string(),
-            storage.schema().as_ref().try_into()?,
-            Default::default(),
-        )?;
-        for batch in storage.to_batches()? {
-            writer.write_batch(&batch).await?;
-        }
-        let storage_len = writer.finish().await? as usize;
+        let storage_len = {
+            let storage = StorageBuilder::new(self.column.clone(), self.distance_type, quantizer)
+                .build(batch)?;
+            let path = self.temp_dir.child(format!("storage_part{}", part_id));
+            let writer = object_store.create(&path).await?;
+            let mut writer = FileWriter::try_new(
+                writer,
+                path.to_string(),
+                storage.schema().as_ref().try_into()?,
+                Default::default(),
+            )?;
+            for batch in storage.to_batches()? {
+                writer.write_batch(&batch).await?;
+            }
+            writer.finish().await? as usize
+        };
 
         // build the sub index, with in-memory storage
-        let sub_index = S::index_vectors(&storage, self.sub_index_params.clone())?;
-        let path = self.temp_dir.child(format!("index_part{}", part_id));
-        let writer = object_store.create(&path).await?;
-        let index_batch = sub_index.to_batch()?;
-        let mut writer = FileWriter::try_new(
-            writer,
-            path.to_string(),
-            index_batch.schema_ref().as_ref().try_into()?,
-            Default::default(),
-        )?;
-        writer.write_batch(&index_batch).await?;
-        let index_len = writer.finish().await? as usize;
+        let index_len = {
+            let vectors = batch[&self.column].as_fixed_size_list();
+            let flat_storage = FlatStorage::new(vectors.clone(), self.distance_type);
+            let sub_index = S::index_vectors(&flat_storage, self.sub_index_params.clone())?;
+            let path = self.temp_dir.child(format!("index_part{}", part_id));
+            let writer = object_store.create(&path).await?;
+            let index_batch = sub_index.to_batch()?;
+            let mut writer = FileWriter::try_new(
+                writer,
+                path.to_string(),
+                index_batch.schema_ref().as_ref().try_into()?,
+                Default::default(),
+            )?;
+            writer.write_batch(&index_batch).await?;
+            writer.finish().await? as usize
+        };
 
         Ok((storage_len, index_len))
     }
