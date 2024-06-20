@@ -37,7 +37,7 @@ use log::info;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
-use tracing::debug_span;
+use tracing::{debug_span, instrument};
 
 use crate::vector::ivf::Ivf;
 use crate::vector::transform::{KeepFiniteVectors, Transformer};
@@ -399,6 +399,63 @@ impl IvfShuffler {
         Ok(partitioned_batches)
     }
 
+    // Converts a Vec of partitions into a Vec of list arrays of size 1
+    //
+    // The input is Vec<Vec<RecordBatch>> where:
+    // - each record batch is a set of part_id, row_id, and pq_code
+    // - each Vec<RecordBatch> is a single partition (all rows in all batches belong to 1 partition)
+    //    - this vec has ~1 entry per batch of input data (likely much less since most partitions
+    //      will not have a record in every single input batch)
+    // - the outer Vec has one entry per partition
+    //
+    // The output is a Vec<RecordBatch> where:
+    // - each record batch contains a single row of List<Struct<...>> where
+    //   the Struct is the part_id, row_id, and pq_code
+    // - the outer Vec has one entry per partition
+    //
+    // This format is suitable for storage as a lance file
+    #[instrument(skip_all, level = "debug")]
+    fn partitions_to_list_arrays(
+        &self,
+        partitions: Vec<Vec<RecordBatch>>,
+        partition_schema: &arrow_schema::Schema,
+    ) -> Result<(Vec<RecordBatch>, Arc<arrow_schema::Schema>)> {
+        // We write out a List array where each list item is one centroid's worth
+        // of data
+        let strct_type = DataType::Struct(partition_schema.fields.clone());
+        let strct_field = Arc::new(Field::new("item", strct_type.clone(), true));
+        let list_field = Arc::new(Field::new(
+            "partitions",
+            DataType::List(strct_field.clone()),
+            false,
+        ));
+        let part_schema = Arc::new(arrow_schema::Schema::new(vec![list_field.clone()]));
+        let mut list_array_batches = Vec::with_capacity(partitions.len());
+        {
+            let _span = debug_span!("arrowify_sorted_partitions");
+            for part in partitions.into_iter() {
+                if !part.is_empty() {
+                    let schema = part[0].schema();
+                    let combined = concat_batches(&schema, part.iter())?;
+                    let combined: StructArray = combined.into();
+                    let list_array = ListArray::new(
+                        strct_field.clone(),
+                        OffsetBuffer::<i32>::new(ScalarBuffer::from(vec![
+                            0,
+                            combined.len() as i32,
+                        ])),
+                        Arc::new(combined),
+                        None,
+                    );
+                    let batch =
+                        RecordBatch::try_new(part_schema.clone(), vec![Arc::new(list_array)])?;
+                    list_array_batches.push(batch);
+                };
+            }
+        }
+        Ok((list_array_batches, part_schema))
+    }
+
     pub async fn write_partitioned_shuffles(
         &self,
         batches_per_partition: usize,
@@ -475,43 +532,10 @@ impl IvfShuffler {
                     "Chunk loaded into memory and sorted, writing to disk at {}",
                     path
                 );
-                // We write out a List array where each list item is one centroid's worth
-                // of data
-                let strct_type = DataType::Struct(schema.fields.clone());
-                let strct_field = Arc::new(Field::new("item", strct_type.clone(), true));
-                let list_field = Arc::new(Field::new(
-                    "partitions",
-                    DataType::List(strct_field.clone()),
-                    false,
-                ));
-                let part_schema = Arc::new(arrow_schema::Schema::new(vec![list_field.clone()]));
-                let mut list_arrays = Vec::with_capacity(shuffled.len());
-                {
-                    let _span = debug_span!("arrowify_sorted_partitions");
-                    for part in shuffled.into_iter() {
-                        if part.is_empty() {
-                            list_arrays.push(ListArray::new(
-                                strct_field.clone(),
-                                OffsetBuffer::<i32>::new(ScalarBuffer::from(vec![0, 0])),
-                                new_empty_array(&strct_type),
-                                None,
-                            ));
-                        } else {
-                            let schema = part[0].schema();
-                            let combined = concat_batches(&schema, part.iter())?;
-                            let combined: StructArray = combined.into();
-                            list_arrays.push(ListArray::new(
-                                strct_field.clone(),
-                                OffsetBuffer::<i32>::new(ScalarBuffer::from(vec![
-                                    0,
-                                    combined.len() as i32,
-                                ])),
-                                Arc::new(combined),
-                                None,
-                            ));
-                        }
-                    }
-                }
+
+                let (shuffled_partition_batches, part_schema) =
+                    self.partitions_to_list_arrays(shuffled, &schema)?;
+
                 let lance_schema = Schema::try_from(part_schema.as_ref())?;
                 let mut file_writer = lance_file::v2::writer::FileWriter::try_new(
                     writer,
@@ -520,14 +544,12 @@ impl IvfShuffler {
                     FileWriterOptions::default(),
                 )?;
 
-                for partition_and_idx in list_arrays.into_iter().enumerate() {
+                for partition_and_idx in shuffled_partition_batches.into_iter().enumerate() {
                     let (idx, partition) = partition_and_idx;
                     if idx % 1000 == 0 {
                         info!("Writing partition {}/{}", idx, self.num_partitions);
                     }
-                    let batch =
-                        RecordBatch::try_new(part_schema.clone(), vec![Arc::new(partition)])?;
-                    file_writer.write_batch(&batch).await?;
+                    file_writer.write_batch(&partition).await?;
                 }
 
                 file_writer.finish().await?;
