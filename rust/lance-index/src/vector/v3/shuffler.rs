@@ -60,9 +60,9 @@ pub struct IvfShuffler {
 }
 
 impl IvfShuffler {
-    pub fn new(object_store: ObjectStore, output_dir: Path, num_partitions: usize) -> Self {
+    pub fn new(output_dir: Path, num_partitions: usize) -> Self {
         Self {
-            object_store,
+            object_store: ObjectStore::local(),
             output_dir,
             num_partitions,
             buffer_size: 4096,

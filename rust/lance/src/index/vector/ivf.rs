@@ -338,7 +338,6 @@ pub(crate) async fn optimize_vector_indices_v2(
         .collect::<Result<Vec<_>>>()?;
 
     let new_uuid = Uuid::new_v4();
-    let object_store = dataset.object_store();
     let index_dir = dataset.indices_dir().child(new_uuid.to_string());
     let ivf_model = existing_indices[0].ivf_model();
     let quantizer = existing_indices[0].quantizer();
@@ -348,11 +347,7 @@ pub(crate) async fn optimize_vector_indices_v2(
 
     let temp_dir = tempfile::tempdir()?;
     let temp_dir = temp_dir.path().to_str().unwrap().into();
-    let shuffler = Box::new(IvfShuffler::new(
-        object_store.clone(),
-        temp_dir,
-        num_partitions,
-    ));
+    let shuffler = Box::new(IvfShuffler::new(temp_dir, num_partitions));
     let start_pos = if options.num_indices_to_merge > existing_indices.len() {
         0
     } else {

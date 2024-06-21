@@ -239,11 +239,7 @@ pub(crate) async fn build_vector_index(
         };
         let temp_dir = tempfile::tempdir()?;
         let path = temp_dir.path().to_str().unwrap().into();
-        let shuffler = IvfShuffler::new(
-            dataset.object_store().clone(),
-            path,
-            ivf_params.num_partitions,
-        );
+        let shuffler = IvfShuffler::new(path, ivf_params.num_partitions);
         IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
             dataset.clone(),
             column.to_owned(),
@@ -298,11 +294,7 @@ pub(crate) async fn build_vector_index(
 
         let temp_dir = tempfile::tempdir()?;
         let path = temp_dir.path().to_str().unwrap().into();
-        let shuffler = IvfShuffler::new(
-            dataset.object_store().clone(),
-            path,
-            ivf_params.num_partitions,
-        );
+        let shuffler = IvfShuffler::new(path, ivf_params.num_partitions);
 
         // with quantization
         if len > 2 {

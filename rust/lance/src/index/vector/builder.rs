@@ -657,11 +657,7 @@ mod tests {
         let ivf_params = IvfBuildParams::default();
         let index_dir = tempdir().unwrap();
         let index_dir = Path::from(index_dir.path().to_str().unwrap());
-        let shuffler = IvfShuffler::new(
-            dataset.object_store().clone(),
-            index_dir.child("shuffled"),
-            ivf_params.num_partitions,
-        );
+        let shuffler = IvfShuffler::new(index_dir.child("shuffled"), ivf_params.num_partitions);
 
         super::IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
             dataset,
@@ -690,11 +686,7 @@ mod tests {
         let sq_params = SQBuildParams::default();
         let index_dir = tempdir().unwrap();
         let index_dir = Path::from(index_dir.path().to_str().unwrap());
-        let shuffler = IvfShuffler::new(
-            dataset.object_store().clone(),
-            index_dir.child("shuffled"),
-            ivf_params.num_partitions,
-        );
+        let shuffler = IvfShuffler::new(index_dir.child("shuffled"), ivf_params.num_partitions);
 
         super::IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
             dataset,
