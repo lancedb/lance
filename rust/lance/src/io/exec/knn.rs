@@ -785,7 +785,7 @@ mod tests {
     use super::*;
 
     use arrow_array::RecordBatchIterator;
-    use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
+    use arrow_array::{FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
@@ -851,7 +851,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stream = dataset
             .scan()
-            .nearest("vector", as_primitive_array(&q), 10)
+            .nearest("vector", q.as_ref(), 10)
             .unwrap()
             .try_into_stream()
             .await

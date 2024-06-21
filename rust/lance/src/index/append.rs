@@ -206,7 +206,7 @@ mod tests {
 
         let q = array.value(5);
         let mut scanner = dataset.scan();
-        scanner.nearest("vector", q.as_primitive(), 10).unwrap();
+        scanner.nearest("vector", q.as_ref(), 10).unwrap();
         let results = scanner
             .try_into_stream()
             .await
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(index_dirs.len(), 2);
 
         let mut scanner = dataset.scan();
-        scanner.nearest("vector", q.as_primitive(), 10).unwrap();
+        scanner.nearest("vector", q.as_ref(), 10).unwrap();
         let results = scanner
             .try_into_stream()
             .await
@@ -367,7 +367,7 @@ mod tests {
             .scan()
             .project(&["id"])
             .unwrap()
-            .nearest("vector", array.value(0).as_primitive(), 2)
+            .nearest("vector", array.value(0).as_ref(), 2)
             .unwrap()
             .try_into_batch()
             .await

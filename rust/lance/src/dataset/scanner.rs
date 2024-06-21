@@ -6,7 +6,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow::datatypes::Float32Type;
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -426,7 +428,7 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+    pub fn nearest(&mut self, column: &str, q: &dyn Array, k: usize) -> Result<&mut Self> {
         self.ensure_not_fragment_scan()?;
 
         if k == 0 {
@@ -445,14 +447,19 @@ impl Scanner {
         ))?;
         let key = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
-                if dt.data_type().is_floating() {
-                    coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
+                if dt.data_type() == q.data_type() {
+                    q.slice(0, q.len())
+                } else if *q.data_type() == DataType::Float32 && dt.data_type().is_floating() {
+                    coerce_float_vector(
+                        q.as_primitive::<Float32Type>(),
+                        FloatType::try_from(dt.data_type())?,
+                    )?
                 } else {
                     return Err(Error::io(
                         format!(
-                            "Column {} is not a vector column (type: {})",
-                            column,
-                            field.data_type()
+                            "Query vector type {} does not match column type {}",
+                            q.data_type(),
+                            dt.data_type()
                         ),
                         location!(),
                     ));
@@ -472,7 +479,7 @@ impl Scanner {
 
         self.nearest = Some(Query {
             column: column.to_string(),
-            key: key.into(),
+            key,
             k,
             nprobes: 1,
             ef: None,
@@ -1530,7 +1537,9 @@ pub mod test_dataset {
 
     use std::vec;
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+    };
     use arrow_schema::ArrowError;
     use lance_index::IndexType;
     use tempfile::{tempdir, TempDir};
@@ -1675,8 +1684,8 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
-        RecordBatchIterator, StringArray, StructArray,
+        ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Int32Array, LargeStringArray,
+        PrimitiveArray, RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_select::take;
@@ -2515,7 +2524,7 @@ mod test {
         let query_key = Arc::new(Float32Array::from_iter_values((0..2).map(|x| x as f32)));
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
-        scan.nearest("vector", &query_key, 1).unwrap();
+        scan.nearest("vector", query_key.as_ref(), 1).unwrap();
         scan.with_row_id();
 
         let batches = scan
