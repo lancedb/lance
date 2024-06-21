@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt::Debug, ops::Range, sync::Arc};
+use std::{fmt::Debug, ops::Range, str::CharIndices, sync::Arc};
 
 use arrow_array::{
     new_null_array,
@@ -32,7 +32,10 @@ use crate::{
         PageInfo, PageScheduler, PhysicalPageDecoder, ScheduledScanLine, SchedulerContext,
         SchedulingJob,
     },
-    encoder::{ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, FieldEncoder},
+    encoder::{
+        get_dict_encoding, ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage,
+        FieldEncoder,
+    },
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
 
@@ -494,34 +497,90 @@ impl PrimitiveFieldDecodeTask {
                 )))
             }
             DataType::Utf8 => {
-                // iterate over buffers to get offsets and then bytes
-                let mut buffer_iter = buffers.into_iter();
-                let indices_bytes = buffer_iter.next().unwrap().freeze();
-                let indices_buffer = Buffer::from_bytes(indices_bytes.into());
-                let indices_buffer =
-                    ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
+                if !get_dict_encoding() {
+                    let mut buffer_iter = buffers.into_iter();
+                    // iterate over buffers to get offsets and then bytes
+                    let indices_bytes = buffer_iter.next().unwrap().freeze();
+                    let indices_buffer = Buffer::from_bytes(indices_bytes.into());
+                    let indices_buffer =
+                        ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
 
-                let offsets = OffsetBuffer::new(indices_buffer.clone());
+                    let offsets = OffsetBuffer::new(indices_buffer.clone());
 
-                // TODO - add NULL support
-                // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
-                let _null_buffer = buffer_iter.next().unwrap();
+                    // TODO - add NULL support
+                    // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
+                    let _null_buffer = buffer_iter.next().unwrap();
 
-                let bytes_buffer = buffer_iter.next().unwrap().freeze();
-                let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
-                let bytes_buffer_len = bytes_buffer.len();
-                let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
+                    let bytes_buffer = buffer_iter.next().unwrap().freeze();
+                    let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
+                    let bytes_buffer_len = bytes_buffer.len();
+                    let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
 
-                let bytes_array = Arc::new(
-                    PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
-                        .with_data_type(DataType::UInt8),
-                );
+                    let bytes_array = Arc::new(
+                        PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
+                            .with_data_type(DataType::UInt8),
+                    );
 
-                Ok(Arc::new(StringArray::new(
-                    offsets,
-                    bytes_array.values().into(),
-                    None,
-                )))
+                    Ok(Arc::new(StringArray::new(
+                        offsets,
+                        bytes_array.values().into(),
+                        None,
+                    )))
+                } else {
+                    // iterate over buffers to get offsets and then bytes
+                    let mut buffer_iter = buffers.into_iter();
+                    let indices_bytes = buffer_iter.next().unwrap().freeze();
+                    let indices_buffer = Buffer::from_bytes(indices_bytes.into());
+                    let indices_buffer =
+                        ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
+
+                    let offsets = OffsetBuffer::new(indices_buffer.clone());
+
+                    // TODO - add NULL support
+                    // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
+                    let _null_buffer = buffer_iter.next().unwrap();
+
+                    let bytes_buffer = buffer_iter.next().unwrap().freeze();
+                    let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
+                    let bytes_buffer_len = bytes_buffer.len();
+                    let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
+
+                    let bytes_array = Arc::new(
+                        PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
+                            .with_data_type(DataType::UInt8),
+                    );
+
+                    Ok(Arc::new(StringArray::new(
+                        offsets,
+                        bytes_array.values().into(),
+                        None,
+                    )))
+                    // let decoded_dict = Arc::new(StringArray::new(
+                    //     offsets.clone(),
+                    //     bytes_array.values().into(),
+                    //     None,
+                    // ));
+
+                    // println!("Decoded String Array of Items: {:?}", decoded_dict);
+
+                    // let remaining_buffers = buffer_iter.collect::<Vec<_>>();
+                    // let dict_indices_array = Self::primitive_array_from_buffers(
+
+                    //     remaining_buffers,
+                    //     num_rows * (*dimension as u32),
+                    // )?;
+
+                    // let dict_indices_bytes = buffer_iter.next().unwrap().freeze();
+                    // let dict_indices_buffer = Buffer::from_bytes(indices_bytes.into());
+                    // let dict_indices_buffer =
+                    //     ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
+
+                    // Ok(Arc::new(StringArray::new(
+                    //     offsets,
+                    //     bytes_array.values().into(),
+                    //     None,
+                    // )))
+                }
             }
             _ => Err(Error::io(
                 format!(

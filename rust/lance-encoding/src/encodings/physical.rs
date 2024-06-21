@@ -7,13 +7,15 @@ use crate::{decoder::PageScheduler, format::pb};
 use self::value::parse_compression_scheme;
 use self::{
     basic::BasicPageScheduler, binary::BinaryPageScheduler, bitmap::DenseBitmapScheduler,
-    fixed_size_list::FixedListScheduler, value::ValuePageScheduler,
+    dictionary::DictionaryPageScheduler, fixed_size_list::FixedListScheduler,
+    value::ValuePageScheduler,
 };
 
 pub mod basic;
 pub mod binary;
 pub mod bitmap;
 pub mod buffers;
+pub mod dictionary;
 pub mod fixed_size_list;
 pub mod value;
 
@@ -126,10 +128,25 @@ pub fn decoder_from_array_encoding(
                 bytes_scheduler.into(),
             ))
         }
+        pb::array_encoding::ArrayEncoding::Dictionary(dictionary) => {
+            let indices_encoding = dictionary.indices.as_ref().unwrap();
+            let items_encoding = dictionary.items.as_ref().unwrap();
+            let size = dictionary.size;
+
+            let indices_scheduler = decoder_from_array_encoding(indices_encoding, buffers);
+            let items_scheduler = decoder_from_array_encoding(items_encoding, buffers);
+
+            Box::new(DictionaryPageScheduler::new(
+                indices_scheduler.into(),
+                items_scheduler.into(),
+                size,
+            ))
+        }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column
         // (that has no data).  We never actually decode that column and so this branch is never actually encountered.
         //
         // This will change in the future when we add support for struct nullability.
         pb::array_encoding::ArrayEncoding::Struct(_) => unreachable!(),
+        // pb::array_encoding::ArrayEncoding::Dictionary(_) => unreachable!()
     }
 }
