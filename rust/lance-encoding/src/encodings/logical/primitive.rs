@@ -622,7 +622,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         let rows_to_take = num_rows;
 
         self.rows_drained += rows_to_take;
-        
+
         let task = Box::new(PrimitiveFieldDecodeTask {
             rows_to_skip,
             rows_to_take,

@@ -18,8 +18,8 @@ use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use snafu::{location, Location};
 
-use lance_core::{Error, Result};
 use crate::encoder::get_dict_encoding;
+use lance_core::{Error, Result};
 
 pub fn new_primitive_array<T: ArrowPrimitiveType>(
     buffers: Vec<BytesMut>,
@@ -44,9 +44,7 @@ pub fn new_primitive_array<T: ArrowPrimitiveType>(
     let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
 
     // The with_data_type is needed here to recover the parameters for types like Decimal/Timestamp
-    Arc::new(
-        PrimitiveArray::<T>::new(data_buffer, null_buffer).with_data_type(data_type.clone()),
-    )
+    Arc::new(PrimitiveArray::<T>::new(data_buffer, null_buffer).with_data_type(data_type.clone()))
 }
 
 fn bytes_to_validity(bytes: BytesMut, num_rows: u32) -> Option<NullBuffer> {
@@ -95,15 +93,15 @@ pub fn primitive_array_from_buffers(
             TimeUnit::Second => {
                 new_primitive_array::<DurationSecondType>(buffers, num_rows, data_type)
             }
-            TimeUnit::Microsecond => new_primitive_array::<DurationMicrosecondType>(
-                buffers, num_rows, data_type,
-            ),
-            TimeUnit::Millisecond => new_primitive_array::<DurationMillisecondType>(
-                buffers, num_rows, data_type,
-            ),
-            TimeUnit::Nanosecond => new_primitive_array::<DurationNanosecondType>(
-                buffers, num_rows, data_type,
-            ),
+            TimeUnit::Microsecond => {
+                new_primitive_array::<DurationMicrosecondType>(buffers, num_rows, data_type)
+            }
+            TimeUnit::Millisecond => {
+                new_primitive_array::<DurationMillisecondType>(buffers, num_rows, data_type)
+            }
+            TimeUnit::Nanosecond => {
+                new_primitive_array::<DurationNanosecondType>(buffers, num_rows, data_type)
+            }
         }),
         DataType::Float16 => Ok(new_primitive_array::<Float16Type>(
             buffers, num_rows, data_type,
@@ -131,9 +129,7 @@ pub fn primitive_array_from_buffers(
                 new_primitive_array::<IntervalDayTimeType>(buffers, num_rows, data_type)
             }
             IntervalUnit::MonthDayNano => {
-                new_primitive_array::<IntervalMonthDayNanoType>(
-                    buffers, num_rows, data_type,
-                )
+                new_primitive_array::<IntervalMonthDayNanoType>(buffers, num_rows, data_type)
             }
             IntervalUnit::YearMonth => {
                 new_primitive_array::<IntervalYearMonthType>(buffers, num_rows, data_type)
@@ -165,15 +161,15 @@ pub fn primitive_array_from_buffers(
             )),
         },
         DataType::Timestamp(unit, _) => Ok(match unit {
-            TimeUnit::Microsecond => new_primitive_array::<TimestampMicrosecondType>(
-                buffers, num_rows, data_type,
-            ),
-            TimeUnit::Millisecond => new_primitive_array::<TimestampMillisecondType>(
-                buffers, num_rows, data_type,
-            ),
-            TimeUnit::Nanosecond => new_primitive_array::<TimestampNanosecondType>(
-                buffers, num_rows, data_type,
-            ),
+            TimeUnit::Microsecond => {
+                new_primitive_array::<TimestampMicrosecondType>(buffers, num_rows, data_type)
+            }
+            TimeUnit::Millisecond => {
+                new_primitive_array::<TimestampMillisecondType>(buffers, num_rows, data_type)
+            }
+            TimeUnit::Nanosecond => {
+                new_primitive_array::<TimestampNanosecondType>(buffers, num_rows, data_type)
+            }
             TimeUnit::Second => {
                 new_primitive_array::<TimestampSecondType>(buffers, num_rows, data_type)
             }

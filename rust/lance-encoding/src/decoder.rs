@@ -1166,7 +1166,7 @@ pub trait PhysicalPageDecoder: Send + Sync {
     /// * `buffers` - A mutable slice of "capacities" (as described above), one per buffer
     /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
     fn update_capacity(
-        &mut self,
+        &self,
         rows_to_skip: u32,
         num_rows: u32,
         buffers: &mut [(u64, bool)],
@@ -1183,7 +1183,7 @@ pub trait PhysicalPageDecoder: Send + Sync {
     /// * `num_rows` - how many rows to decode
     /// * `dest_buffers` - the output buffers to decode into
     fn decode_into(
-        &mut self,
+        &self,
         rows_to_skip: u32,
         num_rows: u32,
         dest_buffers: &mut [BytesMut],

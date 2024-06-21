@@ -185,6 +185,13 @@ message Binary {
   ArrayEncoding bytes = 2;
 }
 
+// An array encoding for dictionary-encoded fields
+message Dictionary {
+  ArrayEncoding indices = 1;
+  ArrayEncoding items = 2;
+  uint32 size = 3;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -194,6 +201,7 @@ message ArrayEncoding {
         List list = 4;
         SimpleStruct struct = 5;
         Binary binary = 6;
+        Dictionary dictionary = 7;
     }
 }
 
