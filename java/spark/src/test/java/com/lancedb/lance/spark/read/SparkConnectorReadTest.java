@@ -12,8 +12,11 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark;
+package com.lancedb.lance.spark.read;
 
+import com.lancedb.lance.spark.LanceConfig;
+import com.lancedb.lance.spark.LanceDataSource;
+import com.lancedb.lance.spark.TestUtils;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -27,7 +30,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-public class SparkLanceConnectorTest {
+public class SparkConnectorReadTest {
   private static SparkSession spark;
   private static String dbPath;
   private static Dataset<Row> data;
@@ -37,11 +40,11 @@ public class SparkLanceConnectorTest {
     spark = SparkSession.builder()
         .appName("spark-lance-connector-test")
         .master("local")
+        .config("spark.sql.catalog.lance", "com.lancedb.lance.spark.LanceCatalog")
         .getOrCreate();
     dbPath = TestUtils.TestTable1Config.dbPath;
-    data = spark.read().format("lance")
-        .option("db", dbPath)
-        .option("table", TestUtils.TestTable1Config.tableName)
+    data = spark.read().format(LanceDataSource.name)
+        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath, TestUtils.TestTable1Config.tableName))
         .load();
   }
 
@@ -125,4 +128,7 @@ public class SparkLanceConnectorTest {
             .filter(row -> row.get(0) > 3)
             .collect(Collectors.toList()));
   }
+  
+  // TODO(lu) support spark.read().format("lance")
+  //    .load(dbPath.resolve(tableName).toString());
 }

@@ -14,7 +14,8 @@
 
 package com.lancedb.lance.spark;
 
-import com.lancedb.lance.spark.internal.LanceConfig;
+import com.lancedb.lance.spark.read.LanceInputPartition;
+import com.lancedb.lance.spark.read.LanceSplit;
 import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
@@ -22,25 +23,9 @@ import org.apache.spark.sql.types.StructType;
 
 import java.net.URL;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 public class TestUtils {
-  /**
-   * Converts dbPath and tableName to a LanceConfig instance using a Map.
-   *
-   * @param dbPath The database path.
-   * @param tableName The table name.
-   * @return A LanceConfig instance.
-   */
-  public static LanceConfig createLanceConfig(String dbPath, String tableName) {
-    Map<String, String> properties = new HashMap<>();
-    properties.put(LanceConfig.CONFIG_DB_PATH, dbPath);
-    properties.put(LanceConfig.CONFIG_TABLE_NAME, tableName);
-    return LanceConfig.from(properties);
-  }
-
   public static class TestTable1Config {
     public static final String dbPath;
     public static final String tableName = "test_table1";
@@ -69,8 +54,8 @@ public class TestUtils {
       } else {
         throw new IllegalArgumentException("example_db not found in resources directory");
       }
-      tablePath = String.format("%s/%s.lance", dbPath, tableName);
-      lanceConfig = createLanceConfig(dbPath, tableName);
+      tablePath = LanceConfig.getTablePath(dbPath, tableName);
+      lanceConfig = LanceConfig.from(tablePath);
       inputPartition = new LanceInputPartition(schema, 0, new LanceSplit(Arrays.asList(0, 1)), lanceConfig, Optional.empty());
     }
   }

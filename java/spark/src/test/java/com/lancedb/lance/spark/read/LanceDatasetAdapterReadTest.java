@@ -12,10 +12,11 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark;
+package com.lancedb.lance.spark.read;
 
+import com.lancedb.lance.spark.TestUtils;
 import com.lancedb.lance.spark.internal.LanceFragmentScanner;
-import com.lancedb.lance.spark.internal.LanceReader;
+import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 import com.lancedb.lance.spark.utils.Optional;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -30,25 +31,25 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
-public class LanceReaderTest {
-  
+public class LanceDatasetAdapterReadTest {
   @Test
   public void testSchema() {
     StructType expectedSchema = TestUtils.TestTable1Config.schema;
-    StructType schema = LanceReader.getSchema(TestUtils.TestTable1Config.lanceConfig);
-    assertNotNull(schema);
-    assertEquals(expectedSchema, schema);
+    Optional<StructType> schema = LanceDatasetAdapter.getSchema(TestUtils.TestTable1Config.lanceConfig);
+    assertTrue(schema.isPresent());
+    assertEquals(expectedSchema, schema.get());
   }
-  
+
   @Test
   public void testFragmentIds() {
-    List<Integer> fragments = LanceReader.getFragmentIds(TestUtils.TestTable1Config.lanceConfig);
+    List<Integer> fragments = LanceDatasetAdapter.getFragmentIds(TestUtils.TestTable1Config.lanceConfig);
     assertEquals(2, fragments.size());
     assertEquals(0, fragments.get(0));
     assertEquals(1, fragments.get(1));
   }
-  
+
   @Test
   public void getFragmentScanner() throws IOException {
     List<List<Object>> expectedValues = Arrays.asList(
@@ -80,7 +81,7 @@ public class LanceReaderTest {
   }
   
   public void validateFragment(List<List<Object>> expectedValues, int fragment, StructType schema) throws IOException {
-    try (LanceFragmentScanner scanner = LanceReader.getFragmentScanner(fragment,
+    try (LanceFragmentScanner scanner = LanceDatasetAdapter.getFragmentScanner(fragment,
         new LanceInputPartition(schema, 0, new LanceSplit(Arrays.asList(fragment)),
             TestUtils.TestTable1Config.lanceConfig, Optional.empty()))) {
       try (ArrowReader reader = scanner.getArrowReader()) {

@@ -14,7 +14,6 @@
 
 package com.lancedb.lance.spark;
 
-import com.lancedb.lance.spark.internal.LanceConfig;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.Test;
 
@@ -26,63 +25,63 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 public class LanceConfigTest {
   @Test
   public void testLanceConfigFromCaseInsensitiveStringMap() {
-    String dbPath = "file://path/to/db";
+    String dbPath = "file://path/to/db/";
     String tableName = "testTableName";
+    String tablePath = LanceConfig.getTablePath(dbPath, tableName);
     CaseInsensitiveStringMap options = new CaseInsensitiveStringMap(new HashMap<String, String>() {{
-      put(LanceConfig.CONFIG_DB_PATH, dbPath);
-      put(LanceConfig.CONFIG_TABLE_NAME, tableName);
+      put(LanceConfig.CONFIG_TABLE_PATH, tablePath);
     }});
 
     LanceConfig config = LanceConfig.from(options);
 
     assertEquals(dbPath, config.getDbPath());
     assertEquals(tableName, config.getTableName());
-    assertEquals(dbPath + "/" + tableName + ".lance", config.getTablePath());
+    assertEquals(tablePath, config.getTablePath());
   }
 
   @Test
   public void testLanceConfigFromCaseInsensitiveStringMap2() {
     String dbPath = "s3://bucket/folder/";
     String tableName = "testTableName";
+    String tablePath = LanceConfig.getTablePath(dbPath, tableName);
     CaseInsensitiveStringMap options = new CaseInsensitiveStringMap(new HashMap<String, String>() {{
-      put(LanceConfig.CONFIG_DB_PATH, dbPath);
-      put(LanceConfig.CONFIG_TABLE_NAME, tableName);
+      put(LanceConfig.CONFIG_TABLE_PATH, tablePath);
     }});
 
     LanceConfig config = LanceConfig.from(options);
 
     assertEquals(dbPath, config.getDbPath());
     assertEquals(tableName, config.getTableName());
-    assertEquals(dbPath + tableName  + ".lance", config.getTablePath());
+    assertEquals(tablePath, config.getTablePath());
   }
 
   @Test
   public void testLanceConfigFromMap() {
-    String dbPath = "file://path/to/db";
+    String dbPath = "file://path/to/db/";
     String tableName = "testTableName";
+    String tablePath = LanceConfig.getTablePath(dbPath, tableName);
     Map<String, String> properties = new HashMap<>();
-    properties.put(LanceConfig.CONFIG_DB_PATH, dbPath);
-    properties.put(LanceConfig.CONFIG_TABLE_NAME, tableName);
+    properties.put(LanceConfig.CONFIG_TABLE_PATH, tablePath);
 
     LanceConfig config = LanceConfig.from(properties);
 
     assertEquals(dbPath, config.getDbPath());
     assertEquals(tableName, config.getTableName());
-    assertEquals(dbPath + "/" + tableName + ".lance", config.getTablePath());
+    assertEquals(tablePath, config.getTablePath());
   }
 
   @Test
   public void testLanceConfigFromMap2() {
     String dbPath = "s3://bucket/folder/";
     String tableName = "testTableName";
+    String tablePath = LanceConfig.getTablePath(dbPath, tableName);
     Map<String, String> properties = new HashMap<>();
-    properties.put(LanceConfig.CONFIG_DB_PATH, dbPath);
-    properties.put(LanceConfig.CONFIG_TABLE_NAME, tableName);
+    properties.put(LanceConfig.CONFIG_TABLE_PATH, tablePath);
 
     LanceConfig config = LanceConfig.from(properties);
 
     assertEquals(dbPath, config.getDbPath());
     assertEquals(tableName, config.getTableName());
-    assertEquals(dbPath + tableName + ".lance", config.getTablePath());
+    assertEquals(tablePath, config.getTablePath());
   }
 }

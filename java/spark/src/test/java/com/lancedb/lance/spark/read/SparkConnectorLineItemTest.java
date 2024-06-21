@@ -12,8 +12,10 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark;
+package com.lancedb.lance.spark.read;
 
+import com.lancedb.lance.spark.LanceConfig;
+import com.lancedb.lance.spark.LanceDataSource;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -27,7 +29,7 @@ import static org.apache.spark.sql.functions.desc;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-public class LargeLanceDatasetSparkConnectorTest {
+public class SparkConnectorLineItemTest {
   private static SparkSession spark;
   private static String dbPath;
   private static String parquetPath;
@@ -44,10 +46,10 @@ public class LargeLanceDatasetSparkConnectorTest {
     spark = SparkSession.builder()
         .appName("spark-lance-connector-test")
         .master("local")
+        .config("spark.sql.catalog.lance", "com.lancedb.lance.spark.LanceCatalog")
         .getOrCreate();
-    lanceData = spark.read().format("lance")
-        .option("db", dbPath)
-        .option("table", "lineitem_10")
+    lanceData = spark.read().format(LanceDataSource.name)
+        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath, "lineitem_10"))
         .load();
     lanceData.createOrReplaceTempView("lance_dataset");
     parquetData = spark.read().parquet(parquetPath);

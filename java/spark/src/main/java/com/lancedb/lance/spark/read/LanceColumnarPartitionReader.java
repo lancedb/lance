@@ -12,7 +12,7 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark;
+package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.internal.LanceFragmentColumnarBatchScanner;
 import org.apache.spark.sql.connector.read.PartitionReader;

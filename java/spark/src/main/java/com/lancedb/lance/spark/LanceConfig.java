@@ -12,7 +12,7 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark.internal;
+package com.lancedb.lance.spark;
 
 import java.io.Serializable;
 import java.util.Map;
@@ -23,10 +23,9 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
  */
 public class LanceConfig implements Serializable {
   private static final long serialVersionUID = 827364827364823764L;
-  public static final String CONFIG_DB_PATH = "db";
-  public static final String CONFIG_TABLE_NAME = "table";
+  public static final String CONFIG_TABLE_PATH = "path";
   public static final String CONFIG_PUSH_DOWN_FILTERS = "pushDownFilters";
-  private static final String LANCE_FILE_SUFFIX = ".lance";
+  public static final String LANCE_FILE_SUFFIX = ".lance";
 
   private static final boolean DEFAULT_PUSH_DOWN_FILTERS = true;
 
@@ -47,26 +46,49 @@ public class LanceConfig implements Serializable {
   }
 
   public static LanceConfig from(CaseInsensitiveStringMap options) {
-    if (!options.containsKey(CONFIG_DB_PATH) || !options.containsKey(CONFIG_TABLE_NAME)) {
-      throw new IllegalArgumentException("Missing required options");
+    if (!options.containsKey(CONFIG_TABLE_PATH)) {
+      throw new IllegalArgumentException("Missing required option " + CONFIG_TABLE_PATH);
     }
-
-    String dbPath = options.get(CONFIG_DB_PATH);
-    String tableName = options.get(CONFIG_TABLE_NAME);
-    boolean pushDownFilters = options.getBoolean(CONFIG_PUSH_DOWN_FILTERS,
-        DEFAULT_PUSH_DOWN_FILTERS);
-
-    String tablePath = calculateTablePath(dbPath, tableName);
-
-    return new LanceConfig(dbPath, tableName, tablePath, pushDownFilters);
+    return from(options, options.get(CONFIG_TABLE_PATH));
   }
 
-  private static String calculateTablePath(String dbPath, String tableName) {
+  public static LanceConfig from(Map<String, String> properties, String tablePath) {
+    return from(new CaseInsensitiveStringMap(properties), tablePath);
+  }
+
+  public static LanceConfig from(String tablePath) {
+    return from(CaseInsensitiveStringMap.empty(), tablePath);
+  }
+
+  public static LanceConfig from(CaseInsensitiveStringMap options, String tablePath) {
+    boolean pushDownFilters = options.getBoolean(CONFIG_PUSH_DOWN_FILTERS,
+        DEFAULT_PUSH_DOWN_FILTERS);
+    String[] paths = extractDbPathAndTableName(tablePath);
+    return new LanceConfig(paths[0], paths[1], tablePath, pushDownFilters);
+  }
+
+  public static String getTablePath(String dbPath, String tableName) {
     StringBuilder sb = new StringBuilder().append(dbPath);
     if (!dbPath.endsWith("/")) {
       sb.append("/");
     }
     return sb.append(tableName).append(LANCE_FILE_SUFFIX).toString();
+  }
+
+  private static String[] extractDbPathAndTableName(String tablePath) {
+    if (tablePath == null || !tablePath.endsWith(LANCE_FILE_SUFFIX)) {
+      throw new IllegalArgumentException("Invalid table path: " + tablePath);
+    }
+
+    int lastSlashIndex = tablePath.lastIndexOf('/');
+    if (lastSlashIndex == -1) {
+      throw new IllegalArgumentException("Invalid table path: " + tablePath);
+    }
+
+    String tableNameWithSuffix = tablePath.substring(lastSlashIndex + 1);
+    return new String[]{tablePath.substring(0, lastSlashIndex + 1),
+        tableNameWithSuffix.substring(0,
+            tableNameWithSuffix.length() - LANCE_FILE_SUFFIX.length())};
   }
 
   public String getDbPath() {

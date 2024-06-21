@@ -18,7 +18,7 @@ import com.lancedb.lance.Dataset;
 import com.lancedb.lance.DatasetFragment;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
-import com.lancedb.lance.spark.LanceInputPartition;
+import com.lancedb.lance.spark.read.LanceInputPartition;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.StructField;

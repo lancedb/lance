@@ -12,10 +12,10 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark;
+package com.lancedb.lance.spark.read;
 
-import com.lancedb.lance.spark.internal.LanceConfig;
-import com.lancedb.lance.spark.internal.LanceReader;
+import com.lancedb.lance.spark.LanceConfig;
+import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 
 import java.io.Serializable;
 import java.util.Collections;
@@ -36,7 +36,7 @@ public class LanceSplit implements Serializable {
   }
 
   public static List<LanceSplit> generateLanceSplits(LanceConfig config) {
-    return LanceReader.getFragmentIds(config).stream()
+    return LanceDatasetAdapter.getFragmentIds(config).stream()
         .map(id -> new LanceSplit(Collections.singletonList(id)))
         .collect(Collectors.toList());
   }

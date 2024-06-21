@@ -14,10 +14,11 @@
 
 package com.lancedb.lance.spark;
 
-import com.lancedb.lance.spark.internal.LanceConfig;
-import com.lancedb.lance.spark.internal.LanceReader;
+import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
+import com.lancedb.lance.spark.utils.Optional;
+import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.catalog.SupportsCatalogOptions;
 import org.apache.spark.sql.connector.catalog.Table;
-import org.apache.spark.sql.connector.catalog.TableProvider;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.sources.DataSourceRegister;
 import org.apache.spark.sql.types.StructType;
@@ -25,29 +26,33 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import java.util.Map;
 
-public class LanceDataSource implements TableProvider, DataSourceRegister {
-  private static final String name = "lance";
+public class LanceDataSource implements SupportsCatalogOptions, DataSourceRegister {
+  public static final String name = "lance";
 
   @Override
   public StructType inferSchema(CaseInsensitiveStringMap options) {
-    // Given options help identify a table, no schema filter is passed in
-    return LanceReader.getSchema(LanceConfig.from(options));
+    Optional<StructType> schema = LanceDatasetAdapter.getSchema(LanceConfig.from(options));
+    return schema.isPresent() ? schema.get() : null;
   }
 
   @Override
   public Table getTable(StructType schema, Transform[] partitioning,
       Map<String, String> properties) {
-    LanceConfig config = LanceConfig.from(properties);
-    return new LanceTable(config, LanceReader.getSchema(config));
-  }
-
-  @Override
-  public boolean supportsExternalMetadata() {
-    return TableProvider.super.supportsExternalMetadata();
+    return new LanceTable(LanceConfig.from(properties), schema);
   }
 
   @Override
   public String shortName() {
     return name;
+  }
+
+  @Override
+  public Identifier extractIdentifier(CaseInsensitiveStringMap options) {
+    return new LanceIdentifier(LanceConfig.from(options).getTablePath());
+  }
+
+  @Override
+  public String extractCatalog(CaseInsensitiveStringMap options) {
+    return "lance";
   }
 }
