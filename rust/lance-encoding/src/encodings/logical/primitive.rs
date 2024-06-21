@@ -246,7 +246,7 @@ impl Debug for PrimitiveFieldDecoder {
     }
 }
 
-struct PrimitiveFieldDecodeTask {
+pub struct PrimitiveFieldDecodeTask {
     rows_to_skip: u32,
     rows_to_take: u32,
     physical_decoder: Arc<dyn PhysicalPageDecoder>,
@@ -259,6 +259,7 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
         // on the data type.  Most data types need two buffers but each layer of fixed-size-list, for
         // example, adds another validity buffer
         let mut capacities = vec![(0, false); self.physical_decoder.num_buffers() as usize];
+
         let mut all_null = false;
         self.physical_decoder.update_capacity(
             self.rows_to_skip,
@@ -497,7 +498,10 @@ impl PrimitiveFieldDecodeTask {
                 )))
             }
             DataType::Utf8 => {
-                if !get_dict_encoding() {
+                let num_buffers = buffers.len();
+                println!("Number of Buffers: {:?}", num_buffers);
+
+                if !get_dict_encoding() || (num_buffers == 3) {
                     let mut buffer_iter = buffers.into_iter();
                     // iterate over buffers to get offsets and then bytes
                     let indices_bytes = buffer_iter.next().unwrap().freeze();
@@ -527,8 +531,16 @@ impl PrimitiveFieldDecodeTask {
                         None,
                     )))
                 } else {
-                    // iterate over buffers to get offsets and then bytes
-                    let mut buffer_iter = buffers.into_iter();
+                    let mut buffer_iter = buffers.clone().into_iter();
+                    // let indices_array = Self::primitive_array_from_buffers(
+                    //     &DataType::UInt64,
+                    //     buffers,
+                    //     num_rows,
+                    // )?;
+                    // println!("Indices Array: {:?}", indices_array);
+
+                    // let remaining_buffers = buffer_iter.collect::<Vec<_>>();
+
                     let indices_bytes = buffer_iter.next().unwrap().freeze();
                     let indices_buffer = Buffer::from_bytes(indices_bytes.into());
                     let indices_buffer =
@@ -610,7 +622,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         let rows_to_take = num_rows;
 
         self.rows_drained += rows_to_take;
-
+        
         let task = Box::new(PrimitiveFieldDecodeTask {
             rows_to_skip,
             rows_to_take,

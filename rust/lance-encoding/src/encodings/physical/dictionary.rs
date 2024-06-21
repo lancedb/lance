@@ -31,6 +31,12 @@ use arrow_schema::DataType;
 use lance_core::Result;
 use std::collections::HashMap;
 // use std::ops::Deref;
+use bytes::BytesMut;
+
+// use crate::encodings::utils::new_primitive_array;
+use crate::encodings::utils::primitive_array_from_buffers;
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+// use crate::encodings::logical::primitive::PrimitiveFieldDecodeTask::primitive_array_from_buffers;
 
 #[derive(Debug)]
 pub struct DictionaryPageScheduler {
@@ -114,10 +120,15 @@ impl PageScheduler for DictionaryPageScheduler {
             );
             let items_decoder: Box<dyn PhysicalPageDecoder> = copy_items_page_decoder.await?;
 
+            let temp_indices_capacities = vec![(0, false); indices_decoder.num_buffers() as usize];
+            let temp_items_capacities = vec![(0, false); items_decoder.num_buffers() as usize];
+
             Ok(Box::new(DictionaryPageDecoder {
                 decoded_dict,
                 indices_decoder,
                 items_decoder,
+                temp_indices_capacities,
+                temp_items_capacities
             }) as Box<dyn PhysicalPageDecoder>)
         }
         .boxed()
@@ -128,6 +139,8 @@ struct DictionaryPageDecoder {
     decoded_dict: Arc<dyn Array>,
     indices_decoder: Box<dyn PhysicalPageDecoder>,
     items_decoder: Box<dyn PhysicalPageDecoder>,
+    temp_indices_capacities: Vec<(u64, bool)>,
+    temp_items_capacities: Vec<(u64, bool)>,
 }
 
 impl PhysicalPageDecoder for DictionaryPageDecoder {
@@ -139,15 +152,18 @@ impl PhysicalPageDecoder for DictionaryPageDecoder {
     // Next rows_to_skip=2, num_rows=1
     // Skip 8 bytes. Allocate 5 bytes capacity.
     fn update_capacity(
-        &self,
+        &mut self,
         rows_to_skip: u32,
         num_rows: u32,
         buffers: &mut [(u64, bool)],
         all_null: &mut bool,
     ) {
+        // let mut temp_indices_capacities = vec![(0, false); self.indices_decoder.num_buffers() as usize];
+        // let mut temp_items_capacities = vec![(0, false); self.items_decoder.num_buffers() as usize];
+
         // Allocate capacity for all indices
         self.indices_decoder
-            .update_capacity(rows_to_skip, num_rows, &mut buffers[..2], all_null);
+            .update_capacity(rows_to_skip, num_rows, &mut self.temp_indices_capacities, all_null);
 
         let dictionary = self
             .decoded_dict
@@ -162,15 +178,58 @@ impl PhysicalPageDecoder for DictionaryPageDecoder {
         self.items_decoder.update_capacity(
             0,
             self.decoded_dict.len() as u32,
-            &mut buffers[2..],
+            &mut self.temp_items_capacities,
             all_null,
         );
 
-        println!("Capacity of decoded dict buffer 0: {:?}", buffers[0].0);
-        println!("Capacity of decoded dict buffer 1: {:?}", buffers[1].0);
-        println!("Capacity of decoded dict buffer 2: {:?}", buffers[2].0);
-        println!("Capacity of decoded dict buffer 3: {:?}", buffers[3].0);
-        println!("Capacity of decoded dict buffer 4: {:?}", buffers[4].0);
+        for i in 0..2 {
+            println!("Capacity of decoded indices buffer {}: {:?}", i, self.temp_indices_capacities[i].0)
+        }
+
+        for j in 0..3 {
+            println!("Capacity of decoded dict buffer {}: {:?}", j, self.temp_items_capacities[j].0)
+        }    
+
+        let mut temp_indices_buffers = self.temp_indices_capacities
+        .into_iter()
+        .map(|(num_bytes, is_needed)| {
+            // Only allocate the validity buffer if it is needed, otherwise we
+            // create an empty BytesMut (does not require allocation)
+            if is_needed {
+                BytesMut::with_capacity(num_bytes as usize)
+            } else {
+                BytesMut::default()
+            }
+        })
+        .collect::<Vec<_>>();
+
+        let mut temp_items_buffers = self.temp_indices_capacities
+        .into_iter()
+        .map(|(num_bytes, is_needed)| {
+            // Only allocate the validity buffer if it is needed, otherwise we
+            // create an empty BytesMut (does not require allocation)
+            if is_needed {
+                BytesMut::with_capacity(num_bytes as usize)
+            } else {
+                BytesMut::default()
+            }
+        })
+        .collect::<Vec<_>>();
+
+        self.indices_decoder
+            .decode_into(rows_to_skip, num_rows, &mut temp_indices_buffers)?;
+
+        // Update capacity of destination buffers
+        // self.items_decoder.update_capacity(
+        //     rows_to_skip,
+        //     num_rows,
+        //     buffers,
+        //     all_null,
+        // );
+
+        // println!("Capacity of dest buffer 0: {:?}", buffers[0].0);
+        // println!("Capacity of dest buffer 1: {:?}", buffers[1].0);
+        // println!("Capacity of dest buffer 2: {:?}", buffers[2].0);
     }
 
     // Continuing from update_capacity:
@@ -185,8 +244,35 @@ impl PhysicalPageDecoder for DictionaryPageDecoder {
         num_rows: u32,
         dest_buffers: &mut [bytes::BytesMut],
     ) -> Result<()> {
+
+        let mut temp_indices_buffers = self.temp_indices_capacities
+        .into_iter()
+        .map(|(num_bytes, is_needed)| {
+            // Only allocate the validity buffer if it is needed, otherwise we
+            // create an empty BytesMut (does not require allocation)
+            if is_needed {
+                BytesMut::with_capacity(num_bytes as usize)
+            } else {
+                BytesMut::default()
+            }
+        })
+        .collect::<Vec<_>>();
+
+        let mut temp_items_buffers = self.temp_indices_capacities
+        .into_iter()
+        .map(|(num_bytes, is_needed)| {
+            // Only allocate the validity buffer if it is needed, otherwise we
+            // create an empty BytesMut (does not require allocation)
+            if is_needed {
+                BytesMut::with_capacity(num_bytes as usize)
+            } else {
+                BytesMut::default()
+            }
+        })
+        .collect::<Vec<_>>();
+
         self.indices_decoder
-            .decode_into(rows_to_skip, num_rows, &mut dest_buffers[3..])?;
+            .decode_into(rows_to_skip, num_rows, &mut temp_indices_buffers)?;
 
         // println!("Length of decoded indices: {:?}", dest_buffers[4].len());
         // println!(
@@ -194,11 +280,28 @@ impl PhysicalPageDecoder for DictionaryPageDecoder {
         // dest_buffers[4].capacity()
         // );
 
-        self.items_decoder.decode_into(
-            0,
+        // self.items_decoder.decode_into(
+        //     0,
+        //     self.decoded_dict.len() as u32,
+        //     &mut buffers[2..],
+        //     &mut [],
+        // )?;
+
+        let indices_array = primitive_array_from_buffers(
+            &DataType::UInt64,
+            temp_indices_buffers,
             self.decoded_dict.len() as u32,
-            &mut dest_buffers[..3],
-        )?;
+        );
+
+        // println!("Indices array: {:?}", indices_array);
+
+
+        // let items_array = primitive_array_from_buffers(
+        //     &DataType::Utf8,
+        //     &temp_buffers[2..],
+        //     self.decoded_dict.len() as u32,
+        // );
+
 
         println!("Buffer 0 contents: {:?}", dest_buffers[0].as_ref());
         println!("Buffer 1 contents: {:?}", dest_buffers[1].as_ref());
@@ -206,11 +309,14 @@ impl PhysicalPageDecoder for DictionaryPageDecoder {
         println!("Buffer 3 contents: {:?}", dest_buffers[3].as_ref());
         println!("Buffer 4 contents: {:?}", dest_buffers[4].as_ref());
 
+        // build temp buffers
+
+
         Ok(())
     }
 
     fn num_buffers(&self) -> u32 {
-        self.indices_decoder.num_buffers() + self.items_decoder.num_buffers() // 2 + 3 = 5
+        self.items_decoder.num_buffers() // 3
     }
 }
 
