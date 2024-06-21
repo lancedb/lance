@@ -944,30 +944,31 @@ impl FileFragment {
         }
     }
 
-    /// Take rows based on internal local row ids
+    /// Take rows based on internal local row offsets
     ///
-    /// If the row ids are out-of-bounds, this will return an error. But if the
-    /// row id is marked deleted, it will be ignored. Thus, the number of rows
-    /// returned may be less than the number of row ids provided.
+    /// If the row offsets are out-of-bounds, this will return an error. But if the
+    /// row offset is marked deleted, it will be ignored. Thus, the number of rows
+    /// returned may be less than the number of row offsets provided.
     ///
-    /// To recover the original row ids from the returned RecordBatch, set the
-    /// `with_row_id` parameter to true. This will add a column named `_row_id`
+    /// To recover the original row addresses from the returned RecordBatch, set the
+    /// `with_row_address` parameter to true. This will add a column named `_rowaddr`
     /// to the RecordBatch at the end.
     pub(crate) async fn take_rows(
         &self,
-        row_ids: &[u32],
+        row_offsets: &[u32],
         projection: &Schema,
-        with_row_id: bool,
+        with_row_address: bool,
     ) -> Result<RecordBatch> {
         // TODO: support taking row addresses
-        let reader = self.open(projection, with_row_id, false).await?;
+        let reader = self.open(projection, false, with_row_address).await?;
 
-        if row_ids.len() > 1 && Self::row_ids_contiguous(row_ids) {
-            let range = (row_ids[0] as usize)..(row_ids[row_ids.len() - 1] as usize + 1);
+        if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
+            let range =
+                (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);
             reader.legacy_read_range_as_batch(range).await
         } else {
             // FIXME, change this method to streams
-            reader.take_as_batch(row_ids).await
+            reader.take_as_batch(row_offsets).await
         }
     }
 
@@ -2008,7 +2009,7 @@ mod tests {
             &Int32Array::from(vec![121, 125, 128])
         );
         assert_eq!(
-            batch.column_by_name(ROW_ID).unwrap().as_ref(),
+            batch.column_by_name(ROW_ADDR).unwrap().as_ref(),
             &UInt64Array::from(vec![(3 << 32) + 1, (3 << 32) + 5, (3 << 32) + 8])
         );
     }
