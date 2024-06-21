@@ -16,6 +16,15 @@ Install using cargo:
 cargo install lance
 ```
 
+> [!TIP]
+> A transitive dependency of `lance` is `lzma-sys`, which uses dynamic linking
+> by default. If you want to statically link `lzma-sys`, you should activate it's
+> `static` feature by adding the following to your dependencies:
+>
+> ```toml
+> lzma-sys = { version = "*", features = ["static"] }
+> ```
+
 ## Examples
 
 ### Create dataset
