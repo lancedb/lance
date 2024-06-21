@@ -3613,21 +3613,6 @@ mod test {
                                         use_compaction,
                                         use_updated,
                                     };
-                                    // Narrow to certain test case
-                                    // let case = ScalarTestParams {
-                                    //     use_index: true,
-                                    //     use_projection: false,
-                                    //     use_deleted_data: false,
-                                    //     use_new_data: false,
-                                    //     with_row_id: false,
-                                    //     use_compaction: false,
-                                    //     use_updated: true,
-                                    // };
-                                    // if &params != &case {
-                                    //     // This is the default case, we don't need to run it twice
-                                    //     continue;
-                                    // }
-                                    // dbg!(&params);
                                     fixture.check_vector_queries(&params).await;
                                     fixture.check_simple_queries(&params).await;
                                 }

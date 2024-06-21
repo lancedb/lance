@@ -26,7 +26,7 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::utils::mask::{RowAddressTreeMap, RowIdMask};
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
 use lance_io::stream::RecordBatchStream;
@@ -291,7 +291,7 @@ struct FilteredRowIdsToPrefilter(SendableRecordBatchStream);
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
-        let mut allow_list = RowAddressTreeMap::new();
+        let mut allow_list = RowIdTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
             let row_ids = batch.column_by_name(ROW_ID).expect(

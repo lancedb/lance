@@ -17,8 +17,8 @@ use futures::stream;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use lance_core::utils::mask::RowAddressTreeMap;
 use lance_core::utils::mask::RowIdMask;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_table::format::Fragment;
 use lance_table::format::Index;
 use roaring::RoaringBitmap;
@@ -103,7 +103,7 @@ impl DatasetPreFilter {
         let mut frag_id_deletion_vectors =
             stream::iter(frag_id_deletion_vectors).buffer_unordered(num_cpus::get());
 
-        let mut deleted_ids = RowAddressTreeMap::new();
+        let mut deleted_ids = RowIdTreeMap::new();
         while let Some((id, deletion_vector)) = frag_id_deletion_vectors.try_next().await? {
             deleted_ids.insert_bitmap(id, deletion_vector);
         }
@@ -137,12 +137,12 @@ impl DatasetPreFilter {
         // on a blocking thread.
         let allow_list = tokio::task::spawn_blocking(move || {
             row_ids_and_deletions.into_iter().fold(
-                RowAddressTreeMap::new(),
+                RowIdTreeMap::new(),
                 |mut allow_list, (row_ids, deletion_vector)| {
                     let row_ids = if let Some(deletion_vector) = deletion_vector {
                         // We have to mask the row ids
                         row_ids.as_ref().iter().enumerate().fold(
-                            RowAddressTreeMap::new(),
+                            RowIdTreeMap::new(),
                             |mut allow_list, (idx, row_id)| {
                                 if !deletion_vector.contains(idx as u32) {
                                     allow_list.insert(row_id);
@@ -152,7 +152,7 @@ impl DatasetPreFilter {
                         )
                     } else {
                         // Can do a direct translation
-                        RowAddressTreeMap::from(row_ids.as_ref())
+                        RowIdTreeMap::from(row_ids.as_ref())
                     };
                     allow_list |= row_ids;
                     allow_list
@@ -161,8 +161,6 @@ impl DatasetPreFilter {
         })
         .await?;
 
-        // TODO: We should see if we can cache this for the dataset, since it should
-        // be re-usable.
         Ok(Arc::new(RowIdMask::from_allowed(allow_list)))
     }
 
@@ -344,7 +342,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let mut expected = RowAddressTreeMap::from_iter(vec![(2 << 32) + 2]);
+        let mut expected = RowIdTreeMap::from_iter(vec![(2 << 32) + 2]);
         expected.insert_fragment(1);
         assert_eq!(&mask.block_list, &Some(expected));
 
@@ -364,7 +362,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let mut expected = RowAddressTreeMap::new();
+        let mut expected = RowIdTreeMap::new();
         expected.insert_fragment(1);
         expected.insert_fragment(2);
         assert_eq!(&mask.block_list, &Some(expected));
@@ -389,7 +387,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let expected = RowAddressTreeMap::from_iter(0..8);
+        let expected = RowIdTreeMap::from_iter(0..8);
         assert_eq!(mask.allow_list, Some(expected)); // There was just one row deleted.
 
         // If there are deletions and missing fragments, we should get an allow list

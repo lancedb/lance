@@ -19,7 +19,7 @@ use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{
     utils::{
         address::RowAddress,
-        mask::{RowAddressTreeMap, RowIdMask},
+        mask::{RowIdMask, RowIdTreeMap},
     },
     Error, Result, ROW_ID_FIELD,
 };
@@ -220,7 +220,7 @@ impl MapIndexExec {
 
             let allow_list =
                 allow_list
-                    .row_addresses()
+                    .row_ids()
                     .ok_or(datafusion::error::DataFusionError::External(
                         "IndexedLookupExec: row addresses didn't have an iterable allow list"
                             .into(),
@@ -452,7 +452,7 @@ async fn row_ids_for_mask(
         (Some(mut allow_list), None) => {
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
-            if let Some(allow_list_iter) = allow_list.row_addresses() {
+            if let Some(allow_list_iter) = allow_list.row_ids() {
                 Ok(allow_list_iter.map(u64::from).collect::<Vec<_>>())
             } else {
                 // We shouldn't hit this branch if the row ids are stable.
@@ -490,7 +490,7 @@ async fn row_ids_for_mask(
             // We need to filter out irrelevant fragments as well.
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
-            if let Some(allow_list_iter) = allow_list.row_addresses() {
+            if let Some(allow_list_iter) = allow_list.row_ids() {
                 Ok(allow_list_iter
                     .filter_map(|addr| {
                         let row_id = u64::from(addr);
@@ -513,14 +513,14 @@ async fn row_ids_for_mask(
 }
 
 async fn retain_fragments(
-    allow_list: &mut RowAddressTreeMap,
+    allow_list: &mut RowIdTreeMap,
     fragments: &[Fragment],
     dataset: &Dataset,
 ) -> Result<()> {
     if dataset.manifest.uses_move_stable_row_ids() {
         let fragment_ids = load_row_id_sequences(dataset, fragments)
-            .map_ok(|(_frag_id, sequence)| RowAddressTreeMap::from(sequence.as_ref()))
-            .try_fold(RowAddressTreeMap::new(), |mut acc, tree| async {
+            .map_ok(|(_frag_id, sequence)| RowIdTreeMap::from(sequence.as_ref()))
+            .try_fold(RowIdTreeMap::new(), |mut acc, tree| async {
                 acc |= tree;
                 Ok(acc)
             })

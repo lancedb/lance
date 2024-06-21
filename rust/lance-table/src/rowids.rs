@@ -25,7 +25,7 @@ mod serde;
 use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
-use lance_core::{utils::mask::RowAddressTreeMap, Error, Result};
+use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
@@ -269,7 +269,7 @@ impl RowIdSequence {
     }
 }
 
-impl From<&RowIdSequence> for RowAddressTreeMap {
+impl From<&RowIdSequence> for RowIdTreeMap {
     fn from(row_ids: &RowIdSequence) -> Self {
         let mut tree_map = Self::new();
         for segment in &row_ids.0 {
