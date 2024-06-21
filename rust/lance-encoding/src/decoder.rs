@@ -230,6 +230,7 @@ use tokio::sync::mpsc::{self, unbounded_channel};
 use lance_core::{Error, Result};
 use tracing::instrument;
 
+use crate::encoder::get_str_encoding_type;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
@@ -551,10 +552,24 @@ impl CoreFieldDecoderStrategy {
     fn is_primitive(data_type: &DataType) -> bool {
         if data_type.is_primitive() {
             true
+        } else if get_str_encoding_type() {
+            match data_type {
+                // DataType::is_primitive doesn't consider these primitive but we do
+                DataType::Boolean
+                | DataType::Null
+                | DataType::FixedSizeBinary(_)
+                | DataType::Utf8 => true,
+                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                _ => false,
+            }
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
+                DataType::Boolean
+                | DataType::Null
+                | DataType::FixedSizeBinary(_)
+                // | DataType::Utf8 
+                => true,
                 DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
                 _ => false,
             }
@@ -1184,6 +1199,7 @@ pub trait PhysicalPageDecoder: Send + Sync {
 /// be shared in follow-up I/O tasks.
 ///
 /// See [`crate::decoder`] for more information
+
 pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     /// Schedules a batch of I/O to load the data needed for the requested ranges
     ///
