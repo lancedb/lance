@@ -110,7 +110,8 @@ jobs:
       run: sudo rm -rf target/wheels
   linux-arm:
     timeout-minutes: 45
-    runs-on: warp-ubuntu-latest-arm64-4x
+    #runs-on: warp-ubuntu-latest-arm64-4x
+    runs-on: buildjet-4vcpu-ubuntu-2204-arm
     name: Python Linux 3.${{ matrix.python-minor-version }} ARM
     strategy:
       matrix:
