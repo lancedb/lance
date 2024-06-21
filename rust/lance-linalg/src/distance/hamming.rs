@@ -3,6 +3,11 @@
 
 //! Hamming distance.
 
+pub trait Hamming {
+    /// Hamming distance between two vectors.
+    fn hamming(x: &[u8], y: &[u8]) -> f32;
+}
+
 /// Hamming distance between two vectors.
 #[inline]
 pub fn hamming(x: &[u8], y: &[u8]) -> f32 {

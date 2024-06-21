@@ -7,7 +7,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::{iter::repeat_with, ops::Range};
 
-use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::{
+    Float32Array, Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt8Array,
+};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::{fixed_size_list_type, ArrowFloatType, FixedSizeListArrayExt};
 use num_traits::{real::Real, FromPrimitive};
@@ -224,6 +226,13 @@ pub fn generate_random_array_with_range(n: usize, range: Range<f32>) -> Float32A
     let mut rng = StdRng::from_seed([13; 32]);
     let distribution = Uniform::new(range.start, range.end);
     Float32Array::from_iter_values(repeat_with(|| distribution.sample(&mut rng)).take(n))
+}
+
+/// Create a random u8 array where each element is uniformly distributed across the given range
+pub fn generate_random_u8_array_with_range(n: usize, range: Range<u8>) -> UInt8Array {
+    let mut rng = StdRng::from_seed([13; 32]);
+    let distribution = Uniform::new(range.start, range.end);
+    UInt8Array::from_iter_values(repeat_with(|| distribution.sample(&mut rng)).take(n))
 }
 
 /// Create a random float32 array where each element is uniformly
