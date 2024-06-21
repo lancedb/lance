@@ -705,4 +705,31 @@ mod test {
             assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
         }
     }
+
+    #[test]
+    fn test_row_id_sequence_to_treemap() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::RangeWithHoles {
+                range: 50..60,
+                holes: vec![53, 54].into(),
+            },
+            U64Segment::SortedArray(vec![7, 9].into()),
+            U64Segment::RangeWithBitmap {
+                range: 10..15,
+                bitmap: [true, false, true, false, true].as_slice().into(),
+            },
+            U64Segment::Array(vec![35, 39].into()),
+            U64Segment::Range(40..50),
+        ]);
+
+        let tree_map = RowIdTreeMap::from(&sequence);
+        let expected = vec![
+            0, 1, 2, 3, 4, 7, 9, 10, 12, 14, 35, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+            51, 52, 55, 56, 57, 58, 59,
+        ]
+        .into_iter()
+        .collect::<RowIdTreeMap>();
+        assert_eq!(tree_map, expected);
+    }
 }

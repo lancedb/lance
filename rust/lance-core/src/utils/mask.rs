@@ -339,9 +339,9 @@ impl RowIdTreeMap {
     /// Returns true if the value was not already in the set.
     ///
     /// ```rust
-    /// use lance_core::utils::mask::RowAddressTreeMap;
+    /// use lance_core::utils::mask::RowIdTreeMap;
     ///
-    /// let mut set = RowAddressTreeMap::new();
+    /// let mut set = RowIdTreeMap::new();
     /// assert_eq!(set.insert(10), true);
     /// assert_eq!(set.insert(10), false);
     /// assert_eq!(set.contains(10), true);
@@ -363,7 +363,7 @@ impl RowIdTreeMap {
 
     /// Insert a range of values into the set
     pub fn insert_range<R: RangeBounds<u64>>(&mut self, range: R) -> u64 {
-        let (mut start_high, start_low) = match range.start_bound() {
+        let (mut start_high, mut start_low) = match range.start_bound() {
             std::ops::Bound::Included(&start) => ((start >> 32) as u32, start as u32),
             std::ops::Bound::Excluded(&start) => {
                 let start = start.saturating_add(1);
@@ -373,18 +373,18 @@ impl RowIdTreeMap {
         };
 
         let (end_high, end_low) = match range.end_bound() {
-            std::ops::Bound::Included(&end) => {
+            std::ops::Bound::Included(&end) => ((end >> 32) as u32, end as u32),
+            std::ops::Bound::Excluded(&end) => {
                 let end = end.saturating_sub(1);
                 ((end >> 32) as u32, end as u32)
             }
-            std::ops::Bound::Excluded(&end) => ((end >> 32) as u32, end as u32),
             std::ops::Bound::Unbounded => (u32::MAX, u32::MAX),
         };
 
         let mut count = 0;
 
         while start_high <= end_high {
-            let start = if start_high == end_high { start_low } else { 0 };
+            let start = start_low;
             let end = if start_high == end_high {
                 end_low
             } else {
@@ -394,15 +394,16 @@ impl RowIdTreeMap {
             match self.inner.get_mut(&fragment) {
                 None => {
                     let mut set = RoaringBitmap::new();
-                    count += set.insert_range(start..end);
+                    count += set.insert_range(start..=end);
                     self.inner.insert(fragment, RowIdSelection::Partial(set));
                 }
                 Some(RowIdSelection::Full) => {}
                 Some(RowIdSelection::Partial(set)) => {
-                    count += set.insert_range(start..end);
+                    count += set.insert_range(start..=end);
                 }
             }
             start_high += 1;
+            start_low = 0;
         }
 
         count
@@ -708,6 +709,62 @@ mod tests {
         assert!(combined.selected(1));
     }
 
+    #[test]
+    fn test_map_insert_range() {
+        let ranges = &[
+            (0..10),
+            (40..500),
+            ((u32::MAX as u64 - 10)..(u32::MAX as u64 + 20)),
+        ];
+
+        for range in ranges {
+            let mut mask = RowIdTreeMap::default();
+
+            let count = mask.insert_range(range.clone());
+            let expected = range.end - range.start;
+            assert_eq!(count, expected);
+
+            let count = mask.insert_range(range.clone());
+            assert_eq!(count, 0);
+
+            let new_range = range.start + 5..range.end + 5;
+            let count = mask.insert_range(new_range.clone());
+            assert_eq!(count, 5);
+        }
+
+        let mut mask = RowIdTreeMap::default();
+        let count = mask.insert_range(..10);
+        assert_eq!(count, 10);
+        assert!(mask.contains(0));
+
+        let count = mask.insert_range(20..=24);
+        assert_eq!(count, 5);
+
+        mask.insert_fragment(0);
+        let count = mask.insert_range(100..200);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_map_remove() {
+        let mut mask = RowIdTreeMap::default();
+
+        assert!(!mask.remove(20));
+
+        mask.insert(20);
+        assert!(mask.contains(20));
+        assert!(mask.remove(20));
+        assert!(!mask.contains(20));
+
+        mask.insert_range(10..=20);
+        assert!(mask.contains(15));
+        assert!(mask.remove(15));
+        assert!(!mask.contains(15));
+
+        // We don't test removing from a full fragment, because that would take
+        // a lot of memory.
+    }
+
     proptest::proptest! {
         #[test]
         fn test_map_serialization_roundtrip(
@@ -797,6 +854,56 @@ mod tests {
 
             let actual = left | right;
             prop_assert_eq!(expected, actual);
+        }
+
+        #[test]
+        fn test_map_subassign_rows(
+            left_full_fragments in proptest::collection::vec(0..u32::MAX, 0..10),
+            left_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
+            right_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
+        ) {
+            let mut left = RowIdTreeMap::default();
+            for fragment in left_full_fragments.clone() {
+                left.insert_fragment(fragment);
+            }
+            left.extend(left_rows.iter().copied());
+
+            let mut right = RowIdTreeMap::default();
+            right.extend(right_rows.iter().copied());
+
+            let mut expected = left.clone();
+            for row in right_rows {
+                expected.remove(row);
+            }
+
+            left -= &right;
+            prop_assert_eq!(expected, left);
+        }
+
+        #[test]
+        fn test_map_subassign_frags(
+            left_full_fragments in proptest::collection::vec(0..u32::MAX, 0..10),
+            right_full_fragments in proptest::collection::vec(0..u32::MAX, 0..10),
+            left_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
+        ) {
+            let mut left = RowIdTreeMap::default();
+            for fragment in left_full_fragments.clone() {
+                left.insert_fragment(fragment);
+            }
+            left.extend(left_rows.iter().copied());
+
+            let mut right = RowIdTreeMap::default();
+            for fragment in right_full_fragments.clone() {
+                right.insert_fragment(fragment);
+            }
+
+            let mut expected = left.clone();
+            for fragment in right_full_fragments {
+                expected.inner.remove(&fragment);
+            }
+
+            left -= &right;
+            prop_assert_eq!(expected, left);
         }
     }
 }
