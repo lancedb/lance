@@ -2,7 +2,7 @@ Training Multi-Modal models using a Lance dataset
 -------------------------------------------------
 
 In this example we will be training a CLIP model for natural image based search using a Lance image-text dataset. 
-In particular, we will be using the `flickr_8k Lance dataset <https://www.kaggle.com/datasets/heyytanay/flickr-8k-lance>`_
+In particular, we will be using the `flickr_8k Lance dataset <https://www.kaggle.com/datasets/heyytanay/flickr-8k-lance>`_.
 
 The model architecture and part of the training code is adapted from Manan Goel's `Implementing CLIP with PyTorch Lightning <https://wandb.ai/manan-goel/coco-clip/reports/Implementing-CLIP-With-PyTorch-Lightning--VmlldzoyMzg4Njk1>`_ with necessary changes to for a minimal, lance-compatible training example.
 
