@@ -11,7 +11,8 @@ use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
+    decoder::{PageScheduler, PrimitivePageDecoder},
+    encodings::utils::create_buffers_from_capacities,
     EncodingsIo,
 };
 
@@ -36,7 +37,7 @@ impl PageScheduler for DenseBitmapScheduler {
         ranges: &[Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let mut min = u64::MAX;
         let mut max = 0;
         let chunk_reqs = ranges
@@ -76,7 +77,7 @@ impl PageScheduler for DenseBitmapScheduler {
                     length,
                 })
                 .collect::<Vec<_>>();
-            Ok(Box::new(BitmapDecoder { chunks }) as Box<dyn PhysicalPageDecoder>)
+            Ok(Box::new(BitmapDecoder { chunks }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
@@ -92,24 +93,20 @@ struct BitmapDecoder {
     chunks: Vec<BitmapData>,
 }
 
-impl PhysicalPageDecoder for BitmapDecoder {
-    fn update_capacity(
-        &self,
-        _rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        _all_null: &mut bool,
-    ) {
-        buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
-        buffers[0].1 = true;
-    }
-
+impl PrimitivePageDecoder for BitmapDecoder {
     fn decode_into(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
-        dest_buffers: &mut [BytesMut],
-    ) -> Result<()> {
+        _all_null: &mut bool,
+    ) -> Result<Vec<BytesMut>> {
+        let mut capacities = vec![(0, false); self.num_buffers() as usize];
+
+        capacities[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
+        capacities[0].1 = true;
+
+        let mut dest_buffers = create_buffers_from_capacities(capacities);
+
         let mut rows_to_skip = rows_to_skip;
 
         let mut dest_builder = BooleanBufferBuilder::new(num_rows as usize);
@@ -146,7 +143,7 @@ impl PhysicalPageDecoder for BitmapDecoder {
         //
         // It's a moot point at the moment since we don't support page bridging
         dest_buffers[0].copy_from_slice(bool_buffer.as_slice());
-        Ok(())
+        Ok(dest_buffers)
     }
 
     fn num_buffers(&self) -> u32 {
@@ -157,9 +154,9 @@ impl PhysicalPageDecoder for BitmapDecoder {
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field};
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
 
-    use crate::decoder::PhysicalPageDecoder;
+    use crate::decoder::PrimitivePageDecoder;
     use crate::encodings::physical::bitmap::BitmapData;
     use crate::testing::check_round_trip_encoding_random;
 
@@ -189,8 +186,8 @@ mod tests {
                 },
             ],
         };
-        let mut dest = vec![BytesMut::with_capacity(1)];
-        let result = decoder.decode_into(5, 1, &mut dest);
+
+        let result = decoder.decode_into(5, 1, &mut false);
         assert!(result.is_ok());
     }
 }

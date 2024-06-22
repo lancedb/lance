@@ -29,7 +29,7 @@ use lance_core::{Error, Result};
 use crate::{
     decoder::{
         DecodeArrayTask, FieldScheduler, FilterExpression, LogicalPageDecoder, NextDecodeTask,
-        PageInfo, PageScheduler, PhysicalPageDecoder, ScheduledScanLine, SchedulerContext,
+        PageInfo, PageScheduler, PrimitivePageDecoder, ScheduledScanLine, SchedulerContext,
         SchedulingJob,
     },
     encoder::{ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, FieldEncoder},
@@ -211,15 +211,15 @@ impl FieldScheduler for PrimitiveFieldScheduler {
 
 pub struct PrimitiveFieldDecoder {
     data_type: DataType,
-    unloaded_physical_decoder: Option<BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>>,
-    physical_decoder: Option<Arc<dyn PhysicalPageDecoder>>,
+    unloaded_physical_decoder: Option<BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>>,
+    physical_decoder: Option<Arc<dyn PrimitivePageDecoder>>,
     num_rows: u32,
     rows_drained: u32,
 }
 
 impl PrimitiveFieldDecoder {
     pub fn new_from_data(
-        physical_decoder: Arc<dyn PhysicalPageDecoder>,
+        physical_decoder: Arc<dyn PrimitivePageDecoder>,
         data_type: DataType,
         num_rows: u32,
     ) -> Self {
@@ -246,45 +246,26 @@ impl Debug for PrimitiveFieldDecoder {
 struct PrimitiveFieldDecodeTask {
     rows_to_skip: u32,
     rows_to_take: u32,
-    physical_decoder: Arc<dyn PhysicalPageDecoder>,
+    physical_decoder: Arc<dyn PrimitivePageDecoder>,
     data_type: DataType,
 }
 
 impl DecodeArrayTask for PrimitiveFieldDecodeTask {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
-        // We start by assuming that no buffers are required.  The number of buffers needed is based
-        // on the data type.  Most data types need two buffers but each layer of fixed-size-list, for
-        // example, adds another validity buffer
-        let mut capacities = vec![(0, false); self.physical_decoder.num_buffers() as usize];
         let mut all_null = false;
-        self.physical_decoder.update_capacity(
+
+        // The number of buffers needed is based on the data type.
+        // Most data types need two buffers but each layer of fixed-size-list, for
+        // example, adds another validity buffer.
+        let bufs = self.physical_decoder.decode_into(
             self.rows_to_skip,
             self.rows_to_take,
-            &mut capacities,
             &mut all_null,
-        );
+        )?;
 
         if all_null {
             return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));
         }
-
-        // At this point we know the size needed for each buffer
-        let mut bufs = capacities
-            .into_iter()
-            .map(|(num_bytes, is_needed)| {
-                // Only allocate the validity buffer if it is needed, otherwise we
-                // create an empty BytesMut (does not require allocation)
-                if is_needed {
-                    BytesMut::with_capacity(num_bytes as usize)
-                } else {
-                    BytesMut::default()
-                }
-            })
-            .collect::<Vec<_>>();
-
-        // Go ahead and fill the validity / values buffers
-        self.physical_decoder
-            .decode_into(self.rows_to_skip, self.rows_to_take, &mut bufs)?;
 
         // Convert the two buffers into an Arrow array
         Self::primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)

@@ -1144,7 +1144,7 @@ impl BatchDecodeStream {
 /// the decode task for batch 0 and the decode task for batch 1.
 ///
 /// See [`crate::decoder`] for more information
-pub trait PhysicalPageDecoder: Send + Sync {
+pub trait PrimitivePageDecoder: Send + Sync {
     /// Calculates and updates the capacity required to represent the requested data
     ///
     /// Capacity is stored as a tuple of (num_bytes: u64, is_needed: bool).  The `is_needed`
@@ -1165,13 +1165,13 @@ pub trait PhysicalPageDecoder: Send + Sync {
     /// * `num_rows` - how many rows to decode
     /// * `buffers` - A mutable slice of "capacities" (as described above), one per buffer
     /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
-    fn update_capacity(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        all_null: &mut bool,
-    );
+    // fn update_capacity(
+    //     &self,
+    //     rows_to_skip: u32,
+    //     num_rows: u32,
+    //     buffers: &mut [(u64, bool)],
+    //     all_null: &mut bool,
+    // );
     /// Decodes the data into the requested buffers.
     ///
     /// You can assume that the capacity will have already been configured on the `BytesMut`
@@ -1182,12 +1182,41 @@ pub trait PhysicalPageDecoder: Send + Sync {
     /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
     /// * `num_rows` - how many rows to decode
     /// * `dest_buffers` - the output buffers to decode into
+    // fn decode_into(
+    //     &self,
+    //     rows_to_skip: u32,
+    //     num_rows: u32,
+    //     dest_buffers: &mut [BytesMut],
+    // ) -> Result<()>;
+
+    /// Combined function to update the capacity required to represent the requested data
+    /// and decode the data into the requested buffers.
+    ///
+    /// Capacity is stored as a tuple of (num_bytes: u64, is_needed: bool).  The `is_needed`
+    /// portion only needs to be updated if the encoding has some concept of an "optional"
+    /// buffer.
+    ///
+    /// The decoder should look at `rows_to_skip` and `num_rows` and then calculate how
+    /// many bytes of data are needed.  It should then update the first part of the tuple.
+    ///
+    /// Note: Most encodings deal with a single buffer.  They may have multiple input buffers
+    /// but they only have a single output buffer.  The current exception to this rule is the
+    /// `basic` encoding which has an output "validity" buffer and an output "values" buffers.
+    /// We may find there are other such exceptions.
+    /// # Arguments
+    ///
+    /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
+    /// * `num_rows` - how many rows to decode
+    /// * `capacities` - A mutable slice of "capacities" (as described above), one per buffer
+    /// * `dest_buffers` - the output buffers to decode into
+    /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
     fn decode_into(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
-        dest_buffers: &mut [BytesMut],
-    ) -> Result<()>;
+        // capacities: &mut [(u64, bool)],
+        all_null: &mut bool,
+    ) -> Result<Vec<BytesMut>>;
     fn num_buffers(&self) -> u32;
 }
 
@@ -1217,7 +1246,7 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
         ranges: &[Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>;
 }
 
 /// Contains the context for a scheduler

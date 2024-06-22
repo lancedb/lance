@@ -4,12 +4,13 @@
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, ArrayRef};
+use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
     EncodingsIo,
@@ -39,7 +40,7 @@ impl PageScheduler for FixedListScheduler {
         ranges: &[std::ops::Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let expanded_ranges = ranges
             .iter()
             .map(|range| (range.start * self.dimension)..(range.end * self.dimension))
@@ -61,42 +62,28 @@ impl PageScheduler for FixedListScheduler {
             Ok(Box::new(FixedListDecoder {
                 items_decoder,
                 dimension,
-            }) as Box<dyn PhysicalPageDecoder>)
+            }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
 }
 
 pub struct FixedListDecoder {
-    items_decoder: Box<dyn PhysicalPageDecoder>,
+    items_decoder: Box<dyn PrimitivePageDecoder>,
     dimension: u32,
 }
 
-impl PhysicalPageDecoder for FixedListDecoder {
-    fn update_capacity(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        all_null: &mut bool,
-    ) {
-        let rows_to_skip = rows_to_skip * self.dimension;
-        let num_rows = num_rows * self.dimension;
-        self.items_decoder
-            .update_capacity(rows_to_skip, num_rows, buffers, all_null);
-    }
-
+impl PrimitivePageDecoder for FixedListDecoder {
     fn decode_into(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
-        dest_buffers: &mut [bytes::BytesMut],
-    ) -> Result<()> {
+        all_null: &mut bool,
+    ) -> Result<Vec<BytesMut>> {
         let rows_to_skip = rows_to_skip * self.dimension;
         let num_rows = num_rows * self.dimension;
         self.items_decoder
-            .decode_into(rows_to_skip, num_rows, dest_buffers)?;
-        Ok(())
+            .decode_into(rows_to_skip, num_rows, all_null)
     }
 
     fn num_buffers(&self) -> u32 {
