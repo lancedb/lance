@@ -9,11 +9,12 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use arrow::datatypes::UInt64Type;
 use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_struct_array, AsArray},
     types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Schema};
@@ -25,7 +26,10 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
+use lance_core::{
+    datatypes::Field, traits::DatasetTakeRows, utils::address::RowAddress, Error, Result, ROW_ID,
+    ROW_ID_FIELD,
+};
 use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
@@ -1181,14 +1185,40 @@ async fn scan_index_field_stream(
 
 async fn load_precomputed_partitions_if_available(
     ivf_params: &IvfBuildParams,
-) -> Result<Option<HashMap<u64, u32>>> {
+) -> Result<Option<Vec<Vec<u32>>>> {
     match &ivf_params.precomputed_partitons_file {
         Some(file) => {
             info!("Loading precomputed partitions from file: {}", file);
             let ds = DatasetBuilder::from_uri(file).load().await?;
+            // First pass: count num fragments
+            let mut scan = ds.scan().project(&["row_id"])?.try_into_stream().await?;
+            let mut max_row_id = 0;
+            while let Some(batch) = scan.try_next().await? {
+                let row_ids = batch.column(0).as_primitive::<UInt64Type>();
+                let batch_max = arrow_arith::aggregate::max(row_ids).unwrap();
+                if batch_max > max_row_id {
+                    max_row_id = batch_max;
+                }
+            }
+            let num_fragments = RowAddress::new_from_id(max_row_id).fragment_id() + 1;
+            // Second pass: count size of each fragment
+            let mut scan = ds.scan().project(&["row_id"])?.try_into_stream().await?;
+            let mut frag_sizes = vec![0; num_fragments as usize];
+            while let Some(batch) = scan.try_next().await? {
+                let row_ids = batch.column(0).as_primitive::<UInt64Type>();
+                for row_id in row_ids.values() {
+                    let addr = RowAddress::new_from_id(*row_id);
+                    let size_needed = addr.row_id() + 1;
+                    let frag_size = &mut frag_sizes[addr.fragment_id() as usize];
+                    if size_needed > *frag_size {
+                        *frag_size = size_needed;
+                    }
+                }
+            }
+            // Third pass: build mapping
             let stream = ds.scan().try_into_stream().await?;
             Ok(Some(
-                load_precomputed_partitions(stream, ds.count_rows(None).await?).await?,
+                load_precomputed_partitions(stream, &frag_sizes).await?,
             ))
         }
         None => Ok(None),
@@ -1434,7 +1464,7 @@ async fn write_ivf_pq_file(
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
+    precomputed_partitons: Option<Vec<Vec<u32>>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
@@ -1501,7 +1531,7 @@ async fn write_ivf_hnsw_file(
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     stream: impl RecordBatchStream + Unpin + 'static,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
+    precomputed_partitons: Option<Vec<Vec<u32>>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,

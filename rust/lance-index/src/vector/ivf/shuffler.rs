@@ -26,6 +26,7 @@ use arrow_schema::{DataType, Field, Fields, SchemaRef};
 use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
+use lance_core::utils::address::RowAddress;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::reader::FileReader;
@@ -235,7 +236,7 @@ pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: Arc<Ivf>,
-    precomputed_partitions: Option<HashMap<u64, u32>>,
+    precomputed_partitions: Option<Vec<Vec<u32>>>,
     num_partitions: u32,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
@@ -259,82 +260,84 @@ pub async fn shuffle_dataset(
 
         let column = column.to_owned();
         let precomputed_partitions = precomputed_partitions.map(Arc::new);
-        let stream = data
-            .zip(repeat_with(move || ivf.clone()))
-            .map(move |(b, ivf)| {
-                // If precomputed_partitions map is provided, use it
-                // for fast partitions.
-                let partition_map = precomputed_partitions
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(Arc::new(HashMap::new()));
-                let nan_filter = KeepFiniteVectors::new(&column);
+        let stream =
+            data.zip(repeat_with(move || ivf.clone()))
+                .map(move |(b, ivf)| {
+                    // If precomputed_partitions map is provided, use it
+                    // for fast partitions.
+                    let partition_map = precomputed_partitions
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or(Arc::new(Vec::new()));
+                    let nan_filter = KeepFiniteVectors::new(&column);
 
-                tokio::task::spawn(async move {
-                    let mut batch = b?;
+                    tokio::task::spawn(async move {
+                        let mut batch = b?;
 
-                    if !partition_map.is_empty() {
-                        let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
-                            message: "column does not exist".to_string(),
-                            location: location!(),
-                        })?;
-                        let part_ids = UInt32Array::from_iter(
-                            row_ids
-                                .as_primitive::<UInt64Type>()
-                                .values()
-                                .iter()
-                                .map(|row_id| partition_map.get(row_id).copied()),
-                        );
-                        let part_ids = UInt32Array::from(part_ids);
-                        batch = batch
-                            .try_with_column(
-                                Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true),
-                                Arc::new(part_ids.clone()),
-                            )
-                            .expect("failed to add part id column");
-
-                        if part_ids.null_count() > 0 {
-                            info!(
-                                "Filter out rows without valid partition IDs: null_count={}",
-                                part_ids.null_count()
+                        if !partition_map.is_empty() {
+                            let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
+                                message: "column does not exist".to_string(),
+                                location: location!(),
+                            })?;
+                            let part_ids = UInt32Array::from_iter(
+                                row_ids.as_primitive::<UInt64Type>().values().iter().map(
+                                    |row_id| {
+                                        let row_addr = RowAddress::new_from_id(*row_id);
+                                        partition_map[row_addr.fragment_id() as usize]
+                                            [row_addr.row_id() as usize]
+                                    },
+                                ),
                             );
-                            let indices = UInt32Array::from_iter(
-                                part_ids
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(idx, v)| v.map(|_| idx as u32)),
-                            );
-                            assert_eq!(indices.len(), batch.num_rows() - part_ids.null_count());
-                            batch = batch.take(&indices)?;
+                            let part_ids = UInt32Array::from(part_ids);
+                            batch = batch
+                                .try_with_column(
+                                    Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true),
+                                    Arc::new(part_ids.clone()),
+                                )
+                                .expect("failed to add part id column");
+
+                            if part_ids.null_count() > 0 {
+                                info!(
+                                    "Filter out rows without valid partition IDs: null_count={}",
+                                    part_ids.null_count()
+                                );
+                                let indices = UInt32Array::from_iter(
+                                    part_ids
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(idx, v)| v.map(|_| idx as u32)),
+                                );
+                                assert_eq!(indices.len(), batch.num_rows() - part_ids.null_count());
+                                batch = batch.take(&indices)?;
+                            }
                         }
-                    }
 
-                    // Filter out NaNs/Infs
-                    let minibatch_size = std::env::var("LANCE_SHUFFLE_BATCH_SIZE")
-                        .unwrap_or("64".to_string())
-                        .parse::<usize>()
-                        .unwrap_or(64);
-                    let num_out_batches = batch.num_rows().div_ceil(minibatch_size);
-                    let mut out_batches = Vec::with_capacity(num_out_batches);
-                    for offset in (0..batch.num_rows()).step_by(minibatch_size) {
-                        let mut batch = batch.slice(
-                            offset,
-                            std::cmp::min(minibatch_size, batch.num_rows() - offset),
-                        );
-                        batch = nan_filter.transform(&batch)?;
-                        out_batches.push(Result::Ok(ivf.transform(&batch))?);
-                    }
-                    Result::Ok(futures::stream::iter(out_batches))
+                        // Filter out NaNs/Infs
+                        let minibatch_size = std::env::var("LANCE_SHUFFLE_BATCH_SIZE")
+                            .unwrap_or("64".to_string())
+                            .parse::<usize>()
+                            .unwrap_or(64);
+                        let num_out_batches = batch.num_rows().div_ceil(minibatch_size);
+                        let mut out_batches = Vec::with_capacity(num_out_batches);
+                        for offset in (0..batch.num_rows()).step_by(minibatch_size) {
+                            let mut batch = batch.slice(
+                                offset,
+                                std::cmp::min(minibatch_size, batch.num_rows() - offset),
+                            );
+                            batch = nan_filter.transform(&batch)?;
+                            out_batches.push(Result::Ok(ivf.transform(&batch))?);
+                        }
+                        Result::Ok(futures::stream::iter(out_batches))
+                    })
                 })
-            })
-            .buffer_unordered(num_cpus::get())
-            .map(|res| match res {
-                Ok(Ok(batch)) => Ok(batch),
-                Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
-                Err(err) => Err(Error::io(err.to_string(), location!())),
-            })
-            .try_flatten()
-            .boxed();
+                .buffer_unordered(num_cpus::get())
+                .map(|res| match res {
+                    Ok(Ok(batch)) => Ok(batch),
+                    Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
+                    Err(err) => Err(Error::io(err.to_string(), location!())),
+                })
+                .try_flatten()
+                .boxed();
 
         let start = std::time::Instant::now();
         shuffler.write_unsorted_stream(stream).await?;
