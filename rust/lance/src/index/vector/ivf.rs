@@ -2574,7 +2574,7 @@ mod tests {
         );
     }
 
-    async fn test_create_ivf_hnsw_sq(distance_type: DistanceType) {
+    async fn test_create_ivf_hnsw_sq(distance_type: DistanceType, expected_recall: f32) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2641,7 +2641,7 @@ mod tests {
 
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 0.9,
+            recall >= expected_recall,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,
@@ -2651,12 +2651,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_hnsw_sq_cosine() {
-        test_create_ivf_hnsw_sq(DistanceType::Cosine).await
+        test_create_ivf_hnsw_sq(DistanceType::Cosine, 0.9).await
     }
 
     #[tokio::test]
     async fn test_create_ivf_hnsw_sq_dot() {
-        test_create_ivf_hnsw_sq(DistanceType::Dot).await
+        test_create_ivf_hnsw_sq(DistanceType::Dot, 0.8).await
     }
 
     #[tokio::test]

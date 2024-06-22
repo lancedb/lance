@@ -153,12 +153,14 @@ impl Hnsw {
         max_level=7,
         m=20,
         ef_construction=100,
+        distance_type="l2",
     ))]
     fn build(
         vectors_array: &PyIterator,
         max_level: u16,
         m: usize,
         ef_construction: usize,
+        distance_type: &str,
     ) -> PyResult<Self> {
         let params = HnswBuildParams::default()
             .max_level(max_level)
@@ -177,9 +179,12 @@ impl Hnsw {
         let vectors = concat(&array_refs).map_err(|e| PyIOError::new_err(e.to_string()))?;
         std::mem::drop(data);
 
+        let dt = DistanceType::try_from(distance_type)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
         let hnsw = RT
             .runtime
-            .block_on(params.build(vectors.clone()))
+            .block_on(params.build(vectors.clone(), dt))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self { hnsw, vectors })
     }

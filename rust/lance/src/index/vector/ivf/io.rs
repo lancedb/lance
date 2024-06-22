@@ -480,7 +480,8 @@ async fn build_hnsw_quantization_partition(
         metric_type = MetricType::L2;
     }
 
-    let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), vectors.clone(), writer);
+    let build_hnsw =
+        build_and_write_hnsw(vectors.clone(), (*hnsw_params).clone(), metric_type, writer);
 
     let build_store = match quantizer {
         Quantizer::Flat(_) => {
@@ -517,11 +518,12 @@ async fn build_hnsw_quantization_partition(
 }
 
 async fn build_and_write_hnsw(
-    params: HnswBuildParams,
     vectors: Arc<dyn Array>,
+    params: HnswBuildParams,
+    distance_type: DistanceType,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
-    let batch = params.build(vectors).await?.to_batch()?;
+    let batch = params.build(vectors, distance_type).await?.to_batch()?;
     let metadata = batch.schema_ref().metadata().clone();
     writer.write_record_batch(batch).await?;
     writer.finish_with_metadata(&metadata).await
