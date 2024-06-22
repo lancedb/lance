@@ -11,7 +11,9 @@ const FSST_CODE_MASK: u16 = FSST_CODE_MAX - 1;
 // we construct FSST symbol tables using a random sample of about 16KB (1<<14) 
 const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
-const FSST_LEAST_INPUT_SIZE: usize = 8 * 1024 * 1024;   // 8MB 
+//const FSST_LEAST_INPUT_SIZE: usize = 8 * 1024 * 1024;   // 8MB 
+// set low in development 
+const FSST_LEAST_INPUT_SIZE: usize = 2;   // 8MB 
 
 const FSST_ICL_FREE: u32 = (8 << 28) | ((FSST_CODE_MASK as u32) << 16);
 
@@ -81,18 +83,6 @@ impl Symbol {
                                                                   // character, 56 bits are ignored
     }
 
-    fn from_char_slice(input: &[u8]) -> Self {
-        let mut s = Self::new();
-        let len = if input.len() >= MAX_SYMBOL_LENGTH { MAX_SYMBOL_LENGTH } else { input.len() };
-        let mut input_in_1_word = [0; 8];
-        input_in_1_word[..len].copy_from_slice(&input[..len]);
-        s.val = fsst_unaligned_load_unchecked(input_in_1_word.as_ptr()); 
-        // a alternative way to copy the input to s.val, test performance difference
-        // unsafe { ptr::copy_nonoverlapping(input.as_ptr(), &mut s.val as *mut _ as *mut u8, len); }
-        s.set_code_len(FSST_CODE_MASK as u16, len as u32);
-        s
-    }
-
     fn set_code_len(&mut self, code: u16, len: u32) {
         self.icl = ((len as u64)<< 28)|((code as u64) << 16)|((8u64.saturating_sub(len as u64))*8);
     }
@@ -127,14 +117,17 @@ impl Symbol {
         (FSST_HASH)(v)
     }
 
-    fn concat(a: Self, b: Self) -> Self {
+    // right is the substring follows left
+    // for example, in "hello", 
+    // "llo" is the substring that follows "he"
+    fn concat(left: Self, right: Self) -> Self {
         let mut s = Self::new();
-        let mut length = a.length() + b.length();
+        let mut length = left.length() + right.length();
         if length > MAX_SYMBOL_LENGTH as u32 {
             length = MAX_SYMBOL_LENGTH as u32;
         }
         s.set_code_len(FSST_CODE_MASK as u16, length);
-        s.val = (b.val << (8 * a.length())) | a.val;
+        s.val = (right.val << (8 * left.length())) | left.val;
         s
     }
 }
@@ -252,8 +245,7 @@ impl SymbolTable {
         }
         let mut short_codes = [FSST_CODE_MASK; 65536];
         for i in 0..=65535 as u16 {
-            // in a empty short_code, the lower 8-bit is the escape code 255, the higher 8-bit is the index's higher 8-bit
-            short_codes[i as usize] = i | FSST_CODE_UNSET; 
+            short_codes[i as usize] = i & 0xFF; 
         }
         Self {
             short_codes,
@@ -280,7 +272,7 @@ impl SymbolTable {
             self.byte_codes[i] = i as u16;
         }
         for i in 0..=65535 as u16 {
-            self.short_codes[i as usize] = i | FSST_CODE_UNSET;
+            self.short_codes[i as usize] = i & 0xFF;
         }
         let s = Symbol::new();
         for i in 0..1 << FSST_HASH_LOG2SIZE {
@@ -298,6 +290,7 @@ impl SymbolTable {
         if taken {
             return false; // collision in hash table
         }
+        //println!("inserting a hash symbl: {}", s);
         self.hash_tab[idx].icl = s.icl;
         self.hash_tab[idx].val = s.val & (u64::MAX >> (s.ignored_bits()));
         true
@@ -320,22 +313,28 @@ impl SymbolTable {
         true
     }
 
-    fn find_longest_symbol(&self, s: Symbol) -> u16 {
-        let idx = (s.hash() & (FSST_HASH_LOG2SIZE as u64 - 1)) as usize;
-        if self.hash_tab[idx].icl == s.icl && self.hash_tab[idx].val == s.val {
-            return ((self.hash_tab[idx].icl >> 16) & FSST_CODE_MASK as u64) as u16; // matched a long symbol 
+    fn find_longest_symbol_from_char_slice(&self, input: &[u8]) -> u16 {
+        let len = if input.len() >= MAX_SYMBOL_LENGTH { MAX_SYMBOL_LENGTH } else { input.len() };
+        if len < 2 {
+            return self.byte_codes[input[0] as usize] & FSST_CODE_MASK;
         }
-        if s.length() >= 2 {
-            let code =  self.short_codes[s.first2() as usize] & FSST_CODE_MASK;
-            if !is_escape_code(code) {
-                return code; 
+        if len == 2 {
+            let short_code = (input[1] as usize) << 8 | input[0] as usize;
+            if self.short_codes[short_code] & FSST_CODE_UNSET == 0 {
+                return self.short_codes[short_code] & FSST_CODE_MASK;
+            } else {
+                return self.byte_codes[input[0] as usize] & FSST_CODE_MASK;
             }
         }
-        self.byte_codes[s.first() as usize] & FSST_CODE_MASK
-    }
-
-    fn find_longest_symbol_from_char_slice(&self, input: &[u8]) -> u16 {
-        self.find_longest_symbol(Symbol::from_char_slice(input))
+        let mut input_in_1_word = [0; 8];
+        input_in_1_word[..len].copy_from_slice(&input[..len]);
+        let input_in_u64 = fsst_unaligned_load_unchecked(input_in_1_word.as_ptr()); 
+        let hash_idx = FSST_HASH(input_in_u64) as usize & (self.hash_tab_size - 1);
+        let s_in_hash_tab = self.hash_tab[hash_idx];
+        if s_in_hash_tab.icl != FSST_ICL_FREE as u64 && s_in_hash_tab.val == (input_in_u64 & (u64::MAX >> s_in_hash_tab.ignored_bits())) {
+            return s_in_hash_tab.code();
+        }
+        return self.byte_codes[input[0] as usize] & FSST_CODE_MASK;
     }
 
    // rationale for finalize:
@@ -402,12 +401,12 @@ impl SymbolTable {
             if (self.byte_codes[i] & FSST_CODE_MASK) >= FSST_CODE_BASE {
                 self.byte_codes[i] = new_code[(self.byte_codes[i] & 0xFF) as usize] as u16;
             } else {
-                self.byte_codes[i] = FSST_CODE_MASK;
+                self.byte_codes[i] = 511;
             }
         }
 
         for i in 0..65536 {
-            if (self.short_codes[i] & FSST_CODE_UNSET) == 0 {
+            if (self.short_codes[i] & FSST_CODE_MASK) > FSST_CODE_BASE {
                 self.short_codes[i] = new_code[(self.short_codes[i] & 0xFF) as usize] as u16;
             } else {
                 self.short_codes[i] = self.byte_codes[(i & 0xFF) as usize];
@@ -498,6 +497,7 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
     for c in &strs {
         byte_histo[*c as usize] += 1;
     }
+   // println!("byte_histo: {:?}", byte_histo);
     let mut curr_min_histo = FSST_SAMPLEMAXSZ;
     
     for i in 0..256 {
@@ -506,8 +506,10 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
             st.terminator = i as u16;
         }
     }
+    //println!("terminator: {}", st.terminator);
     // Compress sample, and compute (pair-)frequencies
     let compress_count = |st: &mut SymbolTable, sample_frac: usize| -> (Box<Counters>, i32) {
+        //println!("symbol table before starting compress_count: {:?}", st);
         // a random number between 1 and 128
         let _rnd128 = |i: usize| -> usize { 
             1 + ((FSST_HASH((i as u64 + 1) * sample_frac as u64)&127) as usize) 
@@ -530,16 +532,19 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
             let mut curr = 0;
             let mut curr_code;
             let mut prev_code = st.find_longest_symbol_from_char_slice(&word[curr..]);
+            //println!("prev_code: {}", prev_code);
             curr += st.symbols[prev_code as usize].length() as usize;
             gain += st.symbols[prev_code as usize].length() as i32 - (1 + is_escape_code(prev_code) as i32);
             while curr < word.len() {
+                //println!("prev_code: {}, st.symbols[prev_code]: {}", prev_code, st.symbols[prev_code as usize]);
+                //https://answers.yahoo.com/question/index?qid=20071007114826AAwCFvR
                 counters.count1_inc(prev_code);
-                
+                let mut symbol_len = 0;
+
                 if st.symbols[prev_code as usize].length() != 1 {
                     counters.count1_inc(word[curr] as u16);
                 }
 
-                let symbol_len;
                 if word.len() > 7 && curr < word.len() - 7 {
                     let mut this_64_bit_word: u64 = fsst_unaligned_load_unchecked(word[curr..].as_ptr());
                     let code = this_64_bit_word & 0xFFFFFF;
@@ -550,7 +555,7 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
                     if (s.icl < FSST_ICL_FREE as u64) & (s.val == this_64_bit_word) {
                         curr_code = s.code();
                         symbol_len = s.length();
-                    } else if short_code & FSST_CODE_UNSET != 0 {
+                    } else if short_code >= FSST_CODE_BASE {
                         curr_code = short_code;
                         symbol_len = 2;
                     } else {
@@ -558,7 +563,7 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
                         symbol_len = 1;
                     }
                 } else {
-                    curr_code = st.find_longest_symbol(Symbol::from_char_slice(&word[curr..]));
+                    curr_code = st.find_longest_symbol_from_char_slice(&word[curr..]);
                     symbol_len = st.symbols[curr_code as usize].length();
                 }
                 gain += symbol_len as i32 - (1 + is_escape_code(curr_code) as i32);
@@ -573,7 +578,14 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
                 prev_code = curr_code;
             }
             counters.count1_inc(prev_code);
+            /* 
+            if st.symbols[prev_code as usize].length() != 1 {
+                counters.count1_inc(word[curr - symbol_len as usize] as u16);
+            }*/
         }
+        //println!("------------------this round finished------------------");
+        //println!();
+        //println!();
         (Box::new(counters), gain)
     };
 
@@ -606,6 +618,9 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
             // heuristic: promoting single-byte symbols (*8) helps reduce exception rates and increases [de]compression speed
             let s1 = st.symbols[pos1];
             add_or_inc(&mut candidates, s1, if s1.length() == 1 { 8 } else { 1 } * cnt1 as u64);
+            if s1.first() == st.terminator as u8 {
+                continue;
+            }
             if sample_frac >= 128 ||
                 s1.length() == MAX_SYMBOL_LENGTH as u32 || 
                 s1.first() == st.terminator as u8 {
@@ -622,6 +637,12 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
                 let s3 = Symbol::concat(s1, s2);
                 // multi-byte symbols cannot contain the terminator byte
                 if s2.first() != st.terminator as u8 {
+                    /* 
+                    println!("s1: {}", s1);
+                    println!("s2: {}", s2);
+                    println!("s3: {}", s3);
+                    println!("new symbol: {}, new_symbol.val: {}", s3, s3.val);
+                    */
                     add_or_inc(&mut candidates, s3, cnt2 as u64);
                 }
             }
@@ -639,7 +660,8 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
         }
     };
 
-    for frac in [8, 38, 68, 98, 128] { // we do 5 rounds (sampleFrac=8,38,68,98,128)
+    for frac in [8, 38, 68, 98, 108, 128] { // we do 5 rounds (sampleFrac=8,38,68,98,128)
+    //for frac in [127, 127, 127, 127, 127, 127, 127, 127, 127, 128] {
         let (mut this_counter, gain ) = compress_count(&mut st, frac);
         if gain >= best_gain { // a new best solution!
             best_gain = gain;
@@ -647,7 +669,9 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
         } 
         make_table(&mut st, &mut this_counter, frac);
     }
+    //println!("before finalize: {}", best_table);
     best_table.finalize(); // renumber codes for more efficient compression
+    //println!("after finalize: {}", best_table);
     if best_table.n_symbols == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Fsst failed to build symbol table, input len: {}, input_offsets len: {}", strs.len(), offsets.len())));
     }
@@ -655,6 +679,7 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
 }    
 
 fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> io::Result<()>{
+    //println!("in compress_bulk, st: {}", st);
     let suffix_lim = st.suffix_lim;
     let byte_lim = st.n_symbols - st.len_histo[0] as u16;
     let mut out_curr = *out_pos;
@@ -675,6 +700,7 @@ fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u
                 out[*out_curr + 1] = (word & 0xFF) as u8;
                 let word2 = word & (u64::MAX as u64 >> s.ignored_bits());
                 if s.icl != FSST_ICL_FREE as u64 && s.val == word2 {
+                    //println!("in_curr: {}, *out_curr: {}, hash hit: {}", in_curr, *out_curr, s);
                     out[*out_curr] = s.code() as u8;
                     *out_curr += 1;
                     in_curr += s.length() as usize;
@@ -685,7 +711,7 @@ fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u
                 } else {
                     // 1 byte code or miss
                     out[*out_curr] = code as u8;
-                    *out_curr += 1 + ((code & FSST_CODE_BASE) >> 8) as usize;
+                    *out_curr += 1 + ((code & 256) >> 8) as usize;
                     in_curr += 1;
                 }
             }
@@ -708,6 +734,7 @@ fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u
         }
         out_offsets[i] = out_curr as i32; 
     }
+
     out.resize(out_curr, 0); // shrink to actual size
     out_offsets.resize(offsets.len(), 0); // shrink to actual size
     *out_pos = out_curr;
@@ -745,6 +772,7 @@ fn decompress_bulk(st: &SymbolTable, compressed_strs: &[u8], offsets: &[i32], ou
         decompress(in_curr, in_end, &mut out_curr);
         out_offsets[i] = out_curr as i32;
     }
+    //println!("out: {:?}", out);
     out.resize(out_curr, 0);
     out_offsets.resize(offsets.len(), 0);
     *out_pos = out_curr;
@@ -1239,11 +1267,18 @@ mod tests {
     */
     #[test_log::test(tokio::test)]
     async fn test_build_symbol_table() {
+        /* 
+        let paragraph = TEST_PARAGRAPH.to_string();
+        let words = paragraph.lines().collect::<Vec<&str>>();
+        let string_array = StringArray::from(words);
+        let st = *build_symbol_table(string_array.value_data().to_vec(), string_array.value_offsets().to_vec()).unwrap();
+        println!("{}", st);
+        */
         // to test build_symbol_table, uncomment this block
         let file_paths = [
-            //"/Users/x/first_column_fulldocs.tsv",
+            "/home/x/first_column_fulldocs.tsv",
             //"/home/x/second_column_fulldocs.tsv",
-            "/home/x/third_column_fulldocs.tsv",
+            //"/home/x/third_column_fulldocs.tsv",
         ];
         for file_path in file_paths {
             let input = read_random_16_m_chunk(file_path).unwrap();
@@ -1256,7 +1291,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_compress_bulk() {
 
-        let paragraph = TEST_PARAGRAPH.to_string().repeat(1024);
+        let paragraph = TEST_PARAGRAPH.to_string();
         let words = paragraph.lines().collect::<Vec<&str>>();
         let string_array = StringArray::from(words);
         let (sample_input, sample_offsets) = make_sample(string_array.values(), string_array.value_offsets());
@@ -1266,6 +1301,8 @@ mod tests {
         let mut compress_out_buf_pos = 0;
         let mut compress_out_offsets_len = 0;
         compress_bulk(&st, string_array.values(), string_array.value_offsets(), &mut compress_output_buf, &mut compress_offset_buf, &mut compress_out_buf_pos, &mut compress_out_offsets_len).unwrap();
+        let this_compression_ratio = string_array.values().len() as f64 / compress_out_buf_pos as f64;
+        println!("compression ratio: {}", this_compression_ratio);
         // due to the non-deterministic nature in the sampling phase, I couldn't find the good way to test this,
         // we can print out the symbol table and parts of the compress_output_buf to inspect 
         println!("symbol table: {}", st);
@@ -1419,7 +1456,27 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_fsst() {
-        let test_num = 10;
+        let paragraph = TEST_PARAGRAPH.to_string().repeat(1024);
+        let words = paragraph.lines().collect::<Vec<&str>>();
+        let string_array = StringArray::from(words);
+        let mut compress_output_buf: Vec<u8> = vec![0; 16 * 1024 * 1024];
+        let mut compress_offset_buf: Vec<i32> = vec![0; 16 * 1024 * 1024];
+        compress(string_array.value_data(), string_array.value_offsets(), &mut compress_output_buf, &mut compress_offset_buf).unwrap();
+        let this_compression_ratio = string_array.value_data().len() as f64 / compress_output_buf.len() as f64;
+        println!("this_compression_ratio: {:?}", this_compression_ratio);
+        let mut decompress_output: Vec<u8> = vec![0; 3 * 16 * 1024 * 1024];
+        let mut decompress_offsets: Vec<i32> = vec![0; 3 * 16 * 1024 * 1024];
+        decompress(&compress_output_buf, &compress_offset_buf, &mut decompress_output, &mut decompress_offsets).unwrap();
+        println!("decompress_offsets.len(): {}", decompress_offsets.len());
+        for i in 1..decompress_offsets.len() {
+            let s = &decompress_output[decompress_offsets[i-1] as usize..decompress_offsets[i] as usize];
+            let original = &string_array.value_data()[string_array.value_offsets().to_vec()[i-1] as usize..string_array.value_offsets().to_vec()[i] as usize];
+            //println!("s: {:?}", std::str::from_utf8(s));
+            //println!("original: {:?}", std::str::from_utf8(original));
+            assert!(s == original, "s: {:?}\n\n, original: {:?}", std::str::from_utf8(s), std::str::from_utf8(original));
+        }
+        /* 
+        let test_num = 1;
         let file_paths = [
             //"/Users/x/first_column_fulldocs.tsv",
             "/home/x/second_column_fulldocs.tsv",
@@ -1454,7 +1511,7 @@ mod tests {
                     assert!(s == original, "s: {:?}\n\n, original: {:?}", std::str::from_utf8(s), std::str::from_utf8(original));
                 }
             }
-        }
+        }*/
     }
 
     use std::fs::File;
@@ -1469,6 +1526,7 @@ mod tests {
     
         let mut rng = rand::thread_rng();
         let mut curr_line = rng.gen_range(0..num_lines);
+        let mut curr_line = 0;
         println!("curr_line: {}", curr_line);
     
         let chunk_size = 16 * 1024 * 1024; // 16MB
