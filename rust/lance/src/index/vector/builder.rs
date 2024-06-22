@@ -330,9 +330,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             .map(|(_, idx)| idx)
             .collect::<Vec<_>>();
 
-        // step 3. build sub index
         let mut partition_sizes = vec![(0, 0); ivf.num_partitions()];
-        for &partition in &partition_build_order {
+        for (i, &partition) in partition_build_order.iter().enumerate() {
+            log::info!(
+                "building partition {}, progress {}/{}",
+                partition,
+                i + 1,
+                ivf.num_partitions(),
+            );
             let mut batches = Vec::new();
             for existing_index in self.existing_indices.iter() {
                 let existing_index = existing_index
@@ -381,6 +386,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
 
             let sizes = self.build_partition(partition, &batch).await?;
             partition_sizes[partition] = sizes;
+            log::info!(
+                "partition {} built, progress {}/{}",
+                partition,
+                i + 1,
+                ivf.num_partitions()
+            );
         }
         self.partition_sizes = partition_sizes;
         Ok(self)
@@ -413,8 +424,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
 
         // build the sub index, with in-memory storage
         let index_len = {
+            let distance_type = match self.distance_type {
+                DistanceType::Cosine | DistanceType::Dot => DistanceType::L2,
+                _ => self.distance_type,
+            };
             let vectors = batch[&self.column].as_fixed_size_list();
-            let flat_storage = FlatStorage::new(vectors.clone(), self.distance_type);
+            let flat_storage = FlatStorage::new(vectors.clone(), distance_type);
             let sub_index = S::index_vectors(&flat_storage, self.sub_index_params.clone())?;
             let path = self.temp_dir.child(format!("index_part{}", part_id));
             let writer = object_store.create(&path).await?;
@@ -464,6 +479,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         let mut partition_index_metadata = Vec::with_capacity(partition_sizes.len());
         let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), 64);
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
+            log::info!("merging partition {}/{}", part_id, ivf.num_partitions());
             if storage_size == 0 {
                 storage_ivf.add_partition(0);
                 partition_storage_metadata.push(quantizer.metadata(None)?.to_string());
@@ -537,6 +553,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                         .unwrap_or_default(),
                 );
             }
+            log::info!("merged partition {}/{}", part_id, ivf.num_partitions());
         }
 
         let mut storage_writer = storage_writer.unwrap();

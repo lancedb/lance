@@ -54,9 +54,6 @@ pub struct HnswBuildParams {
     /// size of the dynamic list for the candidates
     pub ef_construction: usize,
 
-    /// the max number of threads to use for building the graph
-    pub parallel_limit: Option<usize>,
-
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
 }
@@ -67,7 +64,6 @@ impl Default for HnswBuildParams {
             max_level: 7,
             m: 20,
             ef_construction: 150,
-            parallel_limit: None,
             prefetch_distance: Some(2),
         }
     }
@@ -94,12 +90,6 @@ impl HnswBuildParams {
     /// The default value is `100`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
-        self
-    }
-
-    /// The max number of threads to use for building the graph.
-    pub fn parallel_limit(mut self, limit: usize) -> Self {
-        self.parallel_limit = Some(limit);
         self
     }
 
@@ -690,13 +680,6 @@ impl IvfSubIndex for HNSW {
         );
 
         let len = storage.len();
-        let parallel_limit = hnsw
-            .inner
-            .params
-            .parallel_limit
-            .unwrap_or_else(num_cpus::get)
-            .max(1);
-        log::info!("Building HNSW graph with parallel_limit={}", parallel_limit);
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
         (1..len).into_par_iter().for_each(|node| {
             let mut visited_generator = VisitedGenerator::new(len);

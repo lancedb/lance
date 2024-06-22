@@ -85,8 +85,6 @@ impl Shuffler for IvfShuffler {
         let mut partition_sizes = vec![0; self.num_partitions];
         let mut first_pass = true;
 
-        let mut counter = 0;
-
         let num_partitions = self.num_partitions;
         let mut parallel_sort_stream = data
             .map(|batch| {
@@ -133,8 +131,8 @@ impl Shuffler for IvfShuffler {
             .map(|_| Vec::new())
             .collect::<Vec<_>>();
 
+        let mut counter = 0;
         while let Some(shuffled) = parallel_sort_stream.next().await {
-            log::info!("shuffle batch: {}", counter);
             let shuffled = shuffled?;
 
             for (part_id, batches) in shuffled.into_iter().enumerate() {
@@ -176,6 +174,7 @@ impl Shuffler for IvfShuffler {
 
             // do flush
             if counter % self.buffer_size == 0 {
+                log::info!("shuffle {} batches, flushing", counter);
                 let mut futs = vec![];
                 for (part_id, writer) in writers.iter_mut().enumerate() {
                     let batches = &partition_buffers[part_id];
