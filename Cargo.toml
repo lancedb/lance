@@ -73,7 +73,7 @@ arrow-select = "51.0"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "0.57"
-aws-credential-types = "0.56"
+aws-credential-types = "0.57"
 aws-sdk-dynamodb = "0.34"
 half = { "version" = "2.4.1", default-features = false, features = [
     "num-traits",
