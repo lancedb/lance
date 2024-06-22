@@ -75,6 +75,7 @@ pub fn argmin_value<T: Num + Bounded + PartialOrd + Copy>(
 /// Returns the minimal value (float) and the index (argmin) from an Iterator.
 ///
 /// Return `None` if the iterator is empty or all are `Nan/Inf`.
+#[inline]
 pub fn argmin_value_float<T: Float>(iter: impl Iterator<Item = T>) -> Option<(u32, T)> {
     let mut min_idx = None;
     let mut min_value = T::infinity();

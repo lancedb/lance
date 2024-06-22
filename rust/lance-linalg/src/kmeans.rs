@@ -30,7 +30,7 @@ use rayon::prelude::*;
 
 use crate::distance::hamming::hamming;
 use crate::distance::{dot_distance_batch, DistanceType};
-use crate::kernels::argmax;
+use crate::kernels::{argmax, argmin_value_float};
 use crate::{
     distance::{
         l2::{l2_distance_batch, L2},
@@ -214,11 +214,11 @@ where
         let cluster_and_dists = match distance_type {
             DistanceType::L2 => data
                 .par_chunks(dimension)
-                .map(|vec| argmin_value(l2_distance_batch(vec, centroids, dimension)))
+                .map(|vec| argmin_value_float(l2_distance_batch(vec, centroids, dimension)))
                 .collect::<Vec<_>>(),
             DistanceType::Dot => data
                 .par_chunks(dimension)
-                .map(|vec| argmin_value(dot_distance_batch(vec, centroids, dimension)))
+                .map(|vec| argmin_value_float(dot_distance_batch(vec, centroids, dimension)))
                 .collect::<Vec<_>>(),
             _ => {
                 panic!(
@@ -500,8 +500,8 @@ impl KMeans {
                 last_membership = Some(membership);
                 if (loss - last_loss).abs() / last_loss < params.tolerance {
                     info!(
-                        "KMeans training: converged at iteration {} / {}, redo={}",
-                        i, params.max_iters, redo
+                        "KMeans training: converged at iteration {} / {}, redo={}, loss={}, last_loss={}, loss_diff={}",
+                        i, params.max_iters, redo, loss, last_loss, (loss - last_loss).abs() / last_loss
                     );
                     break;
                 }
