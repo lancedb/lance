@@ -524,7 +524,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         // the index file is in lance format since version (0,2)
         // TODO: we need to change the legacy IVF_PQ to be in lance format
-        match (major_version, minor_version) {
+        let index = match (major_version, minor_version) {
             (0, 1) | (0, 0) => {
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
@@ -599,7 +599,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 Arc::downgrade(&self.session),
                             )
                             .await?;
-                            Ok(Arc::new(ivf))
+                            Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                         }
                         _ => Err(Error::Index {
                             message: format!(
@@ -618,7 +618,7 @@ impl DatasetIndexInternalExt for Dataset {
                             Arc::downgrade(&self.session),
                         )
                         .await?;
-                        Ok(Arc::new(ivf))
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
                     _ => Err(Error::Index {
@@ -633,7 +633,10 @@ impl DatasetIndexInternalExt for Dataset {
                     .to_owned(),
                 location: location!(),
             }),
-        }
+        };
+        let index = index?;
+        self.session.index_cache.insert_vector(uuid, index.clone());
+        Ok(index)
     }
 
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {

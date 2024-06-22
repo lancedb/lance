@@ -56,9 +56,16 @@ use crate::{
 };
 
 use super::{centroids_to_vectors, IvfIndexPartitionStatistics, IvfIndexStatistics};
+
+#[derive(Debug)]
+struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
+    index: S,
+    storage: Q::Storage,
+}
+
 /// IVF Index.
 #[derive(Debug)]
-pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization> {
+pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     uuid: String,
 
     /// Ivf model
@@ -69,7 +76,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization> {
     storage: IvfQuantizationStorage,
 
     /// Index in each partition.
-    sub_index_cache: Cache<String, Arc<S>>,
+    partition_cache: Cache<String, Arc<PartitionEntry<S, Q>>>,
 
     distance_type: DistanceType,
 
@@ -165,7 +172,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             ivf,
             reader: index_reader,
             storage,
-            sub_index_cache: Cache::new(DEFAULT_INDEX_CACHE_SIZE as u64),
+            partition_cache: Cache::new(DEFAULT_INDEX_CACHE_SIZE as u64),
             sub_index_metadata,
             distance_type,
             session,
@@ -174,9 +181,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn load_partition(&self, partition_id: usize, write_cache: bool) -> Result<Arc<S>> {
+    pub async fn load_partition(
+        &self,
+        partition_id: usize,
+        write_cache: bool,
+    ) -> Result<Arc<PartitionEntry<S, Q>>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
-        let part_index = if let Some(part_idx) = self.sub_index_cache.get(&cache_key) {
+        let part_entry = if let Some(part_idx) = self.partition_cache.get(&cache_key) {
             part_idx
         } else {
             if partition_id >= self.ivf.num_partitions() {
@@ -211,14 +222,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 S::metadata_key().to_owned(),
                 self.sub_index_metadata[partition_id].clone(),
             )?;
-            let idx = Arc::new(S::load(batch)?);
+            let idx = S::load(batch)?;
+            let storage = self.load_partition_storage(partition_id).await?;
+            let partition_entry = Arc::new(PartitionEntry {
+                index: idx,
+                storage,
+            });
             if write_cache {
-                self.sub_index_cache.insert(cache_key.clone(), idx.clone());
+                self.partition_cache
+                    .insert(cache_key.clone(), partition_entry.clone());
             }
-            idx
+            partition_entry
         };
 
-        Ok(part_index)
+        Ok(part_entry)
     }
 
     pub async fn load_partition_storage(&self, partition_id: usize) -> Result<Q::Storage> {
@@ -362,13 +379,14 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         query: &Query,
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
-        let part_index = self.load_partition(partition_id, true).await?;
-        let part_storage = self.load_partition_storage(partition_id).await?;
+        let part_entry = self.load_partition(partition_id, true).await?;
 
         let query = self.preprocess_query(partition_id, query)?;
         let param = (&query).into();
-        pre_filter.wait_for_ready().await?;
-        part_index.search(query.key, query.k, param, &part_storage, pre_filter)
+        // pre_filter.wait_for_ready().await?;
+        part_entry
+            .index
+            .search(query.key, query.k, param, &part_entry.storage, pre_filter)
     }
 
     fn is_loadable(&self) -> bool {

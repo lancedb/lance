@@ -71,7 +71,7 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
 }
 
 /// An immutable chunk of SclarQuantizationStorage.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct SQStorageChunk {
     batch: RecordBatch,
 
@@ -151,7 +151,7 @@ impl DeepSizeOf for SQStorageChunk {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ScalarQuantizationStorage {
     quantizer: ScalarQuantizer,
 

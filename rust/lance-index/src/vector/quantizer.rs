@@ -44,7 +44,7 @@ use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 pub trait Quantization: Send + Sync + Debug + DeepSizeOf + Into<Quantizer> {
     type BuildParams: QuantizerBuildParams;
     type Metadata: QuantizerMetadata + Send + Sync;
-    type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore;
+    type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore + Debug;
 
     fn build(
         data: &dyn Array,

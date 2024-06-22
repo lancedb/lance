@@ -442,7 +442,6 @@ pub(crate) async fn open_vector_index(
         });
     }
     let idx = last_stage.unwrap();
-    dataset.session.index_cache.insert_vector(uuid, idx.clone());
     Ok(idx)
 }
 
@@ -546,11 +545,6 @@ pub(crate) async fn open_vector_index_v2(
             }
         }
     };
-
-    dataset
-        .session
-        .index_cache
-        .insert_vector(uuid, index.clone());
 
     Ok(index)
 }
