@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use bytes::BytesMut;
 
 pub fn create_buffers_from_capacities(capacities: Vec<(u64, bool)>) -> Vec<BytesMut> {
