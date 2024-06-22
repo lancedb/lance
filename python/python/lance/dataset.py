@@ -1154,11 +1154,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         Unlike the :func:`dataset` constructor, this will re-use the
         current cache.
-        This is a no-op if the dataset is already at the version associated with the given tag.
+        This is a no-op if the dataset is already at the version associated
+        with the given tag.
         """
         ds = copy.copy(self)
-        if ds.tags()[tag] != ds.version:
-            ds._ds = self._ds.checkout_tag(tag)
+        ds._ds = self._ds.checkout_tag(tag)
         return ds
 
     def create_tag(self, tag: str, version: int) -> None:

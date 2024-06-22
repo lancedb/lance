@@ -250,6 +250,40 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_tag(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    assert len(ds.tags()) == 0
+
+    with pytest.raises(ValueError):
+        ds.create_tag("tag1", 3)
+
+    with pytest.raises(ValueError):
+        ds.delete_tag("tag1")
+
+    ds.create_tag("tag1", 1)
+    assert len(ds.tags()) == 1
+
+    with pytest.raises(ValueError):
+        ds.create_tag("tag1", 1)
+
+    ds.delete_tag("tag1")
+
+    ds.create_tag("tag1", 1)
+    ds.create_tag("tag2", 1)
+
+    assert len(ds.tags()) == 2
+
+    with pytest.raises(ValueError):
+        ds.checkout_tag("tag3")
+
+    assert ds.checkout_tag("tag1").version == 1
+
+
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
     base_dir = tmp_path / "test"

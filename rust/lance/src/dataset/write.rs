@@ -26,7 +26,6 @@ use crate::Dataset;
 
 use super::builder::DatasetBuilder;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
-use super::tag::TagContents;
 use super::DATA_DIR;
 
 pub mod merge_insert;

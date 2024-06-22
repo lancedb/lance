@@ -1,8 +1,10 @@
-use crate::{Error, Result};
+use std::ops::Range;
+
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
+
+use crate::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagContents {

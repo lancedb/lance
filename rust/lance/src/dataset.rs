@@ -44,7 +44,7 @@ pub mod progress;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
-mod tag;
+pub mod tag;
 mod take;
 pub mod transaction;
 pub mod updater;
@@ -2931,7 +2931,6 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_tag(#[values(false, true)] use_legacy_format: bool) {
-        // TODO: use a fixture instead to share table creation with test_restore?
         // Create a table
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -2958,7 +2957,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dataset.manifest.version, 1);
-        let original_manifest = dataset.manifest.clone();
 
         // delete some rows
         dataset.delete("i > 50").await.unwrap();
@@ -2966,41 +2964,42 @@ mod tests {
 
         assert_eq!(dataset.tags().await.unwrap().len(), 0);
 
-        let bad_tag_creation = dataset.create_tag("v3", 3).await;
+        let bad_tag_creation = dataset.create_tag("tag1", 3).await;
         assert_eq!(
             bad_tag_creation.err().unwrap().to_string(),
             "Version not found error: version 3 does not exist"
         );
 
-        let bad_tag_deletion = dataset.delete_tag("v3").await;
+        let bad_tag_deletion = dataset.delete_tag("tag1").await;
         assert_eq!(
             bad_tag_deletion.err().unwrap().to_string(),
-            "Tag not found error: tag v3 does not exist"
+            "Tag not found error: tag tag1 does not exist"
         );
 
-        dataset.create_tag("v1", 1).await.unwrap();
+        dataset.create_tag("tag1", 1).await.unwrap();
 
         assert_eq!(dataset.tags().await.unwrap().len(), 1);
 
-        let another_bad_tag_creation = dataset.create_tag("v1", 1).await;
+        let another_bad_tag_creation = dataset.create_tag("tag1", 1).await;
         assert_eq!(
             another_bad_tag_creation.err().unwrap().to_string(),
-            "Tag conflict error: tag v1 already exists"
+            "Tag conflict error: tag tag1 already exists"
         );
 
-        dataset.delete_tag("v1").await.unwrap();
+        dataset.delete_tag("tag1").await.unwrap();
 
-        dataset.create_tag("v1", 1).await.unwrap();
+        dataset.create_tag("tag1", 1).await.unwrap();
+        dataset.create_tag("tag2", 1).await.unwrap();
 
-        assert_eq!(dataset.tags().await.unwrap().len(), 1);
+        assert_eq!(dataset.tags().await.unwrap().len(), 2);
 
-        let bad_checkout = dataset.checkout_tag("v3").await;
+        let bad_checkout = dataset.checkout_tag("tag3").await;
         assert_eq!(
             bad_checkout.err().unwrap().to_string(),
-            "Tag not found error: tag v3 does not exist"
+            "Tag not found error: tag tag3 does not exist"
         );
 
-        dataset = dataset.checkout_tag("v1").await.unwrap();
+        dataset = dataset.checkout_tag("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 1);
     }
 

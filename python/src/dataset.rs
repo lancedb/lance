@@ -27,6 +27,7 @@ use chrono::Duration;
 use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::tag::TagContents;
 use lance::dataset::transaction::validate_operation;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -940,15 +941,28 @@ impl Dataset {
         })
     }
 
-    fn tags(self_: PyRef<'_, Self>) -> PyObject {
-        unimplemented!("not implemented yet");
+    fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        let tags = self_
+            .list_tags()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Python::with_gil(|py| {
+            let pytags = PyDict::new(py);
+            for (k, v) in tags.iter() {
+                let dict = PyDict::new(py);
+                dict.set_item("version", v.version).unwrap();
+                dict.set_item("manifest_size", v.manifest_size).unwrap();
+                dict.to_object(py);
+                pytags.set_item(k, dict).unwrap();
+            }
+            Ok(pytags.to_object(py))
+        })
     }
 
     fn checkout_tag(&self, tag: String) -> PyResult<Self> {
         let ds = RT
-            .block_on(None, self.ds.checkout_tag(tag))?
+            .block_on(None, self.ds.checkout_tag(tag.as_str()))?
             .map_err(|err| match err {
-                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::TagNotFound { .. } => PyValueError::new_err(err.to_string()),
                 _ => PyIOError::new_err(err.to_string()),
             })?;
         Ok(Self {
@@ -958,11 +972,28 @@ impl Dataset {
     }
 
     fn create_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
-        unimplemented!("not implemented yet");
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.create_tag(tag.as_str(), version))?
+            .map_err(|err| match err {
+                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::TagConflict { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::VersionNotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     fn delete_tag(&mut self, tag: String) -> PyResult<()> {
-        unimplemented!("not implemented yet");
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.delete_tag(tag.as_str()))?
+            .map_err(|err| match err {
+                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::TagNotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     #[pyo3(signature = (**kwargs))]
@@ -1217,6 +1248,10 @@ impl Dataset {
 impl Dataset {
     fn list_versions(&self) -> ::lance::error::Result<Vec<Version>> {
         RT.runtime.block_on(self.ds.versions())
+    }
+
+    fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
+        RT.runtime.block_on(self.ds.tags())
     }
 }
 
