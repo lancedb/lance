@@ -18,6 +18,7 @@ use lance_linalg::kmeans::kmeans_find_partitions;
 use lance_linalg::{distance::MetricType, MatrixView};
 use rayon::prelude::*;
 use snafu::{location, Location};
+use tracing::instrument;
 
 pub mod builder;
 mod distance;
@@ -329,6 +330,7 @@ where
         self
     }
 
+    #[instrument(name = "transform_pq2", level = "debug", skip_all)]
     fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
@@ -362,7 +364,7 @@ where
 
         let values = flatten_data
             .as_slice()
-            .par_chunks(dim)
+            .chunks_exact(dim)
             .map(|vector| {
                 vector
                     .chunks_exact(dim / num_sub_vectors)

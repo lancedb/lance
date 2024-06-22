@@ -9,6 +9,7 @@ use arrow_schema::Field;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use snafu::{location, Location};
+use tracing::instrument;
 
 use super::ProductQuantizer;
 use crate::vector::transform::Transformer;
@@ -47,6 +48,7 @@ impl Debug for PQTransformer {
 }
 
 impl Transformer for PQTransformer {
+    #[instrument(name = "transform_pq", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let input_arr = batch
             .column_by_name(&self.input_column)

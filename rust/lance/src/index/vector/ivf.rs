@@ -1161,7 +1161,19 @@ async fn scan_index_field_stream(
     column: &str,
 ) -> Result<impl RecordBatchStream + Unpin + 'static> {
     let mut scanner = dataset.scan();
-    scanner.batch_readahead(num_cpus::get() * 2);
+    // scanner.batch_readahead(num_cpus::get() * 2);
+    scanner.fragment_readahead(
+        std::env::var("LANCE_FRAGMENT_READAHEAD")
+            .unwrap_or("1".to_string())
+            .parse()
+            .unwrap(),
+    );
+    scanner.batch_size(
+        std::env::var("LANCE_BATCH_SIZE")
+            .unwrap_or("32768".to_string())
+            .parse()
+            .unwrap(),
+    );
     scanner.project(&[column])?;
     scanner.with_row_id();
     scanner.try_into_stream().await
@@ -1192,6 +1204,9 @@ pub async fn build_ivf_pq_index(
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
 ) -> Result<()> {
+    let mut pq_params = pq_params.clone();
+    pq_params.max_iters = 1;
+    let pq_params = &pq_params;
     let (ivf_model, pq) =
         build_ivf_model_and_pq(dataset, column, metric_type, ivf_params, pq_params).await?;
     let stream = scan_index_field_stream(dataset, column).await?;

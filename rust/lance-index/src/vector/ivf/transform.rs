@@ -61,6 +61,7 @@ impl IvfTransformer {
     }
 }
 impl Transformer for IvfTransformer {
+    #[instrument(name = "transform_ivf", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {
             // If the partition ID column is already present, we don't need to compute it again.
@@ -125,6 +126,7 @@ impl PartitionFilter {
 }
 
 impl Transformer for PartitionFilter {
+    #[instrument(level = "debug")]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         // TODO: use datafusion execute?
         let arr = batch

@@ -310,9 +310,21 @@ pub async fn shuffle_dataset(
                     }
 
                     // Filter out NaNs/Infs
-                    batch = nan_filter.transform(&batch)?;
-
-                    ivf.transform(&batch)
+                    let minibatch_size = std::env::var("LANCE_SHUFFLE_BATCH_SIZE")
+                        .unwrap_or("64".to_string())
+                        .parse::<usize>()
+                        .unwrap_or(64);
+                    let num_out_batches = batch.num_rows().div_ceil(minibatch_size);
+                    let mut out_batches = Vec::with_capacity(num_out_batches);
+                    for offset in (0..batch.num_rows()).step_by(minibatch_size) {
+                        let mut batch = batch.slice(
+                            offset,
+                            std::cmp::min(minibatch_size, batch.num_rows() - offset),
+                        );
+                        batch = nan_filter.transform(&batch)?;
+                        out_batches.push(Result::Ok(ivf.transform(&batch))?);
+                    }
+                    Result::Ok(futures::stream::iter(out_batches))
                 })
             })
             .buffer_unordered(num_cpus::get())
@@ -321,6 +333,7 @@ pub async fn shuffle_dataset(
                 Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
                 Err(err) => Err(Error::io(err.to_string(), location!())),
             })
+            .try_flatten()
             .boxed();
 
         let start = std::time::Instant::now();
