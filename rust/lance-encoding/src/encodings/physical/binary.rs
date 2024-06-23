@@ -478,7 +478,8 @@ impl ArrayEncoder for BinaryEncoder {
 pub mod tests {
 
     use arrow_array::{
-        builder::StringBuilder, ArrayRef, LargeStringArray, StringArray, UInt64Array,
+        builder::{LargeStringBuilder, StringBuilder},
+        ArrayRef, LargeStringArray, StringArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field};
     use std::{sync::Arc, vec};
@@ -626,18 +627,17 @@ pub mod tests {
         // This is an overflow test.  We have a list of lists where each list
         // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
         // offsets range
-        // let items = BooleanArray::new_null(1024 * 1024);
-        // let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1024 * 1024]));
-        // let list_arr = Arc::new(ListArray::new(
-        //     Arc::new(Field::new("item", DataType::Boolean, true)),
-        //     offsets,
-        //     Arc::new(items),
-        //     None,
-        // )) as ArrayRef;
-        // let arrs = vec![list_arr; 5000];
+        let mut string_builder = LargeStringBuilder::new();
+        // a 1 MiB string
+        let giant_string = String::from_iter((0..(1024 * 1024)).map(|_| '0'));
+        for _ in 0..5000 {
+            string_builder.append_option(Some(&giant_string));
+        }
+        let giant_array = Arc::new(string_builder.finish()) as ArrayRef;
+        let arrs = vec![giant_array];
 
         // // We can't validate because our validation relies on concatenating all input arrays
-        // let test_cases = TestCases::default().without_validation();
-        // check_round_trip_encoding_of_data(arrs, &test_cases).await;
+        let test_cases = TestCases::default().without_validation();
+        check_round_trip_encoding_of_data(arrs, &test_cases).await;
     }
 }
