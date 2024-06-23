@@ -135,7 +135,7 @@ fn benchmark(file_path: &str) {
     );
     println!("{:.3}\t\t\t\t{:.2}MB/s\t\t\t{:.2}MB/s", compression_ratio, com_speed, d_speed);
     for i in 0..TEST_NUM {
-        assert_eq!(inputs[i].value_data()[0..100], decompression_out_bufs[i][0..100]);
+        assert_eq!(inputs[i].value_data(), decompression_out_bufs[i]);
         assert_eq!(inputs[i].value_offsets(), decompression_out_offsets_bufs[i]);
     }
 }
