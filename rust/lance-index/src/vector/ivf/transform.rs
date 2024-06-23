@@ -126,7 +126,7 @@ impl PartitionFilter {
 }
 
 impl Transformer for PartitionFilter {
-    #[instrument(level = "debug")]
+    #[instrument(name = "transform_partition", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         // TODO: use datafusion execute?
         let arr = batch
