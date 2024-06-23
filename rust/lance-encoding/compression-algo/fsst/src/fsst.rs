@@ -15,7 +15,7 @@ const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
 // set low in development 
 const FSST_LEAST_INPUT_SIZE: usize = 2;   // 8MB 
 
-const FSST_ICL_FREE: u32 = (8 << 28) | ((FSST_CODE_MASK as u32) << 16);
+const FSST_ICL_FREE: u64 = (8 << 28) | ((FSST_CODE_MASK as u64) << 16);
 
 
 const FSST_HASH_LOG2SIZE: usize = 10;
@@ -363,9 +363,9 @@ impl SymbolTable {
    //
    // finally, shortCodes[] is modified to also encode all single-byte symbols (hence byteCodes[] is not required on a critical path anymore).
    //
-    fn finalize(&mut self) {
+   fn finalize(&mut self) {
         assert!(self.n_symbols < FSST_CODE_BASE);
-        let mut new_code: [u8; 256] = [0; 256];
+        let mut new_code: [u16; 256] = [0; 256];
         let mut rsum: [u8; 8] = [0; 8];
         let byte_lim = self.n_symbols - self.len_histo[0] as u16;
 
@@ -388,9 +388,9 @@ impl SymbolTable {
                         opt = 0;
                     }
                 }
-                new_code[i as usize] = if opt != 0 { suffix_lim += 1; suffix_lim - 1 } else { j -= 1; j };
+                new_code[i as usize] = if opt != 0 { suffix_lim += 1; suffix_lim - 1 } else { j -= 1; j as u16};
             } else {
-                new_code[i as usize] = rsum[(len - 1) as usize];
+                new_code[i as usize] = rsum[(len - 1) as usize] as u16;
                 rsum[(len - 1) as usize] += 1;
             }
             s1.set_code_len(new_code[i as usize] as u16, len);
@@ -399,17 +399,17 @@ impl SymbolTable {
 
         for i in 0..256 {
             if (self.byte_codes[i] & FSST_CODE_MASK) >= FSST_CODE_BASE {
-                self.byte_codes[i] = new_code[(self.byte_codes[i] & 0xFF) as usize] as u16;
+                self.byte_codes[i] = (new_code[(self.byte_codes[i] & 0xFF) as usize] as u16) | (1 << 12);
             } else {
-                self.byte_codes[i] = 511;
+                self.byte_codes[i] = 511 | (1 << 12);
             }
         }
 
         for i in 0..65536 {
             if (self.short_codes[i] & FSST_CODE_MASK) > FSST_CODE_BASE {
-                self.short_codes[i] = new_code[(self.short_codes[i] & 0xFF) as usize] as u16;
+                self.short_codes[i] = (new_code[(self.short_codes[i] & 0xFF) as usize] as u16) | (2 << 12);
             } else {
-                self.short_codes[i] = self.byte_codes[(i & 0xFF) as usize];
+                self.short_codes[i] = self.byte_codes[(i & 0xFF) as usize] | (1 << 12);
             }
         }
 
@@ -688,35 +688,22 @@ fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u
         let mut in_curr = 0;
         while in_curr < in_end {
             let word = fsst_unaligned_load_unchecked(buf[in_curr..].as_ptr());
-            let code = st.short_codes[(word & 0xFFFF) as usize];
-            if code < suffix_lim {
-                out[*out_curr] = code as u8;
-                *out_curr += 1;
-                in_curr += 2;
+            let short_code = st.short_codes[(word & 0xFFFF) as usize];
+            let word_first_3_byte= word & 0xFFFFFF;
+            let idx = FSST_HASH(word_first_3_byte) as usize & (st.hash_tab_size - 1);
+            let s= st.hash_tab[idx];
+            out[*out_curr + 1] = word as u8; // speculatively write out escaped byte
+            let code = if s.icl < FSST_ICL_FREE && s.val == (word & (u64::MAX >> (s.icl & 0xFFFF))) {
+                (s.icl >> 16)  as u16
             } else {
-                let code_first_3byte= word & 0xFFFFFF;
-                let idx = FSST_HASH(code_first_3byte) as usize & (st.hash_tab_size - 1);
-                let s = st.hash_tab[idx];
-                out[*out_curr + 1] = (word & 0xFF) as u8;
-                let word2 = word & (u64::MAX as u64 >> s.ignored_bits());
-                if s.icl != FSST_ICL_FREE as u64 && s.val == word2 {
-                    //println!("in_curr: {}, *out_curr: {}, hash hit: {}", in_curr, *out_curr, s);
-                    out[*out_curr] = s.code() as u8;
-                    *out_curr += 1;
-                    in_curr += s.length() as usize;
-                } else if code < byte_lim {
-                    out[*out_curr] = code as u8;
-                    *out_curr += 1;
-                    in_curr += 2;
-                } else {
-                    // 1 byte code or miss
-                    out[*out_curr] = code as u8;
-                    *out_curr += 1 + ((code & 256) >> 8) as usize;
-                    in_curr += 1;
-                }
-            }
+                short_code
+            };
+            out[*out_curr] = code as u8;
+            in_curr += (code >> 12) as usize;
+            *out_curr += 1 + ((code & 256) >> 8) as usize;
         }
     };
+
     out_offsets[0] = *out_pos as i32;
     for i in 1..offsets.len() {
         let mut in_curr = offsets[i - 1] as usize;
@@ -780,7 +767,7 @@ fn decompress_bulk(st: &SymbolTable, compressed_strs: &[u8], offsets: &[i32], ou
     Ok(())
 }
 
-fn decompress_bulk2(symbols: &[Symbol], compressed_strs: &[u8], offsets: &[i32], _in_curr: &mut usize, out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> io::Result<()> {
+fn decompress_bulk2(symbols: &[u64], lens: &[u8], compressed_strs: &[u8], offsets: &[i32], _in_curr: &mut usize, out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> io::Result<()> {
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
         let mut prev_esc = false;
         while in_curr < in_end {
@@ -794,8 +781,8 @@ fn decompress_bulk2(symbols: &[Symbol], compressed_strs: &[u8], offsets: &[i32],
                     prev_esc = true;
                 } else {
                     let s = symbols[code as usize];
-                    let len = s.length();
-                    out[*out_curr..*out_curr + len as usize].copy_from_slice(&s.val.to_ne_bytes()[..len as usize]);
+                    let len = lens[code as usize];
+                    out[*out_curr..*out_curr + len as usize].copy_from_slice(&s.to_ne_bytes()[..len as usize]);
                     *out_curr += len as usize;
                 }
             }
@@ -854,27 +841,25 @@ impl FsstEncoder {
         let st = &self.symbol_table;
 
         let st_info: u64 = FSST_MAGIC |  
-                            ((st.suffix_lim & FSST_CODE_BASE) as u64) << 16 |
-                            ((st.terminator & FSST_CODE_BASE) as u64) << 8 | 
-                            ((st.n_symbols & FSST_CODE_BASE) as u64);
+                            ((st.suffix_lim & 255) as u64) << 16 |
+                            ((st.terminator & 255) as u64) << 8 | 
+                            ((st.n_symbols & 255) as u64);
 
         let st_info_bytes = st_info.to_ne_bytes();
         out_buf[*out_pos..*out_pos + st_info_bytes.len()].copy_from_slice(&st_info_bytes);
         
         *out_pos += st_info_bytes.len();
-        for i in 0..8 {
-            out_buf[*out_pos] = st.len_histo[i];
-            *out_pos += 1;
-        }
 
         for i in 0..st.n_symbols as usize {
             let s = st.symbols[i];
             let s_bytes = s.val.to_ne_bytes();
             out_buf[*out_pos..*out_pos + s_bytes.len()].copy_from_slice(&s_bytes);
             *out_pos += s_bytes.len();
-            let s_icl = s.icl.to_ne_bytes();
-            out_buf[*out_pos..*out_pos + s_icl.len()].copy_from_slice(&s_icl);
-            *out_pos += s_icl.len();
+        }
+        for i in 0..st.n_symbols as usize {
+            let this_len = st.symbols[i].length();
+            out_buf[*out_pos] = this_len as u8;
+            *out_pos += 1;
         }
         Ok(())
     }
@@ -901,8 +886,8 @@ impl FsstEncoder {
 
 // use a struct so we can have many implementations based on cpu type
 struct FsstDecoder {
-    len_histo: [u8; 8],
-    symbols: [Symbol; 256],
+    lens: [u8; 256],
+    symbols: [u64; 256],
     decoder_switch: bool,
 }
 
@@ -911,8 +896,8 @@ impl FsstDecoder {
     fn new() -> Self {
         let s = Symbol::new();
         Self {
-            len_histo: [0; 8],
-            symbols: [s; 256],
+            lens: [0; 256],
+            symbols: [FSST_CORRUPT; 256],
             decoder_switch: false,
         }
     }
@@ -931,27 +916,16 @@ impl FsstDecoder {
         if st_info & FSST_MAGIC != FSST_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "the input buffer is not a valid FSST compressed data"));
         }
+        let symbol_num = (st_info & 255) as u8;
         *in_pos += 8;
-        let mut len_histo = [0; 8];
-        len_histo.copy_from_slice(&in_buf[*in_pos..*in_pos + 8]);
-        let mut symbols = [Symbol::new(); 256];
-        *in_pos += len_histo.len();
-        let mut code = 0;
-        for i in [2, 3, 4, 5, 6, 7, 8, 1] {
-            let this_len_histo = len_histo[i - 1];
-            for _ in 0..this_len_histo {
-                symbols[code].val = fsst_unaligned_load_unchecked(in_buf[*in_pos..].as_ptr());
-                *in_pos += 8;
-                symbols[code].icl = fsst_unaligned_load_unchecked(in_buf[*in_pos..].as_ptr());
-                *in_pos += 8;
-                code += 1;
-            }
+        for i in 0..symbol_num as usize {
+            self.symbols[i] = fsst_unaligned_load_unchecked(in_buf[*in_pos..].as_ptr());
+            *in_pos += 8;
         }
-        for curr_code in code..256 {
-            symbols[curr_code].val = FSST_CORRUPT;
+        for i in 0..symbol_num as usize {
+            self.lens[i] = in_buf[*in_pos];
+            *in_pos += 1;
         }
-        self.len_histo = len_histo;
-        self.symbols = symbols;
         Ok(())
     }
 
@@ -969,7 +943,7 @@ impl FsstDecoder {
 
         let mut out_pos = 0;
         let mut out_offsets_len = 0;
-        decompress_bulk2(&self.symbols, in_buf, in_offsets_buf, &mut in_pos, out_buf, out_offsets_buf, &mut out_pos, &mut out_offsets_len)?;
+        decompress_bulk2(&self.symbols, &self.lens, in_buf, in_offsets_buf, &mut in_pos, out_buf, out_offsets_buf, &mut out_pos, &mut out_offsets_len)?;
         Ok(())
     }
 }
