@@ -686,7 +686,7 @@ pub fn compute_partitions<T: Float + L2 + Dot + Sync>(
     vectors
         .par_chunks(dimension)
         .map(|vec| {
-            argmin_value(match distance_type {
+            argmin_value_float(match distance_type {
                 DistanceType::L2 => l2_distance_batch(vec, centroids, dimension),
                 DistanceType::Dot => dot_distance_batch(vec, centroids, dimension),
                 _ => {
