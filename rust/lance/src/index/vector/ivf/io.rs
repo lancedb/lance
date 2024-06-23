@@ -15,6 +15,7 @@ use futures::stream::Peekable;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
+use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::Error;
 use lance_file::reader::FileReader;
@@ -45,10 +46,10 @@ use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
+use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
 use crate::index::vector::sq::build_sq_storage;
 use crate::Result;
-use crate::{dataset::ROW_ID, Dataset};
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 lazy_static::lazy_static! {
@@ -246,9 +247,9 @@ pub(super) async fn write_pq_partitions(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write_hnsw_quantization_index_partitions(
-    dataset: &Dataset,
+    dataset: Arc<dyn DatasetTakeRows>,
     column: &str,
-    metric_type: MetricType,
+    distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     writer: &mut FileWriter<ManifestDescribing>,
     mut auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
@@ -257,8 +258,6 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<(Vec<HnswMetadata>, IvfData)> {
-    let dataset = Arc::new(dataset.clone());
-    let column = Arc::new(column.to_owned());
     let hnsw_params = Arc::new(hnsw_params.clone());
 
     let mut streams_heap = BinaryHeap::new();
@@ -360,7 +359,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         };
 
         let dataset = dataset.clone();
-        let column = column.clone();
+        let column = column.to_owned();
         let hnsw_params = hnsw_params.clone();
         let quantizer = quantizer.clone();
         let sem = sem.clone();
@@ -370,8 +369,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             log::debug!("Building HNSW partition {}", part_id);
             let result = build_hnsw_quantization_partition(
                 dataset,
-                column,
-                metric_type,
+                &column,
+                distance_type,
                 hnsw_params,
                 part_writer,
                 aux_part_writer,
@@ -450,8 +449,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
 #[allow(clippy::too_many_arguments)]
 async fn build_hnsw_quantization_partition(
-    dataset: Arc<Dataset>,
-    column: Arc<String>,
+    dataset: Arc<dyn DatasetTakeRows>,
+    column: &str,
     metric_type: MetricType,
     hnsw_params: Arc<HnswBuildParams>,
     writer: FileWriter<ManifestDescribing>,
@@ -465,7 +464,7 @@ async fn build_hnsw_quantization_partition(
     std::mem::drop(row_ids_array);
     let num_rows = row_ids.len();
 
-    let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
+    let projection = Arc::new(dataset.schema().project(&[column])?);
     let mut vectors = dataset
         .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
         .await?
@@ -481,7 +480,8 @@ async fn build_hnsw_quantization_partition(
         metric_type = MetricType::L2;
     }
 
-    let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), vectors.clone(), writer);
+    let build_hnsw =
+        build_and_write_hnsw(vectors.clone(), (*hnsw_params).clone(), metric_type, writer);
 
     let build_store = match quantizer {
         Quantizer::Flat(_) => {
@@ -507,16 +507,23 @@ async fn build_hnsw_quantization_partition(
         )),
     };
 
-    futures::join!(build_hnsw, build_store).0?;
+    let index_rows = futures::join!(build_hnsw, build_store).0?;
+    assert!(
+        index_rows >= num_rows,
+        "index rows {} must be greater than or equal to num rows {}",
+        index_rows,
+        num_rows
+    );
     Ok(num_rows)
 }
 
 async fn build_and_write_hnsw(
-    params: HnswBuildParams,
     vectors: Arc<dyn Array>,
+    params: HnswBuildParams,
+    distance_type: DistanceType,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
-    let batch = params.build(vectors).await?.to_batch()?;
+    let batch = params.build(vectors, distance_type).await?.to_batch()?;
     let metadata = batch.schema_ref().metadata().clone();
     writer.write_record_batch(batch).await?;
     writer.finish_with_metadata(&metadata).await
@@ -565,6 +572,7 @@ mod tests {
     use super::*;
 
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
+    use crate::Dataset;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
     use lance_index::IndexType;

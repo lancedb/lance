@@ -575,8 +575,7 @@ impl EncodedBatchWriteExt for EncodedBatch {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::types::Float64Type;
-    use arrow_array::RecordBatchReader;
+    use arrow_array::{types::Float64Type, RecordBatchReader};
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;

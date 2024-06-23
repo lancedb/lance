@@ -18,7 +18,10 @@ use crate::{
             binary::BinaryFieldEncoder, list::ListFieldEncoder, primitive::PrimitiveFieldEncoder,
             r#struct::StructFieldEncoder,
         },
-        physical::{basic::BasicEncoder, fixed_size_list::FslEncoder, value::ValueEncoder},
+        physical::{
+            basic::BasicEncoder, binary::BinaryEncoder, fixed_size_list::FslEncoder,
+            value::ValueEncoder,
+        },
     },
     format::pb,
 };
@@ -225,6 +228,11 @@ fn get_compression_scheme() -> CompressionScheme {
     parse_compression_scheme(&compression_scheme).unwrap_or(CompressionScheme::None)
 }
 
+pub fn get_str_encoding_type() -> bool {
+    let str_encoding = std::env::var("LANCE_STR_ARRAY_ENCODING").unwrap_or("none".to_string());
+    matches!(str_encoding.as_str(), "binary")
+}
+
 impl CoreArrayEncodingStrategy {
     fn array_encoder_from_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
@@ -233,6 +241,21 @@ impl CoreArrayEncodingStrategy {
                     Self::array_encoder_from_type(inner.data_type())?,
                     *dimension as u32,
                 )))))
+            }
+            DataType::Utf8 => {
+                if get_str_encoding_type() {
+                    let bin_indices_encoder = Self::array_encoder_from_type(&DataType::UInt64)?;
+                    let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8)?;
+
+                    Ok(Box::new(BinaryEncoder::new(
+                        bin_indices_encoder,
+                        bin_bytes_encoder,
+                    )))
+                } else {
+                    Ok(Box::new(BasicEncoder::new(Box::new(
+                        ValueEncoder::try_new(data_type, get_compression_scheme())?,
+                    ))))
+                }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::try_new(data_type, get_compression_scheme())?,
@@ -352,6 +375,24 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                 self.array_encoding_strategy.clone(),
                 column_index.next_column_index(field.id),
             )?)),
+            DataType::Utf8 => {
+                if get_str_encoding_type() {
+                    Ok(Box::new(PrimitiveFieldEncoder::try_new(
+                        cache_bytes_per_column,
+                        keep_original_array,
+                        self.array_encoding_strategy.clone(),
+                        column_index.next_column_index(field.id),
+                    )?))
+                } else {
+                    let list_idx = column_index.next_column_index(field.id);
+                    column_index.skip();
+                    Ok(Box::new(BinaryFieldEncoder::new(
+                        cache_bytes_per_column,
+                        keep_original_array,
+                        list_idx,
+                    )))
+                }
+            }
             DataType::List(child) => {
                 let list_idx = column_index.next_column_index(field.id);
                 let inner_encoding = encoding_strategy_root.create_field_encoder(
@@ -390,7 +431,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                     header_idx,
                 )))
             }
-            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
+            DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
                 let list_idx = column_index.next_column_index(field.id);
                 column_index.skip();
                 Ok(Box::new(BinaryFieldEncoder::new(

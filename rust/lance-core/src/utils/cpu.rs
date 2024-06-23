@@ -10,6 +10,8 @@ pub enum SimdSupport {
     Sse,
     Avx2,
     Avx512,
+    Lsx,
+    Lasx,
 }
 
 lazy_static! {
@@ -29,6 +31,16 @@ lazy_static! {
                 SimdSupport::Avx512
             } else if is_x86_feature_detected!("avx2") {
                 SimdSupport::Avx2
+            } else {
+                SimdSupport::None
+            }
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            if loongarch64::has_lasx_support() {
+                SimdSupport::Lasx
+            } else if loongarch64::has_lsx_support() {
+                SimdSupport::Lsx
             } else {
                 SimdSupport::None
             }
@@ -77,5 +89,19 @@ mod aarch64 {
         // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/aarch64/mod.rs#L533
         let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
         flags & libc::HWCAP_FPHP != 0
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+mod loongarch64 {
+    pub fn has_lsx_support() -> bool {
+        // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/loongarch64/mod.rs#L263
+        let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
+        flags & libc::HWCAP_LOONGARCH_LSX != 0
+    }
+    pub fn has_lasx_support() -> bool {
+        // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/loongarch64/mod.rs#L264
+        let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
+        flags & libc::HWCAP_LOONGARCH_LASX != 0
     }
 }

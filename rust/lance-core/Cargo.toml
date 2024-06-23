@@ -43,7 +43,7 @@ url.workspace = true
 
 # This is used to detect CPU features at runtime.
 # See src/utils/cpu.rs
-[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
+[target.'cfg(all(any(target_arch = "aarch64", target_arch = "loongarch64"), target_os = "linux"))'.dependencies]
 libc = { version = "0.2" }
 
 [dev-dependencies]

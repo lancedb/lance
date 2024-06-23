@@ -17,7 +17,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
@@ -35,7 +35,6 @@ use super::{distance::build_distance_table_l2, num_centroids, ProductQuantizerIm
 use crate::{
     pb,
     vector::{
-        ivf::storage::IvfData,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         storage::{DistCalculator, VectorStore},
@@ -94,38 +93,6 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
         metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
         Ok(metadata)
     }
-}
-
-/// Write partition of PQ storage to disk.
-#[allow(dead_code)]
-pub async fn write_parted_product_quantizations(
-    object_store: &ObjectStore,
-    path: &Path,
-    partitions: Box<dyn Iterator<Item = ProductQuantizationStorage>>,
-) -> Result<()> {
-    let mut peek = partitions.peekable();
-    let first = peek.peek().ok_or(Error::Index {
-        message: "No partitions to write".to_string(),
-        location: location!(),
-    })?;
-    let schema = first.schema();
-    let lance_schema = Schema::try_from(schema.as_ref())?;
-    let mut writer = FileWriter::<ManifestDescribing>::try_new(
-        object_store,
-        path,
-        lance_schema,
-        &Default::default(), // TODO: support writer options.
-    )
-    .await?;
-
-    let mut ivf_data = IvfData::empty();
-    for storage in peek {
-        let num_rows = storage.write_partition(&mut writer).await?;
-        ivf_data.add_partition(num_rows as u32);
-    }
-    ivf_data.write(&mut writer).await?;
-
-    Ok(())
 }
 
 /// Product Quantization Storage
@@ -602,6 +569,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::datatypes::Schema;
     use lance_core::ROW_ID_FIELD;
 
     const DIM: usize = 32;

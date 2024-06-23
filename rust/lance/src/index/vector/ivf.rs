@@ -25,7 +25,7 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::{datatypes::Field, Error, Result, ROW_ID_FIELD};
+use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
 use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
@@ -251,7 +251,7 @@ impl std::fmt::Debug for IVFIndex {
 ///
 /// Returns (new_uuid, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
-    dataset: &Dataset,
+    dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
@@ -304,7 +304,7 @@ pub(crate) async fn optimize_vector_indices(
             .child(INDEX_AUXILIARY_FILE_NAME);
         let aux_writer = object_store.create(&aux_file).await?;
         optimize_ivf_hnsw_indices(
-            dataset,
+            Arc::new(dataset),
             first_idx,
             hnsw_sq,
             vector_column,
@@ -408,7 +408,7 @@ async fn optimize_ivf_pq_indices(
 
 #[allow(clippy::too_many_arguments)]
 async fn optimize_ivf_hnsw_indices<Q: Quantization>(
-    dataset: &Dataset,
+    dataset: Arc<dyn DatasetTakeRows>,
     first_idx: &IVFIndex,
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
@@ -1576,7 +1576,7 @@ async fn write_ivf_hnsw_file(
     let num_partitions = ivf.num_partitions() as u32;
 
     let (hnsw_metadata, aux_ivf) = builder::build_hnsw_partitions(
-        dataset,
+        Arc::new(dataset.clone()),
         &mut writer,
         Some(&mut aux_writer),
         stream,
@@ -2574,8 +2574,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_create_ivf_hnsw_sq() {
+    async fn test_create_ivf_hnsw_sq(distance_type: DistanceType, expected_recall: f32) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2586,7 +2585,7 @@ mod tests {
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::Cosine,
+            distance_type,
             ivf_params,
             hnsw_params,
             sq_params,
@@ -2635,19 +2634,29 @@ mod tests {
             .to_vec();
 
         let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, DistanceType::Cosine);
+        let gt = ground_truth(&mat, query.values(), k, distance_type);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 0.9,
+            recall >= expected_recall,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,
             gt,
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq_cosine() {
+        test_create_ivf_hnsw_sq(DistanceType::Cosine, 0.9).await
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq_dot() {
+        test_create_ivf_hnsw_sq(DistanceType::Dot, 0.8).await
     }
 
     #[tokio::test]
@@ -2725,7 +2734,7 @@ mod tests {
 
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 0.7,
+            recall >= 0.9,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,
