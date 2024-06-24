@@ -6,15 +6,17 @@ use std::{fmt::Debug, ops::Range, sync::Arc};
 use arrow_array::{
     new_null_array,
     types::{
-        ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
+        ArrowPrimitiveType, ByteArrayType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
         DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
-        DurationSecondType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-        Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType,
-        Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
-        TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-        TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        DurationSecondType, Float16Type, Float32Type, Float64Type, GenericBinaryType,
+        GenericStringType, Int16Type, Int32Type, Int64Type, Int8Type, IntervalDayTimeType,
+        IntervalMonthDayNanoType, IntervalYearMonthType, Time32MillisecondType, Time32SecondType,
+        Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
+        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
+        UInt32Type, UInt64Type, UInt8Type,
     },
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray, StringArray,
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, GenericByteArray,
+    PrimitiveArray,
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
@@ -67,14 +69,15 @@ impl PrimitiveFieldScheduler {
                     column_buffers: buffers,
                     positions_and_sizes: &page.buffer_offsets_and_sizes,
                 };
-                let scheduler = decoder_from_array_encoding(&page.encoding, &page_buffers);
+                let scheduler =
+                    decoder_from_array_encoding(&page.encoding, &page_buffers, &data_type);
                 PrimitivePage {
                     scheduler,
                     num_rows: page.num_rows,
                 }
             })
             .collect::<Vec<_>>();
-        let num_rows = page_schedulers.iter().map(|p| p.num_rows as u64).sum();
+        let num_rows = page_schedulers.iter().map(|p| p.num_rows).sum();
         Self {
             data_type,
             page_schedulers,
@@ -124,8 +127,8 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
             cur_page.num_rows
         );
         // Skip entire pages until we have some overlap with our next range
-        while cur_page.num_rows as u64 + self.global_row_offset <= range.start {
-            self.global_row_offset += cur_page.num_rows as u64;
+        while cur_page.num_rows + self.global_row_offset <= range.start {
+            self.global_row_offset += cur_page.num_rows;
             self.page_idx += 1;
             trace!("Skipping entire page of {} rows", cur_page.num_rows);
             cur_page = &self.scheduler.page_schedulers[self.page_idx];
@@ -135,12 +138,12 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
         // until we find a range that exceeds the current page
 
         let mut ranges_in_page = Vec::new();
-        while cur_page.num_rows as u64 + self.global_row_offset > range.start {
+        while cur_page.num_rows + self.global_row_offset > range.start {
             range.start = range.start.max(self.global_row_offset);
             let start_in_page = range.start - self.global_row_offset;
             let end_in_page = start_in_page + (range.end - range.start);
-            let end_in_page = end_in_page.min(cur_page.num_rows as u64);
-            let last_in_range = (end_in_page as u64 + self.global_row_offset) >= range.end;
+            let end_in_page = end_in_page.min(cur_page.num_rows);
+            let last_in_range = (end_in_page + self.global_row_offset) >= range.end;
 
             ranges_in_page.push(start_in_page..end_in_page);
             if last_in_range {
@@ -162,7 +165,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
             cur_page.num_rows
         );
 
-        self.global_row_offset += cur_page.num_rows as u64;
+        self.global_row_offset += cur_page.num_rows;
         self.page_idx += 1;
 
         let physical_decoder =
@@ -300,6 +303,49 @@ impl PrimitiveFieldDecodeTask {
         Arc::new(
             PrimitiveArray::<T>::new(data_buffer, null_buffer).with_data_type(data_type.clone()),
         )
+    }
+
+    fn new_generic_byte_array<T: ByteArrayType>(buffers: Vec<BytesMut>, num_rows: u64) -> ArrayRef {
+        // iterate over buffers to get offsets and then bytes
+        let mut buffer_iter = buffers.into_iter();
+
+        let null_buffer = buffer_iter.next().unwrap();
+        let null_buffer = if null_buffer.is_empty() {
+            None
+        } else {
+            let null_buffer = null_buffer.freeze().into();
+            Some(NullBuffer::new(BooleanBuffer::new(
+                Buffer::from_bytes(null_buffer),
+                0,
+                num_rows as usize,
+            )))
+        };
+
+        let indices_bytes = buffer_iter.next().unwrap().freeze();
+        let indices_buffer = Buffer::from_bytes(indices_bytes.into());
+        let indices_buffer =
+            ScalarBuffer::<T::Offset>::new(indices_buffer, 0, num_rows as usize + 1);
+
+        let offsets = OffsetBuffer::new(indices_buffer.clone());
+
+        // TODO - add NULL support
+        // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
+        buffer_iter.next().unwrap();
+
+        let bytes_buffer = buffer_iter.next().unwrap().freeze();
+        let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
+        let bytes_buffer_len = bytes_buffer.len();
+        let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
+
+        let bytes_array = Arc::new(
+            PrimitiveArray::<UInt8Type>::new(bytes_buffer, None).with_data_type(DataType::UInt8),
+        );
+
+        Arc::new(GenericByteArray::<T>::new(
+            offsets,
+            bytes_array.values().into(),
+            null_buffer,
+        ))
     }
 
     fn bytes_to_validity(bytes: BytesMut, num_rows: u64) -> Option<NullBuffer> {
@@ -472,49 +518,18 @@ impl PrimitiveFieldDecodeTask {
                     fsl_nulls,
                 )))
             }
-            DataType::Utf8 => {
-                // iterate over buffers to get offsets and then bytes
-                let mut buffer_iter = buffers.into_iter();
-
-                let null_buffer = buffer_iter.next().unwrap();
-                let null_buffer = if null_buffer.is_empty() {
-                    None
-                } else {
-                    let null_buffer = null_buffer.freeze().into();
-                    Some(NullBuffer::new(BooleanBuffer::new(
-                        Buffer::from_bytes(null_buffer),
-                        0,
-                        num_rows as usize,
-                    )))
-                };
-
-                let indices_bytes = buffer_iter.next().unwrap().freeze();
-                let indices_buffer = Buffer::from_bytes(indices_bytes.into());
-                let indices_buffer =
-                    ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
-
-                let offsets = OffsetBuffer::new(indices_buffer.clone());
-
-                // TODO - add NULL support
-                // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
-                buffer_iter.next().unwrap();
-
-                let bytes_buffer = buffer_iter.next().unwrap().freeze();
-                let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
-                let bytes_buffer_len = bytes_buffer.len();
-                let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
-
-                let bytes_array = Arc::new(
-                    PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
-                        .with_data_type(DataType::UInt8),
-                );
-
-                Ok(Arc::new(StringArray::new(
-                    offsets,
-                    bytes_array.values().into(),
-                    null_buffer,
-                )))
-            }
+            DataType::Utf8 => Ok(Self::new_generic_byte_array::<GenericStringType<i32>>(
+                buffers, num_rows,
+            )),
+            DataType::LargeUtf8 => Ok(Self::new_generic_byte_array::<GenericStringType<i64>>(
+                buffers, num_rows,
+            )),
+            DataType::Binary => Ok(Self::new_generic_byte_array::<GenericBinaryType<i32>>(
+                buffers, num_rows,
+            )),
+            DataType::LargeBinary => Ok(Self::new_generic_byte_array::<GenericBinaryType<i64>>(
+                buffers, num_rows,
+            )),
             _ => Err(Error::io(
                 format!(
                     "The data type {} cannot be decoded from a primitive encoding",

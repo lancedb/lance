@@ -43,9 +43,9 @@ impl PageScheduler for DenseBitmapScheduler {
             .iter()
             .map(|range| {
                 debug_assert_ne!(range.start, range.end);
-                let start = self.buffer_offset + range.start as u64 / 8;
+                let start = self.buffer_offset + range.start / 8;
                 let bit_offset = range.start % 8;
-                let end = self.buffer_offset + range.end.div_ceil(8) as u64;
+                let end = self.buffer_offset + range.end.div_ceil(8);
                 let byte_range = start..end;
                 min = min.min(start);
                 max = max.max(end);

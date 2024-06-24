@@ -222,6 +222,7 @@ use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, FuturesOrdered};
 use futures::{FutureExt, StreamExt, TryStreamExt};
+use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
 use log::trace;
 use snafu::{location, Location};
@@ -231,7 +232,6 @@ use lance_core::{Error, Result};
 use tracing::instrument;
 
 use crate::encoder::{values_column_encoding, EncodedBatch};
-use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
 use crate::encodings::logical::primitive::PrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
@@ -549,15 +549,12 @@ impl CoreFieldDecoderStrategy {
     }
 
     fn is_primitive(data_type: &DataType) -> bool {
-        if data_type.is_primitive() {
+        if data_type.is_primitive() | data_type.is_binary_like() {
             true
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean
-                | DataType::Null
-                | DataType::FixedSizeBinary(_)
-                | DataType::Utf8 => true,
+                DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
                 DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
                 _ => false,
             }
@@ -699,28 +696,6 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 .boxed();
                 Ok((chain, list_scheduler_fut))
             }
-            DataType::Utf8 | DataType::Binary | DataType::LargeBinary | DataType::LargeUtf8 => {
-                let list_type = if matches!(data_type, DataType::Utf8 | DataType::Binary) {
-                    DataType::List(Arc::new(ArrowField::new("item", DataType::UInt8, true)))
-                } else {
-                    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::UInt8, true)))
-                };
-                let list_field = ArrowField::new(&field.name, list_type, true);
-                let list_field = Field::try_from(&list_field).unwrap();
-                // We've changed the data type but are still decoding the same "field"
-                let (chain, list_decoder) =
-                    chain.restart_at_current(&list_field, column_infos, buffers)?;
-                let data_type = data_type.clone();
-                let binary_scheduler_fut = async move {
-                    let list_decoder = list_decoder.await?;
-                    Ok(
-                        Arc::new(BinaryFieldScheduler::new(list_decoder, data_type.clone()))
-                            as Arc<dyn FieldScheduler>,
-                    )
-                }
-                .boxed();
-                Ok((chain, binary_scheduler_fut))
-            }
             DataType::Struct(fields) => {
                 let column_info = column_infos.pop_front().unwrap();
                 Self::check_simple_struct(&column_info, chain.current_path()).unwrap();
@@ -849,8 +824,8 @@ impl DecodeBatchScheduler {
                 return;
             }
             let next_scan_line = maybe_next_scan_line.unwrap();
-            num_rows_scheduled += next_scan_line.rows_scheduled as u64;
-            rows_to_schedule -= next_scan_line.rows_scheduled as u64;
+            num_rows_scheduled += next_scan_line.rows_scheduled;
+            rows_to_schedule -= next_scan_line.rows_scheduled;
             trace!(
                 "Scheduled scan line of {} rows and {} decoders",
                 next_scan_line.rows_scheduled,
@@ -1072,15 +1047,15 @@ impl BatchDecodeStream {
 
         let avail = self.root_decoder.avail();
         trace!("Top level page has {} rows already available", avail);
-        if avail < to_take as u64 {
+        if avail < to_take {
             trace!(
                 "Top level page waiting for an additional {} rows",
-                to_take as u64 - avail
+                to_take - avail
             );
             self.root_decoder.wait(to_take).await?;
         }
         let next_task = self.root_decoder.drain(to_take)?;
-        self.rows_drained += to_take as u64;
+        self.rows_drained += to_take;
         Ok(Some(next_task))
     }
 

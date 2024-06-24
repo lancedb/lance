@@ -91,8 +91,8 @@ impl PageScheduler for ValuePageScheduler {
             ranges
                 .iter()
                 .map(|range| {
-                    let start = self.buffer_offset + (range.start as u64 * self.bytes_per_value);
-                    let end = self.buffer_offset + (range.end as u64 * self.bytes_per_value);
+                    let start = self.buffer_offset + (range.start * self.bytes_per_value);
+                    let end = self.buffer_offset + (range.end * self.bytes_per_value);
                     min = min.min(start);
                     max = max.max(end);
                     start..end
@@ -122,8 +122,8 @@ impl PageScheduler for ValuePageScheduler {
             ranges
                 .iter()
                 .map(|range| {
-                    let start = (range.start as u64 * bytes_per_value) as usize;
-                    let end = (range.end as u64 * bytes_per_value) as usize;
+                    let start = (range.start * bytes_per_value) as usize;
+                    let end = (range.end * bytes_per_value) as usize;
                     start..end
                 })
                 .collect::<Vec<_>>()
@@ -210,12 +210,10 @@ impl PrimitivePageDecoder for ValuePageDecoder {
         num_rows: u64,
         _all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
-        let num_bytes = self.bytes_per_value * num_rows as u64;
-
         let mut bytes_to_skip = rows_to_skip as u64 * self.bytes_per_value;
         let mut bytes_to_take = num_rows as u64 * self.bytes_per_value;
 
-        let mut dest_buffers = vec![BytesMut::with_capacity(num_bytes as usize)];
+        let mut dest_buffers = vec![BytesMut::with_capacity(bytes_to_take as usize)];
 
         let dest = &mut dest_buffers[0];
 

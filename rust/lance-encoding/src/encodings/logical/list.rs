@@ -97,9 +97,9 @@ impl ListRequestsIter {
             let mut range = range.clone();
 
             // Skip any offsets pages that are before the range
-            while offsets_offset + (cur_page_info.offsets_in_page as u64) <= range.start {
+            while offsets_offset + (cur_page_info.offsets_in_page) <= range.start {
                 trace!("Skipping null offset adjustment chunk {:?}", offsets_offset);
-                offsets_offset += cur_page_info.offsets_in_page as u64;
+                offsets_offset += cur_page_info.offsets_in_page;
                 items_offset += cur_page_info.num_items_referenced_by_page;
                 cur_page_info = page_infos_iter.next().unwrap();
             }
@@ -118,7 +118,7 @@ impl ListRequestsIter {
             while !range.is_empty() {
                 // The end of the list request is the min of the end of the range
                 // and the end of the current page
-                let end = offsets_offset + cur_page_info.offsets_in_page as u64;
+                let end = offsets_offset + cur_page_info.offsets_in_page;
                 let last = end >= range.end;
                 let end = end.min(range.end);
                 list_requests.push_back(ListRequest {
@@ -133,7 +133,7 @@ impl ListRequestsIter {
                 // If there is still more data in the range, we need to move to the
                 // next page
                 if !last {
-                    offsets_offset += cur_page_info.offsets_in_page as u64;
+                    offsets_offset += cur_page_info.offsets_in_page;
                     items_offset += cur_page_info.num_items_referenced_by_page;
                     cur_page_info = page_infos_iter.next().unwrap();
                 }
@@ -155,12 +155,12 @@ impl ListRequestsIter {
                 num_offsets -= 1;
                 debug_assert_ne!(num_offsets, 0);
             }
-            if num_offsets as u64 >= req.num_lists {
+            if num_offsets >= req.num_lists {
                 num_offsets -= req.num_lists;
                 list_requests.push(self.list_requests.pop_front().unwrap());
             } else {
                 let sub_req = ListRequest {
-                    num_lists: num_offsets as u64,
+                    num_lists: num_offsets,
                     includes_extra_offset: req.includes_extra_offset,
                     null_offset_adjustment: req.null_offset_adjustment,
                     items_offset: req.items_offset,
@@ -168,7 +168,7 @@ impl ListRequestsIter {
 
                 list_requests.push(sub_req);
                 req.includes_extra_offset = false;
-                req.num_lists -= num_offsets as u64;
+                req.num_lists -= num_offsets;
                 num_offsets = 0;
             }
         }
@@ -687,7 +687,7 @@ impl LogicalPageDecoder for ListPageDecoder {
                 );
                 items_needed = items_needed.saturating_sub(items_already_available);
                 if items_needed > 0 {
-                    self.item_decoder.as_mut().unwrap().wait_u64(items_needed).await?;
+                    self.item_decoder.as_mut().unwrap().wait(items_needed).await?;
                 }
             }
             // This is technically undercounting a little.  It's possible that we loaded a big items
@@ -745,7 +745,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         } else {
             self.item_decoder
                 .as_mut()
-                .map(|item_decoder| Result::Ok(item_decoder.drain_u64(num_items_to_drain)?.task))
+                .map(|item_decoder| Result::Ok(item_decoder.drain(num_items_to_drain)?.task))
                 .transpose()?
         };
 
