@@ -187,8 +187,7 @@ impl PrimitivePageDecoder for BasicPageDecoder {
             // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
             // other pages needed the buffer, in which case we need to fill our section
             DataNullStatus::All => {
-                let mut buffers = vec![BytesMut::default()];
-                buffers[0].fill(0);
+                let buffers = vec![BytesMut::default()];
                 *all_null = true;
                 buffers
             }

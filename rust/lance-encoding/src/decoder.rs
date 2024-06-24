@@ -1155,7 +1155,7 @@ pub trait PrimitivePageDecoder: Send + Sync {
     /// buffer.
     ///
     /// Encodings can have any number of input or output buffers.  For example, a dictionary
-    /// decoding will convert multiple two buffers (indices + dictionary) into a single buffer
+    /// decoding will convert two buffers (indices + dictionary) into a single buffer
     ///
     /// Binary decodings have two output buffers (one for values, one for offsets)
     ///
