@@ -24,6 +24,7 @@ jobs:
       - name: Build release
         run: |
           cargo build --release
+          pwd
       - uses: actions/upload-artifact@v4
         with:
           name: liblance_jni_darwin_aarch64.zip
