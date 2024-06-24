@@ -210,8 +210,8 @@ impl PrimitivePageDecoder for ValuePageDecoder {
         num_rows: u64,
         _all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
-        let mut bytes_to_skip = rows_to_skip as u64 * self.bytes_per_value;
-        let mut bytes_to_take = num_rows as u64 * self.bytes_per_value;
+        let mut bytes_to_skip = rows_to_skip * self.bytes_per_value;
+        let mut bytes_to_take = num_rows * self.bytes_per_value;
 
         let mut dest_buffers = vec![BytesMut::with_capacity(bytes_to_take as usize)];
 

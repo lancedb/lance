@@ -490,7 +490,7 @@ pub mod tests {
 
     use super::get_indices_from_string_arrays;
 
-    // #[test_log::test(tokio::test)]
+    #[test_log::test(tokio::test)]
     async fn test_utf8() {
         let field = Field::new("", DataType::Utf8, false);
         check_round_trip_encoding_random(field).await;
