@@ -916,6 +916,7 @@ mod tests {
     use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
+    use rstest::rstest;
     use tempfile::tempdir;
 
     use super::*;
@@ -1113,8 +1114,9 @@ mod tests {
         .unwrap()
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_compact_empty() {
+    async fn test_compact_empty(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1122,7 +1124,16 @@ mod tests {
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
 
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), Arc::new(schema));
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                use_legacy_format,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let plan = plan_compaction(&dataset, &CompactionOptions::default())
             .await
@@ -1137,8 +1148,9 @@ mod tests {
         assert_eq!(dataset.manifest.version, 1);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_compact_all_good() {
+    async fn test_compact_all_good(#[values(false, true)] use_legacy_format: bool) {
         // Compact a table with nothing to do
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -1148,6 +1160,7 @@ mod tests {
         // Just one file
         let write_params = WriteParams {
             max_rows_per_file: 10_000,
+            use_legacy_format,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1165,6 +1178,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 3_000,
             max_rows_per_group: 1_000,
+            use_legacy_format,
             mode: WriteMode::Overwrite,
             ..Default::default()
         };
@@ -1217,8 +1231,9 @@ mod tests {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_compact_many() {
+    async fn test_compact_many(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1228,6 +1243,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 1200))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 400,
+            use_legacy_format,
             ..Default::default()
         };
         Dataset::write(reader, test_uri, Some(write_params))
@@ -1238,6 +1254,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(1200, 2000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
+            use_legacy_format,
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -1255,6 +1272,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(3200, 600))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 300,
+            use_legacy_format,
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -1358,8 +1376,9 @@ mod tests {
         assert_eq!(fragment_ids, vec![3, 7, 8, 9, 10]);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_compact_data_files() {
+    async fn test_compact_data_files(#[values(false, true)] use_legacy_format: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1370,6 +1389,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 5_000,
             max_rows_per_group: 1_000,
+            use_legacy_format,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1439,8 +1459,9 @@ mod tests {
         assert_eq!(scanned_data, data);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_compact_deletions() {
+    async fn test_compact_deletions(#[values(false, true)] use_legacy_format: bool) {
         // For files that have few rows, we don't want to compact just 1 since
         // that won't do anything. But if there are deletions to materialize,
         // we want to do groups of 1. This test checks that.
@@ -1453,6 +1474,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 1000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
+            use_legacy_format,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1490,8 +1512,9 @@ mod tests {
         assert!(fragments[0].metadata.deletion_file.is_none());
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_compact_distributed() {
+    async fn test_compact_distributed(#[values(false, true)] use_legacy_format: bool) {
         // Can run the tasks independently
         // Can provide subset of tasks to commit_compaction
         // Once committed, can't commit remaining tasks
@@ -1504,6 +1527,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
+            use_legacy_format,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
