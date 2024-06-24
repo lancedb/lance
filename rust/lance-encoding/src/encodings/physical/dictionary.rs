@@ -4,21 +4,12 @@
 use core::panic;
 use std::sync::Arc;
 
-// use arrow_array::types::{UInt32Type, UInt64Type};
-// use arrow::compute::concat;
-use arrow_array::{
-    // builder::{ArrayBuilder, Int32Builder, UInt32Builder, UInt8Builder},
-    Array,
-    ArrayRef,
-    StringArray,
-    UInt64Array,
-};
-// use futures::stream::StreamExt;
+use arrow_array::types::UInt64Type;
+use arrow_array::{Array, ArrayRef, DictionaryArray, StringArray, UInt64Array};
 use futures::{future::BoxFuture, FutureExt};
-// use rand::seq::index;
 
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
     EncodingsIo,
@@ -28,15 +19,12 @@ use crate::decoder::LogicalPageDecoder;
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
 use arrow_schema::DataType;
+use bytes::BytesMut;
 use lance_core::Result;
 use std::collections::HashMap;
-// use std::ops::Deref;
-use bytes::BytesMut;
 
-// use crate::encodings::utils::new_primitive_array;
 use crate::encodings::utils::primitive_array_from_buffers;
-use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-// use crate::encodings::logical::primitive::PrimitiveFieldDecodeTask::primitive_array_from_buffers;
+use arrow_array::cast::AsArray;
 
 #[derive(Debug)]
 pub struct DictionaryPageScheduler {
@@ -65,7 +53,7 @@ impl PageScheduler for DictionaryPageScheduler {
         ranges: &[std::ops::Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         // Run schedule ranges on all indices together, decode all indices together.
         // we need to decode certain elements of the dictionary that are
         // present in distinct indices, i.e. distinct values from indices[a]...indices[b] and indices[c]...indices[d].
@@ -84,52 +72,39 @@ impl PageScheduler for DictionaryPageScheduler {
         // decoded indices 1, 0, 1, 3. We need dict[0], dict[1], dict[3] of the original dict.
         // The decoded dictionary will have 2 elements. We should process it sequentially -
 
+        // Schedule indices for decoding
+        let indices_page_decoder =
+            self.indices_scheduler
+                .schedule_ranges(ranges, scheduler, top_level_row);
+
         // Schedule items for decoding
         let items_page_decoder =
             self.items_scheduler
                 .schedule_ranges(&[0..self.size], scheduler, top_level_row);
 
-        let copy_scheduler = scheduler.clone();
-        let ranges = ranges.to_vec();
-        let copy_indices_scheduler = self.indices_scheduler.clone();
-        let copy_items_scheduler = self.items_scheduler.clone();
-        let copy_size = self.size.clone();
+        let copy_size = self.size;
 
         async move {
-            let items: Arc<dyn PhysicalPageDecoder> = Arc::from(items_page_decoder.await?);
+            let items_decoder: Arc<dyn PrimitivePageDecoder> = Arc::from(items_page_decoder.await?);
 
-            let mut primitive_wrapper =
-                PrimitiveFieldDecoder::new_from_data(items, DataType::Utf8, copy_size);
+            let mut primitive_wrapper = PrimitiveFieldDecoder::new_from_data(
+                items_decoder.clone(),
+                DataType::Utf8,
+                copy_size,
+            );
 
             // Decode all items
             let drained_task = primitive_wrapper.drain(copy_size)?;
             let items_decode_task = drained_task.task;
             let decoded_dict = items_decode_task.decode()?;
-            println!("Decoded dict: {:?}", decoded_dict);
 
-            // Schedule indices for decoding
-            let indices_page_decoder =
-                copy_indices_scheduler.schedule_ranges(&ranges, &copy_scheduler, top_level_row);
-
-            let indices_decoder: Box<dyn PhysicalPageDecoder> = indices_page_decoder.await?;
-
-            let copy_items_page_decoder = copy_items_scheduler.schedule_ranges(
-                &[0..copy_size],
-                &copy_scheduler,
-                top_level_row,
-            );
-            let items_decoder: Box<dyn PhysicalPageDecoder> = copy_items_page_decoder.await?;
-
-            let temp_indices_capacities = vec![(0, false); indices_decoder.num_buffers() as usize];
-            let temp_items_capacities = vec![(0, false); items_decoder.num_buffers() as usize];
+            let indices_decoder: Box<dyn PrimitivePageDecoder> = indices_page_decoder.await?;
 
             Ok(Box::new(DictionaryPageDecoder {
                 decoded_dict,
                 indices_decoder,
                 items_decoder,
-                // temp_indices_capacities,
-                // temp_items_capacities,
-            }) as Box<dyn PhysicalPageDecoder>)
+            }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
@@ -137,154 +112,49 @@ impl PageScheduler for DictionaryPageScheduler {
 
 struct DictionaryPageDecoder {
     decoded_dict: Arc<dyn Array>,
-    indices_decoder: Box<dyn PhysicalPageDecoder>,
-    items_decoder: Box<dyn PhysicalPageDecoder>,
-    // temp_indices_capacities: Vec<(u64, bool)>,
-    // temp_items_capacities: Vec<(u64, bool)>,
+    indices_decoder: Box<dyn PrimitivePageDecoder>,
+    items_decoder: Arc<dyn PrimitivePageDecoder>,
 }
 
-impl PhysicalPageDecoder for DictionaryPageDecoder {
-    fn update_capacity(
+impl PrimitivePageDecoder for DictionaryPageDecoder {
+    fn decode(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
-        buffers: &mut [(u64, bool)],
         all_null: &mut bool,
-    ) {
-        let mut temp_indices_capacities =
-            vec![(0, false); self.indices_decoder.num_buffers() as usize];
-        let mut temp_items_capacities = vec![(0, false); self.items_decoder.num_buffers() as usize];
+    ) -> Result<Vec<BytesMut>> {
+        // decode the indices
+        let indices_buffers = self
+            .indices_decoder
+            .decode(rows_to_skip, num_rows, all_null)?;
+        let indices_array =
+            primitive_array_from_buffers(&DataType::UInt64, indices_buffers.clone(), num_rows)?;
+        let indices_array = indices_array.as_primitive::<UInt64Type>().clone();
 
-        // Allocate capacity for all indices
-        self.indices_decoder.update_capacity(
-            rows_to_skip,
-            num_rows,
-            &mut temp_indices_capacities,
-            all_null,
-        );
+        let dictionary = self.decoded_dict.clone();
 
-        let dictionary = self
-            .decoded_dict
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let dict_array = DictionaryArray::<UInt64Type>::try_new(indices_array, dictionary).unwrap();
+        let str_array = arrow_cast::cast(&dict_array, &DataType::Utf8).unwrap();
+        let string_arr = str_array.as_any().downcast_ref::<StringArray>().unwrap();
 
-        let dict_bytes = dictionary.values().as_slice().len();
-        println!("Dict bytes: {:?}", dict_bytes);
+        let (offsets, bytes, nulls) = string_arr.clone().into_parts();
 
-        // Allocate capacity for dictionary
-        self.items_decoder.update_capacity(
-            0,
-            self.decoded_dict.len() as u32,
-            &mut temp_items_capacities,
-            all_null,
-        );
+        let offsets = offsets.inner().inner().as_slice();
+        let bytes = bytes.as_slice();
 
-        for i in 0..2 {
-            println!(
-                "Capacity of decoded indices buffer {}: {:?}",
-                i, temp_indices_capacities[i].0
-            )
-        }
+        let final_nulls = nulls.map_or(BytesMut::default(), |nb| {
+            let nulls = nb.buffer().as_slice();
+            BytesMut::from(nulls)
+        });
 
-        for j in 0..3 {
-            println!(
-                "Capacity of decoded dict buffer {}: {:?}",
-                j, temp_items_capacities[j].0
-            )
-        }
+        let final_offsets = BytesMut::from(offsets);
+        let final_bytes = BytesMut::from(bytes);
 
-        // let mut temp_indices_buffers = temp_indices_capacities
-        //     .into_iter()
-        //     .map(|(num_bytes, is_needed)| {
-        //         // Only allocate the validity buffer if it is needed, otherwise we
-        //         // create an empty BytesMut (does not require allocation)
-        //         if is_needed {
-        //             BytesMut::with_capacity(num_bytes as usize)
-        //         } else {
-        //             BytesMut::default()
-        //         }
-        //     })
-        //     .collect::<Vec<_>>();
-
-        // let mut temp_items_buffers = temp_indices_capacities
-        //     .into_iter()
-        //     .map(|(num_bytes, is_needed)| {
-        //         // Only allocate the validity buffer if it is needed, otherwise we
-        //         // create an empty BytesMut (does not require allocation)
-        //         if is_needed {
-        //             BytesMut::with_capacity(num_bytes as usize)
-        //         } else {
-        //             BytesMut::default()
-        //         }
-        //     })
-        //     .collect::<Vec<_>>();
-
-        // self.indices_decoder
-        //     .decode_into(rows_to_skip, num_rows, &mut temp_indices_buffers)?;
-
-        // Update capacity of destination buffers
-        // self.items_decoder.update_capacity(
-        //     rows_to_skip,
-        //     num_rows,
-        //     buffers,
-        //     all_null,
-        // );
-
-        // println!("Capacity of dest buffer 0: {:?}", buffers[0].0);
-        // println!("Capacity of dest buffer 1: {:?}", buffers[1].0);
-        // println!("Capacity of dest buffer 2: {:?}", buffers[2].0);
-    }
-
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [bytes::BytesMut],
-    ) -> Result<()> {
-        // self.indices_decoder
-        //     .decode_into(rows_to_skip, num_rows, &mut temp_indices_buffers)?;
-
-        // println!("Length of decoded indices: {:?}", dest_buffers[4].len());
-        // println!(
-        //     "Capacity of decoded indices: {:?}",
-        // dest_buffers[4].capacity()
-        // );
-
-        // self.items_decoder.decode_into(
-        //     0,
-        //     self.decoded_dict.len() as u32,
-        //     &mut buffers[2..],
-        //     &mut [],
-        // )?;
-
-        // let indices_array = primitive_array_from_buffers(
-        //     &DataType::UInt64,
-        //     temp_indices_buffers,
-        //     self.decoded_dict.len() as u32,
-        // );
-
-        // println!("Indices array: {:?}", indices_array);
-
-        // let items_array = primitive_array_from_buffers(
-        //     &DataType::Utf8,
-        //     &temp_buffers[2..],
-        //     self.decoded_dict.len() as u32,
-        // );
-
-        // println!("Buffer 0 contents: {:?}", dest_buffers[0].as_ref());
-        // println!("Buffer 1 contents: {:?}", dest_buffers[1].as_ref());
-        // println!("Buffer 2 contents: {:?}", dest_buffers[2].as_ref());
-        // println!("Buffer 3 contents: {:?}", dest_buffers[3].as_ref());
-        // println!("Buffer 4 contents: {:?}", dest_buffers[4].as_ref());
-
-        // build temp buffers
-
-        Ok(())
+        Ok(vec![final_offsets, final_nulls, final_bytes])
     }
 
     fn num_buffers(&self) -> u32 {
-        self.items_decoder.num_buffers() // 3
+        self.items_decoder.num_buffers()
     }
 }
 
@@ -306,47 +176,6 @@ impl DictionaryEncoder {
     }
 }
 
-// Creates indices arrays from string arrays
-// Strings are a vector of arrays corresponding to each record batch
-// Zero offset is removed from the start of the offsets array
-// The indices array is computed across all arrays in the vector
-// fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
-//     let mut indices_builder = Int32Builder::new();
-//     let mut last_offset = 0;
-//     arrays.iter().for_each(|arr| {
-//         let string_arr = arrow_array::cast::as_string_array(arr);
-//         let offsets = string_arr.offsets().inner();
-//         let mut offsets = offsets.slice(1, offsets.len() - 1).to_vec();
-
-//         if indices_builder.len() == 0 {
-//             last_offset = offsets[offsets.len() - 1];
-//         } else {
-//             offsets = offsets
-//                 .iter()
-//                 .map(|offset| offset + last_offset)
-//                 .collect::<Vec<i32>>();
-//             last_offset = offsets[offsets.len() - 1];
-//         }
-
-//         let new_int_arr = Int32Array::from(offsets);
-//         indices_builder.append_slice(new_int_arr.values());
-//     });
-
-//     Arc::new(indices_builder.finish()) as ArrayRef
-// }
-
-// Bytes computed across all string arrays, similar to indices above
-// fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
-//     let mut bytes_builder = UInt8Builder::new();
-//     arrays.iter().for_each(|arr| {
-//         let string_arr = arrow_array::cast::as_string_array(arr);
-//         let values = string_arr.values();
-//         bytes_builder.append_slice(values);
-//     });
-
-//     Arc::new(bytes_builder.finish()) as ArrayRef
-// }
-
 fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
     let mut arr_hashmap: HashMap<&str, u64> = HashMap::new();
     let mut curr_dict_index = 0;
@@ -359,7 +188,7 @@ fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
             let st = string_array.value(i);
 
             if arr_hashmap.contains_key(st) {
-                dict_indices.push(arr_hashmap.get(st).unwrap().clone());
+                dict_indices.push(*arr_hashmap.get(st).unwrap());
             } else {
                 // insert into hashmap
                 arr_hashmap.insert(string_array.value(i), curr_dict_index);

@@ -1682,31 +1682,31 @@ pub mod tests {
                 .await
                 .unwrap();
 
-        for batch_size in [1024] {
+        for batch_size in [1, 2, 1024] {
             // Read different types of ranges from the file
-            // let (read_params, result_batches) = test_reading_rangefrom(schema.clone());
-            // let batch_stream = file_reader
-            //     .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-            //     .unwrap();
-            // verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
+            let (read_params, result_batches) = test_reading_rangefrom(schema.clone());
+            let batch_stream = file_reader
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
+                .unwrap();
+            verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
-            // let (read_params, result_batches) = test_reading_rangeto(schema.clone());
-            // let batch_stream = file_reader
-            //     .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-            //     .unwrap();
-            // verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
+            let (read_params, result_batches) = test_reading_rangeto(schema.clone());
+            let batch_stream = file_reader
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
+                .unwrap();
+            verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
-            // let (read_params, result_batches) = test_reading_random_indices(schema.clone());
-            // let batch_stream = file_reader
-            //     .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-            //     .unwrap();
-            // verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
+            let (read_params, result_batches) = test_reading_random_indices(schema.clone());
+            let batch_stream = file_reader
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
+                .unwrap();
+            verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
-            // let (read_params, result_batches) = test_reading_partial_range(schema.clone());
-            // let batch_stream = file_reader
-            //     .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-            //     .unwrap();
-            // verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
+            let (read_params, result_batches) = test_reading_partial_range(schema.clone());
+            let batch_stream = file_reader
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
+                .unwrap();
+            verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
             let read_params = lance_io::ReadBatchParams::RangeFull;
             let result_batches = batches.clone();

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt::Debug, ops::Range, str::CharIndices, sync::Arc};
+use std::{fmt::Debug, ops::Range, sync::Arc};
 
 use arrow_array::{
     new_null_array,
