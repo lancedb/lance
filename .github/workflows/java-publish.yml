@@ -24,11 +24,10 @@ jobs:
       - name: Build release
         run: |
           cargo build --release
-          cp ../target/release/liblance_jni.dylib liblance_jni.dylib
       - uses: actions/upload-artifact@v4
         with:
           name: liblance_jni_darwin_aarch64.zip
-          path: liblance_jni.dylib
+          path: target/release/liblance_jni.dylib
           retention-days: 1
           if-no-files-found: error
   linux-arm64:
@@ -63,7 +62,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: liblance_jni_linux_aarch64.zip
-          path: liblance_jni.so
+          path: target/release/liblance_jni.so
           retention-days: 1
           if-no-files-found: error
   linux-x86:
