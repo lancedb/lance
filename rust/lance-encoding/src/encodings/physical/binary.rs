@@ -211,15 +211,15 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
         // capacities[0].1 = true;
 
         let bytes_to_skip = offsets.value(rows_to_skip as usize);
-        let num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;        
+        let num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;
         let target_offsets = offsets.slice(
             rows_to_skip.try_into().unwrap(),
             (num_rows + 1).try_into().unwrap(),
         );
 
-        let mut bytes_buffers = self
-            .bytes_decoder
-            .decode_into(bytes_to_skip, num_bytes, all_null)?;
+        let mut bytes_buffers =
+            self.bytes_decoder
+                .decode_into(bytes_to_skip, num_bytes, all_null)?;
 
         // Normalize offsets
         let target_vec = target_offsets.values();
