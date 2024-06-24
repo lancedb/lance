@@ -66,10 +66,10 @@ pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
     T::dot(from, to)
 }
 
-/// Negative dot distance.
+/// Negative [Dot] distance.
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
-    -T::dot(from, to)
+    1.0 - T::dot(from, to)
 }
 
 /// Dot product

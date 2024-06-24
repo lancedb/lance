@@ -75,6 +75,7 @@ pub fn argmin_value<T: Num + Bounded + PartialOrd + Copy>(
 /// Returns the minimal value (float) and the index (argmin) from an Iterator.
 ///
 /// Return `None` if the iterator is empty or all are `Nan/Inf`.
+#[inline]
 pub fn argmin_value_float<T: Float>(iter: impl Iterator<Item = T>) -> Option<(u32, T)> {
     let mut min_idx = None;
     let mut min_value = T::infinity();
@@ -223,10 +224,7 @@ pub fn hash(array: &dyn Array) -> Result<UInt64Array> {
 mod tests {
     use super::*;
 
-    use std::{
-        collections::HashSet,
-        f32::{INFINITY, NAN, NEG_INFINITY},
-    };
+    use std::collections::HashSet;
 
     use approx::assert_relative_eq;
     use arrow_array::{
@@ -238,13 +236,13 @@ mod tests {
         let f = Float32Array::from(vec![1.0, 5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
         assert_eq!(argmax(f.values().iter().copied()), Some(4));
 
-        let f = Float32Array::from(vec![1.0, 5.0, NAN, 3.0, 2.0, 20.0, INFINITY, 3.5]);
+        let f = Float32Array::from(vec![1.0, 5.0, f32::NAN, 3.0, 2.0, 20.0, f32::INFINITY, 3.5]);
         assert_eq!(argmax_opt(f.iter()), Some(6));
 
-        let f = Float32Array::from_iter(vec![Some(2.0), None, Some(20.0), Some(NAN)]);
+        let f = Float32Array::from_iter(vec![Some(2.0), None, Some(20.0), Some(f32::NAN)]);
         assert_eq!(argmax_opt(f.iter()), Some(2));
 
-        let f = Float32Array::from(vec![NAN, NAN, NAN]);
+        let f = Float32Array::from(vec![f32::NAN; 3]);
         assert_eq!(argmax(f.values().iter().copied()), None);
 
         let i = Int16Array::from(vec![1, 5, 3, 2, 20, 8, 16]);
@@ -263,16 +261,16 @@ mod tests {
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
         assert_eq!(argmin(f.values().iter().copied()), Some(2));
 
-        let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, NAN]);
+        let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, f32::NAN]);
         assert_eq!(argmin_opt(f.iter()), Some(2));
 
-        let f = Float32Array::from_iter(vec![Some(2.0), None, Some(NAN)]);
+        let f = Float32Array::from_iter(vec![Some(2.0), None, Some(f32::NAN)]);
         assert_eq!(argmin_opt(f.iter()), Some(0));
 
-        let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, NEG_INFINITY, NAN]);
+        let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, f32::NEG_INFINITY, f32::NAN]);
         assert_eq!(argmin(f.values().iter().copied()), Some(3));
 
-        let f = Float32Array::from_iter(vec![NAN, NAN, NAN, NAN]);
+        let f = Float32Array::from_iter(vec![f32::NAN; 4]);
         assert_eq!(argmin(f.values().iter().copied()), None);
 
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);

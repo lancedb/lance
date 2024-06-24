@@ -36,7 +36,7 @@ use vector::ivf::v2::IVFIndex;
 
 pub(crate) mod append;
 pub(crate) mod cache;
-pub(crate) mod prefilter;
+pub mod prefilter;
 pub mod scalar;
 pub mod vector;
 

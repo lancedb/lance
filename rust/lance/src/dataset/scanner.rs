@@ -2208,6 +2208,42 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_only_row_id(#[values(false, true)] use_legacy_format: bool) {
+        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let dataset = &test_ds.dataset;
+
+        let mut scan = dataset.scan();
+        scan.project::<&str>(&[]).unwrap().with_row_id();
+
+        let results = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 400);
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ArrowSchema::new(vec![ArrowField::new(ROW_ID, DataType::UInt64, true,)])
+        );
+
+        let expected_row_ids: Vec<u64> = (0..400).map(|i| i as u64).collect();
+        let actual_row_ids: Vec<u64> = as_primitive_array::<UInt64Type>(batch.column(0).as_ref())
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(expected_row_ids, actual_row_ids);
+    }
+
     #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
         // This test doesn't make sense for v2 files, there is no way to get an out-of-order scan
