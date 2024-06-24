@@ -1144,50 +1144,44 @@ impl BatchDecodeStream {
 /// the decode task for batch 0 and the decode task for batch 1.
 ///
 /// See [`crate::decoder`] for more information
-pub trait PhysicalPageDecoder: Send + Sync {
-    /// Calculates and updates the capacity required to represent the requested data
+pub trait PrimitivePageDecoder: Send + Sync {
+    /// Decode data into buffers
+    ///
+    /// This may be a simple zero-copy from a disk buffer or could involve complex decoding
+    /// such as decompressing from some compressed representation.
     ///
     /// Capacity is stored as a tuple of (num_bytes: u64, is_needed: bool).  The `is_needed`
     /// portion only needs to be updated if the encoding has some concept of an "optional"
     /// buffer.
     ///
-    /// The decoder should look at `rows_to_skip` and `num_rows` and then calculate how
-    /// many bytes of data are needed.  It should then update the first part of the tuple.
+    /// Encodings can have any number of input or output buffers.  For example, a dictionary
+    /// decoding will convert two buffers (indices + dictionary) into a single buffer
     ///
-    /// Note: Most encodings deal with a single buffer.  They may have multiple input buffers
-    /// but they only have a single output buffer.  The current exception to this rule is the
-    /// `basic` encoding which has an output "validity" buffer and an output "values" buffers.
-    /// We may find there are other such exceptions.
+    /// Binary decodings have two output buffers (one for values, one for offsets)
     ///
+    /// Other decodings could even expand the # of output buffers.  For example, we could decode
+    /// fixed size strings into variable length strings going from one input buffer to multiple output
+    /// buffers.
+    ///
+    /// Each Arrow data type typically has a fixed structure of buffers and the encoding chain will
+    /// generally end at one of these structures.  However, intermediate structures may exist which
+    /// do not correspond to any Arrow type at all.  For example, a bitpacking encoding will deal
+    /// with buffers that have bits-per-value that is not a multiple of 8.
+    ///
+    /// The `primitive_array_from_buffers` method has an expected buffer layout for each arrow
+    /// type (order matters) and encodings that aim to decode into arrow types should respect
+    /// this layout.
     /// # Arguments
     ///
     /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
     /// * `num_rows` - how many rows to decode
-    /// * `buffers` - A mutable slice of "capacities" (as described above), one per buffer
     /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
-    fn update_capacity(
+    fn decode(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
-        buffers: &mut [(u64, bool)],
         all_null: &mut bool,
-    );
-    /// Decodes the data into the requested buffers.
-    ///
-    /// You can assume that the capacity will have already been configured on the `BytesMut`
-    /// according to the capacity calculated in [`PhysicalPageDecoder::update_capacity`]
-    ///
-    /// # Arguments
-    ///
-    /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
-    /// * `num_rows` - how many rows to decode
-    /// * `dest_buffers` - the output buffers to decode into
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [BytesMut],
-    ) -> Result<()>;
+    ) -> Result<Vec<BytesMut>>;
     fn num_buffers(&self) -> u32;
 }
 
@@ -1217,7 +1211,7 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
         ranges: &[Range<u32>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>;
 }
 
 /// Contains the context for a scheduler
