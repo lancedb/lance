@@ -162,8 +162,6 @@ impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
 pub struct SimpleStructScheduler {
     children: Vec<Arc<dyn FieldScheduler>>,
     child_fields: Fields,
-    // A single page cannot contain more than u32 rows.  However, we also use SimpleStructScheduler
-    // at the top level and a single file *can* contain more than u32 rows.
     num_rows: u64,
 }
 
