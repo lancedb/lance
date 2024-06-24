@@ -193,7 +193,7 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
     // We only need [8, 13] to decode in this case.
     // These need to be normalized in order to build the string later
     // So return [0, 5]
-    fn decode_into(
+    fn decode(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
@@ -205,11 +205,6 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
             .downcast_ref::<UInt32Array>()
             .unwrap();
 
-        // let mut capacities = vec![(0, false); self.num_buffers() as usize];
-        // 32 bits or 4 bytes per value.
-        // capacities[0].0 = (num_rows as u64) * 4;
-        // capacities[0].1 = true;
-
         let bytes_to_skip = offsets.value(rows_to_skip as usize);
         let num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;
         let target_offsets = offsets.slice(
@@ -217,9 +212,9 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
             (num_rows + 1).try_into().unwrap(),
         );
 
-        let mut bytes_buffers =
-            self.bytes_decoder
-                .decode_into(bytes_to_skip, num_bytes, all_null)?;
+        let mut bytes_buffers = self
+            .bytes_decoder
+            .decode(bytes_to_skip, num_bytes, all_null)?;
 
         // Normalize offsets
         let target_vec = target_offsets.values();
@@ -230,17 +225,6 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
         let byte_slice = normalized_values.inner().deref();
         let mut dest_buffers = vec![BytesMut::from(byte_slice)];
         dest_buffers.append(&mut bytes_buffers);
-
-        // let mut dest_buffers = create_buffers_from_capacities(capacities);
-
-        // copy target_offsets into dest_buffers[0]
-        // dest_buffers[0].extend_from_slice(byte_slice);
-
-        // Copy decoded bytes into dest_buffers[1..]
-        // Currently an empty null buffer is the first one
-        // The actual bytes are in the second buffer
-        // Including the indices this results in 3 buffers in total
-        // dest_buffers.append(&mut bytes_buffers);
 
         Ok(dest_buffers)
     }

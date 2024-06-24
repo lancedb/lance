@@ -12,7 +12,6 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use crate::encodings::utils::create_buffers_from_capacities;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
@@ -205,21 +204,18 @@ impl ValuePageDecoder {
 }
 
 impl PrimitivePageDecoder for ValuePageDecoder {
-    fn decode_into(
+    fn decode(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
         _all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
-        let mut capacities = vec![(0, false); self.num_buffers() as usize];
-
-        capacities[0].0 = self.bytes_per_value * num_rows as u64;
-        capacities[0].1 = true;
+        let num_bytes = self.bytes_per_value * num_rows as u64;
 
         let mut bytes_to_skip = rows_to_skip as u64 * self.bytes_per_value;
         let mut bytes_to_take = num_rows as u64 * self.bytes_per_value;
 
-        let mut dest_buffers = create_buffers_from_capacities(capacities);
+        let mut dest_buffers = vec![BytesMut::with_capacity(num_bytes as usize)];
 
         let dest = &mut dest_buffers[0];
 

@@ -257,11 +257,9 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
         // The number of buffers needed is based on the data type.
         // Most data types need two buffers but each layer of fixed-size-list, for
         // example, adds another validity buffer.
-        let bufs = self.physical_decoder.decode_into(
-            self.rows_to_skip,
-            self.rows_to_take,
-            &mut all_null,
-        )?;
+        let bufs =
+            self.physical_decoder
+                .decode(self.rows_to_skip, self.rows_to_take, &mut all_null)?;
 
         if all_null {
             return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));

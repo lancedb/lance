@@ -12,7 +12,6 @@ use log::trace;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
-    encodings::utils::create_buffers_from_capacities,
     format::pb,
     EncodingsIo,
 };
@@ -170,67 +169,43 @@ struct BasicPageDecoder {
 }
 
 impl PrimitivePageDecoder for BasicPageDecoder {
-    fn decode_into(
+    fn decode(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
         all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
-        if let Some(_values) = self.mode.values_decoder() {
-            match &self.mode {
-                DataNullStatus::Some(decoders) => {
-                    let mut dest_buffers =
-                        decoders
-                            .validity
-                            .decode_into(rows_to_skip, num_rows, all_null)?; // buffer 0
-                    let mut values_bytesmut =
-                        decoders
-                            .values
-                            .decode_into(rows_to_skip, num_rows, all_null)?; // buffer 1 onwards
+        let dest_buffers = match &self.mode {
+            DataNullStatus::Some(decoders) => {
+                let mut buffers = decoders.validity.decode(rows_to_skip, num_rows, all_null)?; // buffer 0
+                let mut values_bytesmut =
+                    decoders.values.decode(rows_to_skip, num_rows, all_null)?; // buffer 1 onwards
 
-                    dest_buffers.append(&mut values_bytesmut);
-                    Ok(dest_buffers)
-                }
-                // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
-                // other pages needed the buffer, in which case we need to fill our section
-                DataNullStatus::All => {
-                    let mut capacities = vec![(0, false); self.num_buffers() as usize];
-
-                    // No need to look at the validity decoder to know the dest buffer size since it is boolean
-                    capacities[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
-                    // The validity buffer is only required if we have some nulls
-                    capacities[0].1 = matches!(self.mode, DataNullStatus::Some(_));
-
-                    let mut dest_buffers = create_buffers_from_capacities(capacities);
-
-                    dest_buffers[0].fill(0);
-
-                    Ok(dest_buffers)
-                }
-                DataNullStatus::None(values) => {
-                    let mut capacities = vec![(0, false); self.num_buffers() as usize];
-
-                    // No need to look at the validity decoder to know the dest buffer size since it is boolean
-                    capacities[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
-                    // The validity buffer is only required if we have some nulls
-                    capacities[0].1 = matches!(self.mode, DataNullStatus::Some(_));
-
-                    let mut dest_buffers = create_buffers_from_capacities(capacities);
-
-                    dest_buffers[0].fill(1);
-                    let values_bytesmut = values.decode_into(rows_to_skip, num_rows, all_null)?; // buffer 1 onwards
-
-                    for (i, value) in values_bytesmut.into_iter().enumerate() {
-                        dest_buffers[i + 1] = value;
-                    }
-
-                    Ok(dest_buffers)
-                }
+                buffers.append(&mut values_bytesmut);
+                buffers
             }
-        } else {
-            *all_null = true;
-            Ok(vec![])
-        }
+            // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
+            // other pages needed the buffer, in which case we need to fill our section
+            DataNullStatus::All => {
+                let mut buffers = vec![BytesMut::default()];
+                buffers[0].fill(0);
+                *all_null = true;
+                buffers
+            }
+            DataNullStatus::None(values) => {
+                let mut dest_buffers = vec![BytesMut::with_capacity(arrow_buffer::bit_util::ceil(
+                    num_rows as usize,
+                    8,
+                ))];
+                dest_buffers[0].fill(1);
+
+                let mut values_bytesmut = values.decode(rows_to_skip, num_rows, all_null)?;
+                dest_buffers.append(&mut values_bytesmut);
+                dest_buffers
+            }
+        };
+
+        Ok(dest_buffers)
     }
 
     fn num_buffers(&self) -> u32 {

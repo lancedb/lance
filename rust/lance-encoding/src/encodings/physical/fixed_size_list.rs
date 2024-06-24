@@ -74,7 +74,7 @@ pub struct FixedListDecoder {
 }
 
 impl PrimitivePageDecoder for FixedListDecoder {
-    fn decode_into(
+    fn decode(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
@@ -82,8 +82,7 @@ impl PrimitivePageDecoder for FixedListDecoder {
     ) -> Result<Vec<BytesMut>> {
         let rows_to_skip = rows_to_skip * self.dimension;
         let num_rows = num_rows * self.dimension;
-        self.items_decoder
-            .decode_into(rows_to_skip, num_rows, all_null)
+        self.items_decoder.decode(rows_to_skip, num_rows, all_null)
     }
 
     fn num_buffers(&self) -> u32 {

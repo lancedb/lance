@@ -12,7 +12,6 @@ use log::trace;
 
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encodings::utils::create_buffers_from_capacities,
     EncodingsIo,
 };
 
@@ -94,18 +93,14 @@ struct BitmapDecoder {
 }
 
 impl PrimitivePageDecoder for BitmapDecoder {
-    fn decode_into(
+    fn decode(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
         _all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
-        let mut capacities = vec![(0, false); self.num_buffers() as usize];
-
-        capacities[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
-        capacities[0].1 = true;
-
-        let mut dest_buffers = create_buffers_from_capacities(capacities);
+        let num_bytes = arrow_buffer::bit_util::ceil(num_rows as usize, 8);
+        let mut dest_buffers = vec![BytesMut::with_capacity(num_bytes)];
 
         let mut rows_to_skip = rows_to_skip;
 
@@ -187,7 +182,7 @@ mod tests {
             ],
         };
 
-        let result = decoder.decode_into(5, 1, &mut false);
+        let result = decoder.decode(5, 1, &mut false);
         assert!(result.is_ok());
     }
 }
