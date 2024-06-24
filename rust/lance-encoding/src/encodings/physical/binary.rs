@@ -491,10 +491,10 @@ pub mod tests {
     use super::get_indices_from_string_arrays;
 
     // #[test_log::test(tokio::test)]
-    // async fn test_utf8() {
-    //     let field = Field::new("", DataType::Utf8, false);
-    //     check_round_trip_encoding_random(field).await;
-    // }
+    async fn test_utf8() {
+        let field = Field::new("", DataType::Utf8, false);
+        check_round_trip_encoding_random(field).await;
+    }
 
     #[test]
     fn test_encode_indices_stitches_offsets() {
