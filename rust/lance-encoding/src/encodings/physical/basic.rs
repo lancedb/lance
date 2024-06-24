@@ -192,11 +192,7 @@ impl PrimitivePageDecoder for BasicPageDecoder {
                 buffers
             }
             DataNullStatus::None(values) => {
-                let mut dest_buffers = vec![BytesMut::with_capacity(arrow_buffer::bit_util::ceil(
-                    num_rows as usize,
-                    8,
-                ))];
-                dest_buffers[0].fill(1);
+                let mut dest_buffers = vec![BytesMut::default()];
 
                 let mut values_bytesmut = values.decode(rows_to_skip, num_rows, all_null)?;
                 dest_buffers.append(&mut values_bytesmut);
