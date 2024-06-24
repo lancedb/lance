@@ -235,7 +235,7 @@ message DataFile {
   // - dimension: packed-struct (0):
   //   - x: u32 (1)
   //   - y: u32 (2)
-  // - path: string (3)
+  // - path: list<u32> (3)
   // - embedding: fsl<768> (4)
   //   - fp64
   // - borders: fsl<4> (5)
@@ -249,7 +249,7 @@ message DataFile {
   // This reflects quite a few phenomenon:
   // - The packed struct is encoded into a single column and there is no top-level column
   //   for the x or y fields
-  // - The string is encoded into two columns
+  // - The variable sized list is encoded into two columns
   // - The embedding is encoded into a single column (common for FSL of primitive) and there
   //   is not "FSL column"
   // - The borders field actually does have an "FSL column"
