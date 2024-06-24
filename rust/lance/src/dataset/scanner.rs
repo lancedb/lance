@@ -445,17 +445,21 @@ impl Scanner {
         ))?;
         let key = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
-                if dt.data_type().is_floating() {
-                    coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
-                } else {
-                    return Err(Error::io(
-                        format!(
-                            "Column {} is not a vector column (type: {})",
-                            column,
-                            field.data_type()
-                        ),
-                        location!(),
-                    ));
+                match dt.data_type() {
+                    DataType::Float16 => coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?,
+                    DataType::Float32 => coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?,
+                    DataType::Float64 => coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?,
+                    DataType::Int8 => coerce_float_vector(q, FloatType::try_from(&DataType::Float32)?)?,
+                    _ => {
+                        return Err(Error::io(
+                            format!(
+                                "Column {} is not a vector column (type: {})",
+                                column,
+                                field.data_type()
+                            ),
+                            location!(),
+                        ));
+                    }
                 }
             }
             _ => {
@@ -1021,27 +1025,6 @@ impl Scanner {
             return Err(Error::io("No nearest query".to_string(), location!()));
         };
 
-        // Santity check
-        let schema = self.dataset.schema();
-        if let Some(field) = schema.field(&q.column) {
-            match field.data_type() {
-                DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
-                _ => {
-                    return Err(Error::io(
-                        format!(
-                            "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
-                            q.column, field.data_type(),
-                        ),
-                        location!(),
-                    ));
-                }
-            }
-        } else {
-            return Err(Error::io(
-                format!("Vector search error: column {} not found", q.column),
-                location!(),
-            ));
-        }
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
         let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);

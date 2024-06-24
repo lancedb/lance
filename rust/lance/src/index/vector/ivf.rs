@@ -11,9 +11,7 @@ use std::{
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
-    cast::{as_struct_array, AsArray},
-    types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
+    cast::{as_struct_array, AsArray}, types::{Float16Type, Float32Type, Float64Type}, Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Schema};
@@ -953,19 +951,21 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
         ));
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-        if !elem_type.data_type().is_floating() {
-            return Err(Error::Index{
-                message:format!(
-                    "VectorIndex requires the column data type to be fixed size list of f16/f32/f64, got {}",
-                    elem_type.data_type()
-                ),
-                location: location!()
-            });
+        match elem_type.data_type() {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType:: Int8 => (),
+            _ => 
+                return Err(Error::Index{
+                    message:format!(
+                        "VectorIndex requires the column data type to be fixed size list of f16/f32/f64/i8, got {}",
+                        elem_type.data_type()
+                    ),
+                    location: location!()
+                })
         }
     } else {
         return Err(Error::Index {
             message: format!(
-            "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+            "VectorIndex requires the column data type to be fixed size list, got {}",
             field.data_type()
         ),
             location: location!(),

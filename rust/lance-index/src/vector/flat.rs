@@ -100,7 +100,7 @@ async fn flat_search_batch(
         .null_bit_buffer(validity_buffer)
         .build()
         .map(make_array)?;
-    let vectors = as_fixed_size_list_array(vectors.as_ref()).clone();
+    let vectors = as_fixed_size_list_array(vectors.as_ref()).clone().convert_to_floating_point()?;
 
     tokio::task::spawn_blocking(move || {
         let distances = mt.arrow_batch_func()(key.as_ref(), &vectors)? as ArrayRef;

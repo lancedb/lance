@@ -13,7 +13,7 @@ use arrow_schema::Field;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::Result;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kmeans::compute_partitions_arrow_array;
@@ -85,9 +85,11 @@ impl Transformer for IvfTransformer {
                     arr.data_type(),
                 ),
                 location: location!(),
-            })?;
+            })?
+            .clone()
+            .convert_to_floating_point()?;
 
-        let part_ids = self.compute_partitions(fsl);
+        let part_ids = self.compute_partitions(&fsl);
         let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
         Ok(batch.try_with_column(field, Arc::new(part_ids))?)
     }

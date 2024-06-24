@@ -166,11 +166,13 @@ impl Transformer for ResidualTransform {
                 original.data_type(),
             ),
             location: location!(),
-        })?;
+        })?
+        .clone()
+        .convert_to_floating_point()?;
 
         let part_ids_ref = part_ids.as_primitive::<UInt32Type>();
         let residual_arr =
-            compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
+            compute_residual(&self.centroids, &original_vectors, None, Some(part_ids_ref))?;
 
         // Replace original column with residual column.
         let batch = batch.drop_column(&self.vec_col)?;

@@ -147,7 +147,7 @@ fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
         DataType::FixedSizeList(list_field, _)
             if matches!(
                 list_field.data_type(),
-                DataType::UInt8 | DataType::Float16 | DataType::Float32 | DataType::Float64
+                DataType::UInt8 | DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Int8
             ) => Ok(()),
         _ => {
            Err(Error::io(
