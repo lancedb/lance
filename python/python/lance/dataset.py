@@ -40,6 +40,7 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
+from .file import LanceFileWriter
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     CleanupStats,
@@ -1486,6 +1487,14 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator,
                 )
+                arrow_ivf_centroids = pa.FixedSizeListArray.from_arrays(
+                    ivf_centroids.reshape(-1), ivf_centroids.shape[1]
+                )
+                tab = pa.table({"ivf_centroids": arrow_ivf_centroids})
+                with LanceFileWriter(
+                    "/tmp/ivf_centroids.lance", schema=tab.schema
+                ) as f:
+                    f.write_batch(tab)
                 kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):

@@ -14,16 +14,26 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::array::{
+    ArrayBuilder, FixedSizeListBuilder, StructBuilder, UInt32Builder, UInt64Builder, UInt8Builder,
+};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::sort_to_indices;
+use arrow::datatypes::UInt32Type;
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
-use arrow_schema::Field;
+use arrow_array::{FixedSizeListArray, ListArray, StructArray, UInt64Array, UInt8Array};
+use arrow_schema::{DataType, Field, Fields, SchemaRef};
 use futures::stream::repeat_with;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
+use lance_core::utils::address::RowAddress;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::reader::FileReader;
+use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
+use lance_io::scheduler::ScanScheduler;
 use lance_io::stream::RecordBatchStream;
 use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
@@ -46,6 +56,161 @@ fn get_temp_dir() -> Result<Path> {
         location: location!(),
     })?;
     Ok(tmp_dir_path)
+}
+
+/// A builder for a partition of data
+///
+/// After we sort a batch of data into partitions we append those slices into this builder.
+///
+/// The builder is pre-allocated and so this extend operation should only be a memcpy
+#[derive(Debug)]
+struct PartitionBuilder {
+    builder: StructBuilder,
+}
+
+// Fork of arrow_array::builder::make_builder that handles FixedSizeList >_<
+//
+// Not really suitable for upstreaming because FixedSizeListBuilder<Box<dyn ArrayBuilder>> is
+// awkward and the entire make_builder function needs some overhaul (dyn ArrayBuilder should have
+// an extend(array: &dyn Array) method).
+fn make_builder(datatype: &DataType, capacity: usize) -> Box<dyn ArrayBuilder> {
+    if let DataType::FixedSizeList(inner, dim) = datatype {
+        let inner_builder =
+            arrow_array::builder::make_builder(inner.data_type(), capacity * (*dim) as usize);
+        Box::new(FixedSizeListBuilder::new(inner_builder, *dim))
+    } else {
+        arrow_array::builder::make_builder(datatype, capacity)
+    }
+}
+
+// Fork of StructBuilder::from_fields that handles FixedSizeList >_<
+fn from_fields(fields: impl Into<Fields>, capacity: usize) -> StructBuilder {
+    let fields = fields.into();
+    let mut builders = Vec::with_capacity(fields.len());
+    for field in &fields {
+        builders.push(make_builder(field.data_type(), capacity));
+    }
+    StructBuilder::new(fields, builders)
+}
+
+impl PartitionBuilder {
+    fn new(schema: &arrow_schema::Schema, initial_capacity: usize) -> Self {
+        let builder = from_fields(schema.fields.clone(), initial_capacity);
+        Self { builder }
+    }
+
+    fn extend(&mut self, batch: &RecordBatch) {
+        for _ in 0..batch.num_rows() {
+            self.builder.append(true);
+        }
+        let schema = batch.schema_ref();
+        for (field_idx, (col, field)) in batch.columns().iter().zip(schema.fields()).enumerate() {
+            match field.data_type() {
+                DataType::UInt32 => {
+                    let col = col.as_any().downcast_ref::<UInt32Array>().unwrap();
+                    self.builder
+                        .field_builder::<UInt32Builder>(field_idx)
+                        .unwrap()
+                        .append_slice(col.values());
+                }
+                DataType::UInt64 => {
+                    let col = col.as_any().downcast_ref::<UInt64Array>().unwrap();
+                    self.builder
+                        .field_builder::<UInt64Builder>(field_idx)
+                        .unwrap()
+                        .append_slice(col.values());
+                }
+                DataType::FixedSizeList(inner, _) => {
+                    let col = col.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+                    match inner.data_type() {
+                        DataType::UInt8 => {
+                            let values =
+                                col.values().as_any().downcast_ref::<UInt8Array>().unwrap();
+                            let fsl_builder = self
+                                .builder
+                                .field_builder::<FixedSizeListBuilder<Box<dyn ArrayBuilder>>>(
+                                    field_idx,
+                                )
+                                .unwrap();
+                            // TODO: Upstream an append_many to FSL builder
+                            for _ in 0..col.len() {
+                                fsl_builder.append(true);
+                            }
+                            fsl_builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<UInt8Builder>()
+                                .unwrap()
+                                .append_slice(values.values());
+                        }
+                        _ => panic!("Unexpected fixed size list item type in shuffled file"),
+                    }
+                }
+                _ => panic!("Unexpected column type in shuffled file"),
+            }
+        }
+    }
+
+    // Convert the partition builder into a list array with 1 row
+    fn finish(mut self) -> Result<ListArray> {
+        let struct_array = Arc::new(self.builder.finish());
+
+        let item_field = Arc::new(Field::new("item", struct_array.data_type().clone(), true));
+
+        Ok(ListArray::try_new(
+            item_field,
+            OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![
+                0,
+                struct_array.len() as i32,
+            ])),
+            struct_array,
+            None,
+        )?)
+    }
+}
+
+struct PartitionListBuilder {
+    partitions: Vec<Option<PartitionBuilder>>,
+}
+
+impl PartitionListBuilder {
+    fn new(schema: &arrow_schema::Schema, partition_sizes: Vec<u64>) -> Self {
+        Self {
+            partitions: Vec::from_iter(partition_sizes.into_iter().map(|part_size| {
+                if part_size == 0 {
+                    None
+                } else {
+                    Some(PartitionBuilder::new(schema, part_size as usize))
+                }
+            })),
+        }
+    }
+
+    fn extend(&mut self, batch: &RecordBatch) {
+        if batch.num_rows() == 0 {
+            return;
+        }
+
+        let part_ids = batch
+            .column_by_name(PART_ID_COLUMN)
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+
+        let part_id = part_ids.value(0) as usize;
+
+        let builder = &mut self.partitions[part_id];
+        builder
+            .as_mut()
+            .expect("partition size was zero but received data for partition")
+            .extend(batch);
+    }
+
+    fn finish(self) -> Result<Vec<ListArray>> {
+        self.partitions
+            .into_iter()
+            .filter_map(|builder| builder.map(|builder| builder.finish()))
+            .collect()
+    }
 }
 
 /// Disk-based shuffle for a stream of [RecordBatch] into each IVF partition.
@@ -71,7 +236,7 @@ pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: Arc<Ivf>,
-    precomputed_partitions: Option<HashMap<u64, u32>>,
+    precomputed_partitions: Option<Vec<Vec<u32>>>,
     num_partitions: u32,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
@@ -95,69 +260,84 @@ pub async fn shuffle_dataset(
 
         let column = column.to_owned();
         let precomputed_partitions = precomputed_partitions.map(Arc::new);
-        let stream = data
-            .zip(repeat_with(move || ivf.clone()))
-            .map(move |(b, ivf)| {
-                // If precomputed_partitions map is provided, use it
-                // for fast partitions.
-                let partition_map = precomputed_partitions
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(Arc::new(HashMap::new()));
-                let nan_filter = KeepFiniteVectors::new(&column);
+        let stream =
+            data.zip(repeat_with(move || ivf.clone()))
+                .map(move |(b, ivf)| {
+                    // If precomputed_partitions map is provided, use it
+                    // for fast partitions.
+                    let partition_map = precomputed_partitions
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or(Arc::new(Vec::new()));
+                    let nan_filter = KeepFiniteVectors::new(&column);
 
-                tokio::task::spawn(async move {
-                    let mut batch = b?;
+                    tokio::task::spawn(async move {
+                        let mut batch = b?;
 
-                    if !partition_map.is_empty() {
-                        let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
-                            message: "column does not exist".to_string(),
-                            location: location!(),
-                        })?;
-                        let part_ids = UInt32Array::from_iter(
-                            row_ids
-                                .as_primitive::<UInt64Type>()
-                                .values()
-                                .iter()
-                                .map(|row_id| partition_map.get(row_id).copied()),
-                        );
-                        let part_ids = UInt32Array::from(part_ids);
-                        batch = batch
-                            .try_with_column(
-                                Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true),
-                                Arc::new(part_ids.clone()),
-                            )
-                            .expect("failed to add part id column");
-
-                        if part_ids.null_count() > 0 {
-                            info!(
-                                "Filter out rows without valid partition IDs: null_count={}",
-                                part_ids.null_count()
+                        if !partition_map.is_empty() {
+                            let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
+                                message: "column does not exist".to_string(),
+                                location: location!(),
+                            })?;
+                            let part_ids = UInt32Array::from_iter(
+                                row_ids.as_primitive::<UInt64Type>().values().iter().map(
+                                    |row_id| {
+                                        let row_addr = RowAddress::new_from_id(*row_id);
+                                        partition_map[row_addr.fragment_id() as usize]
+                                            [row_addr.row_id() as usize]
+                                    },
+                                ),
                             );
-                            let indices = UInt32Array::from_iter(
-                                part_ids
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(idx, v)| v.map(|_| idx as u32)),
-                            );
-                            assert_eq!(indices.len(), batch.num_rows() - part_ids.null_count());
-                            batch = batch.take(&indices)?;
+                            let part_ids = UInt32Array::from(part_ids);
+                            batch = batch
+                                .try_with_column(
+                                    Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true),
+                                    Arc::new(part_ids.clone()),
+                                )
+                                .expect("failed to add part id column");
+
+                            if part_ids.null_count() > 0 {
+                                info!(
+                                    "Filter out rows without valid partition IDs: null_count={}",
+                                    part_ids.null_count()
+                                );
+                                let indices = UInt32Array::from_iter(
+                                    part_ids
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(idx, v)| v.map(|_| idx as u32)),
+                                );
+                                assert_eq!(indices.len(), batch.num_rows() - part_ids.null_count());
+                                batch = batch.take(&indices)?;
+                            }
                         }
-                    }
 
-                    // Filter out NaNs/Infs
-                    batch = nan_filter.transform(&batch)?;
-
-                    ivf.transform(&batch)
+                        // Filter out NaNs/Infs
+                        let minibatch_size = std::env::var("LANCE_SHUFFLE_BATCH_SIZE")
+                            .unwrap_or("64".to_string())
+                            .parse::<usize>()
+                            .unwrap_or(64);
+                        let num_out_batches = batch.num_rows().div_ceil(minibatch_size);
+                        let mut out_batches = Vec::with_capacity(num_out_batches);
+                        for offset in (0..batch.num_rows()).step_by(minibatch_size) {
+                            let mut batch = batch.slice(
+                                offset,
+                                std::cmp::min(minibatch_size, batch.num_rows() - offset),
+                            );
+                            batch = nan_filter.transform(&batch)?;
+                            out_batches.push(Result::Ok(ivf.transform(&batch))?);
+                        }
+                        Result::Ok(futures::stream::iter(out_batches))
+                    })
                 })
-            })
-            .buffer_unordered(num_cpus::get())
-            .map(|res| match res {
-                Ok(Ok(batch)) => Ok(batch),
-                Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
-                Err(err) => Err(Error::io(err.to_string(), location!())),
-            })
-            .boxed();
+                .buffer_unordered(num_cpus::get())
+                .map(|res| match res {
+                    Ok(Ok(batch)) => Ok(batch),
+                    Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
+                    Err(err) => Err(Error::io(err.to_string(), location!())),
+                })
+                .try_flatten()
+                .boxed();
 
         let start = std::time::Instant::now();
         shuffler.write_unsorted_stream(stream).await?;
@@ -184,10 +364,14 @@ pub async fn shuffle_dataset(
     Ok(stream)
 }
 
+#[derive(Clone)]
 pub struct IvfShuffler {
     unsorted_buffers: Vec<String>,
 
     num_partitions: u32,
+
+    // The schema of the partition files.  Only initialized after the unsorted parts are written
+    schema: Option<SchemaRef>,
 
     output_dir: Path,
 }
@@ -213,6 +397,7 @@ impl IvfShuffler {
             num_partitions,
             output_dir,
             unsorted_buffers: vec![],
+            schema: None,
         })
     }
 
@@ -243,6 +428,7 @@ impl IvfShuffler {
                 return Err(Error::io("empty stream".to_string(), location!()));
             }
         };
+        self.schema = Some(schema.clone());
 
         // validate the schema,
         // we need to have row ID and partition ID column
@@ -325,18 +511,15 @@ impl IvfShuffler {
 
     async fn shuffle_to_partitions(
         &self,
+        schema: &arrow_schema::Schema,
         inputs: &[ShuffleInput],
         partition_size: Vec<u64>,
         num_batches_to_sort: usize,
-    ) -> Result<Vec<Vec<RecordBatch>>> {
-        let mut partitioned_batches = Vec::with_capacity(partition_size.len());
-        for _ in 0..partition_size.len() {
-            partitioned_batches.push(Vec::new());
-        }
-
+    ) -> Result<Vec<ListArray>> {
         info!("Shuffling into memory");
 
         let mut num_processed = 0;
+        let mut partitions_builder = PartitionListBuilder::new(schema, partition_size);
 
         for &ShuffleInput {
             file_idx,
@@ -374,23 +557,24 @@ impl IvfShuffler {
                 let batch = batch.take(&indices)?;
 
                 let mut start = 0;
-                while start < batch.num_rows() {
-                    let part_id = part_ids.value(indices.value(start) as usize);
-                    let mut end = start + 1;
-                    while end < batch.num_rows()
-                        && part_ids.value(indices.value(end) as usize) == part_id
-                    {
-                        end += 1;
+                let mut prev_id = part_ids.value(0);
+                for (idx, part_id) in batch[PART_ID_COLUMN]
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .iter()
+                    .enumerate()
+                {
+                    if *part_id != prev_id {
+                        partitions_builder.extend(&batch.slice(start, idx - start));
+                        start = idx;
+                        prev_id = *part_id;
                     }
-
-                    let part_batches = &mut partitioned_batches[part_id as usize];
-                    part_batches.push(batch.slice(start, end - start));
-                    start = end;
                 }
+                partitions_builder.extend(&batch.slice(start, part_ids.len() - start));
             }
         }
 
-        Ok(partitioned_batches)
+        partitions_builder.finish()
     }
 
     pub async fn write_partitioned_shuffles(
@@ -400,6 +584,11 @@ impl IvfShuffler {
     ) -> Result<Vec<String>> {
         let num_batches = self.total_batches().await?;
         let total_batches = num_batches.iter().sum();
+        let schema = self
+            .schema
+            .as_ref()
+            .expect("unsorted data not written yet so schema not initialized")
+            .clone();
 
         info!(
             "Sorting unsorted data into sorted chunks (batches_per_chunk={} concurrent_jobs={})",
@@ -407,85 +596,103 @@ impl IvfShuffler {
         );
         stream::iter((0..total_batches).step_by(batches_per_partition))
             .zip(stream::repeat(num_batches))
-            .map(|(i, num_batches)| async move {
-                // first, calculate which files and ranges needs to be processed
-                let start = i;
-                let end = std::cmp::min(i + batches_per_partition, total_batches);
-                let num_batches_to_sort = end - start;
-                let mut input = vec![];
+            .map(|(i, num_batches)| {
+                let schema = schema.clone();
+                let this = self.clone();
+                tokio::spawn(async move {
+                    let schema = schema.clone();
+                    // first, calculate which files and ranges needs to be processed
+                    let start = i;
+                    let end = std::cmp::min(i + batches_per_partition, total_batches);
+                    let num_batches_to_sort = end - start;
+                    let mut input = vec![];
 
-                let mut cumulative_size = 0;
-                for (file_idx, partition_size) in num_batches.iter().enumerate() {
-                    let cur_start = cumulative_size;
-                    let cur_end = cumulative_size + partition_size;
+                    let mut cumulative_size = 0;
+                    for (file_idx, partition_size) in num_batches.iter().enumerate() {
+                        let cur_start = cumulative_size;
+                        let cur_end = cumulative_size + partition_size;
 
-                    cumulative_size += partition_size;
+                        cumulative_size += partition_size;
 
-                    let should_include_file = start < cur_end && end > cur_start;
+                        let should_include_file = start < cur_end && end > cur_start;
 
-                    if !should_include_file {
-                        continue;
+                        if !should_include_file {
+                            continue;
+                        }
+
+                        // the currnet part doesn't overlap with the current batch
+                        if start >= cur_end {
+                            continue;
+                        }
+
+                        let local_start = if start < cur_start {
+                            0
+                        } else {
+                            start - cur_start
+                        };
+                        let local_end = std::cmp::min(end - cur_start, *partition_size);
+
+                        input.push(ShuffleInput {
+                            file_idx,
+                            start: local_start,
+                            end: local_end,
+                        });
                     }
 
-                    // the currnet part doesn't overlap with the current batch
-                    if start >= cur_end {
-                        continue;
+                    // second, count the number of rows in each partition
+                    let size_counts = this.count_partition_size(&input).await?;
+
+                    // third, shuffle the data into each partition
+                    let shuffled = this
+                        .shuffle_to_partitions(
+                            schema.as_ref(),
+                            &input,
+                            size_counts,
+                            num_batches_to_sort,
+                        )
+                        .await?;
+
+                    // finally, write the shuffled data to disk
+                    let object_store = ObjectStore::local();
+                    let output_file = format!("sorted_{}.lance", i);
+                    let path = this.output_dir.child(output_file.clone());
+                    let writer = object_store.create(&path).await?;
+
+                    info!(
+                        "Chunk loaded into memory and sorted, writing to disk at {}",
+                        path
+                    );
+
+                    let sorted_file_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                        "partitions",
+                        shuffled.first().unwrap().data_type().clone(),
+                        true,
+                    )]));
+                    let lance_schema = Schema::try_from(sorted_file_schema.as_ref())?;
+                    let mut file_writer = lance_file::v2::writer::FileWriter::try_new(
+                        writer,
+                        path.to_string(),
+                        lance_schema,
+                        FileWriterOptions::default(),
+                    )?;
+
+                    for partition_and_idx in shuffled.into_iter().enumerate() {
+                        let (idx, partition) = partition_and_idx;
+                        if idx % 1000 == 0 {
+                            info!("Writing partition {}/{}", idx, this.num_partitions);
+                        }
+                        let batch = RecordBatch::try_new(
+                            sorted_file_schema.clone(),
+                            vec![Arc::new(partition)],
+                        )?;
+                        file_writer.write_batch(&batch).await?;
                     }
 
-                    let local_start = if start < cur_start {
-                        0
-                    } else {
-                        start - cur_start
-                    };
-                    let local_end = std::cmp::min(end - cur_start, *partition_size);
+                    file_writer.finish().await?;
 
-                    input.push(ShuffleInput {
-                        file_idx,
-                        start: local_start,
-                        end: local_end,
-                    });
-                }
-
-                // second, count the number of rows in each partition
-                let size_counts = self.count_partition_size(&input).await?;
-
-                // third, shuffle the data into each partition
-                let shuffled = self
-                    .shuffle_to_partitions(&input, size_counts, num_batches_to_sort)
-                    .await?;
-                let schema = shuffled
-                    .iter()
-                    .find(|batches| !batches.is_empty())
-                    .ok_or(Error::io("empty input to shuffle".to_owned(), location!()))?[0]
-                    .schema();
-
-                // finally, write the shuffled data to disk
-                let object_store = ObjectStore::local();
-                let output_file = format!("sorted_{}.lance", i);
-                let path = self.output_dir.child(output_file.clone());
-                let writer = object_store.create(&path).await?;
-
-                info!(
-                    "Chunk loaded into memory and sorted, writing to disk at {}",
-                    path
-                );
-                let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
-                    writer,
-                    Schema::try_from(schema.as_ref())?,
-                    &Default::default(),
-                )?;
-
-                for batches_and_idx in shuffled.into_iter().enumerate() {
-                    let (idx, batches) = batches_and_idx;
-                    if idx % 1000 == 0 {
-                        info!("Writing partition {}/{}", idx, self.num_partitions);
-                    }
-                    file_writer.write(&batches).await?;
-                }
-
-                file_writer.finish().await?;
-
-                Ok(output_file) as Result<String>
+                    Ok(output_file) as Result<String>
+                })
+                .map(|join_res| join_res.unwrap())
             })
             .buffered(concurrent_jobs)
             .try_collect()
@@ -500,19 +707,39 @@ impl IvfShuffler {
         let mut streams = vec![];
 
         for file in files {
-            let object_store = ObjectStore::local();
+            let object_store = Arc::new(ObjectStore::local());
             let path = self.output_dir.child(file);
-            let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
-            let reader = Arc::new(reader);
+            let scan_scheduler = ScanScheduler::new(object_store, 16);
+            let file_scheduler = scan_scheduler.open_file(&path).await?;
+            let reader = lance_file::v2::reader::FileReader::try_open(
+                file_scheduler,
+                None,
+                DecoderMiddlewareChain::default(),
+            )
+            .await?;
+            let stream = reader
+                .read_stream(
+                    ReadBatchParams::RangeFull,
+                    1,
+                    32,
+                    FilterExpression::no_filter(),
+                )?
+                .and_then(|batch| {
+                    let list_array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .expect("ListArray expected");
+                    let struct_array = list_array
+                        .values()
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .expect("StructArray expected")
+                        .clone();
+                    let batch: RecordBatch = struct_array.into();
+                    std::future::ready(Ok(batch))
+                });
 
-            let stream = stream::iter(0..reader.num_batches())
-                .zip(stream::repeat(reader))
-                .map(|(i, reader)| async move {
-                    reader
-                        .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema())
-                        .await
-                })
-                .buffered(4);
             streams.push(stream);
         }
 
@@ -530,12 +757,13 @@ mod test {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;
     use lance_io::stream::RecordBatchStreamAdapter;
+    use rand::RngCore;
 
     use crate::vector::PQ_CODE_COLUMN;
 
     use super::*;
 
-    fn make_schema() -> Arc<arrow_schema::Schema> {
+    fn make_schema(pq_dim: u32) -> Arc<arrow_schema::Schema> {
         Arc::new(arrow_schema::Schema::new(vec![
             ROW_ID_FIELD.clone(),
             arrow_schema::Field::new(PART_ID_COLUMN, DataType::UInt32, true),
@@ -543,7 +771,7 @@ mod test {
                 PQ_CODE_COLUMN,
                 DataType::FixedSizeList(
                     Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
-                    32,
+                    pq_dim as i32,
                 ),
                 false,
             ),
@@ -553,7 +781,7 @@ mod test {
     fn make_stream_and_shuffler(
         include_empty_batches: bool,
     ) -> (impl RecordBatchStream, IvfShuffler) {
-        let schema = make_schema();
+        let schema = make_schema(32);
 
         let schema2 = schema.clone();
 
@@ -763,5 +991,82 @@ mod test {
         }
 
         assert_eq!(num_batches, 200);
+    }
+
+    fn make_big_stream_and_shuffler(
+        num_batches: u32,
+        num_partitions: u32,
+        pq_dim: u32,
+    ) -> (impl RecordBatchStream, IvfShuffler) {
+        let schema = make_schema(pq_dim);
+
+        let schema2 = schema.clone();
+
+        let stream = stream::iter(0..num_batches).map(move |idx| {
+            let mut rng = rand::thread_rng();
+            let row_ids = Arc::new(UInt64Array::from_iter(
+                (idx * 1024..(idx + 1) * 1024).map(u64::from),
+            ));
+
+            let part_id = Arc::new(UInt32Array::from_iter(
+                (idx * 1024..(idx + 1) * 1024).map(|_| rng.next_u32() % num_partitions),
+            ));
+
+            let values = Arc::new(UInt8Array::from_iter((0..pq_dim * 1024).map(|_| idx as u8)));
+            let pq_codes = Arc::new(
+                FixedSizeListArray::try_new_from_values(values as Arc<dyn Array>, pq_dim as i32)
+                    .unwrap(),
+            );
+
+            Ok(RecordBatch::try_new(schema2.clone(), vec![row_ids, part_id, pq_codes]).unwrap())
+        });
+
+        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
+
+        let shuffler = IvfShuffler::try_new(num_partitions, None).unwrap();
+
+        (stream, shuffler)
+    }
+
+    // Change NUM_BATCHES = 1000 * 1024 and NUM_PARTITIONS to 35000 to test 1B shuffle
+    const NUM_BATCHES: u32 = 100;
+    const NUM_PARTITIONS: u32 = 1000;
+    const PQ_DIM: u32 = 48;
+    const BATCHES_PER_PARTITION: u32 = 10200;
+    const NUM_CONCURRENT_JOBS: u32 = 16;
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_big_shuffle() {
+        let (stream, mut shuffler) =
+            make_big_stream_and_shuffler(NUM_BATCHES, NUM_PARTITIONS, PQ_DIM);
+
+        shuffler.write_unsorted_stream(stream).await.unwrap();
+        let partition_files = shuffler
+            .write_partitioned_shuffles(
+                BATCHES_PER_PARTITION as usize,
+                NUM_CONCURRENT_JOBS as usize,
+            )
+            .await
+            .unwrap();
+
+        let expected_num_part_files = NUM_BATCHES.div_ceil(BATCHES_PER_PARTITION);
+
+        assert_eq!(partition_files.len(), expected_num_part_files as usize);
+
+        let mut result_stream = shuffler
+            .load_partitioned_shuffles(partition_files)
+            .await
+            .unwrap();
+
+        let mut num_batches = 0;
+        result_stream.reverse();
+
+        while let Some(mut stream) = result_stream.pop() {
+            while stream.next().await.is_some() {
+                num_batches += 1
+            }
+        }
+
+        assert_eq!(num_batches, NUM_PARTITIONS * expected_num_part_files);
     }
 }

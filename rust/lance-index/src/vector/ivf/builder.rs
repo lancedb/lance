@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
+use lance_core::utils::address::RowAddress;
 use object_store::path::Path;
 use snafu::{location, Location};
 
@@ -102,29 +103,30 @@ impl IvfBuildParams {
 /// Currently, because `Dataset` is not cleanly refactored from `lance` to `lance-core`,
 /// we have to use `RecordBatchStream` as parameter.
 pub async fn load_precomputed_partitions(
-    stream: impl RecordBatchStream + Unpin + 'static,
-    size_hint: usize,
-) -> Result<HashMap<u64, u32>> {
-    let partition_lookup = stream
-        .try_fold(HashMap::with_capacity(size_hint), |mut lookup, batch| {
-            let row_ids: &UInt64Array = batch
-                .column_by_name("row_id")
-                .expect("malformed partition file: missing row_id column")
-                .as_primitive();
-            let partitions: &UInt32Array = batch
-                .column_by_name("partition")
-                .expect("malformed partition file: missing partition column")
-                .as_primitive();
-            row_ids
-                .values()
-                .iter()
-                .zip(partitions.values().iter())
-                .for_each(|(row_id, partition)| {
-                    lookup.insert(*row_id, *partition);
-                });
-            async move { Ok(lookup) }
-        })
-        .await?;
-
-    Ok(partition_lookup)
+    mut stream: impl RecordBatchStream + Unpin + 'static,
+    fragment_sizes: &[u32],
+) -> Result<Vec<Vec<u32>>> {
+    let mut mapping = fragment_sizes
+        .iter()
+        .map(|&size| vec![0; size as usize])
+        .collect::<Vec<_>>();
+    while let Some(batch) = stream.try_next().await? {
+        let row_ids: &UInt64Array = batch
+            .column_by_name("row_id")
+            .expect("malformed partition file: missing row_id column")
+            .as_primitive();
+        let partitions: &UInt32Array = batch
+            .column_by_name("partition")
+            .expect("malformed partition file: missing partition column")
+            .as_primitive();
+        row_ids
+            .values()
+            .iter()
+            .zip(partitions.values().iter())
+            .for_each(|(row_id, partition)| {
+                let addr = RowAddress::new_from_id(*row_id);
+                mapping[addr.fragment_id() as usize][addr.row_id() as usize] = *partition;
+            });
+    }
+    Ok(mapping)
 }
