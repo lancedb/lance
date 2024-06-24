@@ -22,6 +22,12 @@
         <module>spark</module>
     </modules>
 
+    <scm>
+        <connection>scm:git:https://github.com/lancedb/lance.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/lancedb/lance.git</developerConnection>
+        <url>https://github.com/lancedb/lance</url>
+    </scm>
+
     <dependencyManagement>
         <dependencies>
             <dependency>
@@ -182,7 +188,8 @@
                         <version>3.2.5</version>
                         <configuration>
                             <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
-                            <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
+                            <forkNode
+                                implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
                             <useSystemClassLoader>false</useSystemClassLoader>
                         </configuration>
                     </plugin>
