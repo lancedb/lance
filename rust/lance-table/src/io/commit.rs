@@ -361,7 +361,10 @@ async fn build_dynamodb_external_store(
     app_name: &str,
 ) -> Result<Arc<dyn ExternalManifestStore>> {
     use super::commit::dynamodb::DynamoDBExternalManifestStore;
-    use aws_sdk_dynamodb::{config::{IdentityCache, Region}, Client};
+    use aws_sdk_dynamodb::{
+        config::{IdentityCache, Region},
+        Client,
+    };
 
     let mut dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
         .region(Some(Region::new(region.to_string())))
