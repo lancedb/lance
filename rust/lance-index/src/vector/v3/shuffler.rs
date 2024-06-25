@@ -200,10 +200,7 @@ impl Shuffler for IvfShuffler {
         }
 
         // finish all writers
-        for (writer, &size) in writers.iter_mut().zip(partition_sizes.iter()) {
-            if size == 0 {
-                continue;
-            }
+        for writer in writers.iter_mut() {
             writer.finish().await?;
         }
 
