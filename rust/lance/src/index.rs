@@ -12,14 +12,19 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_file::reader::FileReader;
+use lance_file::v2;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
+use lance_index::INDEX_METADATA_SCHEMA_KEY;
 use lance_index::{pb, vector::VectorIndex, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use lance_io::scheduler::ScanScheduler;
 use lance_io::traits::Reader;
 use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
@@ -519,7 +524,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         // the index file is in lance format since version (0,2)
         // TODO: we need to change the legacy IVF_PQ to be in lance format
-        match (major_version, minor_version) {
+        let index = match (major_version, minor_version) {
             (0, 1) | (0, 0) => {
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
@@ -557,14 +562,70 @@ impl DatasetIndexInternalExt for Dataset {
             }
 
             (0, 3) => {
-                let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
-                    self.object_store.clone(),
-                    self.indices_dir(),
-                    uuid.to_owned(),
-                    Arc::downgrade(&self.session),
-                )
-                .await?;
-                Ok(Arc::new(ivf))
+                let scheduler = ScanScheduler::new(self.object_store.clone(), 16);
+                let file = scheduler.open_file(&index_file).await?;
+                let reader =
+                    v2::reader::FileReader::try_open(file, None, Default::default()).await?;
+                let index_metadata = reader
+                    .schema()
+                    .metadata
+                    .get(INDEX_METADATA_SCHEMA_KEY)
+                    .ok_or(Error::Index {
+                        message: "Index Metadata not found".to_owned(),
+                        location: location!(),
+                    })?;
+                let index_metadata: lance_index::IndexMetadata =
+                    serde_json::from_str(index_metadata)?;
+                let field = self.schema().field(column).ok_or_else(|| Error::Index {
+                    message: format!("Column {} does not exist in the schema", column),
+                    location: location!(),
+                })?;
+
+                let value_type = if let DataType::FixedSizeList(df, _) = field.data_type() {
+                    Result::Ok(df.data_type().to_owned())
+                } else {
+                    return Err(Error::Index {
+                        message: format!("Column {} is not a vector column", column),
+                        location: location!(),
+                    });
+                }?;
+                match index_metadata.index_type.as_str() {
+                    "FLAT" => match value_type {
+                        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                            let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
+                                self.object_store.clone(),
+                                self.indices_dir(),
+                                uuid.to_owned(),
+                                Arc::downgrade(&self.session),
+                            )
+                            .await?;
+                            Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                        }
+                        _ => Err(Error::Index {
+                            message: format!(
+                                "the field type {} is not supported for FLAT index",
+                                field.data_type()
+                            ),
+                            location: location!(),
+                        }),
+                    },
+
+                    "HNSW" => {
+                        let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    _ => Err(Error::Index {
+                        message: format!("Unsupported index type: {}", index_metadata.index_type),
+                        location: location!(),
+                    }),
+                }
             }
 
             _ => Err(Error::Index {
@@ -572,7 +633,10 @@ impl DatasetIndexInternalExt for Dataset {
                     .to_owned(),
                 location: location!(),
             }),
-        }
+        };
+        let index = index?;
+        self.session.index_cache.insert_vector(uuid, index.clone());
+        Ok(index)
     }
 
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {

@@ -5,6 +5,7 @@
 //!
 //! To improve Arrow-RS ergonomic
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -463,6 +464,19 @@ pub trait RecordBatchExt {
     /// Project the schema over the [RecordBatch].
     fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch>;
 
+    /// metadata of the schema.
+    fn metadata(&self) -> &HashMap<String, String>;
+
+    /// Add metadata to the schema.
+    fn add_metadata(&self, key: String, value: String) -> Result<RecordBatch> {
+        let mut metadata = self.metadata().clone();
+        metadata.insert(key, value);
+        self.with_metadata(metadata)
+    }
+
+    /// Replace the schema metadata with the provided one.
+    fn with_metadata(&self, metadata: HashMap<String, String>) -> Result<RecordBatch>;
+
     /// Take selected rows from the [RecordBatch].
     fn take(&self, indices: &UInt32Array) -> Result<RecordBatch>;
 }
@@ -547,6 +561,16 @@ impl RecordBatchExt for RecordBatch {
     fn project_by_schema(&self, schema: &Schema) -> Result<Self> {
         let struct_array: StructArray = self.clone().into();
         self.try_new_from_struct_array(project(&struct_array, schema.fields())?)
+    }
+
+    fn metadata(&self) -> &HashMap<String, String> {
+        self.schema_ref().metadata()
+    }
+
+    fn with_metadata(&self, metadata: HashMap<String, String>) -> Result<RecordBatch> {
+        let mut schema = self.schema_ref().as_ref().clone();
+        schema.metadata = metadata;
+        Self::try_new(schema.into(), self.columns().into())
     }
 
     fn take(&self, indices: &UInt32Array) -> Result<Self> {

@@ -583,7 +583,7 @@ impl CoreFieldDecoderStrategy {
     /// Helper method to verify the page encoding of a struct header column
     fn check_simple_struct(column_info: &ColumnInfo, path: &VecDeque<u32>) -> Result<()> {
         Self::ensure_values_encoded(column_info, path)?;
-        if !column_info.page_infos.len() == 1 {
+        if column_info.page_infos.len() != 1 {
             return Err(Error::InvalidInput { source: format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into(), location: location!() });
         }
         let encoding = &column_info.page_infos[0].encoding;

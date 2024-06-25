@@ -28,9 +28,7 @@ use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{
-    flat::flat_search, Query, VectorIndex, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
-};
+use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
@@ -44,7 +42,6 @@ use tracing::{instrument, Instrument};
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
-use crate::index::vector::ivf::IVFIndex;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 
@@ -487,12 +484,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                 let ds = ds.clone();
 
                 async move {
-                    let raw_index = ds.open_vector_index(&query.column, &uuid).await?;
-                    let index = raw_index.as_any().downcast_ref::<IVFIndex>().ok_or(
-                        DataFusionError::Execution(
-                            "ANNIVFPartitionExec: index is not a IVF type".to_string(),
-                        ),
-                    )?;
+                    let index = ds.open_vector_index(&query.column, &uuid).await?;
 
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
@@ -734,13 +726,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 .map(move |result| {
                     let query = query.clone();
                     async move {
-                        let (part_id, (raw_index, pre_filter)) = result?;
-
-                        let index = raw_index.as_any().downcast_ref::<IVFIndex>().ok_or(
-                            DataFusionError::Execution(
-                                "ANNSubIndexExec: sub-index is not a IVF type".to_string(),
-                            ),
-                        )?;
+                        let (part_id, (index, pre_filter)) = result?;
 
                         let mut query = query.clone();
                         if index.metric_type() == DistanceType::Cosine {
