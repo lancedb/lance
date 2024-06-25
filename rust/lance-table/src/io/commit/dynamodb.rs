@@ -173,19 +173,7 @@ impl DynamoDBExternalManifestStore {
                     location!(),
                 )
             })?;
-            let key_type = key.key_type.ok_or_else(|| {
-                Error::io(
-                    format!("dynamodb table: {table_name} key types must be defined"),
-                    location!(),
-                )
-            })?;
-            let name = key.attribute_name.ok_or_else(|| {
-                Error::io(
-                    format!("dynamodb table: {table_name} key must have an attribute name"),
-                    location!(),
-                )
-            })?;
-            match (key_type, name.as_str()) {
+            match (key.key_type, key.attribute_name.as_str()) {
                 (KeyType::Hash, base_uri!()) => {
                     has_hask_key = true;
                 }
@@ -195,7 +183,9 @@ impl DynamoDBExternalManifestStore {
                 _ => {
                     return Err(Error::io(
                         format!(
-                            "dynamodb table: {table_name} unknown key type encountered name:{name}",
+                            "dynamodb table: {} unknown key type encountered name:{}",
+                            table_name,
+                            key.attribute_name
                         ),
                         location!(),
                     ));
