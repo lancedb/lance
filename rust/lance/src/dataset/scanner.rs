@@ -2251,25 +2251,16 @@ mod test {
         let mut scan = dataset.scan();
         scan.project::<&str>(&[]).unwrap().with_row_id();
 
-        let results = scan
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
+        let batch = scan.try_into_batch().await.unwrap();
 
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.num_rows(), 400);
-        assert_eq!(
-            batch.schema().as_ref(),
-            &ArrowSchema::new(vec![ArrowField::new(ROW_ID, DataType::UInt64, true,)])
-        );
+        let expected_schema =
+            ArrowSchema::new(vec![ArrowField::new(ROW_ID, DataType::UInt64, true)])
+                .with_metadata(dataset.schema().metadata.clone());
+        assert_eq!(batch.schema().as_ref(), &expected_schema,);
 
-        let expected_row_ids: Vec<u64> = (0..400).map(|i| i as u64).collect();
+        let expected_row_ids: Vec<u64> = (0..200_u64).chain((1 << 32)..((1 << 32) + 200)).collect();
         let actual_row_ids: Vec<u64> = as_primitive_array::<UInt64Type>(batch.column(0).as_ref())
             .values()
             .iter()
