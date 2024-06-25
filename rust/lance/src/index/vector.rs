@@ -220,6 +220,8 @@ pub(crate) async fn build_vector_index(
         });
     };
 
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().to_str().unwrap().into();
     if is_ivf_flat(stages) {
         let StageParams::Ivf(ivf_params) = &stages[0] else {
             return Err(Error::Index {
@@ -227,8 +229,7 @@ pub(crate) async fn build_vector_index(
                 location: location!(),
             });
         };
-        let temp_dir = tempfile::tempdir()?;
-        let path = temp_dir.path().to_str().unwrap().into();
+
         let shuffler = IvfShuffler::new(path, ivf_params.num_partitions);
         IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
             dataset.clone(),
@@ -282,10 +283,7 @@ pub(crate) async fn build_vector_index(
             });
         };
 
-        let temp_dir = tempfile::tempdir()?;
-        let path = temp_dir.path().to_str().unwrap().into();
         let shuffler = IvfShuffler::new(path, ivf_params.num_partitions);
-
         // with quantization
         if len > 2 {
             match stages.last().unwrap() {
