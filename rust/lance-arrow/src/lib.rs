@@ -220,8 +220,7 @@ pub trait FixedSizeListArrayExt {
     /// ```
     fn sample(&self, n: usize) -> Result<FixedSizeListArray>;
 
-    /// Convert fixedSizeListArray content to floating type, if it is floating type, then leave as is
-    /// Int8 -> Float32
+    /// Convert FixedSizeListArray content to floating type
     fn convert_to_floating_point (self) -> Result<FixedSizeListArray>;
 }
 
