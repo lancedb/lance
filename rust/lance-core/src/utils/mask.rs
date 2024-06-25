@@ -363,6 +363,7 @@ impl RowIdTreeMap {
 
     /// Insert a range of values into the set
     pub fn insert_range<R: RangeBounds<u64>>(&mut self, range: R) -> u64 {
+        // Separate the start and end into high and low bits.
         let (mut start_high, mut start_low) = match range.start_bound() {
             std::ops::Bound::Included(&start) => ((start >> 32) as u32, start as u32),
             std::ops::Bound::Excluded(&start) => {

@@ -52,6 +52,10 @@ impl SchemaExt for Schema {
         Ok(Self::new_with_metadata(fields, self.metadata.clone()))
     }
 
+    /// Project the schema to remove the given column.
+    ///
+    /// This only works on top-level fields right now. If a field does not exist,
+    /// the schema will be returned as is.
     fn without_column(&self, column_name: &str) -> Schema {
         let fields: Vec<FieldRef> = self
             .fields()

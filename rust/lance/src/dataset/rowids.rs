@@ -144,6 +144,38 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_must_set_on_creation() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap();
+
+        let batch = sequence_batch(0..10);
+        let reader =
+            RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
+        let write_params = WriteParams {
+            enable_move_stable_row_ids: false,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, tmp_path, Some(write_params))
+            .await
+            .unwrap();
+        assert!(!dataset.manifest().uses_move_stable_row_ids());
+
+        // Trying to append without stable row ids should fail.
+        let write_params = WriteParams {
+            enable_move_stable_row_ids: true,
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let reader =
+            RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
+        let result = Dataset::write(reader, tmp_path, Some(write_params)).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(),
+                Error::NotSupported { source, .. } 
+                    if source.to_string().contains("Cannot enable stable row ids on existing dataset")));
+    }
+
+    #[tokio::test]
     async fn test_new_row_ids() {
         let num_rows = 25u64;
         let batch = sequence_batch(0..num_rows as i32);

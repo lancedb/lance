@@ -356,6 +356,17 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<Index>)> {
+        if config.use_move_stable_row_ids
+            && current_manifest
+                .map(|m| !m.uses_move_stable_row_ids())
+                .unwrap_or_default()
+        {
+            return Err(Error::NotSupported {
+                source: "Cannot enable stable row ids on existing dataset".into(),
+                location: location!(),
+            });
+        }
+
         // Get the schema and the final fragment list
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),

@@ -3835,9 +3835,12 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_plans(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_plans(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_id: bool,
+    ) -> Result<()> {
         // Create a vector dataset
-        let mut dataset = TestVectorDataset::new(use_legacy_format, false).await?;
+        let mut dataset = TestVectorDataset::new(use_legacy_format, stable_row_id).await?;
 
         // Scans
         // ---------------------------------------------------------------------
