@@ -2243,7 +2243,9 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_only_row_id(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
