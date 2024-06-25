@@ -15,10 +15,12 @@ use crate::{
     decoder::{ColumnInfo, PageInfo},
     encodings::{
         logical::{
-            binary::BinaryFieldEncoder, list::ListFieldEncoder, primitive::PrimitiveFieldEncoder,
-            r#struct::StructFieldEncoder,
+            list::ListFieldEncoder, primitive::PrimitiveFieldEncoder, r#struct::StructFieldEncoder,
         },
-        physical::{basic::BasicEncoder, fixed_size_list::FslEncoder, value::ValueEncoder},
+        physical::{
+            basic::BasicEncoder, binary::BinaryEncoder, fixed_size_list::FslEncoder,
+            value::ValueEncoder,
+        },
     },
     format::pb,
 };
@@ -99,7 +101,7 @@ pub struct EncodedPage {
     // The encoded array data
     pub array: EncodedArray,
     /// The number of rows in the encoded page
-    pub num_rows: u32,
+    pub num_rows: u64,
     /// The index of the column
     pub column_idx: u32,
 }
@@ -234,6 +236,15 @@ impl CoreArrayEncodingStrategy {
                     *dimension as u32,
                 )))))
             }
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+                let bin_indices_encoder = Self::array_encoder_from_type(&DataType::UInt64)?;
+                let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8)?;
+
+                Ok(Box::new(BinaryEncoder::new(
+                    bin_indices_encoder,
+                    bin_bytes_encoder,
+                )))
+            }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::try_new(data_type, get_compression_scheme())?,
             )))),
@@ -346,7 +357,11 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
             | DataType::UInt64
             | DataType::UInt8
             | DataType::FixedSizeBinary(_)
-            | DataType::FixedSizeList(_, _) => Ok(Box::new(PrimitiveFieldEncoder::try_new(
+            | DataType::FixedSizeList(_, _)
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Utf8
+            | DataType::LargeUtf8 => Ok(Box::new(PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_column,
                 keep_original_array,
                 self.array_encoding_strategy.clone(),
@@ -388,15 +403,6 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                 Ok(Box::new(StructFieldEncoder::new(
                     children_encoders,
                     header_idx,
-                )))
-            }
-            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
-                let list_idx = column_index.next_column_index(field.id);
-                column_index.skip();
-                Ok(Box::new(BinaryFieldEncoder::new(
-                    cache_bytes_per_column,
-                    keep_original_array,
-                    list_idx,
                 )))
             }
             _ => todo!("Implement encoding for field {}", field),
