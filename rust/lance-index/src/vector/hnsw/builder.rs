@@ -293,7 +293,7 @@ impl HnswBuilder {
             .collect::<Vec<_>>();
 
         let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get()));
-        for _ in 0..(num_cpus::get() * 2) {
+        for _ in 0..num_cpus::get() {
             visited_generator_queue
                 .push(VisitedGenerator::new(0))
                 .unwrap();
