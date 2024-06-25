@@ -789,6 +789,13 @@ impl Index for BTreeIndex {
         self
     }
 
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Err(Error::NotSupported {
+            source: "BTreeIndex is not vector index".into(),
+            location: location!(),
+        })
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::Scalar
     }

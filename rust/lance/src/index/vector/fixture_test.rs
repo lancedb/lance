@@ -14,11 +14,14 @@ mod test {
 
     use approx::assert_relative_eq;
     use arrow::array::AsArray;
-    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::ivf::storage::IvfModel;
+    use lance_index::vector::quantizer::{QuantizationType, Quantizer};
+    use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{vector::Query, Index, IndexType};
     use lance_io::{local::LocalObjectReader, traits::Reader};
     use lance_linalg::distance::MetricType;
@@ -29,7 +32,7 @@ mod test {
     use crate::{
         index::{
             prefilter::{DatasetPreFilter, PreFilter},
-            vector::ivf::{IVFIndex, Ivf},
+            vector::ivf::IVFIndex,
         },
         session::Session,
         Result,
@@ -63,6 +66,10 @@ mod test {
             self
         }
 
+        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+            Ok(self)
+        }
+
         /// Retrieve index statistics as a JSON Value
         fn statistics(&self) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
@@ -91,6 +98,19 @@ mod test {
                 assert_relative_eq!(v, i.unwrap());
             }
             Ok(self.ret_val.clone())
+        }
+
+        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+            unimplemented!("only for IVF")
+        }
+
+        async fn search_in_partition(
+            &self,
+            _: usize,
+            _: &Query,
+            _: Arc<dyn PreFilter>,
+        ) -> Result<RecordBatch> {
+            unimplemented!("only for IVF")
         }
 
         fn is_loadable(&self) -> bool {
@@ -122,6 +142,18 @@ mod test {
             Ok(())
         }
 
+        fn ivf_model(&self) -> IvfModel {
+            unimplemented!("only for IVF")
+        }
+        fn quantizer(&self) -> Quantizer {
+            unimplemented!("only for IVF")
+        }
+
+        /// the index type of this vector index.
+        fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+            unimplemented!("only for IVF")
+        }
+
         /// The metric type of this vector index.
         fn metric_type(&self) -> MetricType {
             self.metric_type
@@ -132,10 +164,10 @@ mod test {
     async fn test_ivf_residual_handling() {
         let centroids = Float32Array::from_iter(vec![1.0, 1.0, -1.0, -1.0, -1.0, 1.0, 1.0, -1.0]);
         let centroids = FixedSizeListArray::try_new_from_values(centroids, 2).unwrap();
-        let mut ivf = Ivf::new(centroids);
+        let mut ivf = IvfModel::new(centroids);
         // Add 4 partitions
         for _ in 0..4 {
-            ivf.add_partition(0, 0);
+            ivf.add_partition(0);
         }
         // hold on to this pointer, because the index only holds a weak reference
         let session = Arc::new(Session::default());

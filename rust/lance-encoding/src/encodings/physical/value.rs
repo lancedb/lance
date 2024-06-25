@@ -3,7 +3,7 @@
 
 use arrow_array::ArrayRef;
 use arrow_schema::DataType;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::DataTypeExt;
 use log::trace;
@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
@@ -82,17 +82,17 @@ impl ValuePageScheduler {
 impl PageScheduler for ValuePageScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
+        ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let (mut min, mut max) = (u64::MAX, 0);
         let byte_ranges = if self.compression_scheme == CompressionScheme::None {
             ranges
                 .iter()
                 .map(|range| {
-                    let start = self.buffer_offset + (range.start as u64 * self.bytes_per_value);
-                    let end = self.buffer_offset + (range.end as u64 * self.bytes_per_value);
+                    let start = self.buffer_offset + (range.start * self.bytes_per_value);
+                    let end = self.buffer_offset + (range.end * self.bytes_per_value);
                     min = min.min(start);
                     max = max.max(end);
                     start..end
@@ -122,8 +122,8 @@ impl PageScheduler for ValuePageScheduler {
             ranges
                 .iter()
                 .map(|range| {
-                    let start = (range.start as u64 * bytes_per_value) as usize;
-                    let end = (range.end as u64 * bytes_per_value) as usize;
+                    let start = (range.start * bytes_per_value) as usize;
+                    let end = (range.end * bytes_per_value) as usize;
                     start..end
                 })
                 .collect::<Vec<_>>()
@@ -139,7 +139,7 @@ impl PageScheduler for ValuePageScheduler {
                 data: bytes,
                 uncompressed_data: Arc::new(Mutex::new(None)),
                 uncompressed_range_offsets: range_offsets,
-            }) as Box<dyn PhysicalPageDecoder>)
+            }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
@@ -203,26 +203,17 @@ impl ValuePageDecoder {
     }
 }
 
-impl PhysicalPageDecoder for ValuePageDecoder {
-    fn update_capacity(
+impl PrimitivePageDecoder for ValuePageDecoder {
+    fn decode(
         &self,
-        _rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
+        rows_to_skip: u64,
+        num_rows: u64,
         _all_null: &mut bool,
-    ) {
-        buffers[0].0 = self.bytes_per_value * num_rows as u64;
-        buffers[0].1 = true;
-    }
+    ) -> Result<Vec<BytesMut>> {
+        let mut bytes_to_skip = rows_to_skip * self.bytes_per_value;
+        let mut bytes_to_take = num_rows * self.bytes_per_value;
 
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [bytes::BytesMut],
-    ) -> Result<()> {
-        let mut bytes_to_skip = rows_to_skip as u64 * self.bytes_per_value;
-        let mut bytes_to_take = num_rows as u64 * self.bytes_per_value;
+        let mut dest_buffers = vec![BytesMut::with_capacity(bytes_to_take as usize)];
 
         let dest = &mut dest_buffers[0];
 
@@ -238,7 +229,7 @@ impl PhysicalPageDecoder for ValuePageDecoder {
                 self.decode_buffer(buf, &mut bytes_to_skip, &mut bytes_to_take, dest);
             }
         }
-        Ok(())
+        Ok(dest_buffers)
     }
 
     fn num_buffers(&self) -> u32 {

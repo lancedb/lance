@@ -442,7 +442,7 @@ impl FileFragment {
         with_row_id: bool,
         with_row_address: bool,
     ) -> Result<FragmentReader> {
-        let open_files = self.open_readers(projection, with_row_id, with_row_address);
+        let open_files = self.open_readers(projection);
         let deletion_vec_load =
             self.load_deletion_vector(&self.dataset.object_store, &self.metadata);
 
@@ -460,16 +460,18 @@ impl FileFragment {
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
 
-        if opened_files.is_empty() {
+        if opened_files.is_empty() && !with_row_id && !with_row_address {
             return Err(Error::io(
                 format!(
-                    "Does not find any data file for schema: {}\nfragment_id={}",
+                    "Did not find any data files for schema: {}\nfragment_id={}",
                     projection,
                     self.id()
                 ),
                 location!(),
             ));
         }
+
+        let num_physical_rows = self.physical_rows().await?;
 
         let mut reader = FragmentReader::try_new(
             self.id(),
@@ -478,6 +480,7 @@ impl FileFragment {
             opened_files,
             ArrowSchema::from(projection),
             self.count_rows().await?,
+            num_physical_rows,
         )?;
 
         if with_row_id {
@@ -498,8 +501,6 @@ impl FileFragment {
         &self,
         data_file: &DataFile,
         projection: Option<&Schema>,
-        with_row_id: bool,
-        with_row_address: bool,
     ) -> Result<Option<(Box<dyn GenericFileReader>, Arc<Schema>)>> {
         let full_schema = self.dataset.schema();
         // The data file may contain fields that are not part of the dataset any longer, remove those
@@ -510,7 +511,7 @@ impl FileFragment {
 
         if data_file.is_legacy_file() {
             let max_field_id = data_file.fields.iter().max().unwrap();
-            if with_row_id || with_row_address || !schema_per_file.fields.is_empty() {
+            if !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
                 let reader = FileReader::try_new_with_fragment_id(
@@ -566,17 +567,10 @@ impl FileFragment {
     async fn open_readers(
         &self,
         projection: &Schema,
-        with_row_id: bool,
-        with_row_address: bool,
     ) -> Result<Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>> {
         let mut opened_files = vec![];
-        for (i, data_file) in self.metadata.files.iter().enumerate() {
-            // TODO: do we still need to do this?
-            let with_row_id = (with_row_id || with_row_address) && i == 0;
-            if let Some((reader, schema)) = self
-                .open_reader(data_file, Some(projection), with_row_id, with_row_address)
-                .await?
-            {
+        for data_file in &self.metadata.files {
+            if let Some((reader, schema)) = self.open_reader(data_file, Some(projection)).await? {
                 opened_files.push((reader, schema));
             }
         }
@@ -668,16 +662,16 @@ impl FileFragment {
 
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
-        let (reader, _) = self
-            .open_reader(some_file, None, false, false)
-            .await?
-            .ok_or_else(|| Error::Internal {
-                message: format!(
-                    "The data file {} did not have any fields contained in the dataset schema",
-                    some_file.path
-                ),
-                location: location!(),
-            })?;
+        let (reader, _) =
+            self.open_reader(some_file, None)
+                .await?
+                .ok_or_else(|| Error::Internal {
+                    message: format!(
+                        "The data file {} did not have any fields contained in the dataset schema",
+                        some_file.path
+                    ),
+                    location: location!(),
+                })?;
 
         Ok(reader.len() as usize)
     }
@@ -762,16 +756,13 @@ impl FileFragment {
         }
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
-            let (reader, _) = self
-                .open_reader(data_file, None, false, false)
-                .await?
-                .ok_or_else(|| {
-                    Error::corrupt_file(
-                        self.dataset.data_dir().child(data_file.path.clone()),
-                        "did not have any fields in common with the dataset schema",
-                        location!(),
-                    )
-                })?;
+            let (reader, _) = self.open_reader(data_file, None).await?.ok_or_else(|| {
+                Error::corrupt_file(
+                    self.dataset.data_dir().child(data_file.path.clone()),
+                    "did not have any fields in common with the dataset schema",
+                    location!(),
+                )
+            })?;
             Result::Ok(reader.len() as usize)
         });
         let get_lengths = try_join_all(get_lengths);
@@ -1207,8 +1198,11 @@ pub struct FragmentReader {
     /// If false, deleted rows will be removed from the batch, requiring a copy
     make_deletions_null: bool,
 
-    // total number of rows in the fragment
+    // total number of real rows in the fragment (num_physical_rows - num_deleted_rows)
     num_rows: usize,
+
+    // total number of physical rows in the fragment (all rows, ignoring deletions)
+    num_physical_rows: usize,
 }
 
 // Custom clone impl needed because it is not easy to clone Box<dyn GenericFileReader>
@@ -1231,6 +1225,7 @@ impl Clone for FragmentReader {
             with_row_addr: self.with_row_addr,
             make_deletions_null: self.make_deletions_null,
             num_rows: self.num_rows,
+            num_physical_rows: self.num_physical_rows,
         }
     }
 }
@@ -1264,15 +1259,9 @@ impl FragmentReader {
         readers: Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>,
         output_schema: ArrowSchema,
         num_rows: usize,
+        num_physical_rows: usize,
     ) -> Result<Self> {
-        if readers.is_empty() {
-            return Err(Error::io(
-                "Cannot create FragmentReader with zero readers".to_string(),
-                location!(),
-            ));
-        }
-
-        if let Some(legacy_reader) = readers[0].0.as_legacy_opt() {
+        if let Some(legacy_reader) = readers.first().and_then(|reader| reader.0.as_legacy_opt()) {
             let num_batches = legacy_reader.num_batches();
             for reader in readers.iter().skip(1) {
                 if let Some(other_legacy) = reader.0.as_legacy_opt() {
@@ -1301,6 +1290,7 @@ impl FragmentReader {
             with_row_addr: false,
             make_deletions_null: false,
             num_rows,
+            num_physical_rows,
         })
     }
 
@@ -1350,7 +1340,7 @@ impl FragmentReader {
     /// use streams, the updater still needs to know the batch size in v1 so that it can create
     /// files with the same batch size.
     pub(crate) fn legacy_num_rows_in_batch(&self, batch_id: u32) -> Option<u32> {
-        if let Some(legacy_reader) = self.readers[0].0.as_legacy_opt() {
+        if let Some(legacy_reader) = self.readers.first().and_then(|r| r.0.as_legacy_opt()) {
             if batch_id < legacy_reader.num_batches() as u32 {
                 Some(legacy_reader.num_rows_in_batch(batch_id as i32) as u32)
             } else {
@@ -1513,7 +1503,7 @@ impl FragmentReader {
         batch_size: u32,
         read_fn: impl Fn(&dyn GenericFileReader, &Arc<Schema>) -> Result<ReadBatchTaskStream>,
     ) -> Result<ReadBatchFutStream> {
-        let total_num_rows = self.readers[0].0.len();
+        let total_num_rows = self.num_physical_rows as u32;
         // Note that the fragment length might be considerably smaller if there are deleted rows.
         // E.g. if a fragment has 100 rows but rows 0..10 are deleted we still need to make
         // sure it is valid to read / take 0..100

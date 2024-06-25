@@ -14,8 +14,9 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
+use snafu::{location, Location};
 
 use crate::{Index, IndexType};
 
@@ -155,6 +156,13 @@ impl Index for FlatIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Err(Error::NotSupported {
+            source: "FlatIndex is not vector index".into(),
+            location: location!(),
+        })
     }
 
     fn index_type(&self) -> IndexType {

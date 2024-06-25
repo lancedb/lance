@@ -35,7 +35,7 @@ pub trait ShuffleReader: Send + Sync {
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>;
 
     /// Get the size of the partition by partition_id
-    fn partiton_size(&self, partition_id: usize) -> Result<usize>;
+    fn partition_size(&self, partition_id: usize) -> Result<usize>;
 }
 
 #[async_trait::async_trait]
@@ -51,7 +51,7 @@ pub trait Shuffler: Send + Sync {
 }
 
 pub struct IvfShuffler {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     output_dir: Path,
     num_partitions: usize,
 
@@ -60,9 +60,9 @@ pub struct IvfShuffler {
 }
 
 impl IvfShuffler {
-    pub fn new(object_store: ObjectStore, output_dir: Path, num_partitions: usize) -> Self {
+    pub fn new(output_dir: Path, num_partitions: usize) -> Self {
         Self {
-            object_store,
+            object_store: Arc::new(ObjectStore::local()),
             output_dir,
             num_partitions,
             buffer_size: 4096,
@@ -84,8 +84,6 @@ impl Shuffler for IvfShuffler {
         let mut writers: Vec<FileWriter> = vec![];
         let mut partition_sizes = vec![0; self.num_partitions];
         let mut first_pass = true;
-
-        let mut counter = 0;
 
         let num_partitions = self.num_partitions;
         let mut parallel_sort_stream = data
@@ -133,8 +131,8 @@ impl Shuffler for IvfShuffler {
             .map(|_| Vec::new())
             .collect::<Vec<_>>();
 
+        let mut counter = 0;
         while let Some(shuffled) = parallel_sort_stream.next().await {
-            log::info!("shuffle batch: {}", counter);
             let shuffled = shuffled?;
 
             for (part_id, batches) in shuffled.into_iter().enumerate() {
@@ -176,6 +174,7 @@ impl Shuffler for IvfShuffler {
 
             // do flush
             if counter % self.buffer_size == 0 {
+                log::info!("shuffle {} batches, flushing", counter);
                 let mut futs = vec![];
                 for (part_id, writer) in writers.iter_mut().enumerate() {
                     let batches = &partition_buffers[part_id];
@@ -208,18 +207,32 @@ impl Shuffler for IvfShuffler {
             writer.finish().await?;
         }
 
-        Ok(Box::new(IvfShufflerReader {
-            object_store: self.object_store.clone(),
-            output_dir: self.output_dir.clone(),
+        Ok(Box::new(IvfShufflerReader::new(
+            self.object_store.clone(),
+            self.output_dir.clone(),
             partition_sizes,
-        }))
+        )))
     }
 }
 
 pub struct IvfShufflerReader {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     output_dir: Path,
     partition_sizes: Vec<usize>,
+}
+
+impl IvfShufflerReader {
+    pub fn new(
+        object_store: Arc<ObjectStore>,
+        output_dir: Path,
+        partition_sizes: Vec<usize>,
+    ) -> Self {
+        Self {
+            object_store,
+            output_dir,
+            partition_sizes,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -228,7 +241,7 @@ impl ShuffleReader for IvfShufflerReader {
         &self,
         partition_id: usize,
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
-        let scheduler = ScanScheduler::new(Arc::new(self.object_store.clone()), 32);
+        let scheduler = ScanScheduler::new(self.object_store.clone(), 32);
         let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
 
         let reader = FileReader::try_open(
@@ -250,7 +263,7 @@ impl ShuffleReader for IvfShufflerReader {
         ))))
     }
 
-    fn partiton_size(&self, partition_id: usize) -> Result<usize> {
+    fn partition_size(&self, partition_id: usize) -> Result<usize> {
         Ok(self.partition_sizes[partition_id])
     }
 }
