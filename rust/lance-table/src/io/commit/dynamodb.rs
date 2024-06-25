@@ -184,8 +184,7 @@ impl DynamoDBExternalManifestStore {
                     return Err(Error::io(
                         format!(
                             "dynamodb table: {} unknown key type encountered name:{}",
-                            table_name,
-                            key.attribute_name
+                            table_name, key.attribute_name
                         ),
                         location!(),
                     ));
