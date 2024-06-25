@@ -133,7 +133,7 @@ impl Transformer for KeepFiniteVectors {
                         DataType::Float16 => is_all_finite::<Float16Type>(&data),
                         DataType::Float32 => is_all_finite::<Float32Type>(&data),
                         DataType::Float64 => is_all_finite::<Float64Type>(&data),
-                        DataType::Int8 => true,
+                        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => true,
                         _ => false,
                     };
                     if is_valid {

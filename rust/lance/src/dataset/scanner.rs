@@ -450,6 +450,9 @@ impl Scanner {
                     DataType::Float32 => coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?,
                     DataType::Float64 => coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?,
                     DataType::Int8 => coerce_float_vector(q, FloatType::try_from(&DataType::Float32)?)?,
+                    DataType::Int16 => coerce_float_vector(q, FloatType::try_from(&DataType::Float32)?)?,
+                    DataType::Int32 => coerce_float_vector(q, FloatType::try_from(&DataType::Float32)?)?,
+                    DataType::Int64 => coerce_float_vector(q, FloatType::try_from(&DataType::Float64)?)?,
                     _ => {
                         return Err(Error::io(
                             format!(

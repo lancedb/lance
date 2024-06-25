@@ -951,16 +951,14 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
         ));
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-        match elem_type.data_type() {
-            DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType:: Int8 => (),
-            _ => 
-                return Err(Error::Index{
-                    message:format!(
-                        "VectorIndex requires the column data type to be fixed size list of f16/f32/f64/i8, got {}",
-                        elem_type.data_type()
-                    ),
-                    location: location!()
-                })
+        if !elem_type.data_type().is_floating() &&  !elem_type.data_type().is_signed_integer() {
+            return Err(Error::Index{
+                message:format!(
+                    "VectorIndex requires the column data type to be fixed size list of f16/f32/f64/i8/i16/i32/i64, got {}",
+                    elem_type.data_type()
+                ),
+                location: location!()
+            });
         }
     } else {
         return Err(Error::Index {
