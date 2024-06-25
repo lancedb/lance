@@ -14,7 +14,7 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
-use lance_linalg::distance::{DistanceType};
+use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
@@ -25,6 +25,7 @@ use super::flat::index::FlatQuantizer;
 use super::pq::ProductQuantizer;
 use super::sq::builder::SQBuildParams;
 use super::sq::storage::SQ_METADATA_KEY;
+use super::SQ_CODE_COLUMN;
 use super::{
     ivf::storage::IvfModel,
     sq::{
@@ -33,7 +34,6 @@ use super::{
     },
     storage::VectorStore,
 };
-use super::{SQ_CODE_COLUMN};
 
 pub trait Quantization: Send + Sync + Debug + DeepSizeOf + Into<Quantizer> {
     type BuildParams: QuantizerBuildParams;

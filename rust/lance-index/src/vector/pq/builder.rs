@@ -4,14 +4,11 @@
 //! Product Quantizer Builder
 //!
 
-
 use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::types::{Float16Type, Float64Type};
-use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, ArrayRef,
-};
-use arrow_array::{FixedSizeListArray};
+use arrow_array::FixedSizeListArray;
+use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
 use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
@@ -23,7 +20,7 @@ use snafu::{location, Location};
 
 use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;
-use crate::vector::{kmeans::train_kmeans};
+use crate::vector::kmeans::train_kmeans;
 
 /// Parameters for building product quantizer.
 #[derive(Debug, Clone)]
