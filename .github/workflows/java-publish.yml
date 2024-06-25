@@ -1,4 +1,4 @@
-name: Build and publish Java packages
+name: Build and publish Java packages Lu debug
 on:
   release:
     types: [released]
@@ -40,6 +40,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Set up Node.js 16
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
