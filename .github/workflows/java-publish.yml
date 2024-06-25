@@ -80,6 +80,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - name: Set up Node.js 16
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
       - name: Set up Java 8
         uses: actions/setup-java@v4
         with:
@@ -97,18 +101,19 @@ jobs:
         uses: actions/download-artifact@v4
       - name: Copy native libs
         run: |
-          mkdir -p ./core/target/classes/nativelib/darwin-aarch64 ./core/target/classes/nativelib/linux-aarch64
-          cp ../liblance_jni_darwin_aarch64.zip/liblance_jni.dylib ./core/target/classes/nativelib/darwin-aarch64/liblance_jni.dylib
-          cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
-      #- name: Build and publish with Java 8
+          mkdir -p ./core/src/main/resources/nativelib/darwin-aarch64 ./core/src/main/resources/nativelib/linux-aarch64
+          cp ../liblance_jni_darwin_aarch64.zip/liblance_jni.dylib ./core/src/main/resources/nativelib/darwin-aarch64/liblance_jni.dylib
+          cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/src/main/resources/nativelib/linux-aarch64/liblance_jni.so
+      - name: Build and publish with Java 8
       #  run: |
       #    mvn release:prepare -DdryRun=true
-      
-      - name: Create Lance Spark Jar with scala 2.13
         run: |
           mvn clean install -Pscala-2.13
-          JAR_PATH=$(find spark/target -name 'lance-spark-2.13-*-jar-with-dependencies.jar')
-          JAR_NAME=$(basename $JAR_PATH)
+      - name: Find Spark Jar
+        run: |
+          RELATIVE_JAR_PATH=$(find spark/target -name 'lance-spark-2.13-*-jar-with-dependencies.jar')
+          JAR_NAME=$(basename $RELATIVE_JAR_PATH)
+          JAR_PATH=$(readlink -f "$RELATIVE_JAR_PATH")
           echo "JAR_PATH=$JAR_PATH" >> $GITHUB_ENV
           echo "JAR_NAME=$JAR_NAME" >> $GITHUB_ENV
       - uses: actions/upload-artifact@v4
