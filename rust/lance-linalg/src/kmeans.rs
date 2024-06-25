@@ -685,20 +685,30 @@ pub fn compute_partitions<T: Float + L2 + Dot + Sync>(
     let dimension = dimension.as_();
     vectors
         .par_chunks(dimension)
-        .map(|vec| {
-            argmin_value(match distance_type {
-                DistanceType::L2 => l2_distance_batch(vec, centroids, dimension),
-                DistanceType::Dot => dot_distance_batch(vec, centroids, dimension),
-                _ => {
-                    panic!(
-                        "KMeans::find_partitions: {} is not supported",
-                        distance_type
-                    );
-                }
-            })
-            .map(|(idx, _)| idx)
-        })
+        .map(|vec| compute_partition(centroids, vec, distance_type))
         .collect::<Vec<_>>()
+}
+
+#[inline]
+pub fn compute_partition<T: Float + L2 + Dot>(
+    centroids: &[T],
+    vector: &[T],
+    distance_type: DistanceType,
+) -> Option<u32> {
+    match distance_type {
+        DistanceType::L2 => {
+            argmin_value_float(l2_distance_batch(vector, centroids, vector.len())).map(|c| c.0)
+        }
+        DistanceType::Dot => {
+            argmin_value_float(dot_distance_batch(vector, centroids, vector.len())).map(|c| c.0)
+        }
+        _ => {
+            panic!(
+                "KMeans::compute_partition: distance type {} is not supported",
+                distance_type
+            );
+        }
+    }
 }
 
 #[cfg(test)]
