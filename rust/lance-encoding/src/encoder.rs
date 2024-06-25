@@ -244,35 +244,25 @@ impl CoreArrayEncodingStrategy {
                     *dimension as u32,
                 )))))
             }
-            DataType::Utf8 => {
-                if get_str_encoding_type() {
-                    if use_dict_encoding {
-                        let dict_indices_encoder =
-                            Self::array_encoder_from_type(&DataType::UInt64, false)?;
-                        let dict_items_encoder =
-                            Self::array_encoder_from_type(&DataType::Utf8, false)?;
-
-                        Ok(Box::new(DictionaryEncoder::new(
-                            dict_indices_encoder,
-                            dict_items_encoder,
-                        )))
-                    } else {
-                        let bin_indices_encoder =
-                            Self::array_encoder_from_type(&DataType::UInt64, false)?;
-                        let bin_bytes_encoder =
-                            Self::array_encoder_from_type(&DataType::UInt8, false)?;
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
-                let bin_indices_encoder = Self::array_encoder_from_type(&DataType::UInt64)?;
-                let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8)?;
+                if use_dict_encoding {
+                    let dict_indices_encoder =
+                        Self::array_encoder_from_type(&DataType::UInt64, false)?;
+                    let dict_items_encoder =
+                        Self::array_encoder_from_type(&DataType::Utf8, false)?;
 
-                    Ok(Box::new(BinaryEncoder::new(
-                        bin_indices_encoder,
-                        bin_bytes_encoder,
+                    Ok(Box::new(DictionaryEncoder::new(
+                        dict_indices_encoder,
+                        dict_items_encoder,
                     )))
                 } else {
-                    Ok(Box::new(BasicEncoder::new(Box::new(
-                        ValueEncoder::try_new(data_type, get_compression_scheme())?,
-                    ))))
+                    let bin_indices_encoder = Self::array_encoder_from_type(&DataType::UInt64, false)?;
+                    let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8, false)?;
+
+                        Ok(Box::new(BinaryEncoder::new(
+                            bin_indices_encoder,
+                            bin_bytes_encoder,
+                        )))
                 }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
@@ -302,8 +292,6 @@ fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
                 }
             }
         }
-
-        println!("Number of distinct elements: {}", curr_dict_index);
     }
 
     curr_dict_index < 100

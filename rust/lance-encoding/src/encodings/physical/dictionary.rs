@@ -30,14 +30,14 @@ use arrow_array::cast::AsArray;
 pub struct DictionaryPageScheduler {
     indices_scheduler: Arc<dyn PageScheduler>,
     items_scheduler: Arc<dyn PageScheduler>,
-    size: u32,
+    size: u64,
 }
 
 impl DictionaryPageScheduler {
     pub fn new(
         indices_scheduler: Arc<dyn PageScheduler>,
         items_scheduler: Arc<dyn PageScheduler>,
-        size: u32,
+        size: u64,
     ) -> Self {
         Self {
             indices_scheduler,
@@ -50,7 +50,7 @@ impl DictionaryPageScheduler {
 impl PageScheduler for DictionaryPageScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
+        ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
@@ -108,8 +108,8 @@ struct DictionaryPageDecoder {
 impl PrimitivePageDecoder for DictionaryPageDecoder {
     fn decode(
         &self,
-        rows_to_skip: u32,
-        num_rows: u32,
+        rows_to_skip: u64,
+        num_rows: u64,
         all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
         // Decode the indices
@@ -141,7 +141,7 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
         let final_offsets = BytesMut::from(offsets);
         let final_bytes = BytesMut::from(bytes);
 
-        Ok(vec![final_offsets, final_nulls, final_bytes])
+        Ok(vec![final_nulls, final_offsets, final_bytes])
     }
 
     fn num_buffers(&self) -> u32 {
@@ -218,7 +218,7 @@ impl ArrayEncoder for DictionaryEncoder {
             let mut encoded_buffers = encoded_indices.buffers;
             encoded_buffers.extend(encoded_items.buffers);
 
-            let dict_size = items_array.len() as u32;
+            let dict_size = items_array.len() as u64;
 
             Ok(EncodedArray {
                 buffers: encoded_buffers,

@@ -26,7 +26,7 @@ use lance_core::{Error, Result};
 
 pub fn new_primitive_array<T: ArrowPrimitiveType>(
     buffers: Vec<BytesMut>,
-    num_rows: u32,
+    num_rows: u64,
     data_type: &DataType,
 ) -> ArrayRef {
     let mut buffer_iter = buffers.into_iter();
@@ -50,7 +50,7 @@ pub fn new_primitive_array<T: ArrowPrimitiveType>(
     Arc::new(PrimitiveArray::<T>::new(data_buffer, null_buffer).with_data_type(data_type.clone()))
 }
 
-fn bytes_to_validity(bytes: BytesMut, num_rows: u32) -> Option<NullBuffer> {
+fn bytes_to_validity(bytes: BytesMut, num_rows: u64) -> Option<NullBuffer> {
     if bytes.is_empty() {
         None
     } else {
@@ -66,7 +66,7 @@ fn bytes_to_validity(bytes: BytesMut, num_rows: u32) -> Option<NullBuffer> {
 pub fn primitive_array_from_buffers(
     data_type: &DataType,
     buffers: Vec<BytesMut>,
-    num_rows: u32,
+    num_rows: u64,
 ) -> Result<ArrayRef> {
     match data_type {
         DataType::Boolean => {
@@ -209,7 +209,7 @@ pub fn primitive_array_from_buffers(
             let items_array = primitive_array_from_buffers(
                 items.data_type(),
                 remaining_buffers,
-                num_rows * (*dimension as u32),
+                num_rows * (*dimension as u64),
             )?;
             Ok(Arc::new(FixedSizeListArray::new(
                 items.clone(),

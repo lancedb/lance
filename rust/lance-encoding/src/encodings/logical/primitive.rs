@@ -533,69 +533,69 @@ impl PrimitiveFieldDecodeTask {
             DataType::LargeBinary => Ok(Self::new_generic_byte_array::<GenericBinaryType<i64>>(
                 buffers, num_rows,
             )),
-            DataType::Utf8 => {
-                let num_buffers = buffers.len();
+            // DataType::Utf8 => {
+            //     let num_buffers = buffers.len();
 
-                if !get_dict_encoding() || (num_buffers == 3) {
-                    let mut buffer_iter = buffers.into_iter();
-                    // iterate over buffers to get offsets and then bytes
-                    let indices_bytes = buffer_iter.next().unwrap().freeze();
-                    let indices_buffer = Buffer::from_bytes(indices_bytes.into());
-                    let indices_buffer =
-                        ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
+            //     if !get_dict_encoding() || (num_buffers == 3) {
+            //         let mut buffer_iter = buffers.into_iter();
+            //         // iterate over buffers to get offsets and then bytes
+            //         let indices_bytes = buffer_iter.next().unwrap().freeze();
+            //         let indices_buffer = Buffer::from_bytes(indices_bytes.into());
+            //         let indices_buffer =
+            //             ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
 
-                    let offsets = OffsetBuffer::new(indices_buffer.clone());
+            //         let offsets = OffsetBuffer::new(indices_buffer.clone());
 
-                    // TODO - add NULL support
-                    // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
-                    let _null_buffer = buffer_iter.next().unwrap();
+            //         // TODO - add NULL support
+            //         // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
+            //         let _null_buffer = buffer_iter.next().unwrap();
 
-                    let bytes_buffer = buffer_iter.next().unwrap().freeze();
-                    let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
-                    let bytes_buffer_len = bytes_buffer.len();
-                    let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
+            //         let bytes_buffer = buffer_iter.next().unwrap().freeze();
+            //         let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
+            //         let bytes_buffer_len = bytes_buffer.len();
+            //         let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
 
-                    let bytes_array = Arc::new(
-                        PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
-                            .with_data_type(DataType::UInt8),
-                    );
+            //         let bytes_array = Arc::new(
+            //             PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
+            //                 .with_data_type(DataType::UInt8),
+            //         );
 
-                    Ok(Arc::new(StringArray::new(
-                        offsets,
-                        bytes_array.values().into(),
-                        None,
-                    )))
-                } else {
-                    let mut buffer_iter = buffers.clone().into_iter();
+            //         Ok(Arc::new(StringArray::new(
+            //             offsets,
+            //             bytes_array.values().into(),
+            //             None,
+            //         )))
+            //     } else {
+            //         let mut buffer_iter = buffers.clone().into_iter();
 
-                    let indices_bytes = buffer_iter.next().unwrap().freeze();
-                    let indices_buffer = Buffer::from_bytes(indices_bytes.into());
-                    let indices_buffer =
-                        ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
+            //         let indices_bytes = buffer_iter.next().unwrap().freeze();
+            //         let indices_buffer = Buffer::from_bytes(indices_bytes.into());
+            //         let indices_buffer =
+            //             ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
 
-                    let offsets = OffsetBuffer::new(indices_buffer.clone());
+            //         let offsets = OffsetBuffer::new(indices_buffer.clone());
 
-                    // TODO - add NULL support
-                    // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
-                    let _null_buffer = buffer_iter.next().unwrap();
+            //         // TODO - add NULL support
+            //         // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
+            //         let _null_buffer = buffer_iter.next().unwrap();
 
-                    let bytes_buffer = buffer_iter.next().unwrap().freeze();
-                    let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
-                    let bytes_buffer_len = bytes_buffer.len();
-                    let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
+            //         let bytes_buffer = buffer_iter.next().unwrap().freeze();
+            //         let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
+            //         let bytes_buffer_len = bytes_buffer.len();
+            //         let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
 
-                    let bytes_array = Arc::new(
-                        PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
-                            .with_data_type(DataType::UInt8),
-                    );
+            //         let bytes_array = Arc::new(
+            //             PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
+            //                 .with_data_type(DataType::UInt8),
+            //         );
 
-                    Ok(Arc::new(StringArray::new(
-                        offsets,
-                        bytes_array.values().into(),
-                        None,
-                    )))
-                }
-            }
+            //         Ok(Arc::new(StringArray::new(
+            //             offsets,
+            //             bytes_array.values().into(),
+            //             None,
+            //         )))
+            //     }
+            // }
             _ => Err(Error::io(
                 format!(
                     "The data type {} cannot be decoded from a primitive encoding",

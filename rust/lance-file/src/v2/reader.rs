@@ -1421,270 +1421,174 @@ pub mod tests {
         assert_eq!(buf, test_bytes);
     }
 
-    // fn test_reading_rangefrom(
-    //     schema: Arc<ArrowSchema>,
-    // ) -> (lance_io::ReadBatchParams, Vec<RecordBatch>) {
-    //     let result_batch = RecordBatch::try_new(
-    //         schema,
-    //         vec![
-    //             Arc::new(UInt32Array::from(vec![3, 4, 5, 6])),
-    //             Arc::new(StringArray::from(vec!["abcd", "apple", "hello", "abcd"])),
-    //         ],
-    //     )
-    //     .unwrap();
+    fn test_reading_rangefrom(
+        schema: Arc<ArrowSchema>,
+    ) -> (lance_io::ReadBatchParams, Vec<RecordBatch>) {
+        let result_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![3, 4, 5, 6])),
+                Arc::new(StringArray::from(vec!["abcd", "apple", "hello", "abcd"])),
+            ],
+        )
+        .unwrap();
 
-    //     let result_batches = vec![result_batch];
-    //     let read_params = lance_io::ReadBatchParams::RangeFrom(2..);
+        let result_batches = vec![result_batch];
+        let read_params = lance_io::ReadBatchParams::RangeFrom(2..);
 
-    //     (read_params, result_batches)
-    // }
+        (read_params, result_batches)
+    }
 
-    // fn test_reading_rangeto(
-    //     schema: Arc<ArrowSchema>,
-    // ) -> (lance_io::ReadBatchParams, Vec<RecordBatch>) {
-    //     let read_params = lance_io::ReadBatchParams::RangeTo(..4);
-    //     let result_batch = RecordBatch::try_new(
-    //         schema,
-    //         vec![
-    //             Arc::new(UInt32Array::from(vec![1, 2, 3, 4])),
-    //             Arc::new(StringArray::from(vec!["abcd", "hello", "abcd", "apple"])),
-    //         ],
-    //     )
-    //     .unwrap();
+    fn test_reading_rangeto(
+        schema: Arc<ArrowSchema>,
+    ) -> (lance_io::ReadBatchParams, Vec<RecordBatch>) {
+        let read_params = lance_io::ReadBatchParams::RangeTo(..4);
+        let result_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["abcd", "hello", "abcd", "apple"])),
+            ],
+        )
+        .unwrap();
 
-    //     let result_batches = vec![result_batch];
+        let result_batches = vec![result_batch];
 
-    //     (read_params, result_batches)
-    // }
+        (read_params, result_batches)
+    }
 
-    // fn test_reading_random_indices(
-    //     schema: Arc<ArrowSchema>,
-    // ) -> (lance_io::ReadBatchParams, Vec<RecordBatch>) {
-    //     let row_indices_vec = vec![0, 2, 4];
-    //     let row_indices = UInt32Array::from(row_indices_vec);
-    //     let read_params = lance_io::ReadBatchParams::from(row_indices);
-    //     let result_batch = RecordBatch::try_new(
-    //         schema,
-    //         vec![
-    //             Arc::new(UInt32Array::from(vec![1, 3, 5])),
-    //             Arc::new(StringArray::from(vec!["abcd", "abcd", "hello"])),
-    //         ],
-    //     )
-    //     .unwrap();
+    fn test_reading_random_indices(
+        schema: Arc<ArrowSchema>,
+    ) -> (lance_io::ReadBatchParams, Vec<RecordBatch>) {
+        let row_indices_vec = vec![0, 2, 4];
+        let row_indices = UInt32Array::from(row_indices_vec);
+        let read_params = lance_io::ReadBatchParams::from(row_indices);
+        let result_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 3, 5])),
+                Arc::new(StringArray::from(vec!["abcd", "abcd", "hello"])),
+            ],
+        )
+        .unwrap();
 
-    //     let result_batches = vec![result_batch];
+        let result_batches = vec![result_batch];
 
-    //     (read_params, result_batches)
-    // }
+        (read_params, result_batches)
+    }
 
-    // fn test_reading_partial_range(
-    //     schema: Arc<ArrowSchema>,
-    // ) -> (lance_io::ReadBatchParams, Vec<RecordBatch>) {
-    //     let read_params = lance_io::ReadBatchParams::Range(2..4);
-    //     let result_batch = RecordBatch::try_new(
-    //         schema,
-    //         vec![
-    //             Arc::new(UInt32Array::from(vec![3, 4])),
-    //             Arc::new(StringArray::from(vec!["abcd", "apple"])),
-    //         ],
-    //     )
-    //     .unwrap();
+    fn test_reading_partial_range(
+        schema: Arc<ArrowSchema>,
+    ) -> (lance_io::ReadBatchParams, Vec<RecordBatch>) {
+        let read_params = lance_io::ReadBatchParams::Range(2..4);
+        let result_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![3, 4])),
+                Arc::new(StringArray::from(vec!["abcd", "apple"])),
+            ],
+        )
+        .unwrap();
 
-    //     let result_batches = vec![result_batch];
+        let result_batches = vec![result_batch];
 
-    //     (read_params, result_batches)
-    // }
+        (read_params, result_batches)
+    }
 
-    // #[tokio::test]
-    // async fn test_string_array_encoding() {
-    //     // set env var temporarily to test string array encoding
-    //     let _env_guard = EnvVarGuard::new("LANCE_STR_ARRAY_ENCODING", "binary");
+    #[tokio::test]
+    async fn test_dict_array_encoding() {
+        // set env var temporarily to test string array encoding
+        let _env_guard = EnvVarGuard::new("LANCE_STR_ARRAY_ENCODING", "binary");
+        let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
 
-    //     let tmp_dir = tempfile::tempdir().unwrap();
-    //     let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
-    //     let tmp_path = Path::parse(tmp_path).unwrap();
-    //     let tmp_path = tmp_path.child("some_file.lance");
-    //     let obj_store = Arc::new(ObjectStore::local());
-    //     let writer = obj_store.create(&tmp_path).await.unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = Path::parse(tmp_path).unwrap();
+        let tmp_path = tmp_path.child("some_file.lance");
+        let obj_store = Arc::new(ObjectStore::local());
+        let writer = obj_store.create(&tmp_path).await.unwrap();
 
-    //     let schema = Arc::new(ArrowSchema::new(vec![
-    //         Field::new("key", DataType::UInt32, false),
-    //         Field::new("strings", DataType::Utf8, false),
-    //     ]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("strings", DataType::Utf8, false),
+        ]));
 
-    //     let batch1 = RecordBatch::try_new(
-    //         schema.clone(),
-    //         vec![
-    //             Arc::new(UInt32Array::from(vec![1, 2, 3])),
-    //             Arc::new(StringArray::from(vec!["abcd", "hello", "abcd"])),
-    //         ],
-    //     )
-    //     .unwrap();
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["abcd", "hello", "abcd"])),
+            ],
+        )
+        .unwrap();
 
-    //     let batch2 = RecordBatch::try_new(
-    //         schema.clone(),
-    //         vec![
-    //             Arc::new(UInt32Array::from(vec![4, 5, 6])),
-    //             Arc::new(StringArray::from(vec!["apple", "hello", "abcd"])),
-    //         ],
-    //     )
-    //     .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 5, 6])),
+                Arc::new(StringArray::from(vec!["apple", "hello", "abcd"])),
+            ],
+        )
+        .unwrap();
 
-    //     let batches = vec![batch1, batch2];
-    //     let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        let batches = vec![batch1, batch2];
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
 
-    //     let mut file_writer = FileWriter::try_new(
-    //         writer,
-    //         tmp_path.to_string(),
-    //         lance_schema,
-    //         FileWriterOptions::default(),
-    //     )
-    //     .unwrap();
+        let mut file_writer = FileWriter::try_new(
+            writer,
+            tmp_path.to_string(),
+            lance_schema,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
 
-    //     for batch in batches.clone() {
-    //         file_writer.write_batch(&batch).await.unwrap();
-    //     }
+        for batch in batches.clone() {
+            file_writer.write_batch(&batch).await.unwrap();
+        }
 
-    //     file_writer.finish().await.unwrap();
+        file_writer.finish().await.unwrap();
 
-    //     let object_store = Arc::new(ObjectStore::local());
-    //     let fs_scheduler = ScanScheduler::new(object_store.clone(), 8);
-    //     let file_scheduler = fs_scheduler.open_file(&tmp_path).await.unwrap();
+        let object_store = Arc::new(ObjectStore::local());
+        let fs_scheduler = ScanScheduler::new(object_store.clone(), 8);
+        let file_scheduler = fs_scheduler.open_file(&tmp_path).await.unwrap();
 
-    //     let file_reader =
-    //         FileReader::try_open(file_scheduler, None, DecoderMiddlewareChain::default())
-    //             .await
-    //             .unwrap();
+        let file_reader =
+            FileReader::try_open(file_scheduler, None, DecoderMiddlewareChain::default())
+                .await
+                .unwrap();
 
-    //     for batch_size in [1, 2, 1024] {
-    //         // Read different types of ranges from the file
-    //         let (read_params, result_batches) = test_reading_rangefrom(schema.clone());
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
+        for batch_size in [1, 2, 1024] {
+            // Read different types of ranges from the file
+            let (read_params, result_batches) = test_reading_rangefrom(schema.clone());
+            let batch_stream = file_reader
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
+                .unwrap();
+            verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
-    //         let (read_params, result_batches) = test_reading_rangeto(schema.clone());
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
+            let (read_params, result_batches) = test_reading_rangeto(schema.clone());
+            let batch_stream = file_reader
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
+                .unwrap();
+            verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
-    //         let (read_params, result_batches) = test_reading_random_indices(schema.clone());
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
+            let (read_params, result_batches) = test_reading_random_indices(schema.clone());
+            let batch_stream = file_reader
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
+                .unwrap();
+            verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
-    //         let (read_params, result_batches) = test_reading_partial_range(schema.clone());
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
+            let (read_params, result_batches) = test_reading_partial_range(schema.clone());
+            let batch_stream = file_reader
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
+                .unwrap();
+            verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
 
-    //         let read_params = lance_io::ReadBatchParams::RangeFull;
-    //         let result_batches = batches.clone();
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
-    //     }
-    // }
-
-    // #[tokio::test]
-    // async fn test_dict_array_encoding() {
-    //     // set env var temporarily to test string array encoding
-    //     let _env_guard = EnvVarGuard::new("LANCE_STR_ARRAY_ENCODING", "binary");
-    //     let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
-
-    //     let tmp_dir = tempfile::tempdir().unwrap();
-    //     let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
-    //     let tmp_path = Path::parse(tmp_path).unwrap();
-    //     let tmp_path = tmp_path.child("some_file.lance");
-    //     let obj_store = Arc::new(ObjectStore::local());
-    //     let writer = obj_store.create(&tmp_path).await.unwrap();
-
-    //     let schema = Arc::new(ArrowSchema::new(vec![
-    //         Field::new("key", DataType::UInt32, false),
-    //         Field::new("strings", DataType::Utf8, false),
-    //     ]));
-
-    //     let batch1 = RecordBatch::try_new(
-    //         schema.clone(),
-    //         vec![
-    //             Arc::new(UInt32Array::from(vec![1, 2, 3])),
-    //             Arc::new(StringArray::from(vec!["abcd", "hello", "abcd"])),
-    //         ],
-    //     )
-    //     .unwrap();
-
-    //     let batch2 = RecordBatch::try_new(
-    //         schema.clone(),
-    //         vec![
-    //             Arc::new(UInt32Array::from(vec![4, 5, 6])),
-    //             Arc::new(StringArray::from(vec!["apple", "hello", "abcd"])),
-    //         ],
-    //     )
-    //     .unwrap();
-
-    //     let batches = vec![batch1, batch2];
-    //     let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
-
-    //     let mut file_writer = FileWriter::try_new(
-    //         writer,
-    //         tmp_path.to_string(),
-    //         lance_schema,
-    //         FileWriterOptions::default(),
-    //     )
-    //     .unwrap();
-
-    //     for batch in batches.clone() {
-    //         file_writer.write_batch(&batch).await.unwrap();
-    //     }
-
-    //     file_writer.finish().await.unwrap();
-
-    //     let object_store = Arc::new(ObjectStore::local());
-    //     let fs_scheduler = ScanScheduler::new(object_store.clone(), 8);
-    //     let file_scheduler = fs_scheduler.open_file(&tmp_path).await.unwrap();
-
-    //     let file_reader =
-    //         FileReader::try_open(file_scheduler, None, DecoderMiddlewareChain::default())
-    //             .await
-    //             .unwrap();
-
-    //     for batch_size in [1, 2, 1024] {
-    //         // Read different types of ranges from the file
-    //         let (read_params, result_batches) = test_reading_rangefrom(schema.clone());
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
-
-    //         let (read_params, result_batches) = test_reading_rangeto(schema.clone());
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
-
-    //         let (read_params, result_batches) = test_reading_random_indices(schema.clone());
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
-
-    //         let (read_params, result_batches) = test_reading_partial_range(schema.clone());
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
-
-    //         let read_params = lance_io::ReadBatchParams::RangeFull;
-    //         let result_batches = batches.clone();
-    //         let batch_stream = file_reader
-    //             .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
-    //             .unwrap();
-    //         verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
-    //     }
-    // }
+            let read_params = lance_io::ReadBatchParams::RangeFull;
+            let result_batches = batches.clone();
+            let batch_stream = file_reader
+                .read_stream(read_params, batch_size, 16, FilterExpression::no_filter())
+                .unwrap();
+            verify_expected(result_batches.as_slice(), batch_stream, batch_size, None).await;
+        }
+    }
 }
