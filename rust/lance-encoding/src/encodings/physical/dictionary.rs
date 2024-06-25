@@ -84,7 +84,13 @@ impl PageScheduler for DictionaryPageScheduler {
             // Decode all items
             let drained_task = primitive_wrapper.drain(copy_size)?;
             let items_decode_task = drained_task.task;
-            let decoded_dict = items_decode_task.decode()?;
+            let mut decoded_dict = items_decode_task.decode()?;
+
+            // For the case where the dictionary is encoded as a single null element
+            // Reset it to be an empty string array
+            if decoded_dict.len() == 1 && decoded_dict.is_null(0) {
+                decoded_dict = Arc::new(StringArray::from(Vec::<Option<String>>::new()));
+            }
 
             let indices_decoder: Box<dyn PrimitivePageDecoder> = indices_page_decoder.await?;
 
@@ -120,9 +126,7 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
             new_primitive_array::<UInt64Type>(indices_buffers.clone(), num_rows, &DataType::UInt64);
 
         let indices_array = indices_array.as_primitive::<UInt64Type>().clone();
-        println!("Indices array: {:?}", indices_array);
         let dictionary = self.decoded_dict.clone();
-        println!("Dictionary: {:?}", dictionary);
 
         let adjusted_indices: UInt64Array = indices_array
             .iter()
@@ -138,14 +142,13 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
             DictionaryArray::<UInt64Type>::try_new(adjusted_indices, dictionary).unwrap();
         let string_array = arrow_cast::cast(&dict_array, &DataType::Utf8).unwrap();
         let string_array = string_array.as_any().downcast_ref::<StringArray>().unwrap();
-        println!("String array: {:?}", string_array);
 
         let null_buffer = string_array
             .nulls()
             .map_or(BytesMut::default(), |n| n.buffer().as_slice().into());
         let offsets_buffer = string_array.offsets().inner().inner().as_slice().into();
 
-        // 3. Empty buffer for nulls of bytes
+        // Empty buffer for nulls of bytes
         let empty_buffer = BytesMut::default();
         let bytes_buffer = string_array.values().as_slice().into();
 
@@ -158,7 +161,7 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
     }
 
     fn num_buffers(&self) -> u32 {
-        self.items_decoder.num_buffers()+2
+        self.items_decoder.num_buffers() + 2
     }
 }
 
@@ -181,9 +184,6 @@ impl DictionaryEncoder {
 }
 
 fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
-    for arr in arrays {
-        println!("Array: {:?}", arr);
-    }
     let mut arr_hashmap: HashMap<&str, u64> = HashMap::new();
     let mut curr_dict_index = 1;
     let total_capacity = arrays.iter().map(|arr| arr.len()).sum();
@@ -218,7 +218,17 @@ fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
     }
 
     let array_dict_indices = Arc::new(UInt64Array::from(dict_indices)) as ArrayRef;
-    let array_dict_elements = Arc::new(StringArray::from(dict_elements)) as ArrayRef;
+
+    // If there is an empty dictionary:
+    // Either there is an array of nulls or an empty array altogether
+    // In this case create the dictionary with a single null element
+    // Because decoding [] is not currently supported by the binary decoder
+    // We will remove this null element later during decoding
+    let array_dict_elements: ArrayRef = if dict_elements.is_empty() {
+        Arc::new(StringArray::from(vec![Option::<&str>::None]))
+    } else {
+        Arc::new(StringArray::from(dict_elements)) as ArrayRef
+    };
 
     (array_dict_indices, array_dict_elements)
 }
@@ -226,14 +236,12 @@ fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
 impl ArrayEncoder for DictionaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let (index_array, items_array) = get_indices_items_from_arrays(arrays);
-        println!("Index array: {:?}", index_array);
-        println!("Items array: {:?}", items_array);
-        
+
         let encoded_indices = self
             .indices_encoder
             .encode(&[index_array.clone()], buffer_index)?;
 
-        let encoded_items: EncodedArray = self
+        let encoded_items = self
             .items_encoder
             .encode(&[items_array.clone()], buffer_index)?;
 
