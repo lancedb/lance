@@ -283,12 +283,12 @@ fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
         let string_array = arrow_array::cast::as_string_array(arr);
         for i in 0..string_array.len() {
             if !string_array.is_null(i) {
-                let st = string_array.value(i);
-
-                if !arr_hashmap.contains_key(st) {
-                    // insert into hashmap
-                    arr_hashmap.insert(string_array.value(i), curr_dict_index);
+                let key_exists = arr_hashmap.insert(string_array.value(i), curr_dict_index);
+                if key_exists.is_some() {
                     curr_dict_index += 1;
+                    if curr_dict_index < 100 {
+                        return true;
+                    }
                 }
             }
         }

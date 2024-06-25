@@ -986,7 +986,7 @@ pub mod tests {
 
     use arrow_array::{
         types::{Float64Type, Int32Type},
-        RecordBatch, StringArray, UInt32Array,
+        RecordBatch,
     };
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use bytes::Bytes;
@@ -998,11 +998,8 @@ pub mod tests {
         decoder::{decode_batch, DecoderMiddlewareChain, FilterExpression},
         encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch},
     };
-    use lance_io::object_store::ObjectStore;
-    use lance_io::scheduler::ScanScheduler;
     use lance_io::stream::RecordBatchStream;
     use log::debug;
-    use object_store::path::Path;
 
     use crate::v2::{
         reader::{EncodedBatchReaderExt, FileReader, ReaderProjection},

@@ -152,7 +152,7 @@ pub fn decoder_from_array_encoding(
         pb::array_encoding::ArrayEncoding::Dictionary(dictionary) => {
             let indices_encoding = dictionary.indices.as_ref().unwrap();
             let items_encoding = dictionary.items.as_ref().unwrap();
-            let size = dictionary.size;
+            let num_dictionary_items = dictionary.num_dictionary_items;
 
             let indices_scheduler =
                 decoder_from_array_encoding(indices_encoding, buffers, data_type);
@@ -161,7 +161,7 @@ pub fn decoder_from_array_encoding(
             Box::new(DictionaryPageScheduler::new(
                 indices_scheduler.into(),
                 items_scheduler.into(),
-                size,
+                num_dictionary_items,
             ))
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column

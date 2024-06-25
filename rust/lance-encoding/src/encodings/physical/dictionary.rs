@@ -29,19 +29,19 @@ use arrow_array::cast::AsArray;
 pub struct DictionaryPageScheduler {
     indices_scheduler: Arc<dyn PageScheduler>,
     items_scheduler: Arc<dyn PageScheduler>,
-    size: u64,
+    num_dictionary_items: u64,
 }
 
 impl DictionaryPageScheduler {
     pub fn new(
         indices_scheduler: Arc<dyn PageScheduler>,
         items_scheduler: Arc<dyn PageScheduler>,
-        size: u64,
+        num_dictionary_items: u64,
     ) -> Self {
         Self {
             indices_scheduler,
             items_scheduler,
-            size,
+            num_dictionary_items,
         }
     }
 }
@@ -66,11 +66,13 @@ impl PageScheduler for DictionaryPageScheduler {
                 .schedule_ranges(ranges, scheduler, top_level_row);
 
         // Schedule items for decoding
-        let items_page_decoder =
-            self.items_scheduler
-                .schedule_ranges(&[0..self.size], scheduler, top_level_row);
+        let items_page_decoder = self.items_scheduler.schedule_ranges(
+            &[0..self.num_dictionary_items],
+            scheduler,
+            top_level_row,
+        );
 
-        let copy_size = self.size;
+        let copy_size = self.num_dictionary_items;
 
         async move {
             let items_decoder: Arc<dyn PrimitivePageDecoder> = Arc::from(items_page_decoder.await?);
@@ -189,7 +191,7 @@ fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
     let total_capacity = arrays.iter().map(|arr| arr.len()).sum();
 
     let mut dict_indices = vec![0; total_capacity];
-    let mut ctr = 0;
+    let mut indices_ctr = 0;
     let mut dict_elements = Vec::new();
 
     for arr in arrays.iter() {
@@ -197,23 +199,21 @@ fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
 
         for i in 0..string_array.len() {
             if !string_array.is_valid(i) {
-                ctr += 1;
+                indices_ctr += 1;
                 continue;
             }
 
             let st = string_array.value(i);
 
-            if arr_hashmap.contains_key(st) {
-                dict_indices[ctr] = *arr_hashmap.get(st).unwrap();
-            } else {
-                // insert into hashmap
-                arr_hashmap.insert(string_array.value(i), curr_dict_index);
-                dict_indices[ctr] = curr_dict_index;
+            let hashmap_entry = *arr_hashmap.entry(st).or_insert(curr_dict_index);
+            dict_indices[indices_ctr] = hashmap_entry;
+
+            if hashmap_entry == curr_dict_index {
                 dict_elements.push(st);
                 curr_dict_index += 1;
             }
 
-            ctr += 1;
+            indices_ctr += 1;
         }
     }
 
@@ -257,7 +257,7 @@ impl ArrayEncoder for DictionaryEncoder {
                     pb::Dictionary {
                         indices: Some(Box::new(encoded_indices.encoding)),
                         items: Some(Box::new(encoded_items.encoding)),
-                        size: dict_size,
+                        num_dictionary_items: dict_size,
                     },
                 ))),
             },

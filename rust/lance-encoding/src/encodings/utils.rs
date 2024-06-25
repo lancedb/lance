@@ -6,22 +6,23 @@ use std::sync::Arc;
 use arrow_array::{
     new_null_array,
     types::{
-        ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
+        ArrowPrimitiveType, ByteArrayType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
         DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
-        DurationSecondType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-        Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType,
-        Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
-        TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-        TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        DurationSecondType, Float16Type, Float32Type, Float64Type, GenericBinaryType,
+        GenericStringType, Int16Type, Int32Type, Int64Type, Int8Type, IntervalDayTimeType,
+        IntervalMonthDayNanoType, IntervalYearMonthType, Time32MillisecondType, Time32SecondType,
+        Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
+        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
+        UInt32Type, UInt64Type, UInt8Type,
     },
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray, StringArray,
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, GenericByteArray,
+    PrimitiveArray,
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use snafu::{location, Location};
 
-use crate::encoder::get_dict_encoding;
 use lance_core::{Error, Result};
 
 pub fn new_primitive_array<T: ArrowPrimitiveType>(
@@ -50,7 +51,49 @@ pub fn new_primitive_array<T: ArrowPrimitiveType>(
     Arc::new(PrimitiveArray::<T>::new(data_buffer, null_buffer).with_data_type(data_type.clone()))
 }
 
-fn bytes_to_validity(bytes: BytesMut, num_rows: u64) -> Option<NullBuffer> {
+pub fn new_generic_byte_array<T: ByteArrayType>(buffers: Vec<BytesMut>, num_rows: u64) -> ArrayRef {
+    // iterate over buffers to get offsets and then bytes
+    let mut buffer_iter = buffers.into_iter();
+
+    let null_buffer = buffer_iter.next().unwrap();
+    let null_buffer = if null_buffer.is_empty() {
+        None
+    } else {
+        let null_buffer = null_buffer.freeze().into();
+        Some(NullBuffer::new(BooleanBuffer::new(
+            Buffer::from_bytes(null_buffer),
+            0,
+            num_rows as usize,
+        )))
+    };
+
+    let indices_bytes = buffer_iter.next().unwrap().freeze();
+    let indices_buffer = Buffer::from_bytes(indices_bytes.into());
+    let indices_buffer = ScalarBuffer::<T::Offset>::new(indices_buffer, 0, num_rows as usize + 1);
+
+    let offsets = OffsetBuffer::new(indices_buffer.clone());
+
+    // TODO - add NULL support
+    // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
+    buffer_iter.next().unwrap();
+
+    let bytes_buffer = buffer_iter.next().unwrap().freeze();
+    let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
+    let bytes_buffer_len = bytes_buffer.len();
+    let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
+
+    let bytes_array = Arc::new(
+        PrimitiveArray::<UInt8Type>::new(bytes_buffer, None).with_data_type(DataType::UInt8),
+    );
+
+    Arc::new(GenericByteArray::<T>::new(
+        offsets,
+        bytes_array.values().into(),
+        null_buffer,
+    ))
+}
+
+pub fn bytes_to_validity(bytes: BytesMut, num_rows: u64) -> Option<NullBuffer> {
     if bytes.is_empty() {
         None
     } else {
@@ -218,103 +261,18 @@ pub fn primitive_array_from_buffers(
                 fsl_nulls,
             )))
         }
-        DataType::Utf8 => {
-            let num_buffers = buffers.len();
-            println!("Number of Buffers: {:?}", num_buffers);
-
-            if !get_dict_encoding() || (num_buffers == 3) {
-                let mut buffer_iter = buffers.into_iter();
-                // iterate over buffers to get offsets and then bytes
-                let indices_bytes = buffer_iter.next().unwrap().freeze();
-                let indices_buffer = Buffer::from_bytes(indices_bytes.into());
-                let indices_buffer =
-                    ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
-
-                let offsets = OffsetBuffer::new(indices_buffer.clone());
-
-                // TODO - add NULL support
-                // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
-                let _null_buffer = buffer_iter.next().unwrap();
-
-                let bytes_buffer = buffer_iter.next().unwrap().freeze();
-                let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
-                let bytes_buffer_len = bytes_buffer.len();
-                let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
-
-                let bytes_array = Arc::new(
-                    PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
-                        .with_data_type(DataType::UInt8),
-                );
-
-                Ok(Arc::new(StringArray::new(
-                    offsets,
-                    bytes_array.values().into(),
-                    None,
-                )))
-            } else {
-                let mut buffer_iter = buffers.clone().into_iter();
-                // let indices_array = primitive_array_from_buffers(
-                //     &DataType::UInt64,
-                //     buffers,
-                //     num_rows,
-                // )?;
-                // println!("Indices Array: {:?}", indices_array);
-
-                // let remaining_buffers = buffer_iter.collect::<Vec<_>>();
-
-                let indices_bytes = buffer_iter.next().unwrap().freeze();
-                let indices_buffer = Buffer::from_bytes(indices_bytes.into());
-                let indices_buffer =
-                    ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
-
-                let offsets = OffsetBuffer::new(indices_buffer.clone());
-
-                // TODO - add NULL support
-                // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
-                let _null_buffer = buffer_iter.next().unwrap();
-
-                let bytes_buffer = buffer_iter.next().unwrap().freeze();
-                let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
-                let bytes_buffer_len = bytes_buffer.len();
-                let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
-
-                let bytes_array = Arc::new(
-                    PrimitiveArray::<UInt8Type>::new(bytes_buffer, None)
-                        .with_data_type(DataType::UInt8),
-                );
-
-                Ok(Arc::new(StringArray::new(
-                    offsets,
-                    bytes_array.values().into(),
-                    None,
-                )))
-                // let decoded_dict = Arc::new(StringArray::new(
-                //     offsets.clone(),
-                //     bytes_array.values().into(),
-                //     None,
-                // ));
-
-                // println!("Decoded String Array of Items: {:?}", decoded_dict);
-
-                // let remaining_buffers = buffer_iter.collect::<Vec<_>>();
-                // let dict_indices_array = primitive_array_from_buffers(
-
-                //     remaining_buffers,
-                //     num_rows * (*dimension as u32),
-                // )?;
-
-                // let dict_indices_bytes = buffer_iter.next().unwrap().freeze();
-                // let dict_indices_buffer = Buffer::from_bytes(indices_bytes.into());
-                // let dict_indices_buffer =
-                //     ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
-
-                // Ok(Arc::new(StringArray::new(
-                //     offsets,
-                //     bytes_array.values().into(),
-                //     None,
-                // )))
-            }
-        }
+        DataType::Utf8 => Ok(new_generic_byte_array::<GenericStringType<i32>>(
+            buffers, num_rows,
+        )),
+        DataType::LargeUtf8 => Ok(new_generic_byte_array::<GenericStringType<i64>>(
+            buffers, num_rows,
+        )),
+        DataType::Binary => Ok(new_generic_byte_array::<GenericBinaryType<i32>>(
+            buffers, num_rows,
+        )),
+        DataType::LargeBinary => Ok(new_generic_byte_array::<GenericBinaryType<i64>>(
+            buffers, num_rows,
+        )),
         _ => Err(Error::io(
             format!(
                 "The data type {} cannot be decoded from a primitive encoding",
