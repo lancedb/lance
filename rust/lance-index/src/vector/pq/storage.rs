@@ -7,13 +7,14 @@
 
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
+use arrow::datatypes::{self};
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
-    FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
+    FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_array::{Array, ArrayRef};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
@@ -24,6 +25,7 @@ use lance_io::{
     traits::{WriteExt, Writer},
     utils::read_message,
 };
+use lance_linalg::distance::L2;
 use lance_linalg::{distance::DistanceType, MatrixView};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
@@ -31,7 +33,8 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
-use super::{distance::build_distance_table_l2, num_centroids, ProductQuantizerImpl};
+use super::ProductQuantizer;
+use super::{distance::build_distance_table_l2, num_centroids};
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
@@ -105,7 +108,7 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
 /// TODO: support f16/f64 later.
 #[derive(Clone, Debug)]
 pub struct ProductQuantizationStorage {
-    codebook: Arc<Float32Array>,
+    codebook: FixedSizeListArray,
     batch: RecordBatch,
 
     // Metadata
@@ -140,10 +143,9 @@ impl PartialEq for ProductQuantizationStorage {
     }
 }
 
-#[allow(dead_code)]
 impl ProductQuantizationStorage {
     pub fn new(
-        codebook: Arc<Float32Array>,
+        codebook: FixedSizeListArray,
         batch: RecordBatch,
         num_bits: u32,
         num_sub_vectors: usize,
@@ -218,7 +220,7 @@ impl ProductQuantizationStorage {
     /// vector_col: &str
     ///   The name of the column containing the vectors.
     pub async fn build(
-        quantizer: Arc<ProductQuantizerImpl<Float32Type>>,
+        quantizer: ProductQuantizer,
         batch: &RecordBatch,
         vector_col: &str,
     ) -> Result<Self> {
@@ -226,7 +228,7 @@ impl ProductQuantizationStorage {
         let num_bits = quantizer.num_bits;
         let dimension = quantizer.dimension;
         let num_sub_vectors = quantizer.num_sub_vectors;
-        let metric_type = quantizer.metric_type;
+        let metric_type = quantizer.distance_type;
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
         let batch = transform.transform(batch)?;
 
@@ -310,7 +312,7 @@ impl ProductQuantizationStorage {
     /// Write the PQ storage to disk.
     pub async fn write_full(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
         let pos = writer.object_writer.tell().await?;
-        let mat = MatrixView::<Float32Type>::new(self.codebook.clone(), self.dimension);
+        let mat = MatrixView::<Float32Type>::try_from(&self.codebook)?;
         let codebook_tensor = pb::Tensor::from(&mat);
         writer
             .object_writer
@@ -362,18 +364,18 @@ impl QuantizerStorage for ProductQuantizationStorage {
         metadata: &Self::Metadata,
     ) -> Result<Self> {
         // Hard coded to float32 for now
-        let codebook = Arc::new(
-            metadata
-                .codebook
-                .as_ref()
-                .ok_or(Error::Index {
-                    message: "Codebook not found in PQ metadata".to_string(),
-                    location: location!(),
-                })?
-                .values()
-                .as_primitive::<Float32Type>()
-                .clone(),
-        );
+        let codebook = metadata
+            .codebook
+            .as_ref()
+            .ok_or(Error::Index {
+                message: "Codebook not found in PQ metadata".to_string(),
+                location: location!(),
+            })?
+            .values()
+            .as_primitive::<Float32Type>()
+            .clone();
+        let codebook =
+            FixedSizeListArray::try_new_from_values(codebook, metadata.dimension as i32)?;
 
         let schema = reader.schema();
         let batch = reader.read_range(range, schema).await?;
@@ -430,7 +432,7 @@ impl VectorStore for ProductQuantizationStorage {
             .clone();
 
         Ok(Self {
-            codebook: Arc::new(codebook.values().as_primitive::<Float32Type>().clone()),
+            codebook,
             batch,
             num_bits: metadata.num_bits,
             num_sub_vectors: metadata.num_sub_vectors,
@@ -442,11 +444,7 @@ impl VectorStore for ProductQuantizationStorage {
     }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
-        let codebook_fsl = FixedSizeListArray::try_new_from_values(
-            self.codebook.as_ref().clone(),
-            self.dimension as i32,
-        )?;
-        let codebook = pb::Tensor::try_from(&codebook_fsl)?.encode_to_vec();
+        let codebook = pb::Tensor::try_from(&self.codebook)?.encode_to_vec();
         let metadata = ProductQuantizationMetadata {
             codebook_position: 0, // deprecated in new format
             num_bits: self.num_bits,
@@ -497,14 +495,42 @@ impl VectorStore for ProductQuantizationStorage {
     }
 
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        PQDistCalculator::new(
-            self.codebook.values(),
-            self.num_bits,
-            self.num_sub_vectors,
-            self.pq_code.clone(),
-            query.as_primitive::<Float32Type>().values(),
-            self.distance_type,
-        )
+        match self.codebook.value_type() {
+            DataType::Float16 => PQDistCalculator::new(
+                self.codebook
+                    .values()
+                    .as_primitive::<datatypes::Float16Type>()
+                    .values(),
+                self.num_bits,
+                self.num_sub_vectors,
+                self.pq_code.clone(),
+                query.as_primitive::<datatypes::Float16Type>().values(),
+                self.distance_type,
+            ),
+            DataType::Float32 => PQDistCalculator::new(
+                self.codebook
+                    .values()
+                    .as_primitive::<datatypes::Float32Type>()
+                    .values(),
+                self.num_bits,
+                self.num_sub_vectors,
+                self.pq_code.clone(),
+                query.as_primitive::<datatypes::Float32Type>().values(),
+                self.distance_type,
+            ),
+            DataType::Float64 => PQDistCalculator::new(
+                self.codebook
+                    .values()
+                    .as_primitive::<datatypes::Float64Type>()
+                    .values(),
+                self.num_bits,
+                self.num_sub_vectors,
+                self.pq_code.clone(),
+                query.as_primitive::<datatypes::Float64Type>().values(),
+                self.distance_type,
+            ),
+            _ => unimplemented!("Unsupported data type: {:?}", self.codebook.value_type()),
+        }
     }
 
     fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
@@ -525,12 +551,12 @@ pub struct PQDistCalculator {
 }
 
 impl PQDistCalculator {
-    fn new(
-        codebook: &[f32],
+    fn new<T: L2>(
+        codebook: &[T],
         num_bits: u32,
         num_sub_vectors: usize,
         pq_code: Arc<UInt8Array>,
-        query: &[f32],
+        query: &[T],
         distance_type: DistanceType,
     ) -> Self {
         let distance_table = if matches!(distance_type, DistanceType::Cosine | DistanceType::L2) {
@@ -566,8 +592,11 @@ impl DistCalculator for PQDistCalculator {
 
 #[cfg(test)]
 mod tests {
+    use crate::vector::storage::StorageBuilder;
+
     use super::*;
 
+    use arrow_array::Float32Array;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::Schema;
@@ -578,16 +607,9 @@ mod tests {
     const NUM_SUB_VECTORS: usize = 16;
 
     async fn create_pq_storage() -> ProductQuantizationStorage {
-        let codebook = Arc::new(Float32Array::from_iter_values(
-            (0..256 * DIM).map(|v| v as f32),
-        ));
-        let pq = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
-            NUM_SUB_VECTORS,
-            8,
-            DIM,
-            codebook,
-            DistanceType::L2,
-        ));
+        let codebook = Float32Array::from_iter_values((0..256 * DIM).map(|v| v as f32));
+        let codebook = FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap();
+        let pq = ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, DistanceType::L2);
 
         let schema = ArrowSchema::new(vec![
             Field::new(
@@ -606,8 +628,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
-        ProductQuantizationStorage::build(pq.clone(), &batch, "vectors")
-            .await
+        StorageBuilder::new("vectors".to_owned(), pq.distance_type, pq)
+            .build(&batch)
             .unwrap()
     }
 

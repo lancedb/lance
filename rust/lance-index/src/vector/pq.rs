@@ -4,20 +4,21 @@
 //! Product Quantization
 //!
 
-use std::any::Any;
 use std::sync::Arc;
 
+use arrow::datatypes::{self, ArrowPrimitiveType};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
-use arrow_array::{ArrayRef, Float32Array};
+use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
+use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, DistanceType, Dot, L2};
-use lance_linalg::kernels::argmin_value_float;
+use lance_linalg::distance::{dot_distance_batch, DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
-use lance_linalg::{distance::MetricType, MatrixView};
+use num_traits::Float;
 use rayon::prelude::*;
 use snafu::{location, Location};
+use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADTA_KEY};
 
 pub mod builder;
 mod distance;
@@ -27,210 +28,236 @@ pub(crate) mod utils;
 
 use self::distance::{build_distance_table_l2, compute_l2_distance};
 pub use self::utils::num_centroids;
-use super::pb;
+use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
+use super::{pb, PQ_CODE_COLUMN};
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
-/// Product Quantization
-pub trait ProductQuantizer: Send + Sync + DeepSizeOf + std::fmt::Debug {
-    fn as_any(&self) -> &dyn Any;
-
-    /// Compute the distance between query vector to the PQ code.
-    ///
-    fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array>;
-
-    fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
-
-    /// Number of sub-vectors
-    fn num_sub_vectors(&self) -> usize;
-
-    fn num_bits(&self) -> u32;
-
-    fn dimension(&self) -> usize;
-
-    // TODO: move to pub(crate) once the refactor of lance::index to lance-index is done.
-    fn codebook_as_fsl(&self) -> FixedSizeListArray;
-
-    /// Whether to use residual as input or not.
-    fn use_residual(&self) -> bool;
-}
-
-/// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
-///
-//
-// TODO: move this to be pub(crate) once we have a better way to test it.
 #[derive(Debug, Clone)]
-pub struct ProductQuantizerImpl<T: ArrowFloatType>
-where
-    T::Native: Dot + L2,
-{
-    /// Number of bits for the centroids.
-    ///
-    /// Only support 8, as one of `u8` byte now.
-    pub num_bits: u32,
-
-    /// Number of sub-vectors.
+pub struct ProductQuantizer {
     pub num_sub_vectors: usize,
-
-    /// Vector dimension.
+    pub num_bits: u32,
     pub dimension: usize,
-
-    /// Distance type.
-    pub metric_type: MetricType,
-
-    /// PQ codebook
-    ///
-    /// ```((2 ^ nbits) * num_subvector * sub_vector_length)``` of `f32`
-    ///
-    /// Use a layout that is cache / SIMD friendly to compute centroid.
-    /// But not sure how to make distance lookup via PQ code lookup
-    /// be cache friendly tho.
-    ///
-    /// Layout:
-    ///
-    ///  - *row*: all centroids for the same sub-vector.
-    ///  - *column*: the centroid value of the n-th sub-vector.
-    ///
-    /// ```text
-    /// // Centroids for a sub-vector.
-    /// Codebook[sub_vector_id][pq_code]
-    /// ```
-    pub codebook: Arc<T::ArrayType>,
+    pub codebook: FixedSizeListArray,
+    pub distance_type: DistanceType,
 }
 
-impl<T: ArrowFloatType> DeepSizeOf for ProductQuantizerImpl<T>
-where
-    T::Native: Dot + L2,
-{
+impl DeepSizeOf for ProductQuantizer {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         self.codebook.get_array_memory_size()
+            + self.num_sub_vectors.deep_size_of_children(_context)
+            + self.num_bits.deep_size_of_children(_context)
+            + self.dimension.deep_size_of_children(_context)
+            + self.distance_type.deep_size_of_children(_context)
     }
 }
 
-impl<T: ArrowFloatType> ProductQuantizerImpl<T>
-where
-    T::Native: Dot + L2,
-{
-    /// Create a [`ProductQuantizer`] with pre-trained codebook.
+impl ProductQuantizer {
     pub fn new(
-        m: usize,
-        nbits: u32,
+        num_sub_vectors: usize,
+        num_bits: u32,
         dimension: usize,
-        codebook: Arc<T::ArrayType>,
-        metric_type: MetricType,
+        codebook: FixedSizeListArray,
+        distance_type: DistanceType,
     ) -> Self {
-        assert_ne!(
-            metric_type,
-            MetricType::Cosine,
-            "Product quantization does not support cosine, use normalized L2 instead"
-        );
-        assert_eq!(nbits, 8, "nbits can only be 8");
         Self {
-            num_bits: nbits,
-            num_sub_vectors: m,
+            num_bits,
+            num_sub_vectors,
             dimension,
             codebook,
-            metric_type,
+            distance_type,
         }
     }
 
-    pub fn num_centroids(num_bits: u32) -> usize {
-        2_usize.pow(num_bits)
+    pub fn from_proto(proto: &pb::Pq, distance_type: DistanceType) -> Result<Self> {
+        let tensor = proto.codebook_tensor.as_ref().ok_or(Error::Index {
+            message: "codebook tensor not found".to_owned(),
+            location: location!(),
+        })?;
+        let codebook = FixedSizeListArray::try_from(tensor)?;
+        Ok(Self {
+            num_bits: proto.num_bits,
+            num_sub_vectors: proto.num_sub_vectors as usize,
+            dimension: proto.dimension as usize,
+            codebook,
+            distance_type,
+        })
     }
 
-    /// Calculate codebook length.
-    pub fn codebook_length(num_bits: u32, num_sub_vectors: usize) -> usize {
-        Self::num_centroids(num_bits) * num_sub_vectors
+    pub fn use_residual(&self) -> bool {
+        matches!(self.distance_type, DistanceType::L2 | DistanceType::Cosine)
     }
 
-    /// Get the centroids for one sub-vector.
-    ///
-    /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
-    pub fn centroids(&self, sub_vector_idx: usize) -> &[T::Native] {
-        get_sub_vector_centroids(
-            self.codebook.as_slice(),
-            self.dimension,
-            self.num_bits,
-            self.num_sub_vectors,
-            sub_vector_idx,
-        )
-    }
+    fn transform<T: ArrowPrimitiveType>(&self, vectors: &dyn Array) -> Result<ArrayRef>
+    where
+        T::Native: Float + L2 + Dot,
+    {
+        let fsl = vectors.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
+                vectors.data_type()
+            ),
+            location: location!(),
+        })?;
+        let num_sub_vectors = self.num_sub_vectors;
+        let dim = self.dimension;
+        let num_bits = self.num_bits;
+        let codebook = self.codebook.values().as_primitive::<T>();
 
-    /// Reconstruct a vector from its PQ code.
-    ///
-    /// It only supports U8 PQ code for now.
-    #[allow(dead_code)]
-    pub(crate) fn reconstruct(&self, code: &[u8]) -> Arc<T::ArrayType> {
-        assert_eq!(code.len(), self.num_sub_vectors);
-        let mut builder = Vec::with_capacity(self.dimension);
-        let sub_vector_dim = self.dimension / self.num_sub_vectors;
-        for (i, sub_code) in code.iter().enumerate() {
-            let centroids = self.centroids(i);
-            builder.extend_from_slice(
-                &centroids[*sub_code as usize * sub_vector_dim
-                    ..(*sub_code as usize + 1) * sub_vector_dim],
-            );
-        }
-        Arc::new(T::ArrayType::from(builder))
-    }
+        let distance_type = self.distance_type;
 
-    /// Compute the quantization distortion (E).
-    ///
-    /// Quantization distortion is the difference between the centroids
-    /// from the PQ code to the actual vector.
-    ///
-    /// This method is just for debugging purpose.
-    #[allow(dead_code)]
-    pub(crate) fn distortion(
-        &self,
-        data: &MatrixView<T>,
-        distance_type: DistanceType,
-    ) -> Result<f64> {
-        let sub_vector_width = self.dimension / self.num_sub_vectors;
-        let total_distortion = data
-            .iter()
+        let flatten_data = fsl.values().as_primitive::<T>();
+        let sub_dim = dim / num_sub_vectors;
+        let values = flatten_data
+            .values()
+            .par_chunks(dim)
             .map(|vector| {
                 vector
-                    .chunks_exact(sub_vector_width)
+                    .chunks_exact(sub_dim)
                     .enumerate()
-                    .map(|(sub_vector_idx, sub_vec)| {
-                        let centroids = self.centroids(sub_vector_idx);
-                        let distances = match distance_type {
-                            DistanceType::L2 => {
-                                l2_distance_batch(sub_vec, centroids, sub_vector_width)
-                            }
-                            DistanceType::Dot => {
-                                dot_distance_batch(sub_vec, centroids, sub_vector_width)
-                            }
-                            _ => {
-                                panic!(
-                                    "ProductQuantization: distance type {} is not supported",
-                                    distance_type
-                                );
-                            }
-                        };
-                        argmin_value_float(distances).map(|(_, v)| v).unwrap_or(0.0)
+                    .map(|(sub_idx, sub_vector)| {
+                        let centroids = get_sub_vector_centroids(
+                            codebook.values(),
+                            dim,
+                            num_bits,
+                            num_sub_vectors,
+                            sub_idx,
+                        );
+                        compute_partition(centroids, sub_vector, distance_type).map(|v| v as u8)
                     })
-                    .sum::<f32>() as f64
+                    .collect::<Vec<_>>()
             })
-            .sum::<f64>();
-        Ok(total_distortion / data.num_rows() as f64)
+            .flatten()
+            .collect::<Vec<_>>();
+
+        Ok(Arc::new(FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(values),
+            self.num_sub_vectors as i32,
+        )?))
+    }
+
+    pub fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+        match self.distance_type {
+            DistanceType::L2 => self.l2_distances(query, code),
+            DistanceType::Cosine => {
+                // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
+                // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
+                // Therefore, Cosine = L2 / 2
+                let l2_dists = self.l2_distances(query, code)?;
+                Ok(l2_dists.values().iter().map(|v| *v / 2.0).collect())
+            }
+            DistanceType::Dot => self.dot_distances(query, code),
+            _ => panic!(
+                "ProductQuantization: distance type {} not supported",
+                self.distance_type
+            ),
+        }
+    }
+
+    /// Pre-compute L2 distance from the query to all code.
+    ///
+    /// It returns the squared L2 distance.
+    fn l2_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+        let distance_table = self.build_l2_distance_table(key)?;
+
+        #[cfg(target_feature = "avx512f")]
+        {
+            Ok(self.compute_l2_distance::<16, 64>(&distance_table, code.values()))
+        }
+        #[cfg(not(target_feature = "avx512f"))]
+        {
+            Ok(self.compute_l2_distance::<8, 64>(&distance_table, code.values()))
+        }
+    }
+
+    /// Parameters
+    /// ----------
+    ///  - query: the query vector, with shape (dimension, )
+    ///  - code: the PQ code in one partition.
+    ///
+    fn dot_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+        match key.data_type() {
+            DataType::Float16 => {
+                self.dot_distances_impl::<datatypes::Float16Type>(key.as_primitive(), code)
+            }
+            DataType::Float32 => {
+                self.dot_distances_impl::<datatypes::Float32Type>(key.as_primitive(), code)
+            }
+            DataType::Float64 => {
+                self.dot_distances_impl::<datatypes::Float64Type>(key.as_primitive(), code)
+            }
+            _ => Err(Error::Index {
+                message: format!("unsupported data type: {}", key.data_type()),
+                location: location!(),
+            }),
+        }
+    }
+
+    fn dot_distances_impl<T: ArrowPrimitiveType>(
+        &self,
+        key: &PrimitiveArray<T>,
+        code: &UInt8Array,
+    ) -> Result<Float32Array>
+    where
+        T::Native: Dot,
+    {
+        let capacity = self.num_sub_vectors * num_centroids(self.num_bits);
+        let mut distance_table = Vec::with_capacity(capacity);
+
+        let sub_vector_length = self.dimension / self.num_sub_vectors;
+        key.values()
+            .chunks_exact(sub_vector_length)
+            .enumerate()
+            .for_each(|(sub_vec_id, sub_vec)| {
+                let subvec_centroids = self.centroids::<T>(sub_vec_id);
+                let distances = dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length);
+                distance_table.extend(distances);
+            });
+
+        // Compute distance from the pre-compute table.
+        Ok(Float32Array::from_iter_values(
+            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                c.iter()
+                    .enumerate()
+                    .map(|(sub_vec_idx, centroid)| {
+                        distance_table[sub_vec_idx * 256 + *centroid as usize]
+                    })
+                    .sum::<f32>()
+            }),
+        ))
     }
 
     fn build_l2_distance_table(&self, key: &dyn Array) -> Result<Vec<f32>> {
-        let key: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
-            message: format!(
-                "Build L2 distance table, type mismatch: {}",
-                key.data_type()
-            ),
-            location: Default::default(),
-        })?;
-        Ok(build_distance_table_l2(
-            self.codebook.as_slice(),
+        match key.data_type() {
+            DataType::Float16 => {
+                Ok(self.build_l2_distance_table_impl::<datatypes::Float16Type>(key.as_primitive()))
+            }
+            DataType::Float32 => {
+                Ok(self.build_l2_distance_table_impl::<datatypes::Float32Type>(key.as_primitive()))
+            }
+            DataType::Float64 => {
+                Ok(self.build_l2_distance_table_impl::<datatypes::Float64Type>(key.as_primitive()))
+            }
+            _ => Err(Error::Index {
+                message: format!("unsupported data type: {}", key.data_type()),
+                location: location!(),
+            }),
+        }
+    }
+
+    fn build_l2_distance_table_impl<T: ArrowPrimitiveType>(
+        &self,
+        key: &PrimitiveArray<T>,
+    ) -> Vec<f32>
+    where
+        T::Native: L2,
+    {
+        build_distance_table_l2(
+            self.codebook.values().as_primitive::<T>().values(),
             self.num_bits,
             self.num_sub_vectors,
-            key.as_slice(),
-        ))
+            key.values(),
+        )
     }
 
     /// Compute L2 distance from the query to all code.
@@ -263,186 +290,102 @@ where
         ))
     }
 
-    /// Pre-compute L2 distance from the query to all code.
+    /// Get the centroids for one sub-vector.
     ///
-    /// It returns the squared L2 distance.
-    fn l2_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
-        let distance_table = self.build_l2_distance_table(key)?;
-
-        #[cfg(target_feature = "avx512f")]
-        {
-            Ok(self.compute_l2_distance::<16, 64>(&distance_table, code.values()))
-        }
-        #[cfg(not(target_feature = "avx512f"))]
-        {
-            Ok(self.compute_l2_distance::<8, 64>(&distance_table, code.values()))
-        }
-    }
-
-    /// Parameters
-    /// ----------
-    ///  - query: the query vector, with shape (dimension, )
-    ///  - code: the PQ code in one partition.
-    ///
-    fn dot_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
-        let key: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
-            message: format!(
-                "Build Dot distance table, type mismatch: {}",
-                key.data_type()
-            ),
-            location: Default::default(),
-        })?;
-
-        // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
-        let capacity = self.num_sub_vectors * num_centroids(self.num_bits);
-        let mut distance_table = Vec::with_capacity(capacity);
-
-        let sub_vector_length = self.dimension / self.num_sub_vectors;
-        key.as_slice()
-            .chunks_exact(sub_vector_length)
-            .enumerate()
-            .for_each(|(sub_vec_id, sub_vec)| {
-                let subvec_centroids = self.centroids(sub_vec_id);
-                let distances = dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length);
-                distance_table.extend(distances);
-            });
-
-        // Compute distance from the pre-compute table.
-        Ok(Float32Array::from_iter_values(
-            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
-                c.iter()
-                    .enumerate()
-                    .map(|(sub_vec_idx, centroid)| {
-                        distance_table[sub_vec_idx * 256 + *centroid as usize]
-                    })
-                    .sum::<f32>()
-            }),
-        ))
+    /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
+    pub fn centroids<T: ArrowPrimitiveType>(&self, sub_vector_idx: usize) -> &[T::Native] {
+        get_sub_vector_centroids(
+            self.codebook.values().as_primitive::<T>().values(),
+            self.dimension,
+            self.num_bits,
+            self.num_sub_vectors,
+            sub_vector_idx,
+        )
     }
 }
 
-impl<T: ArrowFloatType + 'static> ProductQuantizer for ProductQuantizerImpl<T>
-where
-    T::Native: Dot + L2,
-{
-    fn as_any(&self) -> &dyn Any {
-        self
+impl Quantization for ProductQuantizer {
+    type BuildParams = PQBuildParams;
+    type Metadata = ProductQuantizationMetadata;
+    type Storage = ProductQuantizationStorage;
+
+    fn build(_: &dyn Array, _: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        unimplemented!("ProductQuantizer cannot be built with new index builder")
     }
 
-    fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
-        let fsl = data
-            .as_fixed_size_list_opt()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
-                    data.data_type()
-                ),
-                location: location!(),
-            })?
-            .clone();
-
-        let num_sub_vectors = self.num_sub_vectors;
-        let dim = self.dimension;
-        let num_bits = self.num_bits;
-        let codebook = self.codebook.clone();
-
-        let distance_type = self.metric_type;
-
-        let flatten_data =
-            fsl.values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .ok_or(Error::Index {
-                    message: format!(
-                        "Expect to be a float vector array, got: {:?}",
-                        fsl.value_type()
-                    ),
-                    location: location!(),
-                })?;
-
-        let sub_dim = dim / num_sub_vectors;
-        let values = flatten_data
-            .as_slice()
-            .par_chunks(dim)
-            .map(|vector| {
-                vector
-                    .chunks_exact(sub_dim)
-                    .enumerate()
-                    .map(|(sub_idx, sub_vector)| {
-                        let centroids = get_sub_vector_centroids(
-                            codebook.as_slice(),
-                            dim,
-                            num_bits,
-                            num_sub_vectors,
-                            sub_idx,
-                        );
-                        compute_partition(centroids, sub_vector, distance_type).map(|v| v as u8)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-
-        Ok(Arc::new(FixedSizeListArray::try_new_from_values(
-            UInt8Array::from(values),
-            self.num_sub_vectors as i32,
-        )?))
-    }
-
-    fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
-        match self.metric_type {
-            DistanceType::L2 => self.l2_distances(query, code),
-            DistanceType::Cosine => {
-                // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
-                // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
-                // Therefore, Cosine = L2 / 2
-                let l2_dists = self.l2_distances(query, code)?;
-                Ok(l2_dists.values().iter().map(|v| *v / 2.0).collect())
-            }
-            DistanceType::Dot => self.dot_distances(query, code),
-            _ => panic!(
-                "ProductQuantization: metric type {} not supported",
-                self.metric_type
-            ),
-        }
-    }
-
-    fn num_sub_vectors(&self) -> usize {
+    fn code_dim(&self) -> usize {
         self.num_sub_vectors
     }
 
-    fn num_bits(&self) -> u32 {
-        self.num_bits
+    fn column(&self) -> &'static str {
+        PQ_CODE_COLUMN
     }
 
-    fn dimension(&self) -> usize {
-        self.dimension
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        let fsl = vectors.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
+                vectors.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        match fsl.value_type() {
+            DataType::Float16 => self.transform::<datatypes::Float16Type>(vectors),
+            DataType::Float32 => self.transform::<datatypes::Float32Type>(vectors),
+            DataType::Float64 => self.transform::<datatypes::Float64Type>(vectors),
+            _ => Err(Error::Index {
+                message: format!("unsupported data type: {}", fsl.value_type()),
+                location: location!(),
+            }),
+        }
     }
 
-    fn codebook_as_fsl(&self) -> FixedSizeListArray {
-        FixedSizeListArray::try_new_from_values(
-            self.codebook.as_ref().clone(),
-            self.dimension as i32,
-        )
-        .unwrap()
+    fn metadata_key() -> &'static str {
+        PQ_METADTA_KEY
     }
 
-    fn use_residual(&self) -> bool {
-        matches!(self.metric_type, DistanceType::L2 | DistanceType::Cosine)
+    fn quantization_type() -> QuantizationType {
+        QuantizationType::Product
+    }
+
+    fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+        let args = args.unwrap_or_default();
+
+        let codebook_position = args.codebook_position.ok_or(Error::Index {
+            message: "codebook_position not found".to_owned(),
+            location: location!(),
+        })?;
+        Ok(serde_json::to_value(ProductQuantizationMetadata {
+            codebook_position,
+            num_bits: self.num_bits,
+            num_sub_vectors: self.num_sub_vectors,
+            dimension: self.dimension,
+            codebook: args.codebook,
+            codebook_tensor: Vec::new(),
+        })?)
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::Product(Self::new(
+            metadata.num_sub_vectors,
+            metadata.num_bits,
+            metadata.dimension,
+            metadata.codebook.as_ref().unwrap().clone(),
+            distance_type,
+        )))
     }
 }
 
-#[allow(clippy::fallible_impl_from)]
-impl TryFrom<&dyn ProductQuantizer> for pb::Pq {
+impl TryFrom<&ProductQuantizer> for pb::Pq {
     type Error = Error;
 
-    fn try_from(pq: &dyn ProductQuantizer) -> Result<Self> {
-        let fsl = pq.codebook_as_fsl();
-        let tensor = pb::Tensor::try_from(&fsl)?;
+    fn try_from(pq: &ProductQuantizer) -> Result<Self> {
+        let tensor = pb::Tensor::try_from(&pq.codebook)?;
         Ok(Self {
-            num_bits: pq.num_bits(),
-            num_sub_vectors: pq.num_sub_vectors() as u32,
-            dimension: pq.dimension() as u32,
+            num_bits: pq.num_bits,
+            num_sub_vectors: pq.num_sub_vectors as u32,
+            dimension: pq.dimension as u32,
             codebook: vec![],
             codebook_tensor: Some(tensor),
         })
@@ -457,27 +400,27 @@ mod tests {
 
     use approx::assert_relative_eq;
     use arrow::datatypes::UInt8Type;
-    use arrow_array::{
-        types::{Float16Type, Float32Type},
-        Float16Array,
-    };
+    use arrow_array::Float16Array;
     use half::f16;
+    use lance_linalg::distance::l2_distance_batch;
     use lance_linalg::kernels::argmin;
     use lance_testing::datagen::generate_random_array;
     use num_traits::Zero;
 
     #[test]
     fn test_f16_pq_to_protobuf() {
-        let pq = ProductQuantizerImpl::<Float16Type> {
-            num_bits: 8,
-            num_sub_vectors: 4,
-            dimension: 16,
-            codebook: Arc::new(Float16Array::from_iter_values(
-                repeat(f16::zero()).take(256 * 16),
-            )),
-            metric_type: DistanceType::L2,
-        };
-        let proto: pb::Pq = pb::Pq::try_from(&pq as &dyn ProductQuantizer).unwrap();
+        let pq = ProductQuantizer::new(
+            4,
+            8,
+            16,
+            FixedSizeListArray::try_new_from_values(
+                Float16Array::from_iter_values(repeat(f16::zero()).take(256 * 16)),
+                16,
+            )
+            .unwrap(),
+            DistanceType::L2,
+        );
+        let proto: pb::Pq = pb::Pq::try_from(&pq).unwrap();
         assert_eq!(proto.num_bits, 8);
         assert_eq!(proto.num_sub_vectors, 4);
         assert_eq!(proto.dimension, 16);
@@ -493,14 +436,14 @@ mod tests {
     fn test_l2_distance() {
         const DIM: usize = 512;
         const TOTAL: usize = 66; // 64 + 2 to make sure reminder is handled correctly.
-        let codebook = Arc::new(generate_random_array(256 * DIM));
-        let pq = ProductQuantizerImpl::<Float32Type> {
-            num_bits: 8,
-            num_sub_vectors: 16,
-            dimension: DIM,
-            codebook: codebook.clone(),
-            metric_type: DistanceType::L2,
-        };
+        let codebook = generate_random_array(256 * DIM);
+        let pq = ProductQuantizer::new(
+            16,
+            8,
+            DIM,
+            FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap(),
+            DistanceType::L2,
+        );
         let pq_code = UInt8Array::from_iter_values((0..16 * TOTAL).map(|v| v as u8));
         let query = generate_random_array(DIM);
 
@@ -514,7 +457,7 @@ mod tests {
                 code.iter()
                     .enumerate()
                     .flat_map(|(sub_idx, c)| {
-                        let subvec_centroids = pq.centroids(sub_idx);
+                        let subvec_centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
                         let subvec =
                             &query.values()[sub_idx * sub_vec_len..(sub_idx + 1) * sub_vec_len];
                         l2_distance_batch(
@@ -541,24 +484,24 @@ mod tests {
         const DIM: usize = 16;
         const TOTAL: usize = 64;
         let codebook = generate_random_array(DIM * 256);
-        let pq = ProductQuantizerImpl::<Float32Type> {
-            num_bits: 8,
-            num_sub_vectors: 4,
-            dimension: DIM,
-            codebook: Arc::new(codebook),
-            metric_type: MetricType::L2,
-        };
+        let pq = ProductQuantizer::new(
+            4,
+            8,
+            DIM,
+            FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap(),
+            DistanceType::L2,
+        );
 
         let vectors = generate_random_array(DIM * TOTAL);
         let fsl = FixedSizeListArray::try_new_from_values(vectors.clone(), DIM as i32).unwrap();
-        let pq_code = pq.transform(&fsl).unwrap();
+        let pq_code = pq.quantize(&fsl).unwrap();
 
         let mut expected = Vec::with_capacity(TOTAL * 4);
         vectors.values().chunks_exact(DIM).for_each(|vec| {
             vec.chunks_exact(DIM / 4)
                 .enumerate()
                 .for_each(|(sub_idx, sub_vec)| {
-                    let centroids = pq.centroids(sub_idx);
+                    let centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
                     let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
                     let code = argmin(dists).unwrap() as u8;
                     expected.push(code);

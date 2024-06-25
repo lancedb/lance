@@ -24,6 +24,7 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
+use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
 use lance_file::{
@@ -57,13 +58,10 @@ use lance_io::{
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
+use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_linalg::{
     distance::Normalize,
     kernels::{normalize_arrow, normalize_fsl},
-};
-use lance_linalg::{
-    distance::{DistanceType, Dot, MetricType, L2},
-    MatrixView,
 };
 use log::info;
 use object_store::path::Path;
@@ -74,8 +72,6 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
-
-use self::io::write_hnsw_quantization_index_partitions;
 
 use super::builder::IvfIndexBuilder;
 use super::{
@@ -94,7 +90,7 @@ use crate::{
     session::Session,
 };
 
-mod builder;
+pub mod builder;
 mod io;
 pub mod v2;
 
@@ -589,16 +585,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
         Quantizer::Product(pq) => {
-            let mat = MatrixView::<Float32Type>::new(
-                Arc::new(
-                    pq.codebook_as_fsl()
-                        .values()
-                        .as_primitive::<Float32Type>()
-                        .clone(),
-                ),
-                pq.dimension(),
-            );
-            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
             aux_writer
                 .object_writer
@@ -903,7 +890,7 @@ pub struct IvfPQIndexMetadata {
     pub(crate) ivf: IvfModel,
 
     /// Product Quantizer
-    pub(crate) pq: Arc<dyn ProductQuantizer>,
+    pub(crate) pq: ProductQuantizer,
 
     /// Transforms to be applied before search.
     transforms: Vec<pb::Transform>,
@@ -931,9 +918,9 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 )?)),
             },
             pb::VectorIndexStage {
-                stage: Some(pb::vector_index_stage::Stage::Pq(
-                    idx.pq.as_ref().try_into()?,
-                )),
+                stage: Some(pb::vector_index_stage::Stage::Pq(pb::Pq::try_from(
+                    &idx.pq,
+                )?)),
             },
         ]);
 
@@ -1103,7 +1090,7 @@ async fn build_ivf_model_and_pq(
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
-) -> Result<(IvfModel, Arc<dyn ProductQuantizer>)> {
+) -> Result<(IvfModel, ProductQuantizer)> {
     sanity_check_params(ivf_params, pq_params)?;
 
     info!(
@@ -1362,7 +1349,7 @@ async fn write_ivf_pq_file(
     uuid: &str,
     transformers: &[Box<dyn Transformer>],
     mut ivf: IvfModel,
-    pq: Arc<dyn ProductQuantizer>,
+    pq: ProductQuantizer,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<HashMap<u64, u32>>,
@@ -1402,7 +1389,7 @@ async fn write_ivf_pq_file(
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),
         column: column.to_string(),
-        dimension: pq.dimension() as u32,
+        dimension: pq.dimension as u32,
         dataset_version: dataset.version().version,
         metric_type,
         ivf,
@@ -1486,16 +1473,7 @@ async fn write_ivf_hnsw_file(
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
         Quantizer::Product(pq) => {
-            let mat = MatrixView::<Float32Type>::new(
-                Arc::new(
-                    pq.codebook_as_fsl()
-                        .values()
-                        .as_primitive::<Float32Type>()
-                        .clone(),
-                ),
-                pq.dimension(),
-            );
-            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
             aux_writer
                 .object_writer
@@ -1632,6 +1610,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
+    use lance_linalg::MatrixView;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
@@ -2654,7 +2633,7 @@ mod tests {
         // PQ code is on residual space
         pq_idx
             .pq
-            .codebook_as_fsl()
+            .codebook
             .values()
             .as_primitive::<Float32Type>()
             .values()

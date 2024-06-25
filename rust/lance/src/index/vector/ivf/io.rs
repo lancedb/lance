@@ -202,7 +202,7 @@ pub(super) async fn write_pq_partitions(
                     let fsl = Arc::new(
                         FixedSizeListArray::try_new_from_values(
                             pq_code.as_ref().clone(),
-                            pq_index.pq.num_sub_vectors() as i32,
+                            pq_index.pq.code_dim() as i32,
                         )
                         .unwrap(),
                     );
@@ -523,7 +523,7 @@ async fn build_and_write_pq_storage(
     metric_type: MetricType,
     row_ids: Arc<dyn Array>,
     code_array: Vec<Arc<dyn Array>>,
-    pq: Arc<dyn ProductQuantizer>,
+    pq: ProductQuantizer,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<()> {
     let storage = spawn_cpu(move || {
