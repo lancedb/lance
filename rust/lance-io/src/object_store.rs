@@ -104,16 +104,16 @@ impl std::fmt::Display for ObjectStore {
 }
 
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
-    fn new_store(&self, base_path: Url) -> Result<ObjectStore>;
+    fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore>;
 }
 
 #[derive(Default, Debug)]
 pub struct ObjectStoreRegistry {
-    providers: HashMap<String, Box<dyn ObjectStoreProvider>>,
+    providers: HashMap<String, Arc<dyn ObjectStoreProvider>>,
 }
 
 impl ObjectStoreRegistry {
-    pub fn insert(&mut self, scheme: &str, provider: Box<dyn ObjectStoreProvider>) {
+    pub fn insert(&mut self, scheme: &str, provider: Arc<dyn ObjectStoreProvider>) {
         self.providers.insert(scheme.into(), provider);
     }
 }
@@ -713,7 +713,7 @@ async fn configure_store(
     url: &str,
     options: ObjectStoreParams,
 ) -> Result<ObjectStore> {
-    let mut storage_options = StorageOptions(options.storage_options.unwrap_or_default());
+    let mut storage_options = StorageOptions(options.storage_options.clone().unwrap_or_default());
     let mut url = ensure_table_uri(url)?;
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
@@ -809,7 +809,7 @@ async fn configure_store(
         }),
         unknown_scheme => {
             if let Some(provider) = registry.providers.get(unknown_scheme) {
-                provider.new_store(url)
+                provider.new_store(url, &options)
             } else {
                 let err = lance_core::Error::from(object_store::Error::NotSupported {
                     source: format!("Unsupported URI scheme: {}", unknown_scheme).into(),
