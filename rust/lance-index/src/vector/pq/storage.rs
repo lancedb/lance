@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
 use super::{distance::build_distance_table_l2, num_centroids, ProductQuantizerImpl};
+use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
     vector::{
@@ -398,7 +399,7 @@ impl VectorStore for ProductQuantizationStorage {
         let metadata_json = batch
             .schema_ref()
             .metadata()
-            .get("metadata")
+            .get(STORAGE_METADATA_KEY)
             .ok_or(Error::Index {
                 message: "Metadata not found in schema".to_string(),
                 location: location!(),
@@ -456,7 +457,7 @@ impl VectorStore for ProductQuantizationStorage {
         };
 
         let metadata_json = serde_json::to_string(&metadata)?;
-        let metadata = HashMap::from_iter(vec![("metadata".to_string(), metadata_json)]);
+        let metadata = HashMap::from_iter(vec![(STORAGE_METADATA_KEY.to_string(), metadata_json)]);
 
         let schema = self
             .batch

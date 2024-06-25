@@ -52,6 +52,9 @@ pub trait Index: Send + Sync + DeepSizeOf {
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index>;
 
+    /// Cast to [vector::VectorIndex]
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn vector::VectorIndex>>;
+
     /// Retrieve index statistics as a JSON Value
     fn statistics(&self) -> Result<serde_json::Value>;
 

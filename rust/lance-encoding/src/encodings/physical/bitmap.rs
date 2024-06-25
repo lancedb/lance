@@ -11,7 +11,7 @@ use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     EncodingsIo,
 };
 
@@ -33,19 +33,19 @@ impl DenseBitmapScheduler {
 impl PageScheduler for DenseBitmapScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[Range<u32>],
+        ranges: &[Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let mut min = u64::MAX;
         let mut max = 0;
         let chunk_reqs = ranges
             .iter()
             .map(|range| {
                 debug_assert_ne!(range.start, range.end);
-                let start = self.buffer_offset + range.start as u64 / 8;
+                let start = self.buffer_offset + range.start / 8;
                 let bit_offset = range.start % 8;
-                let end = self.buffer_offset + range.end.div_ceil(8) as u64;
+                let end = self.buffer_offset + range.end.div_ceil(8);
                 let byte_range = start..end;
                 min = min.min(start);
                 max = max.max(end);
@@ -76,7 +76,7 @@ impl PageScheduler for DenseBitmapScheduler {
                     length,
                 })
                 .collect::<Vec<_>>();
-            Ok(Box::new(BitmapDecoder { chunks }) as Box<dyn PhysicalPageDecoder>)
+            Ok(Box::new(BitmapDecoder { chunks }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
@@ -84,32 +84,24 @@ impl PageScheduler for DenseBitmapScheduler {
 
 struct BitmapData {
     data: Bytes,
-    bit_offset: u32,
-    length: u32,
+    bit_offset: u64,
+    length: u64,
 }
 
 struct BitmapDecoder {
     chunks: Vec<BitmapData>,
 }
 
-impl PhysicalPageDecoder for BitmapDecoder {
-    fn update_capacity(
+impl PrimitivePageDecoder for BitmapDecoder {
+    fn decode(
         &self,
-        _rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
+        rows_to_skip: u64,
+        num_rows: u64,
         _all_null: &mut bool,
-    ) {
-        buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
-        buffers[0].1 = true;
-    }
+    ) -> Result<Vec<BytesMut>> {
+        let num_bytes = arrow_buffer::bit_util::ceil(num_rows as usize, 8);
+        let mut dest_buffers = vec![BytesMut::with_capacity(num_bytes)];
 
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [BytesMut],
-    ) -> Result<()> {
         let mut rows_to_skip = rows_to_skip;
 
         let mut dest_builder = BooleanBufferBuilder::new(num_rows as usize);
@@ -146,7 +138,7 @@ impl PhysicalPageDecoder for BitmapDecoder {
         //
         // It's a moot point at the moment since we don't support page bridging
         dest_buffers[0].copy_from_slice(bool_buffer.as_slice());
-        Ok(())
+        Ok(dest_buffers)
     }
 
     fn num_buffers(&self) -> u32 {
@@ -157,9 +149,9 @@ impl PhysicalPageDecoder for BitmapDecoder {
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field};
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
 
-    use crate::decoder::PhysicalPageDecoder;
+    use crate::decoder::PrimitivePageDecoder;
     use crate::encodings::physical::bitmap::BitmapData;
     use crate::testing::check_round_trip_encoding_random;
 
@@ -189,8 +181,8 @@ mod tests {
                 },
             ],
         };
-        let mut dest = vec![BytesMut::with_capacity(1)];
-        let result = decoder.decode_into(5, 1, &mut dest);
+
+        let result = decoder.decode(5, 1, &mut false);
         assert!(result.is_ok());
     }
 }
