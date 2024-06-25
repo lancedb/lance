@@ -7,7 +7,6 @@ use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::{stream::BoxStream, FutureExt, Stream, StreamExt};
-use lance_arrow::DataTypeExt;
 use lance_encoding::{
     decoder::{
         BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMiddlewareChain,
@@ -37,10 +36,7 @@ use crate::{
     format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION_NEXT},
 };
 
-use lance_encoding::encoder::get_str_encoding_type;
-
 use super::io::LanceEncodingsIo;
-use arrow_schema::DataType;
 
 // For now, we don't use global buffers for anything other than schema.  If we
 // use these later we should make them lazily loaded and then cached once loaded.
@@ -459,15 +455,11 @@ impl FileReader {
     // Helper function for `default_projection` to determine how many columns are occupied
     // by a lance field.
     fn default_column_count(field: &Field) -> u32 {
-        if field.data_type().is_binary_like() {
-            2
-        } else {
-            1 + field
-                .children
-                .iter()
-                .map(Self::default_column_count)
-                .sum::<u32>()
-        }
+        1 + field
+            .children
+            .iter()
+            .map(Self::default_column_count)
+            .sum::<u32>()
     }
 
     // This function is one of the few spots in the reader where we rely on Lance table
@@ -528,19 +520,6 @@ impl FileReader {
     ) -> Result<()> {
         column_infos.push(self.metadata.column_infos[*column_idx].clone());
         *column_idx += 1;
-
-        if get_str_encoding_type() {
-            // use str array encoding
-            if (field.data_type().is_binary_like()) && (field.data_type() != DataType::Utf8) {
-                // These types are 2 columns in a lance file but a single field id in a lance schema
-                column_infos.push(self.metadata.column_infos[*column_idx].clone());
-                *column_idx += 1;
-            }
-        } else if field.data_type().is_binary_like() {
-            // These types are 2 columns in a lance file but a single field id in a lance schema
-            column_infos.push(self.metadata.column_infos[*column_idx].clone());
-            *column_idx += 1;
-        }
 
         for child in &field.children {
             self.collect_columns(child, column_idx, column_infos)?;
@@ -950,12 +929,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
             data: bytes,
             num_rows: page_table
                 .first()
-                .map(|col| {
-                    col.page_infos
-                        .iter()
-                        .map(|page| page.num_rows as u64)
-                        .sum::<u64>()
-                })
+                .map(|col| col.page_infos.iter().map(|page| page.num_rows).sum::<u64>())
                 .unwrap_or(0),
             page_table,
             schema: Arc::new(schema.clone()),
@@ -998,12 +972,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
             data: bytes,
             num_rows: page_table
                 .first()
-                .map(|col| {
-                    col.page_infos
-                        .iter()
-                        .map(|page| page.num_rows as u64)
-                        .sum::<u64>()
-                })
+                .map(|col| col.page_infos.iter().map(|page| page.num_rows).sum::<u64>())
                 .unwrap_or(0),
             page_table,
             schema: Arc::new(schema.clone()),
@@ -1052,6 +1021,8 @@ pub mod tests {
             .col("score", array::rand::<Float64Type>())
             .col("location", array::rand_type(&location_type))
             .col("categories", array::rand_type(&categories_type))
+            .col("binary", array::rand_type(&DataType::Binary))
+            .col("large_bin", array::rand_type(&DataType::LargeBinary))
             .into_reader_rows(RowCount::from(1000), BatchCount::from(100));
 
         write_lance_file(reader, fs, FileWriterOptions::default()).await

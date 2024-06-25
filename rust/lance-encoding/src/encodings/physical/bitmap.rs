@@ -33,7 +33,7 @@ impl DenseBitmapScheduler {
 impl PageScheduler for DenseBitmapScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[Range<u32>],
+        ranges: &[Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
@@ -43,9 +43,9 @@ impl PageScheduler for DenseBitmapScheduler {
             .iter()
             .map(|range| {
                 debug_assert_ne!(range.start, range.end);
-                let start = self.buffer_offset + range.start as u64 / 8;
+                let start = self.buffer_offset + range.start / 8;
                 let bit_offset = range.start % 8;
-                let end = self.buffer_offset + range.end.div_ceil(8) as u64;
+                let end = self.buffer_offset + range.end.div_ceil(8);
                 let byte_range = start..end;
                 min = min.min(start);
                 max = max.max(end);
@@ -84,8 +84,8 @@ impl PageScheduler for DenseBitmapScheduler {
 
 struct BitmapData {
     data: Bytes,
-    bit_offset: u32,
-    length: u32,
+    bit_offset: u64,
+    length: u64,
 }
 
 struct BitmapDecoder {
@@ -95,8 +95,8 @@ struct BitmapDecoder {
 impl PrimitivePageDecoder for BitmapDecoder {
     fn decode(
         &self,
-        rows_to_skip: u32,
-        num_rows: u32,
+        rows_to_skip: u64,
+        num_rows: u64,
         _all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
         let num_bytes = arrow_buffer::bit_util::ceil(num_rows as usize, 8);

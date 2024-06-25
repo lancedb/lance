@@ -183,6 +183,7 @@ message SimpleStruct {}
 message Binary {
   ArrayEncoding indices = 1;
   ArrayEncoding bytes = 2;
+  uint64 null_adjustment = 3;
 }
 
 // An array encoding for dictionary-encoded fields
