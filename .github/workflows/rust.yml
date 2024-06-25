@@ -155,6 +155,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - name: Select new xcode
+        # Default XCode right now is 15.0.1, which contains a bug that causes
+        # backtraces to not show properly. See: 
+        # https://github.com/rust-lang/rust/issues/113783
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
       - name: Install dependencies
         run: brew install protobuf
       - name: Set up Rust

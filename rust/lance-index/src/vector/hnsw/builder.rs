@@ -54,9 +54,6 @@ pub struct HnswBuildParams {
     /// size of the dynamic list for the candidates
     pub ef_construction: usize,
 
-    /// the max number of threads to use for building the graph
-    pub parallel_limit: Option<usize>,
-
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
 }
@@ -67,7 +64,6 @@ impl Default for HnswBuildParams {
             max_level: 7,
             m: 20,
             ef_construction: 150,
-            parallel_limit: None,
             prefetch_distance: Some(2),
         }
     }
@@ -94,12 +90,6 @@ impl HnswBuildParams {
     /// The default value is `100`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
-        self
-    }
-
-    /// The max number of threads to use for building the graph.
-    pub fn parallel_limit(mut self, limit: usize) -> Self {
-        self.parallel_limit = Some(limit);
         self
     }
 
@@ -136,6 +126,18 @@ impl Debug for HNSW {
 }
 
 impl HNSW {
+    pub fn empty() -> Self {
+        Self {
+            inner: Arc::new(HnswBuilder {
+                params: HnswBuildParams::default(),
+                nodes: Arc::new(Vec::new()),
+                level_count: Vec::new(),
+                entry_point: 0,
+                visited_generator_queue: Arc::new(ArrayQueue::new(1)),
+            }),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.nodes.len()
     }
@@ -176,6 +178,7 @@ impl HNSW {
         }
 
         let bottom_level = HnswBottomView::new(nodes);
+        let mut visited = visited_generator.generate(storage.len());
         Ok(beam_search(
             &bottom_level,
             &ep,
@@ -183,7 +186,7 @@ impl HNSW {
             &dist_calc,
             bitset.as_ref(),
             prefetch_distance,
-            visited_generator,
+            &mut visited,
         )
         .into_iter()
         .take(k)
@@ -415,6 +418,7 @@ impl HnswBuilder {
         visited_generator: &mut VisitedGenerator,
     ) -> Vec<OrderedNode> {
         let cur_level = HnswLevelView::new(level, nodes);
+        let mut visited = visited_generator.generate(nodes.len());
         beam_search(
             &cur_level,
             ep,
@@ -422,7 +426,7 @@ impl HnswBuilder {
             dist_calc,
             None,
             self.params.prefetch_distance,
-            visited_generator,
+            &mut visited,
         )
     }
 
@@ -511,6 +515,10 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
+        if data.num_rows() == 0 {
+            return Ok(Self::empty());
+        }
+
         let hnsw_metadata =
             data.schema_ref()
                 .metadata()
@@ -519,7 +527,14 @@ impl IvfSubIndex for HNSW {
                     message: format!("{} not found", HNSW_METADATA_KEY),
                     location: location!(),
                 })?;
-        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata)?;
+        let hnsw_metadata: HnswMetadata =
+            serde_json::from_str(hnsw_metadata).map_err(|e| Error::Index {
+                message: format!(
+                    "Failed to decode HNSW metadata: {}, json: {}",
+                    e, hnsw_metadata
+                ),
+                location: location!(),
+            })?;
 
         let levels: Vec<_> = hnsw_metadata
             .level_offsets
@@ -581,6 +596,10 @@ impl IvfSubIndex for HNSW {
 
     fn name() -> &'static str {
         HNSW_TYPE
+    }
+
+    fn metadata_key() -> &'static str {
+        "lance:hnsw"
     }
 
     /// Return the schema of the sub index
@@ -661,13 +680,6 @@ impl IvfSubIndex for HNSW {
         );
 
         let len = storage.len();
-        let parallel_limit = hnsw
-            .inner
-            .params
-            .parallel_limit
-            .unwrap_or_else(num_cpus::get)
-            .max(1);
-        log::info!("Building HNSW graph with parallel_limit={}", parallel_limit);
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
         (1..len).into_par_iter().for_each(|node| {
             let mut visited_generator = VisitedGenerator::new(len);
