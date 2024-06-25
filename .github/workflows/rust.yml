@@ -162,6 +162,12 @@ jobs:
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
           rustup component add rustfmt
       - name: Run tests
+        env: 
+          # Make sure backtraces work on MacOS, so we can understand errors output
+          # in CI. Current Mac linker has a bug:
+          #
+          # <https://github.com/rust-lang/rust/issues/113783> 
+          CARGO_BUILD_RUSTFLAGS: "-Clink-arg=-Wl,-ld_classic"
         run: |
           cargo build --all-features
           cargo test --all-features
