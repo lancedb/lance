@@ -120,7 +120,9 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
             new_primitive_array::<UInt64Type>(indices_buffers.clone(), num_rows, &DataType::UInt64);
 
         let indices_array = indices_array.as_primitive::<UInt64Type>().clone();
+        println!("Indices array: {:?}", indices_array);
         let dictionary = self.decoded_dict.clone();
+        println!("Dictionary: {:?}", dictionary);
 
         let adjusted_indices: UInt64Array = indices_array
             .iter()
@@ -136,6 +138,7 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
             DictionaryArray::<UInt64Type>::try_new(adjusted_indices, dictionary).unwrap();
         let string_array = arrow_cast::cast(&dict_array, &DataType::Utf8).unwrap();
         let string_array = string_array.as_any().downcast_ref::<StringArray>().unwrap();
+        println!("String array: {:?}", string_array);
 
         let null_buffer = string_array
             .nulls()
@@ -178,6 +181,9 @@ impl DictionaryEncoder {
 }
 
 fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
+    for arr in arrays {
+        println!("Array: {:?}", arr);
+    }
     let mut arr_hashmap: HashMap<&str, u64> = HashMap::new();
     let mut curr_dict_index = 1;
     let total_capacity = arrays.iter().map(|arr| arr.len()).sum();
@@ -220,6 +226,9 @@ fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
 impl ArrayEncoder for DictionaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let (index_array, items_array) = get_indices_items_from_arrays(arrays);
+        println!("Index array: {:?}", index_array);
+        println!("Items array: {:?}", items_array);
+        
         let encoded_indices = self
             .indices_encoder
             .encode(&[index_array.clone()], buffer_index)?;

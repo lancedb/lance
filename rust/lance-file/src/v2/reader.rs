@@ -1428,7 +1428,7 @@ pub mod tests {
             schema,
             vec![
                 Arc::new(UInt32Array::from(vec![3, 4, 5, 6])),
-                Arc::new(StringArray::from(vec!["abcd", "apple", "hello", "abcd"])),
+                Arc::new(StringArray::from(vec![Some("abcd"), Some("apple"), Some("hello"), None])),
             ],
         )
         .unwrap();
@@ -1447,7 +1447,7 @@ pub mod tests {
             schema,
             vec![
                 Arc::new(UInt32Array::from(vec![1, 2, 3, 4])),
-                Arc::new(StringArray::from(vec!["abcd", "hello", "abcd", "apple"])),
+                Arc::new(StringArray::from(vec![Some("abcd"), None, Some("abcd"), Some("apple")])),
             ],
         )
         .unwrap();

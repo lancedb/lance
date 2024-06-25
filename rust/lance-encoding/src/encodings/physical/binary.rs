@@ -343,9 +343,6 @@ impl BinaryEncoder {
 // Zero offset is removed from the start of the offsets array
 // The indices array is computed across all arrays in the vector
 fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
-    for arr in arrays {
-        println!("{:?}", arr);
-    }
     let num_rows = arrays.iter().map(|arr| arr.len()).sum::<usize>();
     let mut indices = Vec::with_capacity(num_rows);
     let mut last_offset = 0_u64;
@@ -386,6 +383,7 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
             panic!("Array is not a string array");
         }
     }
+
     let last_offset = *indices.last().expect("Indices array is empty");
     // 8 exabytes in a single array seems unlikely but...just in case
     assert!(
