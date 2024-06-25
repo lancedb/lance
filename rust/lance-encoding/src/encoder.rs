@@ -248,21 +248,21 @@ impl CoreArrayEncodingStrategy {
                 if use_dict_encoding {
                     let dict_indices_encoder =
                         Self::array_encoder_from_type(&DataType::UInt64, false)?;
-                    let dict_items_encoder =
-                        Self::array_encoder_from_type(&DataType::Utf8, false)?;
+                    let dict_items_encoder = Self::array_encoder_from_type(&DataType::Utf8, false)?;
 
                     Ok(Box::new(DictionaryEncoder::new(
                         dict_indices_encoder,
                         dict_items_encoder,
                     )))
                 } else {
-                    let bin_indices_encoder = Self::array_encoder_from_type(&DataType::UInt64, false)?;
+                    let bin_indices_encoder =
+                        Self::array_encoder_from_type(&DataType::UInt64, false)?;
                     let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8, false)?;
 
-                        Ok(Box::new(BinaryEncoder::new(
-                            bin_indices_encoder,
-                            bin_bytes_encoder,
-                        )))
+                    Ok(Box::new(BinaryEncoder::new(
+                        bin_indices_encoder,
+                        bin_bytes_encoder,
+                    )))
                 }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(

@@ -34,10 +34,7 @@ use crate::{
         PageInfo, PageScheduler, PrimitivePageDecoder, ScheduledScanLine, SchedulerContext,
         SchedulingJob,
     },
-    encoder::{
-        get_dict_encoding, ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage,
-        FieldEncoder,
-    },
+    encoder::{ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, FieldEncoder},
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
 

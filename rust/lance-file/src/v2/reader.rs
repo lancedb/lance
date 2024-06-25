@@ -1497,8 +1497,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_dict_array_encoding() {
-        // set env var temporarily to test string array encoding
-        let _env_guard = EnvVarGuard::new("LANCE_STR_ARRAY_ENCODING", "binary");
+        // set env var temporarily to test dict encoding
         let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
 
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -1510,14 +1509,14 @@ pub mod tests {
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("key", DataType::UInt32, false),
-            Field::new("strings", DataType::Utf8, false),
+            Field::new("strings", DataType::Utf8, true),
         ]));
 
         let batch1 = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(UInt32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["abcd", "hello", "abcd"])),
+                Arc::new(StringArray::from(vec![Some("abcd"), None, Some("abcd")])),
             ],
         )
         .unwrap();
@@ -1526,7 +1525,7 @@ pub mod tests {
             schema.clone(),
             vec![
                 Arc::new(UInt32Array::from(vec![4, 5, 6])),
-                Arc::new(StringArray::from(vec!["apple", "hello", "abcd"])),
+                Arc::new(StringArray::from(vec![Some("apple"), Some("hello"), None])),
             ],
         )
         .unwrap();
