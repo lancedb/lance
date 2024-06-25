@@ -66,8 +66,9 @@ impl PageScheduler for DictionaryPageScheduler {
                 .schedule_ranges(ranges, scheduler, top_level_row);
 
         // Schedule items for decoding
+        let items_range = 0..self.num_dictionary_items;
         let items_page_decoder = self.items_scheduler.schedule_ranges(
-            &[0..self.num_dictionary_items],
+            std::slice::from_ref(&items_range),
             scheduler,
             top_level_row,
         );
@@ -208,6 +209,8 @@ fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
             let hashmap_entry = *arr_hashmap.entry(st).or_insert(curr_dict_index);
             dict_indices[indices_ctr] = hashmap_entry;
 
+            // if item didn't exist in the hashmap, add it to the dictionary
+            // and increment the dictionary index
             if hashmap_entry == curr_dict_index {
                 dict_elements.push(st);
                 curr_dict_index += 1;
