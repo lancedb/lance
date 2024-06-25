@@ -73,8 +73,8 @@ pub fn new_generic_byte_array<T: ByteArrayType>(buffers: Vec<BytesMut>, num_rows
 
     let offsets = OffsetBuffer::new(indices_buffer.clone());
 
-    // TODO - add NULL support
-    // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
+    // Decoding the bytes creates 2 buffers, the first one is empty since
+    // validity is stored in an earlier buffer
     buffer_iter.next().unwrap();
 
     let bytes_buffer = buffer_iter.next().unwrap().freeze();
