@@ -123,11 +123,11 @@ mod test {
     #[async_trait::async_trait]
     impl VectorIndex for MockIndex {
         async fn search(&self, _: &Query, _: Arc<dyn PreFilter>) -> Result<RecordBatch> {
-            todo!("panic")
+            unimplemented!()
         }
 
         fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
-            todo!("panic")
+            unimplemented!()
         }
 
         async fn search_in_partition(
@@ -136,7 +136,7 @@ mod test {
             _: &Query,
             _: Arc<dyn PreFilter>,
         ) -> Result<RecordBatch> {
-            todo!("panic")
+            unimplemented!()
         }
 
         fn is_loadable(&self) -> bool {
@@ -157,11 +157,11 @@ mod test {
             _: usize,
             _: usize,
         ) -> Result<Box<dyn VectorIndex>> {
-            todo!("panic")
+            unimplemented!()
         }
 
         fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
-            todo!("panic")
+            unimplemented!()
         }
 
         fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
@@ -169,15 +169,15 @@ mod test {
         }
 
         fn ivf_model(&self) -> IvfModel {
-            todo!("panic")
+            unimplemented!()
         }
         fn quantizer(&self) -> Quantizer {
-            todo!("panic")
+            unimplemented!()
         }
 
         /// the index type of this vector index.
         fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
-            todo!("panic")
+            unimplemented!()
         }
 
         fn metric_type(&self) -> MetricType {

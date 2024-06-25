@@ -319,15 +319,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         ))?;
 
         let partition_build_order = (0..ivf.num_partitions())
-            .map(|partition_id| reader.partiton_size(partition_id))
+            .map(|partition_id| reader.partition_size(partition_id))
             .collect::<Result<Vec<_>>>()?
             // sort by partition size in descending order
             .into_iter()
             .enumerate()
-            .map(|(idx, x)| (x, idx))
-            .sorted()
-            .rev()
-            .map(|(_, idx)| idx)
+            .sorted_unstable_by(|(_, a), (_, b)| b.cmp(a))
+            .map(|(idx, _)| idx)
             .collect::<Vec<_>>();
 
         let mut partition_sizes = vec![(0, 0); ivf.num_partitions()];
@@ -355,7 +353,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 );
             }
 
-            match reader.partiton_size(partition)? {
+            match reader.partition_size(partition)? {
                 0 => continue,
                 _ => {
                     let partition_data =

@@ -35,7 +35,7 @@ pub trait ShuffleReader: Send + Sync {
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>;
 
     /// Get the size of the partition by partition_id
-    fn partiton_size(&self, partition_id: usize) -> Result<usize>;
+    fn partition_size(&self, partition_id: usize) -> Result<usize>;
 }
 
 #[async_trait::async_trait]
@@ -259,7 +259,7 @@ impl ShuffleReader for IvfShufflerReader {
         ))))
     }
 
-    fn partiton_size(&self, partition_id: usize) -> Result<usize> {
+    fn partition_size(&self, partition_id: usize) -> Result<usize> {
         Ok(self.partition_sizes[partition_id])
     }
 }

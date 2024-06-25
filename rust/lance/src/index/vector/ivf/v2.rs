@@ -466,6 +466,7 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::generate_random_array_with_range;
@@ -555,15 +556,11 @@ mod tests {
             .await
             .unwrap();
 
-        let row_ids = result
-            .column_by_name(ROW_ID)
-            .unwrap()
+        let row_ids = result[ROW_ID]
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
-        let dists = result
-            .column_by_name("_distance")
-            .unwrap()
+        let dists = result[DIST_COL]
             .as_primitive::<Float32Type>()
             .values()
             .to_vec();
@@ -625,15 +622,11 @@ mod tests {
             .await
             .unwrap();
 
-        let row_ids = result
-            .column_by_name(ROW_ID)
-            .unwrap()
+        let row_ids = result[ROW_ID]
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
-        let dists = result
-            .column_by_name("_distance")
-            .unwrap()
+        let dists = result[DIST_COL]
             .as_primitive::<Float32Type>()
             .values()
             .to_vec();

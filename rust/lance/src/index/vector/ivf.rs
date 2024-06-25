@@ -324,7 +324,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
-    // Senity check the indices
+    // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::Index {
             message: "optimizing vector index: no existing index found".to_string(),
