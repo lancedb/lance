@@ -23,7 +23,7 @@ use bytes::BytesMut;
 use lance_core::Result;
 use std::collections::HashMap;
 
-use crate::encodings::utils::primitive_array_from_buffers;
+use crate::encodings::utils::new_primitive_array;
 use arrow_array::cast::AsArray;
 
 #[derive(Debug)]
@@ -54,23 +54,12 @@ impl PageScheduler for DictionaryPageScheduler {
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
-        // Run schedule ranges on all indices together, decode all indices together.
-        // we need to decode certain elements of the dictionary that are
-        // present in distinct indices, i.e. distinct values from indices[a]...indices[b] and indices[c]...indices[d].
-        // So we need to decode the *distinct* dictionary items in the same order of appearance in the indices.
-        // Let's say this gives schedule dictionary[m...n]
-        // Now during update_capacity, allocate capacity for the items encoder on all the relevant rows
-        // During decode_into, decode all the dict items.
-        // When reconstructing:
-        // get indices buffers, items buffers.
-        // Need to rebuild the large array.
-        // have a bunch of random indices, bunch of items in the same order of appearance as indices
-        // process all indices sequentially to build the array. use a hashmap to keep track of dict items that have been processed.
-        // Should we make a ListArray<StringArray>? Since the return type of primitive_array_from_buffers() is ArrayRef
-
-        // can rebuild the array by iterating over the indices and the distinct dict items.
-        // decoded indices 1, 0, 1, 3. We need dict[0], dict[1], dict[3] of the original dict.
-        // The decoded dictionary will have 2 elements. We should process it sequentially -
+        // We want to decode indices and items
+        // e.g. indices [0, 1, 2, 0, 1, 0]
+        // items (dictionary) ["abcd", "hello", "apple"]
+        // This will map to ["abcd", "hello", "apple", "abcd", "hello", "abcd"]
+        // We decode all the items during scheduling itself
+        // These are used to rebuild the string later
 
         // Schedule indices for decoding
         let indices_page_decoder =
@@ -123,16 +112,18 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
         num_rows: u32,
         all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
-        // decode the indices
+        // Decode the indices
         let indices_buffers = self
             .indices_decoder
             .decode(rows_to_skip, num_rows, all_null)?;
+
         let indices_array =
-            primitive_array_from_buffers(&DataType::UInt64, indices_buffers.clone(), num_rows)?;
+            new_primitive_array::<UInt64Type>(indices_buffers.clone(), num_rows, &DataType::UInt64);
         let indices_array = indices_array.as_primitive::<UInt64Type>().clone();
 
         let dictionary = self.decoded_dict.clone();
 
+        // Build dictionary array using indices and items
         let dict_array = DictionaryArray::<UInt64Type>::try_new(indices_array, dictionary).unwrap();
         let str_array = arrow_cast::cast(&dict_array, &DataType::Utf8).unwrap();
         let string_arr = str_array.as_any().downcast_ref::<StringArray>().unwrap();
@@ -219,12 +210,10 @@ impl ArrayEncoder for DictionaryEncoder {
             let encoded_indices = self
                 .indices_encoder
                 .encode(&[index_array.clone()], buffer_index)?;
-            println!("dict indices: {:?}", index_array);
 
             let encoded_items: EncodedArray = self
                 .items_encoder
                 .encode(&[items_array.clone()], buffer_index)?;
-            println!("dict items: {:?}", items_array);
 
             let mut encoded_buffers = encoded_indices.buffers;
             encoded_buffers.extend(encoded_items.buffers);

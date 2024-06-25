@@ -477,7 +477,6 @@ impl PrimitiveFieldDecodeTask {
             }
             DataType::Utf8 => {
                 let num_buffers = buffers.len();
-                println!("Number of Buffers: {:?}", num_buffers);
 
                 if !get_dict_encoding() || (num_buffers == 3) {
                     let mut buffer_iter = buffers.into_iter();
@@ -510,14 +509,6 @@ impl PrimitiveFieldDecodeTask {
                     )))
                 } else {
                     let mut buffer_iter = buffers.clone().into_iter();
-                    // let indices_array = Self::primitive_array_from_buffers(
-                    //     &DataType::UInt64,
-                    //     buffers,
-                    //     num_rows,
-                    // )?;
-                    // println!("Indices Array: {:?}", indices_array);
-
-                    // let remaining_buffers = buffer_iter.collect::<Vec<_>>();
 
                     let indices_bytes = buffer_iter.next().unwrap().freeze();
                     let indices_buffer = Buffer::from_bytes(indices_bytes.into());
@@ -545,31 +536,6 @@ impl PrimitiveFieldDecodeTask {
                         bytes_array.values().into(),
                         None,
                     )))
-                    // let decoded_dict = Arc::new(StringArray::new(
-                    //     offsets.clone(),
-                    //     bytes_array.values().into(),
-                    //     None,
-                    // ));
-
-                    // println!("Decoded String Array of Items: {:?}", decoded_dict);
-
-                    // let remaining_buffers = buffer_iter.collect::<Vec<_>>();
-                    // let dict_indices_array = Self::primitive_array_from_buffers(
-
-                    //     remaining_buffers,
-                    //     num_rows * (*dimension as u32),
-                    // )?;
-
-                    // let dict_indices_bytes = buffer_iter.next().unwrap().freeze();
-                    // let dict_indices_buffer = Buffer::from_bytes(indices_bytes.into());
-                    // let dict_indices_buffer =
-                    //     ScalarBuffer::<i32>::new(indices_buffer, 0, num_rows as usize + 1);
-
-                    // Ok(Arc::new(StringArray::new(
-                    //     offsets,
-                    //     bytes_array.values().into(),
-                    //     None,
-                    // )))
                 }
             }
             _ => Err(Error::io(
