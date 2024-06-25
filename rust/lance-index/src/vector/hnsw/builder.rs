@@ -292,7 +292,7 @@ impl HnswBuilder {
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>();
 
-        let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get() * 2));
+        let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get()));
         for _ in 0..(num_cpus::get() * 2) {
             visited_generator_queue
                 .push(VisitedGenerator::new(0))
@@ -681,11 +681,12 @@ impl IvfSubIndex for HNSW {
 
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
-        (1..len).into_par_iter().for_each(|node| {
-            let mut visited_generator = VisitedGenerator::new(len);
-            hnsw.inner
-                .insert(node as u32, &mut visited_generator, storage);
-        });
+        (1..len).into_par_iter().for_each_init(
+            || VisitedGenerator::new(len),
+            |visited_generator, node| {
+                hnsw.inner.insert(node as u32, visited_generator, storage);
+            },
+        );
 
         assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
         Ok(hnsw)
