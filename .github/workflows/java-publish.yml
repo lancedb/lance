@@ -100,6 +100,20 @@ jobs:
           mkdir -p ./core/target/classes/nativelib/darwin-aarch64 ./core/target/classes/nativelib/linux-aarch64
           cp ../liblance_jni_darwin_aarch64.zip/liblance_jni.dylib ./core/target/classes/nativelib/darwin-aarch64/liblance_jni.dylib
           cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
-      - name: Build and publish with Java 8
+      #- name: Build and publish with Java 8
+      #  run: |
+      #    mvn release:prepare -DdryRun=true
+      
+      - name: Create Lance Spark Jar with scala 2.13
         run: |
-          mvn release:prepare -DdryRun=true
+          mvn clean install -Pscala-2.13
+          JAR_PATH=$(find spark/target -name 'lance-spark-2.13-*-jar-with-dependencies.jar')
+          JAR_NAME=$(basename $JAR_PATH)
+          echo "JAR_PATH=$JAR_PATH" >> $GITHUB_ENV
+          echo "JAR_NAME=$JAR_NAME" >> $GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.JAR_NAME }}
+          path: ${{ env.JAR_PATH }}
+          retention-days: 1
+          if-no-files-found: error
