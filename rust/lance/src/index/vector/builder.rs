@@ -66,6 +66,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     ivf_params: Option<IvfBuildParams>,
     quantizer_params: Option<Q::BuildParams>,
     sub_index_params: S::BuildParams,
+    _temp_dir: TempDir, // store this for keeping the temp dir alive
     temp_dir: Path,
 
     // fields will be set during build
@@ -91,7 +92,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         sub_index_params: S::BuildParams,
     ) -> Result<Self> {
         let temp_dir = TempDir::new()?;
-        let temp_dir = Path::from(temp_dir.path().to_str().unwrap());
+        let temp_dir_path = temp_dir.path().to_str().unwrap().into();
         Ok(Self {
             dataset,
             column,
@@ -101,7 +102,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             ivf_params,
             quantizer_params,
             sub_index_params,
-            temp_dir,
+            _temp_dir: temp_dir,
+            temp_dir: temp_dir_path,
             // fields will be set during build
             ivf: None,
             quantizer: None,
@@ -287,7 +289,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             None => {
                 log::info!("no data to shuffle");
                 self.shuffle_reader = Some(Box::new(IvfShufflerReader::new(
-                    self.dataset.object_store().clone(),
+                    self.dataset.object_store.clone(),
                     self.temp_dir.clone(),
                     vec![0; ivf.num_partitions()],
                 )));

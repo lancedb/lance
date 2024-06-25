@@ -51,7 +51,7 @@ pub trait Shuffler: Send + Sync {
 }
 
 pub struct IvfShuffler {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     output_dir: Path,
     num_partitions: usize,
 
@@ -62,7 +62,7 @@ pub struct IvfShuffler {
 impl IvfShuffler {
     pub fn new(output_dir: Path, num_partitions: usize) -> Self {
         Self {
-            object_store: ObjectStore::local(),
+            object_store: Arc::new(ObjectStore::local()),
             output_dir,
             num_partitions,
             buffer_size: 4096,
@@ -216,13 +216,17 @@ impl Shuffler for IvfShuffler {
 }
 
 pub struct IvfShufflerReader {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     output_dir: Path,
     partition_sizes: Vec<usize>,
 }
 
 impl IvfShufflerReader {
-    pub fn new(object_store: ObjectStore, output_dir: Path, partition_sizes: Vec<usize>) -> Self {
+    pub fn new(
+        object_store: Arc<ObjectStore>,
+        output_dir: Path,
+        partition_sizes: Vec<usize>,
+    ) -> Self {
         Self {
             object_store,
             output_dir,
@@ -237,7 +241,7 @@ impl ShuffleReader for IvfShufflerReader {
         &self,
         partition_id: usize,
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
-        let scheduler = ScanScheduler::new(Arc::new(self.object_store.clone()), 32);
+        let scheduler = ScanScheduler::new(self.object_store.clone(), 32);
         let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
 
         let reader = FileReader::try_open(
