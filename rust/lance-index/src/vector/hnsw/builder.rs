@@ -738,6 +738,15 @@ impl IvfSubIndex for HNSW {
         let batch = batch.with_schema(Arc::new(schema))?;
         Ok(batch)
     }
+
+    fn stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "index_type": Self::name(),
+            "max_level": self.max_level(),
+            "m": self.inner.params.m,
+            "ef_construction": self.inner.params.ef_construction,
+        })
+    }
 }
 
 #[cfg(test)]

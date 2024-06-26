@@ -141,6 +141,12 @@ impl IvfSubIndex for FlatIndex {
     fn to_batch(&self) -> Result<RecordBatch> {
         Ok(RecordBatch::new_empty(Schema::empty().into()))
     }
+
+    fn stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "index_type": Self::name(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
