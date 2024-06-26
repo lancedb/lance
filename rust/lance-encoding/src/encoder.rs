@@ -286,8 +286,8 @@ fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
                 let key_exists = arr_hashmap.insert(string_array.value(i), curr_dict_index);
                 if key_exists.is_some() {
                     curr_dict_index += 1;
-                    if curr_dict_index < 100 {
-                        return true;
+                    if curr_dict_index >= 100 {
+                        return false;
                     }
                 }
             }
