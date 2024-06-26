@@ -43,7 +43,7 @@ use log::info;
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
-use tempfile::TempDir;
+use tempfile::{tempdir, TempDir};
 
 use crate::Dataset;
 
@@ -66,6 +66,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     ivf_params: Option<IvfBuildParams>,
     quantizer_params: Option<Q::BuildParams>,
     sub_index_params: S::BuildParams,
+    _temp_dir: TempDir, // store this for keeping the temp dir alive and clean up after build
     temp_dir: Path,
 
     // fields will be set during build
@@ -90,7 +91,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         quantizer_params: Option<Q::BuildParams>,
         sub_index_params: S::BuildParams,
     ) -> Result<Self> {
-        let temp_dir = TempDir::new()?.path().to_str().unwrap().into();
+        let temp_dir = tempdir()?;
+        let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
         Ok(Self {
             dataset,
             column,
@@ -100,7 +102,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             ivf_params,
             quantizer_params,
             sub_index_params,
-            temp_dir,
+            _temp_dir: temp_dir,
+            temp_dir: temp_dir_path,
             // fields will be set during build
             ivf: None,
             quantizer: None,

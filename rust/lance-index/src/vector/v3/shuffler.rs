@@ -202,11 +202,6 @@ impl Shuffler for IvfShuffler {
         // finish all writers
         for writer in writers.iter_mut() {
             writer.finish().await?;
-            assert!(
-                self.object_store.exists(&writer.path().into()).await?,
-                "file {} not found after finished",
-                writer.path()
-            );
         }
 
         Ok(Box::new(IvfShufflerReader::new(
