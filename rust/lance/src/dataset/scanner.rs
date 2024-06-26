@@ -4092,11 +4092,11 @@ mod test {
             Projection: fields=[_distance, _rowid, vec]
               SortExec: TopK(fetch=8), expr=...
                 KNNFlat: metric=l2
-                FilterExec: i@1 > 10
-                  LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+                  FilterExec: i@1 > 10
+                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
             Take: columns=\"_distance, _rowid, vec\"
               SortExec: TopK(fetch=8), expr=...
-                ANNSubIndex: name=..., k=5, deltas=1
+                ANNSubIndex: name=..., k=8, deltas=1
                   ANNIvfPartition: uuid=..., nprobes=1, deltas=1
                   ScalarIndexQuery: query=i > 10",
         )
@@ -4108,24 +4108,26 @@ mod test {
             &dataset.dataset,
             |scan| {
                 Ok(scan
-                    .nearest("vec", &q, 5)?
+                    .nearest("vec", &q, 11)?
                     .filter("i > 10")?
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
-      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-        UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              ANNSubIndex: name=..., k=5, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                ScalarIndexQuery: query=i > 10",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    SortExec: TopK(fetch=11), expr=...
+      KNNFlat: metric=l2
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Projection: fields=[_distance, _rowid, vec]
+              SortExec: TopK(fetch=11), expr=...
+                KNNFlat: metric=l2
+                  FilterExec: i@1 > 10
+                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+            Take: columns=\"_distance, _rowid, vec\"
+              SortExec: TopK(fetch=11), expr=...
+                ANNSubIndex: name=..., k=11, deltas=1
+                  ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                  ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
