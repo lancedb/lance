@@ -199,7 +199,19 @@ impl ExecutionPlan for KNNFlatExec {
     }
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
-        self.input.statistics()
+        let inner_stats = self.input.statistics()?;
+        let dist_col_stats = inner_stats.column_statistics[0].clone();
+        let column_statistics = inner_stats
+            .column_statistics
+            .into_iter()
+            .chain([dist_col_stats.clone()])
+            .collect::<Vec<_>>();
+        Ok(Statistics {
+            num_rows: inner_stats.num_rows,
+            column_statistics,
+            ..Statistics::new_unknown(self.schema().as_ref())
+        })
+        // self.input.statistics()
     }
 
     fn properties(&self) -> &PlanProperties {

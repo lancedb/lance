@@ -1376,7 +1376,7 @@ impl Scanner {
             q.metric_type,
         )?);
 
-        // Use datafusion to do top K
+        // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
             vec![PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
@@ -1389,7 +1389,12 @@ impl Scanner {
         )
         .with_fetch(Some(q.k));
 
-        Ok(Arc::new(sort))
+        let not_nulls = FilterExec::try_new(
+            expressions::is_not_null(expressions::col(DIST_COL, sort.schema().as_ref())?)?,
+            Arc::new(sort),
+        )?;
+
+        Ok(Arc::new(not_nulls))
     }
 
     /// Create an Execution plan to do indexed ANN search
@@ -3888,9 +3893,10 @@ mod test {
             |scan| scan.nearest("vec", &q, 5),
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
-    SortExec: TopK(fetch=5), expr=...
-      KNNFlat: metric=l2
-        LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
+    FilterExec: _distance@2 IS NOT NULL
+      SortExec: TopK(fetch=5), expr=...
+        KNNFlat: metric=l2
+          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3913,12 +3919,13 @@ mod test {
             |scan| Ok(scan.nearest("vec", &q, 10)?.refine(4)),
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    SortExec: TopK(fetch=10), expr=...
-      KNNFlat: metric=l2
-        Take: columns=\"_distance, _rowid, vec\"
-          SortExec: TopK(fetch=40), expr=...
-            ANNSubIndex: name=..., k=40, deltas=1
-              ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=10), expr=...
+        KNNFlat: metric=l2
+          Take: columns=\"_distance, _rowid, vec\"
+            SortExec: TopK(fetch=40), expr=...
+              ANNSubIndex: name=..., k=40, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3928,9 +3935,10 @@ mod test {
             |scan| Ok(scan.nearest("vec", &q, 13)?.use_index(false)),
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
-    SortExec: TopK(fetch=13), expr=...
-      KNNFlat: metric=l2
-        LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=13), expr=...
+        KNNFlat: metric=l2
+          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3981,18 +3989,20 @@ mod test {
             // by doing it as part of the last Take. This would likely have minimal impact though.
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    SortExec: TopK(fetch=6), expr=...
-      KNNFlat: metric=l2
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Projection: fields=[_distance, _rowid, vec]
-              SortExec: TopK(fetch=6), expr=...
-                KNNFlat: metric=l2
-                  LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-            Take: columns=\"_distance, _rowid, vec\"
-              SortExec: TopK(fetch=6), expr=...
-                ANNSubIndex: name=..., k=6, deltas=1
-                  ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=6), expr=...
+        KNNFlat: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=6), expr=...
+                    KNNFlat: metric=l2
+                      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=6), expr=...
+                  ANNSubIndex: name=..., k=6, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -4004,18 +4014,20 @@ mod test {
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: i@3 > 10
       Take: columns=\"_rowid, vec, _distance, i\"
-        SortExec: TopK(fetch=15), expr=...
-          KNNFlat: metric=l2
-            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-              UnionExec
-                Projection: fields=[_distance, _rowid, vec]
-                  SortExec: TopK(fetch=15), expr=...
-                    KNNFlat: metric=l2
-                      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-                Take: columns=\"_distance, _rowid, vec\"
-                  SortExec: TopK(fetch=15), expr=...
-                    ANNSubIndex: name=..., k=15, deltas=1
-                      ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+        FilterExec: _distance@... IS NOT NULL
+          SortExec: TopK(fetch=15), expr=...
+            KNNFlat: metric=l2
+              RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+                UnionExec
+                  Projection: fields=[_distance, _rowid, vec]
+                    FilterExec: _distance@... IS NOT NULL
+                      SortExec: TopK(fetch=15), expr=...
+                        KNNFlat: metric=l2
+                          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+                  Take: columns=\"_distance, _rowid, vec\"
+                    SortExec: TopK(fetch=15), expr=...
+                      ANNSubIndex: name=..., k=15, deltas=1
+                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -4032,21 +4044,23 @@ mod test {
             // only to be taken again later. We should fix this.
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    SortExec: TopK(fetch=5), expr=...
-      KNNFlat: metric=l2
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Projection: fields=[_distance, _rowid, vec]
-              SortExec: TopK(fetch=5), expr=...
-                KNNFlat: metric=l2
-                  FilterExec: i@1 > 10
-                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-            Take: columns=\"_distance, _rowid, vec\"
-              SortExec: TopK(fetch=5), expr=...
-                ANNSubIndex: name=..., k=5, deltas=1
-                  ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                  FilterExec: i@0 > 10
-                    LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=5), expr=...
+        KNNFlat: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=5), expr=...
+                    KNNFlat: metric=l2
+                      FilterExec: i@1 > 10
+                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=5), expr=...
+                  ANNSubIndex: name=..., k=5, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -4085,20 +4099,22 @@ mod test {
             },
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    SortExec: TopK(fetch=8), expr=...
-      KNNFlat: metric=l2
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Projection: fields=[_distance, _rowid, vec]
-              SortExec: TopK(fetch=8), expr=...
-                KNNFlat: metric=l2
-                  FilterExec: i@1 > 10
-                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-            Take: columns=\"_distance, _rowid, vec\"
-              SortExec: TopK(fetch=8), expr=...
-                ANNSubIndex: name=..., k=8, deltas=1
-                  ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                  ScalarIndexQuery: query=i > 10",
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=8), expr=...
+        KNNFlat: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=8), expr=...
+                    KNNFlat: metric=l2
+                      FilterExec: i@1 > 10
+                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=8), expr=...
+                  ANNSubIndex: name=..., k=8, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                    ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
@@ -4114,20 +4130,22 @@ mod test {
             },
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    SortExec: TopK(fetch=11), expr=...
-      KNNFlat: metric=l2
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Projection: fields=[_distance, _rowid, vec]
-              SortExec: TopK(fetch=11), expr=...
-                KNNFlat: metric=l2
-                  FilterExec: i@1 > 10
-                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-            Take: columns=\"_distance, _rowid, vec\"
-              SortExec: TopK(fetch=11), expr=...
-                ANNSubIndex: name=..., k=11, deltas=1
-                  ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                  ScalarIndexQuery: query=i > 10",
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=11), expr=...
+        KNNFlat: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=11), expr=...
+                    KNNFlat: metric=l2
+                      FilterExec: i@1 > 10
+                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=11), expr=...
+                  ANNSubIndex: name=..., k=11, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                    ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
