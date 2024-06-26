@@ -21,6 +21,7 @@ use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::ivf::shuffler::get_temp_dir;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizerImpl;
 use lance_index::vector::v3::shuffler::IvfShuffler;
@@ -220,8 +221,7 @@ pub(crate) async fn build_vector_index(
         });
     };
 
-    let temp_dir = tempfile::tempdir()?;
-    let path = temp_dir.path().to_str().unwrap().into();
+    let path = get_temp_dir()?;
     if is_ivf_flat(stages) {
         let StageParams::Ivf(ivf_params) = &stages[0] else {
             return Err(Error::Index {
