@@ -53,8 +53,6 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
 
     /// Encode the sub index into a record batch
     fn to_batch(&self) -> Result<RecordBatch>;
-
-    fn stats(&self) -> serde_json::Value;
 }
 
 pub enum SubIndexType {
