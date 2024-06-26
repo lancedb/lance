@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::any::Any;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use arrow::datatypes::UInt32Type;
 use arrow_array::{
@@ -18,133 +16,26 @@ use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
-    RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
+    SendableRecordBatchStream, Statistics,
 };
 use datafusion::physical_plan::{ExecutionMode, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
-use futures::{future, stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{
-    flat::{flat_search, flat_search_batch},
-    Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
-};
-use lance_io::stream::RecordBatchStream;
+use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
-use log::warn;
 use snafu::{location, Location};
-use tokio::sync::mpsc::Receiver;
-use tokio::task::JoinHandle;
-use tracing::{instrument, Instrument};
 
-use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
-
-/// KNN node for post-filtering.
-pub struct KNNFlatStream {
-    rx: Receiver<DataFusionResult<RecordBatch>>,
-    bg_thread: Option<JoinHandle<()>>,
-    output_schema: SchemaRef,
-}
-
-impl KNNFlatStream {
-    /// Construct a [`KNNFlatStream`] node.
-    #[instrument(level = "debug", skip_all, name = "KNNFlatStream::new")]
-    pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
-        let stream = DatasetRecordBatchStream::new(child);
-        Self::from_stream(stream, query)
-    }
-
-    fn from_stream(stream: impl RecordBatchStream + 'static, query: &Query) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(2);
-
-        // flat_search() appends a distance column to the input schema. The input
-        // may already have a distance column (possibly in the wrong position), so
-        // we need to remove it before adding a new one.
-        let mut output_schema = stream.schema().as_ref().clone();
-        if output_schema.column_with_name(DIST_COL).is_some() {
-            output_schema = output_schema.without_column(DIST_COL);
-        }
-        output_schema = output_schema
-            .try_with_column(Field::new(DIST_COL, DataType::Float32, true))
-            .unwrap();
-        let output_schema = Arc::new(output_schema);
-
-        let q = query.clone();
-        let bg_thread = tokio::spawn(
-            async move {
-                let batch = match flat_search(stream, &q).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tx.send(Err(DataFusionError::Execution(format!(
-                            "Failed to compute distances: {e}"
-                        ))))
-                        .await
-                        .expect("KNNFlat failed to send message");
-                        return;
-                    }
-                };
-
-                if !tx.is_closed() {
-                    if let Err(e) = tx.send(Ok(batch)).await {
-                        eprintln!("KNNFlat tx.send error: {e}")
-                    };
-                }
-                drop(tx);
-            }
-            .in_current_span(),
-        );
-
-        Self {
-            rx,
-            bg_thread: Some(bg_thread),
-            output_schema,
-        }
-    }
-}
-
-impl Stream for KNNFlatStream {
-    type Item = DataFusionResult<RecordBatch>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = Pin::into_inner(self);
-        // We need to check the JoinHandle to make sure the thread hasn't panicked.
-        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
-            match bg_thread.poll_unpin(cx) {
-                Poll::Ready(Ok(())) => true,
-                Poll::Ready(Err(join_error)) => {
-                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(KNNFlatStream): thread panicked: {}",
-                        join_error
-                    )))));
-                }
-                Poll::Pending => false,
-            }
-        } else {
-            false
-        };
-        if bg_thread_completed {
-            // Need to take it, since we aren't allowed to poll if again after.
-            this.bg_thread.take();
-        }
-        // this.rx.
-        this.rx.poll_recv(cx)
-    }
-}
-
-impl DFRecordBatchStream for KNNFlatStream {
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        self.output_schema.clone()
-    }
-}
 
 /// Check vector column exists and has the correct data type.
 fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
@@ -294,7 +185,7 @@ impl ExecutionPlan for KNNFlatExec {
                 let key = key.clone();
                 let column = column.clone();
                 async move {
-                    flat_search_batch(key, dt, &column, batch?)
+                    flat_search(key, dt, &column, batch?)
                         .await
                         .map_err(|e| DataFusionError::Execution(e.to_string()))
                 }
@@ -813,10 +704,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 mod tests {
     use super::*;
 
-    use arrow_array::RecordBatchIterator;
-    use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
+    use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
+    use arrow::datatypes::Float32Type;
+    use arrow_array::{FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-    use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
@@ -879,7 +770,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stream = dataset
             .scan()
-            .nearest("vector", as_primitive_array(&q), 10)
+            .nearest("vector", q.as_primitive(), 10)
             .unwrap()
             .try_into_stream()
             .await
@@ -891,22 +782,17 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let stream = dataset.scan().try_into_stream().await.unwrap();
-        let expected = flat_search(
-            stream,
-            &Query {
-                column: "vector".to_string(),
-                key: q,
-                k: 10,
-                nprobes: 0,
-                ef: None,
-                refine_factor: None,
-                metric_type: MetricType::L2,
-                use_index: false,
-            },
-        )
-        .await
-        .unwrap();
-
+        let all_with_distances = stream
+            .and_then(|batch| flat_search(q.clone(), DistanceType::L2, "vector", batch))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let all_with_distances =
+            concat_batches(&results[0].schema(), all_with_distances.iter()).unwrap();
+        let dist_arr = all_with_distances.column_by_name(DIST_COL).unwrap();
+        let distances = dist_arr.as_primitive::<Float32Type>();
+        let indices = sort_to_indices(distances, None, Some(10)).unwrap();
+        let expected = take_record_batch(&all_with_distances, &indices).unwrap();
         assert_eq!(expected, results[0]);
     }
 
@@ -928,6 +814,7 @@ mod tests {
         let batch = RecordBatch::new_empty(schema);
 
         let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
+
         let idx = KNNFlatExec::try_new(
             input,
             "vector",
