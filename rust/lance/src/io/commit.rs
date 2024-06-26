@@ -513,7 +513,7 @@ fn backoff_time(attempt_i: u32) -> std::time::Duration {
     let jitter = rand::thread_rng().gen_range(-100..100);
     let backoff = backoff + jitter;
     // No more than 5 seconds and less than 10ms.
-    let backoff = backoff.min(5_000).max(10) as u64;
+    let backoff = backoff.clamp(10, 5_000) as u64;
     std::time::Duration::from_millis(backoff)
 }
 
