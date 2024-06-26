@@ -1161,7 +1161,8 @@ mod tests {
             .unwrap();
         assert_eq!(plan.tasks().len(), 0);
 
-        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None, registry)
             .await
             .unwrap();
 
@@ -1379,9 +1380,15 @@ mod tests {
         let mock_remapper = MockIndexRemapper::in_any_order(&[remap_a, remap_b]);
 
         // Run compaction
-        let metrics = compact_files(&mut dataset, options, Some(Arc::new(mock_remapper)))
-            .await
-            .unwrap();
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let metrics = compact_files(
+            &mut dataset,
+            options,
+            Some(Arc::new(mock_remapper)),
+            registry,
+        )
+        .await
+        .unwrap();
 
         // Assert on metrics
         assert_eq!(metrics.fragments_removed, 6);
@@ -1457,9 +1464,15 @@ mod tests {
         assert_eq!(plan.tasks().len(), 1);
         assert_eq!(plan.tasks()[0].fragments.len(), 2);
 
-        let metrics = compact_files(&mut dataset, plan.options, Some(Arc::new(expected_remap)))
-            .await
-            .unwrap();
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let metrics = compact_files(
+            &mut dataset,
+            plan.options,
+            Some(Arc::new(expected_remap)),
+            registry,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(metrics.files_removed, 4); // 2 fragments with 2 data files
         assert_eq!(metrics.files_added, 1); // 1 fragment with 1 data file
@@ -1523,7 +1536,10 @@ mod tests {
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 1);
 
-        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let metrics = compact_files(&mut dataset, options, None, registry)
+            .await
+            .unwrap();
         assert_eq!(metrics.fragments_removed, 1);
         assert_eq!(metrics.files_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
@@ -1565,7 +1581,11 @@ mod tests {
 
         let dataset_ref = &dataset;
         let mut results = futures::stream::iter(plan.compaction_tasks())
-            .then(|task| async move { task.execute(dataset_ref).await.unwrap() })
+            .then(|task| async move {
+                task.execute(dataset_ref, Arc::new(ObjectStoreRegistry::default()))
+                    .await
+                    .unwrap()
+            })
             .collect::<Vec<_>>()
             .await;
 

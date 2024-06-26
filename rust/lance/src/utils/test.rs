@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
-use lance_io::object_store::WrappingObjectStore;
+use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore};
 use lance_table::format::Fragment;
 use object_store::path::Path;
 use object_store::{
@@ -112,7 +112,8 @@ impl TestDatasetGenerator {
 
         let operation = Operation::Overwrite { fragments, schema };
 
-        Dataset::commit(uri, operation, None, Default::default(), None)
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        Dataset::commit(uri, operation, None, Default::default(), None, registry)
             .await
             .unwrap()
     }

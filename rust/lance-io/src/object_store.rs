@@ -1097,6 +1097,7 @@ mod tests {
     async fn test_wrapping_object_store_option_is_used() {
         // Make a store for the inner store first
         let mock_inner_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let registry = Arc::new(ObjectStoreRegistry::default());
 
         assert_eq!(Arc::strong_count(&mock_inner_store), 1);
 
@@ -1113,7 +1114,7 @@ mod tests {
         // not called yet
         assert!(!wrapper.called());
 
-        let _ = ObjectStore::from_uri_and_params("memory:///", &params)
+        let _ = ObjectStore::from_uri_and_params(registry, "memory:///", &params)
             .await
             .unwrap();
 
@@ -1147,6 +1148,7 @@ mod tests {
     #[tokio::test]
     async fn test_injected_aws_creds_option_is_used() {
         let mock_provider = Arc::new(MockAwsCredentialsProvider::default());
+        let registry = Arc::new(ObjectStoreRegistry::default());
 
         let params = ObjectStoreParams {
             aws_credentials: Some(mock_provider.clone() as AwsCredentialProvider),
@@ -1156,7 +1158,7 @@ mod tests {
         // Not called yet
         assert!(!mock_provider.called.load(Ordering::Relaxed));
 
-        let (store, _) = ObjectStore::from_uri_and_params("s3://not-a-bucket", &params)
+        let (store, _) = ObjectStore::from_uri_and_params(registry, "s3://not-a-bucket", &params)
             .await
             .unwrap();
 
