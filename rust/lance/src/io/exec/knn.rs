@@ -7,11 +7,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::datatypes::UInt32Type;
-use arrow_array::StringArray;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
-    RecordBatch, UInt64Array,
+    ArrayRef, RecordBatch, StringArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -24,11 +23,14 @@ use datafusion::physical_plan::{
 use datafusion::physical_plan::{ExecutionMode, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
-use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{future, stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
+use lance_index::vector::{
+    flat::{flat_search, flat_search_batch},
+    Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
+};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
@@ -182,7 +184,10 @@ pub struct KNNFlatExec {
     pub input: Arc<dyn ExecutionPlan>,
 
     /// The vector query to execute.
-    pub query: Query,
+    pub query: ArrayRef,
+    column: String,
+    distance_type: DistanceType,
+
     output_schema: SchemaRef,
     properties: PlanProperties,
 }
@@ -191,11 +196,7 @@ impl DisplayAs for KNNFlatExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "KNNFlat: k={} metric={}",
-                    self.query.k, self.query.metric_type
-                )
+                write!(f, "KNNFlat: metric={}", self.distance_type,)
             }
         }
     }
@@ -205,16 +206,27 @@ impl KNNFlatExec {
     /// Create a new [KNNFlatExec] node.
     ///
     /// Returns an error if the preconditions are not met.
-    pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
-        let schema = input.schema();
-        check_vector_column(&schema, &query.column)?;
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        column: &str,
+        query: ArrayRef,
+        distance_type: DistanceType,
+    ) -> Result<Self> {
+        let mut output_schema = input.schema().as_ref().clone();
+        check_vector_column(&output_schema, column)?;
 
-        let mut fields = schema.fields().to_vec();
-        if schema.field_with_name(DIST_COL).is_err() {
-            fields.push(Arc::new(Field::new(DIST_COL, DataType::Float32, true)));
+        // FlatExec appends a distance column to the input schema. The input
+        // may already have a distance column (possibly in the wrong position), so
+        // we need to remove it before adding a new one.
+        if output_schema.column_with_name(DIST_COL).is_some() {
+            output_schema = output_schema.without_column(DIST_COL);
         }
-
-        let output_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let output_schema = Arc::new(Schema::new(
+            output_schema
+                .try_with_column(Field::new(DIST_COL, DataType::Float32, true))
+                .unwrap()
+                .fields,
+        ));
 
         // This node has the same partitioning & boundedness as the input node
         // but it destroys any ordering.
@@ -226,6 +238,8 @@ impl KNNFlatExec {
         Ok(Self {
             input,
             query,
+            column: column.to_string(),
+            distance_type,
             output_schema,
             properties,
         })
@@ -258,7 +272,9 @@ impl ExecutionPlan for KNNFlatExec {
 
         Ok(Arc::new(Self::try_new(
             children.pop().expect("length checked"),
+            &self.column,
             self.query.clone(),
+            self.distance_type,
         )?))
     }
 
@@ -267,17 +283,32 @@ impl ExecutionPlan for KNNFlatExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        Ok(Box::pin(KNNFlatStream::new(
-            self.input.execute(partition, context)?,
-            &self.query,
-        )))
+        let input_stream = self.input.execute(partition, context)?;
+
+        let key = self.query.clone();
+        let column = self.column.clone();
+        let dt = self.distance_type;
+        let stream = input_stream
+            .try_filter(|batch| future::ready(batch.num_rows() > 0))
+            .map(move |batch| {
+                let key = key.clone();
+                let column = column.clone();
+                async move {
+                    flat_search_batch(key, dt, &column, batch?)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))
+                }
+            })
+            .buffer_unordered(num_cpus::get());
+        let schema = self.schema();
+        Ok(
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
+                as SendableRecordBatchStream,
+        )
     }
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
-            num_rows: Precision::Exact(self.query.k),
-            ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        self.input.statistics()
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -896,19 +927,14 @@ mod tests {
         ]));
         let batch = RecordBatch::new_empty(schema);
 
-        let query = Query {
-            column: "vector".to_string(),
-            key: Arc::new(generate_random_array(dim)),
-            k: 10,
-            nprobes: 0,
-            ef: None,
-            refine_factor: None,
-            metric_type: MetricType::L2,
-            use_index: false,
-        };
-
         let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
-        let idx = KNNFlatExec::try_new(input, query).unwrap();
+        let idx = KNNFlatExec::try_new(
+            input,
+            "vector",
+            Arc::new(generate_random_array(dim)),
+            DistanceType::L2,
+        )
+        .unwrap();
         println!("{:?}", idx);
         assert_eq!(
             idx.schema().as_ref(),

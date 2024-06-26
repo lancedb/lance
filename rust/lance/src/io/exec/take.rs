@@ -61,13 +61,16 @@ impl Take {
                         (dataset.clone(), projection.clone())
                     }))
                     .map(|(batch, (dataset, extra))| async move {
-                        Self::take_batch(batch?, dataset, extra).await
+                        let batch = batch?;
+                        println!("take: batch: {:?}", batch);
+                        println!("take batch schema: {:?}", batch.schema());
+                        Self::take_batch(batch, dataset, extra).await
                     })
                     .buffered(batch_readahead)
                     .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
                     .try_for_each(|b| async {
                         if tx.send(Ok(b)).await.is_err() {
-                        // If channel is closed, make sure we return an error to end the stream. 
+                        // If channel is closed, make sure we return an error to end the stream.
                         return Err(DataFusionError::Internal(
                             "ExecNode(Take): channel closed".to_string(),
                         ));

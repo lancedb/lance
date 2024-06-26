@@ -1376,7 +1376,27 @@ impl Scanner {
 
     /// Add a knn search node to the input plan
     fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(KNNFlatExec::try_new(input, q.clone())?))
+        let flat_dist = Arc::new(KNNFlatExec::try_new(
+            input,
+            &q.column,
+            q.key.clone(),
+            q.metric_type,
+        )?);
+
+        // Use datafusion to do top K
+        let sort = SortExec::new(
+            vec![PhysicalSortExpr {
+                expr: expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            }],
+            flat_dist,
+        )
+        .with_fetch(Some(q.k));
+
+        Ok(Arc::new(sort))
     }
 
     /// Create an Execution plan to do indexed ANN search

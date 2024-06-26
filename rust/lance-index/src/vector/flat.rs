@@ -10,11 +10,11 @@ use arrow_array::{
     cast::AsArray, make_array, Array, ArrayRef, FixedSizeListArray, RecordBatch, StructArray,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, SchemaRef, SortOptions};
+use arrow_schema::{DataType, Field as ArrowField, SchemaRef};
 use arrow_select::{concat::concat, take::take};
 use futures::{
     future,
-    stream::{repeat_with, StreamExt, TryStreamExt},
+    stream::{StreamExt, TryStreamExt},
 };
 use lance_arrow::*;
 use lance_core::{Error, Result, ROW_ID};
@@ -38,11 +38,17 @@ pub async fn flat_search(
     query: &Query,
 ) -> Result<RecordBatch> {
     let input_schema = stream.schema();
+    let dt = query.metric_type;
+    let key = query.key.clone();
+
     let batches = stream
         .try_filter(|batch| future::ready(batch.num_rows() > 0))
-        .zip(repeat_with(|| query.metric_type))
-        .map(|(batch, mt)| async move { flat_search_batch(query, mt, batch?).await })
-        .buffer_unordered(16)
+        .map(|batch| {
+            let key = key.clone();
+            let column = query.column.clone();
+            async move { flat_search_batch(key, dt, &column, batch?).await }
+        })
+        .buffer_unordered(num_cpus::get())
         .try_collect::<Vec<_>>()
         .await?;
 
@@ -66,24 +72,21 @@ pub async fn flat_search(
     Ok(selected_arr.as_struct().into())
 }
 
-#[instrument(level = "debug", skip(query, batch))]
-async fn flat_search_batch(
-    query: &Query,
-    mt: DistanceType,
+#[instrument(level = "debug", skip(key, batch))]
+pub async fn flat_search_batch(
+    key: ArrayRef,
+    dt: DistanceType,
+    column: &str,
     mut batch: RecordBatch,
 ) -> Result<RecordBatch> {
-    let key = query.key.clone();
-    let k = query.k;
     if batch.column_by_name(DIST_COL).is_some() {
         // Ignore the distance calculated from inner vector index.
         batch = batch.drop_column(DIST_COL)?;
     }
-    let vectors = batch
-        .column_by_name(&query.column)
-        .ok_or_else(|| Error::Schema {
-            message: format!("column {} does not exist in dataset", query.column),
-            location: location!(),
-        })?;
+    let vectors = batch.column_by_name(column).ok_or_else(|| Error::Schema {
+        message: format!("column {} does not exist in dataset", column),
+        location: location!(),
+    })?;
 
     // A selection vector may have been applied to _rowid column, so we need to
     // push that onto vectors if possible.
@@ -103,21 +106,16 @@ async fn flat_search_batch(
     let vectors = as_fixed_size_list_array(vectors.as_ref()).clone();
 
     tokio::task::spawn_blocking(move || {
-        let distances = mt.arrow_batch_func()(key.as_ref(), &vectors)? as ArrayRef;
+        let distances = dt.arrow_batch_func()(key.as_ref(), &vectors)? as ArrayRef;
 
-        // We don't want any nulls in result, so limit to k or the number of valid values.
-        let k = std::cmp::min(k, distances.len() - distances.null_count());
-
-        let sort_options = SortOptions {
-            nulls_first: false,
-            ..Default::default()
-        };
-        let indices = sort_to_indices(&distances, Some(sort_options), Some(k))?;
-
-        let batch_with_distance = batch.try_with_column(distance_field(), distances)?;
-        let struct_arr = StructArray::from(batch_with_distance);
-        let selected_arr = take(&struct_arr, &indices, None)?;
-        Ok::<RecordBatch, Error>(selected_arr.as_struct().into())
+        let batch = batch
+            .try_with_column(distance_field(), distances)
+            .map_err(|e| Error::Execution {
+                message: format!("Failed to adding distance column: {}", e),
+                location: location!(),
+            });
+        println!("batch: {:?}", batch);
+        batch
     })
     .await
     .unwrap()
