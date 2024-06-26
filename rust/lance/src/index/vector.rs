@@ -39,7 +39,7 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
 use snafu::{location, Location};
-use tempfile::TempDir;
+use tempfile::tempdir;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -221,7 +221,7 @@ pub(crate) async fn build_vector_index(
         });
     };
 
-    let path = TempDir::new()?.path().to_str().unwrap().into();
+    let path = tempdir()?.path().to_str().unwrap().into();
     if is_ivf_flat(stages) {
         let StageParams::Ivf(ivf_params) = &stages[0] else {
             return Err(Error::Index {

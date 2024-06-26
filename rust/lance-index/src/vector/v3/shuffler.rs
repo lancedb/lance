@@ -151,11 +151,11 @@ impl Shuffler for IvfShuffler {
                     .expect("there should be at least one batch");
                 writers = stream::iter(0..self.num_partitions)
                     .map(|partition_id| {
-                        let path = self.output_dir.clone();
+                        let part_path =
+                            self.output_dir.child(format!("ivf_{}.lance", partition_id));
                         let object_store = self.object_store.clone();
                         let schema = schema.clone();
                         async move {
-                            let part_path = path.child(format!("ivf_{}.lance", partition_id));
                             let writer = object_store.create(&part_path).await?;
                             FileWriter::try_new(
                                 writer,
@@ -202,6 +202,11 @@ impl Shuffler for IvfShuffler {
         // finish all writers
         for writer in writers.iter_mut() {
             writer.finish().await?;
+            assert!(
+                self.object_store.exists(&writer.path().into()).await?,
+                "file {} not found after finished",
+                writer.path()
+            );
         }
 
         Ok(Box::new(IvfShufflerReader::new(
