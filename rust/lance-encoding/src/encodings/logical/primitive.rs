@@ -253,7 +253,7 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
             return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));
         }
 
-        // Convert the two buffers into an Arrow array
+        // Convert the buffers into an Arrow array
         primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)
     }
 }

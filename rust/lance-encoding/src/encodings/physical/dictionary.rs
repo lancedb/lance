@@ -75,7 +75,7 @@ impl PageScheduler for DictionaryPageScheduler {
 
         let copy_size = self.num_dictionary_items;
 
-        async move {
+        tokio::spawn(async move {
             let items_decoder: Arc<dyn PrimitivePageDecoder> = Arc::from(items_page_decoder.await?);
 
             let mut primitive_wrapper = PrimitiveFieldDecoder::new_from_data(
@@ -102,7 +102,8 @@ impl PageScheduler for DictionaryPageScheduler {
                 indices_decoder,
                 items_decoder,
             }) as Box<dyn PrimitivePageDecoder>)
-        }
+        })
+        .map(|join_handle| join_handle.unwrap())
         .boxed()
     }
 }
@@ -148,12 +149,15 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
 
         let null_buffer = string_array
             .nulls()
-            .map_or(BytesMut::default(), |n| n.buffer().as_slice().into());
-        let offsets_buffer = string_array.offsets().inner().inner().as_slice().into();
+            .map(|n| BytesMut::from(n.buffer().as_slice()))
+            .unwrap_or_else(|| BytesMut::new());
+
+        let offsets_buffer = BytesMut::from(string_array.offsets().inner().inner().as_slice());
 
         // Empty buffer for nulls of bytes
-        let empty_buffer = BytesMut::default();
-        let bytes_buffer = string_array.values().as_slice().into();
+        let empty_buffer = BytesMut::new();
+        // let bytes_buffer = string_array.values().as_slice().into();
+        let bytes_buffer = BytesMut::from_iter(string_array.values().iter().copied());
 
         Ok(vec![
             null_buffer,
