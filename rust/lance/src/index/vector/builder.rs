@@ -424,12 +424,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
 
         // build the sub index, with in-memory storage
         let index_len = {
-            let distance_type = match self.distance_type {
-                DistanceType::Cosine | DistanceType::Dot => DistanceType::L2,
-                _ => self.distance_type,
-            };
             let vectors = batch[&self.column].as_fixed_size_list();
-            let flat_storage = FlatStorage::new(vectors.clone(), distance_type);
+            let flat_storage = FlatStorage::new(vectors.clone(), self.distance_type);
             let sub_index = S::index_vectors(&flat_storage, self.sub_index_params.clone())?;
             let path = self.temp_dir.child(format!("index_part{}", part_id));
             let writer = object_store.create(&path).await?;
