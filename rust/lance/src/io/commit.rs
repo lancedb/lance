@@ -28,6 +28,7 @@ use std::sync::Arc;
 use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest, WriterVersion};
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
 use lance_table::io::deletion::read_deletion_file;
+use rand::Rng;
 use snafu::{location, Location};
 
 use futures::future::Either;
@@ -407,7 +408,7 @@ pub(crate) async fn commit_transaction(
         check_transaction(transaction, other_version, other_transaction)?;
     }
 
-    for _ in 0..commit_config.num_retries {
+    for attempt_i in 0..commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
@@ -464,17 +465,27 @@ pub(crate) async fn commit_transaction(
                 return Ok(manifest);
             }
             Err(CommitError::CommitConflict) => {
-                // See if we can retry the commit
-                dataset = dataset.checkout_version(target_version).await?;
+                // See if we can retry the commit. Try to account for all
+                // transactions that have been committed since the read_version.
+                // Use small amount of backoff to handle transactions that all
+                // started at exact same time better.
 
-                let other_transaction =
-                    if let Some(txn_file) = dataset.manifest.transaction_file.as_ref() {
+                let backoff_time = backoff_time(attempt_i);
+                tokio::time::sleep(backoff_time).await;
+
+                let latest_version = dataset.latest_version_id().await?;
+                for version in target_version..=latest_version {
+                    dataset = dataset.checkout_version(version).await?;
+                    let other_transaction = if let Some(txn_file) =
+                        dataset.manifest.transaction_file.as_ref()
+                    {
                         Some(read_transaction_file(object_store, &dataset.base, txn_file).await?)
                     } else {
                         None
                     };
-                check_transaction(transaction, target_version, &other_transaction)?;
-                target_version += 1;
+                    check_transaction(transaction, version, &other_transaction)?;
+                }
+                target_version = latest_version + 1;
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
@@ -492,6 +503,18 @@ pub(crate) async fn commit_transaction(
         .into(),
         location: location!(),
     })
+}
+
+fn backoff_time(attempt_i: u32) -> std::time::Duration {
+    // Exponential base:
+    // 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms
+    let backoff = 2_i32.pow(attempt_i) * 100;
+    // With +-100ms jitter
+    let jitter = rand::thread_rng().gen_range(-100..100);
+    let backoff = backoff + jitter;
+    // No more than 5 seconds and less than 10ms.
+    let backoff = backoff.min(5_000).max(10) as u64;
+    std::time::Duration::from_millis(backoff)
 }
 
 #[cfg(test)]
