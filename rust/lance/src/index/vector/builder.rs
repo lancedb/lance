@@ -66,7 +66,6 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     ivf_params: Option<IvfBuildParams>,
     quantizer_params: Option<Q::BuildParams>,
     sub_index_params: S::BuildParams,
-    _temp_dir: TempDir, // store this for keeping the temp dir alive
     temp_dir: Path,
 
     // fields will be set during build
@@ -91,8 +90,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         quantizer_params: Option<Q::BuildParams>,
         sub_index_params: S::BuildParams,
     ) -> Result<Self> {
-        let temp_dir = TempDir::new()?;
-        let temp_dir_path = temp_dir.path().to_str().unwrap().into();
+        let temp_dir = TempDir::new()?.path().to_str().unwrap().into();
         Ok(Self {
             dataset,
             column,
@@ -102,8 +100,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             ivf_params,
             quantizer_params,
             sub_index_params,
-            _temp_dir: temp_dir,
-            temp_dir: temp_dir_path,
+            temp_dir,
             // fields will be set during build
             ivf: None,
             quantizer: None,

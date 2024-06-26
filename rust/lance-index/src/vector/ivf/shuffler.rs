@@ -39,7 +39,7 @@ use crate::vector::PART_ID_COLUMN;
 
 const UNSORTED_BUFFER: &str = "unsorted.lance";
 
-pub fn get_temp_dir() -> Result<Path> {
+fn get_temp_dir() -> Result<Path> {
     let dir = TempDir::new()?;
     let tmp_dir_path = Path::from_filesystem_path(dir.path()).map_err(|e| Error::IO {
         source: Box::new(e),
