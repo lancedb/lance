@@ -301,7 +301,9 @@ mod test {
     #[tokio::test]
     async fn test_vector_index_extension_roundtrip(#[values(false, true)] use_legacy_format: bool) {
         // make dataset and index that is not supported natively
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+            .await
+            .unwrap();
         let idx = test_ds.dataset.load_indices().await.unwrap();
         assert_eq!(idx.len(), 0);
 

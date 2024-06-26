@@ -1556,7 +1556,7 @@ pub mod test_dataset {
     }
 
     impl TestVectorDataset {
-        pub async fn new(use_legacy_format: bool) -> Result<Self> {
+        pub async fn new(use_legacy_format: bool, stable_row_ids: bool) -> Result<Self> {
             let tmp_dir = tempdir()?;
             let path = tmp_dir.path().to_str().unwrap();
 
@@ -1602,7 +1602,9 @@ pub mod test_dataset {
 
             let params = WriteParams {
                 max_rows_per_group: 10,
+                max_rows_per_file: 200,
                 use_legacy_format,
+                enable_move_stable_row_ids: stable_row_ids,
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1802,7 +1804,7 @@ mod test {
 
     #[tokio::test]
     async fn test_filter_parsing() -> Result<()> {
-        let test_ds = TestVectorDataset::new(true).await?;
+        let test_ds = TestVectorDataset::new(true, false).await?;
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -1836,7 +1838,7 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_limit(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await?;
+        let test_ds = TestVectorDataset::new(use_legacy_format, false).await?;
         let dataset = &test_ds.dataset;
 
         let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
@@ -1853,9 +1855,14 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_nodes(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_knn_nodes(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         for build_index in &[true, false] {
-            let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+            let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+                .await
+                .unwrap();
             if *build_index {
                 test_ds.make_vector_index().await.unwrap();
             }
@@ -1908,8 +1915,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_new_data(#[values(false, true)] use_legacy_format: bool) {
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_new_data(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -1988,8 +2000,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_prefilter(#[values(false, true)] use_legacy_format: bool) {
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_prefilter(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         let dataset = &test_ds.dataset;
 
@@ -2045,11 +2062,16 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_filter_new_data(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_knn_filter_new_data(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         // This test verifies that a filter (prefilter or postfilter) gets applied to the flat KNN results
         // in a combined KNN scan (a scan that combines results from an indexed ANN with an unindexed flat
         // search of new data)
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -2109,8 +2131,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_filter(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_filter(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2160,8 +2187,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_refine_factor(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_refine_factor(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2211,31 +2243,24 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_only_row_id(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
         scan.project::<&str>(&[]).unwrap().with_row_id();
 
-        let results = scan
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
+        let batch = scan.try_into_batch().await.unwrap();
 
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.num_rows(), 400);
-        assert_eq!(
-            batch.schema().as_ref(),
-            &ArrowSchema::new(vec![ArrowField::new(ROW_ID, DataType::UInt64, true,)])
-        );
+        let expected_schema =
+            ArrowSchema::new(vec![ArrowField::new(ROW_ID, DataType::UInt64, true)])
+                .with_metadata(dataset.schema().metadata.clone());
+        assert_eq!(batch.schema().as_ref(), &expected_schema,);
 
-        let expected_row_ids: Vec<u64> = (0..400).map(|i| i as u64).collect();
+        let expected_row_ids: Vec<u64> = (0..200_u64).chain((1 << 32)..((1 << 32) + 200)).collect();
         let actual_row_ids: Vec<u64> = as_primitive_array::<UInt64Type>(batch.column(0).as_ref())
             .values()
             .iter()
@@ -2247,7 +2272,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
         // This test doesn't make sense for v2 files, there is no way to get an out-of-order scan
-        let test_ds = TestVectorDataset::new(/*use_legacy_format=*/ true)
+        let test_ds = TestVectorDataset::new(/*use_legacy_format=*/ true, false)
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
@@ -2508,7 +2533,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_ann_prefilter(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_ann_prefilter(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2530,6 +2558,8 @@ mod test {
 
         let write_params = WriteParams {
             use_legacy_format,
+            max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
+            enable_move_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2774,7 +2804,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_ann_with_deletion(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_ann_with_deletion(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
@@ -2817,6 +2850,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     use_legacy_format,
+                    enable_move_stable_row_ids: stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -3122,7 +3156,7 @@ mod test {
         append_then_delete_version: u64,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq)]
     struct ScalarTestParams {
         use_index: bool,
         use_projection: bool,
@@ -3134,7 +3168,7 @@ mod test {
     }
 
     impl ScalarIndexTestFixture {
-        async fn new(use_legacy_format: bool) -> Self {
+        async fn new(use_legacy_format: bool, use_stable_row_ids: bool) -> Self {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
@@ -3160,6 +3194,7 @@ mod test {
                 Some(WriteParams {
                     max_rows_per_file: 500,
                     use_legacy_format,
+                    enable_move_stable_row_ids: use_stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -3398,6 +3433,7 @@ mod test {
                     "The non-indexed refine filter was not applied",
                 );
             }
+
             // If there is new data then the dupe of row 50 should be in the results
             if params.use_new_data || params.use_updated {
                 self.assert_one(
@@ -3532,8 +3568,11 @@ mod test {
     // different configurations to ensure that we get consistent results
     #[rstest]
     #[tokio::test]
-    async fn test_secondary_index_scans(#[values(false, true)] use_legacy_format: bool) {
-        let fixture = ScalarIndexTestFixture::new(use_legacy_format).await;
+    async fn test_secondary_index_scans(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] use_stable_row_ids: bool,
+    ) {
+        let fixture = ScalarIndexTestFixture::new(use_legacy_format, use_stable_row_ids).await;
 
         for use_index in [false, true] {
             for use_projection in [false, true] {
@@ -3542,11 +3581,13 @@ mod test {
                         // Don't test compaction in conjuction with deletion and new data, it's too
                         // many combinations with no clear benefit.  Feel free to update if there is
                         // a need
-                        let compaction_choices = if use_deleted_data || use_new_data {
-                            vec![false]
-                        } else {
-                            vec![false, true]
-                        };
+                        // TODO: enable compaction for stable row id once supported.
+                        let compaction_choices =
+                            if use_deleted_data || use_new_data || use_stable_row_ids {
+                                vec![false]
+                            } else {
+                                vec![false, true]
+                            };
                         for use_compaction in compaction_choices {
                             let updated_choices =
                                 if use_deleted_data || use_new_data || use_compaction {
@@ -3787,9 +3828,12 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_plans(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_plans(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_id: bool,
+    ) -> Result<()> {
         // Create a vector dataset
-        let mut dataset = TestVectorDataset::new(use_legacy_format).await?;
+        let mut dataset = TestVectorDataset::new(use_legacy_format, stable_row_id).await?;
 
         // Scans
         // ---------------------------------------------------------------------
