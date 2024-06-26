@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::{HashSet, HashMap}, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
@@ -274,27 +274,26 @@ impl CoreArrayEncodingStrategy {
 
 // check whether we want to use dictionary encoding or not
 // by applying a threshold on cardinality
+// returns true if cardinality < 100
 fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
-    let mut arr_hashmap: HashMap<&str, u64> = HashMap::new();
-    let mut curr_dict_index = 0;
+
+    let mut unique_values = HashSet::new();
 
     // Checking cardinality for elements in all arrays together.
     for arr in arrays.iter() {
         let string_array = arrow_array::cast::as_string_array(arr);
         for i in 0..string_array.len() {
             if !string_array.is_null(i) {
-                let key_exists = arr_hashmap.insert(string_array.value(i), curr_dict_index);
-                if key_exists.is_some() {
-                    curr_dict_index += 1;
-                    if curr_dict_index >= 100 {
-                        return false;
-                    }
+                unique_values.insert(string_array.value(i));
+                // let key_exists = arr_hashmap.insert(string_array.value(i), curr_dict_index);
+                if unique_values.len() >= 100 {
+                    return false;
                 }
             }
         }
     }
 
-    curr_dict_index < 100
+    true
 }
 
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
