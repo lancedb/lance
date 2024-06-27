@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::{collections::{HashSet, HashMap}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
@@ -276,7 +279,6 @@ impl CoreArrayEncodingStrategy {
 // by applying a threshold on cardinality
 // returns true if cardinality < 100
 fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
-
     let mut unique_values = HashSet::new();
 
     // Checking cardinality for elements in all arrays together.
