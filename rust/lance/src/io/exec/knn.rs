@@ -44,11 +44,13 @@ use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
+use lance_arrow::*;
 
 /// KNN node for post-filtering.
 pub struct KNNFlatStream {
     rx: Receiver<DataFusionResult<RecordBatch>>,
     bg_thread: Option<JoinHandle<()>>,
+    output_schema: SchemaRef,
 }
 
 impl KNNFlatStream {
@@ -61,6 +63,18 @@ impl KNNFlatStream {
 
     fn from_stream(stream: impl RecordBatchStream + 'static, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
+
+        // flat_search() appends a distance column to the input schema. The input
+        // may already have a distance column (possibly in the wrong position), so
+        // we need to remove it before adding a new one.
+        let mut output_schema = stream.schema().as_ref().clone();
+        if output_schema.column_with_name(DIST_COL).is_some() {
+            output_schema = output_schema.without_column(DIST_COL);
+        }
+        output_schema = output_schema
+            .try_with_column(Field::new(DIST_COL, DataType::Float32, true))
+            .unwrap();
+        let output_schema = Arc::new(output_schema);
 
         let q = query.clone();
         let bg_thread = tokio::spawn(
@@ -90,6 +104,7 @@ impl KNNFlatStream {
         Self {
             rx,
             bg_thread: Some(bg_thread),
+            output_schema,
         }
     }
 }
@@ -125,10 +140,7 @@ impl Stream for KNNFlatStream {
 
 impl DFRecordBatchStream for KNNFlatStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new(DIST_COL, DataType::Float32, true),
-            ROW_ID_FIELD.clone(),
-        ]))
+        self.output_schema.clone()
     }
 }
 
@@ -777,7 +789,6 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
-    use crate::arrow::*;
     use crate::dataset::WriteParams;
     use crate::io::exec::testing::TestingExec;
 
