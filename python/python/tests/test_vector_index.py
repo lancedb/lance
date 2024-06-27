@@ -491,8 +491,8 @@ def test_optimize_index_recall(tmp_path: Path):
         for query in sample_queries:
             results = dataset.to_table(nearest=query).column("vector")
             assert has_target(query["q"], results)
-            plan = dataset.scanner(nearest=query).explain_plan()
-            assert ("KNNFlat" in plan) == has_knn_combined
+            plan = dataset.scanner(nearest=query).explain_plan(verbose=True)
+            assert ("KNNVectorDistance" in plan) == has_knn_combined
         for query in sample_delete_queries:
             results = dataset.to_table(nearest=query).column("vector")
             assert delete_has_happened != has_target(query["q"], results)
