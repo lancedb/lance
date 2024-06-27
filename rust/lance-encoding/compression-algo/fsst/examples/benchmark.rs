@@ -1,12 +1,15 @@
-use rand::Rng;
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use fsst::fsst::{compress, decompress};
+use rand::Rng;
 
 const TEST_NUM: usize = 10;
 const BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
+use arrow::array::StringArray;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use arrow::array::StringArray; // Add this import statement
+use std::io::{BufRead, BufReader}; // Add this import statement
 
 fn read_random_16_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error> {
     let file = File::open(file_path)?;
@@ -59,18 +62,29 @@ fn benchmark(file_path: &str) {
         decompression_out_offsets_bufs.push(this_decom_out_offsets_buf);
     }
 
-
     let original_total_size: usize = inputs.iter().map(|input| input.values().len()).sum();
 
     // Step 3: compress data
     let start = std::time::Instant::now();
     for i in 0..TEST_NUM {
-        compress(&inputs[i].values(), inputs[i].value_offsets(), &mut compression_out_bufs[i], &mut compression_out_offsets_bufs[i]).unwrap();
+        compress(
+            &inputs[i].values(),
+            inputs[i].value_offsets(),
+            &mut compression_out_bufs[i],
+            &mut compression_out_offsets_bufs[i],
+        )
+        .unwrap();
     }
     let compression_finish_time = std::time::Instant::now();
 
     for i in 0..TEST_NUM {
-        decompress(&compression_out_bufs[i], &compression_out_offsets_bufs[i], &mut decompression_out_bufs[i], &mut decompression_out_offsets_bufs[i]).unwrap();
+        decompress(
+            &compression_out_bufs[i],
+            &compression_out_offsets_bufs[i],
+            &mut decompression_out_bufs[i],
+            &mut decompression_out_offsets_bufs[i],
+        )
+        .unwrap();
     }
     let decompression_finish_time = std::time::Instant::now();
     let compression_total_size: usize = compression_out_bufs.iter().map(|buf| buf.len()).sum();
@@ -78,17 +92,17 @@ fn benchmark(file_path: &str) {
     let compress_time = compression_finish_time - start;
     let decompress_time = decompression_finish_time - compression_finish_time;
 
-    let compress_seconds = compress_time.as_secs() as f64
-        + compress_time.subsec_nanos() as f64 * 1e-9;
+    let compress_seconds =
+        compress_time.as_secs() as f64 + compress_time.subsec_nanos() as f64 * 1e-9;
 
-    let decompress_seconds = decompress_time.as_secs() as f64
-        + decompress_time.subsec_nanos() as f64 * 1e-9;
+    let decompress_seconds =
+        decompress_time.as_secs() as f64 + decompress_time.subsec_nanos() as f64 * 1e-9;
 
     let com_speed = (original_total_size as f64 / compress_seconds) / 1024f64 / 1024f64;
 
     let d_speed = (original_total_size as f64 / decompress_seconds) / 1024f64 / 1024f64;
     //println!("Compressed form: {:?}", &compression_out_bufs[0][..compression_out_offsets_bufs[0][1] as usize]);
-    /* 
+    /*
     println!("Compressed form: {:?}", &compression_out_bufs[0][compression_out_offsets_bufs[0][0] as usize..compression_out_offsets_bufs[0][1] as usize]);
     println!("input in string: {:?}", std::str::from_utf8(&inputs[0].value_data()[inputs[0].value_offsets()[0] as usize ..inputs[0].value_offsets()[1] as usize]));
     println!("input: {:?}", &inputs[0].value_data()[inputs[0].value_offsets()[0] as usize ..inputs[0].value_offsets()[1] as usize]);
@@ -97,7 +111,10 @@ fn benchmark(file_path: &str) {
     */
     for i in 0..TEST_NUM {
         //assert_eq!(inputs[i].value_data().len(), decompression_out_bufs[i].len());
-        assert_eq!(inputs[i].value_offsets().len(), decompression_out_offsets_bufs[i].len());
+        assert_eq!(
+            inputs[i].value_offsets().len(),
+            decompression_out_offsets_bufs[i].len()
+        );
         //assert_eq!(inputs[i].value_data(), decompression_out_bufs[i]);
         //assert_eq!(inputs[i].value_offsets(), decompression_out_offsets_bufs[i]);
     }
@@ -106,11 +123,12 @@ fn benchmark(file_path: &str) {
     println!("for file: {}", file_path);
     println!(
         "{}\t{}\t{}",
-        "Compression ratio",
-        "Compression speed",
-        "Decompression speed"
+        "Compression ratio", "Compression speed", "Decompression speed"
     );
-    println!("{:.3}\t\t\t\t{:.2}MB/s\t\t\t{:.2}MB/s", compression_ratio, com_speed, d_speed);
+    println!(
+        "{:.3}\t\t\t\t{:.2}MB/s\t\t\t{:.2}MB/s",
+        compression_ratio, com_speed, d_speed
+    );
     for i in 0..TEST_NUM {
         assert_eq!(inputs[i].value_data(), decompression_out_bufs[i]);
         assert_eq!(inputs[i].value_offsets(), decompression_out_offsets_bufs[i]);
@@ -127,15 +145,15 @@ fn main() {
         "/home/x/second_column_fulldocs.tsv",
         "/home/x/third_column_fulldocs_chunk_0.tsv",
     ];
-/* 
-    let file_paths = [
-        "/home/x/dbtext/c_name",
-        "/home/x/dbtext/l_comment",
-        "/home/x/dbtext/wikipedia",
-        "/home/x/dbtext/chinese"
-    ];
-*/
+    /*
+        let file_paths = [
+            "/home/x/dbtext/c_name",
+            "/home/x/dbtext/l_comment",
+            "/home/x/dbtext/wikipedia",
+            "/home/x/dbtext/chinese"
+        ];
+    */
     for file_path in file_paths {
         benchmark(file_path);
-    } 
+    }
 }
