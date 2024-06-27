@@ -17,7 +17,7 @@ mod take;
 pub mod testing;
 pub mod utils;
 
-pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNFlatExec, PreFilterSource};
+pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec, PreFilterSource};
 pub use planner::{FilterPlan, Planner};
 pub use projection::ProjectionExec;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};

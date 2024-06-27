@@ -25,7 +25,9 @@ use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
+use lance_index::vector::{
+    flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
+};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
@@ -63,14 +65,13 @@ fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
     }
 }
 
-/// [ExecutionPlan] for Flat KNN (bruteforce) search.
+/// [ExecutionPlan] compute vector distance from a query vector.
 ///
 /// Preconditions:
 /// - `input` schema must contains `query.column`,
-/// - The column must be a vector.
-/// - `input` schema does not have "_distance" column.
+/// - The column must be a vector column.
 #[derive(Debug)]
-pub struct KNNFlatExec {
+pub struct KNNVectorDistanceExec {
     /// Inner input node.
     pub input: Arc<dyn ExecutionPlan>,
 
@@ -83,17 +84,17 @@ pub struct KNNFlatExec {
     properties: PlanProperties,
 }
 
-impl DisplayAs for KNNFlatExec {
+impl DisplayAs for KNNVectorDistanceExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "KNNFlat: metric={}", self.distance_type,)
+                write!(f, "KNNVectorDistance: metric={}", self.distance_type,)
             }
         }
     }
 }
 
-impl KNNFlatExec {
+impl KNNVectorDistanceExec {
     /// Create a new [KNNFlatExec] node.
     ///
     /// Returns an error if the preconditions are not met.
@@ -137,7 +138,7 @@ impl KNNFlatExec {
     }
 }
 
-impl ExecutionPlan for KNNFlatExec {
+impl ExecutionPlan for KNNVectorDistanceExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -157,7 +158,7 @@ impl ExecutionPlan for KNNFlatExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
-                "KNNFlatExec node must have exactly one child".to_string(),
+                "KNNVectorDistanceExec node must have exactly one child".to_string(),
             ));
         }
 
@@ -185,7 +186,7 @@ impl ExecutionPlan for KNNFlatExec {
                 let key = key.clone();
                 let column = column.clone();
                 async move {
-                    flat_search(key, dt, &column, batch?)
+                    compute_distance(key, dt, &column, batch?)
                         .await
                         .map_err(|e| DataFusionError::Execution(e.to_string()))
                 }
@@ -795,7 +796,7 @@ mod tests {
 
         let stream = dataset.scan().try_into_stream().await.unwrap();
         let all_with_distances = stream
-            .and_then(|batch| flat_search(q.clone(), DistanceType::L2, "vector", batch))
+            .and_then(|batch| compute_distance(q.clone(), DistanceType::L2, "vector", batch))
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -827,7 +828,7 @@ mod tests {
 
         let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
 
-        let idx = KNNFlatExec::try_new(
+        let idx = KNNVectorDistanceExec::try_new(
             input,
             "vector",
             Arc::new(generate_random_array(dim)),

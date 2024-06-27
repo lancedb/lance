@@ -22,7 +22,7 @@ fn distance_field() -> ArrowField {
 }
 
 #[instrument(level = "debug", skip_all)]
-pub async fn flat_search(
+pub async fn compute_distance(
     key: ArrayRef,
     dt: DistanceType,
     column: &str,
@@ -57,14 +57,12 @@ pub async fn flat_search(
     tokio::task::spawn_blocking(move || {
         let distances = dt.arrow_batch_func()(key.as_ref(), &vectors)? as ArrayRef;
 
-        let batch = batch
+        batch
             .try_with_column(distance_field(), distances)
             .map_err(|e| Error::Execution {
                 message: format!("Failed to adding distance column: {}", e),
                 location: location!(),
-            });
-        println!("batch: {:?}", batch);
-        batch
+            })
     })
     .await
     .unwrap()

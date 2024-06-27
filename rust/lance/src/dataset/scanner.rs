@@ -47,8 +47,8 @@ use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
-    knn::new_knn_exec, FilterPlan, KNNFlatExec, LancePushdownScanExec, LanceScanExec, Planner,
-    PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
+    knn::new_knn_exec, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec,
+    Planner, PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
@@ -1369,7 +1369,7 @@ impl Scanner {
 
     /// Add a knn search node to the input plan
     fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
-        let flat_dist = Arc::new(KNNFlatExec::try_new(
+        let flat_dist = Arc::new(KNNVectorDistanceExec::try_new(
             input,
             &q.column,
             q.key.clone(),
@@ -3895,7 +3895,7 @@ mod test {
   Take: columns=\"vec, _rowid, _distance, i, s\"
     FilterExec: _distance@2 IS NOT NULL
       SortExec: TopK(fetch=5), expr=...
-        KNNFlat: metric=l2
+        KNNVectorDistance: metric=l2
           LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
@@ -3921,7 +3921,7 @@ mod test {
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=10), expr=...
-        KNNFlat: metric=l2
+        KNNVectorDistance: metric=l2
           Take: columns=\"_distance, _rowid, vec\"
             SortExec: TopK(fetch=40), expr=...
               ANNSubIndex: name=..., k=40, deltas=1
@@ -3937,7 +3937,7 @@ mod test {
   Take: columns=\"vec, _rowid, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=13), expr=...
-        KNNFlat: metric=l2
+        KNNVectorDistance: metric=l2
           LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
@@ -3991,13 +3991,13 @@ mod test {
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=6), expr=...
-        KNNFlat: metric=l2
+        KNNVectorDistance: metric=l2
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Projection: fields=[_distance, _rowid, vec]
                 FilterExec: _distance@... IS NOT NULL
                   SortExec: TopK(fetch=6), expr=...
-                    KNNFlat: metric=l2
+                    KNNVectorDistance: metric=l2
                       LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
               Take: columns=\"_distance, _rowid, vec\"
                 SortExec: TopK(fetch=6), expr=...
@@ -4016,13 +4016,13 @@ mod test {
       Take: columns=\"_rowid, vec, _distance, i\"
         FilterExec: _distance@... IS NOT NULL
           SortExec: TopK(fetch=15), expr=...
-            KNNFlat: metric=l2
+            KNNVectorDistance: metric=l2
               RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                 UnionExec
                   Projection: fields=[_distance, _rowid, vec]
                     FilterExec: _distance@... IS NOT NULL
                       SortExec: TopK(fetch=15), expr=...
-                        KNNFlat: metric=l2
+                        KNNVectorDistance: metric=l2
                           LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
                   Take: columns=\"_distance, _rowid, vec\"
                     SortExec: TopK(fetch=15), expr=...
@@ -4046,13 +4046,13 @@ mod test {
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=5), expr=...
-        KNNFlat: metric=l2
+        KNNVectorDistance: metric=l2
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Projection: fields=[_distance, _rowid, vec]
                 FilterExec: _distance@... IS NOT NULL
                   SortExec: TopK(fetch=5), expr=...
-                    KNNFlat: metric=l2
+                    KNNVectorDistance: metric=l2
                       FilterExec: i@1 > 10
                         LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
               Take: columns=\"_distance, _rowid, vec\"
@@ -4101,13 +4101,13 @@ mod test {
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=8), expr=...
-        KNNFlat: metric=l2
+        KNNVectorDistance: metric=l2
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Projection: fields=[_distance, _rowid, vec]
                 FilterExec: _distance@... IS NOT NULL
                   SortExec: TopK(fetch=8), expr=...
-                    KNNFlat: metric=l2
+                    KNNVectorDistance: metric=l2
                       FilterExec: i@1 > 10
                         LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
               Take: columns=\"_distance, _rowid, vec\"
@@ -4132,13 +4132,13 @@ mod test {
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=11), expr=...
-        KNNFlat: metric=l2
+        KNNVectorDistance: metric=l2
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Projection: fields=[_distance, _rowid, vec]
                 FilterExec: _distance@... IS NOT NULL
                   SortExec: TopK(fetch=11), expr=...
-                    KNNFlat: metric=l2
+                    KNNVectorDistance: metric=l2
                       FilterExec: i@1 > 10
                         LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
               Take: columns=\"_distance, _rowid, vec\"
