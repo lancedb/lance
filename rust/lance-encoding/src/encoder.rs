@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
+use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -228,22 +229,31 @@ fn get_compression_scheme() -> CompressionScheme {
 }
 
 impl CoreArrayEncodingStrategy {
-    fn array_encoder_from_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
+    fn array_encoder_from_type(
+        data_type: &DataType,
+        data_size: u64,
+    ) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
-                    Self::array_encoder_from_type(inner.data_type())?,
+                    Self::array_encoder_from_type(inner.data_type(), data_size)?,
                     *dimension as u32,
                 )))))
             }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
-                let bin_indices_encoder = Self::array_encoder_from_type(&DataType::UInt64)?;
-                let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8)?;
+                let bin_indices_encoder =
+                    Self::array_encoder_from_type(&DataType::UInt64, data_size)?;
+                let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8, data_size)?;
 
-                Ok(Box::new(BinaryEncoder::new(
-                    bin_indices_encoder,
-                    bin_bytes_encoder,
-                )))
+                let bin_encoder =
+                    Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
+
+                if matches!(data_type, DataType::Utf8 | DataType::Binary) && data_size > 1024 * 1024
+                {
+                    Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+                } else {
+                    Ok(bin_encoder)
+                }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::try_new(data_type, get_compression_scheme())?,
@@ -254,7 +264,11 @@ impl CoreArrayEncodingStrategy {
 
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     fn create_array_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn ArrayEncoder>> {
-        Self::array_encoder_from_type(arrays[0].data_type())
+        let data_size = arrays
+            .iter()
+            .map(|arr| arr.get_buffer_memory_size() as u64)
+            .sum::<u64>();
+        Self::array_encoder_from_type(arrays[0].data_type(), data_size)
     }
 }
 

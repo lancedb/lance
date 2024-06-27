@@ -186,6 +186,11 @@ message Binary {
   uint64 null_adjustment = 3;
 }
 
+message Fsst {
+  ArrayEncoding binary = 1;
+  bytes symbol_table = 2;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -195,6 +200,7 @@ message ArrayEncoding {
         List list = 4;
         SimpleStruct struct = 5;
         Binary binary = 6;
+        Fsst fsst = 7;
     }
 }
 

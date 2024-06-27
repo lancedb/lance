@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::DataType;
+use fsst::FsstPageScheduler;
 
 use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PageScheduler, format::pb};
@@ -17,6 +18,7 @@ pub mod binary;
 pub mod bitmap;
 pub mod buffers;
 pub mod fixed_size_list;
+pub mod fsst;
 pub mod value;
 
 /// These contain the file buffers shared across the entire file
@@ -146,6 +148,12 @@ pub fn decoder_from_array_encoding(
                 offset_type,
                 binary.null_adjustment,
             ))
+        }
+        pb::array_encoding::ArrayEncoding::Fsst(fsst) => {
+            let inner =
+                decoder_from_array_encoding(fsst.binary.as_ref().unwrap(), buffers, data_type);
+
+            Box::new(FsstPageScheduler::new(inner, fsst.symbol_table.clone()))
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column
         // (that has no data).  We never actually decode that column and so this branch is never actually encountered.
