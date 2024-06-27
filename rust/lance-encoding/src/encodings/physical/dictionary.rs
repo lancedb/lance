@@ -147,6 +147,10 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
         let string_array = arrow_cast::cast(&dict_array, &DataType::Utf8).unwrap();
         let string_array = string_array.as_any().downcast_ref::<StringArray>().unwrap();
 
+        // This is not ideal, since we go from DictionaryArray -> StringArray -> buffers (BytesMut)
+        // and later in primitive_array_from_buffers() we will go from buffers -> StringArray again.
+        // Creating the BytesMut is an unnecessary copy.
+        // But it is the best we can do in the current structure
         let null_buffer = string_array
             .nulls()
             .map(|n| BytesMut::from(n.buffer().as_slice()))
@@ -277,7 +281,7 @@ pub mod tests {
 
     use arrow_array::{
         builder::{LargeStringBuilder, StringBuilder},
-        ArrayRef, StringArray, UInt64Array,
+        ArrayRef, StringArray, UInt8Array,
     };
     use arrow_schema::{DataType, Field};
     use std::{sync::Arc, vec};
@@ -288,32 +292,6 @@ pub mod tests {
 
     use super::get_indices_items_from_arrays;
 
-    struct EnvVarGuard {
-        key: String,
-        original_value: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn new(key: &str, new_value: &str) -> Self {
-            let original_value = std::env::var(key).ok();
-            std::env::set_var(key, new_value);
-            Self {
-                key: key.to_string(),
-                original_value,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(ref value) = self.original_value {
-                std::env::set_var(&self.key, value);
-            } else {
-                std::env::remove_var(&self.key);
-            }
-        }
-    }
-
     #[test]
     fn test_encode_dict_nulls() {
         // Null entries in string arrays should be adjusted
@@ -323,8 +301,7 @@ pub mod tests {
         let (dict_indices, dict_items) =
             get_indices_items_from_arrays(&[string_array1, string_array2, string_array3]);
 
-        let expected_indices =
-            Arc::new(UInt64Array::from(vec![0, 1, 2, 2, 0, 1, 0, 0])) as ArrayRef;
+        let expected_indices = Arc::new(UInt8Array::from(vec![0, 1, 2, 2, 0, 1, 0, 0])) as ArrayRef;
         let expected_items = Arc::new(StringArray::from(vec!["foo", "bar"])) as ArrayRef;
         assert_eq!(&dict_indices, &expected_indices);
         assert_eq!(&dict_items, &expected_items);
@@ -332,40 +309,30 @@ pub mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_utf8() {
-        let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
-
         let field = Field::new("", DataType::Utf8, false);
         check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_binary() {
-        let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
-
         let field = Field::new("", DataType::Binary, false);
         check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_binary() {
-        let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
-
         let field = Field::new("", DataType::LargeBinary, true);
         check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_utf8() {
-        let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
-
         let field = Field::new("", DataType::LargeUtf8, true);
         check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_simple_utf8() {
-        let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
-
         let string_array = StringArray::from(vec![Some("abc"), Some("de"), None, Some("fgh")]);
 
         let test_cases = TestCases::default()
@@ -378,8 +345,6 @@ pub mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_sliced_utf8() {
-        let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
-
         let string_array = StringArray::from(vec![Some("abc"), Some("de"), None, Some("fgh")]);
         let string_array = string_array.slice(1, 3);
 
@@ -392,8 +357,6 @@ pub mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_empty_strings() {
-        let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
-
         // Scenario 1: Some strings are empty
 
         let values = [Some("abc"), Some(""), None];
@@ -428,8 +391,6 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     #[ignore] // This test is quite slow in debug mode
     async fn test_jumbo_string() {
-        let _env_guard = EnvVarGuard::new("LANCE_DICT_ENCODING", "dict");
-
         // This is an overflow test.  We have a list of lists where each list
         // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
         // offsets range

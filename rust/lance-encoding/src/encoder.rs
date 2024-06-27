@@ -230,11 +230,6 @@ fn get_compression_scheme() -> CompressionScheme {
     parse_compression_scheme(&compression_scheme).unwrap_or(CompressionScheme::None)
 }
 
-pub fn get_dict_encoding() -> bool {
-    let str_encoding = std::env::var("LANCE_DICT_ENCODING").unwrap_or("none".to_string());
-    matches!(str_encoding.as_str(), "dict")
-}
-
 impl CoreArrayEncodingStrategy {
     fn array_encoder_from_type(
         data_type: &DataType,
@@ -278,6 +273,7 @@ impl CoreArrayEncodingStrategy {
 // check whether we want to use dictionary encoding or not
 // by applying a threshold on cardinality
 // returns true if cardinality < 100
+// The choice to use 100 is just a heuristic for now
 fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
     let mut unique_values = HashSet::new();
 
@@ -301,7 +297,7 @@ fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     fn create_array_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn ArrayEncoder>> {
         if arrays[0].data_type() == &DataType::Utf8 {
-            if get_dict_encoding() && check_dict_encoding(arrays) {
+            if check_dict_encoding(arrays) {
                 // Dictionary encoding
                 Self::array_encoder_from_type(arrays[0].data_type(), true)
             } else {
