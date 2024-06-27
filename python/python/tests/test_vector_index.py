@@ -447,6 +447,22 @@ def test_optimize_index(dataset, tmp_path):
     assert len(list(indices_dir.iterdir())) == 2
 
 
+def test_create_index_dot(dataset, tmp_path):
+    dataset_uri = tmp_path / "dataset.lance"
+    assert not dataset.has_index
+    ds = lance.write_dataset(dataset.to_table(), dataset_uri)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="dot",
+        num_partitions=4,
+        num_sub_vectors=2,
+    )
+
+    assert ds.has_index
+    assert "dot" == ds.stats.index_stats("vector_idx")["indices"][0]["metric_type"]
+
+
 def create_uniform_table(min, max, nvec, offset, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     # rowid = np.arange(offset, offset + nvec)
