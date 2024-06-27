@@ -1,44 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use lance_core::Result;
-use num_traits::Num;
+use arrow_array::{ArrayRef, RecordBatch};
+use deepsize::DeepSizeOf;
+use lance_core::{Error, Result};
+use snafu::{location, Location};
 
-use super::storage::VectorStore;
-
-/// A prefilter that can be used to skip vectors during search
-///
-/// Note: there is a `struct PreFilter` in `lance`. However we can't depend on `lance` in `lance-index`
-/// because it would create a circular dependency.
-///
-/// By defining a trait here, we can implement the trait for `lance::PreFilter`
-/// and not have the circular dependency
-pub trait PreFilter {
-    fn no_prefilter() -> Arc<NoPreFilter> {
-        Arc::new(NoPreFilter {})
-    }
-
-    fn should_drop(&self, id: u64) -> bool;
-}
-
-/// A prefilter that does not skip any vectors
-pub struct NoPreFilter {}
-
-impl PreFilter for NoPreFilter {
-    fn should_drop(&self, _id: u64) -> bool {
-        false
-    }
-}
-
+use crate::vector::storage::VectorStore;
+use crate::vector::{flat, hnsw};
+use crate::{prefilter::PreFilter, vector::Query};
 /// A sub index for IVF index
-pub trait IvfSubIndex: Send + Sync + Sized {
-    type QueryParams: Default;
+pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
+    type QueryParams: Send + Sync + for<'a> From<&'a Query>;
     type BuildParams: Clone;
 
-    fn name(&self) -> &str;
+    /// Load the sub index from a record batch with a single row
+    fn load(data: RecordBatch) -> Result<Self>
+    where
+        Self: Sized;
+
+    fn use_residual() -> bool;
+
+    fn name() -> &'static str;
+
+    fn metadata_key() -> &'static str;
+
+    /// Return the schema of the sub index
+    fn schema() -> arrow_schema::SchemaRef;
 
     /// Search the sub index for nearest neighbors.
     /// # Arguments:
@@ -46,24 +37,49 @@ pub trait IvfSubIndex: Send + Sync + Sized {
     /// * `k` - The number of nearest neighbors to return
     /// * `params` - The query parameters
     /// * `prefilter` - The prefilter object indicating which vectors to skip
-    fn search<T: Num>(
+    fn search(
         &self,
-        query: &[T],
+        query: ArrayRef,
         k: usize,
         params: Self::QueryParams,
         storage: &impl VectorStore,
-        prefilter: Arc<impl PreFilter>,
+        prefilter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch>;
 
-    /// Load the sub index from a record batch with a single row
-    fn load(data: RecordBatch) -> Result<Self>;
-
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
-    fn index_vectors(&self, storage: &impl VectorStore, params: Self::BuildParams) -> Result<()>;
-
-    /// Return the schema of the sub index
-    fn schema(&self) -> arrow_schema::SchemaRef;
+    fn index_vectors(storage: &impl VectorStore, params: Self::BuildParams) -> Result<Self>
+    where
+        Self: Sized;
 
     /// Encode the sub index into a record batch
     fn to_batch(&self) -> Result<RecordBatch>;
+}
+
+pub enum SubIndexType {
+    Flat,
+    Hnsw,
+}
+
+impl std::fmt::Display for SubIndexType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Flat => write!(f, "{}", flat::index::FlatIndex::name()),
+            Self::Hnsw => write!(f, "{}", hnsw::builder::HNSW::name()),
+        }
+    }
+}
+
+impl TryFrom<&str> for SubIndexType {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "FLAT" => Ok(Self::Flat),
+            "HNSW" => Ok(Self::Hnsw),
+            _ => Err(Error::Index {
+                message: format!("unknown sub index type {}", value),
+                location: location!(),
+            }),
+        }
+    }
 }

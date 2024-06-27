@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package lance.encodings;
  
+import "google/protobuf/empty.proto";
+
 // This file contains a specification for encodings that can be used
 // to store and load Arrow data into a Lance file.
 //
@@ -177,6 +179,13 @@ message Flat {
 // TODO: Struct validity bitmaps will be placed here.
 message SimpleStruct {}
 
+// An array encoding for binary fields
+message Binary {
+  ArrayEncoding indices = 1;
+  ArrayEncoding bytes = 2;
+  uint64 null_adjustment = 3;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -185,5 +194,23 @@ message ArrayEncoding {
         FixedSizeList fixed_size_list = 3;
         List list = 4;
         SimpleStruct struct = 5;
+        Binary binary = 6;
     }
+}
+
+// Wraps a column with a zone map index that can be used
+// to apply pushdown filters
+message ZoneIndex {
+  uint32 rows_per_zone = 1;
+  Buffer zone_map_buffer = 2;
+  ColumnEncoding inner = 3;
+}
+
+// Encodings that describe a column of values
+message ColumnEncoding {
+  oneof column_encoding {
+    // No special encoding, just column values
+    google.protobuf.Empty values = 1;
+    ZoneIndex zone_index = 2;
+  }
 }

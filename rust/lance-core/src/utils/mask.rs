@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::ops::RangeBounds;
 use std::{collections::BTreeMap, io::Read};
 
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
@@ -73,8 +74,8 @@ impl RowIdMask {
     }
 
     /// Return the indices of the input row ids that were valid
-    pub fn selected_indices(&self, row_ids: &[u64]) -> Vec<u64> {
-        let enumerated_ids = row_ids.iter().enumerate();
+    pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
+        let enumerated_ids = row_ids.enumerate();
         match (&self.block_list, &self.allow_list) {
             (Some(block_list), Some(allow_list)) => {
                 // Only take rows that are both in the allow list and not in the block list
@@ -102,7 +103,7 @@ impl RowIdMask {
             (None, None) => {
                 // We should not encounter this case because callers should
                 // check is_empty first.
-                panic!("filter_row_ids called but prefilter has nothing to filter with")
+                panic!("selected_indices called but prefilter has nothing to filter with")
             }
         }
     }
@@ -142,7 +143,7 @@ impl RowIdMask {
         }
     }
 
-    /// Converst a mask into an arrow array
+    /// Convert a mask into an arrow array
     ///
     /// A row id mask is not very arrow-compatible.  We can't make it a batch with
     /// two columns because the block list and allow list will have different lengths.  Also,
@@ -265,12 +266,17 @@ impl std::ops::BitOr for RowIdMask {
 
 /// A collection of row ids.
 ///
+/// These row ids may either be stable-style (where they can be an incrementing
+/// u64 sequence) or address style, where they are a fragment id and a row offset.
+/// When address style, this supports setting entire fragments as selected,
+/// without needing to enumerate all the ids in the fragment.
+///
 /// This is similar to a [RoaringTreemap] but it is optimized for the case where
 /// entire fragments are selected or deselected.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RowIdTreeMap {
-    /// The contents of the set. If there is a pair (k, None) then the entire
-    /// fragment k is selected. If there is a pair (k, Some(v)) then the
+    /// The contents of the set. If there is a pair (k, Full) then the entire
+    /// fragment k is selected. If there is a pair (k, Partial(v)) then the
     /// fragment k has the selected rows in v.
     inner: BTreeMap<u32, RowIdSelection>,
 }
@@ -328,6 +334,82 @@ impl RowIdTreeMap {
         }
     }
 
+    /// Insert a single value into the set
+    ///
+    /// Returns true if the value was not already in the set.
+    ///
+    /// ```rust
+    /// use lance_core::utils::mask::RowIdTreeMap;
+    ///
+    /// let mut set = RowIdTreeMap::new();
+    /// assert_eq!(set.insert(10), true);
+    /// assert_eq!(set.insert(10), false);
+    /// assert_eq!(set.contains(10), true);
+    /// ```
+    pub fn insert(&mut self, value: u64) -> bool {
+        let fragment = (value >> 32) as u32;
+        let row_addr = value as u32;
+        match self.inner.get_mut(&fragment) {
+            None => {
+                let mut set = RoaringBitmap::new();
+                set.insert(row_addr);
+                self.inner.insert(fragment, RowIdSelection::Partial(set));
+                true
+            }
+            Some(RowIdSelection::Full) => false,
+            Some(RowIdSelection::Partial(set)) => set.insert(row_addr),
+        }
+    }
+
+    /// Insert a range of values into the set
+    pub fn insert_range<R: RangeBounds<u64>>(&mut self, range: R) -> u64 {
+        // Separate the start and end into high and low bits.
+        let (mut start_high, mut start_low) = match range.start_bound() {
+            std::ops::Bound::Included(&start) => ((start >> 32) as u32, start as u32),
+            std::ops::Bound::Excluded(&start) => {
+                let start = start.saturating_add(1);
+                ((start >> 32) as u32, start as u32)
+            }
+            std::ops::Bound::Unbounded => (0, 0),
+        };
+
+        let (end_high, end_low) = match range.end_bound() {
+            std::ops::Bound::Included(&end) => ((end >> 32) as u32, end as u32),
+            std::ops::Bound::Excluded(&end) => {
+                let end = end.saturating_sub(1);
+                ((end >> 32) as u32, end as u32)
+            }
+            std::ops::Bound::Unbounded => (u32::MAX, u32::MAX),
+        };
+
+        let mut count = 0;
+
+        while start_high <= end_high {
+            let start = start_low;
+            let end = if start_high == end_high {
+                end_low
+            } else {
+                u32::MAX
+            };
+            let fragment = start_high;
+            match self.inner.get_mut(&fragment) {
+                None => {
+                    let mut set = RoaringBitmap::new();
+                    count += set.insert_range(start..=end);
+                    self.inner.insert(fragment, RowIdSelection::Partial(set));
+                }
+                Some(RowIdSelection::Full) => {}
+                Some(RowIdSelection::Partial(set)) => {
+                    count += set.insert_range(start..=end);
+                }
+            }
+            start_high += 1;
+            start_low = 0;
+        }
+
+        count
+    }
+
     /// Add a bitmap for a single fragment
     pub fn insert_bitmap(&mut self, fragment: u32, bitmap: RoaringBitmap) {
         self.inner.insert(fragment, RowIdSelection::Partial(bitmap));
@@ -340,16 +422,37 @@ impl RowIdTreeMap {
 
     /// Returns whether the set contains the given value
     pub fn contains(&self, value: u64) -> bool {
-        let fragment = (value >> 32) as u32;
-        let row_id = value as u32;
-        match self.inner.get(&fragment) {
+        let upper = (value >> 32) as u32;
+        let lower = value as u32;
+        match self.inner.get(&upper) {
             None => false,
             Some(RowIdSelection::Full) => true,
-            Some(RowIdSelection::Partial(fragment_set)) => fragment_set.contains(row_id),
+            Some(RowIdSelection::Partial(fragment_set)) => fragment_set.contains(lower),
         }
     }
 
-    pub fn remove_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
+    pub fn remove(&mut self, value: u64) -> bool {
+        let upper = (value >> 32) as u32;
+        let lower = value as u32;
+        match self.inner.get_mut(&upper) {
+            None => false,
+            Some(RowIdSelection::Full) => {
+                let mut set = RoaringBitmap::full();
+                set.remove(lower);
+                self.inner.insert(upper, RowIdSelection::Partial(set));
+                true
+            }
+            Some(RowIdSelection::Partial(lower_set)) => {
+                let removed = lower_set.remove(lower);
+                if lower_set.is_empty() {
+                    self.inner.remove(&upper);
+                }
+                removed
+            }
+        }
+    }
+
+    pub fn retain_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
         let frag_id_set = frag_ids.into_iter().collect::<HashSet<_>>();
         self.inner
             .retain(|frag_id, _| frag_id_set.contains(frag_id));
@@ -418,6 +521,13 @@ impl std::ops::BitOr<Self> for RowIdTreeMap {
     type Output = Self;
 
     fn bitor(mut self, rhs: Self) -> Self::Output {
+        self |= rhs;
+        self
+    }
+}
+
+impl std::ops::BitOrAssign<Self> for RowIdTreeMap {
+    fn bitor_assign(&mut self, rhs: Self) {
         for (fragment, rhs_set) in &rhs.inner {
             match self.inner.get_mut(fragment) {
                 None => {
@@ -433,7 +543,6 @@ impl std::ops::BitOr<Self> for RowIdTreeMap {
                 }
             }
         }
-        self
     }
 }
 
@@ -441,6 +550,13 @@ impl std::ops::BitAnd<Self> for RowIdTreeMap {
     type Output = Self;
 
     fn bitand(mut self, rhs: Self) -> Self::Output {
+        self &= rhs;
+        self
+    }
+}
+
+impl std::ops::BitAndAssign<Self> for RowIdTreeMap {
+    fn bitand_assign(&mut self, rhs: Self) {
         // Remove fragment that aren't on the RHS
         self.inner
             .retain(|fragment, _| rhs.inner.contains_key(fragment));
@@ -465,8 +581,41 @@ impl std::ops::BitAnd<Self> for RowIdTreeMap {
             RowIdSelection::Partial(set) => !set.is_empty(),
             RowIdSelection::Full => true,
         });
+    }
+}
 
-        self
+impl std::ops::SubAssign<&Self> for RowIdTreeMap {
+    fn sub_assign(&mut self, rhs: &Self) {
+        for (fragment, rhs_set) in &rhs.inner {
+            match self.inner.get_mut(fragment) {
+                None => {}
+                Some(RowIdSelection::Full) => {
+                    // If the fragment is already selected then there is nothing to do
+                    match rhs_set {
+                        RowIdSelection::Full => {
+                            self.inner.remove(fragment);
+                        }
+                        RowIdSelection::Partial(rhs_set) => {
+                            // This generally won't be hit.
+                            let mut set = RoaringBitmap::full();
+                            set -= rhs_set;
+                            self.inner.insert(*fragment, RowIdSelection::Partial(set));
+                        }
+                    }
+                }
+                Some(RowIdSelection::Partial(lhs_set)) => match rhs_set {
+                    RowIdSelection::Full => {
+                        self.inner.remove(fragment);
+                    }
+                    RowIdSelection::Partial(rhs_set) => {
+                        *lhs_set -= rhs_set;
+                        if lhs_set.is_empty() {
+                            self.inner.remove(fragment);
+                        }
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -474,19 +623,19 @@ impl FromIterator<u64> for RowIdTreeMap {
     fn from_iter<T: IntoIterator<Item = u64>>(iter: T) -> Self {
         let mut inner = BTreeMap::new();
         for row_id in iter {
-            let fragment = (row_id >> 32) as u32;
-            let row_id = row_id as u32;
-            match inner.get_mut(&fragment) {
+            let upper = (row_id >> 32) as u32;
+            let lower = row_id as u32;
+            match inner.get_mut(&upper) {
                 None => {
                     let mut set = RoaringBitmap::new();
-                    set.insert(row_id);
-                    inner.insert(fragment, RowIdSelection::Partial(set));
+                    set.insert(lower);
+                    inner.insert(upper, RowIdSelection::Partial(set));
                 }
                 Some(RowIdSelection::Full) => {
                     // If the fragment is already selected then there is nothing to do
                 }
                 Some(RowIdSelection::Partial(set)) => {
-                    set.insert(row_id);
+                    set.insert(lower);
                 }
             }
         }
@@ -503,19 +652,19 @@ impl<'a> FromIterator<&'a u64> for RowIdTreeMap {
 impl Extend<u64> for RowIdTreeMap {
     fn extend<T: IntoIterator<Item = u64>>(&mut self, iter: T) {
         for row_id in iter {
-            let fragment = (row_id >> 32) as u32;
-            let row_id = row_id as u32;
-            match self.inner.get_mut(&fragment) {
+            let upper = (row_id >> 32) as u32;
+            let lower = row_id as u32;
+            match self.inner.get_mut(&upper) {
                 None => {
                     let mut set = RoaringBitmap::new();
-                    set.insert(row_id);
-                    self.inner.insert(fragment, RowIdSelection::Partial(set));
+                    set.insert(lower);
+                    self.inner.insert(upper, RowIdSelection::Partial(set));
                 }
                 Some(RowIdSelection::Full) => {
                     // If the fragment is already selected then there is nothing to do
                 }
                 Some(RowIdSelection::Partial(set)) => {
-                    set.insert(row_id);
+                    set.insert(lower);
                 }
             }
         }
@@ -559,6 +708,62 @@ mod tests {
         let allow_list = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[3]));
         let combined = block_list | allow_list;
         assert!(combined.selected(1));
+    }
+
+    #[test]
+    fn test_map_insert_range() {
+        let ranges = &[
+            (0..10),
+            (40..500),
+            ((u32::MAX as u64 - 10)..(u32::MAX as u64 + 20)),
+        ];
+
+        for range in ranges {
+            let mut mask = RowIdTreeMap::default();
+
+            let count = mask.insert_range(range.clone());
+            let expected = range.end - range.start;
+            assert_eq!(count, expected);
+
+            let count = mask.insert_range(range.clone());
+            assert_eq!(count, 0);
+
+            let new_range = range.start + 5..range.end + 5;
+            let count = mask.insert_range(new_range.clone());
+            assert_eq!(count, 5);
+        }
+
+        let mut mask = RowIdTreeMap::default();
+        let count = mask.insert_range(..10);
+        assert_eq!(count, 10);
+        assert!(mask.contains(0));
+
+        let count = mask.insert_range(20..=24);
+        assert_eq!(count, 5);
+
+        mask.insert_fragment(0);
+        let count = mask.insert_range(100..200);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_map_remove() {
+        let mut mask = RowIdTreeMap::default();
+
+        assert!(!mask.remove(20));
+
+        mask.insert(20);
+        assert!(mask.contains(20));
+        assert!(mask.remove(20));
+        assert!(!mask.contains(20));
+
+        mask.insert_range(10..=20);
+        assert!(mask.contains(15));
+        assert!(mask.remove(15));
+        assert!(!mask.contains(15));
+
+        // We don't test removing from a full fragment, because that would take
+        // a lot of memory.
     }
 
     proptest::proptest! {
@@ -650,6 +855,56 @@ mod tests {
 
             let actual = left | right;
             prop_assert_eq!(expected, actual);
+        }
+
+        #[test]
+        fn test_map_subassign_rows(
+            left_full_fragments in proptest::collection::vec(0..u32::MAX, 0..10),
+            left_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
+            right_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
+        ) {
+            let mut left = RowIdTreeMap::default();
+            for fragment in left_full_fragments.clone() {
+                left.insert_fragment(fragment);
+            }
+            left.extend(left_rows.iter().copied());
+
+            let mut right = RowIdTreeMap::default();
+            right.extend(right_rows.iter().copied());
+
+            let mut expected = left.clone();
+            for row in right_rows {
+                expected.remove(row);
+            }
+
+            left -= &right;
+            prop_assert_eq!(expected, left);
+        }
+
+        #[test]
+        fn test_map_subassign_frags(
+            left_full_fragments in proptest::collection::vec(0..u32::MAX, 0..10),
+            right_full_fragments in proptest::collection::vec(0..u32::MAX, 0..10),
+            left_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
+        ) {
+            let mut left = RowIdTreeMap::default();
+            for fragment in left_full_fragments.clone() {
+                left.insert_fragment(fragment);
+            }
+            left.extend(left_rows.iter().copied());
+
+            let mut right = RowIdTreeMap::default();
+            for fragment in right_full_fragments.clone() {
+                right.insert_fragment(fragment);
+            }
+
+            let mut expected = left.clone();
+            for fragment in right_full_fragments {
+                expected.inner.remove(&fragment);
+            }
+
+            left -= &right;
+            prop_assert_eq!(expected, left);
         }
     }
 }

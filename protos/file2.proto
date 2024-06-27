@@ -15,10 +15,9 @@ import "google/protobuf/empty.proto";
 //
 // * Each Lance file contains between 0 and 4Gi columns
 // * Each column contains between 0 and 4Gi pages
-// * Each page contains between 0 and 4Gi items
+// * Each page contains between 0 and 2^64 items
 // * Different pages within a column can have different items counts
-// * Columns may have more than 4Gi items, though this will require more than
-//   one page
+// * Columns may have up to 2^64 items
 // * Different columns within a file can have different item counts
 //
 // The Lance file format does not have any notion of a type system or schemas.
@@ -178,7 +177,7 @@ message ColumnMetadata {
     // may be empty.
     repeated uint64 buffer_sizes = 2;
     // Logical length (e.g. # rows) of the page
-    uint32 length = 3;
+    uint64 length = 3;
     // The encoding used to encode the page
     Encoding encoding = 4;
   }

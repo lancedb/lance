@@ -34,10 +34,6 @@ use crate::{
     RT,
 };
 
-///////////////////
-// Write Methods //
-///////////////////
-
 //////////////////
 // Read Methods //
 //////////////////
@@ -70,6 +66,9 @@ fn inner_count_rows_native(
     Ok(res)
 }
 
+///////////////////
+// Write Methods //
+///////////////////
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'local>(
     mut env: JNIEnv<'local>,

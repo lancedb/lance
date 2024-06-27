@@ -20,10 +20,10 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, LogicalPageDecoder, NextDecodeTask,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression,
+        LogicalPageDecoder, NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
+    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
     encodings::{
         logical::r#struct::SimpleStructScheduler,
         physical::{
@@ -97,9 +97,9 @@ impl ListRequestsIter {
             let mut range = range.clone();
 
             // Skip any offsets pages that are before the range
-            while offsets_offset + (cur_page_info.offsets_in_page as u64) <= range.start {
+            while offsets_offset + (cur_page_info.offsets_in_page) <= range.start {
                 trace!("Skipping null offset adjustment chunk {:?}", offsets_offset);
-                offsets_offset += cur_page_info.offsets_in_page as u64;
+                offsets_offset += cur_page_info.offsets_in_page;
                 items_offset += cur_page_info.num_items_referenced_by_page;
                 cur_page_info = page_infos_iter.next().unwrap();
             }
@@ -118,7 +118,7 @@ impl ListRequestsIter {
             while !range.is_empty() {
                 // The end of the list request is the min of the end of the range
                 // and the end of the current page
-                let end = offsets_offset + cur_page_info.offsets_in_page as u64;
+                let end = offsets_offset + cur_page_info.offsets_in_page;
                 let last = end >= range.end;
                 let end = end.min(range.end);
                 list_requests.push_back(ListRequest {
@@ -133,7 +133,7 @@ impl ListRequestsIter {
                 // If there is still more data in the range, we need to move to the
                 // next page
                 if !last {
-                    offsets_offset += cur_page_info.offsets_in_page as u64;
+                    offsets_offset += cur_page_info.offsets_in_page;
                     items_offset += cur_page_info.num_items_referenced_by_page;
                     cur_page_info = page_infos_iter.next().unwrap();
                 }
@@ -146,7 +146,7 @@ impl ListRequestsIter {
     }
 
     // Given a page of offset data, grab the corresponding list requests
-    fn next(&mut self, mut num_offsets: u32) -> Vec<ListRequest> {
+    fn next(&mut self, mut num_offsets: u64) -> Vec<ListRequest> {
         let mut list_requests = Vec::new();
         while num_offsets > 0 {
             let req = self.list_requests.front_mut().unwrap();
@@ -155,12 +155,12 @@ impl ListRequestsIter {
                 num_offsets -= 1;
                 debug_assert_ne!(num_offsets, 0);
             }
-            if num_offsets as u64 >= req.num_lists {
-                num_offsets -= req.num_lists as u32;
+            if num_offsets >= req.num_lists {
+                num_offsets -= req.num_lists;
                 list_requests.push(self.list_requests.pop_front().unwrap());
             } else {
                 let sub_req = ListRequest {
-                    num_lists: num_offsets as u64,
+                    num_lists: num_offsets,
                     includes_extra_offset: req.includes_extra_offset,
                     null_offset_adjustment: req.null_offset_adjustment,
                     items_offset: req.items_offset,
@@ -168,7 +168,7 @@ impl ListRequestsIter {
 
                 list_requests.push(sub_req);
                 req.includes_extra_offset = false;
-                req.num_lists -= num_offsets as u64;
+                req.num_lists -= num_offsets;
                 num_offsets = 0;
             }
         }
@@ -353,14 +353,19 @@ async fn indirect_schedule_task(
     let item_ranges = item_ranges.into_iter().collect::<Vec<_>>();
 
     // Create a new root scheduler, which has one column, which is our items data
-    let indirect_root_scheduler = SimpleStructScheduler::new(
-        vec![items_scheduler],
-        Fields::from(vec![Field::new("item", items_type, true)]),
-    );
-    let mut root_decoder = indirect_root_scheduler.new_root_decoder_ranges(&item_ranges);
+    let root_fields = Fields::from(vec![Field::new("item", items_type, true)]);
+    let indirect_root_scheduler =
+        SimpleStructScheduler::new(vec![items_scheduler], root_fields.clone());
+    let mut indirect_scheduler =
+        DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields);
+    let mut root_decoder = indirect_scheduler.new_root_decoder_ranges(&item_ranges);
 
-    let mut indirect_scheduler = DecodeBatchScheduler::from_scheduler(indirect_root_scheduler);
-    let indirect_messages = indirect_scheduler.schedule_ranges_to_vec(&item_ranges, io)?;
+    let indirect_messages = indirect_scheduler.schedule_ranges_to_vec(
+        &item_ranges,
+        // Can't push filters into list items
+        &FilterExpression::no_filter(),
+        io,
+    )?;
 
     for message in indirect_messages {
         for decoder in message.decoders {
@@ -381,19 +386,26 @@ async fn indirect_schedule_task(
 struct ListFieldSchedulingJob<'a> {
     scheduler: &'a ListFieldScheduler,
     offsets: Box<dyn SchedulingJob + 'a>,
+    num_rows: u64,
     list_requests_iter: ListRequestsIter,
 }
 
 impl<'a> ListFieldSchedulingJob<'a> {
-    fn try_new(scheduler: &'a ListFieldScheduler, ranges: &[Range<u64>]) -> Result<Self> {
+    fn try_new(
+        scheduler: &'a ListFieldScheduler,
+        ranges: &[Range<u64>],
+        filter: &FilterExpression,
+    ) -> Result<Self> {
         let list_requests_iter = ListRequestsIter::new(ranges, &scheduler.offset_page_info);
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         let offsets = scheduler
             .offsets_scheduler
-            .schedule_ranges(&list_requests_iter.offsets_requests)?;
+            .schedule_ranges(&list_requests_iter.offsets_requests, filter)?;
         Ok(Self {
             scheduler,
             offsets,
             list_requests_iter,
+            num_rows,
         })
     }
 }
@@ -418,7 +430,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         debug_assert!(list_reqs
             .iter()
             .all(|req| req.null_offset_adjustment == null_offset_adjustment));
-        let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>() as u32;
+        let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>();
         // offsets is a uint64 which is guaranteed to create one decoder on each call to schedule_next
         let next_offsets_decoder = next_offsets.decoders.into_iter().next().unwrap().decoder;
 
@@ -455,6 +467,10 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             rows_scheduled: num_rows,
         })
     }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
 }
 
 /// A page scheduler for list fields that encodes offsets in one field and items in another
@@ -486,7 +502,7 @@ pub struct ListFieldScheduler {
 /// This is needed to construct the scheduler
 #[derive(Debug)]
 pub struct OffsetPageInfo {
-    pub offsets_in_page: u32,
+    pub offsets_in_page: u64,
     pub null_offset_adjustment: u64,
     pub num_items_referenced_by_page: u64,
 }
@@ -522,8 +538,14 @@ impl ListFieldScheduler {
 }
 
 impl FieldScheduler for ListFieldScheduler {
-    fn schedule_ranges<'a>(&'a self, ranges: &[Range<u64>]) -> Result<Box<dyn SchedulingJob + 'a>> {
-        Ok(Box::new(ListFieldSchedulingJob::try_new(self, ranges)?))
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[Range<u64>],
+        filter: &FilterExpression,
+    ) -> Result<Box<dyn SchedulingJob + 'a>> {
+        Ok(Box::new(ListFieldSchedulingJob::try_new(
+            self, ranges, filter,
+        )?))
     }
 
     fn num_rows(&self) -> u64 {
@@ -548,9 +570,9 @@ struct ListPageDecoder {
     offsets: Vec<u64>,
     validity: BooleanBuffer,
     item_decoder: Option<SimpleStructDecoder>,
-    lists_available: u32,
-    num_rows: u32,
-    rows_drained: u32,
+    lists_available: u64,
+    num_rows: u64,
+    rows_drained: u64,
     items_type: DataType,
     offset_type: DataType,
     data_type: DataType,
@@ -620,7 +642,7 @@ impl DecodeArrayTask for ListDecodeTask {
 }
 
 impl LogicalPageDecoder for ListPageDecoder {
-    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
+    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
         async move {
             // wait for the indirect I/O to finish, run the scheduler for the indirect
             // I/O and then wait for enough items to arrive
@@ -657,7 +679,7 @@ impl LogicalPageDecoder for ListPageDecoder {
                 self.offsets[offset_wait_start as usize + num_rows as usize] - item_start;
             if items_needed > 0 {
                 // First discount any already available items
-                let items_already_available = self.item_decoder.as_mut().unwrap().avail_u64();
+                let items_already_available = self.item_decoder.as_mut().unwrap().avail();
                 trace!(
                     "List's items decoder needs {} items and already has {} items available",
                     items_needed,
@@ -665,7 +687,7 @@ impl LogicalPageDecoder for ListPageDecoder {
                 );
                 items_needed = items_needed.saturating_sub(items_already_available);
                 if items_needed > 0 {
-                    self.item_decoder.as_mut().unwrap().wait_u64(items_needed).await?;
+                    self.item_decoder.as_mut().unwrap().wait(items_needed).await?;
                 }
             }
             // This is technically undercounting a little.  It's possible that we loaded a big items
@@ -678,11 +700,11 @@ impl LogicalPageDecoder for ListPageDecoder {
         .boxed()
     }
 
-    fn unawaited(&self) -> u32 {
+    fn unawaited(&self) -> u64 {
         self.num_rows - self.lists_available - self.rows_drained
     }
 
-    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         self.lists_available -= num_rows;
         // We already have the offsets but need to drain the item pages
         let mut actual_num_rows = num_rows;
@@ -723,7 +745,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         } else {
             self.item_decoder
                 .as_mut()
-                .map(|item_decoder| Result::Ok(item_decoder.drain_u64(num_items_to_drain)?.task))
+                .map(|item_decoder| Result::Ok(item_decoder.drain(num_items_to_drain)?.task))
                 .transpose()?
         };
 
@@ -741,7 +763,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         })
     }
 
-    fn avail(&self) -> u32 {
+    fn avail(&self) -> u64 {
         self.lists_available
     }
 
@@ -856,7 +878,7 @@ impl ListOffsetsEncoder {
         tokio::task::spawn(async move {
             let num_rows =
                 offset_arrays.iter().map(|arr| arr.len()).sum::<usize>() - offset_arrays.len();
-            let num_rows = num_rows as u32;
+            let num_rows = num_rows as u64;
             let mut buffer_index = 0;
             let array = Self::do_encode(
                 offset_arrays,
@@ -990,7 +1012,7 @@ impl ListOffsetsEncoder {
     fn do_encode_u64(
         offset_arrays: Vec<ArrayRef>,
         validity: Vec<Option<&BooleanArray>>,
-        num_offsets: u32,
+        num_offsets: u64,
         null_offset_adjustment: u64,
         buffer_index: &mut u32,
         inner_encoder: Arc<dyn ArrayEncoder>,
@@ -1013,7 +1035,7 @@ impl ListOffsetsEncoder {
         offset_arrays: Vec<ArrayRef>,
         validity_arrays: Vec<ArrayRef>,
         buffer_index: &mut u32,
-        num_offsets: u32,
+        num_offsets: u64,
         inner_encoder: Arc<dyn ArrayEncoder>,
     ) -> Result<EncodedArray> {
         let validity_arrays = validity_arrays
@@ -1144,6 +1166,15 @@ impl FieldEncoder for ListFieldEncoder {
 
     fn num_columns(&self) -> u32 {
         self.items_encoder.num_columns() + 1
+    }
+
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        async move {
+            let mut columns = vec![EncodedColumn::default()];
+            columns.extend(self.items_encoder.finish().await?);
+            Ok(columns)
+        }
+        .boxed()
     }
 }
 

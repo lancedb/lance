@@ -6,6 +6,7 @@ use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::UInt32Array;
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
@@ -18,8 +19,10 @@ use deepsize::DeepSizeOf;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::ProductQuantizationStorage;
-use lance_index::vector::quantizer::Quantization;
+use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
+use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     vector::{pq::ProductQuantizer, Query, DIST_COL},
     Index, IndexType,
@@ -36,7 +39,6 @@ use tracing::{instrument, span, Level};
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
 use lance_linalg::kernels::normalize_fsl;
 
-use super::ivf::Ivf;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
@@ -101,12 +103,12 @@ impl PQIndex {
 
     /// Filter the row id and PQ code arrays based on the pre-filter.
     fn filter_arrays(
-        pre_filter: &PreFilter,
+        pre_filter: &dyn PreFilter,
         code: Arc<UInt8Array>,
         row_ids: Arc<UInt64Array>,
         num_sub_vectors: i32,
     ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
-        let indices_to_keep = pre_filter.filter_row_ids(row_ids.values());
+        let indices_to_keep = pre_filter.filter_row_ids(Box::new(row_ids.values().iter()));
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
@@ -130,6 +132,10 @@ impl Index for PQIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+        Ok(self)
     }
 
     fn index_type(&self) -> IndexType {
@@ -170,7 +176,7 @@ impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     #[instrument(level = "debug", skip_all, name = "PQIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
@@ -209,6 +215,19 @@ impl VectorIndex for PQIndex {
             Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
         })
         .await
+    }
+
+    fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        unimplemented!("only for IVF")
+    }
+
+    async fn search_in_partition(
+        &self,
+        _: usize,
+        _: &Query,
+        _: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        unimplemented!("only for IVF")
     }
 
     fn is_loadable(&self) -> bool {
@@ -254,7 +273,7 @@ impl VectorIndex for PQIndex {
         }))
     }
 
-    fn row_ids(&self) -> &[u64] {
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
@@ -289,6 +308,18 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
+    fn ivf_model(&self) -> IvfModel {
+        unimplemented!("only for IVF")
+    }
+    fn quantizer(&self) -> Quantizer {
+        unimplemented!("only for IVF")
+    }
+
+    /// the index type of this vector index.
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+        (SubIndexType::Flat, QuantizationType::Product)
+    }
+
     fn metric_type(&self) -> MetricType {
         self.metric_type
     }
@@ -309,7 +340,7 @@ pub(super) async fn build_pq_model(
     dim: usize,
     metric_type: MetricType,
     params: &PQBuildParams,
-    ivf: Option<&Ivf>,
+    ivf: Option<&IvfModel>,
 ) -> Result<Arc<dyn ProductQuantizer>> {
     if let Some(codebook) = &params.codebook {
         let mt = if metric_type == MetricType::Cosine {
@@ -381,7 +412,11 @@ pub(super) async fn build_pq_model(
         // Compute residual for PQ training.
         //
         // TODO: consolidate IVF models to `lance_index`.
-        let ivf2 = lance_index::vector::ivf::new_ivf(ivf.centroids.clone(), MetricType::L2, vec![]);
+        let ivf2 = lance_index::vector::ivf::new_ivf_transformer(
+            ivf.centroids.clone().unwrap(),
+            MetricType::L2,
+            vec![],
+        );
         span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf2.compute_residual(&training_data))?
     } else {
@@ -470,7 +505,7 @@ mod tests {
 
         let centroids = generate_random_array_with_range(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf = Ivf::new(fsl);
+        let ivf = IvfModel::new(fsl);
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
             .await
@@ -533,7 +568,11 @@ mod tests {
         let vectors = normalize_fsl(&vectors).unwrap();
         let row = vectors.slice(0, 1);
 
-        let ivf2 = lance_index::vector::ivf::new_ivf(ivf.centroids.clone(), MetricType::L2, vec![]);
+        let ivf2 = lance_index::vector::ivf::new_ivf_transformer(
+            ivf.centroids.clone().unwrap(),
+            MetricType::L2,
+            vec![],
+        );
 
         let residual_query = ivf2.compute_residual(&row).unwrap();
         let pq_code = pq.transform(&residual_query).unwrap();

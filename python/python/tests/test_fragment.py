@@ -58,6 +58,16 @@ def test_write_fragment_two_phases(tmp_path: Path):
     )
 
 
+def test_write_v2_fragment(tmp_path: Path):
+    tab = pa.table({"a": range(1024)})
+    frag = LanceFragment.create(tmp_path, tab, use_legacy_format=True)
+    assert "file_minor_version: 3" not in str(frag)
+
+    tab = pa.table({"a": range(1024)})
+    frag = LanceFragment.create(tmp_path, tab, use_legacy_format=False)
+    assert "file_minor_version: 3" in str(frag)
+
+
 def test_scan_fragment(tmp_path: Path):
     tab = pa.table({"a": range(100), "b": range(100, 200)})
     ds = write_dataset(tab, tmp_path)
@@ -261,7 +271,7 @@ def test_fragment_v2(tmp_path):
     fragments = write_fragments(
         tab,
         tmp_path,
-        use_experimental_writer=True,
+        use_legacy_format=False,
     )
     assert len(fragments) == 1
     ds = lance.dataset(dataset_uri)

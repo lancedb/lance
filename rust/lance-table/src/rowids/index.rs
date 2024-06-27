@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
@@ -23,11 +24,12 @@ use super::{RowIdSequence, U64Segment};
 // Disjoint ranges of row ids are stored as the keys of the map. The values are
 // a pair of segments. The first segment is the row ids, and the second segment
 // is the addresses.
+#[derive(Debug)]
 pub struct RowIdIndex(RangeInclusiveMap<u64, (U64Segment, U64Segment)>);
 
 impl RowIdIndex {
     /// Create a new index from a list of fragment ids and their corresponding row id sequences.
-    pub fn new(fragment_indices: &[(u32, RowIdSequence)]) -> Result<Self> {
+    pub fn new(fragment_indices: &[(u32, Arc<RowIdSequence>)]) -> Result<Self> {
         let mut pieces = fragment_indices
             .iter()
             .flat_map(|(fragment_id, sequence)| decompose_sequence(*fragment_id, sequence))
@@ -101,24 +103,24 @@ mod tests {
         let fragment_indices = vec![
             (
                 10,
-                RowIdSequence(vec![
+                Arc::new(RowIdSequence(vec![
                     U64Segment::Range(0..10),
                     U64Segment::RangeWithHoles {
                         range: 10..17,
                         holes: vec![12, 15].into(),
                     },
                     U64Segment::SortedArray(vec![20, 25, 30].into()),
-                ]),
+                ])),
             ),
             (
                 20,
-                RowIdSequence(vec![
+                Arc::new(RowIdSequence(vec![
                     U64Segment::RangeWithBitmap {
                         range: 17..20,
                         bitmap: [true, false, true].as_slice().into(),
                     },
                     U64Segment::Array(vec![40, 50, 60].into()),
-                ]),
+                ])),
             ),
         ];
 

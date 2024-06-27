@@ -6,9 +6,9 @@ use std::sync::Arc;
 use deepsize::DeepSizeOf;
 use lance_core::Result;
 use lance_file::reader::FileReader;
-use lance_index::{IndexParams, IndexType};
+use lance_index::{vector::VectorIndex, IndexParams, IndexType};
 
-use crate::{index::vector::VectorIndex, Dataset};
+use crate::Dataset;
 
 pub trait IndexExtension: Send + Sync + DeepSizeOf {
     fn index_type(&self) -> IndexType;
@@ -65,10 +65,13 @@ mod test {
         sync::{atomic::AtomicBool, Arc},
     };
 
-    use arrow_array::RecordBatch;
+    use arrow_array::{RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use deepsize::DeepSizeOf;
     use lance_file::writer::{FileWriter, FileWriterOptions};
+    use lance_index::vector::ivf::storage::IvfModel;
+    use lance_index::vector::quantizer::{QuantizationType, Quantizer};
+    use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
         vector::{hnsw::VECTOR_ID_FIELD, Query},
         DatasetIndexExt, Index, IndexMetadata, IndexType, INDEX_FILE_NAME,
@@ -100,6 +103,10 @@ mod test {
             self
         }
 
+        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+            Ok(self)
+        }
+
         fn statistics(&self) -> Result<serde_json::Value> {
             Ok(json!(()))
         }
@@ -115,8 +122,21 @@ mod test {
 
     #[async_trait::async_trait]
     impl VectorIndex for MockIndex {
-        async fn search(&self, _: &Query, _: Arc<PreFilter>) -> Result<RecordBatch> {
-            todo!("panic")
+        async fn search(&self, _: &Query, _: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+            unimplemented!()
+        }
+
+        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+            unimplemented!()
+        }
+
+        async fn search_in_partition(
+            &self,
+            _: usize,
+            _: &Query,
+            _: Arc<dyn PreFilter>,
+        ) -> Result<RecordBatch> {
+            unimplemented!()
         }
 
         fn is_loadable(&self) -> bool {
@@ -137,15 +157,27 @@ mod test {
             _: usize,
             _: usize,
         ) -> Result<Box<dyn VectorIndex>> {
-            todo!("panic")
+            unimplemented!()
         }
 
-        fn row_ids(&self) -> &[u64] {
-            todo!("panic")
+        fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
+            unimplemented!()
         }
 
         fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
             Ok(())
+        }
+
+        fn ivf_model(&self) -> IvfModel {
+            unimplemented!()
+        }
+        fn quantizer(&self) -> Quantizer {
+            unimplemented!()
+        }
+
+        /// the index type of this vector index.
+        fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+            unimplemented!()
         }
 
         fn metric_type(&self) -> MetricType {
@@ -267,11 +299,9 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_vector_index_extension_roundtrip(
-        #[values(false, true)] use_experimental_writer: bool,
-    ) {
+    async fn test_vector_index_extension_roundtrip(#[values(false, true)] use_legacy_format: bool) {
         // make dataset and index that is not supported natively
-        let test_ds = TestVectorDataset::new(use_experimental_writer)
+        let test_ds = TestVectorDataset::new(use_legacy_format, false)
             .await
             .unwrap();
         let idx = test_ds.dataset.load_indices().await.unwrap();

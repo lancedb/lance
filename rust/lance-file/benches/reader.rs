@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::StreamExt;
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{
     reader::FileReader,
     writer::{FileWriter, FileWriterOptions},
@@ -46,9 +47,20 @@ fn bench_reader(c: &mut Criterion) {
             rt.block_on(async move {
                 let store_scheduler = ScanScheduler::new(Arc::new(object_store.clone()), 8);
                 let scheduler = store_scheduler.open_file(file_path).await.unwrap();
-                let reader = FileReader::try_open(scheduler.clone(), None).await.unwrap();
+                let reader = FileReader::try_open(
+                    scheduler.clone(),
+                    None,
+                    DecoderMiddlewareChain::default(),
+                )
+                .await
+                .unwrap();
                 let mut stream = reader
-                    .read_stream(lance_io::ReadBatchParams::RangeFull, 16 * 1024, 16)
+                    .read_stream(
+                        lance_io::ReadBatchParams::RangeFull,
+                        16 * 1024,
+                        16,
+                        FilterExpression::no_filter(),
+                    )
                     .unwrap();
                 let mut row_count = 0;
                 while let Some(batch) = stream.next().await {
