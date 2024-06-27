@@ -356,6 +356,17 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<Index>)> {
+        if config.use_move_stable_row_ids
+            && current_manifest
+                .map(|m| !m.uses_move_stable_row_ids())
+                .unwrap_or_default()
+        {
+            return Err(Error::NotSupported {
+                source: "Cannot enable stable row ids on existing dataset".into(),
+                location: location!(),
+            });
+        }
+
         // Get the schema and the final fragment list
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
@@ -551,7 +562,7 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest)?;
+            apply_feature_flags(&mut manifest, config.use_move_stable_row_ids)?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
