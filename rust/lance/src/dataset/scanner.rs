@@ -47,8 +47,8 @@ use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
-    knn::new_knn_exec, FilterPlan, KNNFlatExec, LancePushdownScanExec, LanceScanExec, Planner,
-    PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
+    knn::new_knn_exec, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec,
+    Planner, PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
@@ -1117,10 +1117,8 @@ impl Scanner {
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
             let mut columns = vec![q.column.clone()];
-            let mut num_filter_columns = 0;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 let filter_columns = Planner::column_names_in_expr(expr);
-                num_filter_columns = filter_columns.len();
                 columns.extend(filter_columns);
             }
             let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
@@ -1150,13 +1148,8 @@ impl Scanner {
             // To do a union, we need to make the schemas match. Right now
             // knn_node: _distance, _rowid, vector
             // topk_appended: vector, <filter columns?>, _rowid, _distance
-            let new_schema = Schema::try_from(
-                &topk_appended
-                    .schema()
-                    .project(&[2 + num_filter_columns, 1 + num_filter_columns, 0])?
-                    .with_metadata(knn_node.schema().metadata.clone()),
-            )?;
-            let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
+            let new_schema = Schema::try_from(knn_node.schema().as_ref())?;
+            let topk_appended = ProjectionExec::try_new(topk_appended, new_schema.into())?;
             assert_eq!(topk_appended.schema(), knn_node.schema());
             // union
             let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
@@ -1376,7 +1369,32 @@ impl Scanner {
 
     /// Add a knn search node to the input plan
     fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(KNNFlatExec::try_new(input, q.clone())?))
+        let flat_dist = Arc::new(KNNVectorDistanceExec::try_new(
+            input,
+            &q.column,
+            q.key.clone(),
+            q.metric_type,
+        )?);
+
+        // Use DataFusion's [SortExec] for Top-K search
+        let sort = SortExec::new(
+            vec![PhysicalSortExpr {
+                expr: expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            }],
+            flat_dist,
+        )
+        .with_fetch(Some(q.k));
+
+        let not_nulls = FilterExec::try_new(
+            expressions::is_not_null(expressions::col(DIST_COL, sort.schema().as_ref())?)?,
+            Arc::new(sort),
+        )?;
+
+        Ok(Arc::new(not_nulls))
     }
 
     /// Create an Execution plan to do indexed ANN search
@@ -3875,8 +3893,10 @@ mod test {
             |scan| scan.nearest("vec", &q, 5),
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
-    KNNFlat: k=5 metric=l2
-      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
+    FilterExec: _distance@2 IS NOT NULL
+      SortExec: TopK(fetch=5), expr=...
+        KNNVectorDistance: metric=l2
+          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3898,12 +3918,14 @@ mod test {
             &dataset.dataset,
             |scan| Ok(scan.nearest("vec", &q, 10)?.refine(4)),
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=10 metric=l2
-      Take: columns=\"_distance, _rowid, vec\"
-        SortExec: TopK(fetch=40), expr=...
-          ANNSubIndex: name=..., k=40, deltas=1
-            ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=10), expr=...
+        KNNVectorDistance: metric=l2
+          Take: columns=\"_distance, _rowid, vec\"
+            SortExec: TopK(fetch=40), expr=...
+              ANNSubIndex: name=..., k=40, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3913,8 +3935,10 @@ mod test {
             |scan| Ok(scan.nearest("vec", &q, 13)?.use_index(false)),
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
-    KNNFlat: k=13 metric=l2
-      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=13), expr=...
+        KNNVectorDistance: metric=l2
+          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3960,42 +3984,50 @@ mod test {
         dataset.append_new_data().await?;
         assert_plan_equals(
             &dataset.dataset,
-            |scan| scan.nearest("vec", &q, 5),
+            |scan| scan.nearest("vec", &q, 6),
             // TODO: we could write an optimizer rule to eliminate the last Projection
             // by doing it as part of the last Take. This would likely have minimal impact though.
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
-      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-        UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
-              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              ANNSubIndex: name=..., k=5, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=6), expr=...
+        KNNVectorDistance: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=6), expr=...
+                    KNNVectorDistance: metric=l2
+                      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=6), expr=...
+                  ANNSubIndex: name=..., k=6, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
         // new data and with filter
         assert_plan_equals(
             &dataset.dataset,
-            |scan| scan.nearest("vec", &q, 5)?.filter("i > 10"),
+            |scan| scan.nearest("vec", &q, 15)?.filter("i > 10"),
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: i@3 > 10
-      Take: columns=\"_distance, _rowid, vec, i\"
-        KNNFlat: k=5 metric=l2
-          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-            UnionExec
-              Projection: fields=[_distance, _rowid, vec]
-                KNNFlat: k=5 metric=l2
-                  LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-              Take: columns=\"_distance, _rowid, vec\"
-                SortExec: TopK(fetch=5), expr=...
-                  ANNSubIndex: name=..., k=5, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+      Take: columns=\"_rowid, vec, _distance, i\"
+        FilterExec: _distance@... IS NOT NULL
+          SortExec: TopK(fetch=15), expr=...
+            KNNVectorDistance: metric=l2
+              RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+                UnionExec
+                  Projection: fields=[_distance, _rowid, vec]
+                    FilterExec: _distance@... IS NOT NULL
+                      SortExec: TopK(fetch=15), expr=...
+                        KNNVectorDistance: metric=l2
+                          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+                  Take: columns=\"_distance, _rowid, vec\"
+                    SortExec: TopK(fetch=15), expr=...
+                      ANNSubIndex: name=..., k=15, deltas=1
+                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -4011,20 +4043,24 @@ mod test {
             // TODO: i is scanned on both sides but is projected away mid-plan
             // only to be taken again later. We should fix this.
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
-      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-        UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              ANNSubIndex: name=..., k=5, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                FilterExec: i@0 > 10
-                  LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=5), expr=...
+        KNNVectorDistance: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=5), expr=...
+                    KNNVectorDistance: metric=l2
+                      FilterExec: i@1 > 10
+                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=5), expr=...
+                  ANNSubIndex: name=..., k=5, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -4057,24 +4093,28 @@ mod test {
             &dataset.dataset,
             |scan| {
                 Ok(scan
-                    .nearest("vec", &q, 5)?
+                    .nearest("vec", &q, 8)?
                     .filter("i > 10")?
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
-      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-        UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              ANNSubIndex: name=..., k=5, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                ScalarIndexQuery: query=i > 10",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=8), expr=...
+        KNNVectorDistance: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=8), expr=...
+                    KNNVectorDistance: metric=l2
+                      FilterExec: i@1 > 10
+                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=8), expr=...
+                  ANNSubIndex: name=..., k=8, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                    ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
@@ -4084,24 +4124,28 @@ mod test {
             &dataset.dataset,
             |scan| {
                 Ok(scan
-                    .nearest("vec", &q, 5)?
+                    .nearest("vec", &q, 11)?
                     .filter("i > 10")?
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
-      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-        UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              ANNSubIndex: name=..., k=5, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                ScalarIndexQuery: query=i > 10",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=11), expr=...
+        KNNVectorDistance: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=11), expr=...
+                    KNNVectorDistance: metric=l2
+                      FilterExec: i@1 > 10
+                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=11), expr=...
+                  ANNSubIndex: name=..., k=11, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                    ScalarIndexQuery: query=i > 10",
         )
         .await?;
 

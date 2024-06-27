@@ -2,16 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::any::Any;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use arrow::datatypes::UInt32Type;
-use arrow_array::StringArray;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
-    RecordBatch, UInt64Array,
+    ArrayRef, RecordBatch, StringArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -19,130 +16,28 @@ use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
-    RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
+    SendableRecordBatchStream, Statistics,
 };
 use datafusion::physical_plan::{ExecutionMode, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
-use futures::{stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{flat::flat_search, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN};
-use lance_io::stream::RecordBatchStream;
+use lance_index::vector::{
+    flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
+};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
-use log::warn;
 use snafu::{location, Location};
-use tokio::sync::mpsc::Receiver;
-use tokio::task::JoinHandle;
-use tracing::{instrument, Instrument};
 
-use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
-
-/// KNN node for post-filtering.
-pub struct KNNFlatStream {
-    rx: Receiver<DataFusionResult<RecordBatch>>,
-    bg_thread: Option<JoinHandle<()>>,
-    output_schema: SchemaRef,
-}
-
-impl KNNFlatStream {
-    /// Construct a [`KNNFlatStream`] node.
-    #[instrument(level = "debug", skip_all, name = "KNNFlatStream::new")]
-    pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
-        let stream = DatasetRecordBatchStream::new(child);
-        Self::from_stream(stream, query)
-    }
-
-    fn from_stream(stream: impl RecordBatchStream + 'static, query: &Query) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(2);
-
-        // flat_search() appends a distance column to the input schema. The input
-        // may already have a distance column (possibly in the wrong position), so
-        // we need to remove it before adding a new one.
-        let mut output_schema = stream.schema().as_ref().clone();
-        if output_schema.column_with_name(DIST_COL).is_some() {
-            output_schema = output_schema.without_column(DIST_COL);
-        }
-        output_schema = output_schema
-            .try_with_column(Field::new(DIST_COL, DataType::Float32, true))
-            .unwrap();
-        let output_schema = Arc::new(output_schema);
-
-        let q = query.clone();
-        let bg_thread = tokio::spawn(
-            async move {
-                let batch = match flat_search(stream, &q).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tx.send(Err(DataFusionError::Execution(format!(
-                            "Failed to compute distances: {e}"
-                        ))))
-                        .await
-                        .expect("KNNFlat failed to send message");
-                        return;
-                    }
-                };
-
-                if !tx.is_closed() {
-                    if let Err(e) = tx.send(Ok(batch)).await {
-                        eprintln!("KNNFlat tx.send error: {e}")
-                    };
-                }
-                drop(tx);
-            }
-            .in_current_span(),
-        );
-
-        Self {
-            rx,
-            bg_thread: Some(bg_thread),
-            output_schema,
-        }
-    }
-}
-
-impl Stream for KNNFlatStream {
-    type Item = DataFusionResult<RecordBatch>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = Pin::into_inner(self);
-        // We need to check the JoinHandle to make sure the thread hasn't panicked.
-        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
-            match bg_thread.poll_unpin(cx) {
-                Poll::Ready(Ok(())) => true,
-                Poll::Ready(Err(join_error)) => {
-                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(KNNFlatStream): thread panicked: {}",
-                        join_error
-                    )))));
-                }
-                Poll::Pending => false,
-            }
-        } else {
-            false
-        };
-        if bg_thread_completed {
-            // Need to take it, since we aren't allowed to poll if again after.
-            this.bg_thread.take();
-        }
-        // this.rx.
-        this.rx.poll_recv(cx)
-    }
-}
-
-impl DFRecordBatchStream for KNNFlatStream {
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        self.output_schema.clone()
-    }
-}
 
 /// Check vector column exists and has the correct data type.
 fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
@@ -170,51 +65,60 @@ fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
     }
 }
 
-/// [ExecutionPlan] for Flat KNN (bruteforce) search.
+/// [ExecutionPlan] compute vector distance from a query vector.
 ///
 /// Preconditions:
 /// - `input` schema must contains `query.column`,
-/// - The column must be a vector.
-/// - `input` schema does not have "_distance" column.
+/// - The column must be a vector column.
 #[derive(Debug)]
-pub struct KNNFlatExec {
+pub struct KNNVectorDistanceExec {
     /// Inner input node.
     pub input: Arc<dyn ExecutionPlan>,
 
     /// The vector query to execute.
-    pub query: Query,
+    pub query: ArrayRef,
+    column: String,
+    distance_type: DistanceType,
+
     output_schema: SchemaRef,
     properties: PlanProperties,
 }
 
-impl DisplayAs for KNNFlatExec {
+impl DisplayAs for KNNVectorDistanceExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "KNNFlat: k={} metric={}",
-                    self.query.k, self.query.metric_type
-                )
+                write!(f, "KNNVectorDistance: metric={}", self.distance_type,)
             }
         }
     }
 }
 
-impl KNNFlatExec {
+impl KNNVectorDistanceExec {
     /// Create a new [KNNFlatExec] node.
     ///
     /// Returns an error if the preconditions are not met.
-    pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
-        let schema = input.schema();
-        check_vector_column(&schema, &query.column)?;
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        column: &str,
+        query: ArrayRef,
+        distance_type: DistanceType,
+    ) -> Result<Self> {
+        let mut output_schema = input.schema().as_ref().clone();
+        check_vector_column(&output_schema, column)?;
 
-        let mut fields = schema.fields().to_vec();
-        if schema.field_with_name(DIST_COL).is_err() {
-            fields.push(Arc::new(Field::new(DIST_COL, DataType::Float32, true)));
+        // FlatExec appends a distance column to the input schema. The input
+        // may already have a distance column (possibly in the wrong position), so
+        // we need to remove it before adding a new one.
+        if output_schema.column_with_name(DIST_COL).is_some() {
+            output_schema = output_schema.without_column(DIST_COL);
         }
-
-        let output_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let output_schema = Arc::new(Schema::new(
+            output_schema
+                .try_with_column(Field::new(DIST_COL, DataType::Float32, true))
+                .unwrap()
+                .fields,
+        ));
 
         // This node has the same partitioning & boundedness as the input node
         // but it destroys any ordering.
@@ -226,13 +130,15 @@ impl KNNFlatExec {
         Ok(Self {
             input,
             query,
+            column: column.to_string(),
+            distance_type,
             output_schema,
             properties,
         })
     }
 }
 
-impl ExecutionPlan for KNNFlatExec {
+impl ExecutionPlan for KNNVectorDistanceExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -252,13 +158,15 @@ impl ExecutionPlan for KNNFlatExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
-                "KNNFlatExec node must have exactly one child".to_string(),
+                "KNNVectorDistanceExec node must have exactly one child".to_string(),
             ));
         }
 
         Ok(Arc::new(Self::try_new(
             children.pop().expect("length checked"),
+            &self.column,
             self.query.clone(),
+            self.distance_type,
         )?))
     }
 
@@ -267,17 +175,44 @@ impl ExecutionPlan for KNNFlatExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        Ok(Box::pin(KNNFlatStream::new(
-            self.input.execute(partition, context)?,
-            &self.query,
-        )))
+        let input_stream = self.input.execute(partition, context)?;
+
+        let key = self.query.clone();
+        let column = self.column.clone();
+        let dt = self.distance_type;
+        let stream = input_stream
+            .try_filter(|batch| future::ready(batch.num_rows() > 0))
+            .map(move |batch| {
+                let key = key.clone();
+                let column = column.clone();
+                async move {
+                    compute_distance(key, dt, &column, batch?)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))
+                }
+            })
+            .buffer_unordered(num_cpus::get());
+        let schema = self.schema();
+        Ok(
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
+                as SendableRecordBatchStream,
+        )
     }
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
+        let inner_stats = self.input.statistics()?;
+        let dist_col_stats = inner_stats.column_statistics[0].clone();
+        let column_statistics = inner_stats
+            .column_statistics
+            .into_iter()
+            .chain([dist_col_stats.clone()])
+            .collect::<Vec<_>>();
         Ok(Statistics {
-            num_rows: Precision::Exact(self.query.k),
+            num_rows: inner_stats.num_rows,
+            column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
+        // self.input.statistics()
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -782,10 +717,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 mod tests {
     use super::*;
 
-    use arrow_array::RecordBatchIterator;
-    use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
+    use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
+    use arrow::datatypes::Float32Type;
+    use arrow_array::{FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-    use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
@@ -848,7 +783,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stream = dataset
             .scan()
-            .nearest("vector", as_primitive_array(&q), 10)
+            .nearest("vector", q.as_primitive(), 10)
             .unwrap()
             .try_into_stream()
             .await
@@ -860,22 +795,17 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let stream = dataset.scan().try_into_stream().await.unwrap();
-        let expected = flat_search(
-            stream,
-            &Query {
-                column: "vector".to_string(),
-                key: q,
-                k: 10,
-                nprobes: 0,
-                ef: None,
-                refine_factor: None,
-                metric_type: MetricType::L2,
-                use_index: false,
-            },
-        )
-        .await
-        .unwrap();
-
+        let all_with_distances = stream
+            .and_then(|batch| compute_distance(q.clone(), DistanceType::L2, "vector", batch))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let all_with_distances =
+            concat_batches(&results[0].schema(), all_with_distances.iter()).unwrap();
+        let dist_arr = all_with_distances.column_by_name(DIST_COL).unwrap();
+        let distances = dist_arr.as_primitive::<Float32Type>();
+        let indices = sort_to_indices(distances, None, Some(10)).unwrap();
+        let expected = take_record_batch(&all_with_distances, &indices).unwrap();
         assert_eq!(expected, results[0]);
     }
 
@@ -896,19 +826,15 @@ mod tests {
         ]));
         let batch = RecordBatch::new_empty(schema);
 
-        let query = Query {
-            column: "vector".to_string(),
-            key: Arc::new(generate_random_array(dim)),
-            k: 10,
-            nprobes: 0,
-            ef: None,
-            refine_factor: None,
-            metric_type: MetricType::L2,
-            use_index: false,
-        };
-
         let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
-        let idx = KNNFlatExec::try_new(input, query).unwrap();
+
+        let idx = KNNVectorDistanceExec::try_new(
+            input,
+            "vector",
+            Arc::new(generate_random_array(dim)),
+            DistanceType::L2,
+        )
+        .unwrap();
         println!("{:?}", idx);
         assert_eq!(
             idx.schema().as_ref(),
