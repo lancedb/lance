@@ -8,29 +8,6 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use arrow::array::StringArray; // Add this import statement
 
-fn read_file(file_path: &str) -> Result<StringArray, std::io::Error> {
-    let file = File::open(file_path)?;
-    let reader = BufReader::new(file);
-
-    let lines: Vec<String> = reader.lines().collect::<std::result::Result<_, _>>()?;
-    let num_lines = lines.len();
-
-    let mut rng = rand::thread_rng();
-    let mut curr_line = rng.gen_range(0..num_lines);
-    let mut curr_line = 0;
-
-    let chunk_size = BUFFER_SIZE; // 16MB
-    let mut size = 0;
-    let mut result_lines = vec![];
-    while curr_line < num_lines {
-        result_lines.push(lines[curr_line].clone());
-        size += lines[curr_line].len();
-        curr_line += 1;
-    }
-
-    Ok(StringArray::from(result_lines))
-}
-
 fn read_random_16_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);

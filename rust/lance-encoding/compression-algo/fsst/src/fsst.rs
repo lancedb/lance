@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 const FSST_MAGIC: u64 = 0x46535354 << 32; // "FSST"
 const FSST_ESC: u8 = 255;
@@ -11,9 +13,8 @@ const FSST_CODE_MASK: u16 = FSST_CODE_MAX - 1;
 // we construct FSST symbol tables using a random sample of about 16KB (1<<14) 
 const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
-//const FSST_LEAST_INPUT_SIZE: usize = 8 * 1024 * 1024;   // 8MB 
-// set low in development 
-const FSST_LEAST_INPUT_SIZE: usize = 2;   // 8MB 
+
+const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024;   // 4MB 
 
 const FSST_ICL_FREE: u64 = (8 << 28) | ((FSST_CODE_MASK as u64) << 16);
 
@@ -456,13 +457,6 @@ impl Counters {
         self.count2[pos1][pos2]
     }
 
-    /* 
-    fn clear(&self) {
-        Self {
-            count1: vec![0; FSST_CODE_MAX as usize],
-            count2: vec![vec![0; FSST_CODE_MAX as usize]; FSST_CODE_MAX as usize],
-        };
-    }*/
 }
 
 fn is_escape_code(pos: u16) -> bool {
@@ -497,7 +491,6 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
     for c in &strs {
         byte_histo[*c as usize] += 1;
     }
-   // println!("byte_histo: {:?}", byte_histo);
     let mut curr_min_histo = FSST_SAMPLEMAXSZ;
     
     for i in 0..256 {
@@ -506,24 +499,13 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
             st.terminator = i as u16;
         }
     }
-    //println!("terminator: {}", st.terminator);
+
     // Compress sample, and compute (pair-)frequencies
     let compress_count = |st: &mut SymbolTable, sample_frac: usize| -> (Box<Counters>, i32) {
-        //println!("symbol table before starting compress_count: {:?}", st);
-        // a random number between 1 and 128
-        let _rnd128 = |i: usize| -> usize { 
-            1 + ((FSST_HASH((i as u64 + 1) * sample_frac as u64)&127) as usize) 
-        };
         let mut gain:i32 = 0;
         let mut counters = Counters::new();
 
         for i in 1..offsets.len() {
-            // this is commented out during development
-            /* 
-            if sample_frac < 128 && _rnd128(i) > sample_frac {
-                continue;
-            }
-            */
             if offsets[i] == offsets[i-1] {
                 continue;
             }
@@ -532,14 +514,11 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
             let mut curr = 0;
             let mut curr_code;
             let mut prev_code = st.find_longest_symbol_from_char_slice(&word[curr..]);
-            //println!("prev_code: {}", prev_code);
             curr += st.symbols[prev_code as usize].length() as usize;
             gain += st.symbols[prev_code as usize].length() as i32 - (1 + is_escape_code(prev_code) as i32);
             while curr < word.len() {
-                //println!("prev_code: {}, st.symbols[prev_code]: {}", prev_code, st.symbols[prev_code as usize]);
-                //https://answers.yahoo.com/question/index?qid=20071007114826AAwCFvR
                 counters.count1_inc(prev_code);
-                let mut symbol_len = 0;
+                let symbol_len ;
 
                 if st.symbols[prev_code as usize].length() != 1 {
                     counters.count1_inc(word[curr] as u16);
@@ -578,14 +557,7 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
                 prev_code = curr_code;
             }
             counters.count1_inc(prev_code);
-            /* 
-            if st.symbols[prev_code as usize].length() != 1 {
-                counters.count1_inc(word[curr - symbol_len as usize] as u16);
-            }*/
         }
-        //println!("------------------this round finished------------------");
-        //println!();
-        //println!();
         (Box::new(counters), gain)
     };
 
@@ -637,12 +609,6 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
                 let s3 = Symbol::concat(s1, s2);
                 // multi-byte symbols cannot contain the terminator byte
                 if s2.first() != st.terminator as u8 {
-                    /* 
-                    println!("s1: {}", s1);
-                    println!("s2: {}", s2);
-                    println!("s3: {}", s3);
-                    println!("new symbol: {}, new_symbol.val: {}", s3, s3.val);
-                    */
                     add_or_inc(&mut candidates, s3, cnt2 as u64);
                 }
             }
@@ -661,7 +627,6 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
     };
 
     for frac in [8, 38, 68, 98, 108, 128] { // we do 5 rounds (sampleFrac=8,38,68,98,128)
-    //for frac in [127, 127, 127, 127, 127, 127, 127, 127, 127, 128] {
         let (mut this_counter, gain ) = compress_count(&mut st, frac);
         if gain >= best_gain { // a new best solution!
             best_gain = gain;
@@ -669,9 +634,7 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
         } 
         make_table(&mut st, &mut this_counter, frac);
     }
-    //println!("before finalize: {}", best_table);
     best_table.finalize(); // renumber codes for more efficient compression
-    //println!("after finalize: {}", best_table);
     if best_table.n_symbols == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Fsst failed to build symbol table, input len: {}, input_offsets len: {}", strs.len(), offsets.len())));
     }
@@ -679,9 +642,6 @@ fn build_symbol_table(strs: Vec<u8>, offsets: Vec<i32>) -> io::Result<Box<Symbol
 }    
 
 fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> io::Result<()>{
-    //println!("in compress_bulk, st: {}", st);
-    let suffix_lim = st.suffix_lim;
-    let byte_lim = st.n_symbols - st.len_histo[0] as u16;
     let mut out_curr = *out_pos;
 
     let mut compress = |buf: &[u8], in_end: usize, out_curr: &mut usize| { 
@@ -724,44 +684,6 @@ fn compress_bulk(st: &SymbolTable, strs: &[u8], offsets: &[i32], out: &mut Vec<u
 
     out.resize(out_curr, 0); // shrink to actual size
     out_offsets.resize(offsets.len(), 0); // shrink to actual size
-    *out_pos = out_curr;
-    *out_offsets_len = offsets.len();
-    Ok(())
-}
-
-fn decompress_bulk(st: &SymbolTable, compressed_strs: &[u8], offsets: &[i32], out: &mut Vec<u8>, out_offsets: &mut Vec<i32>, out_pos: &mut usize, out_offsets_len: &mut usize) -> io::Result<()> {
-    let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
-        let mut prev_esc = false;
-        while in_curr < in_end {
-            if prev_esc {
-                out[*out_curr] = compressed_strs[in_curr];
-                *out_curr += 1;
-                prev_esc = false;
-            } else {
-                let code = compressed_strs[in_curr];
-                if code == FSST_ESC {
-                    prev_esc = true;
-                } else {
-                    let s = st.symbols[code as usize];
-                    let len = s.length();
-                    out[*out_curr..*out_curr + len as usize].copy_from_slice(&s.val.to_ne_bytes()[..len as usize]);
-                    *out_curr += len as usize;
-                }
-            }
-            in_curr += 1;
-        }
-    };
-    let mut out_curr = *out_pos;
-    out_offsets[0] = 0;
-    for i in 1..offsets.len() {
-        let in_curr = offsets[i - 1] as usize;
-        let in_end = offsets[i] as usize;
-        decompress(in_curr, in_end, &mut out_curr);
-        out_offsets[i] = out_curr as i32;
-    }
-    //println!("out: {:?}", out);
-    out.resize(out_curr, 0);
-    out_offsets.resize(offsets.len(), 0);
     *out_pos = out_curr;
     *out_offsets_len = offsets.len();
     Ok(())
@@ -894,7 +816,6 @@ struct FsstDecoder {
 const FSST_CORRUPT: u64 = 32774747032022883; // 7-byte number in little endian containing "corrupt"
 impl FsstDecoder {
     fn new() -> Self {
-        let s = Symbol::new();
         Self {
             lens: [0; 256],
             symbols: [FSST_CORRUPT; 256],
@@ -902,7 +823,8 @@ impl FsstDecoder {
         }
     }
     fn init(&mut self, in_buf: &[u8], in_pos: &mut usize, out_buf: &Vec<u8>, _out_offsets_buf: &Vec<i32>) -> io::Result<()> {
-        if in_buf.len() < FSST_LEAST_INPUT_SIZE {
+        // this logic should be changed
+        if in_buf.len() < FSST_LEAST_INPUT_SIZE / 2 {
             return Ok(());
         }
 
@@ -962,7 +884,6 @@ pub fn decompress(in_buf: &[u8], in_offsets_buf: &[i32], out_buf: &mut Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use arrow::array::StringArray;
-    use rand::Rng;
 
     use crate::fsst::*;
 
@@ -1132,303 +1053,6 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_symbol_from_slice() {
-        let hello_str = "hello";
-        let symbol_hello = Symbol::from_char_slice(hello_str.as_bytes());
-        assert!(symbol_hello.length() == hello_str.len() as u32);
-        assert!(symbol_hello.ignored_bits() == 24); // 8 - 5 = 3
-        for i in 0..hello_str.len() {
-            assert!(symbol_hello.val.to_ne_bytes()[i] == hello_str.as_bytes()[i]);
-        }
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_symbol_add() {
-        let mut st = SymbolTable::new();
-        let hello_str = "hello";
-        st.add(Symbol::from_char_slice(hello_str.as_bytes()));
-        let symbol_hello = Symbol::from_char_slice(hello_str.as_bytes());
-        assert!(st.symbols[FSST_CODE_BASE as usize].length() == symbol_hello.length());
-        assert!(st.symbols[FSST_CODE_BASE as usize].ignored_bits() == symbol_hello.ignored_bits());
-        assert!(st.symbols[FSST_CODE_BASE as usize].val == symbol_hello.val);
-        assert!(st.n_symbols == 1);
-        assert!(false == st.add(symbol_hello));
-        assert!(st.n_symbols == 1);
-        let world_str = "world";
-        let symbol_world = Symbol::from_char_slice(world_str.as_bytes());
-        st.add(symbol_world);
-        assert!(st.n_symbols == 2);
-        assert!(st.symbols[FSST_CODE_BASE as usize + 1].length() == symbol_world.length());
-        assert!(st.symbols[FSST_CODE_BASE as usize + 1].ignored_bits() == symbol_world.ignored_bits());
-        assert!(st.symbols[FSST_CODE_BASE as usize + 1].val == symbol_world.val);
-        let us_str = "us";
-        let us_symbol = Symbol::from_char_slice(us_str.as_bytes());
-        st.add(us_symbol);
-        assert!(st.n_symbols == 3);
-        assert!(st.symbols[FSST_CODE_BASE as usize + 2].val == us_symbol.val);
-        assert!(st.symbols[FSST_CODE_BASE as usize + 2].ignored_bits() == us_symbol.ignored_bits());
-        assert!(st.symbols[FSST_CODE_BASE as usize + 2].length() == us_symbol.length());
-        let short_codes_idx: usize = u16::from_ne_bytes([us_str.as_bytes()[0], us_str.as_bytes()[1]]) as usize;
-        let code_in_short_codes = st.short_codes[short_codes_idx];
-        assert!(code_in_short_codes as usize == (FSST_CODE_BASE + 2) as usize);
-        let x_str = "x";
-        let x_symbol = Symbol::from_char_slice(x_str.as_bytes());
-        st.add(x_symbol);
-        assert!(st.n_symbols == 4);
-        assert!(st.symbols[FSST_CODE_BASE as usize + 3].val == x_symbol.val);
-        assert!(st.symbols[FSST_CODE_BASE as usize + 3].ignored_bits() == x_symbol.ignored_bits());
-        assert!(st.symbols[FSST_CODE_BASE as usize + 3].length() == x_symbol.length());
-        assert!(st.symbols[code_in_short_codes as usize].val == us_symbol.val);
-    }
-
-    // to run this test, download MS Marco dataset from https://msmarco.z22.web.core.windows.net/msmarcoranking/fulldocs.tsv.gz
-    // and use a script like this to get each column, then uncomment the block in test_make_sample
-    /* 
-    import csv
-    import sys
-
-    def write_second_column(input_path, output_path):
-        csv.field_size_limit(sys.maxsize)
-
-        with open(input_path, 'r') as input_file, open(output_path, 'w') as output_file:
-            tsv_reader = csv.reader(input_file, delimiter='\t')
-            tsv_writer = csv.writer(output_file, delimiter='\t')
-
-            for row in tsv_reader:
-                tsv_writer.writerow([row[2]])
-
-    #write_second_column('/Users/x/fulldocs.tsv', '/Users/x/first_column_fulldocs.tsv')
-    #write_second_column('/Users/x/fulldocs.tsv', '/Users/x/second_column_fulldocs.tsv')
-    write_second_column('/Users/x/fulldocs.tsv', '/Users/x/third_column_fulldocs.tsv')
-    */
-    #[test_log::test(tokio::test)]
-    async fn test_make_sample() {
-        /* 
-        let file_paths = [
-            //"/Users/x/first_column_fulldocs.tsv",
-            "/Users/x/second_column_fulldocs.tsv",
-            //"/Users/x/third_column_fulldocs.tsv",
-        ];
-        for file_path in file_paths {
-            let input = read_random_16_m_chunk(file_path).unwrap();
-            let (sample_input, sample_offsets) = make_sample(input.values(), input.value_offsets());
-            println!("first sample string {:?}", std::str::from_utf8(&sample_input[sample_offsets[0] as usize..sample_offsets[1] as usize]));
-            println!("sample size: {}", sample_input.len());
-            println!("sample string number: {}", sample_offsets.len() - 1);
-        }
-        */
-    }
-
-    // to run this test, download MS Marco dataset from https://msmarco.z22.web.core.windows.net/msmarcoranking/fulldocs.tsv.gz
-    // and use a script like this to get each column, then uncomment the block in test_build_symbol_table
-    /* 
-    import csv
-    import sys
-
-    def write_second_column(input_path, output_path):
-        csv.field_size_limit(sys.maxsize)
-
-        with open(input_path, 'r') as input_file, open(output_path, 'w') as output_file:
-            tsv_reader = csv.reader(input_file, delimiter='\t')
-            tsv_writer = csv.writer(output_file, delimiter='\t')
-
-            for row in tsv_reader:
-                tsv_writer.writerow([row[2]])
-
-    #write_second_column('/Users/x/fulldocs.tsv', '/Users/x/first_column_fulldocs.tsv')
-    #write_second_column('/Users/x/fulldocs.tsv', '/Users/x/second_column_fulldocs.tsv')
-    write_second_column('/Users/x/fulldocs.tsv', '/Users/x/third_column_fulldocs.tsv')
-    */
-    #[test_log::test(tokio::test)]
-    async fn test_build_symbol_table() {
-        /* 
-        let paragraph = TEST_PARAGRAPH.to_string();
-        let words = paragraph.lines().collect::<Vec<&str>>();
-        let string_array = StringArray::from(words);
-        let st = *build_symbol_table(string_array.value_data().to_vec(), string_array.value_offsets().to_vec()).unwrap();
-        println!("{}", st);
-        */
-        // to test build_symbol_table, uncomment this block
-        let file_paths = [
-            "/home/x/first_column_fulldocs.tsv",
-            //"/home/x/second_column_fulldocs.tsv",
-            //"/home/x/third_column_fulldocs.tsv",
-        ];
-        for file_path in file_paths {
-            let input = read_random_16_m_chunk(file_path).unwrap();
-            let (sample_input, sample_offsets) = make_sample(input.values(), input.value_offsets());
-            let st = *build_symbol_table(sample_input, sample_offsets).unwrap();
-            println!("{}", st);
-        }
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_compress_bulk() {
-
-        let paragraph = TEST_PARAGRAPH.to_string();
-        let words = paragraph.lines().collect::<Vec<&str>>();
-        let string_array = StringArray::from(words);
-        let (sample_input, sample_offsets) = make_sample(string_array.values(), string_array.value_offsets());
-        let st = *build_symbol_table(sample_input, sample_offsets).unwrap();
-        let mut compress_output_buf: Vec<u8> = vec![0; 16 * 1024 * 1024];
-        let mut compress_offset_buf: Vec<i32> = vec![0; 16 * 1024 * 1024];
-        let mut compress_out_buf_pos = 0;
-        let mut compress_out_offsets_len = 0;
-        compress_bulk(&st, string_array.values(), string_array.value_offsets(), &mut compress_output_buf, &mut compress_offset_buf, &mut compress_out_buf_pos, &mut compress_out_offsets_len).unwrap();
-        let this_compression_ratio = string_array.values().len() as f64 / compress_out_buf_pos as f64;
-        println!("compression ratio: {}", this_compression_ratio);
-        // due to the non-deterministic nature in the sampling phase, I couldn't find the good way to test this,
-        // we can print out the symbol table and parts of the compress_output_buf to inspect 
-        println!("symbol table: {}", st);
-        println!("PARAGRAPH[0.100]: {}", TEST_PARAGRAPH[0..100].to_string());
-        println!("compress_output_buf[0..100]: {:?}", &compress_output_buf[0..100]);
-    }
-
-    // to run this test, download MS Marco dataset from https://msmarco.z22.web.core.windows.net/msmarcoranking/fulldocs.tsv.gz
-    // and use a script like this to get each column
-    /* 
-    import csv
-    import sys
-
-    def write_second_column(input_path, output_path):
-        csv.field_size_limit(sys.maxsize)
-
-        with open(input_path, 'r') as input_file, open(output_path, 'w') as output_file:
-            tsv_reader = csv.reader(input_file, delimiter='\t')
-            tsv_writer = csv.writer(output_file, delimiter='\t')
-
-            for row in tsv_reader:
-                tsv_writer.writerow([row[2]])
-
-    #write_second_column('/Users/x/fulldocs.tsv', '/Users/x/first_column_fulldocs.tsv')
-    #write_second_column('/Users/x/fulldocs.tsv', '/Users/x/second_column_fulldocs.tsv')
-    write_second_column('/Users/x/fulldocs.tsv', '/Users/x/third_column_fulldocs.tsv')
-    */
-    // 
-    #[test_log::test(tokio::test)]
-    async fn test_fsst_without_seralize_symbol_table() {
-        for _ in 0..1 {
-            let num = rand::thread_rng().gen_range(1..10);
-            let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(num); 
-            let mut generator = lance_datagen::array::rand_utf8(lance_datagen::ByteCount::from(num), false);
-            let result = generator.generate((8 * 1024 * 1024).into(), &mut rng).unwrap(); // so we generate 16MB * num of data
-            let string_array = result.as_any().downcast_ref::<StringArray>().unwrap();
-            let (sample_strs_buffer, sample_offsets_buffer) = make_sample(string_array.values(), string_array.value_offsets());
-            let st = *build_symbol_table(sample_strs_buffer, sample_offsets_buffer).unwrap();
-            // in the case of randomly generated data, we expect the compression ratio to be low, so we allocate 2 * input size here
-            let mut compress_output_buffer: Vec<u8> = vec![0; 2 * 8 * 1024 * 1024 * num as usize]; 
-            let mut compress_offset_buffer: Vec<i32> = vec![0; 2 * 8 * 1024 * 1024 * num as usize];
-            let mut compress_out_buf_pos = 0;
-            let mut compress_out_offsets_len = 0;
-            compress_bulk(&st, string_array.values(), string_array.value_offsets(), &mut compress_output_buffer, &mut compress_offset_buffer, &mut compress_out_buf_pos, & mut compress_out_offsets_len).unwrap();
-            let mut decompressed_output: Vec<u8> = vec![0; 3 * 2 * 8 * 1024 * 1024 * num as usize];
-            let mut decompressed_offsets: Vec<i32> = vec![0; 3 * 2 * 8 * 1024 * 1024 * num as usize];
-            let mut decompressed_output_pos = 0;
-            let mut decompressed_offsets_len = 0;
-            let _ = decompress_bulk(&st, &compress_output_buffer, &compress_offset_buffer, &mut decompressed_output, &mut decompressed_offsets, &mut decompressed_output_pos, &mut decompressed_offsets_len);
-            assert!(decompressed_offsets_len == string_array.value_offsets().to_vec().len());
-            assert!(decompressed_output_pos == string_array.values().len());
-            for i in 1..decompressed_offsets_len {
-                let s = &decompressed_output[decompressed_offsets[i-1] as usize..decompressed_offsets[i] as usize];
-                let original = &string_array.value_data()[string_array.value_offsets().to_vec()[i-1] as usize..string_array.value_offsets().to_vec()[i] as usize];
-                assert!(s == original);
-            }
-        }
-
-        /* 
-        let paragraph2 = TEST_PARAGRAPH.to_string().repeat(1024);
-        let words = paragraph2.split_whitespace().collect::<Vec<&str>>();
-        let string_array = StringArray::from(words);
-        let st = *build_symbol_table(string_array.value_data().to_vec(), string_array.value_offsets().to_vec()).unwrap();
-        let mut compress_output_buffer: Vec<u8> = vec![0; 16 * 1024 * 1024];
-        let mut compress_offset_buffer: Vec<i32> = vec![0; 16 * 1024 * 1024];
-        let mut compress_out_buf_pos = 0;
-        let mut compress_out_offsets_len = 0;
-        compress_bulk(&st, string_array.value_data(), string_array.value_offsets(), &mut compress_output_buffer, &mut compress_offset_buffer, &mut compress_out_buf_pos, &mut compress_out_offsets_len).unwrap();
-        println!("compress_out_buf_pos: {:?}", compress_out_buf_pos);
-        println!("string_array.values().len(): {:?}", string_array.values().len());
-        println!("compression_ratio: {:?}", compress_out_buf_pos as f64 / string_array.values().len() as f64);
-        let mut decompressed_output: Vec<u8> = vec![0; 3 * 16 * 1024 * 1024];
-        let mut decompressed_offsets: Vec<i32> = vec![0; 3 * 16 * 1024 * 1024];
-        let mut decompressed_output_pos = 0;
-        let mut decompressed_offsets_len = 0;
-        let _ = decompress_bulk(&st, &compress_output_buffer, &compress_offset_buffer, &mut decompressed_output, &mut decompressed_offsets, &mut decompressed_output_pos, &mut decompressed_offsets_len);
-        for i in 1..string_array.value_offsets().to_vec().len() {
-            let s = &decompressed_output[decompressed_offsets[i-1] as usize..decompressed_offsets[i] as usize];
-            let original = &string_array.value_data()[string_array.value_offsets().to_vec()[i-1] as usize..string_array.value_offsets().to_vec()[i] as usize];
-            assert!(s == original);
-        }
-        */
-        // to run this test, download MS Marco dataset from https://msmarco.z22.web.core.windows.net/msmarcoranking/fulldocs.tsv.gz
-        // and use a script like this to get each column
-        /* 
-        import csv
-        import sys
-
-        def write_second_column(input_path, output_path):
-            csv.field_size_limit(sys.maxsize)
-
-            with open(input_path, 'r') as input_file, open(output_path, 'w') as output_file:
-                tsv_reader = csv.reader(input_file, delimiter='\t')
-                tsv_writer = csv.writer(output_file, delimiter='\t')
-
-                for row in tsv_reader:
-                    tsv_writer.writerow([row[2]])
-
-        #write_second_column('/Users/x/fulldocs.tsv', '/Users/x/first_column_fulldocs.tsv')
-        #write_second_column('/Users/x/fulldocs.tsv', '/Users/x/second_column_fulldocs.tsv')
-        write_second_column('/Users/x/fulldocs.tsv', '/Users/x/third_column_fulldocs.tsv')
-        */
-        /* 
-        let test_num = 1;
-        let file_paths = [
-            "/Users/x/first_column_fulldocs.tsv",
-            "/Users/x/second_column_fulldocs.tsv",
-            "/Users/x/third_column_fulldocs.tsv",
-        ];
-        for file_path in file_paths {
-            let mut compression_ratio_sum: f64 = 0.0;
-            for _ in 0..test_num {
-                let input = read_random_16_m_chunk(file_path).unwrap();
-                let (sample_input, sample_offsets) = make_sample(input.values(), input.value_offsets());
-                let st = *build_symbol_table(sample_input, sample_offsets).unwrap();
-                //println!("symbol table: {}", st);
-                let mut compress_output_buffer: Vec<u8> = vec![0; 16 * 1024 * 1024 * 2]; // 16MB * 2
-                let mut compress_offset_buffer: Vec<i32> = vec![0; 16 * 1024 * 1024 * 2];
-                let mut compress_out_buf_pos = 0;
-                let mut compress_out_offsets_len = 0;
-                compress_bulk(&st, input.values(), input.value_offsets(), &mut compress_output_buffer, &mut compress_offset_buffer, &mut compress_out_buf_pos, &mut compress_out_offsets_len).unwrap();
-                assert!(compress_out_offsets_len == input.value_offsets().to_vec().len());
-                //println!("compress_out_buf_pos: {:?}", compress_out_buf_pos);
-                //println!("input.values().len(): {:?}", input.values().len());
-                let this_compression_ratio = input.values().len() as f64 / compress_out_buf_pos as f64;
-                println!("this_compression_ratio: {:?}", this_compression_ratio);
-                compression_ratio_sum += this_compression_ratio;
-                let mut decompressed_output: Vec<u8> = vec![0; 16 * 1024 * 1024 * 2];
-                let mut decompressed_offsets: Vec<i32> = vec![0; 16 * 1024 * 1024 * 2];
-                let mut decompressed_output_pos = 0;
-                let mut decompressed_offsets_len = 0;
-                let mut _in_pos = 0;
-                let _ = decompress_bulk(&st, &compress_output_buffer, &compress_offset_buffer, &mut decompressed_output, &mut decompressed_offsets, &mut decompressed_output_pos, &mut decompressed_offsets_len);
-                //println!("decompressed_output_pos: {:?}", decompressed_output_pos);
-                //println!("decompressed_offsets_len: {:?}", decompressed_offsets_len);
-                //println!("input.values().len(): {:?}", input.values().len());
-                assert!(decompressed_offsets_len == input.value_offsets().to_vec().len());
-                assert!(decompressed_output_pos == input.values().len());
-                for i in 1..decompressed_offsets_len {
-                    let s = &decompressed_output[decompressed_offsets[i-1] as usize..decompressed_offsets[i] as usize];
-                    let original = &input.value_data()[input.value_offsets().to_vec()[i-1] as usize..input.value_offsets().to_vec()[i] as usize];
-                    //println!("s: {:?}", std::str::from_utf8(s));
-                    //println!("original: {:?}", std::str::from_utf8(original));
-                    assert!(s == original);
-                }
-            }
-            println!("for file: {}, average compression_ratio: {:?}", file_path, compression_ratio_sum / test_num as f64);
-        }
-        */
-    }
-
-    #[test_log::test(tokio::test)]
     async fn test_fsst() {
         let paragraph = TEST_PARAGRAPH.to_string().repeat(1024);
         let words = paragraph.lines().collect::<Vec<&str>>();
@@ -1436,107 +1060,13 @@ mod tests {
         let mut compress_output_buf: Vec<u8> = vec![0; 16 * 1024 * 1024];
         let mut compress_offset_buf: Vec<i32> = vec![0; 16 * 1024 * 1024];
         compress(string_array.value_data(), string_array.value_offsets(), &mut compress_output_buf, &mut compress_offset_buf).unwrap();
-        let this_compression_ratio = string_array.value_data().len() as f64 / compress_output_buf.len() as f64;
-        println!("this_compression_ratio: {:?}", this_compression_ratio);
         let mut decompress_output: Vec<u8> = vec![0; 3 * 16 * 1024 * 1024];
         let mut decompress_offsets: Vec<i32> = vec![0; 3 * 16 * 1024 * 1024];
         decompress(&compress_output_buf, &compress_offset_buf, &mut decompress_output, &mut decompress_offsets).unwrap();
-        println!("decompress_offsets.len(): {}", decompress_offsets.len());
         for i in 1..decompress_offsets.len() {
             let s = &decompress_output[decompress_offsets[i-1] as usize..decompress_offsets[i] as usize];
             let original = &string_array.value_data()[string_array.value_offsets().to_vec()[i-1] as usize..string_array.value_offsets().to_vec()[i] as usize];
-            //println!("s: {:?}", std::str::from_utf8(s));
-            //println!("original: {:?}", std::str::from_utf8(original));
             assert!(s == original, "s: {:?}\n\n, original: {:?}", std::str::from_utf8(s), std::str::from_utf8(original));
         }
-        /* 
-        let test_num = 1;
-        let file_paths = [
-            //"/Users/x/first_column_fulldocs.tsv",
-            "/home/x/second_column_fulldocs.tsv",
-            //"/Users/x/third_column_fulldocs.tsv",
-        ];
-        for file_path in file_paths {
-            let mut compression_ratio_sum: f64 = 0.0;
-            for _ in 0..test_num {
-                let input = read_random_32_m_chunk(file_path).unwrap();
-                let mut encoder = FsstEncoder::new();
-                let mut compress_output_buffer: Vec<u8> = vec![0; 32 * 1024 * 1024 + 8096]; 
-                let mut compress_offset_buffer: Vec<i32> = vec![0; 32 * 1024 * 1024 + 8096];
-                encoder.compress(input.value_data(), input.value_offsets(), &mut compress_output_buffer, & mut compress_offset_buffer).unwrap();
-                //println!("compress_output_buffer.len(): {}", compress_output_buffer.len());
-                //println!("compree_offset_buffer.len(): {}", compress_offset_buffer.len());
-                let this_compression_ratio = input.value_data().len() as f64 / compress_output_buffer.len() as f64;
-                println!("this_compression_ratio: {:?}", this_compression_ratio);
-                let mut decoder = FsstDecoder::new();
-                let mut decompress_output_buffer: Vec<u8> = vec![0; 3 * compress_output_buffer.len() + 8096]; 
-                //let mut decompress_output_buffer: Vec<u8> = vec![0; 32 * 1024 * 1024 + 8096]; 
-                let mut decompress_offset_buffer: Vec<i32> = vec![0; 32 * 1024 * 1024 + 8096];
-                decoder.decompress(&compress_output_buffer, &compress_offset_buffer, &mut decompress_output_buffer, &mut decompress_offset_buffer).unwrap();
-                println!("decompress_output_buffer.len(): {}", decompress_output_buffer.len());
-                println!("input.values().len(): {}", input.value_data().len());
-                assert!(decompress_offset_buffer.len() == input.value_offsets().to_vec().len());
-                assert!(decompress_output_buffer.len() == input.value_data().len());
-                for i in 1..decompress_offset_buffer.len() {
-                    let s = &decompress_output_buffer[decompress_offset_buffer[i-1] as usize..decompress_offset_buffer[i] as usize];
-                    let original = &input.value_data()[input.value_offsets().to_vec()[i-1] as usize..input.value_offsets().to_vec()[i] as usize];
-                    //println!("s: {:?}", std::str::from_utf8(s));
-                    //println!("original: {:?}", std::str::from_utf8(original));
-                    assert!(s == original, "s: {:?}\n\n, original: {:?}", std::str::from_utf8(s), std::str::from_utf8(original));
-                }
-            }
-        }*/
-    }
-
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    fn read_random_16_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error> {
-        let file = File::open(file_path)?;
-        let reader = BufReader::new(file);
-    
-        let lines: Vec<String> = reader.lines().collect::<std::result::Result<_, _>>()?;
-        let num_lines = lines.len();
-    
-        let mut rng = rand::thread_rng();
-        let mut curr_line = rng.gen_range(0..num_lines);
-        let mut curr_line = 0;
-        println!("curr_line: {}", curr_line);
-    
-        let chunk_size = 16 * 1024 * 1024; // 16MB
-        let mut size = 0;
-        let mut result_lines = vec![];
-        while size + lines[curr_line].len() < chunk_size {
-            result_lines.push(lines[curr_line].clone());
-            size += lines[curr_line].len();
-            curr_line += 1;
-            curr_line %= num_lines;
-        }
-    
-        Ok(StringArray::from(result_lines))
-    }
-    fn read_random_32_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error> {
-        let file = File::open(file_path)?;
-        let reader = BufReader::new(file);
-    
-        let lines: Vec<String> = reader.lines().collect::<std::result::Result<_, _>>()?;
-        let num_lines = lines.len();
-    
-        let mut rng = rand::thread_rng();
-        let curr_line = rng.gen_range(0..num_lines);
-        println!("curr_line: {}", curr_line);
-        let mut curr_line = 2489500;
-    
-        let chunk_size = 32 * 1024 * 1024; // 32MB
-        let mut size = 0;
-        let mut result_lines = vec![];
-        while size + lines[curr_line].len() < chunk_size {
-            result_lines.push(lines[curr_line].clone());
-            size += lines[curr_line].len();
-            curr_line += 1;
-            curr_line %= num_lines;
-        }
-    
-        Ok(StringArray::from(result_lines))
     }
 }

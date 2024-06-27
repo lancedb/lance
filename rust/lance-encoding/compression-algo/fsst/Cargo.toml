@@ -16,6 +16,6 @@ tokio.workspace = true
 rand_xoshiro = "0.6.0"
 lance-datagen = { workspace = true }
 
-[[bin]]
+[[example]]
 name = "benchmark"
 path = "examples/benchmark.rs"
