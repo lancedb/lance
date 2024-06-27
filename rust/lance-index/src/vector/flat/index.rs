@@ -6,14 +6,16 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
-use lance_core::{Result, ROW_ID_FIELD};
+use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
+use snafu::{location, Location};
 
 use crate::{
     prefilter::PreFilter,
@@ -61,6 +63,10 @@ impl IvfSubIndex for FlatIndex {
         "FLAT"
     }
 
+    fn metadata_key() -> &'static str {
+        "lance:flat"
+    }
+
     fn schema() -> arrow_schema::SchemaRef {
         Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
     }
@@ -74,25 +80,44 @@ impl IvfSubIndex for FlatIndex {
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator(query);
-        let filtered_row_ids = prefilter
-            .filter_row_ids(Box::new(storage.row_ids()))
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let (row_ids, dists): (Vec<u64>, Vec<f32>) = (0..storage.len())
-            .filter(|&id| !filtered_row_ids.contains(&storage.row_id(id as u32)))
-            .map(|id| OrderedNode {
-                id: id as u32,
-                dist: OrderedFloat(dist_calc.distance(id as u32)),
-            })
-            .sorted_unstable()
-            .take(k)
-            .map(
-                |OrderedNode {
-                     id,
-                     dist: OrderedFloat(dist),
-                 }| (storage.row_id(id), dist),
-            )
-            .unzip();
+
+        let (row_ids, dists): (Vec<u64>, Vec<f32>) = match prefilter.is_empty() {
+            true => (0..storage.len())
+                .map(|id| OrderedNode {
+                    id: id as u32,
+                    dist: OrderedFloat(dist_calc.distance(id as u32)),
+                })
+                .sorted_unstable()
+                .take(k)
+                .map(
+                    |OrderedNode {
+                         id,
+                         dist: OrderedFloat(dist),
+                     }| (storage.row_id(id), dist),
+                )
+                .unzip(),
+            false => {
+                let filtered_row_ids = prefilter
+                    .filter_row_ids(Box::new(storage.row_ids()))
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                (0..storage.len())
+                    .filter(|&id| !filtered_row_ids.contains(&storage.row_id(id as u32)))
+                    .map(|id| OrderedNode {
+                        id: id as u32,
+                        dist: OrderedFloat(dist_calc.distance(id as u32)),
+                    })
+                    .sorted_unstable()
+                    .take(k)
+                    .map(
+                        |OrderedNode {
+                             id,
+                             dist: OrderedFloat(dist),
+                         }| (storage.row_id(id), dist),
+                    )
+                    .unzip()
+            }
+        };
 
         let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
 
@@ -143,8 +168,14 @@ impl FlatQuantizer {
 }
 
 impl Quantization for FlatQuantizer {
+    type BuildParams = ();
     type Metadata = FlatMetadata;
     type Storage = FlatStorage;
+
+    fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        let dim = data.as_fixed_size_list().value_length();
+        Ok(Self::new(dim as usize, distance_type))
+    }
 
     fn code_dim(&self) -> usize {
         self.dim
@@ -173,7 +204,7 @@ impl Quantization for FlatQuantizer {
         "flat"
     }
 
-    fn quantization_type(&self) -> QuantizationType {
+    fn quantization_type() -> QuantizationType {
         QuantizationType::Flat
     }
 
@@ -185,5 +216,19 @@ impl Quantization for FlatQuantizer {
 impl From<FlatQuantizer> for Quantizer {
     fn from(value: FlatQuantizer) -> Self {
         Self::Flat(value)
+    }
+}
+
+impl TryFrom<Quantizer> for FlatQuantizer {
+    type Error = Error;
+
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::Flat(quantizer) => Ok(quantizer),
+            _ => Err(Error::invalid_input(
+                "quantizer is not FlatQuantizer",
+                location!(),
+            )),
+        }
     }
 }

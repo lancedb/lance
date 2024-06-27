@@ -232,9 +232,8 @@ pub fn beam_search(
     dist_calc: &impl DistCalculator,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
     prefetch_distance: Option<usize>,
-    visited_generator: &mut VisitedGenerator,
+    visited: &mut Visited,
 ) -> Vec<OrderedNode> {
-    let mut visited = visited_generator.generate(graph.len());
     //let mut visited: HashSet<_> = HashSet::with_capacity(k);
     let mut candidates = BinaryHeap::with_capacity(k);
     visited.insert(ep.id);

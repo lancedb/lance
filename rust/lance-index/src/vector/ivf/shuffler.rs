@@ -33,7 +33,7 @@ use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
 
-use crate::vector::ivf::Ivf;
+use crate::vector::ivf::IvfTransformer;
 use crate::vector::transform::{KeepFiniteVectors, Transformer};
 use crate::vector::PART_ID_COLUMN;
 
@@ -70,7 +70,7 @@ fn get_temp_dir() -> Result<Path> {
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
-    ivf: Arc<Ivf>,
+    ivf: Arc<IvfTransformer>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
     shuffle_partition_batches: usize,

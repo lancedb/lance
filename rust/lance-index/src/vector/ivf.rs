@@ -15,14 +15,13 @@ use lance_linalg::{
     kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array},
 };
 
-use crate::vector::ivf::transform::IvfTransformer;
+use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::{
     pq::{transform::PQTransformer, ProductQuantizer},
     residual::ResidualTransform,
     transform::Transformer,
 };
 
-use super::transform::DropColumn;
 use super::{quantizer::Quantizer, residual::compute_residual};
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
@@ -40,38 +39,48 @@ mod transform;
 /// - *metric_type*: metric type to compute pair-wise vector distance.
 /// - *transforms*: a list of transforms to apply to the vector column.
 /// - *range*: only covers a range of partitions. Default is None
-pub fn new_ivf(
+pub fn new_ivf_transformer(
     centroids: FixedSizeListArray,
     metric_type: DistanceType,
     transforms: Vec<Arc<dyn Transformer>>,
-) -> Ivf {
-    Ivf::new(centroids, metric_type, transforms)
+) -> IvfTransformer {
+    IvfTransformer::new(centroids, metric_type, transforms)
 }
 
-pub fn new_ivf_with_quantizer(
+pub fn new_ivf_transformer_with_quantizer(
     centroids: FixedSizeListArray,
     metric_type: MetricType,
     vector_column: &str,
     quantizer: Quantizer,
     range: Option<Range<u32>>,
-) -> Result<Ivf> {
+) -> Result<IvfTransformer> {
     match quantizer {
-        Quantizer::Flat(_) => Ok(Ivf::new_flat(centroids, metric_type, vector_column, range)),
-        Quantizer::Product(pq) => Ok(Ivf::with_pq(
+        Quantizer::Flat(_) => Ok(IvfTransformer::new_flat(
+            centroids,
+            metric_type,
+            vector_column,
+            range,
+        )),
+        Quantizer::Product(pq) => Ok(IvfTransformer::with_pq(
             centroids,
             metric_type,
             vector_column,
             pq,
             range,
         )),
-        Quantizer::Scalar(_) => Ok(Ivf::with_sq(centroids, metric_type, vector_column, range)),
+        Quantizer::Scalar(_) => Ok(IvfTransformer::with_sq(
+            centroids,
+            metric_type,
+            vector_column,
+            range,
+        )),
     }
 }
 
 /// IVF - IVF file partition
 ///
 #[derive(Debug)]
-pub struct Ivf {
+pub struct IvfTransformer {
     /// Centroids of a cluster algorithm, to run IVF.
     ///
     /// It is a 2-D `(num_partitions * dimension)` of floating array.
@@ -84,7 +93,7 @@ pub struct Ivf {
     distance_type: DistanceType,
 }
 
-impl Ivf {
+impl IvfTransformer {
     /// Create a new Ivf model.
     pub fn new(
         centroids: FixedSizeListArray,
@@ -115,7 +124,11 @@ impl Ivf {
             distance_type
         };
 
-        let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), dt, vector_column));
+        let ivf_transform = Arc::new(PartitionTransformer::new(
+            centroids.clone(),
+            dt,
+            vector_column,
+        ));
         transforms.push(ivf_transform.clone());
 
         if let Some(range) = range {
@@ -151,8 +164,12 @@ impl Ivf {
             distance_type
         };
 
-        let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), mt, vector_column));
-        transforms.push(ivf_transform.clone());
+        let partition_transform = Arc::new(PartitionTransformer::new(
+            centroids.clone(),
+            mt,
+            vector_column,
+        ));
+        transforms.push(partition_transform.clone());
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -203,8 +220,12 @@ impl Ivf {
             metric_type
         };
 
-        let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), mt, vector_column));
-        transforms.push(ivf_transform.clone());
+        let partition_transformer = Arc::new(PartitionTransformer::new(
+            centroids.clone(),
+            mt,
+            vector_column,
+        ));
+        transforms.push(partition_transformer.clone());
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -213,9 +234,6 @@ impl Ivf {
             )));
         }
 
-        // For SQ we will transofrm the vector to SQ code while building the index,
-        // so simply drop the vector column now.
-        transforms.push(Arc::new(DropColumn::new(vector_column)));
         Self {
             centroids,
             distance_type: metric_type,
@@ -243,7 +261,7 @@ impl Ivf {
     }
 }
 
-impl Transformer for Ivf {
+impl Transformer for IvfTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut batch = batch.clone();
         for transform in self.transforms.as_slice() {
