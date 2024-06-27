@@ -291,13 +291,28 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
 
+        let index_type = match self.sub_index_type() {
+            (sub_index_type, QuantizationType::Flat) => format!("IVF_{}", sub_index_type), // ignore FLAT quantization
+            (sub_index_type, quantization_type) => {
+                if sub_index_type.to_string() == quantization_type.to_string() {
+                    // ignore redundant quantization type
+                    // e.g. IVF_PQ_PQ should be IVF_PQ
+                    format!("IVF_{}", sub_index_type)
+                } else {
+                    format!("IVF_{}_{}", sub_index_type, quantization_type)
+                }
+            }
+        };
+        let mut sub_index_stats: serde_json::Value =
+            serde_json::from_str(self.sub_index_metadata[0].as_str())?;
+        sub_index_stats["index_type"] = S::name().into();
         Ok(serde_json::to_value(IvfIndexStatistics {
-            index_type: "IVF".to_string(),
+            index_type,
             uuid: self.uuid.clone(),
             uri: self.uuid.clone(),
             metric_type: self.distance_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
-            sub_index: Default::default(),
+            sub_index: sub_index_stats,
             partitions: partitions_statistics,
             centroids: centroid_vecs,
         })?)
@@ -662,5 +677,48 @@ mod tests {
     #[tokio::test]
     async fn test_create_ivf_hnsw_sq_dot() {
         test_create_ivf_hnsw_sq(DistanceType::Dot).await
+    }
+
+    #[tokio::test]
+    async fn test_index_stats() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let nlist = 4;
+        let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::new(nlist);
+        let sq_params = SQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_index".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats = dataset.index_statistics("test_index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(stats.as_str()).unwrap();
+
+        assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+        for index in stats["indices"].as_array().unwrap() {
+            assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+            assert_eq!(
+                index["num_partitions"].as_number().unwrap(),
+                &serde_json::Number::from(nlist)
+            );
+            assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
+        }
     }
 }
