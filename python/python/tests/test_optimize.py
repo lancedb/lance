@@ -116,7 +116,7 @@ def test_index_remapping(tmp_path: Path):
             results = dataset.to_table(nearest=query).column("vector")
             assert has_target(query["q"], results)
             plan = dataset.scanner(nearest=query).explain_plan()
-            assert ("KNNFlat" in plan) == has_knn_combined
+            assert ("KNNVectorDistanceExec" in plan) == has_knn_combined
 
     # Original state is 2 indexed fragments of size 150.  This should not require
     # a combined scan
