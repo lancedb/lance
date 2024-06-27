@@ -10,7 +10,6 @@ const BUFFER_SIZE: usize = 16 * 1024 * 1024;
 use arrow::array::StringArray;
 use std::fs::File;
 use std::io::{BufRead, BufReader}; // Add this import statement
-
 fn read_random_16_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
@@ -103,6 +102,7 @@ fn benchmark(file_path: &str) {
     let d_speed = (original_total_size as f64 / decompress_seconds) / 1024f64 / 1024f64;
     //println!("Compressed form: {:?}", &compression_out_bufs[0][..compression_out_offsets_bufs[0][1] as usize]);
     /*
+=======
     println!("Compressed form: {:?}", &compression_out_bufs[0][compression_out_offsets_bufs[0][0] as usize..compression_out_offsets_bufs[0][1] as usize]);
     println!("input in string: {:?}", std::str::from_utf8(&inputs[0].value_data()[inputs[0].value_offsets()[0] as usize ..inputs[0].value_offsets()[1] as usize]));
     println!("input: {:?}", &inputs[0].value_data()[inputs[0].value_offsets()[0] as usize ..inputs[0].value_offsets()[1] as usize]);

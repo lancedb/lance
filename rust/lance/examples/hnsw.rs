@@ -14,6 +14,7 @@ use arrow_select::concat::concat;
 use clap::Parser;
 use futures::StreamExt;
 use lance::Dataset;
+use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{
     flat::storage::FlatStorage,
     hnsw::{builder::HnswBuildParams, HNSW},
@@ -86,15 +87,13 @@ async fn main() {
 
     for ef_construction in [15, 30, 50] {
         let now = std::time::Instant::now();
-        let hnsw = HNSW::build_with_storage(
-            DistanceType::L2,
+        let hnsw = HNSW::index_vectors(
+            vector_store.as_ref(),
             HnswBuildParams::default()
                 .max_level(args.max_level)
                 .num_edges(15)
                 .ef_construction(ef_construction),
-            vector_store.clone(),
         )
-        .await
         .unwrap();
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();

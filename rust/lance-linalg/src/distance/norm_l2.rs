@@ -29,6 +29,10 @@ mod kernel {
         pub fn norm_l2_f16_avx512(ptr: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn norm_l2_f16_avx2(ptr: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn norm_l2_f16_lsx(ptr: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn norm_l2_f16_lasx(ptr: *const f16, len: u32) -> f32;
     }
 }
 
@@ -51,6 +55,14 @@ impl Normalize for f16 {
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx2 => unsafe {
                 kernel::norm_l2_f16_avx2(vector.as_ptr(), vector.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                kernel::norm_l2_f16_lasx(vector.as_ptr(), vector.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                kernel::norm_l2_f16_lsx(vector.as_ptr(), vector.len() as u32)
             },
             _ => norm_l2_impl::<Self, f32, 32>(vector),
         }

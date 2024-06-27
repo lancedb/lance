@@ -16,14 +16,10 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
-import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
-import javax.annotation.concurrent.NotThreadSafe;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
@@ -91,7 +87,7 @@ public class Dataset implements Closeable {
   public static Dataset create(BufferAllocator allocator, ArrowArrayStream stream,
       String path, WriteParams params) {
     Preconditions.checkNotNull(allocator);
-    Preconditions.checkNotNull(stream); 
+    Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(params);
     Dataset dataset = createWithFfiStream(stream.memoryAddress(), path,
@@ -217,7 +213,7 @@ public class Dataset implements Closeable {
   /**
    * Count the number of rows in the dataset.
    *
-   * @return num of rows.
+   * @return num of rows
    */
   public int countRows() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

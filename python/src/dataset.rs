@@ -54,7 +54,7 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PySet, PyString};
+use pyo3::types::{PyBytes, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
@@ -63,6 +63,7 @@ use pyo3::{
 };
 use snafu::{location, Location};
 
+use crate::error::PythonErrorExt;
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::schema::LanceSchema;
 use crate::session::Session;
@@ -276,6 +277,7 @@ pub struct Dataset {
 
 #[pymethods]
 impl Dataset {
+    #[allow(clippy::too_many_arguments)]
     #[new]
     fn new(
         uri: String,
@@ -285,6 +287,7 @@ impl Dataset {
         metadata_cache_size: Option<usize>,
         commit_handler: Option<PyObject>,
         storage_options: Option<HashMap<String, String>>,
+        manifest: Option<&[u8]>,
     ) -> PyResult<Self> {
         let mut params = ReadParams {
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
@@ -307,6 +310,9 @@ impl Dataset {
         }
         if let Some(storage_options) = storage_options {
             builder = builder.with_storage_options(storage_options);
+        }
+        if let Some(manifest) = manifest {
+            builder = builder.with_serialized_manifest(manifest).infer_error()?;
         }
 
         let dataset = RT.runtime.block_on(builder.load());
@@ -349,6 +355,11 @@ impl Dataset {
                     index_name, err
                 )),
             })
+    }
+
+    fn serialized_manifest(&self, py: Python) -> PyObject {
+        let manifest_bytes = self.ds.manifest().serialized();
+        PyBytes::new(py, &manifest_bytes).into()
     }
 
     /// Load index metadata
@@ -1171,10 +1182,8 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(maybe_nbytes) = get_dict_opt::<usize>(options, "max_bytes_per_file")? {
             p.max_bytes_per_file = maybe_nbytes;
         }
-        if let Some(use_experimental_writer) =
-            get_dict_opt::<bool>(options, "use_experimental_writer")?
-        {
-            p.use_experimental_writer = use_experimental_writer;
+        if let Some(use_legacy_format) = get_dict_opt::<bool>(options, "use_legacy_format")? {
+            p.use_legacy_format = use_legacy_format;
         }
         if let Some(progress) = get_dict_opt::<PyObject>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));

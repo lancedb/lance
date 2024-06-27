@@ -23,6 +23,7 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 bytes.workspace = true
 futures.workspace = true
+fsst.workspace = true
 log.workspace = true
 num_cpus.workspace = true
 prost.workspace = true

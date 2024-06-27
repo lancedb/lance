@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use arrow_array::{cast::AsArray, ArrayRef};
+use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
     EncodingsIo,
@@ -34,13 +37,13 @@ impl FixedListScheduler {
 impl PageScheduler for FixedListScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
-        scheduler: &dyn EncodingsIo,
+        ranges: &[std::ops::Range<u64>],
+        scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let expanded_ranges = ranges
             .iter()
-            .map(|range| (range.start * self.dimension)..(range.end * self.dimension))
+            .map(|range| (range.start * self.dimension as u64)..(range.end * self.dimension as u64))
             .collect::<Vec<_>>();
         trace!(
             "Expanding {} fsl ranges across {}..{} to item ranges across {}..{}",
@@ -58,43 +61,28 @@ impl PageScheduler for FixedListScheduler {
             let items_decoder = inner_page_decoder.await?;
             Ok(Box::new(FixedListDecoder {
                 items_decoder,
-                dimension,
-            }) as Box<dyn PhysicalPageDecoder>)
+                dimension: dimension as u64,
+            }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
 }
 
 pub struct FixedListDecoder {
-    items_decoder: Box<dyn PhysicalPageDecoder>,
-    dimension: u32,
+    items_decoder: Box<dyn PrimitivePageDecoder>,
+    dimension: u64,
 }
 
-impl PhysicalPageDecoder for FixedListDecoder {
-    fn update_capacity(
+impl PrimitivePageDecoder for FixedListDecoder {
+    fn decode(
         &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
+        rows_to_skip: u64,
+        num_rows: u64,
         all_null: &mut bool,
-    ) {
+    ) -> Result<Vec<BytesMut>> {
         let rows_to_skip = rows_to_skip * self.dimension;
         let num_rows = num_rows * self.dimension;
-        self.items_decoder
-            .update_capacity(rows_to_skip, num_rows, buffers, all_null);
-    }
-
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [bytes::BytesMut],
-    ) -> Result<()> {
-        let rows_to_skip = rows_to_skip * self.dimension;
-        let num_rows = num_rows * self.dimension;
-        self.items_decoder
-            .decode_into(rows_to_skip, num_rows, dest_buffers)?;
-        Ok(())
+        self.items_decoder.decode(rows_to_skip, num_rows, all_null)
     }
 
     fn num_buffers(&self) -> u32 {

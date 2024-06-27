@@ -10,6 +10,7 @@ use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
+use prost::Message;
 use prost_types::Timestamp;
 
 use super::Fragment;
@@ -251,6 +252,18 @@ impl Manifest {
         }
 
         fragments
+    }
+
+    /// Whether the dataset uses move-stable row ids.
+    pub fn uses_move_stable_row_ids(&self) -> bool {
+        self.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0
+    }
+
+    /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
+    /// and can be used to create a dataset
+    pub fn serialized(&self) -> Vec<u8> {
+        let pb_manifest: pb::Manifest = self.into();
+        pb_manifest.encode_to_vec()
     }
 }
 

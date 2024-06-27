@@ -22,21 +22,17 @@ use lance_core::utils::mask::RowIdTreeMap;
 use lance_table::format::Fragment;
 use lance_table::format::Index;
 use roaring::RoaringBitmap;
+use tokio::join;
 use tracing::instrument;
 use tracing::Instrument;
 
 use crate::dataset::fragment::FileFragment;
+use crate::dataset::rowids::load_row_id_sequence;
 use crate::error::Result;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 
-/// A trait to be implemented by anything supplying a prefilter row id mask
-///
-/// This trait is for internal use only and has no stability guarantees.
-#[async_trait]
-pub trait FilterLoader: Send + 'static {
-    async fn load(self: Box<Self>) -> Result<RowIdMask>;
-}
+pub use lance_index::prefilter::{FilterLoader, PreFilter};
 
 /// Filter out row ids that we know are not relevant to the query.
 ///
@@ -44,17 +40,17 @@ pub trait FilterLoader: Send + 'static {
 /// that should be applied to the search
 ///
 /// This struct is for internal use only and has no stability guarantees.
-pub struct PreFilter {
+pub struct DatasetPreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await
     // these tasks only when we've done as much work as we can without them.
-    pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowIdTreeMap>>>>,
+    pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowIdMask>>>>,
     pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<RowIdMask>>,
 }
 
-impl PreFilter {
+impl DatasetPreFilter {
     pub fn new(
         dataset: Arc<Dataset>,
         indices: &[Index],
@@ -79,25 +75,12 @@ impl PreFilter {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.deleted_ids.is_none() && self.filtered_ids.is_none()
-    }
-
-    /// Check whether a single row id should be included in the query.
-    pub fn check_one(&self, row_id: u64) -> bool {
-        let final_mask = self.final_mask.lock().unwrap();
-        final_mask
-            .get()
-            .expect("check_one called before wait_ready")
-            .selected(row_id)
-    }
-
     #[instrument(level = "debug", skip_all)]
     async fn do_create_deletion_mask(
         dataset: Arc<Dataset>,
         missing_frags: Vec<u32>,
         frags_with_deletion_files: Vec<u32>,
-    ) -> Result<Arc<RowIdTreeMap>> {
+    ) -> Result<Arc<RowIdMask>> {
         let fragments = dataset.get_fragments();
         let frag_map: Arc<HashMap<u32, &FileFragment>> = Arc::new(HashMap::from_iter(
             fragments.iter().map(|frag| (frag.id() as u32, frag)),
@@ -128,17 +111,72 @@ impl PreFilter {
         for frag_id in missing_frags.into_iter() {
             deleted_ids.insert_fragment(frag_id);
         }
-        Ok(Arc::new(deleted_ids))
+        Ok(Arc::new(RowIdMask::from_block(deleted_ids)))
     }
 
-    /// Creates a task to load deleted row ids in `fragments`
+    #[instrument(level = "debug", skip_all)]
+    async fn do_create_deletion_mask_row_id(dataset: Arc<Dataset>) -> Result<Arc<RowIdMask>> {
+        // This can only be computed as an allow list, since we have no idea
+        // what the row ids were in the missing fragments.
+
+        // For each fragment, compute which row ids are still in use.
+        let dataset_ref = dataset.as_ref();
+
+        let row_ids_and_deletions = stream::iter(dataset.get_fragments())
+            .map(|frag| async move {
+                let row_ids = load_row_id_sequence(dataset_ref, frag.metadata());
+                let deletion_vector = frag.get_deletion_vector();
+                let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
+                Ok::<_, crate::Error>((row_ids?, deletion_vector?))
+            })
+            .buffer_unordered(10)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // The process of computing the final mask is CPU-bound, so we spawn it
+        // on a blocking thread.
+        let allow_list = tokio::task::spawn_blocking(move || {
+            row_ids_and_deletions.into_iter().fold(
+                RowIdTreeMap::new(),
+                |mut allow_list, (row_ids, deletion_vector)| {
+                    let row_ids = if let Some(deletion_vector) = deletion_vector {
+                        // We have to mask the row ids
+                        row_ids.as_ref().iter().enumerate().fold(
+                            RowIdTreeMap::new(),
+                            |mut allow_list, (idx, row_id)| {
+                                if !deletion_vector.contains(idx as u32) {
+                                    allow_list.insert(row_id);
+                                }
+                                allow_list
+                            },
+                        )
+                    } else {
+                        // Can do a direct translation
+                        RowIdTreeMap::from(row_ids.as_ref())
+                    };
+                    allow_list |= row_ids;
+                    allow_list
+                },
+            )
+        })
+        .await?;
+
+        Ok(Arc::new(RowIdMask::from_allowed(allow_list)))
+    }
+
+    /// Creates a task to load mask to filter out deleted rows.
+    ///
+    /// Sometimes this will be a block list of row ids that are deleted, based
+    /// on the deletion files in the fragments. If stable row ids are used and
+    /// there are missing fragments, this may instead be an allow list, since
+    /// we can't easily compute the block list.
     ///
     /// If it can be synchronously determined that there are no missing row ids then
     /// this function return None
     pub fn create_deletion_mask(
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
-    ) -> Option<BoxFuture<'static, Result<Arc<RowIdTreeMap>>>> {
+    ) -> Option<BoxFuture<'static, Result<Arc<RowIdMask>>>> {
         let mut missing_frags = Vec::new();
         let mut frags_with_deletion_files = Vec::new();
         let frag_map: HashMap<u32, &Fragment> = HashMap::from_iter(
@@ -160,6 +198,8 @@ impl PreFilter {
         }
         if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
             None
+        } else if dataset.manifest.uses_move_stable_row_ids() {
+            Some(Self::do_create_deletion_mask_row_id(dataset.clone()).boxed())
         } else {
             Some(
                 Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files)
@@ -167,14 +207,17 @@ impl PreFilter {
             )
         }
     }
+}
 
+#[async_trait]
+impl PreFilter for DatasetPreFilter {
     /// Waits for the prefilter to be fully loaded
     ///
     /// The prefilter loads in the background while the rest of the index
     /// search is running.  When you are ready to use the prefilter you
     /// must first call this method to ensure it is fully loaded.  This
     /// allows `filter_row_ids` to be a synchronous method.
-    pub async fn wait_for_ready(&self) -> Result<()> {
+    async fn wait_for_ready(&self) -> Result<()> {
         if let Some(filtered_ids) = &self.filtered_ids {
             filtered_ids.wait_ready().await?;
         }
@@ -188,11 +231,16 @@ impl PreFilter {
                 combined = combined & filtered_ids.get_ready();
             }
             if let Some(deleted_ids) = &self.deleted_ids {
-                combined = combined.also_block((*deleted_ids.get_ready()).clone());
+                combined = combined & (*deleted_ids.get_ready()).clone();
             }
             combined
         });
+
         Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.deleted_ids.is_none() && self.filtered_ids.is_none()
     }
 
     /// Check whether a slice of row ids should be included in a query.
@@ -202,11 +250,162 @@ impl PreFilter {
     ///
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
-    pub fn filter_row_ids(&self, row_ids: &[u64]) -> Vec<u64> {
+    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
         let final_mask = self.final_mask.lock().unwrap();
         final_mask
             .get()
             .expect("filter_row_ids called without call to wait_for_ready")
             .selected_indices(row_ids)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+    use crate::dataset::WriteParams;
+
+    use super::*;
+
+    struct TestDatasets {
+        no_deletions: Arc<Dataset>,
+        deletions_no_missing_frags: Arc<Dataset>,
+        deletions_missing_frags: Arc<Dataset>,
+        only_missing_frags: Arc<Dataset>,
+    }
+
+    async fn test_datasets(use_stable_row_id: bool) -> TestDatasets {
+        let test_data = BatchGenerator::new()
+            .col(Box::new(IncrementingInt32::new().named("x")))
+            .batch(9);
+        let mut dataset = Dataset::write(
+            test_data,
+            "memory://test",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_move_stable_row_ids: use_stable_row_id,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let no_deletions = Arc::new(dataset.clone());
+
+        // This will add a deletion file.
+        dataset.delete("x = 8").await.unwrap();
+        let deletions_no_missing_frags = Arc::new(dataset.clone());
+
+        dataset.delete("x >= 3 and x <= 5").await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let deletions_missing_frags = Arc::new(dataset.clone());
+
+        dataset.delete("x >= 3").await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert!(dataset.get_fragments()[0]
+            .metadata()
+            .deletion_file
+            .is_none());
+        let only_missing_frags = Arc::new(dataset.clone());
+
+        TestDatasets {
+            no_deletions,
+            deletions_no_missing_frags,
+            deletions_missing_frags,
+            only_missing_frags,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deletion_mask() {
+        let datasets = test_datasets(false).await;
+
+        // If there are no deletions, we should get None
+        let mask = DatasetPreFilter::create_deletion_mask(
+            datasets.no_deletions.clone(),
+            RoaringBitmap::from_iter(0..3),
+        );
+        assert!(mask.is_none());
+
+        // If there are deletions, we should get a mask
+        let mask = DatasetPreFilter::create_deletion_mask(
+            datasets.deletions_no_missing_frags.clone(),
+            RoaringBitmap::from_iter(0..3),
+        );
+        assert!(mask.is_some());
+        let mask = mask.unwrap().await.unwrap();
+        assert_eq!(mask.block_list.as_ref().and_then(|x| x.len()), Some(1)); // There was just one row deleted.
+
+        // If there are deletions and missing fragments, we should get a mask
+        let mask = DatasetPreFilter::create_deletion_mask(
+            datasets.deletions_missing_frags.clone(),
+            RoaringBitmap::from_iter(0..3),
+        );
+        assert!(mask.is_some());
+        let mask = mask.unwrap().await.unwrap();
+        let mut expected = RowIdTreeMap::from_iter(vec![(2 << 32) + 2]);
+        expected.insert_fragment(1);
+        assert_eq!(&mask.block_list, &Some(expected));
+
+        // If we don't pass the missing fragment id, we should get a smaller mask.
+        let mask = DatasetPreFilter::create_deletion_mask(
+            datasets.deletions_missing_frags.clone(),
+            RoaringBitmap::from_iter(2..3),
+        );
+        assert!(mask.is_some());
+        let mask = mask.unwrap().await.unwrap();
+        assert_eq!(mask.block_list.as_ref().and_then(|x| x.len()), Some(1));
+
+        // If there are only missing fragments, we should still get a mask
+        let mask = DatasetPreFilter::create_deletion_mask(
+            datasets.only_missing_frags.clone(),
+            RoaringBitmap::from_iter(0..3),
+        );
+        assert!(mask.is_some());
+        let mask = mask.unwrap().await.unwrap();
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_fragment(1);
+        expected.insert_fragment(2);
+        assert_eq!(&mask.block_list, &Some(expected));
+    }
+
+    #[tokio::test]
+    async fn test_deletion_mask_stable_row_id() {
+        // Here, behavior is different.
+        let datasets = test_datasets(true).await;
+
+        // If there are no deletions, we should get None
+        let mask = DatasetPreFilter::create_deletion_mask(
+            datasets.no_deletions.clone(),
+            RoaringBitmap::from_iter(0..3),
+        );
+        assert!(mask.is_none());
+
+        // If there are deletions but no missing files, we should get a block list
+        let mask = DatasetPreFilter::create_deletion_mask(
+            datasets.deletions_no_missing_frags.clone(),
+            RoaringBitmap::from_iter(0..3),
+        );
+        assert!(mask.is_some());
+        let mask = mask.unwrap().await.unwrap();
+        let expected = RowIdTreeMap::from_iter(0..8);
+        assert_eq!(mask.allow_list, Some(expected)); // There was just one row deleted.
+
+        // If there are deletions and missing fragments, we should get an allow list
+        let mask = DatasetPreFilter::create_deletion_mask(
+            datasets.deletions_missing_frags.clone(),
+            RoaringBitmap::from_iter(0..2),
+        );
+        assert!(mask.is_some());
+        let mask = mask.unwrap().await.unwrap();
+        assert_eq!(mask.allow_list.as_ref().and_then(|x| x.len()), Some(5)); // There were five rows left over;
+
+        // If there are only missing fragments, we should get an allow list
+        let mask = DatasetPreFilter::create_deletion_mask(
+            datasets.only_missing_frags.clone(),
+            RoaringBitmap::from_iter(0..3),
+        );
+        assert!(mask.is_some());
+        let mask = mask.unwrap().await.unwrap();
+        assert_eq!(mask.allow_list.as_ref().and_then(|x| x.len()), Some(3)); // There were three rows left over;
     }
 }

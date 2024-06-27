@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use core::fmt;
+use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow::datatypes::Float32Type;
+use arrow::array::AsArray;
+use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array};
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_arrow::ArrowFloatType;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
-use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::format::SelfDescribingFileReader;
+use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
@@ -20,9 +25,10 @@ use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 use super::flat::index::FlatQuantizer;
 use super::pq::storage::PQ_METADTA_KEY;
 use super::pq::ProductQuantizer;
+use super::sq::builder::SQBuildParams;
 use super::sq::storage::SQ_METADATA_KEY;
 use super::{
-    ivf::storage::IvfData,
+    ivf::storage::IvfModel,
     pq::{
         storage::{ProductQuantizationMetadata, ProductQuantizationStorage},
         ProductQuantizerImpl,
@@ -31,19 +37,25 @@ use super::{
         storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage},
         ScalarQuantizer,
     },
-    v3::storage::VectorStore,
+    storage::VectorStore,
 };
 use super::{PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
-pub trait Quantization: DeepSizeOf + Into<Quantizer> {
+pub trait Quantization: Send + Sync + Debug + DeepSizeOf + Into<Quantizer> {
+    type BuildParams: QuantizerBuildParams;
     type Metadata: QuantizerMetadata + Send + Sync;
-    type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore;
+    type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore + Debug;
 
+    fn build(
+        data: &dyn Array,
+        distance_type: DistanceType,
+        params: &Self::BuildParams,
+    ) -> Result<Self>;
     fn code_dim(&self) -> usize;
     fn column(&self) -> &'static str;
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef>;
-    fn metadata_key(&self) -> &'static str;
-    fn quantization_type(&self) -> QuantizationType;
+    fn metadata_key() -> &'static str;
+    fn quantization_type() -> QuantizationType;
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value>;
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer>;
 }
@@ -64,6 +76,21 @@ impl std::fmt::Display for QuantizationType {
     }
 }
 
+pub trait QuantizerBuildParams {
+    fn sample_size(&self) -> usize;
+}
+
+impl QuantizerBuildParams for () {
+    fn sample_size(&self) -> usize {
+        0
+    }
+}
+
+/// Quantization Method.
+///
+/// <section class="warning">
+/// Internal use only. End-user does not use this directly.
+/// </section>
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Quantizer {
     Flat(FlatQuantizer),
@@ -90,17 +117,17 @@ impl Quantizer {
 
     pub fn metadata_key(&self) -> &'static str {
         match self {
-            Self::Flat(fq) => fq.metadata_key(),
-            Self::Product(pq) => pq.metadata_key(),
-            Self::Scalar(sq) => sq.metadata_key(),
+            Self::Flat(_) => FlatQuantizer::metadata_key(),
+            Self::Product(_) => ProductQuantizerImpl::<Float32Type>::metadata_key(),
+            Self::Scalar(_) => ScalarQuantizer::metadata_key(),
         }
     }
 
     pub fn quantization_type(&self) -> QuantizationType {
         match self {
-            Self::Flat(fq) => fq.quantization_type(),
-            Self::Product(pq) => pq.quantization_type(),
-            Self::Scalar(sq) => sq.quantization_type(),
+            Self::Flat(_) => QuantizationType::Flat,
+            Self::Product(_) => QuantizationType::Product,
+            Self::Scalar(_) => QuantizationType::Scalar,
         }
     }
 
@@ -142,25 +169,60 @@ pub struct QuantizationMetadata {
 }
 
 #[async_trait]
-pub trait QuantizerMetadata: Clone + Sized + DeepSizeOf {
+pub trait QuantizerMetadata:
+    fmt::Debug + Clone + Sized + DeepSizeOf + for<'a> Deserialize<'a> + Serialize
+{
     async fn load(reader: &FileReader) -> Result<Self>;
 }
 
 #[async_trait::async_trait]
-pub trait QuantizerStorage: Clone + Sized + DeepSizeOf {
+pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
     type Metadata: QuantizerMetadata;
 
     async fn load_partition(
         reader: &FileReader,
         range: std::ops::Range<usize>,
-        metric_type: MetricType,
+        distance_type: DistanceType,
         metadata: &Self::Metadata,
     ) -> Result<Self>;
 }
 
 impl Quantization for ScalarQuantizer {
+    type BuildParams = SQBuildParams;
     type Metadata = ScalarQuantizationMetadata;
     type Storage = ScalarQuantizationStorage;
+
+    fn build(data: &dyn Array, _: DistanceType, params: &Self::BuildParams) -> Result<Self> {
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "SQ builder: input is not a FixedSizeList: {}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
+
+        match fsl.value_type() {
+            DataType::Float16 => {
+                quantizer.update_bounds::<Float16Type>(fsl)?;
+            }
+            DataType::Float32 => {
+                quantizer.update_bounds::<Float32Type>(fsl)?;
+            }
+            DataType::Float64 => {
+                quantizer.update_bounds::<Float64Type>(fsl)?;
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!("SQ builder: unsupported data type: {}", fsl.value_type()),
+                    location: location!(),
+                })
+            }
+        }
+
+        Ok(quantizer)
+    }
 
     fn code_dim(&self) -> usize {
         self.dim
@@ -171,15 +233,22 @@ impl Quantization for ScalarQuantizer {
     }
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
-        let code_array = self.transform::<Float32Type>(vectors)?;
-        Ok(code_array)
+        match vectors.as_fixed_size_list().value_type() {
+            DataType::Float16 => self.transform::<Float16Type>(vectors),
+            DataType::Float32 => self.transform::<Float32Type>(vectors),
+            DataType::Float64 => self.transform::<Float64Type>(vectors),
+            value_type => Err(Error::invalid_input(
+                format!("unsupported data type {} for scalar quantizer", value_type),
+                location!(),
+            )),
+        }
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         SQ_METADATA_KEY
     }
 
-    fn quantization_type(&self) -> QuantizationType {
+    fn quantization_type() -> QuantizationType {
         QuantizationType::Scalar
     }
 
@@ -201,8 +270,13 @@ impl Quantization for ScalarQuantizer {
 }
 
 impl Quantization for Arc<dyn ProductQuantizer> {
+    type BuildParams = ();
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
+
+    fn build(_: &dyn Array, _: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        unimplemented!("ProductQuantizer cannot be built with new index builder")
+    }
 
     fn code_dim(&self) -> usize {
         self.num_sub_vectors()
@@ -217,11 +291,11 @@ impl Quantization for Arc<dyn ProductQuantizer> {
         Ok(code_array)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         PQ_METADTA_KEY
     }
 
-    fn quantization_type(&self) -> QuantizationType {
+    fn quantization_type() -> QuantizationType {
         QuantizationType::Product
     }
 
@@ -269,8 +343,13 @@ impl<T: ArrowFloatType + 'static> Quantization for ProductQuantizerImpl<T>
 where
     T::Native: Dot + L2,
 {
+    type BuildParams = ();
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
+
+    fn build(_: &dyn Array, _: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        unimplemented!("ProductQuantizer cannot be built with new index builder")
+    }
 
     fn code_dim(&self) -> usize {
         self.num_sub_vectors()
@@ -285,11 +364,11 @@ where
         Ok(code_array)
     }
 
-    fn metadata_key(&self) -> &'static str {
+    fn metadata_key() -> &'static str {
         PQ_METADTA_KEY
     }
 
-    fn quantization_type(&self) -> QuantizationType {
+    fn quantization_type() -> QuantizationType {
         QuantizationType::Product
     }
 
@@ -331,15 +410,15 @@ where
     }
 }
 
-/// Loader to load partitioned PQ storage from disk.
+/// Loader to load partitioned [VectorStore] from disk.
 pub struct IvfQuantizationStorage<Q: Quantization> {
     reader: FileReader,
 
-    metric_type: MetricType,
+    distance_type: DistanceType,
     quantizer: Quantizer,
     metadata: Q::Metadata,
 
-    ivf: IvfData,
+    ivf: IvfModel,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -355,7 +434,7 @@ impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {
     fn clone(&self) -> Self {
         Self {
             reader: self.reader.clone(),
-            metric_type: self.metric_type,
+            distance_type: self.distance_type,
             quantizer: self.quantizer.clone(),
             metadata: self.metadata.clone(),
             ivf: self.ivf.clone(),
@@ -387,19 +466,23 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 message: format!("Failed to parse index metadata: {}", metadata_str),
                 location: location!(),
             })?;
-        let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
+        let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-        let ivf_data = IvfData::load(&reader).await?;
+        let ivf_data = IvfModel::load(&reader).await?;
 
         let metadata = Q::Metadata::load(&reader).await?;
-        let quantizer = Q::from_metadata(&metadata, metric_type)?;
+        let quantizer = Q::from_metadata(&metadata, distance_type)?;
         Ok(Self {
             reader,
-            metric_type,
+            distance_type,
             quantizer,
             metadata,
             ivf: ivf_data,
         })
+    }
+
+    pub fn distance_type(&self) -> DistanceType {
+        self.distance_type
     }
 
     pub fn quantizer(&self) -> &Quantizer {
@@ -415,8 +498,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
+    /// Load one partition of vector storage.
+    ///
+    /// # Parameters
+    /// - `part_id`, partition id
+    ///
+    ///
     pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
-        Q::Storage::load_partition(&self.reader, range, self.metric_type, &self.metadata).await
+        Q::Storage::load_partition(&self.reader, range, self.distance_type, &self.metadata).await
     }
 }

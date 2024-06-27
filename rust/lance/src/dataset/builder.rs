@@ -2,9 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_table::io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation};
+use lance_table::{
+    format::Manifest,
+    io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation},
+};
 use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
+use prost::Message;
 use snafu::{location, Location};
 use tracing::instrument;
 use url::Url;
@@ -23,6 +28,8 @@ pub struct DatasetBuilder {
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
     metadata_cache_size: usize,
+    /// Optional pre-loaded manifest to avoid loading it again.
+    manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     options: ObjectStoreParams,
@@ -40,6 +47,7 @@ impl DatasetBuilder {
             commit_handler: None,
             session: None,
             version: None,
+            manifest: None,
         }
     }
 }
@@ -103,6 +111,15 @@ impl DatasetBuilder {
         self.options.object_store = Some((object_store, location));
         self.commit_handler = Some(commit_handler);
         self
+    }
+
+    /// Use a serialized manifest instead of loading it from the object store.
+    ///
+    /// This is common when transferring a dataset across IPC boundaries.
+    pub fn with_serialized_manifest(mut self, manifest: &[u8]) -> Result<Self> {
+        let manifest = Manifest::try_from(lance_table::format::pb::Manifest::decode(manifest)?)?;
+        self.manifest = Some(manifest);
+        Ok(self)
     }
 
     /// Set options used to initialize storage backend
@@ -214,33 +231,50 @@ impl DatasetBuilder {
         let version = self.version;
         let table_uri = self.table_uri.clone();
 
+        let manifest = self.manifest.take();
+
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
-        let manifest = match version {
-            Some(version) => {
+
+        let manifest = if manifest.is_some() {
+            let mut manifest = manifest.unwrap();
+            if manifest.schema.has_dictionary_types() {
                 let path = commit_handler
-                    .resolve_version(&base_path, version, &object_store.inner)
+                    .resolve_version(&base_path, manifest.version, &object_store.inner)
                     .await?;
-                ManifestLocation {
-                    version,
-                    path,
-                    size: None,
-                }
+                let reader = object_store.open(&path).await?;
+                populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
             }
-            None => commit_handler
-                .resolve_latest_location(&base_path, &object_store)
-                .await
-                .map_err(|e| Error::DatasetNotFound {
-                    source: Box::new(e),
-                    path: base_path.to_string(),
-                    location: location!(),
-                })?,
+            manifest
+        } else {
+            let manifest_location = match version {
+                Some(version) => {
+                    let path = commit_handler
+                        .resolve_version(&base_path, version, &object_store.inner)
+                        .await?;
+                    ManifestLocation {
+                        version,
+                        path,
+                        size: None,
+                    }
+                }
+                None => commit_handler
+                    .resolve_latest_location(&base_path, &object_store)
+                    .await
+                    .map_err(|e| Error::DatasetNotFound {
+                        source: Box::new(e),
+                        path: base_path.to_string(),
+                        location: location!(),
+                    })?,
+            };
+
+            Dataset::load_manifest(&object_store, &manifest_location).await?
         };
 
         Dataset::checkout_manifest(
             Arc::new(object_store),
             base_path,
             table_uri,
-            &manifest,
+            manifest,
             session,
             commit_handler,
         )

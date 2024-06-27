@@ -90,7 +90,11 @@ impl Symbol {
     fn new() -> Self {
         Self {
             val: 0,
+<<<<<<< HEAD
             icl: FSST_ICL_FREE,
+=======
+            icl: FSST_ICL_FREE as u64,
+>>>>>>> weston/feat/integrate-fsst-lance
         }
     }
 

@@ -19,7 +19,7 @@ import org.apache.arrow.util.Preconditions;
 import org.json.JSONObject;
 
 /**
- * Metadata of a Fragment in the dataset. 
+ * Metadata of a Fragment in the dataset.
  * Matching to lance Fragment.
  * */
 public class FragmentMetadata implements Serializable {
@@ -39,7 +39,7 @@ public class FragmentMetadata implements Serializable {
   public int getId() {
     return id;
   }
-  
+
   public long getPhysicalRows() {
     return physicalRows;
   }

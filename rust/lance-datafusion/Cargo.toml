@@ -30,6 +30,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 substrait-expr = { version = "0.2.1" }
+lance-datagen.workspace = true
 
 [features]
 substrait = ["dep:datafusion-substrait"]

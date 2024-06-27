@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_buffer::BooleanBuffer;
+use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
@@ -20,21 +21,21 @@ use lance_core::Result;
 use super::buffers::BitmapBufferEncoder;
 
 struct DataDecoders {
-    validity: Box<dyn PhysicalPageDecoder>,
-    values: Box<dyn PhysicalPageDecoder>,
+    validity: Box<dyn PrimitivePageDecoder>,
+    values: Box<dyn PrimitivePageDecoder>,
 }
 
 enum DataNullStatus {
     // Neither validity nor values
     All,
     // Values only
-    None(Box<dyn PhysicalPageDecoder>),
+    None(Box<dyn PrimitivePageDecoder>),
     // Validity and values
     Some(DataDecoders),
 }
 
 impl DataNullStatus {
-    fn values_decoder(&self) -> Option<&dyn PhysicalPageDecoder> {
+    fn values_decoder(&self) -> Option<&dyn PrimitivePageDecoder> {
         match self {
             Self::All => None,
             Self::Some(decoders) => Some(decoders.values.as_ref()),
@@ -121,10 +122,10 @@ impl BasicPageScheduler {
 impl PageScheduler for BasicPageScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
-        scheduler: &dyn EncodingsIo,
+        ranges: &[std::ops::Range<u64>],
+        scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let validity_future = match &self.mode {
             SchedulerNullStatus::None(_) | SchedulerNullStatus::All => None,
             SchedulerNullStatus::Some(schedulers) => Some(schedulers.validity.schedule_ranges(
@@ -157,7 +158,7 @@ impl PageScheduler for BasicPageScheduler {
                 }
                 _ => unreachable!(),
             };
-            Ok(Box::new(BasicPageDecoder { mode }) as Box<dyn PhysicalPageDecoder>)
+            Ok(Box::new(BasicPageDecoder { mode }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
@@ -167,51 +168,39 @@ struct BasicPageDecoder {
     mode: DataNullStatus,
 }
 
-impl PhysicalPageDecoder for BasicPageDecoder {
-    fn update_capacity(
+impl PrimitivePageDecoder for BasicPageDecoder {
+    fn decode(
         &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
+        rows_to_skip: u64,
+        num_rows: u64,
         all_null: &mut bool,
-    ) {
-        // No need to look at the validity decoder to know the dest buffer size since it is boolean
-        buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
-        // The validity buffer is only required if we have some nulls
-        buffers[0].1 = matches!(self.mode, DataNullStatus::Some(_));
-        if let Some(values) = self.mode.values_decoder() {
-            values.update_capacity(rows_to_skip, num_rows, &mut buffers[1..], all_null);
-        } else {
-            *all_null = true;
-        }
-    }
-
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [bytes::BytesMut],
-    ) -> Result<()> {
-        match &self.mode {
+    ) -> Result<Vec<BytesMut>> {
+        let dest_buffers = match &self.mode {
             DataNullStatus::Some(decoders) => {
-                decoders
-                    .validity
-                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[..1])?;
-                decoders
-                    .values
-                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..])?;
+                let mut buffers = decoders.validity.decode(rows_to_skip, num_rows, all_null)?; // buffer 0
+                let mut values_bytesmut =
+                    decoders.values.decode(rows_to_skip, num_rows, all_null)?; // buffer 1 onwards
+
+                buffers.append(&mut values_bytesmut);
+                buffers
             }
             // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
             // other pages needed the buffer, in which case we need to fill our section
             DataNullStatus::All => {
-                dest_buffers[0].fill(0);
+                let buffers = vec![BytesMut::default()];
+                *all_null = true;
+                buffers
             }
             DataNullStatus::None(values) => {
-                dest_buffers[0].fill(1);
-                values.decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..])?;
+                let mut dest_buffers = vec![BytesMut::default()];
+
+                let mut values_bytesmut = values.decode(rows_to_skip, num_rows, all_null)?;
+                dest_buffers.append(&mut values_bytesmut);
+                dest_buffers
             }
-        }
-        Ok(())
+        };
+
+        Ok(dest_buffers)
     }
 
     fn num_buffers(&self) -> u32 {

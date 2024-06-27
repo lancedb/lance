@@ -2,6 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance secondary index library
+//!
+//! <section class="warning">
+//! This is internal crate used by <a href="https://github.com/lancedb/lance">the lance project</a>.
+//! <br/>
+//! API stability is not guaranteed.
+//! </section>
 
 #![cfg_attr(
     all(feature = "nightly", target_arch = "x86_64"),
@@ -17,6 +23,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 pub mod optimize;
+pub mod prefilter;
 pub mod scalar;
 pub mod traits;
 pub mod vector;
@@ -44,6 +51,9 @@ pub trait Index: Send + Sync + DeepSizeOf {
 
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index>;
+
+    /// Cast to [vector::VectorIndex]
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn vector::VectorIndex>>;
 
     /// Retrieve index statistics as a JSON Value
     fn statistics(&self) -> Result<serde_json::Value>;

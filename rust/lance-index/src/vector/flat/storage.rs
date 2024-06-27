@@ -6,13 +6,15 @@
 use std::sync::Arc;
 
 use crate::vector::quantizer::QuantizerStorage;
-use crate::vector::utils::prefetch_arrow_array;
-use crate::vector::v3::storage::{DistCalculator, VectorStore};
+use crate::vector::storage::{DistCalculator, VectorStore};
+use crate::vector::utils::do_prefetch;
 use arrow::array::AsArray;
-use arrow::datatypes::UInt64Type;
-use arrow_array::{types::Float32Type, RecordBatch};
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt64Array};
-use arrow_schema::DataType;
+use arrow::compute::concat_batches;
+use arrow_array::{
+    types::{Float32Type, UInt64Type},
+    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array,
+};
+use arrow_schema::{DataType, SchemaRef};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
@@ -24,13 +26,13 @@ use super::index::FlatMetadata;
 pub const FLAT_COLUMN: &str = "flat";
 
 /// All data are stored in memory
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct FlatStorage {
     batch: RecordBatch,
     distance_type: DistanceType,
 
     // helper fields
-    row_ids: Arc<UInt64Array>,
+    pub(super) row_ids: Arc<UInt64Array>,
     vectors: Arc<FixedSizeListArray>,
 }
 
@@ -79,12 +81,9 @@ impl FlatStorage {
 }
 
 impl VectorStore for FlatStorage {
-    type DistanceCalculator<'a> = FlatDistanceCal;
+    type DistanceCalculator<'a> = FlatDistanceCal<'a>;
 
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
-    where
-        Self: Sized,
-    {
+    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
@@ -113,8 +112,20 @@ impl VectorStore for FlatStorage {
         })
     }
 
-    fn to_batch(&self) -> Result<RecordBatch> {
-        Ok(self.batch.clone())
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
+        Ok([self.batch.clone()].into_iter())
+    }
+
+    fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+        // TODO: use chunked storage
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let mut storage = self.clone();
+        storage.batch = new_batch;
+        Ok(storage)
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        self.batch.schema_ref()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -125,28 +136,28 @@ impl VectorStore for FlatStorage {
         self.vectors.len()
     }
 
-    fn row_ids(&self) -> &[u64] {
-        self.row_ids.values()
-    }
-
-    fn metric_type(&self) -> DistanceType {
+    fn distance_type(&self) -> DistanceType {
         self.distance_type
     }
 
+    fn row_id(&self, id: u32) -> u64 {
+        self.row_ids.values()[id as usize]
+    }
+
+    fn row_ids(&self) -> impl Iterator<Item = &u64> {
+        self.row_ids.values().iter()
+    }
+
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        FlatDistanceCal {
-            vectors: self.vectors.clone(),
-            query,
-            distance_type: self.distance_type,
-        }
+        FlatDistanceCal::new(self.vectors.as_ref(), query, self.distance_type)
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
-        FlatDistanceCal {
-            vectors: self.vectors.clone(),
-            query: self.vectors.value(id as usize),
-            distance_type: self.distance_type,
-        }
+        FlatDistanceCal::new(
+            self.vectors.as_ref(),
+            self.vectors.value(id as usize),
+            self.distance_type,
+        )
     }
 
     /// Distance between two vectors.
@@ -165,23 +176,43 @@ impl VectorStore for FlatStorage {
     }
 }
 
-pub struct FlatDistanceCal {
-    vectors: Arc<FixedSizeListArray>,
-    query: ArrayRef,
-    distance_type: DistanceType,
+pub struct FlatDistanceCal<'a> {
+    vectors: &'a [f32],
+    query: Vec<f32>,
+    dimension: usize,
+    distance_fn: fn(&[f32], &[f32]) -> f32,
 }
 
-impl DistCalculator for FlatDistanceCal {
+impl<'a> FlatDistanceCal<'a> {
+    fn new(vectors: &'a FixedSizeListArray, query: ArrayRef, distance_type: DistanceType) -> Self {
+        // Gained sigificant performance improvement by using strong typed primtive slice.
+        // TODO: to support other data types other than `f32`, make FlatDistanceCal a generic struct.
+        let flat_array = vectors.values().as_primitive::<Float32Type>();
+        let dimension = vectors.value_length() as usize;
+        Self {
+            vectors: flat_array.values(),
+            query: query.as_primitive::<Float32Type>().values().to_vec(),
+            dimension,
+            distance_fn: distance_type.func(),
+        }
+    }
+
+    #[inline]
+    fn get_vector(&self, id: u32) -> &[f32] {
+        &self.vectors[self.dimension * id as usize..self.dimension * (id + 1) as usize]
+    }
+}
+
+impl DistCalculator for FlatDistanceCal<'_> {
     #[inline]
     fn distance(&self, id: u32) -> f32 {
-        let vector = self.vectors.slice(id as usize, 1);
-        self.distance_type.arrow_batch_func()(&self.query, &vector)
-            .unwrap()
-            .value(0)
+        let vector = self.get_vector(id);
+        (self.distance_fn)(&self.query, vector)
     }
 
     #[inline]
     fn prefetch(&self, id: u32) {
-        prefetch_arrow_array(self.vectors.value(id as usize).as_ref()).unwrap();
+        let vector = self.get_vector(id);
+        do_prefetch(vector.as_ptr_range())
     }
 }

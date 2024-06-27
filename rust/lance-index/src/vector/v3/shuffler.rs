@@ -12,6 +12,7 @@ use future::join_all;
 use futures::prelude::*;
 use lance_arrow::RecordBatchExt;
 use lance_core::{utils::tokio::spawn_cpu, Error, Result};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
@@ -24,7 +25,7 @@ use crate::vector::PART_ID_COLUMN;
 
 #[async_trait::async_trait]
 /// A reader that can read the shuffled partitions.
-pub trait ShuffleReader {
+pub trait ShuffleReader: Send + Sync {
     /// Read a partition by partition_id
     /// will return Ok(None) if partition_size is 0
     /// check reader.partiton_size(partition_id) before calling this function
@@ -34,13 +35,13 @@ pub trait ShuffleReader {
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>;
 
     /// Get the size of the partition by partition_id
-    fn partiton_size(&self, partition_id: usize) -> Result<usize>;
+    fn partition_size(&self, partition_id: usize) -> Result<usize>;
 }
 
 #[async_trait::async_trait]
 /// A shuffler that can shuffle the incoming stream of record batches into IVF partitions.
 /// Returns a IvfShuffleReader that can be used to read the shuffled partitions.
-pub trait Shuffler {
+pub trait Shuffler: Send + Sync {
     /// Shuffle the incoming stream of record batches into IVF partitions.
     /// Returns a IvfShuffleReader that can be used to read the shuffled partitions.
     async fn shuffle(
@@ -50,7 +51,7 @@ pub trait Shuffler {
 }
 
 pub struct IvfShuffler {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     output_dir: Path,
     num_partitions: usize,
 
@@ -59,9 +60,9 @@ pub struct IvfShuffler {
 }
 
 impl IvfShuffler {
-    pub fn new(object_store: ObjectStore, output_dir: Path, num_partitions: usize) -> Self {
+    pub fn new(output_dir: Path, num_partitions: usize) -> Self {
         Self {
-            object_store,
+            object_store: Arc::new(ObjectStore::local()),
             output_dir,
             num_partitions,
             buffer_size: 4096,
@@ -83,8 +84,6 @@ impl Shuffler for IvfShuffler {
         let mut writers: Vec<FileWriter> = vec![];
         let mut partition_sizes = vec![0; self.num_partitions];
         let mut first_pass = true;
-
-        let mut counter = 0;
 
         let num_partitions = self.num_partitions;
         let mut parallel_sort_stream = data
@@ -132,8 +131,8 @@ impl Shuffler for IvfShuffler {
             .map(|_| Vec::new())
             .collect::<Vec<_>>();
 
+        let mut counter = 0;
         while let Some(shuffled) = parallel_sort_stream.next().await {
-            log::info!("shuffle batch: {}", counter);
             let shuffled = shuffled?;
 
             for (part_id, batches) in shuffled.into_iter().enumerate() {
@@ -152,11 +151,11 @@ impl Shuffler for IvfShuffler {
                     .expect("there should be at least one batch");
                 writers = stream::iter(0..self.num_partitions)
                     .map(|partition_id| {
-                        let path = self.output_dir.clone();
+                        let part_path =
+                            self.output_dir.child(format!("ivf_{}.lance", partition_id));
                         let object_store = self.object_store.clone();
                         let schema = schema.clone();
                         async move {
-                            let part_path = path.child(format!("ivf_{}.lance", partition_id));
                             let writer = object_store.create(&part_path).await?;
                             FileWriter::try_new(
                                 writer,
@@ -175,6 +174,7 @@ impl Shuffler for IvfShuffler {
 
             // do flush
             if counter % self.buffer_size == 0 {
+                log::info!("shuffle {} batches, flushing", counter);
                 let mut futs = vec![];
                 for (part_id, writer) in writers.iter_mut().enumerate() {
                     let batches = &partition_buffers[part_id];
@@ -200,25 +200,37 @@ impl Shuffler for IvfShuffler {
         }
 
         // finish all writers
-        for (writer, &size) in writers.iter_mut().zip(partition_sizes.iter()) {
-            if size == 0 {
-                continue;
-            }
+        for writer in writers.iter_mut() {
             writer.finish().await?;
         }
 
-        Ok(Box::new(IvfShufflerReader {
-            object_store: self.object_store.clone(),
-            output_dir: self.output_dir.clone(),
+        Ok(Box::new(IvfShufflerReader::new(
+            self.object_store.clone(),
+            self.output_dir.clone(),
             partition_sizes,
-        }))
+        )))
     }
 }
 
 pub struct IvfShufflerReader {
-    object_store: ObjectStore,
+    scheduler: Arc<ScanScheduler>,
     output_dir: Path,
     partition_sizes: Vec<usize>,
+}
+
+impl IvfShufflerReader {
+    pub fn new(
+        object_store: Arc<ObjectStore>,
+        output_dir: Path,
+        partition_sizes: Vec<usize>,
+    ) -> Self {
+        let scheduler = ScanScheduler::new(object_store, 32);
+        Self {
+            scheduler,
+            output_dir,
+            partition_sizes,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -227,20 +239,28 @@ impl ShuffleReader for IvfShufflerReader {
         &self,
         partition_id: usize,
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
-        let scheduler = ScanScheduler::new(Arc::new(self.object_store.clone()), 32);
         let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
 
-        let reader =
-            FileReader::try_open(scheduler.open_file(&partition_path).await?, None).await?;
+        let reader = FileReader::try_open(
+            self.scheduler.open_file(&partition_path).await?,
+            None,
+            DecoderMiddlewareChain::default(),
+        )
+        .await?;
         let schema = reader.schema().as_ref().into();
 
         Ok(Some(Box::new(RecordBatchStreamAdapter::new(
             Arc::new(schema),
-            reader.read_stream(lance_io::ReadBatchParams::RangeFull, 4096, 16)?,
+            reader.read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                4096,
+                16,
+                FilterExpression::no_filter(),
+            )?,
         ))))
     }
 
-    fn partiton_size(&self, partition_id: usize) -> Result<usize> {
+    fn partition_size(&self, partition_id: usize) -> Result<usize> {
         Ok(self.partition_sizes[partition_id])
     }
 }

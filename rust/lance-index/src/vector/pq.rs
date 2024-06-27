@@ -14,7 +14,7 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, DistanceType, Dot, L2};
 use lance_linalg::kernels::argmin_value_float;
-use lance_linalg::kmeans::kmeans_find_partitions;
+use lance_linalg::kmeans::compute_partition;
 use lance_linalg::{distance::MetricType, MatrixView};
 use rayon::prelude::*;
 use snafu::{location, Location};
@@ -360,14 +360,15 @@ where
                     location: location!(),
                 })?;
 
+        let sub_dim = dim / num_sub_vectors;
         let values = flatten_data
             .as_slice()
             .par_chunks(dim)
             .map(|vector| {
                 vector
-                    .chunks_exact(dim / num_sub_vectors)
+                    .chunks_exact(sub_dim)
                     .enumerate()
-                    .flat_map(|(sub_idx, sub_vector)| {
+                    .map(|(sub_idx, sub_vector)| {
                         let centroids = get_sub_vector_centroids(
                             codebook.as_slice(),
                             dim,
@@ -375,9 +376,7 @@ where
                             num_sub_vectors,
                             sub_idx,
                         );
-                        let parts = kmeans_find_partitions(centroids, sub_vector, 1, distance_type)
-                            .expect("kmeans_find_partitions failed");
-                        parts.values().iter().map(|v| *v as u8).collect::<Vec<_>>()
+                        compute_partition(centroids, sub_vector, distance_type).map(|v| v as u8)
                     })
                     .collect::<Vec<_>>()
             })
