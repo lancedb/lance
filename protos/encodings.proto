@@ -190,7 +190,7 @@ message Binary {
 message Dictionary {
   ArrayEncoding indices = 1;
   ArrayEncoding items = 2;
-  uint64 num_dictionary_items = 3;
+  uint32 num_dictionary_items = 3;
 }
 
 // Encodings that decode into an Arrow array

@@ -247,7 +247,7 @@ impl CoreArrayEncodingStrategy {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
                     let dict_indices_encoder =
-                        Self::array_encoder_from_type(&DataType::UInt64, false)?;
+                        Self::array_encoder_from_type(&DataType::UInt8, false)?;
                     let dict_items_encoder = Self::array_encoder_from_type(&DataType::Utf8, false)?;
 
                     Ok(Box::new(DictionaryEncoder::new(

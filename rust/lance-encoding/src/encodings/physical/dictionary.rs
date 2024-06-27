@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::types::UInt64Type;
-use arrow_array::{Array, ArrayRef, DictionaryArray, StringArray, UInt64Array};
+use arrow_array::types::UInt8Type;
+use arrow_array::{Array, ArrayRef, DictionaryArray, StringArray, UInt8Array};
 use futures::{future::BoxFuture, FutureExt};
 
 use crate::{
@@ -29,14 +29,14 @@ use arrow_array::cast::AsArray;
 pub struct DictionaryPageScheduler {
     indices_scheduler: Arc<dyn PageScheduler>,
     items_scheduler: Arc<dyn PageScheduler>,
-    num_dictionary_items: u64,
+    num_dictionary_items: u32,
 }
 
 impl DictionaryPageScheduler {
     pub fn new(
         indices_scheduler: Arc<dyn PageScheduler>,
         items_scheduler: Arc<dyn PageScheduler>,
-        num_dictionary_items: u64,
+        num_dictionary_items: u32,
     ) -> Self {
         Self {
             indices_scheduler,
@@ -66,14 +66,14 @@ impl PageScheduler for DictionaryPageScheduler {
                 .schedule_ranges(ranges, scheduler, top_level_row);
 
         // Schedule items for decoding
-        let items_range = 0..self.num_dictionary_items;
+        let items_range = 0..(self.num_dictionary_items as u64);
         let items_page_decoder = self.items_scheduler.schedule_ranges(
             std::slice::from_ref(&items_range),
             scheduler,
             top_level_row,
         );
 
-        let copy_size = self.num_dictionary_items;
+        let copy_size = self.num_dictionary_items as u64;
 
         tokio::spawn(async move {
             let items_decoder: Arc<dyn PrimitivePageDecoder> = Arc::from(items_page_decoder.await?);
@@ -127,12 +127,12 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
             .decode(rows_to_skip, num_rows, all_null)?;
 
         let indices_array =
-            new_primitive_array::<UInt64Type>(indices_buffers.clone(), num_rows, &DataType::UInt64);
+            new_primitive_array::<UInt8Type>(indices_buffers.clone(), num_rows, &DataType::UInt8);
 
-        let indices_array = indices_array.as_primitive::<UInt64Type>().clone();
+        let indices_array = indices_array.as_primitive::<UInt8Type>().clone();
         let dictionary = self.decoded_dict.clone();
 
-        let adjusted_indices: UInt64Array = indices_array
+        let adjusted_indices: UInt8Array = indices_array
             .iter()
             .map(|x| match x {
                 Some(0) => None,
@@ -143,14 +143,14 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
 
         // Build dictionary array using indices and items
         let dict_array =
-            DictionaryArray::<UInt64Type>::try_new(adjusted_indices, dictionary).unwrap();
+            DictionaryArray::<UInt8Type>::try_new(adjusted_indices, dictionary).unwrap();
         let string_array = arrow_cast::cast(&dict_array, &DataType::Utf8).unwrap();
         let string_array = string_array.as_any().downcast_ref::<StringArray>().unwrap();
 
         let null_buffer = string_array
             .nulls()
             .map(|n| BytesMut::from(n.buffer().as_slice()))
-            .unwrap_or_else(|| BytesMut::new());
+            .unwrap_or_else(BytesMut::new);
 
         let offsets_buffer = BytesMut::from(string_array.offsets().inner().inner().as_slice());
 
@@ -191,7 +191,7 @@ impl DictionaryEncoder {
 }
 
 fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
-    let mut arr_hashmap: HashMap<&str, u64> = HashMap::new();
+    let mut arr_hashmap: HashMap<&str, u8> = HashMap::new();
     let mut curr_dict_index = 1;
     let total_capacity = arrays.iter().map(|arr| arr.len()).sum();
 
@@ -224,7 +224,7 @@ fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
         }
     }
 
-    let array_dict_indices = Arc::new(UInt64Array::from(dict_indices)) as ArrayRef;
+    let array_dict_indices = Arc::new(UInt8Array::from(dict_indices)) as ArrayRef;
 
     // If there is an empty dictionary:
     // Either there is an array of nulls or an empty array altogether
@@ -255,7 +255,7 @@ impl ArrayEncoder for DictionaryEncoder {
         let mut encoded_buffers = encoded_indices.buffers;
         encoded_buffers.extend(encoded_items.buffers);
 
-        let dict_size = items_array.len() as u64;
+        let dict_size = items_array.len() as u32;
 
         Ok(EncodedArray {
             buffers: encoded_buffers,
