@@ -31,13 +31,13 @@ const FREQUENCY_COL: &str = "_frequency";
 const NUM_TOKEN_COL: &str = "_num_tokens";
 
 #[derive(Debug, Clone, Default, DeepSizeOf)]
-pub struct InvertIndex {
+pub struct InvertedIndex {
     tokens: TokenSet,
-    invert_list: InvertList,
+    invert_list: InvertedList,
     docs: DocSet,
 }
 
-impl InvertIndex {
+impl InvertedIndex {
     // map tokens to token ids
     // ignore tokens that are not in the index cause they won't contribute to the search
     fn map(&self, texts: &[String]) -> Vec<u32> {
@@ -49,7 +49,7 @@ impl InvertIndex {
 }
 
 #[async_trait]
-impl Index for InvertIndex {
+impl Index for InvertedIndex {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -82,7 +82,7 @@ impl Index for InvertIndex {
 }
 
 #[async_trait]
-impl ScalarIndex for InvertIndex {
+impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
     async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
         let row_ids = match query {
@@ -115,7 +115,7 @@ impl ScalarIndex for InvertIndex {
         let docs_reader = store.open_index_file(DOCS_FILE).await?;
 
         let tokens = TokenSet::load(token_reader).await?;
-        let invert_list = InvertList::load(invert_list_reader).await?;
+        let invert_list = InvertedList::load(invert_list_reader).await?;
         let docs = DocSet::load(docs_reader).await?;
 
         Ok(Arc::new(Self {
@@ -271,13 +271,13 @@ impl TokenSet {
 }
 
 #[derive(Debug, Clone, Default, DeepSizeOf)]
-struct InvertList {
+struct InvertedList {
     tokens: Vec<u32>,
     row_ids_list: Vec<Vec<u64>>,
     frequencies_list: Vec<Vec<u64>>,
 }
 
-impl InvertList {
+impl InvertedList {
     fn to_batch(&self) -> Result<RecordBatch> {
         let token_id_col = UInt32Array::from(self.tokens.clone());
         let mut row_ids_col =
@@ -463,18 +463,18 @@ mod tests {
     use crate::scalar::ScalarIndex;
 
     #[tokio::test]
-    async fn test_invert_index() {
+    async fn test_inverted_index() {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = LanceIndexStore::new(ObjectStore::local(), index_dir, None);
 
-        let invert_index = super::InvertIndex::default();
+        let invert_index = super::InvertedIndex::default();
         let row_id_col = UInt64Array::from(vec![0, 1, 2, 3]);
         let doc_col = StringArray::from(vec!["a b c", "a b", "a c", "b c"]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("doc", super::DataType::Utf8, false),
-                arrow_schema::Field::new(super::ROW_ID, super::DataType::UInt64, false),
+                arrow_schema::Field::new("doc", arrow_schema::DataType::Utf8, false),
+                arrow_schema::Field::new(super::ROW_ID, arrow_schema::DataType::UInt64, false),
             ])
             .into(),
             vec![
@@ -491,7 +491,7 @@ mod tests {
             .await
             .expect("failed to update invert index");
 
-        let invert_index = super::InvertIndex::load(Arc::new(store)).await.unwrap();
+        let invert_index = super::InvertedIndex::load(Arc::new(store)).await.unwrap();
         let row_ids = invert_index
             .search(&super::ScalarQuery::FullTextSearch(vec!["a".to_string()]))
             .await
