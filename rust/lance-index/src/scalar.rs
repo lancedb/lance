@@ -21,7 +21,7 @@ use crate::Index;
 pub mod btree;
 pub mod expression;
 pub mod flat;
-pub mod inverted;
+pub mod invert;
 pub mod lance_format;
 
 /// Trait for storing an index (or parts of an index) into storage
