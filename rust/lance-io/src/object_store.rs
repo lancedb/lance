@@ -103,6 +103,21 @@ impl std::fmt::Display for ObjectStore {
     }
 }
 
+pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
+    fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore>;
+}
+
+#[derive(Default, Debug)]
+pub struct ObjectStoreRegistry {
+    providers: HashMap<String, Arc<dyn ObjectStoreProvider>>,
+}
+
+impl ObjectStoreRegistry {
+    pub fn insert(&mut self, scheme: &str, provider: Arc<dyn ObjectStoreProvider>) {
+        self.providers.insert(scheme.into(), provider);
+    }
+}
+
 const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
 
 /// Adapt an AWS SDK cred into object_store credentials
@@ -343,13 +358,16 @@ impl ObjectStore {
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
     pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
-        Self::from_uri_and_params(uri, &ObjectStoreParams::default()).await
+        let registry = Arc::new(ObjectStoreRegistry::default());
+
+        Self::from_uri_and_params(registry, uri, &ObjectStoreParams::default()).await
     }
 
     /// Parse from a string URI.
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
     pub async fn from_uri_and_params(
+        registry: Arc<ObjectStoreRegistry>,
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Self, Path)> {
@@ -359,7 +377,7 @@ impl ObjectStore {
                 Self::from_path(uri)
             }
             Ok(url) => {
-                let store = Self::new_from_url(url.clone(), params.clone()).await?;
+                let store = Self::new_from_url(registry, url.clone(), params.clone()).await?;
                 Ok((store, Path::from(url.path())))
             }
             Err(_) => Self::from_path(uri),
@@ -405,8 +423,12 @@ impl ObjectStore {
         Self::from_path_with_scheme(str_path, "file")
     }
 
-    async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
-        configure_store(url.as_str(), params).await
+    async fn new_from_url(
+        registry: Arc<ObjectStoreRegistry>,
+        url: Url,
+        params: ObjectStoreParams,
+    ) -> Result<Self> {
+        configure_store(registry, url.as_str(), params).await
     }
 
     /// Local object store.
@@ -686,8 +708,12 @@ impl From<HashMap<String, String>> for StorageOptions {
     }
 }
 
-async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<ObjectStore> {
-    let mut storage_options = StorageOptions(options.storage_options.unwrap_or_default());
+async fn configure_store(
+    registry: Arc<ObjectStoreRegistry>,
+    url: &str,
+    options: ObjectStoreParams,
+) -> Result<ObjectStore> {
+    let mut storage_options = StorageOptions(options.storage_options.clone().unwrap_or_default());
     let mut url = ensure_table_uri(url)?;
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
@@ -781,11 +807,16 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             scheme: String::from("memory"),
             block_size: 64 * 1024,
         }),
-        unknow_scheme => {
-            let err = lance_core::Error::from(object_store::Error::NotSupported {
-                source: format!("Unsupported URI scheme: {}", unknow_scheme).into(),
-            });
-            Err(err)
+        unknown_scheme => {
+            if let Some(provider) = registry.providers.get(unknown_scheme) {
+                provider.new_store(url, &options)
+            } else {
+                let err = lance_core::Error::from(object_store::Error::NotSupported {
+                    source: format!("Unsupported URI scheme: {} in url {}", unknown_scheme, url)
+                        .into(),
+                });
+                Err(err)
+            }
         }
     }
 }
@@ -856,10 +887,8 @@ pub fn ensure_table_uri(table_uri: impl AsRef<str>) -> Result<Url> {
                 Error::InvalidTableLocation { message: msg }
             })?)
         // NOTE this check is required to support absolute windows paths which may properly parse as url
-        } else if KNOWN_SCHEMES.contains(&url.scheme()) {
-            UriType::Url(url)
         } else {
-            UriType::LocalPath(PathBuf::from(table_uri))
+            UriType::Url(url)
         }
     } else {
         UriType::LocalPath(PathBuf::from(table_uri))
@@ -1069,6 +1098,7 @@ mod tests {
     async fn test_wrapping_object_store_option_is_used() {
         // Make a store for the inner store first
         let mock_inner_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let registry = Arc::new(ObjectStoreRegistry::default());
 
         assert_eq!(Arc::strong_count(&mock_inner_store), 1);
 
@@ -1085,7 +1115,7 @@ mod tests {
         // not called yet
         assert!(!wrapper.called());
 
-        let _ = ObjectStore::from_uri_and_params("memory:///", &params)
+        let _ = ObjectStore::from_uri_and_params(registry, "memory:///", &params)
             .await
             .unwrap();
 
@@ -1119,6 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn test_injected_aws_creds_option_is_used() {
         let mock_provider = Arc::new(MockAwsCredentialsProvider::default());
+        let registry = Arc::new(ObjectStoreRegistry::default());
 
         let params = ObjectStoreParams {
             aws_credentials: Some(mock_provider.clone() as AwsCredentialProvider),
@@ -1128,7 +1159,7 @@ mod tests {
         // Not called yet
         assert!(!mock_provider.called.load(Ordering::Relaxed));
 
-        let (store, _) = ObjectStore::from_uri_and_params("s3://not-a-bucket", &params)
+        let (store, _) = ObjectStore::from_uri_and_params(registry, "s3://not-a-bucket", &params)
             .await
             .unwrap();
 

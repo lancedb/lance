@@ -14,7 +14,7 @@ use futures::{FutureExt, Stream};
 use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
@@ -155,6 +155,8 @@ pub struct ReadParams {
     /// If a custom object store is provided (via store_params.object_store) then this
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
+
+    pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl ReadParams {
@@ -176,6 +178,15 @@ impl ReadParams {
         self
     }
 
+    /// Provide an object store registry for custom object stores
+    pub fn with_object_store_registry(
+        &mut self,
+        object_store_registry: Arc<ObjectStoreRegistry>,
+    ) -> &mut Self {
+        self.object_store_registry = object_store_registry;
+        self
+    }
+
     /// Use the explicit locking to resolve the latest version
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
@@ -190,6 +201,7 @@ impl Default for ReadParams {
             session: None,
             store_options: None,
             commit_handler: None,
+            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -207,9 +219,12 @@ impl Dataset {
         uri: &str,
         commit_handler: &Option<Arc<dyn CommitHandler>>,
         store_options: &Option<ObjectStoreParams>,
+        object_store_registry: Arc<ObjectStoreRegistry>,
     ) -> Result<(ObjectStore, Path, Arc<dyn CommitHandler>)> {
         let (mut object_store, base_path) = match store_options.as_ref() {
-            Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
+            Some(store_options) => {
+                ObjectStore::from_uri_and_params(object_store_registry, uri, store_options).await?
+            }
             None => ObjectStore::from_uri(uri).await?,
         };
 
@@ -390,8 +405,13 @@ impl Dataset {
         params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut params = params.unwrap_or_default();
-        let (object_store, base, commit_handler) =
-            Self::params_from_uri(uri, &params.commit_handler, &params.store_params).await?;
+        let (object_store, base, commit_handler) = Self::params_from_uri(
+            uri,
+            &params.commit_handler,
+            &params.store_params,
+            params.object_store_registry.clone(),
+        )
+        .await?;
 
         // Read expected manifest path for the dataset
         let dataset_exists = match commit_handler
@@ -436,6 +456,7 @@ impl Dataset {
                     .with_read_params(ReadParams {
                         store_options: params.store_params.clone(),
                         commit_handler: params.commit_handler.clone(),
+                        object_store_registry: params.object_store_registry.clone(),
                         ..Default::default()
                     })
                     .load()
@@ -747,6 +768,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
+        object_store_registry: Arc<ObjectStoreRegistry>,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
             || match operation {
@@ -759,8 +781,13 @@ impl Dataset {
             Ok,
         )?;
 
-        let (object_store, base, commit_handler) =
-            Self::params_from_uri(base_uri, &commit_handler, &store_params).await?;
+        let (object_store, base, commit_handler) = Self::params_from_uri(
+            base_uri,
+            &commit_handler,
+            &store_params,
+            object_store_registry.clone(),
+        )
+        .await?;
 
         // Test if the dataset exists
         let dataset_exists = match commit_handler
@@ -785,6 +812,7 @@ impl Dataset {
                 DatasetBuilder::from_uri(base_uri)
                     .with_read_params(ReadParams {
                         store_options: store_params.clone(),
+                        object_store_registry: object_store_registry.clone(),
                         ..Default::default()
                     })
                     .load()

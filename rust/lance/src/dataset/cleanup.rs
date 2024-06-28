@@ -444,7 +444,7 @@ mod tests {
     use arrow_array::{RecordBatchIterator, RecordBatchReader};
     use lance_core::utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::{DatasetIndexExt, IndexType};
-    use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
+    use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use snafu::{location, Location};
@@ -685,8 +685,10 @@ mod tests {
         }
 
         async fn count_files(&self) -> Result<FileCounts> {
+            let registry = Arc::new(ObjectStoreRegistry::default());
             let (os, path) =
-                ObjectStore::from_uri_and_params(&self.dataset_path, &self.os_params()).await?;
+                ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
+                    .await?;
             let mut file_stream = os.read_dir_all(&path, None).await?;
             let mut file_count = FileCounts {
                 num_data_files: 0,

@@ -1666,6 +1666,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
+    use lance_io::object_store::ObjectStoreRegistry;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
@@ -2033,7 +2034,8 @@ mod tests {
             fragments,
         };
 
-        let new_dataset = Dataset::commit(test_uri, op, None, None, None)
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let new_dataset = Dataset::commit(test_uri, op, None, None, None, registry)
             .await
             .unwrap();
 
@@ -2126,7 +2128,8 @@ mod tests {
                 schema: full_schema.clone(),
             };
 
-            let dataset = Dataset::commit(test_uri, op, None, None, None)
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let dataset = Dataset::commit(test_uri, op, None, None, None, registry)
                 .await
                 .unwrap();
 
@@ -2336,6 +2339,7 @@ mod tests {
 
         // Rearrange schema so it's `s` then `i`.
         let schema = updater.schema().unwrap().clone().project(&["s", "i"])?;
+        let registry = Arc::new(ObjectStoreRegistry::default());
 
         let dataset = Dataset::commit(
             test_uri,
@@ -2346,6 +2350,7 @@ mod tests {
             Some(dataset.manifest.version),
             None,
             None,
+            registry,
         )
         .await?;
 

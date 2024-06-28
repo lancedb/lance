@@ -30,6 +30,7 @@ use jni::{objects::JObject, JNIEnv};
 use lance::dataset::transaction::Operation;
 use lance::dataset::{Dataset, WriteParams};
 use lance::table::format::Fragment;
+use lance_io::object_store::ObjectStoreRegistry;
 use std::iter::empty;
 use std::sync::Arc;
 
@@ -56,7 +57,15 @@ impl BlockingDataset {
     }
 
     pub fn commit(uri: &str, operation: Operation, read_version: Option<u64>) -> Result<Self> {
-        let inner = RT.block_on(Dataset::commit(uri, operation, read_version, None, None))?;
+        let object_store_registry = Arc::new(ObjectStoreRegistry::default());
+        let inner = RT.block_on(Dataset::commit(
+            uri,
+            operation,
+            read_version,
+            None,
+            None,
+            object_store_registry,
+        ))?;
         Ok(Self { inner })
     }
 

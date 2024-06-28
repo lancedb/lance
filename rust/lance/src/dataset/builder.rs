@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::{
     format::Manifest,
     io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation},
@@ -35,6 +35,7 @@ pub struct DatasetBuilder {
     options: ObjectStoreParams,
     version: Option<u64>,
     table_uri: String,
+    object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl DatasetBuilder {
@@ -48,6 +49,7 @@ impl DatasetBuilder {
             session: None,
             version: None,
             manifest: None,
+            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -167,6 +169,8 @@ impl DatasetBuilder {
             self.commit_handler = Some(commit_handler);
         }
 
+        self.object_store_registry = read_params.object_store_registry.clone();
+
         self
     }
 
@@ -179,6 +183,9 @@ impl DatasetBuilder {
         if let Some(commit_handler) = write_params.commit_handler {
             self.commit_handler = Some(commit_handler);
         }
+
+        self.object_store_registry = write_params.object_store_registry.clone();
+
         self
     }
 
@@ -189,6 +196,11 @@ impl DatasetBuilder {
     /// If this is set, then `with_index_cache_size` and `with_metadata_cache_size` are ignored.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    pub fn with_object_store_registry(mut self, registry: Arc<ObjectStoreRegistry>) -> Self {
+        self.object_store_registry = registry;
         self
     }
 
@@ -211,8 +223,12 @@ impl DatasetBuilder {
                 commit_handler,
             )),
             None => {
-                let (store, path) =
-                    ObjectStore::from_uri_and_params(&self.table_uri, &self.options).await?;
+                let (store, path) = ObjectStore::from_uri_and_params(
+                    self.object_store_registry.clone(),
+                    &self.table_uri,
+                    &self.options,
+                )
+                .await?;
                 Ok((store, path, commit_handler))
             }
         }
