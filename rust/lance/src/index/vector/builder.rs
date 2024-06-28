@@ -43,7 +43,7 @@ use log::info;
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
-use tempfile::TempDir;
+use tempfile::{tempdir, TempDir};
 
 use crate::Dataset;
 
@@ -66,7 +66,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     ivf_params: Option<IvfBuildParams>,
     quantizer_params: Option<Q::BuildParams>,
     sub_index_params: S::BuildParams,
-    _temp_dir: TempDir, // store this for keeping the temp dir alive
+    _temp_dir: TempDir, // store this for keeping the temp dir alive and clean up after build
     temp_dir: Path,
 
     // fields will be set during build
@@ -91,8 +91,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         quantizer_params: Option<Q::BuildParams>,
         sub_index_params: S::BuildParams,
     ) -> Result<Self> {
-        let temp_dir = TempDir::new()?;
-        let temp_dir_path = temp_dir.path().to_str().unwrap().into();
+        let temp_dir = tempdir()?;
+        let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
         Ok(Self {
             dataset,
             column,
@@ -424,12 +424,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
 
         // build the sub index, with in-memory storage
         let index_len = {
-            let distance_type = match self.distance_type {
-                DistanceType::Cosine | DistanceType::Dot => DistanceType::L2,
-                _ => self.distance_type,
-            };
             let vectors = batch[&self.column].as_fixed_size_list();
-            let flat_storage = FlatStorage::new(vectors.clone(), distance_type);
+            let flat_storage = FlatStorage::new(vectors.clone(), self.distance_type);
             let sub_index = S::index_vectors(&flat_storage, self.sub_index_params.clone())?;
             let path = self.temp_dir.child(format!("index_part{}", part_id));
             let writer = object_store.create(&path).await?;
@@ -672,8 +668,7 @@ mod tests {
         let (dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::default();
-        let index_dir = tempdir().unwrap();
-        let index_dir = Path::from(index_dir.path().to_str().unwrap());
+        let index_dir: Path = tempdir().unwrap().path().to_str().unwrap().into();
         let shuffler = IvfShuffler::new(index_dir.child("shuffled"), ivf_params.num_partitions);
 
         super::IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
@@ -701,8 +696,7 @@ mod tests {
         let ivf_params = IvfBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let sq_params = SQBuildParams::default();
-        let index_dir = tempdir().unwrap();
-        let index_dir = Path::from(index_dir.path().to_str().unwrap());
+        let index_dir: Path = tempdir().unwrap().path().to_str().unwrap().into();
         let shuffler = IvfShuffler::new(index_dir.child("shuffled"), ivf_params.num_partitions);
 
         super::IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(

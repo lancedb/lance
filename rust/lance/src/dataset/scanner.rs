@@ -47,8 +47,8 @@ use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
-    knn::new_knn_exec, FilterPlan, KNNFlatExec, LancePushdownScanExec, LanceScanExec, Planner,
-    PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
+    knn::new_knn_exec, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec,
+    Planner, PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
@@ -1117,10 +1117,8 @@ impl Scanner {
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
             let mut columns = vec![q.column.clone()];
-            let mut num_filter_columns = 0;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 let filter_columns = Planner::column_names_in_expr(expr);
-                num_filter_columns = filter_columns.len();
                 columns.extend(filter_columns);
             }
             let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
@@ -1150,13 +1148,8 @@ impl Scanner {
             // To do a union, we need to make the schemas match. Right now
             // knn_node: _distance, _rowid, vector
             // topk_appended: vector, <filter columns?>, _rowid, _distance
-            let new_schema = Schema::try_from(
-                &topk_appended
-                    .schema()
-                    .project(&[2 + num_filter_columns, 1 + num_filter_columns, 0])?
-                    .with_metadata(knn_node.schema().metadata.clone()),
-            )?;
-            let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
+            let new_schema = Schema::try_from(knn_node.schema().as_ref())?;
+            let topk_appended = ProjectionExec::try_new(topk_appended, new_schema.into())?;
             assert_eq!(topk_appended.schema(), knn_node.schema());
             // union
             let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
@@ -1376,7 +1369,32 @@ impl Scanner {
 
     /// Add a knn search node to the input plan
     fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(KNNFlatExec::try_new(input, q.clone())?))
+        let flat_dist = Arc::new(KNNVectorDistanceExec::try_new(
+            input,
+            &q.column,
+            q.key.clone(),
+            q.metric_type,
+        )?);
+
+        // Use DataFusion's [SortExec] for Top-K search
+        let sort = SortExec::new(
+            vec![PhysicalSortExpr {
+                expr: expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            }],
+            flat_dist,
+        )
+        .with_fetch(Some(q.k));
+
+        let not_nulls = FilterExec::try_new(
+            expressions::is_not_null(expressions::col(DIST_COL, sort.schema().as_ref())?)?,
+            Arc::new(sort),
+        )?;
+
+        Ok(Arc::new(not_nulls))
     }
 
     /// Create an Execution plan to do indexed ANN search
@@ -1556,7 +1574,7 @@ pub mod test_dataset {
     }
 
     impl TestVectorDataset {
-        pub async fn new(use_legacy_format: bool) -> Result<Self> {
+        pub async fn new(use_legacy_format: bool, stable_row_ids: bool) -> Result<Self> {
             let tmp_dir = tempdir()?;
             let path = tmp_dir.path().to_str().unwrap();
 
@@ -1602,7 +1620,9 @@ pub mod test_dataset {
 
             let params = WriteParams {
                 max_rows_per_group: 10,
+                max_rows_per_file: 200,
                 use_legacy_format,
+                enable_move_stable_row_ids: stable_row_ids,
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1802,7 +1822,7 @@ mod test {
 
     #[tokio::test]
     async fn test_filter_parsing() -> Result<()> {
-        let test_ds = TestVectorDataset::new(true).await?;
+        let test_ds = TestVectorDataset::new(true, false).await?;
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -1836,7 +1856,7 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_limit(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await?;
+        let test_ds = TestVectorDataset::new(use_legacy_format, false).await?;
         let dataset = &test_ds.dataset;
 
         let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
@@ -1853,9 +1873,14 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_nodes(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_knn_nodes(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         for build_index in &[true, false] {
-            let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+            let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+                .await
+                .unwrap();
             if *build_index {
                 test_ds.make_vector_index().await.unwrap();
             }
@@ -1908,8 +1933,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_new_data(#[values(false, true)] use_legacy_format: bool) {
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_new_data(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -1988,8 +2018,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_prefilter(#[values(false, true)] use_legacy_format: bool) {
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_prefilter(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         let dataset = &test_ds.dataset;
 
@@ -2045,11 +2080,16 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_filter_new_data(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_knn_filter_new_data(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         // This test verifies that a filter (prefilter or postfilter) gets applied to the flat KNN results
         // in a combined KNN scan (a scan that combines results from an indexed ANN with an unindexed flat
         // search of new data)
-        let mut test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         test_ds.make_vector_index().await.unwrap();
         test_ds.append_new_data().await.unwrap();
         let dataset = &test_ds.dataset;
@@ -2109,8 +2149,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_knn_with_filter(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_knn_with_filter(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2160,8 +2205,13 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_refine_factor(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+    async fn test_refine_factor(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -2211,31 +2261,24 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_only_row_id(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+            .await
+            .unwrap();
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
         scan.project::<&str>(&[]).unwrap().with_row_id();
 
-        let results = scan
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
+        let batch = scan.try_into_batch().await.unwrap();
 
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.num_rows(), 400);
-        assert_eq!(
-            batch.schema().as_ref(),
-            &ArrowSchema::new(vec![ArrowField::new(ROW_ID, DataType::UInt64, true,)])
-        );
+        let expected_schema =
+            ArrowSchema::new(vec![ArrowField::new(ROW_ID, DataType::UInt64, true)])
+                .with_metadata(dataset.schema().metadata.clone());
+        assert_eq!(batch.schema().as_ref(), &expected_schema,);
 
-        let expected_row_ids: Vec<u64> = (0..400).map(|i| i as u64).collect();
+        let expected_row_ids: Vec<u64> = (0..200_u64).chain((1 << 32)..((1 << 32) + 200)).collect();
         let actual_row_ids: Vec<u64> = as_primitive_array::<UInt64Type>(batch.column(0).as_ref())
             .values()
             .iter()
@@ -2247,7 +2290,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
         // This test doesn't make sense for v2 files, there is no way to get an out-of-order scan
-        let test_ds = TestVectorDataset::new(/*use_legacy_format=*/ true)
+        let test_ds = TestVectorDataset::new(/*use_legacy_format=*/ true, false)
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
@@ -2508,7 +2551,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_ann_prefilter(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_ann_prefilter(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2530,6 +2576,8 @@ mod test {
 
         let write_params = WriteParams {
             use_legacy_format,
+            max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
+            enable_move_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2774,7 +2822,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_ann_with_deletion(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_ann_with_deletion(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
@@ -2817,6 +2868,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     use_legacy_format,
+                    enable_move_stable_row_ids: stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -3122,7 +3174,7 @@ mod test {
         append_then_delete_version: u64,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq)]
     struct ScalarTestParams {
         use_index: bool,
         use_projection: bool,
@@ -3134,7 +3186,7 @@ mod test {
     }
 
     impl ScalarIndexTestFixture {
-        async fn new(use_legacy_format: bool) -> Self {
+        async fn new(use_legacy_format: bool, use_stable_row_ids: bool) -> Self {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
@@ -3160,6 +3212,7 @@ mod test {
                 Some(WriteParams {
                     max_rows_per_file: 500,
                     use_legacy_format,
+                    enable_move_stable_row_ids: use_stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -3399,6 +3452,7 @@ mod test {
                     "The non-indexed refine filter was not applied",
                 );
             }
+
             // If there is new data then the dupe of row 50 should be in the results
             if params.use_new_data || params.use_updated {
                 self.assert_one(
@@ -3533,8 +3587,11 @@ mod test {
     // different configurations to ensure that we get consistent results
     #[rstest]
     #[tokio::test]
-    async fn test_secondary_index_scans(#[values(false, true)] use_legacy_format: bool) {
-        let fixture = ScalarIndexTestFixture::new(use_legacy_format).await;
+    async fn test_secondary_index_scans(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] use_stable_row_ids: bool,
+    ) {
+        let fixture = ScalarIndexTestFixture::new(use_legacy_format, use_stable_row_ids).await;
 
         for use_index in [false, true] {
             for use_projection in [false, true] {
@@ -3543,11 +3600,13 @@ mod test {
                         // Don't test compaction in conjuction with deletion and new data, it's too
                         // many combinations with no clear benefit.  Feel free to update if there is
                         // a need
-                        let compaction_choices = if use_deleted_data || use_new_data {
-                            vec![false]
-                        } else {
-                            vec![false, true]
-                        };
+                        // TODO: enable compaction for stable row id once supported.
+                        let compaction_choices =
+                            if use_deleted_data || use_new_data || use_stable_row_ids {
+                                vec![false]
+                            } else {
+                                vec![false, true]
+                            };
                         for use_compaction in compaction_choices {
                             let updated_choices =
                                 if use_deleted_data || use_new_data || use_compaction {
@@ -3788,9 +3847,12 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_plans(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_plans(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] stable_row_id: bool,
+    ) -> Result<()> {
         // Create a vector dataset
-        let mut dataset = TestVectorDataset::new(use_legacy_format).await?;
+        let mut dataset = TestVectorDataset::new(use_legacy_format, stable_row_id).await?;
 
         // Scans
         // ---------------------------------------------------------------------
@@ -3832,8 +3894,10 @@ mod test {
             |scan| scan.nearest("vec", &q, 5),
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
-    KNNFlat: k=5 metric=l2
-      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
+    FilterExec: _distance@2 IS NOT NULL
+      SortExec: TopK(fetch=5), expr=...
+        KNNVectorDistance: metric=l2
+          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3855,12 +3919,14 @@ mod test {
             &dataset.dataset,
             |scan| Ok(scan.nearest("vec", &q, 10)?.refine(4)),
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=10 metric=l2
-      Take: columns=\"_distance, _rowid, vec\"
-        SortExec: TopK(fetch=40), expr=...
-          ANNSubIndex: name=..., k=40, deltas=1
-            ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=10), expr=...
+        KNNVectorDistance: metric=l2
+          Take: columns=\"_distance, _rowid, vec\"
+            SortExec: TopK(fetch=40), expr=...
+              ANNSubIndex: name=..., k=40, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3870,8 +3936,10 @@ mod test {
             |scan| Ok(scan.nearest("vec", &q, 13)?.use_index(false)),
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
-    KNNFlat: k=13 metric=l2
-      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=13), expr=...
+        KNNVectorDistance: metric=l2
+          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -3917,42 +3985,50 @@ mod test {
         dataset.append_new_data().await?;
         assert_plan_equals(
             &dataset.dataset,
-            |scan| scan.nearest("vec", &q, 5),
+            |scan| scan.nearest("vec", &q, 6),
             // TODO: we could write an optimizer rule to eliminate the last Projection
             // by doing it as part of the last Take. This would likely have minimal impact though.
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
-      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-        UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
-              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              ANNSubIndex: name=..., k=5, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=6), expr=...
+        KNNVectorDistance: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=6), expr=...
+                    KNNVectorDistance: metric=l2
+                      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=6), expr=...
+                  ANNSubIndex: name=..., k=6, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
         // new data and with filter
         assert_plan_equals(
             &dataset.dataset,
-            |scan| scan.nearest("vec", &q, 5)?.filter("i > 10"),
+            |scan| scan.nearest("vec", &q, 15)?.filter("i > 10"),
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: i@3 > 10
-      Take: columns=\"_distance, _rowid, vec, i\"
-        KNNFlat: k=5 metric=l2
-          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-            UnionExec
-              Projection: fields=[_distance, _rowid, vec]
-                KNNFlat: k=5 metric=l2
-                  LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-              Take: columns=\"_distance, _rowid, vec\"
-                SortExec: TopK(fetch=5), expr=...
-                  ANNSubIndex: name=..., k=5, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+      Take: columns=\"_rowid, vec, _distance, i\"
+        FilterExec: _distance@... IS NOT NULL
+          SortExec: TopK(fetch=15), expr=...
+            KNNVectorDistance: metric=l2
+              RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+                UnionExec
+                  Projection: fields=[_distance, _rowid, vec]
+                    FilterExec: _distance@... IS NOT NULL
+                      SortExec: TopK(fetch=15), expr=...
+                        KNNVectorDistance: metric=l2
+                          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+                  Take: columns=\"_distance, _rowid, vec\"
+                    SortExec: TopK(fetch=15), expr=...
+                      ANNSubIndex: name=..., k=15, deltas=1
+                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -3968,20 +4044,24 @@ mod test {
             // TODO: i is scanned on both sides but is projected away mid-plan
             // only to be taken again later. We should fix this.
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
-      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-        UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              ANNSubIndex: name=..., k=5, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                FilterExec: i@0 > 10
-                  LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=5), expr=...
+        KNNVectorDistance: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=5), expr=...
+                    KNNVectorDistance: metric=l2
+                      FilterExec: i@1 > 10
+                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=5), expr=...
+                  ANNSubIndex: name=..., k=5, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -4014,24 +4094,28 @@ mod test {
             &dataset.dataset,
             |scan| {
                 Ok(scan
-                    .nearest("vec", &q, 5)?
+                    .nearest("vec", &q, 8)?
                     .filter("i > 10")?
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
-      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-        UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              ANNSubIndex: name=..., k=5, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                ScalarIndexQuery: query=i > 10",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=8), expr=...
+        KNNVectorDistance: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=8), expr=...
+                    KNNVectorDistance: metric=l2
+                      FilterExec: i@1 > 10
+                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=8), expr=...
+                  ANNSubIndex: name=..., k=8, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                    ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
@@ -4041,24 +4125,28 @@ mod test {
             &dataset.dataset,
             |scan| {
                 Ok(scan
-                    .nearest("vec", &q, 5)?
+                    .nearest("vec", &q, 11)?
                     .filter("i > 10")?
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNFlat: k=5 metric=l2
-      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-        UnionExec
-          Projection: fields=[_distance, _rowid, vec]
-            KNNFlat: k=5 metric=l2
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=5), expr=...
-              ANNSubIndex: name=..., k=5, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                ScalarIndexQuery: query=i > 10",
+  Take: columns=\"_rowid, vec, _distance, i, s\"
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=11), expr=...
+        KNNVectorDistance: metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=11), expr=...
+                    KNNVectorDistance: metric=l2
+                      FilterExec: i@1 > 10
+                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                SortExec: TopK(fetch=11), expr=...
+                  ANNSubIndex: name=..., k=11, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                    ScalarIndexQuery: query=i > 10",
         )
         .await?;
 

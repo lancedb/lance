@@ -709,6 +709,6 @@ pub struct CommitConfig {
 
 impl Default for CommitConfig {
     fn default() -> Self {
-        Self { num_retries: 5 }
+        Self { num_retries: 20 }
     }
 }
