@@ -97,7 +97,6 @@ use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Dataset;
 use crate::Result;
 use lance_core::utils::address::RowAddress;
-use lance_io::object_store::ObjectStoreRegistry;
 use lance_table::format::Fragment;
 
 use super::fragment::FileFragment;
@@ -244,7 +243,6 @@ pub async fn compact_files(
     dataset: &mut Dataset,
     mut options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>,
-    object_store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<CompactionMetrics> {
     options.validate();
 
@@ -258,14 +256,7 @@ pub async fn compact_files(
     let dataset_ref = &dataset.clone();
 
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
-        .map(|task| {
-            rewrite_files(
-                Cow::Borrowed(dataset_ref),
-                task,
-                &options,
-                object_store_registry.clone(),
-            )
-        })
+        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &options))
         .buffer_unordered(options.num_threads);
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
@@ -376,23 +367,13 @@ impl CompactionTask {
     /// Note: you should pass the version of the dataset that is the same as
     /// the read version for this task (the same version from which the
     /// compaction was planned).
-    pub async fn execute(
-        &self,
-        dataset: &Dataset,
-        object_store_registry: Arc<ObjectStoreRegistry>,
-    ) -> Result<RewriteResult> {
+    pub async fn execute(&self, dataset: &Dataset) -> Result<RewriteResult> {
         let dataset = if dataset.manifest.version == self.read_version {
             Cow::Borrowed(dataset)
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        rewrite_files(
-            dataset,
-            self.task.clone(),
-            &self.options,
-            object_store_registry,
-        )
-        .await
+        rewrite_files(dataset, self.task.clone(), &self.options).await
     }
 }
 
@@ -777,7 +758,6 @@ async fn rewrite_files(
     dataset: Cow<'_, Dataset>,
     task: TaskData,
     options: &CompactionOptions,
-    object_store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
 
@@ -816,7 +796,6 @@ async fn rewrite_files(
         max_rows_per_file: options.target_rows_per_fragment,
         max_rows_per_group: options.max_rows_per_group,
         mode: WriteMode::Append,
-        object_store_registry,
         ..Default::default()
     };
     let mut new_fragments = write_fragments_internal(

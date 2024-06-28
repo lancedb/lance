@@ -812,7 +812,8 @@ async fn configure_store(
                 provider.new_store(url, &options)
             } else {
                 let err = lance_core::Error::from(object_store::Error::NotSupported {
-                    source: format!("Unsupported URI scheme: {}", unknown_scheme).into(),
+                    source: format!("Unsupported URI scheme: {} in url {}", unknown_scheme, url)
+                        .into(),
                 });
                 Err(err)
             }
