@@ -1704,7 +1704,7 @@ mod test {
     use half::f16;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_index::IndexType;
-    use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+    use lance_io::object_store::ObjectStoreParams;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
@@ -3296,9 +3296,7 @@ mod test {
             let delete_version = dataset.version().version;
 
             // COMPACT (this should materialize the deletion)
-
-            let registry = Arc::new(ObjectStoreRegistry::default());
-            compact_files(&mut dataset, CompactionOptions::default(), None, registry)
+            compact_files(&mut dataset, CompactionOptions::default(), None)
                 .await
                 .unwrap();
             let compact_version = dataset.version().version;

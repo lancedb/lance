@@ -3360,8 +3360,7 @@ mod tests {
 
         // Running compaction right away should work (this is verifying compaction
         // is not broken by the potentially malformed fragment bitmaps)
-        let registry = Arc::new(ObjectStoreRegistry::default());
-        compact_files(&mut dataset, CompactionOptions::default(), None, registry)
+        compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
 
