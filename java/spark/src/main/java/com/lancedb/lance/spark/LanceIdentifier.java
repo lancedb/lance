@@ -18,10 +18,10 @@ import org.apache.spark.sql.connector.catalog.Identifier;
 
 public class LanceIdentifier implements Identifier {
   private final String[] namespace = new String[]{"default"};
-  private final String tablePath;
+  private final String datasetUri;
 
-  public LanceIdentifier(String tablePath) {
-    this.tablePath = tablePath;
+  public LanceIdentifier(String datasetUri) {
+    this.datasetUri = datasetUri;
   }
 
   @Override
@@ -31,6 +31,6 @@ public class LanceIdentifier implements Identifier {
 
   @Override
   public String name() {
-    return tablePath;
+    return datasetUri;
   }
 }

@@ -23,21 +23,22 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
  */
 public class LanceConfig implements Serializable {
   private static final long serialVersionUID = 827364827364823764L;
-  public static final String CONFIG_TABLE_PATH = "path";
+  public static final String CONFIG_DATASET_URI = "path"; // Path is default spark option key
   public static final String CONFIG_PUSH_DOWN_FILTERS = "pushDownFilters";
   public static final String LANCE_FILE_SUFFIX = ".lance";
 
   private static final boolean DEFAULT_PUSH_DOWN_FILTERS = true;
 
   private final String dbPath;
-  private final String tableName;
-  private final String tablePath;
+  private final String datasetName;
+  private final String datasetUri;
   private final boolean pushDownFilters;
 
-  private LanceConfig(String dbPath, String tableName, String tablePath, boolean pushDownFilters) {
+  private LanceConfig(String dbPath, String datasetName,
+      String datasetUri, boolean pushDownFilters) {
     this.dbPath = dbPath;
-    this.tableName = tableName;
-    this.tablePath = tablePath;
+    this.datasetName = datasetName;
+    this.datasetUri = datasetUri;
     this.pushDownFilters = pushDownFilters;
   }
 
@@ -46,61 +47,61 @@ public class LanceConfig implements Serializable {
   }
 
   public static LanceConfig from(CaseInsensitiveStringMap options) {
-    if (!options.containsKey(CONFIG_TABLE_PATH)) {
-      throw new IllegalArgumentException("Missing required option " + CONFIG_TABLE_PATH);
+    if (!options.containsKey(CONFIG_DATASET_URI)) {
+      throw new IllegalArgumentException("Missing required option " + CONFIG_DATASET_URI);
     }
-    return from(options, options.get(CONFIG_TABLE_PATH));
+    return from(options, options.get(CONFIG_DATASET_URI));
   }
 
-  public static LanceConfig from(Map<String, String> properties, String tablePath) {
-    return from(new CaseInsensitiveStringMap(properties), tablePath);
+  public static LanceConfig from(Map<String, String> properties, String datasetUri) {
+    return from(new CaseInsensitiveStringMap(properties), datasetUri);
   }
 
-  public static LanceConfig from(String tablePath) {
-    return from(CaseInsensitiveStringMap.empty(), tablePath);
+  public static LanceConfig from(String datasetUri) {
+    return from(CaseInsensitiveStringMap.empty(), datasetUri);
   }
 
-  public static LanceConfig from(CaseInsensitiveStringMap options, String tablePath) {
+  public static LanceConfig from(CaseInsensitiveStringMap options, String datasetUri) {
     boolean pushDownFilters = options.getBoolean(CONFIG_PUSH_DOWN_FILTERS,
         DEFAULT_PUSH_DOWN_FILTERS);
-    String[] paths = extractDbPathAndTableName(tablePath);
-    return new LanceConfig(paths[0], paths[1], tablePath, pushDownFilters);
+    String[] paths = extractDbPathAndDatasetName(datasetUri);
+    return new LanceConfig(paths[0], paths[1], datasetUri, pushDownFilters);
   }
 
-  public static String getTablePath(String dbPath, String tableName) {
+  public static String getDatasetUri(String dbPath, String datasetUri) {
     StringBuilder sb = new StringBuilder().append(dbPath);
     if (!dbPath.endsWith("/")) {
       sb.append("/");
     }
-    return sb.append(tableName).append(LANCE_FILE_SUFFIX).toString();
+    return sb.append(datasetUri).append(LANCE_FILE_SUFFIX).toString();
   }
 
-  private static String[] extractDbPathAndTableName(String tablePath) {
-    if (tablePath == null || !tablePath.endsWith(LANCE_FILE_SUFFIX)) {
-      throw new IllegalArgumentException("Invalid table path: " + tablePath);
+  private static String[] extractDbPathAndDatasetName(String datasetUri) {
+    if (datasetUri == null || !datasetUri.endsWith(LANCE_FILE_SUFFIX)) {
+      throw new IllegalArgumentException("Invalid dataset uri: " + datasetUri);
     }
 
-    int lastSlashIndex = tablePath.lastIndexOf('/');
+    int lastSlashIndex = datasetUri.lastIndexOf('/');
     if (lastSlashIndex == -1) {
-      throw new IllegalArgumentException("Invalid table path: " + tablePath);
+      throw new IllegalArgumentException("Invalid dataset uri: " + datasetUri);
     }
 
-    String tableNameWithSuffix = tablePath.substring(lastSlashIndex + 1);
-    return new String[]{tablePath.substring(0, lastSlashIndex + 1),
-        tableNameWithSuffix.substring(0,
-            tableNameWithSuffix.length() - LANCE_FILE_SUFFIX.length())};
+    String datasetNameWithSuffix = datasetUri.substring(lastSlashIndex + 1);
+    return new String[]{datasetUri.substring(0, lastSlashIndex + 1),
+        datasetNameWithSuffix.substring(0,
+            datasetNameWithSuffix.length() - LANCE_FILE_SUFFIX.length())};
   }
 
   public String getDbPath() {
     return dbPath;
   }
 
-  public String getTableName() {
-    return tableName;
+  public String getDatasetName() {
+    return datasetName;
   }
 
-  public String getTablePath() {
-    return tablePath;
+  public String getDatasetUri() {
+    return datasetUri;
   }
 
   public boolean isPushDownFilters() {

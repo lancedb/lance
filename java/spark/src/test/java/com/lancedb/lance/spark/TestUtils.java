@@ -28,8 +28,8 @@ import java.util.List;
 public class TestUtils {
   public static class TestTable1Config {
     public static final String dbPath;
-    public static final String tableName = "test_table1";
-    public static final String tablePath;
+    public static final String datasetName = "test_dataset1";
+    public static final String datasetUri;
     public static final List<List<Long>> expectedValues = Arrays.asList(
         Arrays.asList(0L, 0L, 0L, 0L),
         Arrays.asList(1L, 2L, 3L, -1L),
@@ -54,8 +54,8 @@ public class TestUtils {
       } else {
         throw new IllegalArgumentException("example_db not found in resources directory");
       }
-      tablePath = LanceConfig.getTablePath(dbPath, tableName);
-      lanceConfig = LanceConfig.from(tablePath);
+      datasetUri = LanceConfig.getDatasetUri(dbPath, datasetName);
+      lanceConfig = LanceConfig.from(datasetUri);
       inputPartition = new LanceInputPartition(schema, 0, new LanceSplit(Arrays.asList(0, 1)), lanceConfig, Optional.empty());
     }
   }

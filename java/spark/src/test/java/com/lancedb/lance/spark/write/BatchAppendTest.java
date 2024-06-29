@@ -50,16 +50,16 @@ public class BatchAppendTest {
 
   @Test
   public void testLanceDataWriter(TestInfo testInfo) throws Exception {
-    String tableName = testInfo.getTestMethod().get().getName();
-    String tablePath = LanceConfig.getTablePath(tempDir.toString(), tableName);
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String datasetUri = LanceConfig.getDatasetUri(tempDir.toString(), datasetName);
     try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       // Create lance dataset
       Field field = new Field("column1", FieldType.nullable(new ArrowType.Int(32, true)), null);
       Schema schema = new Schema(Collections.singletonList(field));
-      Dataset.create(allocator, tablePath, schema, new WriteParams.Builder().build()).close();
+      Dataset.create(allocator, datasetUri, schema, new WriteParams.Builder().build()).close();
 
       // Append data to lance dataset
-      LanceConfig config = LanceConfig.from(tablePath);
+      LanceConfig config = LanceConfig.from(datasetUri);
       StructType sparkSchema = ArrowUtils.fromArrowSchema(schema);
       BatchAppend batchAppend = new BatchAppend(sparkSchema, config);
       DataWriterFactory factor = batchAppend.createBatchWriterFactory(() -> 1);
@@ -76,7 +76,7 @@ public class BatchAppendTest {
       batchAppend.commit(new WriterCommitMessage[]{message});
 
       // Validate lance dataset data
-      try (Dataset dataset = Dataset.open(tablePath, allocator)) {
+      try (Dataset dataset = Dataset.open(datasetUri, allocator)) {
         try (Scanner scanner = dataset.newScan()) {
           try (ArrowReader reader = scanner.scanBatches()) {
             VectorSchemaRoot readerRoot = reader.getVectorSchemaRoot();

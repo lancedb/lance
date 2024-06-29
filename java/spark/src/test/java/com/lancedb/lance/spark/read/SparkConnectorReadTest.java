@@ -44,7 +44,7 @@ public class SparkConnectorReadTest {
         .getOrCreate();
     dbPath = TestUtils.TestTable1Config.dbPath;
     data = spark.read().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath, TestUtils.TestTable1Config.tableName))
+        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath, TestUtils.TestTable1Config.datasetName))
         .load();
   }
 
@@ -130,5 +130,5 @@ public class SparkConnectorReadTest {
   }
   
   // TODO(lu) support spark.read().format("lance")
-  //    .load(dbPath.resolve(tableName).toString());
+  //    .load(dbPath.resolve(datasetName).toString());
 }

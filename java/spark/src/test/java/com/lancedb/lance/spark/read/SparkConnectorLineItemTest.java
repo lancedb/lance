@@ -49,7 +49,7 @@ public class SparkConnectorLineItemTest {
         .config("spark.sql.catalog.lance", "com.lancedb.lance.spark.LanceCatalog")
         .getOrCreate();
     lanceData = spark.read().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath, "lineitem_10"))
+        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath, "lineitem_10"))
         .load();
     lanceData.createOrReplaceTempView("lance_dataset");
     parquetData = spark.read().parquet(parquetPath);

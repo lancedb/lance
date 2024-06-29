@@ -1,6 +1,6 @@
 # Spark-Lance Connector
 
-The Spark-Lance Connector allows Apache Spark to efficiently read tables stored in Lance format.
+The Spark-Lance Connector allows Apache Spark to efficiently read datasets stored in Lance format.
 Lance is a modern columnar data format optimized for machine learning workflows and datasets,
 supporting distributed, parallel scans, and optimizations such as column and filter pushdown to improve performance.
 Additionally, Lance provides high-performance random access that is 100 times faster than Parquet without sacrificing scan performance.
@@ -8,8 +8,8 @@ By using the Spark-Lance Connector, you can leverage Spark's powerful data proce
 
 ## Features
 
-* Query Lance Tables: Seamlessly query tables stored in the Lance format using Spark.
-* Distributed, Parallel Scans: Leverage Spark's distributed computing capabilities to perform parallel scans on Lance tables.
+* Query Lance Datasets: Seamlessly query datasets stored in the Lance format using Spark.
+* Distributed, Parallel Scans: Leverage Spark's distributed computing capabilities to perform parallel scans on Lance datasets.
 * Column and Filter Pushdown: Optimize query performance by pushing down column selections and filters to the data source.
 
 ## Installation
@@ -49,7 +49,7 @@ SparkSession spark = SparkSession.builder()
 
 Dataset<Row> data = spark.read().format("lance")
     .option("db", "/path/to/example_db")
-    .option("table", "lance_example_table")
+    .option("dataset", "lance_example_dataset")
     .load();
 
 data.show(100)

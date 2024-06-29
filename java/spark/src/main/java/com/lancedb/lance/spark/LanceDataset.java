@@ -31,9 +31,9 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 /**
- * Lance Spark Table.
+ * Lance Spark Dataset.
  */
-public class LanceTable implements Table, SupportsRead, SupportsWrite {
+public class LanceDataset implements Table, SupportsRead, SupportsWrite {
   private static final Set<TableCapability> CAPABILITIES =
     ImmutableSet.of(
         TableCapability.BATCH_READ,
@@ -43,12 +43,12 @@ public class LanceTable implements Table, SupportsRead, SupportsWrite {
   private final StructType sparkSchema;
 
   /**
-   * Creates a spark table.
+   * Creates a Lance dataset.
    *
    * @param config read config
    * @param sparkSchema spark struct type
    */
-  public LanceTable(LanceConfig config, StructType sparkSchema) {
+  public LanceDataset(LanceConfig config, StructType sparkSchema) {
     this.options = config;
     this.sparkSchema = sparkSchema;
   }
@@ -60,7 +60,7 @@ public class LanceTable implements Table, SupportsRead, SupportsWrite {
 
   @Override
   public String name() {
-    return this.options.getTableName();
+    return this.options.getDatasetName();
   }
 
   @Override

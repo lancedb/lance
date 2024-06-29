@@ -33,7 +33,7 @@ import java.util.Map;
 public class LanceCatalog implements TableCatalog {
   @Override
   public Identifier[] listTables(String[] namespace) throws NoSuchNamespaceException {
-    throw new UnsupportedOperationException("Please use lancedb catalog for table listing");
+    throw new UnsupportedOperationException("Please use lancedb catalog for dataset listing");
   }
 
   @Override
@@ -41,20 +41,20 @@ public class LanceCatalog implements TableCatalog {
     LanceConfig config = LanceConfig.from(ident.name());
     Optional<StructType> schema = LanceDatasetAdapter.getSchema(ident.name());
     if (schema.isEmpty()) {
-      throw new NoSuchTableException(config.getDbPath(), config.getTableName());
+      throw new NoSuchTableException(config.getDbPath(), config.getDatasetName());
     }
-    return new LanceTable(LanceConfig.from(ident.name()), schema.get());
+    return new LanceDataset(LanceConfig.from(ident.name()), schema.get());
   }
 
   @Override
   public Table createTable(Identifier ident, StructType schema, Transform[] partitions,
       Map<String, String> properties) throws TableAlreadyExistsException, NoSuchNamespaceException {
     try {
-      LanceDatasetAdapter.createTable(ident.name(), schema);
+      LanceDatasetAdapter.createDataset(ident.name(), schema);
     } catch (IllegalArgumentException e) {
       throw new TableAlreadyExistsException(ident.name(), new Some<>(e));
     }
-    return new LanceTable(LanceConfig.from(properties, ident.name()), schema);
+    return new LanceDataset(LanceConfig.from(properties, ident.name()), schema);
   }
 
   @Override

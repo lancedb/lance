@@ -43,11 +43,11 @@ public class LanceDataWriterTest {
 
   @Test
   public void testLanceDataWriter(TestInfo testInfo) throws IOException {
-    String tableName = testInfo.getTestMethod().get().getName();
+    String datasetName = testInfo.getTestMethod().get().getName();
     try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       Field field = new Field("column1", FieldType.nullable(new ArrowType.Int(32, true)), null);
       Schema schema = new Schema(Collections.singletonList(field));
-      LanceConfig config = LanceConfig.from(tempDir.resolve(tableName + LanceConfig.LANCE_FILE_SUFFIX).toString());
+      LanceConfig config = LanceConfig.from(tempDir.resolve(datasetName + LanceConfig.LANCE_FILE_SUFFIX).toString());
       StructType sparkSchema = ArrowUtils.fromArrowSchema(schema);
       LanceDataWriter.WriterFactory writerFactory = new LanceDataWriter.WriterFactory(sparkSchema, config);
       LanceDataWriter dataWriter = (LanceDataWriter) writerFactory.createWriter(0, 0);

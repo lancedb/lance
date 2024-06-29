@@ -16,10 +16,7 @@ package com.lancedb.lance.spark.write;
 
 import com.google.common.base.Preconditions;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.ArrowReader;
-import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.execution.arrow.ArrowWriter;
@@ -33,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * A custom arrow reader that supports writes Spark internal rows while reading data in batches.
  */
-public class InternalRowWriterArrowReader extends ArrowReader {
+public class LanceArrowWriter extends ArrowReader {
   private final Schema schema;
   private final int batchSize;
   private final Object monitor = new Object();
@@ -45,7 +42,7 @@ public class InternalRowWriterArrowReader extends ArrowReader {
   private final AtomicLong totalBytesRead = new AtomicLong();
   private ArrowWriter arrowWriter = null;
 
-  public InternalRowWriterArrowReader(BufferAllocator allocator, Schema schema, int batchSize) {
+  public LanceArrowWriter(BufferAllocator allocator, Schema schema, int batchSize) {
     super(allocator);
     Preconditions.checkNotNull(schema);
     Preconditions.checkArgument(batchSize > 0);
@@ -54,7 +51,7 @@ public class InternalRowWriterArrowReader extends ArrowReader {
     this.batchSize = batchSize;
   }
 
-  public void write(InternalRow row) {
+  void write(InternalRow row) {
     Preconditions.checkNotNull(row);
     synchronized (monitor) {
       // TODO(lu) wait if too much elements in rowQueue
@@ -63,7 +60,7 @@ public class InternalRowWriterArrowReader extends ArrowReader {
     }
   }
 
-  public void setFinished() {
+  void setFinished() {
     synchronized (monitor) {
       finished = true;
       monitor.notify();
@@ -105,19 +102,12 @@ public class InternalRowWriterArrowReader extends ArrowReader {
       return false;
     }
     arrowWriter.finish();
-    // Calculate bytes read for the current record batch
-    // If the following code impacts performance, can be removed
-    VectorSchemaRoot root = this.getVectorSchemaRoot();
-    VectorUnloader unloader = new VectorUnloader(root);
-    try (ArrowRecordBatch recordBatch = unloader.getRecordBatch()) {
-      totalBytesRead.addAndGet(recordBatch.computeBodyLength());
-    }
     return true;
   }
 
   @Override
   public long bytesRead() {
-    return totalBytesRead.get();
+    throw new UnsupportedOperationException();
   }
 
   @Override

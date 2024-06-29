@@ -38,7 +38,7 @@ public class LanceDataSource implements SupportsCatalogOptions, DataSourceRegist
   @Override
   public Table getTable(StructType schema, Transform[] partitioning,
       Map<String, String> properties) {
-    return new LanceTable(LanceConfig.from(properties), schema);
+    return new LanceDataset(LanceConfig.from(properties), schema);
   }
 
   @Override
@@ -48,7 +48,7 @@ public class LanceDataSource implements SupportsCatalogOptions, DataSourceRegist
 
   @Override
   public Identifier extractIdentifier(CaseInsensitiveStringMap options) {
-    return new LanceIdentifier(LanceConfig.from(options).getTablePath());
+    return new LanceIdentifier(LanceConfig.from(options).getDatasetUri());
   }
 
   @Override

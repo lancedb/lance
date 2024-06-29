@@ -23,7 +23,7 @@ import com.lancedb.lance.WriteParams;
 import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.read.LanceInputPartition;
 import com.lancedb.lance.spark.utils.Optional;
-import com.lancedb.lance.spark.write.InternalRowWriterArrowReader;
+import com.lancedb.lance.spark.write.LanceArrowWriter;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
@@ -42,11 +42,11 @@ public class LanceDatasetAdapter {
           .maxAllocation(4 * 1024 * 1024).build());
 
   public static Optional<StructType> getSchema(LanceConfig config) {
-    return getSchema(config.getTablePath());
+    return getSchema(config.getDatasetUri());
   }
 
-  public static Optional<StructType> getSchema(String tablePath) {
-    try (Dataset dataset = Dataset.open(tablePath, allocator)) {
+  public static Optional<StructType> getSchema(String datasetUri) {
+    try (Dataset dataset = Dataset.open(datasetUri, allocator)) {
       return Optional.of(ArrowUtils.fromArrowSchema(dataset.getSchema()));
     } catch (IllegalArgumentException e) {
       // dataset not found
@@ -55,7 +55,7 @@ public class LanceDatasetAdapter {
   }
 
   public static List<Integer> getFragmentIds(LanceConfig config) {
-    try (Dataset dataset = Dataset.open(config.getTablePath(), allocator)) {
+    try (Dataset dataset = Dataset.open(config.getDatasetUri(), allocator)) {
       return dataset.getFragments().stream()
           .map(DatasetFragment::getId).collect(Collectors.toList());
     }
@@ -68,14 +68,14 @@ public class LanceDatasetAdapter {
 
   public static void appendFragments(LanceConfig config, List<FragmentMetadata> fragments) {
     FragmentOperation.Append appendOp = new FragmentOperation.Append(fragments);
-    try (Dataset datasetRead = Dataset.open(config.getTablePath(), allocator)) {
-      Dataset.commit(allocator, config.getTablePath(),
+    try (Dataset datasetRead = Dataset.open(config.getDatasetUri(), allocator)) {
+      Dataset.commit(allocator, config.getDatasetUri(),
           appendOp, java.util.Optional.of(datasetRead.version())).close();
     }
   }
 
-  public static InternalRowWriterArrowReader getArrowReader(StructType sparkSchema, int batchSize) {
-    return new InternalRowWriterArrowReader(allocator,
+  public static LanceArrowWriter getArrowWriter(StructType sparkSchema, int batchSize) {
+    return new LanceArrowWriter(allocator,
         ArrowUtils.toArrowSchema(sparkSchema, "UTC", false, false), batchSize);
   }
 
@@ -87,7 +87,7 @@ public class LanceDatasetAdapter {
     }
   }
 
-  public static void createTable(String datasetUri, StructType sparkSchema) {
+  public static void createDataset(String datasetUri, StructType sparkSchema) {
     Dataset.create(allocator, datasetUri,
         ArrowUtils.toArrowSchema(sparkSchema, ZoneId.systemDefault().getId(), true, false),
         new WriteParams.Builder().build()).close();

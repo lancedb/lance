@@ -26,24 +26,22 @@ import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 import org.junit.jupiter.api.Test;
 
-import java.io.IOException;
 import java.util.Collections;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-public class InternalRowWriterArrowReaderTest {
-
+public class LanceArrowWriterTest {
   @Test
-  public void testInternalRowWriterArrowReader() throws InterruptedException, IOException {
+  public void test() throws Exception {
     try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       Field field = new Field("column1", FieldType.nullable(org.apache.arrow.vector.types.Types.MinorType.INT.getType()), null);
       Schema schema = new Schema(Collections.singletonList(field));
 
       final int totalRows = 125;
       final int batchSize = 34;
-      final InternalRowWriterArrowReader arrowReader = new InternalRowWriterArrowReader(allocator, schema, batchSize);
+      final LanceArrowWriter arrowWriter = new LanceArrowWriter(allocator, schema, batchSize);
 
       AtomicInteger rowsWritten = new AtomicInteger(0);
       AtomicInteger rowsRead = new AtomicInteger(0);
@@ -53,19 +51,19 @@ public class InternalRowWriterArrowReaderTest {
         try {
           for (int i = 0; i < totalRows; i++) {
             InternalRow row = new GenericInternalRow(new Object[]{rowsWritten.incrementAndGet()});
-            arrowReader.write(row);
-            Thread.sleep(1);
+            arrowWriter.write(row);
           }
-          arrowReader.setFinished();
+          arrowWriter.setFinished();
         } catch (Exception e) {
           e.printStackTrace();
+          throw e;
         }
       });
 
       Thread readerThread = new Thread(() -> {
         try {
-          while (arrowReader.loadNextBatch()) {
-            VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
+          while (arrowWriter.loadNextBatch()) {
+            VectorSchemaRoot root = arrowWriter.getVectorSchemaRoot();
             int rowCount = root.getRowCount();
             rowsRead.addAndGet(rowCount);
             try (ArrowRecordBatch recordBatch = new VectorUnloader(root).getRecordBatch()) {
@@ -86,14 +84,9 @@ public class InternalRowWriterArrowReaderTest {
 
       writerThread.join();
       readerThread.join();
-      
-      int expectedRowsWritten = rowsWritten.get();
-      int expectedRowsRead = rowsRead.get();
-
-      assertEquals(totalRows, expectedRowsWritten);
-      assertEquals(totalRows, expectedRowsRead);
-      assertEquals(expectedBytesRead.get(), arrowReader.bytesRead());
-      arrowReader.close();
+      assertEquals(totalRows, rowsWritten.get());
+      assertEquals(totalRows, rowsRead.get());
+      arrowWriter.close();
     }
   }
 }

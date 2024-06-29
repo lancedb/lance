@@ -26,62 +26,62 @@ public class LanceConfigTest {
   @Test
   public void testLanceConfigFromCaseInsensitiveStringMap() {
     String dbPath = "file://path/to/db/";
-    String tableName = "testTableName";
-    String tablePath = LanceConfig.getTablePath(dbPath, tableName);
+    String datasetName = "testDatasetName";
+    String datasetUri = LanceConfig.getDatasetUri(dbPath, datasetName);
     CaseInsensitiveStringMap options = new CaseInsensitiveStringMap(new HashMap<String, String>() {{
-      put(LanceConfig.CONFIG_TABLE_PATH, tablePath);
+      put(LanceConfig.CONFIG_DATASET_URI, datasetUri);
     }});
 
     LanceConfig config = LanceConfig.from(options);
 
     assertEquals(dbPath, config.getDbPath());
-    assertEquals(tableName, config.getTableName());
-    assertEquals(tablePath, config.getTablePath());
+    assertEquals(datasetName, config.getDatasetName());
+    assertEquals(datasetUri, config.getDatasetUri());
   }
 
   @Test
   public void testLanceConfigFromCaseInsensitiveStringMap2() {
     String dbPath = "s3://bucket/folder/";
-    String tableName = "testTableName";
-    String tablePath = LanceConfig.getTablePath(dbPath, tableName);
+    String datasetName = "testDatasetName";
+    String datasetUri = LanceConfig.getDatasetUri(dbPath, datasetName);
     CaseInsensitiveStringMap options = new CaseInsensitiveStringMap(new HashMap<String, String>() {{
-      put(LanceConfig.CONFIG_TABLE_PATH, tablePath);
+      put(LanceConfig.CONFIG_DATASET_URI, datasetUri);
     }});
 
     LanceConfig config = LanceConfig.from(options);
 
     assertEquals(dbPath, config.getDbPath());
-    assertEquals(tableName, config.getTableName());
-    assertEquals(tablePath, config.getTablePath());
+    assertEquals(datasetName, config.getDatasetName());
+    assertEquals(datasetUri, config.getDatasetUri());
   }
 
   @Test
   public void testLanceConfigFromMap() {
     String dbPath = "file://path/to/db/";
-    String tableName = "testTableName";
-    String tablePath = LanceConfig.getTablePath(dbPath, tableName);
+    String datasetName = "testDatasetName";
+    String datasetUri = LanceConfig.getDatasetUri(dbPath, datasetName);
     Map<String, String> properties = new HashMap<>();
-    properties.put(LanceConfig.CONFIG_TABLE_PATH, tablePath);
+    properties.put(LanceConfig.CONFIG_DATASET_URI, datasetUri);
 
     LanceConfig config = LanceConfig.from(properties);
 
     assertEquals(dbPath, config.getDbPath());
-    assertEquals(tableName, config.getTableName());
-    assertEquals(tablePath, config.getTablePath());
+    assertEquals(datasetName, config.getDatasetName());
+    assertEquals(datasetUri, config.getDatasetUri());
   }
 
   @Test
   public void testLanceConfigFromMap2() {
     String dbPath = "s3://bucket/folder/";
-    String tableName = "testTableName";
-    String tablePath = LanceConfig.getTablePath(dbPath, tableName);
+    String datasetName = "testDatasetName";
+    String datasetUri = LanceConfig.getDatasetUri(dbPath, datasetName);
     Map<String, String> properties = new HashMap<>();
-    properties.put(LanceConfig.CONFIG_TABLE_PATH, tablePath);
+    properties.put(LanceConfig.CONFIG_DATASET_URI, datasetUri);
 
     LanceConfig config = LanceConfig.from(properties);
 
     assertEquals(dbPath, config.getDbPath());
-    assertEquals(tableName, config.getTableName());
-    assertEquals(tablePath, config.getTablePath());
+    assertEquals(datasetName, config.getDatasetName());
+    assertEquals(datasetUri, config.getDatasetUri());
   }
 }

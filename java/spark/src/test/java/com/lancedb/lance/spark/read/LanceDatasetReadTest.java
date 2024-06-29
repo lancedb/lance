@@ -33,7 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-public class LanceDatasetAdapterReadTest {
+public class LanceDatasetReadTest {
   @Test
   public void testSchema() {
     StructType expectedSchema = TestUtils.TestTable1Config.schema;
@@ -99,5 +99,5 @@ public class LanceDatasetAdapterReadTest {
     }
   }
   
-  // TODO test_table4 [UNSUPPORTED_ARROWTYPE] Unsupported arrow type FixedSizeList(128).
+  // TODO test_dataset4 [UNSUPPORTED_ARROWTYPE] Unsupported arrow type FixedSizeList(128).
 }

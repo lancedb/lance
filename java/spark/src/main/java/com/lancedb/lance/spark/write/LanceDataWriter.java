@@ -30,26 +30,26 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 
 public class LanceDataWriter implements DataWriter<InternalRow> {
-  private InternalRowWriterArrowReader arrowReader;
+  private LanceArrowWriter arrowWriter;
   private FutureTask<FragmentMetadata> fragmentCreationTask;
   private Thread fragmentCreationThread;
 
-  private LanceDataWriter(InternalRowWriterArrowReader arrowReader,
+  private LanceDataWriter(LanceArrowWriter arrowWriter,
       FutureTask<FragmentMetadata> fragmentCreationTask, Thread fragmentCreationThread) {
     // TODO support write to multiple fragments
-    this.arrowReader = arrowReader;
+    this.arrowWriter = arrowWriter;
     this.fragmentCreationThread = fragmentCreationThread;
     this.fragmentCreationTask = fragmentCreationTask;
   }
 
   @Override
   public void write(InternalRow record) throws IOException {
-    arrowReader.write(record);
+    arrowWriter.write(record);
   }
 
   @Override
   public WriterCommitMessage commit() throws IOException {
-    arrowReader.setFinished();
+    arrowWriter.setFinished();
     try {
       FragmentMetadata fragmentMetadata = fragmentCreationTask.get();
       return new BatchAppend.TaskCommit(Arrays.asList(fragmentMetadata));
@@ -74,7 +74,7 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
 
   @Override
   public void close() throws IOException {
-    arrowReader.close();
+    arrowWriter.close();
   }
 
   public static class WriterFactory implements DataWriterFactory {
@@ -89,14 +89,14 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
 
     @Override
     public DataWriter<InternalRow> createWriter(int partitionId, long taskId) {
-      InternalRowWriterArrowReader arrowReader = LanceDatasetAdapter.getArrowReader(schema, 1024);
+      LanceArrowWriter arrowWriter = LanceDatasetAdapter.getArrowWriter(schema, 1024);
       Callable<FragmentMetadata> fragmentCreator
-          = () -> LanceDatasetAdapter.createFragment(config.getTablePath(), arrowReader);
+          = () -> LanceDatasetAdapter.createFragment(config.getDatasetUri(), arrowWriter);
       FutureTask<FragmentMetadata> fragmentCreationTask = new FutureTask<>(fragmentCreator);
       Thread fragmentCreationThread = new Thread(fragmentCreationTask);
       fragmentCreationThread.start();
 
-      return new LanceDataWriter(arrowReader, fragmentCreationTask, fragmentCreationThread);
+      return new LanceDataWriter(arrowWriter, fragmentCreationTask, fragmentCreationThread);
     }
   }
 }

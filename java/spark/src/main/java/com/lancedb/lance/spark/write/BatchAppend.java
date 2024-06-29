@@ -63,7 +63,7 @@ public class BatchAppend implements BatchWrite {
 
   @Override
   public String toString() {
-    return String.format("LanceBatchWrite(datasetUri=%s)", config.getTablePath());
+    return String.format("LanceBatchWrite(datasetUri=%s)", config.getDatasetUri());
   }
 
   public static class TaskCommit implements WriterCommitMessage {

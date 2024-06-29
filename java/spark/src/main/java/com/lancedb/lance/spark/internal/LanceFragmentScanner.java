@@ -46,7 +46,7 @@ public class LanceFragmentScanner implements AutoCloseable {
     DatasetFragment fragment = null;
     LanceScanner scanner = null;
     try {
-      dataset = Dataset.open(inputPartition.getConfig().getTablePath(), allocator);
+      dataset = Dataset.open(inputPartition.getConfig().getDatasetUri(), allocator);
       fragment = dataset.getFragments().get(fragmentId);
       ScanOptions.Builder scanOptions = new ScanOptions.Builder();
       scanOptions.columns(getColumnNames(inputPartition.getSchema()));

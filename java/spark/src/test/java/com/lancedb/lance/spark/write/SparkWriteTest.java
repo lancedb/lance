@@ -74,47 +74,47 @@ public class SparkWriteTest {
 
   @Test
   public void defaultWrite(TestInfo testInfo) {
-    String tableName = testInfo.getTestMethod().get().getName();
+    String datasetName = testInfo.getTestMethod().get().getName();
     testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath.toString(), tableName))
+        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .save();
 
-    validateData(tableName, 1);
+    validateData(datasetName, 1);
   }
 
   @Test
   public void errorIfExists(TestInfo testInfo) {
-    String tableName = testInfo.getTestMethod().get().getName();
+    String datasetName = testInfo.getTestMethod().get().getName();
     testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath.toString(), tableName))
+        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .save();
 
     assertThrows(TableAlreadyExistsException.class, () -> {
       testData.write().format(LanceDataSource.name)
-          .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath.toString(), tableName))
+          .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
           .save();
     });
   }
 
   @Test
   public void append(TestInfo testInfo) {
-    String tableName = testInfo.getTestMethod().get().getName();
+    String datasetName = testInfo.getTestMethod().get().getName();
     testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath.toString(), tableName))
+        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .save();
     testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath.toString(), tableName))
+        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .mode("append")
         .save();
-    validateData(tableName, 2);
+    validateData(datasetName, 2);
   }
 
   @Test
   public void appendErrorIfNotExist(TestInfo testInfo) {
-    String tableName = testInfo.getTestMethod().get().getName();
+    String datasetName = testInfo.getTestMethod().get().getName();
     assertThrows(NoSuchTableException.class, () -> {
       testData.write().format(LanceDataSource.name)
-          .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath.toString(), tableName))
+          .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
           .mode("append")
           .save();
     });
@@ -122,31 +122,31 @@ public class SparkWriteTest {
 
   @Test
   public void saveToPath(TestInfo testInfo) {
-    String tableName = testInfo.getTestMethod().get().getName();
+    String datasetName = testInfo.getTestMethod().get().getName();
     testData.write().format(LanceDataSource.name)
-        .save(LanceConfig.getTablePath(dbPath.toString(), tableName));
+        .save(LanceConfig.getDatasetUri(dbPath.toString(), datasetName));
 
-    validateData(tableName, 1);
+    validateData(datasetName, 1);
   }
 
   @Disabled("Do not support overwrite")
   @Test
   public void overwrite(TestInfo testInfo) {
-    String tableName = testInfo.getTestMethod().get().getName();
+    String datasetName = testInfo.getTestMethod().get().getName();
     testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath.toString(), tableName))
+        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .save();
     testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath.toString(), tableName))
+        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .mode("overwrite")
         .save();
 
-    validateData(tableName, 1);
+    validateData(datasetName, 1);
   }
 
-  private void validateData(String tableName, int iteration) {
+  private void validateData(String datasetName, int iteration) {
     Dataset<Row> data = spark.read().format("lance")
-        .option(LanceConfig.CONFIG_TABLE_PATH, LanceConfig.getTablePath(dbPath.toString(), tableName))
+        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .load();
 
     assertEquals(2 * iteration, data.count());
