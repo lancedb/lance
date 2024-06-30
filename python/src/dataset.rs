@@ -994,7 +994,16 @@ impl Dataset {
         operation: Operation,
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
+        storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
+        let object_store_params = if let Some(storage_options) = storage_options {
+            Some(ObjectStoreParams {
+                storage_options: Some(storage_options),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
         let commit_handler = commit_lock.map(|commit_lock| {
             Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
                 as Arc<dyn CommitHandler>
@@ -1008,8 +1017,14 @@ impl Dataset {
                 };
                 let manifest = dataset.as_ref().map(|ds| ds.manifest());
                 validate_operation(manifest, &operation.0)?;
-                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler)
-                    .await
+                LanceDataset::commit(
+                    dataset_uri,
+                    operation.0,
+                    read_version,
+                    object_store_params,
+                    commit_handler,
+                )
+                .await
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
