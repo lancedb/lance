@@ -996,14 +996,11 @@ impl Dataset {
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let object_store_params = if let Some(storage_options) = storage_options {
-            Some(ObjectStoreParams {
-                storage_options: Some(storage_options),
-                ..Default::default()
-            })
-        } else {
-            None
-        };
+        let object_store_params = storage_options.map(|storage_options| ObjectStoreParams {
+            storage_options: Some(storage_options),
+            ..Default::default()
+        });
+
         let commit_handler = commit_lock.map(|commit_lock| {
             Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
                 as Arc<dyn CommitHandler>
