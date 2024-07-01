@@ -16,6 +16,7 @@ use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
 use num_traits::Float;
+use prost::Message;
 use rayon::prelude::*;
 use snafu::{location, Location};
 use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADTA_KEY};
@@ -352,19 +353,22 @@ impl Quantization for ProductQuantizer {
     }
 
     fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
-        let args = args.unwrap_or_default();
-
-        let codebook_position = args.codebook_position.ok_or(Error::Index {
+        let codebook_position = match args {
+            Some(args) => args.codebook_position,
+            None => Some(0),
+        };
+        let codebook_position = codebook_position.ok_or(Error::Index {
             message: "codebook_position not found".to_owned(),
             location: location!(),
         })?;
+        let tensor = pb::Tensor::try_from(&self.codebook)?;
         Ok(serde_json::to_value(ProductQuantizationMetadata {
             codebook_position,
             num_bits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
-            codebook: args.codebook,
-            codebook_tensor: Vec::new(),
+            codebook: None,
+            codebook_tensor: tensor.encode_to_vec(),
         })?)
     }
 

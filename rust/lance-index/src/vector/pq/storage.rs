@@ -638,7 +638,7 @@ mod tests {
         let storage = create_pq_storage().await;
         assert_eq!(storage.len(), TOTAL);
         assert_eq!(storage.num_sub_vectors, NUM_SUB_VECTORS);
-        assert_eq!(storage.codebook.len(), 256 * DIM);
+        assert_eq!(storage.codebook.values().len(), 256 * DIM);
         assert_eq!(storage.pq_code.len(), TOTAL * NUM_SUB_VECTORS);
         assert_eq!(storage.row_ids.len(), TOTAL);
     }
