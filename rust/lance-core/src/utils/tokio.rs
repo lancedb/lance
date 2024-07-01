@@ -1,16 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::{sync::atomic::AtomicUsize, time::Duration};
+
 use crate::Result;
 
+use core_affinity::CoreId;
 use futures::{Future, FutureExt};
 use tokio::runtime::{Builder, Runtime};
 use tracing::Span;
 
 lazy_static::lazy_static! {
+    // TODO: handle systems with less than 2 cores
+    pub static ref IO_CORE_RESERVATION: usize = std::env::var("LANCE_IO_CORE_RESERVATION").unwrap_or("2".to_string()).parse().unwrap();
+
+    pub static ref CPU_RUNTIME_THREAD_START_COUNTER: AtomicUsize = AtomicUsize::new(*IO_CORE_RESERVATION);
+
     pub static ref CPU_RUNTIME: Runtime = Builder::new_multi_thread()
         .thread_name("lance-cpu")
-        .max_blocking_threads(num_cpus::get())
+        .max_blocking_threads(num_cpus::get() - *IO_CORE_RESERVATION - 1)
+        .worker_threads(1)
+        .on_thread_start(|| {
+            let id = CPU_RUNTIME_THREAD_START_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            core_affinity::set_for_current(CoreId{id});
+        })
+        // keep the thread alive "forever"
+        .thread_keep_alive(Duration::from_secs(u64::MAX))
         .build()
         .unwrap();
 }

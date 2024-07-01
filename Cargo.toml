@@ -151,6 +151,7 @@ url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 pretty_assertions = "1.4.0"
 zstd = "0.13.1"
+core_affinity = "~0.8"
 
 [profile.bench]
 opt-level = 3
