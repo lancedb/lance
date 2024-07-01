@@ -236,8 +236,8 @@ impl ScalarIndexExpr {
             }
             Self::Query(column, query) => {
                 let index = index_loader.load_index(column).await?;
-                let allow_list = index.search(query).await?;
-                let allow_list = RowIdTreeMap::from_iter(allow_list.values().iter());
+                let matching_row_ids = index.search(query).await?;
+                let allow_list = RowIdTreeMap::from_iter(matching_row_ids.values().iter());
                 Ok(RowIdMask {
                     block_list: None,
                     allow_list: Some(allow_list),

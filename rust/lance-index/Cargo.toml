@@ -60,13 +60,15 @@ clap = { workspace = true, features = ["derive"] }
 criterion.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
-pprof.workspace = true
 tempfile.workspace = true
 datafusion-sql.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
 rustc_version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof.workspace = true
 
 [[bench]]
 name = "find_partitions"

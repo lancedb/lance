@@ -37,7 +37,9 @@ use lance_index::{IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KE
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
+use object_store::path::Path;
 use snafu::{location, Location};
+use tempfile::tempdir;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -219,8 +221,8 @@ pub(crate) async fn build_vector_index(
         });
     };
 
-    let temp_dir = tempfile::tempdir()?;
-    let path = temp_dir.path().to_str().unwrap().into();
+    let temp_dir = tempdir()?;
+    let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     if is_ivf_flat(stages) {
         let StageParams::Ivf(ivf_params) = &stages[0] else {
             return Err(Error::Index {
@@ -229,7 +231,7 @@ pub(crate) async fn build_vector_index(
             });
         };
 
-        let shuffler = IvfShuffler::new(path, ivf_params.num_partitions);
+        let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
         IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
             dataset.clone(),
             column.to_owned(),
@@ -283,7 +285,7 @@ pub(crate) async fn build_vector_index(
             });
         };
 
-        let shuffler = IvfShuffler::new(path, ivf_params.num_partitions);
+        let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
         // with quantization
         if len > 2 {
             match stages.last().unwrap() {
