@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::RequestId;
 use aws_sdk_dynamodb::operation::{
     get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
     query::builders::QueryFluentBuilder,
@@ -44,7 +45,14 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WrappedSdkError: {}", self.0)
+        let request_id = self.0.request_id().unwrap_or("unknown");
+        let service_err = &self.0.raw_response();
+        write!(f, "WrappedSdkError: request_id: {}", request_id)?;
+        if let Some(err) = service_err {
+            write!(f, ", service_error: {:?}", err)
+        } else {
+            write!(f, ", no service error")
+        }
     }
 }
 

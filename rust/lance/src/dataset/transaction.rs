@@ -232,10 +232,10 @@ impl Transaction {
     /// Returns true if the transaction cannot be committed if the other
     /// transaction is committed first.
     pub fn conflicts_with(&self, other: &Self) -> bool {
-        // TODO: this assume IsolationLevel is Serializable, but we could also
-        // support Snapshot Isolation, which is more permissive. In particular,
-        // it would allow a Delete transaction to succeed after a concurrent
-        // Append, even if the Append added rows that would be deleted.
+        // This assumes IsolationLevel is Snapshot Isolation, which is more
+        // permissive than Serializable. In particular, it allows a Delete
+        // transaction to succeed after a concurrent Append, even if the Append
+        // added rows that would be deleted.
         match &self.operation {
             Operation::Append { .. } => match &other.operation {
                 // Append is compatible with anything that doesn't change the schema
@@ -295,6 +295,7 @@ impl Transaction {
                     self.operation.modifies_same_ids(&other.operation)
                 }
                 Operation::Project { .. } => false,
+                Operation::Append { .. } => false,
                 _ => true,
             },
             // Merge changes the schema, but preserves row ids, so the only operations
@@ -1174,7 +1175,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, false, true, true, false, false, true],
+                [false, false, false, true, true, false, false, true],
             ),
             (
                 Operation::Delete {
@@ -1183,7 +1184,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, true, true, true, true, false, true],
+                [false, false, true, true, true, true, false, true],
             ),
             (
                 Operation::Overwrite {
@@ -1239,12 +1240,12 @@ mod tests {
             ),
             (
                 Operation::Update {
-                    // Delete that affects same fragments as other transactions
+                    // Update that affects same fragments as other transactions
                     updated_fragments: vec![fragment0.clone()],
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2.clone()],
                 },
-                [true, false, true, true, true, true, false, true],
+                [false, false, true, true, true, true, false, true],
             ),
         ];
 
