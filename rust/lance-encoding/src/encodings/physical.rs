@@ -152,6 +152,8 @@ pub fn decoder_from_array_encoding(
         pb::array_encoding::ArrayEncoding::Fsst(fsst) => {
             let inner =
                 decoder_from_array_encoding(fsst.binary.as_ref().unwrap(), buffers, data_type);
+            
+            //println!("fsst header before decoding: {:?}", fsst.symbol_table[0..8].to_vec());
 
             Box::new(FsstPageScheduler::new(inner, fsst.symbol_table.clone()))
         }

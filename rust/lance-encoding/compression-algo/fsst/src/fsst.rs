@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-const FSST_MAGIC: u64 = 0x46535354 << 32; // "FSST"
+//const FSST_MAGIC: u64 = 0x46535354 << 32; // "FSST"
+const FSST_MAGIC: u64 = 0xFFFFFFFF << 32; // "FSST"
 const FSST_ESC: u8 = 255;
 const FSST_CODE_BITS: u16 = 9;
 // first 256 codes [0,255] are pseudo codes: escaped bytes
@@ -14,6 +15,7 @@ const FSST_CODE_MASK: u16 = FSST_CODE_MAX - 1;
 const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
 
+//const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
 const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
 
 const FSST_ICL_FREE: u64 = (8 << 28) | ((FSST_CODE_MASK as u64) << 16);
@@ -24,6 +26,8 @@ const FSST_SHIFT: usize = 15;
 const FSST_HASH: fn(u64) -> u64 =
     |w| (w.wrapping_mul(FSST_HASH_PRIME) ^ (w.wrapping_mul(FSST_HASH_PRIME)) >> FSST_SHIFT);
 const MAX_SYMBOL_LENGTH: usize = 8;
+
+pub const FSST_SYMBOL_TABLE_SIZE: usize = 8 + 256 * 8 + 256; // 8 bytes for the header, 256 symbols(8 bytes each), 256 bytes for lens 
 
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -90,11 +94,7 @@ impl Symbol {
     fn new() -> Self {
         Self {
             val: 0,
-<<<<<<< HEAD
             icl: FSST_ICL_FREE,
-=======
-            icl: FSST_ICL_FREE as u64,
->>>>>>> weston/feat/integrate-fsst-lance
         }
     }
 
@@ -802,6 +802,55 @@ fn decompress_bulk2(
     Ok(())
 }
 
+fn decompress_bulk3(
+    decoder: &FsstDecoder3,
+    compressed_strs: &[u8],
+    offsets: &[i32],
+    out: &mut Vec<u8>,
+    out_offsets: &mut Vec<i32>,
+    out_pos: &mut usize,
+    out_offsets_len: &mut usize,
+) -> io::Result<()> {
+    //println!("inside decompress_bulk3");
+    let symbols = decoder.symbols;
+    let lens = decoder.lens;
+    let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
+        let mut prev_esc = false;
+        while in_curr < in_end {
+            if prev_esc {
+                out[*out_curr] = compressed_strs[in_curr];
+                *out_curr += 1;
+                prev_esc = false;
+            } else {
+                let code = compressed_strs[in_curr];
+                if code == FSST_ESC {
+                    prev_esc = true;
+                } else {
+                    let s = symbols[code as usize];
+                    let len = lens[code as usize];
+                    out[*out_curr..*out_curr + len as usize]
+                        .copy_from_slice(&s.to_ne_bytes()[..len as usize]);
+                    *out_curr += len as usize;
+                }
+            }
+            in_curr += 1;
+        }
+    };
+    let mut out_curr = *out_pos;
+    out_offsets[0] = 0;
+    for i in 1..offsets.len() {
+        let in_curr = offsets[i - 1] as usize;
+        let in_end = offsets[i] as usize;
+        decompress(in_curr, in_end, &mut out_curr);
+        out_offsets[i] = out_curr as i32;
+    }
+    out.resize(out_curr, 0);
+    out_offsets.resize(offsets.len(), 0);
+    *out_pos = out_curr;
+    *out_offsets_len = offsets.len();
+    Ok(())
+}
+
 // use a struct so we can have many implementations based on cpu type
 struct FsstEncoder {
     symbol_table: Box<SymbolTable>,
@@ -904,6 +953,110 @@ impl FsstEncoder {
     }
 }
 
+struct FsstEncoder3 {
+    symbol_table: Box<SymbolTable>,
+    // when in_buf is less than FSST_LEAST_INPUT_SIZE, we simply copy the input to the output
+    encoder_switch: bool,
+}
+
+impl FsstEncoder3 {
+    fn new() -> Self {
+        Self {
+            symbol_table: Box::new(SymbolTable::new()),
+            encoder_switch: false,
+        }
+    }
+
+    fn init(
+        &mut self,
+        in_buf: &[u8],
+        in_offsets_buf: &[i32],
+        out_buf: &[u8],
+        _out_offsets_buf: &[i32],
+    ) -> io::Result<()> {
+        if in_buf.len() < FSST_LEAST_INPUT_SIZE {
+            return Ok(());
+        }
+
+        // currently, we make sure the compress output buffer has at least the same size as the input buffer,
+        // because I don't know a good way to estimate this yet
+        if in_buf.len() > out_buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output buffer too small for FSST encoder",
+            ));
+        }
+
+        self.encoder_switch = true;
+        let (sample, sample_offsets) = make_sample(in_buf, in_offsets_buf);
+        let st = build_symbol_table(sample, sample_offsets)?;
+        self.symbol_table = st;
+        Ok(())
+    }
+
+    fn export(&self, symbol_table_buf: &mut [u8]) -> io::Result<()> {
+        let st = &self.symbol_table;
+
+        
+        let st_info: u64 = FSST_MAGIC
+            | (self.encoder_switch as u64) << 24
+            | ((st.suffix_lim & 255) as u64) << 16
+            | ((st.terminator & 255) as u64) << 8
+            | ((st.n_symbols & 255) as u64);
+
+        let st_info_bytes = st_info.to_ne_bytes();
+        let mut pos = 0;
+        symbol_table_buf[pos..pos + st_info_bytes.len()].copy_from_slice(&st_info_bytes);
+
+        pos += st_info_bytes.len();
+
+        for i in 0..st.n_symbols as usize {
+            let s = st.symbols[i];
+            let s_bytes = s.val.to_ne_bytes();
+            symbol_table_buf[pos..pos + s_bytes.len()].copy_from_slice(&s_bytes);
+            pos += s_bytes.len();
+        }
+        for i in 0..st.n_symbols as usize {
+            let this_len = st.symbols[i].length();
+            symbol_table_buf[pos] = this_len as u8;
+            pos += 1;
+        }
+        Ok(())
+    }
+
+    fn compress(
+        &mut self,
+        in_buf: &[u8],
+        in_offsets_buf: &[i32],
+        out_buf: &mut Vec<u8>,
+        out_offsets_buf: &mut Vec<i32>,
+        symbol_table_buf: &mut [u8],
+    ) -> io::Result<()> {
+        self.init(in_buf, in_offsets_buf, out_buf, out_offsets_buf)?;
+        self.export(symbol_table_buf)?;
+
+        // if the input buffer is less than FSST_LEAST_INPUT_SIZE, we simply copy the input to the output
+        if !self.encoder_switch {
+            out_buf.resize(in_buf.len(), 0);
+            out_buf.copy_from_slice(in_buf);
+            out_offsets_buf.resize(in_offsets_buf.len(), 0);
+            out_offsets_buf.copy_from_slice(in_offsets_buf);
+            return Ok(());
+        }
+        let mut out_pos = 0;
+        let mut out_offsets_len = 0;
+        compress_bulk(
+            &self.symbol_table,
+            in_buf,
+            in_offsets_buf,
+            out_buf,
+            out_offsets_buf,
+            &mut out_pos,
+            &mut out_offsets_len,
+        )?;
+        Ok(())
+    }
+}
 // use a struct so we can have many implementations based on cpu type
 struct FsstDecoder {
     lens: [u8; 256],
@@ -940,7 +1093,6 @@ impl FsstDecoder {
                 "output buffer too small for FSST decoder",
             ));
         }
-        self.decoder_switch = true;
         let st_info = u64::from_ne_bytes(in_buf[*in_pos..*in_pos + 8].try_into().unwrap());
         if st_info & FSST_MAGIC != FSST_MAGIC {
             return Err(io::Error::new(
@@ -948,6 +1100,7 @@ impl FsstDecoder {
                 "the input buffer is not a valid FSST compressed data",
             ));
         }
+        self.decoder_switch = true;
         let symbol_num = (st_info & 255) as u8;
         *in_pos += 8;
         for i in 0..symbol_num as usize {
@@ -994,6 +1147,7 @@ impl FsstDecoder {
     }
 }
 
+
 pub fn compress(
     in_buf: &[u8],
     in_offsets_buf: &[i32],
@@ -1014,11 +1168,98 @@ pub fn decompress(
     Ok(())
 }
 
+struct FsstDecoder3 {
+    lens: [u8; 256],
+    symbols: [u64; 256],
+    decoder_switch_on: bool,
+}
+
+impl FsstDecoder3 {
+    fn new() -> Self {
+        Self {
+            lens: [0; 256],
+            symbols: [FSST_CORRUPT; 256],
+            decoder_switch_on: false,
+        }
+    }
+
+    fn init(&mut self, symbol_table: &[u8]) -> io::Result<()> {
+        let st_info = u64::from_ne_bytes(symbol_table[..8].try_into().unwrap());
+        if st_info & FSST_MAGIC != FSST_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the input buffer is not a valid FSST compressed data",
+            ));
+        }
+        self.decoder_switch_on = (st_info & (1 << 24)) != 0;
+        let symbol_num = (st_info & 255) as u8;
+        let mut pos = 8;
+        for i in 0..symbol_num as usize {
+            self.symbols[i] = fsst_unaligned_load_unchecked(symbol_table[pos..].as_ptr());
+            pos += 8;
+        }
+        for i in 0..symbol_num as usize {
+            self.lens[i] = symbol_table[pos];
+            pos += 1;
+        }
+        //println!("decoder_switch: {}", self.decoder_switch);
+        Ok(())
+    }
+
+    fn decompress(
+        &mut self,
+        in_buf: &[u8],
+        in_offsets_buf: &[i32],
+        out_buf: &mut Vec<u8>,
+        out_offsets_buf: &mut Vec<i32>,
+
+    ) -> io::Result<()> {
+        if !self.decoder_switch_on {
+            out_buf.resize(in_buf.len(), 0);
+            out_buf.copy_from_slice(in_buf);
+            out_offsets_buf.resize(in_offsets_buf.len(), 0);
+            out_offsets_buf.copy_from_slice(in_offsets_buf);
+            return Ok(());
+        }
+        let mut out_pos = 0;
+        let mut out_offsets_len = 0;
+        decompress_bulk3(
+            self,
+            in_buf,
+            in_offsets_buf,
+            out_buf,
+            out_offsets_buf,
+            &mut out_pos,
+            &mut out_offsets_len,
+        )?;
+        Ok(())
+    }
+}
+
+pub fn compress3(
+    in_buf: &[u8],
+    in_offsets_buf: &[i32],
+    out_buf: &mut Vec<u8>,
+    out_offsets_buf: &mut Vec<i32>,
+    symbol_table: &mut [u8],
+) -> io::Result<()> {
+    FsstEncoder3::new().compress(in_buf, in_offsets_buf, out_buf, out_offsets_buf, symbol_table)?;
+    //println!("inside fsst::compress3: in_buf.len(): {}, out_buf.len: {}, out_offsets_buf.len: {}", in_buf.len(), out_buf.len(), out_offsets_buf.len());
+    Ok(())
+}
+
+pub fn decompress3(symbol_table: &[u8], in_buf: &[u8], in_offsets_buf: &[i32], out_buf: &mut Vec<u8>, out_offsets_buf: &mut Vec<i32>) -> io::Result<()> {
+    let mut decoder = FsstDecoder3::new();
+    decoder.init(symbol_table)?;
+    decoder.decompress(in_buf, in_offsets_buf, out_buf, out_offsets_buf)?;
+    //println!("inside fsst::decompress3: in_buf.len: {}, in_offsets_buf.len: {}", in_buf.len(), in_offsets_buf.len());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow::array::StringArray;
-
     use crate::fsst::*;
+    use arrow::array::StringArray;
 
     const TEST_PARAGRAPH: &str = "ACT I. Scene I.
     Elsinore. A platform before the Castle.

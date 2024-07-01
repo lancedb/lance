@@ -87,31 +87,37 @@ impl PrimitivePageDecoder for FsstPageDecoder {
 
         // Need to adjust offsets to account for symbol table
         // TODO: Don't do this with a copy
+        /* 
         let mut compressed_offsets = Vec::with_capacity(offsets.len());
         compressed_offsets.extend(
             offsets
                 .iter()
                 .map(|val| *val + self.symbol_table.len() as i32),
         );
+        */
 
         // Need to insert symbol table back in front of compressed bytes
+        /* 
         let mut compressed_bytes = Vec::with_capacity(self.symbol_table.len() + bytes.len());
         compressed_bytes.extend_from_slice(&self.symbol_table);
         compressed_bytes.extend_from_slice(&bytes);
+        */
 
-        let mut decompressed_offsets = vec![0_i32; compressed_offsets.len()];
-        let mut decompressed_bytes = vec![0_u8; compressed_bytes.len() * 3];
+        let mut decompressed_offsets = vec![0_i32; offsets.len()];
+        let mut decompressed_bytes = vec![0_u8; bytes.len() * 5];
         // Safety: Exposes uninitialized memory but we're about to clobber it
         unsafe {
             decompressed_bytes.set_len(decompressed_bytes.capacity());
         }
-
-        fsst::fsst::decompress(
-            &compressed_bytes,
-            &compressed_offsets,
+        //println!("inside fsst page decoder");
+        fsst::fsst::decompress3(
+            &self.symbol_table,
+            &bytes,
+            &offsets,
             &mut decompressed_bytes,
             &mut decompressed_offsets,
         )?;
+        //println!("first string: {:?}", std::str::from_utf8(&decompressed_bytes[decompressed_offsets[0] as usize ..decompressed_offsets[1] as usize].to_vec()));
 
         // TODO: Change PrimitivePageDecoder to use Vec instead of BytesMut
         // since there is no way to get BytesMut from Vec but these copies should be avoidable
@@ -169,16 +175,20 @@ impl ArrayEncoder for FsstArrayEncoder {
 
         let mut dest_offsets = vec![0_i32; offsets.len() * 2];
         let mut dest_values = vec![0_u8; values.len() * 2];
+        let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
 
-        fsst::fsst::compress(
+        fsst::fsst::compress3(
             values.as_slice(),
-            &offsets,
+            offsets,
             &mut dest_values,
             &mut dest_offsets,
+            &mut symbol_table,
         )?;
-
+        //println!("fsst header after encoding: {:?}", symbol_table[0..8].to_vec());
+        /* 
         let symbol_table_num_bytes = dest_offsets[0] as usize;
         let symbol_table = dest_values[0..symbol_table_num_bytes].to_vec();
+        */
 
         let dest_array = Arc::new(BinaryArray::new(
             OffsetBuffer::new(ScalarBuffer::from(dest_offsets)),
@@ -213,7 +223,7 @@ mod tests {
             basic::BasicEncoder,
             binary::BinaryEncoder,
             value::{CompressionScheme, ValueEncoder},
-        },
+        }, testing::{check_round_trip_encoding_of_data, TestCases},
     };
 
     use super::FsstArrayEncoder;
@@ -241,4 +251,16 @@ mod tests {
 
         dbg!(encoded);
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_fsst() {
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(32), false))
+            .into_batch_rows(RowCount::from(1_000_000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default()).await;
+    }
+
 }
