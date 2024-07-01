@@ -28,6 +28,8 @@ use crate::{
     format::pb,
 };
 
+use std::cmp::min;
+
 /// An encoded buffer
 pub struct EncodedBuffer {
     /// Buffers that make up the encoded buffer
@@ -272,10 +274,13 @@ impl CoreArrayEncodingStrategy {
 
 // check whether we want to use dictionary encoding or not
 // by applying a threshold on cardinality
-// returns true if cardinality < 100
+// returns true if cardinality < min(100, num_total_rows)
 // The choice to use 100 is just a heuristic for now
 fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
     let mut unique_values = HashSet::new();
+
+    let num_total_rows = arrays.iter().map(|arr| arr.len()).sum::<usize>();
+    let thresh = min(100, num_total_rows);
 
     // Checking cardinality for elements in all arrays together.
     for arr in arrays.iter() {
@@ -284,7 +289,7 @@ fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
         for i in 0..arr_len {
             if !string_array.is_null(i) {
                 unique_values.insert(string_array.value(i));
-                if unique_values.len() >= 100 {
+                if unique_values.len() >= thresh {
                     return false;
                 }
             }
