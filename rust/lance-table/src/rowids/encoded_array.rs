@@ -8,7 +8,7 @@ use deepsize::DeepSizeOf;
 /// Encoded array of u64 values.
 ///
 /// This is a internal data type used as part of row id indices.
-#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf, Hash)]
 pub enum EncodedU64Array {
     /// u64 values represented as u16 offset from a base value.
     ///

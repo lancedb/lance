@@ -10,6 +10,7 @@ mod optimizer;
 mod planner;
 mod projection;
 mod pushdown_scan;
+mod rowids;
 pub mod scalar_index;
 mod scan;
 mod take;
@@ -19,7 +20,8 @@ pub mod utils;
 
 pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec, PreFilterSource};
 pub use planner::{FilterPlan, Planner};
-pub use projection::ProjectionExec;
+pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
+pub use rowids::RowAddrExpr;
 pub use scan::LanceScanExec;
 pub use take::TakeExec;

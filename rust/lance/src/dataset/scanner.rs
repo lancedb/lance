@@ -49,8 +49,8 @@ use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
-    knn::new_knn_exec, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec,
-    Planner, PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
+    knn::new_knn_exec, project, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
+    LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
@@ -1020,7 +1020,11 @@ impl Scanner {
         // Stage 6: physical projection -- reorder physical columns needed before final projection
         let output_arrow_schema = physical_schema.as_ref().into();
         if plan.schema().as_ref() != &output_arrow_schema {
-            plan = Arc::new(ProjectionExec::try_new(plan, physical_schema)?);
+            plan = Arc::new(project(
+                plan,
+                &None, // TODO,
+                &physical_schema,
+            )?);
         }
 
         // Stage 7: final projection
@@ -1033,6 +1037,9 @@ impl Scanner {
         }
 
         debug!("Execution plan:\n{:?}", plan);
+
+        // let display = DisplayableExecutionPlan::new(plan.as_ref());
+        // println!("{}", display.indent(true));
 
         Ok(plan)
     }
@@ -1181,7 +1188,7 @@ impl Scanner {
             // knn_node: _distance, _rowid, vector
             // topk_appended: vector, <filter columns?>, _rowid, _distance
             let new_schema = Schema::try_from(knn_node.schema().as_ref())?;
-            let topk_appended = ProjectionExec::try_new(topk_appended, new_schema.into())?;
+            let topk_appended = project(topk_appended, &None, &new_schema)?;
             assert_eq!(topk_appended.schema(), knn_node.schema());
             // union
             let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
@@ -1257,7 +1264,11 @@ impl Scanner {
             Arc::new(relevant_frags),
         ));
 
-        let taken = self.take(plan, projection, self.batch_readahead)?;
+        let plan = if !projection.fields.is_empty() {
+            self.take(plan, projection, self.batch_readahead)?
+        } else {
+            plan
+        };
 
         let new_data_path: Option<Arc<dyn ExecutionPlan>> = if !missing_frags.is_empty() {
             // If there is new data then we need this:
@@ -1293,17 +1304,18 @@ impl Scanner {
                 false,
             );
             let filtered = Arc::new(FilterExec::try_new(physical_refine_expr, new_data_scan)?);
-            let projection = Schema::try_from(taken.schema().as_ref())?;
-            Some(Arc::new(ProjectionExec::try_new(
+            let projection = Schema::try_from(plan.schema().as_ref())?;
+            Some(Arc::new(project(
                 filtered,
-                projection.into(),
+                &None, // TODO
+                &projection,
             )?))
         } else {
             None
         };
 
         if let Some(new_data_path) = new_data_path {
-            let unioned = UnionExec::new(vec![taken, new_data_path]);
+            let unioned = UnionExec::new(vec![plan, new_data_path]);
             // Enforce only 1 partition.
             let unioned = RepartitionExec::try_new(
                 Arc::new(unioned),
@@ -1311,7 +1323,7 @@ impl Scanner {
             )?;
             Ok(Arc::new(unioned))
         } else {
-            Ok(taken)
+            Ok(plan)
         }
     }
 
@@ -4201,6 +4213,19 @@ mod test {
         )
         .await?;
 
+        // Empty projection
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.filter("i > 10")
+                    .unwrap()
+                    .with_row_address()
+                    .project::<&str>(&[])
+            },
+            "MaterializeIndex: query=i > 10",
+        )
+        .await?;
+
         dataset.append_new_data().await?;
         assert_plan_equals(
             &dataset.dataset,
@@ -4213,6 +4238,23 @@ mod test {
       Projection: fields=[_rowid, s]
         FilterExec: i@1 > 10
           LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
+        )
+        .await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.filter("i > 10")
+                    .unwrap()
+                    .with_row_address()
+                    .project::<&str>(&[])
+            },
+            "RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+  UnionExec
+    MaterializeIndex: query=i > 10
+    Projection: fields=[_rowaddr]
+      FilterExec: i@1 > 10
+        LanceScan: uri=..., projection=[i], row_id=false, row_addr=true, ordered=false",
         )
         .await?;
 

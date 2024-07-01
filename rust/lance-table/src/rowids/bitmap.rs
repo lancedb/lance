@@ -3,7 +3,7 @@
 
 use deepsize::DeepSizeOf;
 
-#[derive(PartialEq, Eq, Clone, DeepSizeOf)]
+#[derive(PartialEq, Eq, Clone, DeepSizeOf, Hash)]
 pub struct Bitmap {
     pub data: Vec<u8>,
     pub len: usize,
