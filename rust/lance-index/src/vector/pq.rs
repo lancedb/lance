@@ -70,11 +70,13 @@ impl ProductQuantizer {
     }
 
     pub fn from_proto(proto: &pb::Pq, distance_type: DistanceType) -> Result<Self> {
-        let tensor = proto.codebook_tensor.as_ref().ok_or(Error::Index {
-            message: "codebook tensor not found".to_owned(),
-            location: location!(),
-        })?;
-        let codebook = FixedSizeListArray::try_from(tensor)?;
+        let codebook = match proto.codebook_tensor.as_ref() {
+            Some(tensor) => FixedSizeListArray::try_from(tensor)?,
+            None => FixedSizeListArray::try_new_from_values(
+                Float32Array::from(proto.codebook.clone()),
+                proto.dimension as i32,
+            )?,
+        };
         Ok(Self {
             num_bits: proto.num_bits,
             num_sub_vectors: proto.num_sub_vectors as usize,
