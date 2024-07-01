@@ -238,7 +238,7 @@ impl CoreArrayEncodingStrategy {
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
-                    Self::array_encoder_from_type(inner.data_type(), false)?,
+                    Self::array_encoder_from_type(inner.data_type(), use_dict_encoding)?,
                     *dimension as u32,
                 )))))
             }
@@ -280,10 +280,10 @@ fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
     // Checking cardinality for elements in all arrays together.
     for arr in arrays.iter() {
         let string_array = arrow_array::cast::as_string_array(arr);
-        for i in 0..string_array.len() {
+        let arr_len = string_array.len();
+        for i in 0..arr_len {
             if !string_array.is_null(i) {
                 unique_values.insert(string_array.value(i));
-                // let key_exists = arr_hashmap.insert(string_array.value(i), curr_dict_index);
                 if unique_values.len() >= 100 {
                     return false;
                 }

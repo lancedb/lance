@@ -169,6 +169,5 @@ pub fn decoder_from_array_encoding(
         //
         // This will change in the future when we add support for struct nullability.
         pb::array_encoding::ArrayEncoding::Struct(_) => unreachable!(),
-        // pb::array_encoding::ArrayEncoding::Dictionary(_) => unreachable!()
     }
 }

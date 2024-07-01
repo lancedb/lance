@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::builder::{ArrayBuilder, StringBuilder};
 use arrow_array::types::UInt8Type;
 use arrow_array::{Array, ArrayRef, DictionaryArray, StringArray, UInt8Array};
 use futures::{future::BoxFuture, FutureExt};
@@ -87,13 +88,7 @@ impl PageScheduler for DictionaryPageScheduler {
             // Decode all items
             let drained_task = primitive_wrapper.drain(copy_size)?;
             let items_decode_task = drained_task.task;
-            let mut decoded_dict = items_decode_task.decode()?;
-
-            // For the case where the dictionary is encoded as a single null element
-            // Reset it to be an empty string array
-            if decoded_dict.len() == 1 && decoded_dict.is_null(0) {
-                decoded_dict = Arc::new(StringArray::from(Vec::<Option<String>>::new()));
-            }
+            let decoded_dict = items_decode_task.decode()?;
 
             let indices_decoder: Box<dyn PrimitivePageDecoder> = indices_page_decoder.await?;
 
@@ -147,10 +142,9 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
         let string_array = arrow_cast::cast(&dict_array, &DataType::Utf8).unwrap();
         let string_array = string_array.as_any().downcast_ref::<StringArray>().unwrap();
 
-        // This is not ideal, since we go from DictionaryArray -> StringArray -> buffers (BytesMut)
-        // and later in primitive_array_from_buffers() we will go from buffers -> StringArray again.
-        // Creating the BytesMut is an unnecessary copy.
-        // But it is the best we can do in the current structure
+        // This workflow is not ideal, since we go from DictionaryArray -> StringArray -> nulls, offsets, and bytes buffers (BytesMut)
+        // and later in primitive_array_from_buffers() we will go from nulls, offsets, and bytes buffers -> StringArray again.
+        // Creating the BytesMut is an unnecessary copy. But it is the best we can do in the current structure
         let null_buffer = string_array
             .nulls()
             .map(|n| BytesMut::from(n.buffer().as_slice()))
@@ -160,7 +154,7 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
 
         // Empty buffer for nulls of bytes
         let empty_buffer = BytesMut::new();
-        // let bytes_buffer = string_array.values().as_slice().into();
+
         let bytes_buffer = BytesMut::from_iter(string_array.values().iter().copied());
 
         Ok(vec![
@@ -194,37 +188,37 @@ impl DictionaryEncoder {
     }
 }
 
-fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
+fn encode_dict_indices_and_items(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
     let mut arr_hashmap: HashMap<&str, u8> = HashMap::new();
+    // We start with a dict index of 1 because the value 0 is reserved for nulls
+    // The dict indices are adjusted by subtracting 1 later during decode
     let mut curr_dict_index = 1;
     let total_capacity = arrays.iter().map(|arr| arr.len()).sum();
 
-    let mut dict_indices = vec![0; total_capacity];
-    let mut indices_ctr = 0;
-    let mut dict_elements = Vec::new();
+    let mut dict_indices = Vec::with_capacity(total_capacity);
+    let mut dict_builder = StringBuilder::new();
 
     for arr in arrays.iter() {
         let string_array = arrow_array::cast::as_string_array(arr);
 
         for i in 0..string_array.len() {
             if !string_array.is_valid(i) {
-                indices_ctr += 1;
+                // null value
+                dict_indices.push(0);
                 continue;
             }
 
             let st = string_array.value(i);
 
             let hashmap_entry = *arr_hashmap.entry(st).or_insert(curr_dict_index);
-            dict_indices[indices_ctr] = hashmap_entry;
+            dict_indices.push(hashmap_entry);
 
             // if item didn't exist in the hashmap, add it to the dictionary
             // and increment the dictionary index
             if hashmap_entry == curr_dict_index {
-                dict_elements.push(st);
+                dict_builder.append_value(st);
                 curr_dict_index += 1;
             }
-
-            indices_ctr += 1;
         }
     }
 
@@ -234,19 +228,19 @@ fn get_indices_items_from_arrays(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
     // Either there is an array of nulls or an empty array altogether
     // In this case create the dictionary with a single null element
     // Because decoding [] is not currently supported by the binary decoder
-    // We will remove this null element later during decoding
-    let array_dict_elements: ArrayRef = if dict_elements.is_empty() {
-        Arc::new(StringArray::from(vec![Option::<&str>::None]))
-    } else {
-        Arc::new(StringArray::from(dict_elements)) as ArrayRef
-    };
+    if dict_builder.is_empty() {
+        dict_builder.append_option(Option::<&str>::None);
+    }
+
+    let dict_elements = dict_builder.finish();
+    let array_dict_elements = arrow_cast::cast(&dict_elements, &DataType::Utf8).unwrap();
 
     (array_dict_indices, array_dict_elements)
 }
 
 impl ArrayEncoder for DictionaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let (index_array, items_array) = get_indices_items_from_arrays(arrays);
+        let (index_array, items_array) = encode_dict_indices_and_items(arrays);
 
         let encoded_indices = self
             .indices_encoder
@@ -290,7 +284,7 @@ pub mod tests {
         check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
     };
 
-    use super::get_indices_items_from_arrays;
+    use super::encode_dict_indices_and_items;
 
     #[test]
     fn test_encode_dict_nulls() {
@@ -299,7 +293,7 @@ pub mod tests {
         let string_array2 = Arc::new(StringArray::from(vec![Some("bar"), None, Some("foo")]));
         let string_array3 = Arc::new(StringArray::from(vec![None as Option<&str>, None]));
         let (dict_indices, dict_items) =
-            get_indices_items_from_arrays(&[string_array1, string_array2, string_array3]);
+            encode_dict_indices_and_items(&[string_array1, string_array2, string_array3]);
 
         let expected_indices = Arc::new(UInt8Array::from(vec![0, 1, 2, 2, 0, 1, 0, 0])) as ArrayRef;
         let expected_items = Arc::new(StringArray::from(vec!["foo", "bar"])) as ArrayRef;
