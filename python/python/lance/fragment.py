@@ -147,6 +147,7 @@ class LanceFragment(pa.dataset.Fragment):
         mode: str = "append",
         *,
         use_legacy_format=True,
+        storage_options: Optional[Dict[str, str]] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -180,6 +181,9 @@ class LanceFragment(pa.dataset.Fragment):
         use_legacy_format: bool, default True
             Use the legacy format to write Lance files. The default is True
             while the v2 format is still in beta.
+        storage_options : optional, dict
+            Extra options that make sense for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
 
         See Also
         --------
@@ -219,6 +223,7 @@ class LanceFragment(pa.dataset.Fragment):
             progress=progress,
             mode=mode,
             use_legacy_format=use_legacy_format,
+            storage_options=storage_options,
         )
         return FragmentMetadata(inner_meta.json())
 

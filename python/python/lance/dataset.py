@@ -1589,6 +1589,7 @@ class LanceDataset(pa.dataset.Dataset):
         operation: LanceOperation.BaseOperation,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
+        storage_options: Optional[Dict[str, str]] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -1623,6 +1624,9 @@ class LanceDataset(pa.dataset.Dataset):
         commit_lock : CommitLock, optional
             A custom commit lock.  Only needed if your object store does not support
             atomic commits.  See the user guide for more details.
+        storage_options : optional, dict
+            Extra options that make sense for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
 
         Returns
         -------
@@ -1660,8 +1664,14 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
-        return LanceDataset(base_uri)
+        _Dataset.commit(
+            base_uri,
+            operation._to_inner(),
+            read_version,
+            commit_lock,
+            storage_options=storage_options,
+        )
+        return LanceDataset(base_uri, storage_options=storage_options)
 
     def validate(self):
         """

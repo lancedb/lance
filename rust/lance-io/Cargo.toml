@@ -48,12 +48,14 @@ async-priority-channel = "0.2.0"
 [dev-dependencies]
 criterion.workspace = true
 parquet.workspace = true
-pprof.workspace = true
 tempfile.workspace = true
 mockall.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof.workspace = true
 
 [[bench]]
 name = "scheduler"
