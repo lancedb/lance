@@ -31,7 +31,7 @@ use super::{bitmap::Bitmap, encoded_array::EncodedU64Array};
 /// Size of SortedArray for N values (assuming u16 packed):
 ///     8 bytes + 8 bytes + 8 bytes + 2 bytes * N
 ///
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum U64Segment {
     /// A contiguous sorted range of row ids.
     ///
