@@ -17,9 +17,14 @@ async fn main() {
     let args = env::args().collect::<Vec<String>>();
     let uri = args[1].clone();
     let column = args[2].clone();
-    let concurrency = args[3].parse::<usize>().unwrap();
 
-    let dataset = Arc::new(DatasetBuilder::from_uri(uri).with_index_cache_size(10000).load().await.unwrap());
+    let dataset = Arc::new(
+        DatasetBuilder::from_uri(uri)
+            .with_index_cache_size(10000)
+            .load()
+            .await
+            .unwrap(),
+    );
 
     println!("Start benchmarking");
     for _ in 0..5 {
@@ -35,44 +40,52 @@ async fn main() {
     }
     println!("Finished warmup");
 
-    let mut acc = 0.0;
-    let batch_size = 100;
+    for concurrency in 1..=32 {
+        println!("running test for concurrency: {}", concurrency);
+        let mut stream = stream::repeat(dataset.clone())
+            .map(|d| {
+                let col = column.clone();
+                async move {
+                    let start = std::time::Instant::now();
+                    d.scan()
+                        .nearest(&col, &random_vector(512), 1)
+                        .unwrap()
+                        .nprobs(4)
+                        // .filter("year >= 2010 AND year < 2020")
+                        // .unwrap()
+                        .prefilter(true)
+                        .project(&["id"])
+                        .unwrap()
+                        .try_into_batch()
+                        .await
+                        .unwrap();
+                    let elapsed = start.elapsed();
+                    elapsed
+                }
+            })
+            .map(|f| tokio::spawn(f))
+            .buffer_unordered(concurrency);
 
-    let mut stream = stream::repeat(dataset)
-        .map(|d| {
-            let col = column.clone();
-
-            async move {
-                let start = std::time::Instant::now();
-                d.scan()
-                    .nearest(&col, &random_vector(512), 1)
-                    .unwrap()
-                    .nprobs(4)
-                    // .filter("year >= 2010 AND year < 2020")
-                    // .unwrap()
-                    .prefilter(true)
-                    .project(&["id"])
-                    .unwrap()
-                    .try_into_batch()
-                    .await
-                    .unwrap();
-                let elapsed = start.elapsed();
-                elapsed
+        let mut acc = Vec::with_capacity(10000);
+        let mut counter = 0;
+        while let Some(elapsed) = stream.next().await {
+            counter += 1;
+            // skip the first 100 runs
+            if counter < 100 * concurrency {
+                continue;
             }
-        })
-        .map(|f| tokio::spawn(f))
-        .buffer_unordered(concurrency);
+            acc.push(elapsed.unwrap().as_micros());
+        }
 
-    let mut counter = 0;
-    while let Some(elapsed) = stream.next().await {
-        acc += elapsed.unwrap().as_secs_f64();
-        counter += 1;
-        if counter % batch_size == 0 {
-            println!("Avg latency: {:.2} ms", acc / batch_size as f64 * 1000.0);
-            acc = 0.0;
-        }
-        if counter == 10000 * concurrency {
-            break;
-        }
+        acc.sort_unstable();
+        let p50 = acc[acc.len() / 2];
+        let p90 = acc[(acc.len() as f64 * 0.9) as usize];
+        let p99 = acc[(acc.len() as f64 * 0.99) as usize];
+        let p999 = acc[(acc.len() as f64 * 0.999) as usize];
+        let avg = acc.iter().sum::<u128>() / acc.len() as u128;
+        println!(
+            "{}, {}, {}, {}, {}, {}",
+            concurrency, p50, p90, p99, p999, avg
+        );
     }
 }
