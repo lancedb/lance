@@ -1031,7 +1031,7 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
 ///
 /// Visibility: pub(super) for testing
 #[instrument(level = "debug", skip_all, name = "build_ivf_model")]
-pub(super) async fn build_ivf_model(
+pub async fn build_ivf_model(
     dataset: &Dataset,
     column: &str,
     dim: usize,

@@ -57,6 +57,7 @@ pub(crate) mod error;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
+pub(crate) mod indices;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;
@@ -74,6 +75,7 @@ pub use dataset::write_dataset;
 pub use dataset::{Dataset, Operation};
 pub use fragment::FragmentMetadata;
 use fragment::{DataFile, FileFragment};
+pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
 
@@ -148,6 +150,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
+    register_indices(py, m)?;
     Ok(())
 }
 
