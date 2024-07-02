@@ -325,6 +325,7 @@ impl<S: IvfSubIndex, Q: Quantization + Clone> IvfIndexBuilder<S, Q> {
 mod tests {
     use std::{collections::HashMap, ops::Range, sync::Arc};
 
+    use arrow::datatypes::Float32Type;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
@@ -349,7 +350,7 @@ mod tests {
         test_uri: &str,
         range: Range<f32>,
     ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range(1000 * DIM, range);
+        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();

@@ -438,7 +438,7 @@ mod tests {
         test_uri: &str,
         range: Range<f32>,
     ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range(1000 * DIM, range);
+        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
@@ -468,7 +468,7 @@ mod tests {
 
         let (dataset, _) = generate_dataset(test_uri, 100.0..120.0).await;
 
-        let centroids = generate_random_array_with_range(4 * DIM, -1.0..1.0);
+        let centroids = generate_random_array_with_range::<Float32Type>(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
         let ivf = Ivf::new(fsl);
         let params = PQBuildParams::new(16, 8);
