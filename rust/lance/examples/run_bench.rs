@@ -62,7 +62,7 @@ async fn main() {
     while let Some(elapsed) = stream.next().await {
         acc += elapsed.unwrap().as_secs_f64();
         counter += 1;
-        if counter % batch_size == 0{
+        if counter % batch_size == 0 {
             println!("Avg latency: {:.2} ms", acc / batch_size as f64 * 1000.0);
             acc = 0.0;
         }
