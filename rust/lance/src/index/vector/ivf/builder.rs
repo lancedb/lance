@@ -36,7 +36,7 @@ pub(super) async fn build_partitions(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: &mut IvfModel,
-    pq: Arc<dyn ProductQuantizer>,
+    pq: ProductQuantizer,
     metric_type: MetricType,
     part_range: Range<u32>,
     precomputed_partitons: Option<HashMap<u64, u32>>,
