@@ -38,7 +38,6 @@ async fn main() {
     let batch_size = 100;
 
     let mut stream = stream::repeat(dataset)
-        .take(10000 * concurrency)
         .map(|d| {
             let col = column.clone();
 
@@ -62,8 +61,11 @@ async fn main() {
     while let Some(elapsed) = stream.next().await {
         acc += elapsed.unwrap().as_secs_f64();
         counter += 1;
-        if counter == batch_size {
+        if counter % batch_size == 0{
             println!("Avg latency: {:.2} ms", acc / batch_size as f64 * 1000.0);
+        }
+        if counter == 10000 * concurrency {
+            break;
         }
     }
 }
