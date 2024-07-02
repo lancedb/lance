@@ -45,7 +45,7 @@ async fn main() {
             async move {
                 let start = std::time::Instant::now();
                 d.scan()
-                    .nearest(&col, &random_vector(512), 100)
+                    .nearest(&col, &random_vector(512), 1)
                     .unwrap()
                     .nprobs(20)
                     .filter("year >= 2010 AND year < 2020")
