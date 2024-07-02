@@ -75,6 +75,9 @@ async fn main() {
                 continue;
             }
             acc.push(elapsed.unwrap().as_micros());
+            if acc.len() == 10000 {
+                break;
+            }
         }
 
         acc.sort_unstable();
