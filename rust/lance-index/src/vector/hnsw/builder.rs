@@ -590,10 +590,6 @@ impl IvfSubIndex for HNSW {
         })
     }
 
-    fn use_residual() -> bool {
-        false
-    }
-
     fn name() -> &'static str {
         HNSW_TYPE
     }

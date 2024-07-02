@@ -15,7 +15,7 @@ use lance_linalg::{
 
 /// Train KMeans model and returns the centroids of each cluster.
 #[allow(clippy::too_many_arguments)]
-pub async fn train_kmeans<T: ArrowFloatType>(
+pub fn train_kmeans<T: ArrowFloatType>(
     array: &T::ArrayType,
     dimension: usize,
     k: usize,

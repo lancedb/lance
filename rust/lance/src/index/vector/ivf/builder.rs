@@ -17,7 +17,6 @@ use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
     ivf::shuffler::shuffle_dataset,
-    pq::ProductQuantizer,
 };
 use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::MetricType;
@@ -36,7 +35,6 @@ pub(super) async fn build_partitions(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: &mut IvfModel,
-    pq: ProductQuantizer,
     metric_type: MetricType,
     part_range: Range<u32>,
     precomputed_partitons: Option<HashMap<u64, u32>>,
@@ -62,7 +60,6 @@ pub(super) async fn build_partitions(
         ivf.centroids.clone().unwrap(),
         metric_type,
         column,
-        pq.clone(),
         Some(part_range),
     );
 

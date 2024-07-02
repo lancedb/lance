@@ -50,6 +50,7 @@ use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tracing::instrument;
 
+use crate::index::vector::builder::index_type_string;
 use crate::{
     index::{vector::VectorIndex, PreFilter},
     session::Session,
@@ -246,7 +247,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     ///
     /// Internal API with no stability guarantees.
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
-        if S::use_residual() {
+        if Q::use_residual(self.distance_type) {
             let partition_centroids =
                 self.ivf
                     .centroid(partition_id)
@@ -291,18 +292,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
 
-        let index_type = match self.sub_index_type() {
-            (sub_index_type, QuantizationType::Flat) => format!("IVF_{}", sub_index_type), // ignore FLAT quantization
-            (sub_index_type, quantization_type) => {
-                if sub_index_type.to_string() == quantization_type.to_string() {
-                    // ignore redundant quantization type
-                    // e.g. IVF_PQ_PQ should be IVF_PQ
-                    format!("IVF_{}", sub_index_type)
-                } else {
-                    format!("IVF_{}_{}", sub_index_type, quantization_type)
-                }
-            }
-        };
+        let (sub_index_type, quantization_type) = self.sub_index_type();
+        let index_type = index_type_string(sub_index_type, quantization_type);
         let mut sub_index_stats: serde_json::Value =
             serde_json::from_str(self.sub_index_metadata[0].as_str())?;
         sub_index_stats["index_type"] = S::name().into();
@@ -480,6 +471,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
@@ -540,22 +532,13 @@ mod tests {
         dists
     }
 
-    #[tokio::test]
-    async fn test_build_ivf_flat() {
+    async fn test_index(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let (mut dataset, vectors) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
-        let nlist = 16;
-        let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
         dataset
-            .create_index(
-                &["vector"],
-                lance_index::IndexType::Vector,
-                None,
-                &params,
-                true,
-            )
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
 
@@ -595,7 +578,7 @@ mod tests {
 
         let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 1.0,
+            recall >= recall_requirement,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,
@@ -603,13 +586,34 @@ mod tests {
         );
     }
 
-    async fn test_create_ivf_hnsw_sq(distance_type: DistanceType) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+    #[tokio::test]
+    async fn test_build_ivf_flat() {
+        let nlist = 16;
+        let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
+        test_index(params, nlist, 1.0).await;
+    }
 
+    #[tokio::test]
+    async fn test_build_ivf_pq_l2() {
         let nlist = 4;
-        let (mut dataset, vectors) = generate_test_dataset(test_uri, 0.0..1.0).await;
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        test_index(params, nlist, 0.9).await;
+    }
 
+    #[tokio::test]
+    async fn test_build_ivf_pq_cosine() {
+        let nlist = 4;
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::default();
+        let params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::Cosine, ivf_params, pq_params);
+        test_index(params, nlist, 0.6).await;
+    }
+
+    async fn test_create_ivf_hnsw_sq(distance_type: DistanceType) {
+        let nlist = 4;
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
@@ -619,54 +623,7 @@ mod tests {
             hnsw_params,
             sq_params,
         );
-
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, true)
-            .await
-            .unwrap();
-
-        let query = vectors.value(0);
-        let k = 100;
-        let result = dataset
-            .scan()
-            .nearest("vector", query.as_primitive::<Float32Type>(), k)
-            .unwrap()
-            .nprobs(nlist)
-            .with_row_id()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        let row_ids = result[ROW_ID]
-            .as_primitive::<UInt64Type>()
-            .values()
-            .to_vec();
-        let dists = result[DIST_COL]
-            .as_primitive::<Float32Type>()
-            .values()
-            .to_vec();
-        let results = dists
-            .into_iter()
-            .zip(row_ids.into_iter())
-            .collect::<Vec<_>>();
-        let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
-
-        let gt = ground_truth(
-            &vectors,
-            query.as_primitive::<Float32Type>().values(),
-            k,
-            distance_type,
-        );
-        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
-
-        let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
-        assert!(
-            recall >= 0.9,
-            "recall: {}\n results: {:?}\n\ngt: {:?}",
-            recall,
-            results,
-            gt,
-        );
+        test_index(params, nlist, 0.9).await;
     }
 
     #[tokio::test]
@@ -677,6 +634,30 @@ mod tests {
     #[tokio::test]
     async fn test_create_ivf_hnsw_sq_dot() {
         test_create_ivf_hnsw_sq(DistanceType::Dot).await
+    }
+
+    async fn test_create_ivf_hnsw_pq(distance_type: DistanceType) {
+        let nlist = 4;
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+            distance_type,
+            ivf_params,
+            hnsw_params,
+            pq_params,
+        );
+        test_index(params, nlist, 0.9).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_pq_l2() {
+        test_create_ivf_hnsw_pq(DistanceType::L2).await
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_pq_cosine() {
+        test_create_ivf_hnsw_pq(DistanceType::Cosine).await
     }
 
     #[tokio::test]
