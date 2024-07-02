@@ -34,6 +34,9 @@ async fn main() {
     }
     println!("Finished warmup");
 
+    let mut acc = 0.0;
+    let batch_size = 100;
+
     let mut stream = stream::repeat(dataset)
         .take(10000 * concurrency)
         .map(|d| {
@@ -55,7 +58,12 @@ async fn main() {
         .map(|f| tokio::spawn(f))
         .buffer_unordered(concurrency);
 
+    let mut counter = 0;
     while let Some(elapsed) = stream.next().await {
-        println!("{:?}", elapsed.unwrap());
+        acc += elapsed.unwrap().as_secs_f64();
+        counter += 1;
+        if counter == batch_size {
+            println!("Avg latency: {:.2} ms", acc / batch_size as f64 * 1000.0);
+        }
     }
 }
