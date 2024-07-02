@@ -1,6 +1,6 @@
 [profile.release]
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 
 [profile.release-with-debug]
 inherits = "release"

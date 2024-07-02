@@ -769,7 +769,7 @@ impl VectorIndex for IVFIndex {
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
             .map(|part_id| self.search_in_partition(part_id as usize, &query, pre_filter.clone()))
-            .buffer_unordered(num_cpus::get())
+            .buffer_unordered(4)
             .try_collect::<Vec<_>>()
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
