@@ -64,6 +64,7 @@ async fn main() {
         counter += 1;
         if counter % batch_size == 0{
             println!("Avg latency: {:.2} ms", acc / batch_size as f64 * 1000.0);
+            acc = 0.0;
         }
         if counter == 10000 * concurrency {
             break;
