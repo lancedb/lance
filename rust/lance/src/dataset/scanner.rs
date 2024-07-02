@@ -125,7 +125,7 @@ pub struct Scanner {
     dataset: Arc<Dataset>,
 
     /// The physical schema (before dynamic projection) that must be loaded from the table
-    phyical_columns: Schema,
+    physical_columns: Schema,
 
     /// The expressions for all the columns to be in the output
     /// Note: this doesn't include _distance, and _rowid
@@ -179,6 +179,14 @@ pub struct Scanner {
 
     /// If set, this scanner serves only these fragments.
     fragments: Option<Vec<Fragment>>,
+
+    /// Only search the data being indexed (weak consistency search).
+    ///
+    /// Default value is false.
+    ///
+    /// This is essentially a weak consistency search. Users can run index or optimize index
+    /// to make the index catch up with the latest data.
+    fast_search: bool,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -194,7 +202,7 @@ impl Scanner {
 
         Self {
             dataset,
-            phyical_columns: projection,
+            physical_columns: projection,
             requested_output_expr: None,
             prefilter: false,
             filter: None,
@@ -210,6 +218,7 @@ impl Scanner {
             with_row_address: false,
             ordered: true,
             fragments: None,
+            fast_search: false,
         }
     }
 
@@ -297,7 +306,10 @@ impl Scanner {
             }
             output.insert(output_name.as_ref().to_string(), expr);
         }
-        self.phyical_columns = self.dataset.schema().project(&physical_cols)?;
+
+        let physical_schema = self.physical_schema(true)?;
+        let schema_with_meta_columns = self.dataset.schema().merge(physical_schema.as_ref())?;
+        self.physical_columns = schema_with_meta_columns.project(&physical_cols)?;
 
         let mut output_cols = vec![];
         for (name, _) in columns {
@@ -497,6 +509,19 @@ impl Scanner {
         self
     }
 
+    /// Only search the data being indexed.
+    ///
+    /// Default value is false.
+    ///
+    /// This is essentially a weak consistency search, only on the indexed data.
+    pub fn fast_search(&mut self) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.use_index = true;
+        }
+        self.fast_search = true;
+        self
+    }
+
     /// Apply a refine step to the vector search.
     ///
     /// A refine improves query accuracy but also makes search slower, by reading extra elements
@@ -582,20 +607,14 @@ impl Scanner {
     }
 
     /// The schema of the Scanner from lance physical takes
-    pub(crate) fn physical_schema(&self) -> Result<Arc<Schema>> {
+    pub(crate) fn physical_schema(&self, in_projection: bool) -> Result<Arc<Schema>> {
         let mut extra_columns = vec![];
 
-        if let Some(q) = self.nearest.as_ref() {
-            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::io(
-                format!("Column {} not found", q.column),
-                location!(),
-            ))?;
-            let vector_field = ArrowField::from(vector_field);
-            extra_columns.push(vector_field);
+        if self.nearest.as_ref().is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
 
-        if self.with_row_id {
+        if self.with_row_id || in_projection {
             extra_columns.push(ROW_ID_FIELD.clone());
         }
 
@@ -604,10 +623,10 @@ impl Scanner {
         }
 
         let schema = if !extra_columns.is_empty() {
-            self.phyical_columns
+            self.physical_columns
                 .merge(&ArrowSchema::new(extra_columns))?
         } else {
-            self.phyical_columns.clone()
+            self.physical_columns.clone()
         };
 
         // drop metadata
@@ -625,7 +644,7 @@ impl Scanner {
     }
 
     pub(crate) fn output_expr(&self) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-        let physical_schema = self.physical_schema()?;
+        let physical_schema = self.physical_schema(false)?;
 
         // reset the id ordering becuase we will take the batch after projection
         let physical_schema = ArrowSchema::new(
@@ -638,7 +657,7 @@ impl Scanner {
         let df_schema = Arc::new(DFSchema::try_from(physical_schema.clone())?);
 
         let project_star = self
-            .phyical_columns
+            .physical_columns
             .fields
             .iter()
             .map(|f| {
@@ -669,17 +688,17 @@ impl Scanner {
         let mut output_expr = output_expr.unwrap_or(Ok(project_star))?;
 
         // distance goes before the row_id column
-        if self.nearest.is_some() {
+        if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
             let vector_expr = expressions::col(DIST_COL, &physical_schema)?;
             output_expr.push((vector_expr, DIST_COL.to_string()));
         }
 
-        if self.with_row_id {
+        if self.with_row_id && output_expr.iter().all(|(_, name)| name != ROW_ID) {
             let row_id_expr = expressions::col(ROW_ID, &physical_schema)?;
             output_expr.push((row_id_expr, ROW_ID.to_string()));
         }
 
-        if self.with_row_address {
+        if self.with_row_address && output_expr.iter().all(|(_, name)| name != ROW_ADDR) {
             let row_addr_expr = expressions::col(ROW_ADDR, &physical_schema)?;
             output_expr.push((row_addr_expr, ROW_ADDR.to_string()));
         }
@@ -808,7 +827,7 @@ impl Scanner {
     ///     -> Take(remaining_cols) -> Projection()
     /// ```
     ///
-    /// In general, a plan has 4 stages:
+    /// In general, a plan has 5 stages:
     ///
     /// 1. Source (from dataset Scan or from index, may include prefilter)
     /// 2. Filter
@@ -816,7 +835,7 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.phyical_columns.fields.is_empty() && !self.with_row_id && !self.with_row_address {
+        if self.physical_columns.fields.is_empty() && !self.with_row_id && !self.with_row_address {
             return Err(Error::InvalidInput {
                 source:
                     "no columns were selected and with_row_id is false, there is nothing to scan"
@@ -889,7 +908,7 @@ impl Scanner {
             };
             match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
                 (Some(index_query), None) => {
-                    self.scalar_indexed_scan(&self.phyical_columns, index_query)
+                    self.scalar_indexed_scan(&self.physical_columns, index_query)
                         .await?
                 }
                 // TODO: support combined pushdown and scalar index scan
@@ -913,7 +932,7 @@ impl Scanner {
                         let columns = filter_plan.refine_columns();
                         Arc::new(self.dataset.schema().project(&columns)?)
                     } else {
-                        Arc::new(self.phyical_columns.clone())
+                        Arc::new(self.physical_columns.clone())
                     };
                     self.scan(with_row_id, self.with_row_address, false, schema)
                 }
@@ -989,12 +1008,11 @@ impl Scanner {
         }
 
         // Stage 5: take remaining columns required for projection
-        let physical_schema = self.physical_schema()?;
+        let physical_schema = self.physical_schema(false)?;
         let remaining_schema = physical_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
         }
-
         // Stage 6: physical projection -- reorder physical columns needed before final projection
         let output_arrow_schema = physical_schema.as_ref().into();
         if plan.schema().as_ref() != &output_arrow_schema {
@@ -1021,7 +1039,7 @@ impl Scanner {
             return Err(Error::io("No nearest query".to_string(), location!()));
         };
 
-        // Santity check
+        // Sanity check
         let schema = self.dataset.schema();
         if let Some(field) = schema.field(&q.column) {
             match field.data_type() {
@@ -1064,9 +1082,10 @@ impl Scanner {
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let ann_node = self.ann(q, &deltas, filter_plan).await?; // _distance, _rowid
 
-            let with_vector = self.dataset.schema().project(&[&q.column])?;
-            let knn_node_with_vector = self.take(ann_node, &with_vector, self.batch_readahead)?;
             let mut knn_node = if q.refine_factor.is_some() {
+                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                let knn_node_with_vector =
+                    self.take(ann_node, &with_vector, self.batch_readahead)?;
                 // TODO: now we just open an index to get its metric type.
                 let idx = self
                     .dataset
@@ -1076,10 +1095,12 @@ impl Scanner {
                 q.metric_type = idx.metric_type();
                 self.flat_knn(knn_node_with_vector, &q)?
             } else {
-                knn_node_with_vector
+                ann_node
             }; // vector, _distance, _rowid
 
-            knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
+            if !self.fast_search {
+                knn_node = self.knn_combined(q, index, knn_node, filter_plan).await?;
+            }
 
             Ok(knn_node)
         } else {
@@ -1108,14 +1129,21 @@ impl Scanner {
     /// Combine ANN results with KNN results for data appended after index creation
     async fn knn_combined(
         &self,
-        q: &&Query,
+        q: &Query,
         index: &Index,
-        knn_node: Arc<dyn ExecutionPlan>,
+        mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Check if we've created new versions since the index
+        // Check if we've created new versions since the index was built.
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
+            // If the vector column is not present, we need to take the vector column, so
+            // that the distance value is comparable with the flat search ones.
+            if knn_node.schema().column_with_name(&q.column).is_none() {
+                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                knn_node = self.take(knn_node, &with_vector, self.batch_readahead)?;
+            }
+
             let mut columns = vec![q.column.clone()];
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 let filter_columns = Planner::column_names_in_expr(expr);
@@ -1361,7 +1389,7 @@ impl Scanner {
         Ok(Arc::new(LancePushdownScanExec::try_new(
             self.dataset.clone(),
             fragments,
-            self.phyical_columns.clone().into(),
+            self.physical_columns.clone().into(),
             predicate,
             config,
         )?))
@@ -3907,7 +3935,7 @@ mod test {
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 42),
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=42), expr=...
       ANNSubIndex: name=..., k=42, deltas=1
         ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
@@ -3953,9 +3981,9 @@ mod test {
                     .with_row_id())
             },
             "Projection: fields=[s, vec, _distance, _rowid]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    FilterExec: i@3 > 10
-      Take: columns=\"_distance, _rowid, vec, i\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
+    FilterExec: i@2 > 10
+      Take: columns=\"_distance, _rowid, i\"
         SortExec: TopK(fetch=17), expr=...
           ANNSubIndex: name=..., k=17, deltas=1
             ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
@@ -3972,7 +4000,7 @@ mod test {
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=17), expr=...
       ANNSubIndex: name=..., k=17, deltas=1
         ANNIvfPartition: uuid=..., nprobes=1, deltas=1
@@ -4079,7 +4107,7 @@ mod test {
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=5), expr=...
       ANNSubIndex: name=..., k=5, deltas=1
         ANNIvfPartition: uuid=..., nprobes=1, deltas=1
@@ -4196,5 +4224,73 @@ mod test {
         .await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_search_plan() {
+        // Create a vector dataset
+        let mut dataset = TestVectorDataset::new(false, true).await.unwrap();
+        dataset.make_vector_index().await.unwrap();
+        dataset.append_new_data().await.unwrap();
+
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.nearest("vec", &q, 32)?
+                    .fast_search()
+                    .project(&["_rowid", "_distance"])
+            },
+            "Projection: fields=[_rowid, _distance]
+  SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]
+    ANNSubIndex: name=idx, k=32, deltas=1
+      ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+        )
+        .await
+        .unwrap();
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.nearest("vec", &q, 33)?
+                    .fast_search()
+                    .with_row_id()
+                    .project(&["_rowid", "_distance"])
+            },
+            "Projection: fields=[_rowid, _distance]
+  SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]
+    ANNSubIndex: name=idx, k=33, deltas=1
+      ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+        )
+        .await
+        .unwrap();
+
+        // Not `fast_scan` case
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.nearest("vec", &q, 34)?
+                    .with_row_id()
+                    .project(&["_rowid", "_distance"])
+            },
+            "Projection: fields=[_rowid, _distance]
+  FilterExec: _distance@2 IS NOT NULL
+    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]
+      KNNVectorDistance: metric=l2
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Projection: fields=[_distance, _rowid, vec]
+              FilterExec: _distance@2 IS NOT NULL
+                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]
+                  KNNVectorDistance: metric=l2
+                    LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+            Take: columns=\"_distance, _rowid, vec\"
+              SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]
+                ANNSubIndex: name=idx, k=34, deltas=1
+                  ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+        )
+        .await
+        .unwrap();
     }
 }
