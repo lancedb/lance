@@ -41,7 +41,6 @@ async fn main() {
     println!("Finished warmup");
 
     for concurrency in 1..=32 {
-        println!("running test for concurrency: {}", concurrency);
         let mut stream = stream::repeat(dataset.clone())
             .map(|d| {
                 let col = column.clone();
@@ -86,9 +85,12 @@ async fn main() {
         let p99 = acc[(acc.len() as f64 * 0.99) as usize];
         let p999 = acc[(acc.len() as f64 * 0.999) as usize];
         let avg = acc.iter().sum::<u128>() / acc.len() as u128;
+        let std = (acc.iter().map(|x| (*x - avg)).map(|x| (x * x)).sum::<u128>()
+            / acc.len() as u128) as f32;
+        let std = std.sqrt();
         println!(
-            "{}, {}, {}, {}, {}, {}",
-            concurrency, p50, p90, p99, p999, avg
+            "{}, {}, {}, {}, {}, {}, {:.2}",
+            concurrency, p50, p90, p99, p999, avg, std
         );
     }
 }
