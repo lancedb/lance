@@ -25,6 +25,7 @@ class IvfModel:
         self.distance_type = distance_type
         """The distance type used to train the IVF model"""
 
+    @property
     def num_partitions(self) -> int:
         """
         The number of partitions / centroids in the IVF model

@@ -3,6 +3,7 @@
 import lance
 import numpy as np
 import pyarrow as pa
+import pytest
 from lance.indices import IndicesBuilder, IvfModel
 
 
@@ -28,6 +29,15 @@ def test_ivf_centroids(tmpdir):
     reloaded = IvfModel.load(str(tmpdir / "ivf"))
     assert reloaded.distance_type == "l2"
     assert ivf.centroids == reloaded.centroids
+
+
+@pytest.mark.cuda
+def test_ivf_centroids_cuda(tmpdir):
+    ds = gen_dataset(tmpdir)
+    ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16, accelerator="cuda")
+
+    assert ivf.distance_type == "l2"
+    assert len(ivf.centroids) == 100
 
 
 def test_ivf_centroids_column_type(tmpdir):
@@ -67,4 +77,4 @@ def test_num_partitions(tmpdir):
     ds = gen_dataset(tmpdir)
 
     ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16, num_partitions=10)
-    assert ivf.num_partitions() == 10
+    assert ivf.num_partitions == 10
