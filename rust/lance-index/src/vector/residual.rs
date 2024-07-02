@@ -8,7 +8,7 @@ use arrow_array::{
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type, UInt32Type},
     Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
 };
-use arrow_schema::{DataType};
+use arrow_schema::DataType;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};

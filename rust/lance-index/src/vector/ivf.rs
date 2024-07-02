@@ -16,14 +16,10 @@ use lance_linalg::{
 };
 
 use crate::vector::ivf::transform::PartitionTransformer;
-use crate::vector::{
-    pq::{ProductQuantizer},
-    residual::ResidualTransform,
-    transform::Transformer,
-};
+use crate::vector::{pq::ProductQuantizer, residual::ResidualTransform, transform::Transformer};
 
+use super::PART_ID_COLUMN;
 use super::{quantizer::Quantizer, residual::compute_residual};
-use super::{PART_ID_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
