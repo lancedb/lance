@@ -1551,8 +1551,7 @@ where
         rng,
         metric_type,
         params.sample_rate,
-    )
-    .await?;
+    )?;
     Ok(IvfModel::new(FixedSizeListArray::try_new_from_values(
         centroids,
         dimension as i32,

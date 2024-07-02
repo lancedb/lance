@@ -8,7 +8,7 @@ use arrow_array::{
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type, UInt32Type},
     Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
@@ -173,10 +173,10 @@ impl Transformer for ResidualTransform {
             compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
 
         // Replace original column with residual column.
-        let batch = batch.drop_column(&self.vec_col)?;
+        let batch = batch.replace_column_by_name(&self.vec_col, Arc::new(residual_arr))?;
 
-        let residual_field = Field::new(RESIDUAL_COLUMN, residual_arr.data_type().clone(), false);
-        let batch = batch.try_with_column(residual_field, Arc::new(residual_arr))?;
+        // let residual_field = Field::new(RESIDUAL_COLUMN, residual_arr.data_type().clone(), false);
+        // let batch = batch.try_with_column(residual_field, Arc::new(residual_arr))?;
         Ok(batch)
     }
 }

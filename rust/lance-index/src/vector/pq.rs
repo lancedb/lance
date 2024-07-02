@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{self, ArrowPrimitiveType};
+use arrow::datatypes::{self, ArrowPrimitiveType, Float16Type, Float32Type, Float64Type};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::DataType;
@@ -15,6 +15,7 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
+use lance_linalg::MatrixView;
 use num_traits::Float;
 use prost::Message;
 use rayon::prelude::*;
@@ -312,8 +313,49 @@ impl Quantization for ProductQuantizer {
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
 
-    fn build(_: &dyn Array, _: DistanceType, _: &Self::BuildParams) -> Result<Self> {
-        unimplemented!("ProductQuantizer cannot be built with new index builder")
+    fn build(
+        data: &dyn Array,
+        distance_type: DistanceType,
+        params: &Self::BuildParams,
+    ) -> Result<Self> {
+        assert_eq!(data.null_count(), 0);
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "PQ builder: input is not a FixedSizeList: {}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        if let Some(codebook) = params.codebook.as_ref() {
+            return Ok(Self::new(
+                params.num_sub_vectors,
+                params.num_bits as u32,
+                fsl.value_length() as usize,
+                FixedSizeListArray::try_new_from_values(codebook.clone(), fsl.value_length())?,
+                distance_type,
+            ));
+        }
+
+        // TODO: support bf16 later.
+        match fsl.value_type() {
+            DataType::Float16 => {
+                let data = MatrixView::<Float16Type>::try_from(fsl)?;
+                params.build_from_matrix(&data, distance_type)
+            }
+            DataType::Float32 => {
+                let data = MatrixView::<Float32Type>::try_from(fsl)?;
+                params.build_from_matrix(&data, distance_type)
+            }
+            DataType::Float64 => {
+                let data = MatrixView::<Float64Type>::try_from(fsl)?;
+                params.build_from_matrix(&data, distance_type)
+            }
+            _ => Err(Error::Index {
+                message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
+                location: location!(),
+            }),
+        }
     }
 
     fn code_dim(&self) -> usize {

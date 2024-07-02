@@ -6,17 +6,14 @@
 
 use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::datatypes::ArrowPrimitiveType;
-use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::FixedSizeListArray;
-use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
-use arrow_schema::DataType;
-use futures::{stream, StreamExt, TryStreamExt};
+use arrow_array::{Array, ArrayRef};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
-use lance_core::{Error, Result};
+use lance_core::Result;
 use lance_linalg::distance::{Dot, Normalize, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
-use snafu::{location, Location};
+use rayon::prelude::*;
 
 use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;
@@ -77,7 +74,7 @@ impl PQBuildParams {
         }
     }
 
-    pub async fn build_from_matrix<T: ArrowFloatType + 'static + ArrowPrimitiveType>(
+    pub fn build_from_matrix<T: ArrowFloatType + 'static + ArrowPrimitiveType>(
         &self,
         data: &MatrixView<T>,
         metric_type: MetricType,
@@ -98,8 +95,9 @@ impl PQBuildParams {
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
-        let d = stream::iter(sub_vectors.into_iter())
-            .map(|sub_vec| async move {
+        let d = sub_vectors
+            .into_par_iter()
+            .map(|sub_vec| {
                 let rng = rand::rngs::SmallRng::from_entropy();
                 train_kmeans::<T>(
                     sub_vec.as_ref(),
@@ -111,11 +109,8 @@ impl PQBuildParams {
                     metric_type,
                     self.sample_rate,
                 )
-                .await
             })
-            .buffered(num_cpus::get())
-            .try_collect::<Vec<_>>()
-            .await?;
+            .collect::<Result<Vec<_>>>()?;
         let mut codebook_builder = Vec::with_capacity(num_centroids * dimension);
         for centroid in d.iter() {
             let c = centroid.as_any().downcast_ref::<T::ArrayType>().unwrap();
@@ -131,42 +126,5 @@ impl PQBuildParams {
             FixedSizeListArray::try_new_from_values(pd_centroids, dimension as i32)?,
             metric_type,
         ))
-    }
-
-    /// Build a [ProductQuantizer] from the given data.
-    ///
-    /// If the [MetricType] is [MetricType::Cosine], the input data will be normalized.
-    pub async fn build(
-        &self,
-        data: &dyn Array,
-        metric_type: MetricType,
-    ) -> Result<ProductQuantizer> {
-        assert_eq!(data.null_count(), 0);
-        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "PQ builder: input is not a FixedSizeList: {}",
-                data.data_type()
-            ),
-            location: location!(),
-        })?;
-        // TODO: support bf16 later.
-        match fsl.value_type() {
-            DataType::Float16 => {
-                let data = MatrixView::<Float16Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
-            }
-            DataType::Float32 => {
-                let data = MatrixView::<Float32Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
-            }
-            DataType::Float64 => {
-                let data = MatrixView::<Float64Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
-            }
-            _ => Err(Error::Index {
-                message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
-                location: location!(),
-            }),
-        }
     }
 }

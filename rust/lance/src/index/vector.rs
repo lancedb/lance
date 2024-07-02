@@ -290,17 +290,18 @@ pub(crate) async fn build_vector_index(
         if len > 2 {
             match stages.last().unwrap() {
                 StageParams::PQ(pq_params) => {
-                    build_ivf_hnsw_pq_index(
-                        dataset,
-                        column,
-                        name,
-                        uuid,
+                    IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+                        dataset.clone(),
+                        column.to_owned(),
+                        dataset.indices_dir().child(uuid),
                         params.metric_type,
-                        ivf_params,
-                        hnsw_params,
-                        pq_params,
-                    )
-                    .await?
+                        Box::new(shuffler),
+                        Some(ivf_params.clone()),
+                        Some(pq_params.clone()),
+                        hnsw_params.clone(),
+                    )?
+                    .build()
+                    .await?;
                 }
                 StageParams::SQ(sq_params) => {
                     IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(

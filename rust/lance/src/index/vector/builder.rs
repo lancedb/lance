@@ -618,6 +618,7 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::hnsw::HNSW;
 
+    use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::{
@@ -707,6 +708,34 @@ mod tests {
             Box::new(shuffler),
             Some(ivf_params),
             Some(sq_params),
+            hnsw_params,
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_build_ivf_hnsw_pq() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let pq_params = PQBuildParams::default();
+        let index_dir: Path = tempdir().unwrap().path().to_str().unwrap().into();
+        let shuffler = IvfShuffler::new(index_dir.child("shuffled"), ivf_params.num_partitions);
+
+        super::IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            dataset,
+            "vector".to_owned(),
+            index_dir,
+            DistanceType::L2,
+            Box::new(shuffler),
+            Some(ivf_params),
+            Some(pq_params),
             hnsw_params,
         )
         .unwrap()

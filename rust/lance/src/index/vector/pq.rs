@@ -409,7 +409,7 @@ pub(super) async fn build_pq_model(
         training_data
     };
     info!("Start train PQ: params={:#?}", params);
-    let pq = params.build(&training_data, MetricType::L2).await?;
+    let pq = ProductQuantizer::build(&training_data, DistanceType::L2, params)?;
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
     Ok(pq)
 }

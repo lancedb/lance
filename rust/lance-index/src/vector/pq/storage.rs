@@ -17,7 +17,7 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
@@ -456,14 +456,7 @@ impl VectorStore for ProductQuantizationStorage {
 
         let metadata_json = serde_json::to_string(&metadata)?;
         let metadata = HashMap::from_iter(vec![(STORAGE_METADATA_KEY.to_string(), metadata_json)]);
-
-        let schema = self
-            .batch
-            .schema_ref()
-            .as_ref()
-            .clone()
-            .with_metadata(metadata);
-        Ok([self.batch.clone().with_schema(schema.into())?].into_iter())
+        Ok([self.batch.with_metadata(metadata)?].into_iter())
     }
 
     fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {

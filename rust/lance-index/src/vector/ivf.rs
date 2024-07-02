@@ -17,13 +17,13 @@ use lance_linalg::{
 
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::{
-    pq::{transform::PQTransformer, ProductQuantizer},
+    pq::{ProductQuantizer},
     residual::ResidualTransform,
     transform::Transformer,
 };
 
 use super::{quantizer::Quantizer, residual::compute_residual};
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+use super::{PART_ID_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
@@ -183,17 +183,6 @@ impl IvfTransformer {
                 centroids.clone(),
                 PART_ID_COLUMN,
                 vector_column,
-            )));
-            transforms.push(Arc::new(PQTransformer::new(
-                pq.clone(),
-                RESIDUAL_COLUMN,
-                PQ_CODE_COLUMN,
-            )));
-        } else {
-            transforms.push(Arc::new(PQTransformer::new(
-                pq.clone(),
-                vector_column,
-                PQ_CODE_COLUMN,
             )));
         };
         Self {
