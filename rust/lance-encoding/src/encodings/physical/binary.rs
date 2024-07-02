@@ -303,7 +303,7 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
 
         let mut output_buffers = vec![validity_buffer, offsets_buf];
 
-        // Copy decoded bytes into dest_buffers[2..]
+        // Add decoded bytes into output_buffers[2..]
         // Currently an empty null buffer is the first one
         // The actual bytes are in the second buffer
         // Including the indices this results in 4 buffers in total
@@ -383,6 +383,7 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
             panic!("Array is not a string array");
         }
     }
+
     let last_offset = *indices.last().expect("Indices array is empty");
     // 8 exabytes in a single array seems unlikely but...just in case
     assert!(

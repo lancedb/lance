@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
@@ -18,12 +21,14 @@ use crate::{
             list::ListFieldEncoder, primitive::PrimitiveFieldEncoder, r#struct::StructFieldEncoder,
         },
         physical::{
-            basic::BasicEncoder, binary::BinaryEncoder, fixed_size_list::FslEncoder,
-            value::ValueEncoder,
+            basic::BasicEncoder, binary::BinaryEncoder, dictionary::DictionaryEncoder,
+            fixed_size_list::FslEncoder, value::ValueEncoder,
         },
     },
     format::pb,
 };
+
+use std::cmp::min;
 
 /// An encoded buffer
 pub struct EncodedBuffer {
@@ -228,22 +233,37 @@ fn get_compression_scheme() -> CompressionScheme {
 }
 
 impl CoreArrayEncodingStrategy {
-    fn array_encoder_from_type(data_type: &DataType) -> Result<Box<dyn ArrayEncoder>> {
+    fn array_encoder_from_type(
+        data_type: &DataType,
+        use_dict_encoding: bool,
+    ) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
-                    Self::array_encoder_from_type(inner.data_type())?,
+                    Self::array_encoder_from_type(inner.data_type(), use_dict_encoding)?,
                     *dimension as u32,
                 )))))
             }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
-                let bin_indices_encoder = Self::array_encoder_from_type(&DataType::UInt64)?;
-                let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8)?;
+                if use_dict_encoding {
+                    let dict_indices_encoder =
+                        Self::array_encoder_from_type(&DataType::UInt8, false)?;
+                    let dict_items_encoder = Self::array_encoder_from_type(&DataType::Utf8, false)?;
 
-                Ok(Box::new(BinaryEncoder::new(
-                    bin_indices_encoder,
-                    bin_bytes_encoder,
-                )))
+                    Ok(Box::new(DictionaryEncoder::new(
+                        dict_indices_encoder,
+                        dict_items_encoder,
+                    )))
+                } else {
+                    let bin_indices_encoder =
+                        Self::array_encoder_from_type(&DataType::UInt64, false)?;
+                    let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8, false)?;
+
+                    Ok(Box::new(BinaryEncoder::new(
+                        bin_indices_encoder,
+                        bin_bytes_encoder,
+                    )))
+                }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::try_new(data_type, get_compression_scheme())?,
@@ -252,9 +272,48 @@ impl CoreArrayEncodingStrategy {
     }
 }
 
+// check whether we want to use dictionary encoding or not
+// by applying a threshold on cardinality
+// returns true if cardinality < min(100, num_total_rows)
+// The choice to use 100 is just a heuristic for now
+fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
+    let mut unique_values = HashSet::new();
+
+    let num_total_rows = arrays.iter().map(|arr| arr.len()).sum::<usize>();
+    let thresh = min(100, num_total_rows);
+
+    // Checking cardinality for elements in all arrays together.
+    for arr in arrays.iter() {
+        let string_array = arrow_array::cast::as_string_array(arr);
+        let arr_len = string_array.len();
+        for i in 0..arr_len {
+            if !string_array.is_null(i) {
+                unique_values.insert(string_array.value(i));
+                if unique_values.len() >= thresh {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     fn create_array_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn ArrayEncoder>> {
-        Self::array_encoder_from_type(arrays[0].data_type())
+        if arrays[0].data_type() == &DataType::Utf8 {
+            if check_dict_encoding(arrays) {
+                // Dictionary encoding
+                Self::array_encoder_from_type(arrays[0].data_type(), true)
+            } else {
+                // Binary encoding, but not dictionary
+                Self::array_encoder_from_type(arrays[0].data_type(), false)
+            }
+        }
+        // Default encoding for other datatypes
+        else {
+            Self::array_encoder_from_type(arrays[0].data_type(), false)
+        }
     }
 }
 
