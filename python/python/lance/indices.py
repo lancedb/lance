@@ -4,6 +4,7 @@ import math
 import warnings
 from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
 import pyarrow as pa
 
 from lance.file import LanceFileReader, LanceFileWriter
@@ -153,12 +154,25 @@ class IndicesBuilder:
     use the `create_index` method on the dataset object.
     """
 
-    def __init__(self, dataset):
+    def __init__(self, dataset, column: str):
+        """
+        Create an index builder for the given vector column
+
+        Parameters
+        ----------
+
+        dataset: LanceDataset
+            the dataset containing the data
+        column: str
+            The vector column to index, must be a fixed size list of floats
+            or 1-dimensional fixed-shape tensor column.
+        """
         self.dataset = dataset
+        self.column = self._normalize_column(column)
+        self.dimension = self.dataset.schema.field(self.column[0]).type.list_size
 
     def train_ivf(
         self,
-        column,
         num_partitions=None,
         *,
         distance_type="l2",
@@ -209,7 +223,6 @@ class IndicesBuilder:
             possible minima.  In these cases we must terminate or run forever.  The
             max_iters parameter defines a cutoff at which we terminate training.
         """
-        column = self._normalize_column(column)
         num_rows = self.dataset.count_rows()
         num_partitions = self._determine_num_partitions(num_partitions, num_rows)
         self._verify_ivf_sample_rate(sample_rate, num_partitions, num_rows)
@@ -217,11 +230,10 @@ class IndicesBuilder:
         self._verify_ivf_params(num_partitions)
 
         if accelerator is None:
-            dimension = self.dataset.schema.field(column[0]).type.list_size
             ivf_centroids = indices.train_ivf_model(
                 self.dataset._ds,
-                column[0],
-                dimension,
+                self.column[0],
+                self.dimension,
                 num_partitions,
                 distance_type,
                 sample_rate,
@@ -234,7 +246,7 @@ class IndicesBuilder:
 
             ivf_centroids, _ = train_ivf_centroids_on_accelerator(
                 self.dataset,
-                column[0],
+                self.column[0],
                 num_partitions,
                 distance_type,
                 accelerator,
@@ -251,7 +263,6 @@ class IndicesBuilder:
 
     def train_pq(
         self,
-        column,
         ivf_model: IvfModel,
         num_subvectors=None,
         *,
@@ -270,9 +281,6 @@ class IndicesBuilder:
         Parameters
         ----------
 
-        column: str
-            The vector column to quantize, must be a fixed size list of floats
-            or 1-dimensional fixed-shape tensor column.
         ivf_model: IvfModel
             The IVF model to use to partition the vectors into clusters.  This is
             needed because PQ is trained on residuals from the IVF model.
@@ -291,17 +299,15 @@ class IndicesBuilder:
         max_iters: int
             This parameter is used in the same way as in the IVF model.
         """
-        column = self._normalize_column(column)
         num_rows = self.dataset.count_rows()
-        dimension = self.dataset.schema.field(column[0]).type.list_size
-        self.dataset.schema.field(column[0]).type.list_size
-        num_subvectors = self._normalize_pq_params(num_subvectors, dimension)
+        self.dataset.schema.field(self.column[0]).type.list_size
+        num_subvectors = self._normalize_pq_params(num_subvectors, self.dimension)
         self._verify_pq_sample_rate(num_rows, sample_rate)
         distance_type = ivf_model.distance_type
         pq_codebook = indices.train_pq_model(
             self.dataset._ds,
-            column[0],
-            dimension,
+            self.column[0],
+            self.dimension,
             num_subvectors,
             distance_type,
             sample_rate,
@@ -309,6 +315,60 @@ class IndicesBuilder:
             ivf_model.centroids,
         )
         return PqModel(num_subvectors, pq_codebook)
+
+    def assign_ivf_partitions(
+        self,
+        ivf_model: IvfModel,
+        dst_dataset_uri: Optional[str],
+        accelerator: Union[str, "torch.Device"],
+    ) -> str:
+        """
+        Calculates which IVF partition each vector belongs to.  This searches the
+        IVF centroids and assigns the closest centroid to the vector.  The result is
+        stored in a Lance dataset located at dst_dataset_uri.  The schema of the
+        partition assignment dataset is:
+
+        row_id: uint64
+        partition: uint32
+
+        Note: There is no advantage to separately computing the partition assignment
+        without an accelerator.  If you are not using an accelerator then you should
+        skip this method and proceed without precomputed partition assignments.
+
+        Parameters
+        ----------
+        ivf_model: IvfModel
+            An IvfModel, previously created by ``train_ivf`` which the data will be
+            assigned to.
+        dst_dataset_uri: Optional[str]
+            Destination Lance dataset where the partition assignments will be written
+            Can be None in which case a random directory will be used.
+        accelerator: Optional[Union[str, torch.Device]] = None
+            An optional accelerator to use to offload computation to specialized
+            hardware.  Currently supported values are the same as those in ``train_ivf``
+
+        Returns
+        -------
+        str
+            The path of the partition assignment dataset (will be equal to
+            dst_dataset_uri unless the input is None)
+        """
+        from .dependencies import torch
+        from .torch.kmeans import KMeans
+        from .vector import compute_partitions
+
+        centroids = torch.from_numpy(
+            np.stack(ivf_model.centroids.to_numpy(zero_copy_only=False))
+        ).to(accelerator)
+        kmeans = KMeans(
+            ivf_model.num_partitions,
+            metric=ivf_model.distance_type,
+            device=accelerator,
+            centroids=centroids,
+        )
+        return compute_partitions(
+            self.dataset, self.column[0], kmeans, dst_dataset_uri=dst_dataset_uri
+        )
 
     def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
         if num_partitions is None:
