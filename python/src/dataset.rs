@@ -962,7 +962,7 @@ impl Dataset {
         let ds = RT
             .block_on(None, self.ds.checkout_tag(tag.as_str()))?
             .map_err(|err| match err {
-                lance::Error::TagNotFound { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
                 _ => PyIOError::new_err(err.to_string()),
             })?;
         Ok(Self {
@@ -976,7 +976,7 @@ impl Dataset {
         RT.block_on(None, new_self.create_tag(tag.as_str(), version))?
             .map_err(|err| match err {
                 lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
-                lance::Error::TagConflict { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::RefConflict { .. } => PyValueError::new_err(err.to_string()),
                 lance::Error::VersionNotFound { .. } => PyValueError::new_err(err.to_string()),
                 _ => PyIOError::new_err(err.to_string()),
             })?;
@@ -989,7 +989,7 @@ impl Dataset {
         RT.block_on(None, new_self.delete_tag(tag.as_str()))?
             .map_err(|err| match err {
                 lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
-                lance::Error::TagNotFound { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
                 _ => PyIOError::new_err(err.to_string()),
             })?;
         self.ds = Arc::new(new_self);

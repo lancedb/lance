@@ -84,10 +84,14 @@ pub enum Error {
     Cloned { message: String, location: Location },
     #[snafu(display("Query Execution error: {message}, {location}"))]
     Execution { message: String, location: Location },
-    #[snafu(display("Tag conflict error: {message}"))]
-    TagConflict { message: String },
-    #[snafu(display("Tag not found error: {message}"))]
-    TagNotFound { message: String },
+    #[snafu(display("Ref is invalid: {message}"))]
+    InvalidRef { message: String },
+    #[snafu(display("Ref conflict error: {message}"))]
+    RefConflict { message: String },
+    #[snafu(display("Ref not found error: {message}"))]
+    RefNotFound { message: String },
+    #[snafu(display("Cleanup error: {message}"))]
+    Cleanup { message: String },
     #[snafu(display("Version not found error: {message}"))]
     VersionNotFound { message: String },
 }

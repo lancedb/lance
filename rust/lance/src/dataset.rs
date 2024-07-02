@@ -54,7 +54,7 @@ mod write;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
-use self::refs::{base_tags_path, tag_path, TagContents};
+use self::refs::{base_tags_path, check_valid_ref, tag_path, TagContents};
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
@@ -313,10 +313,12 @@ impl Dataset {
 
     /// Check out the specified tagged version of this dataset
     pub async fn checkout_tag(&self, tag: &str) -> Result<Self> {
+        check_valid_ref(tag)?;
+
         let tag_file = tag_path(&self.base, tag);
 
         if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::TagNotFound {
+            return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
@@ -1102,10 +1104,12 @@ impl Dataset {
     }
 
     pub async fn create_tag(&mut self, tag: &str, version: u64) -> Result<()> {
+        check_valid_ref(tag)?;
+
         let tag_file = tag_path(&self.base, tag);
 
         if self.object_store().exists(&tag_file).await? {
-            return Err(Error::TagConflict {
+            return Err(Error::RefConflict {
                 message: format!("tag {} already exists", tag),
             });
         }
@@ -1135,10 +1139,12 @@ impl Dataset {
     }
 
     pub async fn delete_tag(&mut self, tag: &str) -> Result<()> {
+        check_valid_ref(tag)?;
+
         let tag_file = tag_path(&self.base, tag);
 
         if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::TagNotFound {
+            return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
@@ -1342,7 +1348,7 @@ impl Dataset {
     /// This is a metadata-only operation and does not remove the data from the
     /// underlying storage. In order to remove the data, you must subsequently
     /// call `compact_files` to rewrite the data without the removed columns and
-    /// then call `cleanup_files` to remove the old files.
+    /// then call `cleanup_old_versions` to remove the old files.
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
         schema_evolution::drop_columns(self, columns).await
     }
@@ -2975,7 +2981,7 @@ mod tests {
         let bad_tag_deletion = dataset.delete_tag("tag1").await;
         assert_eq!(
             bad_tag_deletion.err().unwrap().to_string(),
-            "Tag not found error: tag tag1 does not exist"
+            "Ref not found error: tag tag1 does not exist"
         );
 
         dataset.create_tag("tag1", 1).await.unwrap();
@@ -2985,20 +2991,23 @@ mod tests {
         let another_bad_tag_creation = dataset.create_tag("tag1", 1).await;
         assert_eq!(
             another_bad_tag_creation.err().unwrap().to_string(),
-            "Tag conflict error: tag tag1 already exists"
+            "Ref conflict error: tag tag1 already exists"
         );
 
         dataset.delete_tag("tag1").await.unwrap();
 
+        assert_eq!(dataset.tags().await.unwrap().len(), 0);
+
         dataset.create_tag("tag1", 1).await.unwrap();
         dataset.create_tag("tag2", 1).await.unwrap();
+        dataset.create_tag("v1.0.0-rc1", 1).await.unwrap();
 
-        assert_eq!(dataset.tags().await.unwrap().len(), 2);
+        assert_eq!(dataset.tags().await.unwrap().len(), 3);
 
         let bad_checkout = dataset.checkout_tag("tag3").await;
         assert_eq!(
             bad_checkout.err().unwrap().to_string(),
-            "Tag not found error: tag tag3 does not exist"
+            "Ref not found error: tag tag3 does not exist"
         );
 
         dataset = dataset.checkout_tag("tag1").await.unwrap();

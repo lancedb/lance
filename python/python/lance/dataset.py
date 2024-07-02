@@ -908,7 +908,7 @@ class LanceDataset(pa.dataset.Dataset):
         This is a metadata-only operation and does not remove the data from the
         underlying storage. In order to remove the data, you must subsequently
         call ``compact_files`` to rewrite the data without the removed columns and
-        then call ``cleanup_files`` to remove the old files.
+        then call ``cleanup_old_versions`` to remove the old files.
 
         Examples
         --------
