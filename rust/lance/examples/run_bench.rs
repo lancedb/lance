@@ -48,6 +48,11 @@ async fn main() {
                     .nearest(&col, &random_vector(512), 100)
                     .unwrap()
                     .nprobs(2)
+                    .filter("year >= 2010 AND year < 2020")
+                    .unwrap()
+                    .prefilter(true)
+                    .project(&["id"])
+                    .unwrap()
                     .try_into_batch()
                     .await
                     .unwrap();
