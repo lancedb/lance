@@ -4238,10 +4238,9 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
-                Ok(scan
-                    .nearest("vec", &q, 32)?
+                scan.nearest("vec", &q, 32)?
                     .fast_search()
-                    .project(&["_rowid", "_distance"])?)
+                    .project(&["_rowid", "_distance"])
             },
             "Projection: fields=[_rowid, _distance]
   SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]
@@ -4254,11 +4253,10 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
-                Ok(scan
-                    .nearest("vec", &q, 33)?
+                scan.nearest("vec", &q, 33)?
                     .fast_search()
                     .with_row_id()
-                    .project(&["_rowid", "_distance"])?)
+                    .project(&["_rowid", "_distance"])
             },
             "Projection: fields=[_rowid, _distance]
   SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]
@@ -4272,10 +4270,9 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
-                Ok(scan
-                    .nearest("vec", &q, 34)?
+                scan.nearest("vec", &q, 34)?
                     .with_row_id()
-                    .project(&["_rowid", "_distance"])?)
+                    .project(&["_rowid", "_distance"])
             },
             "Projection: fields=[_rowid, _distance]
   FilterExec: _distance@2 IS NOT NULL
