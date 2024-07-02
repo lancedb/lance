@@ -40,6 +40,7 @@ mod hash_joiner;
 pub mod index;
 pub mod optimize;
 pub mod progress;
+pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
@@ -52,6 +53,7 @@ mod write;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
+use self::refs::{base_tags_path, check_valid_ref, tag_path, TagContents};
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
@@ -297,6 +299,23 @@ impl Dataset {
             self.commit_handler.clone(),
         )
         .await
+    }
+
+    /// Check out the specified tagged version of this dataset
+    pub async fn checkout_tag(&self, tag: &str) -> Result<Self> {
+        check_valid_ref(tag)?;
+
+        let tag_file = tag_path(&self.base, tag);
+
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+
+        self.checkout_version(tag_contents.version).await
     }
 
     async fn load_manifest(
@@ -1055,6 +1074,55 @@ impl Dataset {
             .await
     }
 
+    pub async fn create_tag(&mut self, tag: &str, version: u64) -> Result<()> {
+        check_valid_ref(tag)?;
+
+        let tag_file = tag_path(&self.base, tag);
+
+        if self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("tag {} already exists", tag),
+            });
+        }
+
+        let manifest_file = self
+            .commit_handler
+            .resolve_version(&self.base, version, &self.object_store.inner)
+            .await?;
+
+        if !self.object_store().exists(&manifest_file).await? {
+            return Err(Error::VersionNotFound {
+                message: format!("version {} does not exist", version),
+            });
+        }
+
+        let tag_contents = TagContents {
+            version,
+            manifest_size: self.object_store().size(&manifest_file).await?,
+        };
+
+        self.object_store()
+            .put(
+                &tag_file,
+                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+            )
+            .await
+    }
+
+    pub async fn delete_tag(&mut self, tag: &str) -> Result<()> {
+        check_valid_ref(tag)?;
+
+        let tag_file = tag_path(&self.base, tag);
+
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        self.object_store().delete(&tag_file).await
+    }
+
     pub(crate) fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
@@ -1114,6 +1182,27 @@ impl Dataset {
         versions.sort_by_key(|v| v.version);
 
         Ok(versions)
+    }
+
+    /// Get all tags.
+    pub async fn tags(&self) -> Result<HashMap<String, TagContents>> {
+        let mut tags = HashMap::<String, TagContents>::new();
+
+        let tag_names = self
+            .object_store()
+            .read_dir(base_tags_path(&self.base))
+            .await?;
+
+        for n in tag_names.iter() {
+            let tag_name = n.strip_suffix(".json").unwrap();
+            let tag_path = tag_path(&self.base, tag_name);
+            tags.insert(
+                tag_name.to_string(),
+                TagContents::from_path(&tag_path, self.object_store()).await?,
+            );
+        }
+
+        Ok(tags)
     }
 
     /// Get the latest version of the dataset
@@ -1230,7 +1319,7 @@ impl Dataset {
     /// This is a metadata-only operation and does not remove the data from the
     /// underlying storage. In order to remove the data, you must subsequently
     /// call `compact_files` to rewrite the data without the removed columns and
-    /// then call `cleanup_files` to remove the old files.
+    /// then call `cleanup_old_versions` to remove the old files.
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
         schema_evolution::drop_columns(self, columns).await
     }
@@ -2792,6 +2881,84 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(dataset.count_fragments(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_tag(#[values(false, true)] use_legacy_format: bool) {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                use_legacy_format,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.version, 1);
+
+        // delete some rows
+        dataset.delete("i > 50").await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        assert_eq!(dataset.tags().await.unwrap().len(), 0);
+
+        let bad_tag_creation = dataset.create_tag("tag1", 3).await;
+        assert_eq!(
+            bad_tag_creation.err().unwrap().to_string(),
+            "Version not found error: version 3 does not exist"
+        );
+
+        let bad_tag_deletion = dataset.delete_tag("tag1").await;
+        assert_eq!(
+            bad_tag_deletion.err().unwrap().to_string(),
+            "Ref not found error: tag tag1 does not exist"
+        );
+
+        dataset.create_tag("tag1", 1).await.unwrap();
+
+        assert_eq!(dataset.tags().await.unwrap().len(), 1);
+
+        let another_bad_tag_creation = dataset.create_tag("tag1", 1).await;
+        assert_eq!(
+            another_bad_tag_creation.err().unwrap().to_string(),
+            "Ref conflict error: tag tag1 already exists"
+        );
+
+        dataset.delete_tag("tag1").await.unwrap();
+
+        assert_eq!(dataset.tags().await.unwrap().len(), 0);
+
+        dataset.create_tag("tag1", 1).await.unwrap();
+        dataset.create_tag("tag2", 1).await.unwrap();
+        dataset.create_tag("v1.0.0-rc1", 1).await.unwrap();
+
+        assert_eq!(dataset.tags().await.unwrap().len(), 3);
+
+        let bad_checkout = dataset.checkout_tag("tag3").await;
+        assert_eq!(
+            bad_checkout.err().unwrap().to_string(),
+            "Ref not found error: tag tag3 does not exist"
+        );
+
+        dataset = dataset.checkout_tag("tag1").await.unwrap();
+        assert_eq!(dataset.manifest.version, 1);
     }
 
     #[rstest]

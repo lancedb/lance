@@ -861,7 +861,7 @@ class LanceDataset(pa.dataset.Dataset):
         This is a metadata-only operation and does not remove the data from the
         underlying storage. In order to remove the data, you must subsequently
         call ``compact_files`` to rewrite the data without the removed columns and
-        then call ``cleanup_files`` to remove the old files.
+        then call ``cleanup_old_versions`` to remove the old files.
 
         Examples
         --------
@@ -1094,6 +1094,37 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.cleanup_old_versions(
             td_to_micros(older_than), delete_unverified
         )
+
+    def tags(self) -> dict[str, int]:
+        """
+        Return all tags in this dataset.
+        """
+        return self._ds.tags()
+
+    def checkout_tag(self, tag: str) -> "LanceDataset":
+        """
+        Load the version of the dataset associated with the given tag.
+
+        Unlike the :func:`dataset` constructor, this will re-use the
+        current cache.
+        This is a no-op if the dataset is already at the version associated
+        with the given tag.
+        """
+        ds = copy.copy(self)
+        ds._ds = self._ds.checkout_tag(tag)
+        return ds
+
+    def create_tag(self, tag: str, version: int) -> None:
+        """
+        Create a tag for a given dataset version.
+        """
+        self._ds.create_tag(tag, version)
+
+    def delete_tag(self, tag: str) -> None:
+        """
+        Delete tag from the dataset.
+        """
+        self._ds.delete_tag(tag)
 
     def create_scalar_index(
         self,
