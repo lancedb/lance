@@ -969,7 +969,6 @@ impl Scanner {
             )?;
         }
         if let Some(additional_schema) = additional_schema {
-            println!("additional schema: {:#}", additional_schema);
             plan = self.take(plan, &additional_schema, self.batch_readahead)?;
         }
 
@@ -1024,20 +1023,13 @@ impl Scanner {
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
         }
-        println!("Stage 5: physical schema: {:#?}\n", remaining_schema);
         // Stage 6: physical projection -- reorder physical columns needed before final projection
         let output_arrow_schema = physical_schema.as_ref().into();
         if plan.schema().as_ref() != &output_arrow_schema {
-            println!(
-                "Plan schema: {:#}\n, output schema: {:#}",
-                plan.schema(),
-                output_arrow_schema
-            );
             plan = Arc::new(ProjectionExec::try_new(plan, physical_schema)?);
         }
 
         // Stage 7: final projection
-        println!("Output expr: {:#?}", self.output_expr());
         plan = Arc::new(DFProjectionExec::try_new(self.output_expr()?, plan)?);
 
         let optimizer = Planner::get_physical_optimizer();
@@ -1101,7 +1093,6 @@ impl Scanner {
             let ann_node = self.ann(q, &deltas, filter_plan).await?; // _distance, _rowid
 
             let mut knn_node = if q.refine_factor.is_some() {
-                println!("Refine factor: {}", q.refine_factor.unwrap());
                 let with_vector = self.dataset.schema().project(&[&q.column])?;
                 let knn_node_with_vector =
                     self.take(ann_node, &with_vector, self.batch_readahead)?;
@@ -1116,8 +1107,6 @@ impl Scanner {
             } else {
                 ann_node
             }; // vector, _distance, _rowid
-
-            print!("knn_node schema: {:#}\n\n", knn_node.schema());
 
             if !self.fast_search {
                 knn_node = self.knn_combined(q, index, knn_node, filter_plan).await?;
