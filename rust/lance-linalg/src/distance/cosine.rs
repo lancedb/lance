@@ -65,6 +65,8 @@ pub trait Cosine: Dot + Normalize {
     }
 }
 
+impl Cosine for u8 {}
+
 impl Cosine for bf16 {}
 
 #[cfg(feature = "fp16kernels")]
