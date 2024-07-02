@@ -20,6 +20,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
@@ -590,7 +591,7 @@ impl DatasetIndexInternalExt for Dataset {
                     });
                 }?;
                 match index_metadata.index_type.as_str() {
-                    "FLAT" => match value_type {
+                    "IVF_FLAT" => match value_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
                                 self.object_store.clone(),
@@ -610,8 +611,30 @@ impl DatasetIndexInternalExt for Dataset {
                         }),
                     },
 
-                    "HNSW" => {
+                    "IVF_PQ" => {
+                        let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    "IVF_HNSW_PQ" => {
+                        let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),

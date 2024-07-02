@@ -424,7 +424,6 @@ async fn optimize_ivf_pq_indices(
         first_idx.ivf.centroids.clone().unwrap(),
         metric_type,
         vector_column,
-        pq_index.pq.clone(),
         None,
     );
 
@@ -1368,7 +1367,6 @@ async fn write_ivf_pq_file(
         stream,
         column,
         &mut ivf,
-        pq.clone(),
         metric_type,
         0..num_partitions,
         precomputed_partitons,

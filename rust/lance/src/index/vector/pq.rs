@@ -234,7 +234,7 @@ impl VectorIndex for PQIndex {
     }
 
     fn use_residual(&self) -> bool {
-        self.pq.use_residual()
+        ProductQuantizer::use_residual(self.metric_type)
     }
 
     /// Load a PQ index (page) from the disk.

@@ -34,6 +34,9 @@ pub trait Quantization: Send + Sync + Debug + DeepSizeOf + Into<Quantizer> {
     ) -> Result<Self>;
     fn code_dim(&self) -> usize;
     fn column(&self) -> &'static str;
+    fn use_residual(_: DistanceType) -> bool {
+        false
+    }
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef>;
     fn metadata_key() -> &'static str;
     fn quantization_type() -> QuantizationType;
@@ -45,6 +48,22 @@ pub enum QuantizationType {
     Flat,
     Product,
     Scalar,
+}
+
+impl TryFrom<&str> for QuantizationType {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "FLAT" => Ok(Self::Flat),
+            "PQ" => Ok(Self::Product),
+            "SQ" => Ok(Self::Scalar),
+            _ => Err(Error::Index {
+                message: format!("Unknown quantization type: {}", value),
+                location: location!(),
+            }),
+        }
+    }
 }
 
 impl std::fmt::Display for QuantizationType {
@@ -59,6 +78,9 @@ impl std::fmt::Display for QuantizationType {
 
 pub trait QuantizerBuildParams {
     fn sample_size(&self) -> usize;
+    fn use_residual(_: DistanceType) -> bool {
+        false
+    }
 }
 
 impl QuantizerBuildParams for () {

@@ -10,7 +10,7 @@ use arrow_array::FixedSizeListArray;
 use arrow_array::{Array, ArrayRef};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::Result;
-use lance_linalg::distance::{Dot, Normalize, L2};
+use lance_linalg::distance::{DistanceType, Dot, Normalize, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
 use rayon::prelude::*;
@@ -53,6 +53,10 @@ impl Default for PQBuildParams {
 impl QuantizerBuildParams for PQBuildParams {
     fn sample_size(&self) -> usize {
         self.sample_rate * 2_usize.pow(self.num_bits as u32)
+    }
+
+    fn use_residual(distance_type: DistanceType) -> bool {
+        matches!(distance_type, DistanceType::L2 | DistanceType::Cosine)
     }
 }
 

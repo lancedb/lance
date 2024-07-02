@@ -55,10 +55,6 @@ impl IvfSubIndex for FlatIndex {
     type QueryParams = FlatQueryParams;
     type BuildParams = ();
 
-    fn use_residual() -> bool {
-        false
-    }
-
     fn name() -> &'static str {
         "FLAT"
     }

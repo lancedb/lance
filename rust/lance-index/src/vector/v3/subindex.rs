@@ -22,8 +22,6 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     where
         Self: Sized;
 
-    fn use_residual() -> bool;
-
     fn name() -> &'static str;
 
     fn metadata_key() -> &'static str;

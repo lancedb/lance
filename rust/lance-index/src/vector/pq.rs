@@ -30,7 +30,9 @@ pub(crate) mod utils;
 
 use self::distance::{build_distance_table_l2, compute_l2_distance};
 pub use self::utils::num_centroids;
-use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
+use super::quantizer::{
+    Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
+};
 use super::{pb, PQ_CODE_COLUMN};
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
@@ -86,10 +88,6 @@ impl ProductQuantizer {
             codebook,
             distance_type,
         })
-    }
-
-    pub fn use_residual(&self) -> bool {
-        matches!(self.distance_type, DistanceType::L2 | DistanceType::Cosine)
     }
 
     fn transform<T: ArrowPrimitiveType>(&self, vectors: &dyn Array) -> Result<ArrayRef>
@@ -364,6 +362,10 @@ impl Quantization for ProductQuantizer {
 
     fn column(&self) -> &'static str {
         PQ_CODE_COLUMN
+    }
+
+    fn use_residual(distance_type: DistanceType) -> bool {
+        <PQBuildParams as QuantizerBuildParams>::use_residual(distance_type)
     }
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {

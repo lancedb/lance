@@ -18,6 +18,7 @@ use lance_linalg::{
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::{pq::ProductQuantizer, residual::ResidualTransform, transform::Transformer};
 
+use super::quantizer::Quantization;
 use super::PART_ID_COLUMN;
 use super::{quantizer::Quantizer, residual::compute_residual};
 
@@ -57,11 +58,10 @@ pub fn new_ivf_transformer_with_quantizer(
             vector_column,
             range,
         )),
-        Quantizer::Product(pq) => Ok(IvfTransformer::with_pq(
+        Quantizer::Product(_) => Ok(IvfTransformer::with_pq(
             centroids,
             metric_type,
             vector_column,
-            pq,
             range,
         )),
         Quantizer::Scalar(_) => Ok(IvfTransformer::with_sq(
@@ -146,7 +146,6 @@ impl IvfTransformer {
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
         vector_column: &str,
-        pq: ProductQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
@@ -174,7 +173,7 @@ impl IvfTransformer {
             )));
         }
 
-        if pq.use_residual() {
+        if ProductQuantizer::use_residual(distance_type) {
             transforms.push(Arc::new(ResidualTransform::new(
                 centroids.clone(),
                 PART_ID_COLUMN,
