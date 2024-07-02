@@ -22,12 +22,13 @@ async fn main() {
     let dataset = Arc::new(DatasetBuilder::from_uri(uri).load().await.unwrap());
 
     println!("Start benchmarking");
-    for _ in 0..3 {
+    for _ in 0..100 {
+        println!("warmup run...")
         let _batch = dataset
             .scan()
             .nearest(&column, &random_vector(512), 100)
             .unwrap()
-            .nprobs(128)
+            .nprobs(4)
             .try_into_batch()
             .await
             .unwrap();
