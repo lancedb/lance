@@ -12,7 +12,7 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark;
+package com.lancedb.lance.spark.read;
 
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.catalyst.InternalRow;

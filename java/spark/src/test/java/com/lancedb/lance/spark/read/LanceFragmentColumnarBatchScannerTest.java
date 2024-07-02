@@ -12,14 +12,14 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark;
+package com.lancedb.lance.spark.read;
 
+import com.lancedb.lance.spark.TestUtils;
 import com.lancedb.lance.spark.internal.LanceFragmentColumnarBatchScanner;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.junit.jupiter.api.Test;
 
-import javax.xml.validation.Schema;
 import java.io.IOException;
 import java.util.Iterator;
 import java.util.List;
