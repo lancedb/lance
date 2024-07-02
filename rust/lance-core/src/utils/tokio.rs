@@ -8,7 +8,13 @@ use tokio::runtime::{Builder, Runtime};
 use tracing::Span;
 
 lazy_static::lazy_static! {
+    pub static ref IO_CORE_RESERVATION: usize = std::env::var("LANCE_IO_CORE_RESERVATION").unwrap_or("2".to_string()).parse().unwrap();
+
     pub static ref CPU_RUNTIME: Runtime = Builder::new_multi_thread()
+        .max_blocking_threads(num_cpus::get() - *IO_CORE_RESERVATION)
+        .worker_threads(1)
+        // keep the thread alive "forever"
+        .thread_keep_alive(Duration::from_secs(u64::MAX))
         .thread_name("lance-cpu")
         .max_blocking_threads(num_cpus::get())
         .build()
