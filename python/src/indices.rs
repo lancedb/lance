@@ -41,6 +41,7 @@ async fn do_train_ivf_model(
 }
 
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 fn train_ivf_model(
     py: Python<'_>,
     dataset: &Dataset,
