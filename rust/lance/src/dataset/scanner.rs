@@ -1120,7 +1120,7 @@ impl Scanner {
             print!("knn_node schema: {:#}\n\n", knn_node.schema());
 
             if !self.fast_search {
-                knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
+                knn_node = self.knn_combined(q, index, knn_node, filter_plan).await?;
             }
 
             Ok(knn_node)
@@ -4285,6 +4285,34 @@ mod test {
   SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]
     ANNSubIndex: name=idx, k=33, deltas=1
       ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+        )
+        .await
+        .unwrap();
+
+        // Not `fast_scan` case
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                Ok(scan
+                    .nearest("vec", &q, 34)?
+                    .with_row_id()
+                    .project(&["_rowid", "_distance"])?)
+            },
+            "Projection: fields=[_rowid, _distance]
+  FilterExec: _distance@2 IS NOT NULL
+    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]
+      KNNVectorDistance: metric=l2
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Projection: fields=[_distance, _rowid, vec]
+              FilterExec: _distance@2 IS NOT NULL
+                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]
+                  KNNVectorDistance: metric=l2
+                    LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+            Take: columns=\"_distance, _rowid, vec\"
+              SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]
+                ANNSubIndex: name=idx, k=34, deltas=1
+                  ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await
         .unwrap();
