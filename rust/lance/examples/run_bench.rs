@@ -19,16 +19,16 @@ async fn main() {
     let column = args[2].clone();
     let concurrency = args[3].parse::<usize>().unwrap();
 
-    let dataset = Arc::new(DatasetBuilder::from_uri(uri).load().await.unwrap());
+    let dataset = Arc::new(DatasetBuilder::from_uri(uri).with_index_cache_size(10000).load().await.unwrap());
 
     println!("Start benchmarking");
-    for _ in 0..100 {
+    for _ in 0..5 {
         println!("warmup run...");
         let _batch = dataset
             .scan()
             .nearest(&column, &random_vector(512), 100)
             .unwrap()
-            .nprobs(4)
+            .nprobs(10000)
             .try_into_batch()
             .await
             .unwrap();
@@ -47,7 +47,7 @@ async fn main() {
                 d.scan()
                     .nearest(&col, &random_vector(512), 100)
                     .unwrap()
-                    .nprobs(2)
+                    .nprobs(20)
                     .filter("year >= 2010 AND year < 2020")
                     .unwrap()
                     .prefilter(true)
