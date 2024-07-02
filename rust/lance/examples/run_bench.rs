@@ -35,6 +35,7 @@ async fn main() {
     println!("Finished warmup");
 
     let mut stream = stream::repeat(dataset)
+        .take(10000 * concurrency)
         .map(|d| {
             let col = column.clone();
 
@@ -43,7 +44,7 @@ async fn main() {
                 d.scan()
                     .nearest(&col, &random_vector(512), 100)
                     .unwrap()
-                    .nprobs(128)
+                    .nprobs(2)
                     .try_into_batch()
                     .await
                     .unwrap();
