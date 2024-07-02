@@ -166,11 +166,10 @@ jobs:
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
           rustup component add rustfmt
-      - name: Check all
-        run: cargo check --tests --benches --all-features --workspace
       - name: Run tests
-        run: |
-          cargo build --all-features
+        # Check all benches, even though we aren't going to run them.
+        run: |  
+          cargo build --tests --benches --all-features --workspace
           cargo test --all-features
   windows-build:
     runs-on: windows-latest
@@ -191,9 +190,8 @@ jobs:
           7z x protoc.zip
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
-      - name: Check all
-        run: cargo check --tests --benches --all-features --workspace
       - name: Run tests
+        # Check all benches, even though we aren't going to run them.
         run: |
-          cargo build
+          cargo build --tests --benches --all-features --workspace
           cargo test
