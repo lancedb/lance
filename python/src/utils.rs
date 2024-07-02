@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::compute::concat;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use lance::utils::GenericProgressCallback;
 use lance::Result;
 use lance::{datatypes::Schema, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::utils::progress::NoopProgressCallback;
 use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
@@ -32,7 +34,9 @@ use lance_linalg::{
     kmeans::{KMeans as LanceKMeans, KMeansParams},
 };
 use lance_table::io::manifest::ManifestDescribing;
+use log::warn;
 use object_store::path::Path;
+use pyo3::types::PyDict;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
@@ -80,8 +84,13 @@ impl KMeans {
             max_iters: self.max_iters,
             ..Default::default()
         };
-        let kmeans = LanceKMeans::new_with_params(&fixed_size_arr, self.k, &params)
-            .map_err(|e| PyRuntimeError::new_err(format!("Error training KMeans: {}", e)))?;
+        let kmeans = LanceKMeans::new_with_params(
+            &fixed_size_arr,
+            self.k,
+            &params,
+            &NoopProgressCallback::default(),
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Error training KMeans: {}", e)))?;
         self.trained_kmeans = Some(kmeans);
         Ok(())
     }
@@ -213,5 +222,54 @@ impl Hnsw {
 
     fn vectors(&self, py: Python) -> PyResult<PyObject> {
         self.vectors.to_data().to_pyarrow(py)
+    }
+}
+
+#[derive(Default)]
+pub struct TqdmProgressCallback {
+    progress: Arc<Mutex<Option<PyObject>>>,
+}
+
+impl TqdmProgressCallback {
+    fn do_begin(&self, total_units: u64) -> PyResult<()> {
+        let mut prog = self.progress.lock().unwrap();
+        let prog_obj = Python::with_gil(|py| {
+            let tqdm = py.import("tqdm")?;
+            let tqdm = tqdm.getattr("tqdm")?;
+            let kwargs = vec![("total", total_units.to_object(py))].to_object(py);
+            let kwargs = PyDict::from_sequence(py, kwargs)?;
+            let progress = tqdm.call((), Some(kwargs))?;
+            PyResult::Ok(progress.to_object(py))
+        })?;
+        *prog = Some(prog_obj);
+        Ok(())
+    }
+
+    fn do_update(&self, new_units_completed: u64) -> PyResult<()> {
+        let prog = self.progress.lock().unwrap();
+        if let Some(prog) = prog.as_ref() {
+            Python::with_gil(|py| {
+                prog.call_method1(py, "update", (new_units_completed,))
+                    .unwrap();
+            });
+        }
+        Ok(())
+    }
+}
+
+impl GenericProgressCallback for TqdmProgressCallback {
+    fn begin(&self, total_units: u64) {
+        if let Err(err) = self.do_begin(total_units) {
+            warn!(
+                "Failed to report progress, is tqdm installed?  Error: {}",
+                err
+            );
+        }
+    }
+
+    fn update(&self, new_units_completed: u64) {
+        if let Err(err) = self.do_update(new_units_completed) {
+            warn!("Failed to report progress.  Error: {}", err);
+        }
     }
 }

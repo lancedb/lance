@@ -26,7 +26,12 @@ use futures::{
 };
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
-use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
+use lance_core::{
+    datatypes::Field,
+    traits::DatasetTakeRows,
+    utils::progress::{GenericProgressCallback, NoopProgressCallback},
+    Error, Result, ROW_ID_FIELD,
+};
 use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
@@ -1037,6 +1042,7 @@ pub async fn build_ivf_model(
     dim: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
+    progress: Option<Arc<dyn GenericProgressCallback>>,
 ) -> Result<IvfModel> {
     if let Some(centroids) = params.centroids.as_ref() {
         info!("Pre-computed IVF centroids is provided, skip IVF training");
@@ -1075,8 +1081,10 @@ pub async fn build_ivf_model(
     };
 
     info!("Start to train IVF model");
+    let progress = progress.unwrap_or_else(|| Arc::new(NoopProgressCallback::default()));
+
     let start = std::time::Instant::now();
-    let ivf = train_ivf_model(&training_data, mt, params).await?;
+    let ivf = train_ivf_model(&training_data, mt, params, progress.as_ref()).await?;
     info!(
         "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -1111,7 +1119,7 @@ async fn build_ivf_model_and_pq(
         });
     };
 
-    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
+    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params, None).await?;
 
     let ivf_residual = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
         Some(&ivf_model)
@@ -1536,6 +1544,7 @@ async fn do_train_ivf_model<T: ArrowFloatType + 'static>(
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
+    progress: &dyn GenericProgressCallback,
 ) -> Result<IvfModel>
 where
     T::Native: Dot + L2 + Normalize,
@@ -1551,6 +1560,7 @@ where
         rng,
         metric_type,
         params.sample_rate,
+        progress,
     )
     .await?;
     Ok(IvfModel::new(FixedSizeListArray::try_new_from_values(
@@ -1564,6 +1574,7 @@ async fn train_ivf_model(
     data: &FixedSizeListArray,
     distance_type: DistanceType,
     params: &IvfBuildParams,
+    progress: &dyn GenericProgressCallback,
 ) -> Result<IvfModel> {
     assert!(
         distance_type != DistanceType::Cosine,
@@ -1573,16 +1584,34 @@ async fn train_ivf_model(
     let dim = data.value_length() as usize;
     match (values.data_type(), distance_type) {
         (DataType::Float16, _) => {
-            do_train_ivf_model::<Float16Type>(values.as_primitive(), dim, distance_type, params)
-                .await
+            do_train_ivf_model::<Float16Type>(
+                values.as_primitive(),
+                dim,
+                distance_type,
+                params,
+                progress,
+            )
+            .await
         }
         (DataType::Float32, _) => {
-            do_train_ivf_model::<Float32Type>(values.as_primitive(), dim, distance_type, params)
-                .await
+            do_train_ivf_model::<Float32Type>(
+                values.as_primitive(),
+                dim,
+                distance_type,
+                params,
+                progress,
+            )
+            .await
         }
         (DataType::Float64, _) => {
-            do_train_ivf_model::<Float64Type>(values.as_primitive(), dim, distance_type, params)
-                .await
+            do_train_ivf_model::<Float64Type>(
+                values.as_primitive(),
+                dim,
+                distance_type,
+                params,
+                progress,
+            )
+            .await
         }
         // (DataType::UInt8, DistanceType::Hamming) => {
         //     do_train_ivf_model::<UInt8Type>(values.as_primitive(), dim, distance_type, params).await
@@ -2132,7 +2161,7 @@ mod tests {
         let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
 
         let ivf_params = IvfBuildParams::new(2);
-        let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::L2, &ivf_params)
+        let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::L2, &ivf_params, None)
             .await
             .unwrap();
         assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
@@ -2160,9 +2189,16 @@ mod tests {
         let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
 
         let ivf_params = IvfBuildParams::new(2);
-        let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::Cosine, &ivf_params)
-            .await
-            .unwrap();
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            DIM,
+            MetricType::Cosine,
+            &ivf_params,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
         assert_eq!(32, ivf_model.centroids.as_ref().unwrap().value_length());
         assert_eq!(2, ivf_model.num_partitions());

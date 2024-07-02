@@ -23,6 +23,7 @@ use arrow_array::{ArrowNumericType, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
 use bitvec::prelude::*;
+use lance_core::utils::progress::GenericProgressCallback;
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
@@ -428,23 +429,30 @@ impl KMeans {
     }
 
     /// Train a KMeans model on data with `k` clusters.
-    pub fn new(data: &FixedSizeListArray, k: usize, max_iters: u32) -> Result<Self> {
+    pub fn new(
+        data: &FixedSizeListArray,
+        k: usize,
+        max_iters: u32,
+        progress: &dyn GenericProgressCallback,
+    ) -> Result<Self> {
         let params = KMeansParams {
             max_iters,
             distance_type: DistanceType::L2,
             ..Default::default()
         };
-        Self::new_with_params(data, k, &params)
+        Self::new_with_params(data, k, &params, progress)
     }
 
     fn train_kmeans<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
         data: &FixedSizeListArray,
         k: usize,
         params: &KMeansParams,
+        progress: &dyn GenericProgressCallback,
     ) -> Result<Self>
     where
         T::Native: Num,
     {
+        progress.begin(params.max_iters as u64 * params.redos as u64);
         let dimension = data.value_length() as usize;
 
         let data = data
@@ -503,9 +511,11 @@ impl KMeans {
                         "KMeans training: converged at iteration {} / {}, redo={}, loss={}, last_loss={}, loss_diff={}",
                         i, params.max_iters, redo, loss, last_loss, (loss - last_loss).abs() / last_loss
                     );
+                    progress.update(params.max_iters as u64 - i as u64 + 1);
                     break;
                 }
                 loss = last_loss;
+                progress.update(1);
             }
             let stddev = hist_stddev(
                 k,
@@ -529,6 +539,7 @@ impl KMeans {
         data: &FixedSizeListArray,
         k: usize,
         params: &KMeansParams,
+        progress: &dyn GenericProgressCallback,
     ) -> Result<Self> {
         let n = data.len();
         if n < k {
@@ -542,17 +553,23 @@ impl KMeans {
 
         match (data.value_type(), params.distance_type) {
             (DataType::Float16, _) => {
-                Self::train_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(data, k, params)
+                Self::train_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(
+                    data, k, params, progress,
+                )
             }
 
             (DataType::Float32, _) => {
-                Self::train_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(data, k, params)
+                Self::train_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                    data, k, params, progress,
+                )
             }
             (DataType::Float64, _) => {
-                Self::train_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(data, k, params)
+                Self::train_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(
+                    data, k, params, progress,
+                )
             }
             (DataType::UInt8, DistanceType::Hamming) => {
-                Self::train_kmeans::<UInt8Type, KModeAlgo>(data, k, params)
+                Self::train_kmeans::<UInt8Type, KModeAlgo>(data, k, params, progress)
             }
             _ => Err(ArrowError::InvalidArgumentError(format!(
                 "KMeans: can not train data type {} with distance type: {}",
@@ -716,6 +733,7 @@ mod tests {
     use std::iter::repeat;
 
     use lance_arrow::*;
+    use lance_core::utils::progress::NoopProgressCallback;
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
@@ -726,7 +744,7 @@ mod tests {
     fn test_train_with_small_dataset() {
         let data = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
         let data = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
-        match KMeans::new(&data, 128, 5) {
+        match KMeans::new(&data, 128, 5, &NoopProgressCallback::default()) {
             Ok(_) => panic!("Should fail to train KMeans"),
             Err(e) => {
                 assert!(e.to_string().contains("smaller than"));
@@ -823,7 +841,8 @@ mod tests {
             distance_type: DistanceType::Hamming,
             ..Default::default()
         };
-        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
+        let kmeans =
+            KMeans::new_with_params(&fsl, K, &params, &NoopProgressCallback::default()).unwrap();
         assert_eq!(kmeans.centroids.len(), K * DIM);
         assert_eq!(kmeans.dimension, DIM);
         assert_eq!(kmeans.centroids.data_type(), &DataType::UInt8);

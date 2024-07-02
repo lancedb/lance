@@ -7,7 +7,7 @@ use log::info;
 use rand::{seq::IteratorRandom, Rng};
 use snafu::{location, Location};
 
-use lance_core::{Error, Result};
+use lance_core::{utils::progress::GenericProgressCallback, Error, Result};
 use lance_linalg::{
     distance::{DistanceType, Dot, Normalize, L2},
     kmeans::{KMeans, KMeansParams},
@@ -24,6 +24,7 @@ pub async fn train_kmeans<T: ArrowFloatType>(
     mut rng: impl Rng,
     distance_type: DistanceType,
     sample_rate: usize,
+    progress: &dyn GenericProgressCallback,
 ) -> Result<ArrayRef>
 where
     T::Native: Dot + L2 + Normalize,
@@ -63,6 +64,6 @@ where
         ..Default::default()
     };
     let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
-    let model = KMeans::new_with_params(&data, k, &params)?;
+    let model = KMeans::new_with_params(&data, k, &params, progress)?;
     Ok(model.centroids.clone())
 }

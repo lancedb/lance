@@ -184,6 +184,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             dim,
             self.distance_type,
             ivf_params,
+            None,
         )
         .await
 

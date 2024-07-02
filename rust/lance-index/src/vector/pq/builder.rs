@@ -12,6 +12,7 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
 use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::utils::progress::NoopProgressCallback;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{Dot, Normalize, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
@@ -110,6 +111,7 @@ impl PQBuildParams {
                     rng.clone(),
                     metric_type,
                     self.sample_rate,
+                    &NoopProgressCallback::default(),
                 )
                 .await
             })
