@@ -58,7 +58,7 @@ pub fn check_valid_ref(s: &str) -> Result<()> {
         });
     }
 
-    if s.ends_with(".") {
+    if s.ends_with('.') {
         return Err(Error::InvalidRef {
             message: "Ref cannot end with a dot".to_string(),
         });
