@@ -23,7 +23,7 @@ async fn main() {
 
     println!("Start benchmarking");
     for _ in 0..100 {
-        println!("warmup run...")
+        println!("warmup run...");
         let _batch = dataset
             .scan()
             .nearest(&column, &random_vector(512), 100)
