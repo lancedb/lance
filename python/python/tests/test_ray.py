@@ -5,16 +5,18 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 
 ray = pytest.importorskip("ray")
 
 
-from lance.ray.sink import (  # noqa: E402
+from lance.ray import (  # noqa: E402
     LanceCommitter,
     LanceDatasink,
     LanceFragmentWriter,
     _register_hooks,
+    merge_columns,
 )
 
 # Use this hook until we have offical DataSink in Ray.
@@ -99,3 +101,28 @@ def test_ray_write_lance(tmp_path: Path):
     tbl = ds.to_table()
     assert sorted(tbl["id"].to_pylist()) == list(range(10))
     assert set(tbl["str"].to_pylist()) == set([f"str-{i}" for i in range(10)])
+
+
+def test_ray_merge_column(tmp_path: Path):
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
+
+    (
+        ray.data.range(10)
+        .map(lambda x: {"id": x["id"], "str": f"str-{x['id']}"})
+        .write_lance(tmp_path, schema=schema)
+    )
+
+    def value_func(batch):
+        arrs = pc.add(batch["id"], 2)
+        return pa.RecordBatch.from_arrays([arrs], ["sum"])
+
+    merge_columns(tmp_path, value_func)
+
+    ds = lance.dataset(tmp_path)
+    schema = ds.schema
+    assert schema.names == ["id", "str", "sum"]
+
+    tbl = ds.to_table()
+    assert set(tbl["sum"].to_pylist()) == set(range(2, 12))
+    # Only bumped 1 version.
+    assert ds.version == 2
