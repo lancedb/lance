@@ -31,7 +31,6 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
-use lance_core::datatypes::Field;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_index::vector::{Query, DIST_COL};
@@ -51,7 +50,7 @@ use crate::io::exec::{
     knn::new_knn_exec, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec,
     Planner, PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
 };
-use crate::{Error, Result, DIST_FIELD};
+use crate::{Error, Result};
 use snafu::{location, Location};
 
 #[cfg(feature = "substrait")]
@@ -308,17 +307,8 @@ impl Scanner {
             output.insert(output_name.as_ref().to_string(), expr);
         }
 
-        let mut schema_with_meta_columns = self.dataset.schema().clone();
-        if self.with_row_id || self.nearest.is_some() {
-            schema_with_meta_columns
-                .fields
-                .push(Field::try_from(ROW_ID_FIELD.clone())?);
-        }
-        if self.nearest.is_some() {
-            schema_with_meta_columns
-                .fields
-                .push(Field::try_from(DIST_FIELD.clone())?);
-        }
+        let physical_schema = self.physical_schema()?;
+        let schema_with_meta_columns = self.dataset.schema().merge(physical_schema.as_ref())?;
         self.physical_columns = schema_with_meta_columns.project(&physical_cols)?;
 
         let mut output_cols = vec![];
@@ -624,7 +614,7 @@ impl Scanner {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
 
-        if self.with_row_id {
+        if self.with_row_id || self.nearest.is_some() {
             extra_columns.push(ROW_ID_FIELD.clone());
         }
 
