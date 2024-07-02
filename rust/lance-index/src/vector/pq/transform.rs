@@ -11,23 +11,20 @@ use lance_core::{Error, Result};
 use snafu::{location, Location};
 
 use super::ProductQuantizer;
+use crate::vector::quantizer::Quantization;
 use crate::vector::transform::Transformer;
 
 /// Product Quantizer Transformer
 ///
 /// It transforms a column of vectors into a column of PQ codes.
 pub struct PQTransformer {
-    quantizer: Arc<dyn ProductQuantizer>,
+    quantizer: ProductQuantizer,
     input_column: String,
     output_column: String,
 }
 
 impl PQTransformer {
-    pub fn new(
-        quantizer: Arc<dyn ProductQuantizer>,
-        input_column: &str,
-        output_column: &str,
-    ) -> Self {
+    pub fn new(quantizer: ProductQuantizer, input_column: &str, output_column: &str) -> Self {
         Self {
             quantizer,
             input_column: input_column.to_owned(),
@@ -65,7 +62,7 @@ impl Transformer for PQTransformer {
             ),
             location: location!(),
         })?;
-        let pq_code = self.quantizer.transform(&data)?;
+        let pq_code = self.quantizer.quantize(&data)?;
         let pq_field = Field::new(&self.output_column, pq_code.data_type().clone(), false);
         let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
         let batch = batch.drop_column(&self.input_column)?;

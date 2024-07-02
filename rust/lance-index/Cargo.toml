@@ -60,7 +60,6 @@ clap = { workspace = true, features = ["derive"] }
 criterion.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
-pprof.workspace = true
 tempfile.workspace = true
 datafusion-sql.workspace = true
 
@@ -68,12 +67,19 @@ datafusion-sql.workspace = true
 prost-build.workspace = true
 rustc_version.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof.workspace = true
+
 [[bench]]
 name = "find_partitions"
 harness = false
 
 [[bench]]
 name = "pq_dist_table"
+harness = false
+
+[[bench]]
+name = "pq_assignment"
 harness = false
 
 [[bench]]

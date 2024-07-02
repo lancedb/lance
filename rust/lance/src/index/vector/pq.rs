@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::UInt32Array;
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
@@ -18,8 +18,10 @@ use deepsize::DeepSizeOf;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::ProductQuantizationStorage;
-use lance_index::vector::quantizer::Quantization;
+use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
+use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     vector::{pq::ProductQuantizer, Query, DIST_COL},
     Index, IndexType,
@@ -33,10 +35,9 @@ use snafu::{location, Location};
 use tracing::{instrument, span, Level};
 
 // Re-export
-pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
+pub use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::kernels::normalize_fsl;
 
-use super::ivf::Ivf;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
@@ -48,7 +49,7 @@ use crate::{Error, Result};
 #[derive(Clone)]
 pub struct PQIndex {
     /// Product quantizer.
-    pub pq: Arc<dyn ProductQuantizer>,
+    pub pq: ProductQuantizer,
 
     /// PQ code
     pub code: Option<Arc<UInt8Array>>,
@@ -81,8 +82,8 @@ impl std::fmt::Debug for PQIndex {
         write!(
             f,
             "PQ(m={}, nbits={}, {})",
-            self.pq.num_sub_vectors(),
-            self.pq.num_bits(),
+            self.pq.code_dim(),
+            self.pq.num_bits,
             self.metric_type
         )
     }
@@ -90,7 +91,7 @@ impl std::fmt::Debug for PQIndex {
 
 impl PQIndex {
     /// Load a PQ index (page) from the disk.
-    pub(crate) fn new(pq: Arc<dyn ProductQuantizer>, metric_type: MetricType) -> Self {
+    pub(crate) fn new(pq: ProductQuantizer, metric_type: MetricType) -> Self {
         Self {
             code: None,
             row_ids: None,
@@ -132,6 +133,10 @@ impl Index for PQIndex {
         self
     }
 
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+        Ok(self)
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::Vector
     }
@@ -139,9 +144,9 @@ impl Index for PQIndex {
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
             "index_type": "PQ",
-            "nbits": self.pq.num_bits(),
-            "num_sub_vectors": self.pq.num_sub_vectors(),
-            "dimension": self.pq.dimension(),
+            "nbits": self.pq.num_bits,
+            "num_sub_vectors": self.pq.code_dim(),
+            "dimension": self.pq.dimension,
             "metric_type": self.metric_type.to_string(),
         }))
     }
@@ -184,7 +189,7 @@ impl VectorIndex for PQIndex {
 
         let pq = self.pq.clone();
         let query = query.clone();
-        let num_sub_vectors = self.pq.num_sub_vectors() as i32;
+        let num_sub_vectors = self.pq.code_dim() as i32;
         spawn_cpu(move || {
             let (code, row_ids) = if pre_filter.is_empty() {
                 Ok((code, row_ids))
@@ -211,6 +216,19 @@ impl VectorIndex for PQIndex {
         .await
     }
 
+    fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        unimplemented!("only for IVF")
+    }
+
+    async fn search_in_partition(
+        &self,
+        _: usize,
+        _: &Query,
+        _: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        unimplemented!("only for IVF")
+    }
+
     fn is_loadable(&self) -> bool {
         true
     }
@@ -226,7 +244,7 @@ impl VectorIndex for PQIndex {
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        let pq_code_length = self.pq.num_sub_vectors() * length;
+        let pq_code_length = self.pq.code_dim() * length;
         let pq_code = read_fixed_stride_array(
             reader.as_ref(),
             &DataType::UInt8,
@@ -268,7 +286,7 @@ impl VectorIndex for PQIndex {
             .as_ref()
             .unwrap()
             .values()
-            .chunks_exact(self.pq.num_sub_vectors());
+            .chunks_exact(self.pq.code_dim());
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
         let remapped = row_ids
             .zip(code)
@@ -287,6 +305,18 @@ impl VectorIndex for PQIndex {
             remapped.into_iter().flat_map(|(_, code)| code).copied(),
         )));
         Ok(())
+    }
+
+    fn ivf_model(&self) -> IvfModel {
+        unimplemented!("only for IVF")
+    }
+    fn quantizer(&self) -> Quantizer {
+        unimplemented!("only for IVF")
+    }
+
+    /// the index type of this vector index.
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+        (SubIndexType::Flat, QuantizationType::Product)
     }
 
     fn metric_type(&self) -> MetricType {
@@ -309,10 +339,10 @@ pub(super) async fn build_pq_model(
     dim: usize,
     metric_type: MetricType,
     params: &PQBuildParams,
-    ivf: Option<&Ivf>,
-) -> Result<Arc<dyn ProductQuantizer>> {
+    ivf: Option<&IvfModel>,
+) -> Result<ProductQuantizer> {
     if let Some(codebook) = &params.codebook {
-        let mt = if metric_type == MetricType::Cosine {
+        let dt = if metric_type == MetricType::Cosine {
             info!("Normalize training data for PQ training: Cosine");
             MetricType::L2
         } else {
@@ -320,33 +350,20 @@ pub(super) async fn build_pq_model(
         };
 
         return match codebook.data_type() {
-            DataType::Float16 => Ok(Arc::new(ProductQuantizerImpl::<Float16Type>::new(
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(ProductQuantizer::new(
                 params.num_sub_vectors,
                 params.num_bits as u32,
                 dim,
-                Arc::new(codebook.as_primitive().clone()),
-                mt,
-            ))),
-            DataType::Float32 => Ok(Arc::new(ProductQuantizerImpl::<Float32Type>::new(
-                params.num_sub_vectors,
-                params.num_bits as u32,
-                dim,
-                Arc::new(codebook.as_primitive().clone()),
-                mt,
-            ))),
-            DataType::Float64 => Ok(Arc::new(ProductQuantizerImpl::<Float64Type>::new(
-                params.num_sub_vectors,
-                params.num_bits as u32,
-                dim,
-                Arc::new(codebook.as_primitive().clone()),
-                mt,
-            ))),
-            _ => {
-                return Err(Error::Index {
-                    message: format!("Wrong codebook data type: {:?}", codebook.data_type()),
-                    location: location!(),
-                });
-            }
+                FixedSizeListArray::try_new_from_values(
+                    codebook.slice(0, codebook.len()),
+                    dim as i32,
+                )?,
+                dt,
+            )),
+            _ => Err(Error::Index {
+                message: format!("Wrong codebook data type: {:?}", codebook.data_type()),
+                location: location!(),
+            }),
         };
     }
     info!(
@@ -381,7 +398,11 @@ pub(super) async fn build_pq_model(
         // Compute residual for PQ training.
         //
         // TODO: consolidate IVF models to `lance_index`.
-        let ivf2 = lance_index::vector::ivf::new_ivf(ivf.centroids.clone(), MetricType::L2, vec![]);
+        let ivf2 = lance_index::vector::ivf::new_ivf_transformer(
+            ivf.centroids.clone().unwrap(),
+            MetricType::L2,
+            vec![],
+        );
         span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf2.compute_residual(&training_data))?
     } else {
@@ -397,7 +418,7 @@ pub(crate) fn build_pq_storage(
     distance_type: DistanceType,
     row_ids: Arc<dyn Array>,
     code_array: Vec<Arc<dyn Array>>,
-    pq: Arc<dyn ProductQuantizer>,
+    pq: ProductQuantizer,
 ) -> Result<ProductQuantizationStorage> {
     let pq_arrs = code_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
     let pq_column = concat(&pq_arrs)?;
@@ -408,15 +429,11 @@ pub(crate) fn build_pq_storage(
         (pq.column(), pq_column, false),
     ])?;
     let pq_store = ProductQuantizationStorage::new(
-        pq.codebook_as_fsl()
-            .values()
-            .as_primitive::<Float32Type>()
-            .clone()
-            .into(),
+        pq.codebook.clone(),
         pq_batch.clone(),
-        pq.num_bits(),
-        pq.num_sub_vectors(),
-        pq.dimension(),
+        pq.num_bits,
+        pq.code_dim(),
+        pq.dimension,
         distance_type,
     )?;
 
@@ -426,6 +443,7 @@ pub(crate) fn build_pq_storage(
 mod tests {
     use super::*;
     use crate::index::vector::ivf::build_ivf_model;
+    use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
     use lance_index::vector::ivf::IvfBuildParams;
@@ -470,17 +488,17 @@ mod tests {
 
         let centroids = generate_random_array_with_range::<Float32Type>(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf = Ivf::new(fsl);
+        let ivf = IvfModel::new(fsl);
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
             .await
             .unwrap();
 
-        assert_eq!(pq.num_sub_vectors(), 16);
-        assert_eq!(pq.num_bits(), 8);
-        assert_eq!(pq.dimension(), DIM);
+        assert_eq!(pq.code_dim(), 16);
+        assert_eq!(pq.num_bits, 8);
+        assert_eq!(pq.dimension, DIM);
 
-        let codebook = pq.codebook_as_fsl();
+        let codebook = pq.codebook.clone();
         assert_eq!(codebook.len(), 256);
         codebook
             .values()
@@ -515,11 +533,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(pq.num_sub_vectors(), 16);
-        assert_eq!(pq.num_bits(), 8);
-        assert_eq!(pq.dimension(), DIM);
+        assert_eq!(pq.code_dim(), 16);
+        assert_eq!(pq.num_bits, 8);
+        assert_eq!(pq.dimension, DIM);
 
-        let codebook = pq.codebook_as_fsl();
+        let codebook = pq.codebook.clone();
         assert_eq!(codebook.len(), 256);
         codebook
             .values()
@@ -533,10 +551,14 @@ mod tests {
         let vectors = normalize_fsl(&vectors).unwrap();
         let row = vectors.slice(0, 1);
 
-        let ivf2 = lance_index::vector::ivf::new_ivf(ivf.centroids.clone(), MetricType::L2, vec![]);
+        let ivf2 = lance_index::vector::ivf::new_ivf_transformer(
+            ivf.centroids.clone().unwrap(),
+            MetricType::L2,
+            vec![],
+        );
 
         let residual_query = ivf2.compute_residual(&row).unwrap();
-        let pq_code = pq.transform(&residual_query).unwrap();
+        let pq_code = pq.quantize(&residual_query).unwrap();
         let distances = pq
             .compute_distances(
                 &residual_query.value(0),

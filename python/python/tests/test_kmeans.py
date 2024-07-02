@@ -20,3 +20,9 @@ def test_invalid_inputs():
     )
     with pytest.raises(ValueError, match="Array must be float32 type, got: double"):
         kmeans.fit(data)
+
+
+def test_kmeans_dot():
+    kmeans = lance.util.KMeans(32, metric_type="dot")
+    data = np.random.randn(1000, 128).astype(np.float32)
+    kmeans.fit(data)

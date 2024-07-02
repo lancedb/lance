@@ -4,18 +4,14 @@
 //! Product Quantizer Builder
 //!
 
-use std::sync::Arc;
-
-use crate::pb;
+use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::types::{Float16Type, Float64Type};
-use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, ArrayRef, Float32Array, PrimitiveArray,
-};
-use arrow_array::{ArrowNumericType, FixedSizeListArray};
+use arrow_array::FixedSizeListArray;
+use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
 use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_arrow::{ArrowFloatType, FloatArray};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{Dot, Normalize, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
@@ -24,8 +20,7 @@ use snafu::{location, Location};
 
 use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;
-use crate::pb::Pq;
-use crate::vector::{kmeans::train_kmeans, pq::ProductQuantizerImpl};
+use crate::vector::kmeans::train_kmeans;
 
 /// Parameters for building product quantizer.
 #[derive(Debug, Clone)]
@@ -58,6 +53,12 @@ impl Default for PQBuildParams {
     }
 }
 
+impl QuantizerBuildParams for PQBuildParams {
+    fn sample_size(&self) -> usize {
+        self.sample_rate * 2_usize.pow(self.num_bits as u32)
+    }
+}
+
 impl PQBuildParams {
     pub fn new(num_sub_vectors: usize, num_bits: usize) -> Self {
         Self {
@@ -80,7 +81,7 @@ impl PQBuildParams {
         &self,
         data: &MatrixView<T>,
         metric_type: MetricType,
-    ) -> Result<Arc<dyn ProductQuantizer + 'static>>
+    ) -> Result<ProductQuantizer>
     where
         <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
     {
@@ -123,13 +124,13 @@ impl PQBuildParams {
 
         let pd_centroids = T::ArrayType::from(codebook_builder);
 
-        Ok(Arc::new(ProductQuantizerImpl::<T>::new(
+        Ok(ProductQuantizer::new(
             self.num_sub_vectors,
             self.num_bits as u32,
             dimension,
-            Arc::new(pd_centroids),
+            FixedSizeListArray::try_new_from_values(pd_centroids, dimension as i32)?,
             metric_type,
-        )))
+        ))
     }
 
     /// Build a [ProductQuantizer] from the given data.
@@ -139,7 +140,7 @@ impl PQBuildParams {
         &self,
         data: &dyn Array,
         metric_type: MetricType,
-    ) -> Result<Arc<dyn ProductQuantizer>> {
+    ) -> Result<ProductQuantizer> {
         assert_eq!(data.null_count(), 0);
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
@@ -167,64 +168,5 @@ impl PQBuildParams {
                 location: location!(),
             }),
         }
-    }
-}
-
-fn create_typed_pq<T: ArrowFloatType<ArrayType = PrimitiveArray<T>> + ArrowNumericType>(
-    proto: &Pq,
-    metric_type: MetricType,
-    array: &dyn Array,
-) -> Arc<dyn ProductQuantizer>
-where
-    <T as ArrowFloatType>::Native: Dot + L2,
-{
-    Arc::new(ProductQuantizerImpl::<T>::new(
-        proto.num_sub_vectors as usize,
-        proto.num_bits,
-        proto.dimension as usize,
-        Arc::new(array.as_primitive::<T>().clone()),
-        metric_type,
-    ))
-}
-
-/// Load ProductQuantizer from Protobuf
-pub fn from_proto(proto: &Pq, metric_type: MetricType) -> Result<Arc<dyn ProductQuantizer>> {
-    let mt = if metric_type == MetricType::Cosine {
-        MetricType::L2
-    } else {
-        metric_type
-    };
-
-    if let Some(tensor) = &proto.codebook_tensor {
-        let fsl = FixedSizeListArray::try_from(tensor)?;
-
-        match pb::tensor::DataType::try_from(tensor.data_type)? {
-            pb::tensor::DataType::Bfloat16 => {
-                unimplemented!()
-            }
-            pb::tensor::DataType::Float16 => {
-                Ok(create_typed_pq::<Float16Type>(proto, mt, fsl.values()))
-            }
-            pb::tensor::DataType::Float32 => {
-                Ok(create_typed_pq::<Float32Type>(proto, mt, fsl.values()))
-            }
-            pb::tensor::DataType::Float64 => {
-                Ok(create_typed_pq::<Float64Type>(proto, mt, fsl.values()))
-            }
-            _ => Err(Error::Index {
-                message: format!("PQ builder: unsupported data type: {:?}", tensor.data_type),
-                location: location!(),
-            }),
-        }
-    } else {
-        Ok(Arc::new(ProductQuantizerImpl::<Float32Type>::new(
-            proto.num_sub_vectors as usize,
-            proto.num_bits,
-            proto.dimension as usize,
-            Arc::new(Float32Array::from_iter_values(
-                proto.codebook.iter().copied(),
-            )),
-            metric_type,
-        )))
     }
 }

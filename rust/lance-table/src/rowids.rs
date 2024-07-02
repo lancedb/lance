@@ -25,7 +25,7 @@ mod serde;
 use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
-use lance_core::{Error, Result};
+use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
@@ -266,6 +266,39 @@ impl RowIdSequence {
             offset += segment_len;
         }
         None
+    }
+}
+
+impl From<&RowIdSequence> for RowIdTreeMap {
+    fn from(row_ids: &RowIdSequence) -> Self {
+        let mut tree_map = Self::new();
+        for segment in &row_ids.0 {
+            match segment {
+                U64Segment::Range(range) => {
+                    tree_map.insert_range(range.clone());
+                }
+                U64Segment::RangeWithBitmap { range, bitmap } => {
+                    tree_map.insert_range(range.clone());
+                    for (i, val) in range.clone().enumerate() {
+                        if !bitmap.get(i) {
+                            tree_map.remove(val);
+                        }
+                    }
+                }
+                U64Segment::RangeWithHoles { range, holes } => {
+                    tree_map.insert_range(range.clone());
+                    for hole in holes.iter() {
+                        tree_map.remove(hole);
+                    }
+                }
+                U64Segment::SortedArray(array) | U64Segment::Array(array) => {
+                    for val in array.iter() {
+                        tree_map.insert(val);
+                    }
+                }
+            }
+        }
+        tree_map
     }
 }
 
@@ -671,5 +704,32 @@ mod test {
             assert!(result.is_err());
             assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
         }
+    }
+
+    #[test]
+    fn test_row_id_sequence_to_treemap() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::RangeWithHoles {
+                range: 50..60,
+                holes: vec![53, 54].into(),
+            },
+            U64Segment::SortedArray(vec![7, 9].into()),
+            U64Segment::RangeWithBitmap {
+                range: 10..15,
+                bitmap: [true, false, true, false, true].as_slice().into(),
+            },
+            U64Segment::Array(vec![35, 39].into()),
+            U64Segment::Range(40..50),
+        ]);
+
+        let tree_map = RowIdTreeMap::from(&sequence);
+        let expected = vec![
+            0, 1, 2, 3, 4, 7, 9, 10, 12, 14, 35, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+            51, 52, 55, 56, 57, 58, 59,
+        ]
+        .into_iter()
+        .collect::<RowIdTreeMap>();
+        assert_eq!(tree_map, expected);
     }
 }

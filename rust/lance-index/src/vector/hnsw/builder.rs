@@ -54,9 +54,6 @@ pub struct HnswBuildParams {
     /// size of the dynamic list for the candidates
     pub ef_construction: usize,
 
-    /// the max number of threads to use for building the graph
-    pub parallel_limit: Option<usize>,
-
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
 }
@@ -67,7 +64,6 @@ impl Default for HnswBuildParams {
             max_level: 7,
             m: 20,
             ef_construction: 150,
-            parallel_limit: None,
             prefetch_distance: Some(2),
         }
     }
@@ -97,17 +93,15 @@ impl HnswBuildParams {
         self
     }
 
-    /// The max number of threads to use for building the graph.
-    pub fn parallel_limit(mut self, limit: usize) -> Self {
-        self.parallel_limit = Some(limit);
-        self
-    }
-
-    pub async fn build(self, data: ArrayRef) -> Result<HNSW> {
-        // We have normalized the vectors if the metric type is cosine, so we can use the L2 distance
+    /// Build the HNSW index from the given data.
+    ///
+    /// # Parameters
+    /// - `data`: A FixedSizeList to build the HNSW.
+    /// - `distance_type`: The distance type to use.
+    pub async fn build(self, data: ArrayRef, distance_type: DistanceType) -> Result<HNSW> {
         let vec_store = Arc::new(FlatStorage::new(
             data.as_fixed_size_list().clone(),
-            DistanceType::L2,
+            distance_type,
         ));
         HNSW::index_vectors(vec_store.as_ref(), self)
     }
@@ -132,6 +126,18 @@ impl Debug for HNSW {
 }
 
 impl HNSW {
+    pub fn empty() -> Self {
+        Self {
+            inner: Arc::new(HnswBuilder {
+                params: HnswBuildParams::default(),
+                nodes: Arc::new(Vec::new()),
+                level_count: Vec::new(),
+                entry_point: 0,
+                visited_generator_queue: Arc::new(ArrayQueue::new(1)),
+            }),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.nodes.len()
     }
@@ -172,6 +178,7 @@ impl HNSW {
         }
 
         let bottom_level = HnswBottomView::new(nodes);
+        let mut visited = visited_generator.generate(storage.len());
         Ok(beam_search(
             &bottom_level,
             &ep,
@@ -179,7 +186,7 @@ impl HNSW {
             &dist_calc,
             bitset.as_ref(),
             prefetch_distance,
-            visited_generator,
+            &mut visited,
         )
         .into_iter()
         .take(k)
@@ -285,8 +292,8 @@ impl HnswBuilder {
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>();
 
-        let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get() * 2));
-        for _ in 0..(num_cpus::get() * 2) {
+        let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get()));
+        for _ in 0..num_cpus::get() {
             visited_generator_queue
                 .push(VisitedGenerator::new(0))
                 .unwrap();
@@ -411,6 +418,7 @@ impl HnswBuilder {
         visited_generator: &mut VisitedGenerator,
     ) -> Vec<OrderedNode> {
         let cur_level = HnswLevelView::new(level, nodes);
+        let mut visited = visited_generator.generate(nodes.len());
         beam_search(
             &cur_level,
             ep,
@@ -418,7 +426,7 @@ impl HnswBuilder {
             dist_calc,
             None,
             self.params.prefetch_distance,
-            visited_generator,
+            &mut visited,
         )
     }
 
@@ -507,6 +515,10 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
+        if data.num_rows() == 0 {
+            return Ok(Self::empty());
+        }
+
         let hnsw_metadata =
             data.schema_ref()
                 .metadata()
@@ -515,7 +527,14 @@ impl IvfSubIndex for HNSW {
                     message: format!("{} not found", HNSW_METADATA_KEY),
                     location: location!(),
                 })?;
-        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata)?;
+        let hnsw_metadata: HnswMetadata =
+            serde_json::from_str(hnsw_metadata).map_err(|e| Error::Index {
+                message: format!(
+                    "Failed to decode HNSW metadata: {}, json: {}",
+                    e, hnsw_metadata
+                ),
+                location: location!(),
+            })?;
 
         let levels: Vec<_> = hnsw_metadata
             .level_offsets
@@ -577,6 +596,10 @@ impl IvfSubIndex for HNSW {
 
     fn name() -> &'static str {
         HNSW_TYPE
+    }
+
+    fn metadata_key() -> &'static str {
+        "lance:hnsw"
     }
 
     /// Return the schema of the sub index
@@ -648,27 +671,22 @@ impl IvfSubIndex for HNSW {
         };
 
         log::info!(
-            "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}",
+            "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
             hnsw.inner.params.max_level,
             hnsw.inner.params.m,
-            hnsw.inner.params.ef_construction
+            hnsw.inner.params.ef_construction,
+            storage.distance_type(),
         );
 
         let len = storage.len();
-        let parallel_limit = hnsw
-            .inner
-            .params
-            .parallel_limit
-            .unwrap_or_else(num_cpus::get)
-            .max(1);
-        log::info!("Building HNSW graph with parallel_limit={}", parallel_limit);
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
-        (1..len).into_par_iter().for_each(|node| {
-            let mut visited_generator = VisitedGenerator::new(len);
-            hnsw.inner
-                .insert(node as u32, &mut visited_generator, storage);
-        });
+        (1..len).into_par_iter().for_each_init(
+            || VisitedGenerator::new(len),
+            |visited_generator, node| {
+                hnsw.inner.insert(node as u32, visited_generator, storage);
+            },
+        );
 
         assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
         Ok(hnsw)
