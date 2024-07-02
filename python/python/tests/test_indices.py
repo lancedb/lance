@@ -43,9 +43,7 @@ def test_ivf_centroids_cuda(tmpdir):
 def test_ivf_centroids_column_type(tmpdir):
     def check(column_type, typename):
         ds = gen_dataset(tmpdir / typename, column_type)
-        ivf = IndicesBuilder(ds).train_ivf(
-            "vectors", sample_rate=16, accelerator="cuda"
-        )
+        ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16)
         assert len(ivf.centroids) == 100
         ivf.save(str(tmpdir / f"ivf_{typename}"))
         reloaded = IvfModel.load(str(tmpdir / f"ivf_{typename}"))
