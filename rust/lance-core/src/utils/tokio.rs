@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::time::Duration;
+
 use crate::Result;
 
 use futures::{Future, FutureExt};

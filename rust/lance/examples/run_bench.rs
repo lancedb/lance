@@ -47,7 +47,7 @@ async fn main() {
                 d.scan()
                     .nearest(&col, &random_vector(512), 1)
                     .unwrap()
-                    .nprobs(20)
+                    .nprobs(4)
                     // .filter("year >= 2010 AND year < 2020")
                     // .unwrap()
                     .prefilter(true)
