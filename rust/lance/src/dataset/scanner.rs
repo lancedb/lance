@@ -307,7 +307,7 @@ impl Scanner {
             output.insert(output_name.as_ref().to_string(), expr);
         }
 
-        let physical_schema = self.physical_schema()?;
+        let physical_schema = self.physical_schema(true)?;
         let schema_with_meta_columns = self.dataset.schema().merge(physical_schema.as_ref())?;
         self.physical_columns = schema_with_meta_columns.project(&physical_cols)?;
 
@@ -607,14 +607,14 @@ impl Scanner {
     }
 
     /// The schema of the Scanner from lance physical takes
-    pub(crate) fn physical_schema(&self) -> Result<Arc<Schema>> {
+    pub(crate) fn physical_schema(&self, in_projection: bool) -> Result<Arc<Schema>> {
         let mut extra_columns = vec![];
 
         if self.nearest.as_ref().is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
 
-        if self.with_row_id || self.nearest.is_some() {
+        if self.with_row_id || in_projection {
             extra_columns.push(ROW_ID_FIELD.clone());
         }
 
@@ -644,7 +644,7 @@ impl Scanner {
     }
 
     pub(crate) fn output_expr(&self) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-        let physical_schema = self.physical_schema()?;
+        let physical_schema = self.physical_schema(false)?;
 
         // reset the id ordering becuase we will take the batch after projection
         let physical_schema = ArrowSchema::new(
@@ -827,7 +827,7 @@ impl Scanner {
     ///     -> Take(remaining_cols) -> Projection()
     /// ```
     ///
-    /// In general, a plan has 4 stages:
+    /// In general, a plan has 5 stages:
     ///
     /// 1. Source (from dataset Scan or from index, may include prefilter)
     /// 2. Filter
@@ -1008,7 +1008,7 @@ impl Scanner {
         }
 
         // Stage 5: take remaining columns required for projection
-        let physical_schema = self.physical_schema()?;
+        let physical_schema = self.physical_schema(false)?;
         let remaining_schema = physical_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
