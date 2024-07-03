@@ -105,7 +105,7 @@ fn bench_distance(c: &mut Criterion) {
     run_bench::<Float64Type>(
         c,
         target.as_slice(),
-        norm_l2_impl::<f64, f64, 8>,
+        norm_l2_impl::<f64, f32, 8>,
         None, // TODO: implement SIMD for f64
     );
 }

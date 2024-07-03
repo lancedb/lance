@@ -8,7 +8,7 @@ use half::{bf16, f16};
 use lance_core::utils::cpu::SimdSupport;
 #[allow(unused_imports)]
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
-use num_traits::{AsPrimitive, Num};
+use num_traits::{AsPrimitive, Float, Num};
 
 /// L2 normalization
 pub trait Normalize: Num {
@@ -93,7 +93,7 @@ impl Normalize for f32 {
 impl Normalize for f64 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        norm_l2_impl::<Self, Self, 8>(vector)
+        norm_l2_impl::<Self, Self, 8>(vector) as f32
     }
 }
 
@@ -101,11 +101,11 @@ impl Normalize for f64 {
 #[inline]
 pub fn norm_l2_impl<
     T: AsPrimitive<Output>,
-    Output: AsPrimitive<f32> + Num + Copy + Sum + 'static + AddAssign,
+    Output: Float + Sum + 'static + AddAssign,
     const LANES: usize,
 >(
     vector: &[T],
-) -> f32 {
+) -> Output {
     let chunks = vector.chunks_exact(LANES);
     let sum = if chunks.remainder().is_empty() {
         Output::zero()
@@ -113,16 +113,16 @@ pub fn norm_l2_impl<
         chunks
             .remainder()
             .iter()
-            .map(|&v| v.as_() * v.as_())
+            .map(|&v| v.as_().powi(2))
             .sum::<Output>()
     };
     let mut sums = [Output::zero(); LANES];
     for chunk in chunks {
         for i in 0..LANES {
-            sums[i] += chunk[i].as_() * chunk[i].as_();
+            sums[i] += chunk[i].as_().powi(2);
         }
     }
-    (sum + sums.iter().copied().sum::<Output>()).as_().sqrt()
+    (sum + sums.iter().copied().sum::<Output>()).sqrt()
 }
 
 /// Normalize a vector.
