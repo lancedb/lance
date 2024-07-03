@@ -185,14 +185,9 @@ impl LanceFileWriter {
         };
         let inner = if let Some(schema) = schema {
             let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
-            FileWriter::try_new(object_writer, path.to_string(), lance_schema, options)
-                .infer_error()
+            FileWriter::try_new(object_writer, lance_schema, options).infer_error()
         } else {
-            Ok(FileWriter::new_lazy(
-                object_writer,
-                path.to_string(),
-                options,
-            ))
+            Ok(FileWriter::new_lazy(object_writer, options))
         }?;
         Ok(Self {
             inner: Box::new(inner),
