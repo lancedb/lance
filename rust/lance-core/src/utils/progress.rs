@@ -4,13 +4,9 @@
 /// Trait for systems that can display progress of long running operations.
 ///
 /// The long running operation should take in Arc<dyn GenericProgressCallback>
-/// and call the `begin`, `update`, or `update_to` methods to report progress.
+/// and call the `begin` and `update` methods to report progress.
 ///
 /// The `begin` method should be called once at the beginning of the operation.
-///
-/// Operations should either call `update` or `update_to` to report progress.
-/// Operations will not generally call both and implementations should be prepared
-/// to handle either call.
 pub trait GenericProgressCallback: Send + Sync {
     /// Called when the operation starts
     fn begin(&self, total_units: u64);
