@@ -14,6 +14,67 @@ if TYPE_CHECKING:
     from .dependencies import torch
 
 
+class PqModel:
+    """
+    A class that represents a trained PQ model
+
+    Can be saved / loaded to checkpoint progress.
+    """
+
+    def __init__(self, num_subvectors: int, codebook: pa.FixedSizeListArray):
+        self.num_subvectors = num_subvectors
+        """The number of subvectors to divide source vectors into"""
+        self.codebook = codebook
+        """The centroids of the PQ clusters"""
+
+    @property
+    def dimension(self):
+        """The dimension of the vectors this model was trained on"""
+        return self.codebook.type.list_size
+
+    def save(self, uri: str):
+        """
+        Save the PQ model to a lance file.
+
+        Parameters
+        ----------
+
+        uri: str
+            The URI to save the model to.  The URI can be a local file path or a
+            cloud storage path.
+        """
+        with LanceFileWriter(
+            uri,
+            pa.schema(
+                [pa.field("codebook", self.codebook.type)],
+                metadata={b"num_subvectors": str(self.num_subvectors).encode()},
+            ),
+        ) as writer:
+            batch = pa.table([self.codebook], names=["codebook"])
+            writer.write_batch(batch)
+
+    @classmethod
+    def load(cls, uri: str):
+        """
+        Load a PQ model from a lance file.
+
+        Parameters
+        ----------
+
+        uri: str
+            The URI to load the model from.  The URI can be a local file path or a
+            cloud storage path.
+        """
+        reader = LanceFileReader(uri)
+        num_rows = reader.metadata().num_rows
+        metadata = reader.metadata().schema.metadata
+        num_subvectors = int(metadata[b"num_subvectors"].decode())
+        codebook = (
+            reader.read_all(batch_size=num_rows).to_table().column("codebook").chunk(0)
+        )
+        return cls(num_subvectors, codebook)
+
+
 class IvfModel:
     """
     A class that represents a trained IVF model.
@@ -112,6 +173,9 @@ class IndicesBuilder:
         centroids. This is the first step in several vector indices.  The centroids
         will be used to partition the vectors into different clusters.
 
+        IVF centroids are trained from a sample of the data (determined by the
+        sample_rate).  While this sample is not huge it might still be quite large.
+
         K-means is an iterative algorithm that can be computationally expensive. The
         accelerator argument can be used to offload the computation to a hardware
         accelerator such as a GPU or TPU.
@@ -148,7 +212,7 @@ class IndicesBuilder:
         column = self._normalize_column(column)
         num_rows = self.dataset.count_rows()
         num_partitions = self._determine_num_partitions(num_partitions, num_rows)
-        self._verify_sample_rate(sample_rate, num_partitions, num_rows)
+        self._verify_ivf_sample_rate(sample_rate, num_partitions, num_rows)
         distance_type = self._normalize_distance_type(distance_type)
         self._verify_ivf_params(num_partitions)
 
@@ -185,16 +249,119 @@ class IndicesBuilder:
             )
             return IvfModel(centroids_array, distance_type)
 
+    def train_pq(
+        self,
+        column,
+        ivf_model: IvfModel,
+        num_subvectors=None,
+        *,
+        sample_rate: int = 256,
+        max_iters: int = 50,
+    ) -> PqModel:
+        """
+        Train a PQ model for a given column.
+
+        This will run k-means clustering on each subvector to determine the centroids
+        that will be used to quantize the subvectors.  This step runs against a
+        randomly chosen sample of the data.  The sample size is typically quite small
+        and PQ training is relatively fast regardless of dataset scale.  As a result,
+        accelerators are not needed here.
+
+        Parameters
+        ----------
+
+        column: str
+            The vector column to quantize, must be a fixed size list of floats
+            or 1-dimensional fixed-shape tensor column.
+        ivf_model: IvfModel
+            The IVF model to use to partition the vectors into clusters.  This is
+            needed because PQ is trained on residuals from the IVF model.
+        num_subvectors: int
+            The number of subvectors to divide the source vectors into.  This must be
+            a divisor of the vector dimension.  If not specified the default will be
+            the vector dimension divided by 16 if the dimension is divisible by 16,
+            otherwise the vector dimension divided by 8 if the dimension is divisible
+            by 8.
+
+            Automatic calculation of num_subvectors will fail if the vector dimension
+            is not divisible by 16 or 8.  In this case you must specify num_subvectors
+            manually (though any value you choose is likely to lead to poor performance)
+        sample_rate: int
+            This parameter is used in the same way as in the IVF model.
+        max_iters: int
+            This parameter is used in the same way as in the IVF model.
+        """
+        column = self._normalize_column(column)
+        num_rows = self.dataset.count_rows()
+        dimension = self.dataset.schema.field(column[0]).type.list_size
+        self.dataset.schema.field(column[0]).type.list_size
+        num_subvectors = self._normalize_pq_params(num_subvectors, dimension)
+        self._verify_pq_sample_rate(num_rows, sample_rate)
+        distance_type = ivf_model.distance_type
+        pq_codebook = indices.train_pq_model(
+            self.dataset._ds,
+            column[0],
+            dimension,
+            num_subvectors,
+            distance_type,
+            sample_rate,
+            max_iters,
+            ivf_model.centroids,
+        )
+        return PqModel(num_subvectors, pq_codebook)
+
     def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
         if num_partitions is None:
             return round(math.sqrt(num_rows))
         return num_partitions
 
-    def _verify_sample_rate(self, sample_rate: int, num_partitions: int, num_rows: int):
+    def _normalize_pq_params(self, num_subvectors: int, dimension: int):
+        if num_subvectors is None:
+            if dimension % 16 == 0:
+                return dimension // 16
+            elif dimension % 8 == 0:
+                return dimension // 8
+            else:
+                raise ValueError(
+                    f"vector dimension {dimension} is not divisible by 16 or 8."
+                    " PQ performance will be poor.  Cowardly refusing to create"
+                    " PQ model.  Please specify num_subvectors manually."
+                )
+        if not isinstance(num_subvectors, int):
+            raise ValueError("num_subvectors must be an int")
+        if num_subvectors < 1:
+            raise ValueError("num_subvectors must be greater than 0")
+        if num_subvectors > dimension:
+            raise ValueError(
+                "num_subvectors must be less than or equal to the dimension of"
+                " the vectors"
+            )
+        if dimension % num_subvectors != 0:
+            raise ValueError(
+                "dimension ({dimension}) must be divisible by num_subvectors"
+                " ({num_subvectors}) without remainder"
+            )
+        return num_subvectors
+
+    def _verify_base_sample_rate(self, sample_rate: int):
         if not isinstance(sample_rate, int) or sample_rate < 2:
             raise ValueError(
                 f"The sample_rate must be an int greater than 1, got {sample_rate}"
             )
+
+    def _verify_pq_sample_rate(self, num_rows: int, sample_rate: int):
+        self._verify_base_sample_rate(sample_rate)
+        if 256 * sample_rate > num_rows:
+            raise ValueError(
+                "There are not enough rows in the dataset to create PQ"
+                f" codebook with a sample rate of {sample_rate}.  {sample_rate * 256}"
+                f" rows needed and there are {num_rows}"
+            )
+
+    def _verify_ivf_sample_rate(
+        self, sample_rate: int, num_partitions: int, num_rows: int
+    ):
+        self._verify_base_sample_rate(sample_rate)
         if num_partitions * sample_rate > num_rows:
             raise ValueError(
                 "There are not enough rows in the dataset to create IVF centroids with"

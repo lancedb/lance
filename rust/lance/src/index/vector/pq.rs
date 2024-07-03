@@ -333,7 +333,7 @@ impl VectorIndex for PQIndex {
 /// - `metric_type`: The metric type of the vectors.
 /// - `params`: The parameters to train the PQ model.
 /// - `ivf`: If provided, the IVF model to compute the residual for PQ training.
-pub(super) async fn build_pq_model(
+pub async fn build_pq_model(
     dataset: &Dataset,
     column: &str,
     dim: usize,
