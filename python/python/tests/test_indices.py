@@ -98,6 +98,7 @@ def test_gen_pq(tmpdir, ds_with_ivf):
     assert pq.codebook == reloaded.codebook
 
 
+@pytest.mark.cuda
 def test_assign_partitions(tmpdir):
     ds = gen_dataset(tmpdir)
     builder = IndicesBuilder(ds, "vectors")
