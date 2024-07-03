@@ -267,8 +267,17 @@ def compute_partitions(
 
     if dst_dataset_uri is None:
         dst_dataset_uri = tempfile.mkdtemp()
+    ds = write_dataset(
+        rbr,
+        dst_dataset_uri,
+        schema=output_schema,
+        max_rows_per_file=dataset.count_rows(),
+        use_legacy_format=True,
+    )
+    assert len(ds.get_fragments()) == 1
+    files = ds.get_fragments()[0].data_files()
+    assert len(files) == 1
 
-    write_dataset(rbr, dst_dataset_uri, output_schema, use_legacy_format=False)
     progress.close()
 
     logging.info("Saved precomputed partitions to %s", dst_dataset_uri)
