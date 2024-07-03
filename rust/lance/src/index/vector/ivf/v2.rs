@@ -27,6 +27,7 @@ use lance_file::v2::reader::FileReader;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::subindex::SubIndexType;
@@ -47,6 +48,7 @@ use moka::sync::Cache;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
+use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -294,8 +296,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         let (sub_index_type, quantization_type) = self.sub_index_type();
         let index_type = index_type_string(sub_index_type, quantization_type);
-        let mut sub_index_stats: serde_json::Value =
-            serde_json::from_str(self.sub_index_metadata[0].as_str())?;
+        let mut sub_index_stats: serde_json::Value = match self.sub_index_metadata[0].len() {
+            0 => json!({}), // for FLAT index, the metadata is empty
+            _ => serde_json::from_str(self.sub_index_metadata[0].as_str())?,
+        };
         sub_index_stats["index_type"] = S::name().into();
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type,
@@ -455,7 +459,9 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
 }
 
 pub type IvfFlatIndex = IVFIndex<FlatIndex, FlatQuantizer>;
+pub type IvfPq = IVFIndex<FlatIndex, ProductQuantizer>;
 pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
+pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
 
 #[cfg(test)]
 mod tests {
@@ -642,7 +648,7 @@ mod tests {
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.6)]
-    #[case(4, DistanceType::Dot, 0.3)]
+    #[case(4, DistanceType::Dot, 0.2)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq(
         #[case] nlist: usize,

@@ -352,6 +352,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let indices_to_merge = existing_indices[start_pos..].to_vec();
     let merged_num = indices_to_merge.len();
     match index_type {
+        // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
             IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                 dataset.clone(),
@@ -369,7 +370,25 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?;
         }
-
+        // IVF_PQ
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
+        // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
@@ -390,7 +409,27 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?;
         }
-
+        // IVF_HNSW_PQ
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                None,
+                None,
+                // TODO: get the HNSW parameters from the existing indices
+                HnswBuildParams::default(),
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
         (sub_index_type, quantizer_type) => {
             return Err(Error::Index {
                 message: format!(
@@ -2219,11 +2258,16 @@ mod tests {
 
         for batch in results.iter() {
             let dist = &batch["_distance"];
-            assert!(dist
-                .as_primitive::<Float32Type>()
+            dist.as_primitive::<Float32Type>()
                 .values()
                 .iter()
-                .all(|v| (-2.0 * DIM as f32..0.0).contains(v)));
+                .for_each(|v| {
+                    assert!(
+                        (-2.0 * DIM as f32..0.0).contains(v),
+                        "Expect dot product value in range [-2.0 * DIM, 0.0], got: {}",
+                        v
+                    )
+                });
         }
     }
 
@@ -2608,10 +2652,10 @@ mod tests {
             .open_generic_index("vector", indices[0].uuid.to_string().as_str())
             .await
             .unwrap();
-        let ivf_idx = idx.as_any().downcast_ref::<IVFIndex>().unwrap();
+        let ivf_idx = idx.as_any().downcast_ref::<v2::IvfPq>().unwrap();
 
         assert!(ivf_idx
-            .ivf
+            .ivf_model()
             .centroids
             .as_ref()
             .unwrap()
@@ -2621,16 +2665,9 @@ mod tests {
             .iter()
             .all(|v| (0.0..=1.0).contains(v)));
 
-        let pq_idx = ivf_idx
-            .sub_index
-            .as_any()
-            .downcast_ref::<PQIndex>()
-            .unwrap();
-
         // PQ code is on residual space
-        pq_idx
-            .pq
-            .codebook
+        let pq: ProductQuantizer = ivf_idx.quantizer().try_into().unwrap();
+        pq.codebook
             .values()
             .as_primitive::<Float32Type>()
             .values()

@@ -10,6 +10,7 @@ use arrow::datatypes::{self, ArrowPrimitiveType, Float16Type, Float32Type, Float
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::DataType;
+use datafusion::parquet::data_type::AsBytes;
 use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use lance_core::{Error, Result};
@@ -417,11 +418,18 @@ impl Quantization for ProductQuantizer {
     }
 
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        let codebook = match metadata.codebook.as_ref() {
+            Some(fsl) => fsl.clone(),
+            None => {
+                let tensor = pb::Tensor::decode(metadata.codebook_tensor.as_bytes())?;
+                FixedSizeListArray::try_from(&tensor)?
+            }
+        };
         Ok(Quantizer::Product(Self::new(
             metadata.num_sub_vectors,
             metadata.num_bits,
             metadata.dimension,
-            metadata.codebook.as_ref().unwrap().clone(),
+            codebook,
             distance_type,
         )))
     }
@@ -439,6 +447,19 @@ impl TryFrom<&ProductQuantizer> for pb::Pq {
             codebook: vec![],
             codebook_tensor: Some(tensor),
         })
+    }
+}
+
+impl TryFrom<Quantizer> for ProductQuantizer {
+    type Error = Error;
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::Product(pq) => Ok(pq),
+            _ => Err(Error::Index {
+                message: "Expect to be a ProductQuantizer".to_string(),
+                location: location!(),
+            }),
+        }
     }
 }
 
