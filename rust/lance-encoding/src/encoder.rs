@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, env, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
@@ -28,7 +25,8 @@ use crate::{
     format::pb,
 };
 
-use std::cmp::min;
+use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
+use std::collections::hash_map::RandomState;
 
 /// An encoded buffer
 pub struct EncodedBuffer {
@@ -272,26 +270,37 @@ impl CoreArrayEncodingStrategy {
     }
 }
 
+fn get_dict_encoding_threshold() -> u64 {
+    env::var("LANCE_DICT_ENCODING_THRESHOLD")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(100)
+}
+
 // check whether we want to use dictionary encoding or not
 // by applying a threshold on cardinality
-// returns true if cardinality < min(100, num_total_rows)
+// returns true if cardinality < threshold but false if the total number of rows is less than the threshold
 // The choice to use 100 is just a heuristic for now
-fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
-    let mut unique_values = HashSet::new();
-
+// hyperloglog is used for cardinality estimation
+// error rate = 1.04 / sqrt(2^p), where p is the precision
+// and error rate is 1.04 / sqrt(2^12) = 1.56%
+fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     let num_total_rows = arrays.iter().map(|arr| arr.len()).sum::<usize>();
-    let thresh = min(100, num_total_rows);
+    if num_total_rows < threshold as usize {
+        return false;
+    }
+    const PRECISION: u8 = 12;
 
-    // Checking cardinality for elements in all arrays together.
-    for arr in arrays.iter() {
+    let mut hll: HyperLogLogPlus<String, RandomState> =
+        HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+
+    for arr in arrays {
         let string_array = arrow_array::cast::as_string_array(arr);
-        let arr_len = string_array.len();
-        for i in 0..arr_len {
-            if !string_array.is_null(i) {
-                unique_values.insert(string_array.value(i));
-                if unique_values.len() >= thresh {
-                    return false;
-                }
+        for value in string_array.iter().flatten() {
+            hll.insert(value);
+            let estimated_cardinality = hll.count() as u64;
+            if estimated_cardinality >= threshold {
+                return false;
             }
         }
     }
@@ -301,19 +310,10 @@ fn check_dict_encoding(arrays: &[ArrayRef]) -> bool {
 
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     fn create_array_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn ArrayEncoder>> {
-        if arrays[0].data_type() == &DataType::Utf8 {
-            if check_dict_encoding(arrays) {
-                // Dictionary encoding
-                Self::array_encoder_from_type(arrays[0].data_type(), true)
-            } else {
-                // Binary encoding, but not dictionary
-                Self::array_encoder_from_type(arrays[0].data_type(), false)
-            }
-        }
-        // Default encoding for other datatypes
-        else {
-            Self::array_encoder_from_type(arrays[0].data_type(), false)
-        }
+        let data_type = arrays[0].data_type();
+        let use_dict_encoding = data_type == &DataType::Utf8
+            && check_dict_encoding(arrays, get_dict_encoding_threshold());
+        Self::array_encoder_from_type(data_type, use_dict_encoding)
     }
 }
 
@@ -612,4 +612,52 @@ pub async fn encode_batch(
         schema,
         num_rows: batch.num_rows() as u64,
     })
+}
+
+#[cfg(test)]
+pub mod tests {
+    use arrow_array::{ArrayRef, StringArray};
+    use std::sync::Arc;
+
+    use super::check_dict_encoding;
+
+    fn is_dict_encoding_applicable(arr: Vec<Option<&str>>, threshold: u64) -> bool {
+        let arr = StringArray::from(arr);
+        let arr = Arc::new(arr) as ArrayRef;
+        check_dict_encoding(&[arr], threshold)
+    }
+
+    #[test]
+    fn test_dict_encoding_should_be_applied_if_cardinality_less_than_threshold() {
+        assert!(is_dict_encoding_applicable(
+            vec![Some("a"), Some("b"), Some("a"), Some("b")],
+            3,
+        ));
+    }
+
+    #[test]
+    fn test_dict_encoding_should_not_be_applied_if_cardinality_larger_than_threshold() {
+        assert!(!is_dict_encoding_applicable(
+            vec![Some("a"), Some("b"), Some("c"), Some("d")],
+            3,
+        ));
+    }
+
+    #[test]
+    fn test_dict_encoding_should_not_be_applied_if_cardinality_equal_to_threshold() {
+        assert!(!is_dict_encoding_applicable(
+            vec![Some("a"), Some("b"), Some("c"), Some("a")],
+            3,
+        ));
+    }
+
+    #[test]
+    fn test_dict_encoding_should_not_be_applied_for_empty_arrays() {
+        assert!(!is_dict_encoding_applicable(vec![], 3));
+    }
+
+    #[test]
+    fn test_dict_encoding_should_not_be_applied_for_smaller_than_threshold_arrays() {
+        assert!(!is_dict_encoding_applicable(vec![Some("a"), Some("a")], 3));
+    }
 }
