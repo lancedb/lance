@@ -225,6 +225,7 @@ impl FileWriter {
 
         self.column_writers = encoder.field_encoders;
         self.column_metadata = vec![initial_column_metadata(); self.num_columns as usize];
+        self.field_id_to_column_indices = encoder.field_id_to_column_index;
         self.schema_metadata
             .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
