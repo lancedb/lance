@@ -51,7 +51,10 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::{
-    index::{vector::VectorIndex, PreFilter},
+    index::{
+        vector::{utils::PartitionLoadLock, VectorIndex},
+        PreFilter,
+    },
     session::Session,
 };
 
@@ -77,6 +80,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     /// Index in each partition.
     partition_cache: Cache<String, Arc<PartitionEntry<S, Q>>>,
+
+    partition_locks: PartitionLoadLock,
 
     distance_type: DistanceType,
 
@@ -173,6 +178,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             reader: index_reader,
             storage,
             partition_cache: Cache::new(DEFAULT_INDEX_CACHE_SIZE as u64),
+            partition_locks: PartitionLoadLock::new(),
             sub_index_metadata,
             distance_type,
             session,
@@ -201,38 +207,48 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 });
             }
 
-            let schema = Arc::new(self.reader.schema().as_ref().into());
-            let batch = match self.reader.metadata().num_rows {
-                0 => RecordBatch::new_empty(schema),
-                _ => {
-                    let batches = self
-                        .reader
-                        .read_stream(
-                            ReadBatchParams::Range(self.ivf.row_range(partition_id)),
-                            u32::MAX,
-                            1,
-                            FilterExpression::no_filter(),
-                        )?
-                        .try_collect::<Vec<_>>()
-                        .await?;
-                    concat_batches(&schema, batches.iter())?
+            let mtx = self.partition_locks.get_partition_mutex(&cache_key)?;
+            let _guard = mtx.lock().await;
+
+            // check the cache again, as the partition may have been loaded by another
+            // thread that held the lock on loading the partition
+            if let Some(part_idx) = self.partition_cache.get(&cache_key) {
+                part_idx
+            } else {
+                let schema = Arc::new(self.reader.schema().as_ref().into());
+                let batch = match self.reader.metadata().num_rows {
+                    0 => RecordBatch::new_empty(schema),
+                    _ => {
+                        let batches = self
+                            .reader
+                            .read_stream(
+                                ReadBatchParams::Range(self.ivf.row_range(partition_id)),
+                                u32::MAX,
+                                1,
+                                FilterExpression::no_filter(),
+                            )?
+                            .try_collect::<Vec<_>>()
+                            .await?;
+                        concat_batches(&schema, batches.iter())?
+                    }
+                };
+                let batch = batch.add_metadata(
+                    S::metadata_key().to_owned(),
+                    self.sub_index_metadata[partition_id].clone(),
+                )?;
+                let idx = S::load(batch)?;
+                let storage = self.load_partition_storage(partition_id).await?;
+                let partition_entry = Arc::new(PartitionEntry {
+                    index: idx,
+                    storage,
+                });
+                if write_cache {
+                    self.partition_cache
+                        .insert(cache_key.clone(), partition_entry.clone());
                 }
-            };
-            let batch = batch.add_metadata(
-                S::metadata_key().to_owned(),
-                self.sub_index_metadata[partition_id].clone(),
-            )?;
-            let idx = S::load(batch)?;
-            let storage = self.load_partition_storage(partition_id).await?;
-            let partition_entry = Arc::new(PartitionEntry {
-                index: idx,
-                storage,
-            });
-            if write_cache {
-                self.partition_cache
-                    .insert(cache_key.clone(), partition_entry.clone());
+
+                partition_entry
             }
-            partition_entry
         };
 
         Ok(part_entry)

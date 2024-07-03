@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use arrow_array::{cast::AsArray, FixedSizeListArray};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
+use log::error;
 use snafu::{location, Location};
+use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};
@@ -64,4 +69,54 @@ pub async fn maybe_sample_training_data(
         location: location!(),
     })?;
     Ok(array.as_fixed_size_list().clone())
+}
+
+#[derive(Debug)]
+pub struct PartitionLoadLock {
+    partition_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl PartitionLoadLock {
+    pub fn new() -> Self {
+        Self {
+            partition_locks: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn get_partition_mutex(&self, partition_key: &str) -> Result<Arc<Mutex<()>>> {
+        let read_guard = self.partition_locks.read().map_err(|e| {
+            error!("mutex poisoned");
+            Error::Internal {
+                message: e.to_string(),
+                location: location!(),
+            }
+        })?;
+
+        if !read_guard.contains_key(partition_key) {
+            drop(read_guard);
+
+            let mut write_guard = self.partition_locks.write().map_err(|e| {
+                error!("mutex poisoned");
+                Error::Internal {
+                    message: e.to_string(),
+                    location: location!(),
+                }
+            })?;
+            if !write_guard.contains_key(partition_key) {
+                write_guard.insert(partition_key.to_string(), Arc::new(Mutex::new(())));
+            }
+            drop(write_guard);
+        }
+
+        let read_guard = self.partition_locks.read().map_err(|e| {
+            error!("mutex poisoned");
+            Error::Internal {
+                message: e.to_string(),
+                location: location!(),
+            }
+        })?;
+        let mtx = read_guard.get(partition_key).unwrap();
+
+        Ok(mtx.clone())
+    }
 }

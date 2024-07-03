@@ -73,7 +73,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
-use super::builder::IvfIndexBuilder;
+use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
@@ -105,6 +105,8 @@ pub struct IVFIndex {
 
     /// Index in each partition.
     sub_index: Arc<dyn VectorIndex>,
+
+    partition_locks: PartitionLoadLock,
 
     metric_type: MetricType,
 
@@ -146,6 +148,7 @@ impl IVFIndex {
             reader,
             sub_index,
             metric_type,
+            partition_locks: PartitionLoadLock::new(),
         })
     }
 
@@ -170,32 +173,40 @@ impl IVFIndex {
         let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
             part_idx
         } else {
-            if partition_id >= self.ivf.num_partitions() {
-                return Err(Error::Index {
-                    message: format!(
-                        "partition id {} is out of range of {} partitions",
-                        partition_id,
-                        self.ivf.num_partitions()
-                    ),
-                    location: location!(),
-                });
-            }
+            let mtx = self.partition_locks.get_partition_mutex(&cache_key)?;
+            let _guard = mtx.lock().await;
+            // check the cache again, as the partition may have been loaded by another
+            // thread that held the lock on loading the partition
+            if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
+                part_idx
+            } else {
+                if partition_id >= self.ivf.num_partitions() {
+                    return Err(Error::Index {
+                        message: format!(
+                            "partition id {} is out of range of {} partitions",
+                            partition_id,
+                            self.ivf.num_partitions()
+                        ),
+                        location: location!(),
+                    });
+                }
 
-            let range = self.ivf.row_range(partition_id);
-            let idx = self
-                .sub_index
-                .load_partition(
-                    self.reader.clone(),
-                    range.start,
-                    range.end - range.start,
-                    partition_id,
-                )
-                .await?;
-            let idx: Arc<dyn VectorIndex> = idx.into();
-            if write_cache {
-                session.index_cache.insert_vector(&cache_key, idx.clone());
+                let range = self.ivf.row_range(partition_id);
+                let idx = self
+                    .sub_index
+                    .load_partition(
+                        self.reader.clone(),
+                        range.start,
+                        range.end - range.start,
+                        partition_id,
+                    )
+                    .await?;
+                let idx: Arc<dyn VectorIndex> = idx.into();
+                if write_cache {
+                    session.index_cache.insert_vector(&cache_key, idx.clone());
+                }
+                idx
             }
-            idx
         };
         Ok(part_index)
     }
@@ -232,7 +243,7 @@ pub(crate) async fn optimize_vector_indices(
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
-    // Senity check the indices
+    // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::Index {
             message: "optimizing vector index: no existing index found".to_string(),
