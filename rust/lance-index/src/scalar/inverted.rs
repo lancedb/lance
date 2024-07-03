@@ -86,10 +86,10 @@ impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
     async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
         let row_ids = match query {
-            ScalarQuery::FullTextSearch(texts) => {
-                let tokens = self.map(texts);
+            ScalarQuery::FullTextSearch(tokens) => {
+                let token_ids = self.map(tokens);
                 let mut results = HashSet::<u64>::new();
-                tokens
+                token_ids
                     .iter()
                     .filter_map(|token| self.invert_list.retrieve(*token))
                     .for_each(|(row_ids, _)| results.extend(row_ids));
