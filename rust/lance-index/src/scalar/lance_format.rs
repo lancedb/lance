@@ -158,9 +158,7 @@ mod tests {
     use std::{ops::Bound, path::Path};
 
     use crate::scalar::{
-        btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
-        flat::FlatIndexMetadata,
-        ScalarIndex, ScalarQuery,
+        bitmap::{train_bitmap_index, BitmapIndex}, btree::{train_btree_index, BTreeIndex, BtreeTrainingSource}, flat::FlatIndexMetadata, ScalarIndex, ScalarQuery
     };
 
     use super::*;
@@ -653,5 +651,32 @@ mod tests {
 
         let row_ids = index.search(&ScalarQuery::IsNull()).await.unwrap();
         assert_eq!(row_ids.len(), 4096);
+    }
+
+
+    async fn train_bitmap(
+        index_store: &Arc<dyn IndexStore>,
+        data: impl RecordBatchReader + Send + Sync + 'static,
+        value_type: DataType,
+    ) {
+        // let sub_index_trainer = FlatIndexMetadata::new(value_type);
+
+        let data = Box::new(MockTrainingSource::new(data).await);
+        train_bitmap_index(data, index_store.as_ref())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_basic_bitmap() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let data = gen()
+            .col("values", array::step::<Int32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
+
+        train_bitmap(&index_store, data, DataType::Int32).await;
+        let index = BitmapIndex::load(index_store).await.unwrap();
     }
 }
