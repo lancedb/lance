@@ -1248,6 +1248,10 @@ fn prepare_vector_index_params(
             ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
         };
 
+        if let Some(n) = kwargs.get_item("shuffle_partition_concurrency")? {
+            ivf_params.shuffle_partition_concurrency = PyAny::downcast::<PyInt>(n)?.extract()?
+        };
+
         if let Some(c) = kwargs.get_item("ivf_centroids")? {
             let batch = RecordBatch::from_pyarrow(c)?;
             if "_ivf_centroids" != batch.schema().field(0).name() {
