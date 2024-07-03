@@ -16,6 +16,32 @@ def test_file_writer(tmp_path):
     assert metadata.num_rows == 3
 
 
+def test_write_no_schema(tmp_path):
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    reader = LanceFileReader(str(path))
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+
+
+def test_no_schema_no_data(tmp_path):
+    path = tmp_path / "foo.lance"
+    with pytest.raises(
+        ValueError, match="Schema is unknown and file cannot be created"
+    ):
+        with LanceFileWriter(str(path)) as _:
+            pass
+
+
+def test_schema_only(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    with LanceFileWriter(str(path), schema=schema) as _:
+        pass
+    reader = LanceFileReader(str(path))
+    assert reader.metadata().schema == schema
+
+
 def test_aborted_write(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
