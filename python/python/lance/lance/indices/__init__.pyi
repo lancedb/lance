@@ -33,3 +33,13 @@ def train_pq_model(
     max_iters: int,
     ivf_model: pa.Array,
 ) -> pa.Array: ...
+def transform_vectors(
+    dataset,
+    column: str,
+    dimension: int,
+    num_subvectors: int,
+    distance_type: str,
+    ivf_centroids: pa.Array,
+    pq_codebook: pa.Array,
+    dst_uri: str,
+): ...
