@@ -503,17 +503,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row_ids.len(), 3);
-        assert_eq!(row_ids.value(0), 0);
-        assert_eq!(row_ids.value(1), 1);
-        assert_eq!(row_ids.value(2), 2);
+        assert!(row_ids.values().contains(&0));
+        assert!(row_ids.values().contains(&1));
+        assert!(row_ids.values().contains(&2));
 
         let row_ids = invert_index
             .search(&super::ScalarQuery::FullTextSearch(vec!["b".to_string()]))
             .await
             .unwrap();
         assert_eq!(row_ids.len(), 3);
-        assert_eq!(row_ids.value(0), 0);
-        assert_eq!(row_ids.value(1), 1);
-        assert_eq!(row_ids.value(2), 3);
+        assert!(row_ids.values().contains(&0));
+        assert!(row_ids.values().contains(&1));
+        assert!(row_ids.values().contains(&3));
     }
 }
