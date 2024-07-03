@@ -412,7 +412,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             let writer = object_store.create(&path).await?;
             let mut writer = FileWriter::try_new(
                 writer,
-                path.to_string(),
                 storage.schema().as_ref().try_into()?,
                 Default::default(),
             )?;
@@ -432,7 +431,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             let index_batch = sub_index.to_batch()?;
             let mut writer = FileWriter::try_new(
                 writer,
-                path.to_string(),
                 index_batch.schema_ref().as_ref().try_into()?,
                 Default::default(),
             )?;
@@ -463,7 +461,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         let mut storage_writer = None;
         let mut index_writer = FileWriter::try_new(
             self.dataset.object_store().create(&index_path).await?,
-            index_path.to_string(),
             S::schema().as_ref().try_into()?,
             Default::default(),
         )?;
@@ -500,7 +497,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 if storage_writer.is_none() {
                     storage_writer = Some(FileWriter::try_new(
                         self.dataset.object_store().create(&storage_path).await?,
-                        storage_path.to_string(),
                         batch.schema_ref().as_ref().try_into()?,
                         Default::default(),
                     )?);

@@ -29,7 +29,6 @@ fn bench_reader(c: &mut Criterion) {
 
     let mut writer = FileWriter::try_new(
         object_writer,
-        file_path.to_string(),
         data.schema().as_ref().try_into().unwrap(),
         FileWriterOptions::default(),
     )

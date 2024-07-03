@@ -71,7 +71,6 @@ pub struct FileWriterOptions {
 
 pub struct FileWriter {
     writer: ObjectWriter,
-    path: String,
     schema: Option<LanceSchema>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
@@ -96,11 +95,10 @@ impl FileWriter {
     /// Create a new FileWriter with a desired output schema
     pub fn try_new(
         object_writer: ObjectWriter,
-        path: String,
         schema: LanceSchema,
         options: FileWriterOptions,
     ) -> Result<Self> {
-        let mut writer = Self::new_lazy(object_writer, path, options);
+        let mut writer = Self::new_lazy(object_writer, options);
         writer.initialize(schema)?;
         Ok(writer)
     }
@@ -109,10 +107,9 @@ impl FileWriter {
     ///
     /// The output schema will be set based on the first batch of data to arrive.
     /// If no data arrives and the writer is finished then the write will fail.
-    pub fn new_lazy(object_writer: ObjectWriter, path: String, options: FileWriterOptions) -> Self {
+    pub fn new_lazy(object_writer: ObjectWriter, options: FileWriterOptions) -> Self {
         Self {
             writer: object_writer,
-            path,
             schema: None,
             column_writers: Vec::new(),
             column_metadata: Vec::new(),
@@ -485,10 +482,6 @@ impl FileWriter {
     pub fn field_id_to_column_indices(&self) -> &[(i32, i32)] {
         &self.field_id_to_column_indices
     }
-
-    pub fn path(&self) -> &str {
-        &self.path
-    }
 }
 
 /// Utility trait for converting EncodedBatch to Bytes using the
@@ -634,13 +627,8 @@ mod tests {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
 
-        let mut file_writer = FileWriter::try_new(
-            writer,
-            tmp_path.to_string(),
-            lance_schema,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(writer, lance_schema, FileWriterOptions::default()).unwrap();
 
         for batch in reader {
             file_writer.write_batch(&batch.unwrap()).await.unwrap();
@@ -667,13 +655,8 @@ mod tests {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
 
-        let mut file_writer = FileWriter::try_new(
-            writer,
-            tmp_path.to_string(),
-            lance_schema,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(writer, lance_schema, FileWriterOptions::default()).unwrap();
 
         for batch in reader {
             file_writer.write_batch(&batch.unwrap()).await.unwrap();
