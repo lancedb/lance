@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{AsArray, ListBuilder, UInt64Builder};
@@ -88,12 +88,12 @@ impl ScalarIndex for InvertedIndex {
         let row_ids = match query {
             ScalarQuery::FullTextSearch(texts) => {
                 let tokens = self.map(texts);
-                let row_ids = tokens
+                let mut results = HashSet::<u64>::new();
+                tokens
                     .iter()
                     .filter_map(|token| self.invert_list.retrieve(*token))
-                    .flat_map(|(row_ids, _)| row_ids.iter().cloned())
-                    .collect::<Vec<_>>();
-                row_ids
+                    .for_each(|(row_ids, _)| results.extend(row_ids));
+                results.into_iter().collect_vec()
             }
             query => {
                 return Err(Error::invalid_input(
@@ -156,8 +156,8 @@ impl ScalarIndex for InvertedIndex {
                 let mut token_stream = tokenizer.token_stream(doc);
                 let mut token_cnt = 0;
                 while let Some(token) = token_stream.next() {
-                    let token_id = token_set.add(token.text.to_string());
-                    invert_list.add(token_id, row_id, 1);
+                    let token_id = token_set.add(token.text.clone());
+                    invert_list.add(token_id, row_id);
                     token_cnt += 1;
                 }
                 docs.add(row_id, token_cnt);
@@ -191,6 +191,8 @@ impl ScalarIndex for InvertedIndex {
     }
 }
 
+// TokenSet is a mapping from tokens to token ids
+// it also records the frequency of each token
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 struct TokenSet {
     tokens: Vec<String>,
@@ -270,6 +272,8 @@ impl TokenSet {
     }
 }
 
+// InvertedList is a mapping from token ids to row ids
+// it's used to retrieve the documents that contain a token
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 struct InvertedList {
     tokens: Vec<u32>,
@@ -366,7 +370,7 @@ impl InvertedList {
         })
     }
 
-    fn add(&mut self, token_id: u32, row_id: u64, frequency: u64) {
+    fn add(&mut self, token_id: u32, row_id: u64) {
         let pos = match self.tokens.binary_search(&token_id) {
             Ok(pos) => pos,
             Err(pos) => {
@@ -378,7 +382,7 @@ impl InvertedList {
         };
 
         self.row_ids_list[pos].push(row_id);
-        self.frequencies_list[pos].push(frequency);
+        self.frequencies_list[pos].push(1);
     }
 
     fn retrieve(&self, token_id: u32) -> Option<(&[u64], &[u64])> {
@@ -399,6 +403,8 @@ impl InvertedList {
     // }
 }
 
+// DocSet is a mapping from row ids to the number of tokens in the document
+// It's used to sort the documents by the bm25 score
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 struct DocSet {
     row_ids: Vec<u64>,
