@@ -477,6 +477,7 @@ mod tests {
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::generate_random_array_with_range;
+    use rstest::rstest;
     use tempfile::tempdir;
 
     use crate::{index::vector::VectorIndexParams, Dataset};
@@ -586,34 +587,46 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case(4, DistanceType::L2, 1.0)]
+    #[case(4, DistanceType::Cosine, 1.0)]
+    #[case(4, DistanceType::Dot, 1.0)]
     #[tokio::test]
-    async fn test_build_ivf_flat() {
-        let nlist = 16;
-        let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
-        test_index(params, nlist, 1.0).await;
+    async fn test_build_ivf_flat(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let params = VectorIndexParams::ivf_flat(nlist, distance_type);
+        test_index(params, nlist, recall_requirement).await;
     }
 
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.6)]
+    #[case(4, DistanceType::Dot, 0.2)]
     #[tokio::test]
-    async fn test_build_ivf_pq_l2() {
-        let nlist = 4;
+    async fn test_build_ivf_pq(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
-        let params = VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
-        test_index(params, nlist, 0.9).await;
+        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
+        test_index(params, nlist, recall_requirement).await;
     }
 
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
-    async fn test_build_ivf_pq_cosine() {
-        let nlist = 4;
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::default();
-        let params =
-            VectorIndexParams::with_ivf_pq_params(DistanceType::Cosine, ivf_params, pq_params);
-        test_index(params, nlist, 0.6).await;
-    }
-
-    async fn test_create_ivf_hnsw_sq(distance_type: DistanceType) {
-        let nlist = 4;
+    async fn test_create_ivf_hnsw_sq(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
@@ -623,21 +636,19 @@ mod tests {
             hnsw_params,
             sq_params,
         );
-        test_index(params, nlist, 0.9).await;
+        test_index(params, nlist, recall_requirement).await;
     }
 
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.6)]
+    #[case(4, DistanceType::Dot, 0.3)]
     #[tokio::test]
-    async fn test_create_ivf_hnsw_sq_cosine() {
-        test_create_ivf_hnsw_sq(DistanceType::Cosine).await
-    }
-
-    #[tokio::test]
-    async fn test_create_ivf_hnsw_sq_dot() {
-        test_create_ivf_hnsw_sq(DistanceType::Dot).await
-    }
-
-    async fn test_create_ivf_hnsw_pq(distance_type: DistanceType) {
-        let nlist = 4;
+    async fn test_create_ivf_hnsw_pq(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
@@ -647,17 +658,7 @@ mod tests {
             hnsw_params,
             pq_params,
         );
-        test_index(params, nlist, 0.9).await;
-    }
-
-    #[tokio::test]
-    async fn test_create_ivf_hnsw_pq_l2() {
-        test_create_ivf_hnsw_pq(DistanceType::L2).await
-    }
-
-    #[tokio::test]
-    async fn test_create_ivf_hnsw_pq_cosine() {
-        test_create_ivf_hnsw_pq(DistanceType::Cosine).await
+        test_index(params, nlist, recall_requirement).await;
     }
 
     #[tokio::test]

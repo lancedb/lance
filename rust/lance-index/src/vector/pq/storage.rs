@@ -25,7 +25,7 @@ use lance_io::{
     traits::{WriteExt, Writer},
     utils::read_message,
 };
-use lance_linalg::distance::L2;
+use lance_linalg::distance::{Dot, L2};
 use lance_linalg::{distance::DistanceType, MatrixView};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
@@ -33,6 +33,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
+use super::distance::build_distance_table_dot;
 use super::ProductQuantizer;
 use super::{distance::build_distance_table_l2, num_centroids};
 use crate::vector::storage::STORAGE_METADATA_KEY;
@@ -544,7 +545,7 @@ pub struct PQDistCalculator {
 }
 
 impl PQDistCalculator {
-    fn new<T: L2>(
+    fn new<T: L2 + Dot>(
         codebook: &[T],
         num_bits: u32,
         num_sub_vectors: usize,
@@ -555,7 +556,7 @@ impl PQDistCalculator {
         let distance_table = if matches!(distance_type, DistanceType::Cosine | DistanceType::L2) {
             build_distance_table_l2(codebook, num_bits, num_sub_vectors, query)
         } else {
-            unimplemented!("DistanceType is not supported: {:?}", distance_type);
+            build_distance_table_dot(codebook, num_bits, num_sub_vectors, query)
         };
         Self {
             distance_table,
