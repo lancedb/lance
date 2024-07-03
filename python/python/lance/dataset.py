@@ -1490,7 +1490,7 @@ class LanceDataset(pa.dataset.Dataset):
                     accelerator,
                 )
                 partitions_file = compute_partitions(
-                    self, column, kmeans, batch_size=20480
+                    self, column[0], kmeans, batch_size=20480
                 )
                 kwargs["precomputed_partitions_file"] = partitions_file
 

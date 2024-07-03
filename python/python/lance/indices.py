@@ -168,7 +168,7 @@ class IndicesBuilder:
             # Use accelerator to train ivf centroids
             from .vector import train_ivf_centroids_on_accelerator
 
-            ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
+            ivf_centroids, _ = train_ivf_centroids_on_accelerator(
                 self.dataset,
                 column[0],
                 num_partitions,
