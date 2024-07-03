@@ -488,6 +488,7 @@ impl FieldEncoder for StructFieldEncoder {
         let column_index = self.column_index;
         // In this "simple struct / no nulls" case we emit a single header page at
         // the very end which covers the entire struct.
+        let page_idx = 0;
         child_tasks.push(
             std::future::ready(Ok(EncodedPage {
                 array: EncodedArray {
@@ -500,6 +501,7 @@ impl FieldEncoder for StructFieldEncoder {
                 },
                 num_rows: num_rows_seen,
                 column_idx: column_index,
+                page_idx,
             }))
             .boxed(),
         );

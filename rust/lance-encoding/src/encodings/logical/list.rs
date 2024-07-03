@@ -887,10 +887,12 @@ impl ListOffsetsEncoder {
                 num_rows,
                 inner_encoder,
             )?;
+            let page_idx = 0;
             Ok(EncodedPage {
                 array,
                 num_rows,
                 column_idx,
+                page_idx,
             })
         })
         .map(|res_res| res_res.unwrap())

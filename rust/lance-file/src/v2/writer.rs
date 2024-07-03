@@ -185,8 +185,14 @@ impl FileWriter {
         //
         // Also, there is no point in trying to make write_page parallel anyways
         // because we wouldn't want buffers getting mixed up across pages.
+        let mut encoded_pages = Vec::new();
         while let Some(encoding_task) = encoding_tasks.next().await {
             let encoded_page = encoding_task?;
+            //self.write_page(encoded_page).await?;
+            encoded_pages.push(encoded_page);
+        }
+        encoded_pages.sort_by_key(|p| p.page_idx);
+        for encoded_page in encoded_pages.into_iter() {
             self.write_page(encoded_page).await?;
         }
         // It's important to flush here, we don't know when the next batch will arrive

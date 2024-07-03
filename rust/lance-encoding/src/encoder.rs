@@ -109,6 +109,9 @@ pub struct EncodedPage {
     pub num_rows: u64,
     /// The index of the column
     pub column_idx: u32,
+    /// For one arrow array, we may write multiple pages, and these pages need to be in order,
+    /// so we need to a page index to sort them before writing to the file
+    pub page_idx: u32,
 }
 
 /// Encodes data into a single buffer

@@ -5,6 +5,7 @@ use std::{fmt::Debug, ops::Range, sync::Arc};
 
 use arrow_array::{new_null_array, ArrayRef};
 use arrow_schema::DataType;
+use arrow_select::concat::concat;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::deepcopy::deep_copy_array;
 use log::{debug, trace};
@@ -344,7 +345,8 @@ impl AccumulationQueue {
             // Push into buffered_arrays without copy since we are about to flush anyways
             self.buffered_arrays.push(array);
             self.current_bytes = 0;
-            Some(std::mem::take(&mut self.buffered_arrays))
+            Some(self.slice_all_buffered_arrays_into_flush_task_arrays())
+            //Some(std::mem::take(&mut self.buffered_arrays))
         } else {
             trace!(
                 "Accumulating data for column {}.  Now at {} bytes",
@@ -374,8 +376,37 @@ impl AccumulationQueue {
                 self.current_bytes
             );
             self.current_bytes = 0;
-            Some(std::mem::take(&mut self.buffered_arrays))
+            Some(self.slice_all_buffered_arrays_into_flush_task_arrays())
+            //Some(std::mem::take(&mut self.buffered_arrays))
         }
+    }
+
+    fn slice_all_buffered_arrays_into_flush_task_arrays(&mut self) -> Vec<ArrayRef> {
+        let concat_array = concat(
+            &self
+                .buffered_arrays
+                .iter()
+                .map(|arr| arr.as_ref())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let flush_task_num = concat_array.get_array_memory_size() / self.cache_bytes as usize;
+        let mut flush_task_arrays = Vec::new();
+        if flush_task_num == 0 {
+            flush_task_arrays.push(concat_array);
+        } else {
+            let step = concat_array.len() / flush_task_num;
+            let mut offset = 0;
+            for _ in 0..flush_task_num - 1 {
+                let array = concat_array.slice(offset, step);
+                offset += step;
+                flush_task_arrays.push(array);
+            }
+            flush_task_arrays.push(concat_array.slice(offset, concat_array.len() - offset));
+        }
+        self.buffered_arrays = Vec::new();
+        self.current_bytes = 0;
+        flush_task_arrays
     }
 }
 
@@ -404,7 +435,7 @@ impl PrimitiveFieldEncoder {
     }
 
     // Creates an encode task, consuming all buffered data
-    fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<EncodeTask> {
+    fn do_flush(&mut self, arrays: Vec<ArrayRef>, page_idx: u32) -> Result<EncodeTask> {
         let encoder = self.array_encoding_strategy.create_array_encoder(&arrays)?;
         let column_idx = self.column_index;
 
@@ -416,6 +447,7 @@ impl PrimitiveFieldEncoder {
                 array,
                 num_rows,
                 column_idx,
+                page_idx,
             })
         })
         .map(|res_res| res_res.unwrap())
@@ -427,7 +459,12 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.insert(array) {
-            Ok(vec![self.do_flush(arrays)?])
+            let tasks = arrays
+                .into_iter()
+                .enumerate()
+                .map(|(idx, array)| self.do_flush(vec![array], idx as u32))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(tasks)
         } else {
             Ok(vec![])
         }
@@ -436,7 +473,12 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.flush() {
-            Ok(vec![self.do_flush(arrays)?])
+            let tasks = arrays
+                .into_iter()
+                .enumerate()
+                .map(|(idx, array)| self.do_flush(vec![array], idx as u32))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(tasks)
         } else {
             Ok(vec![])
         }
