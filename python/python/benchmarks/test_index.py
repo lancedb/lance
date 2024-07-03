@@ -6,6 +6,7 @@ import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance.indices import IndicesBuilder
 
 N_DIMS = 512
 
@@ -95,3 +96,16 @@ def test_optimize_index(
         lance.write_dataset(small_table, test_large_dataset.uri, mode="append")
 
     benchmark(test_large_dataset.optimize.optimize_indices)
+
+
+@pytest.mark.benchmark(group="optimize_index")
+@pytest.mark.parametrize("num_partitions", [100, 300])
+def test_train_ivf(test_large_dataset, benchmark, num_partitions):
+    builder = IndicesBuilder(test_large_dataset)
+    benchmark.pedantic(
+        builder.train_ivf,
+        args=["vector"],
+        kwargs={"num_partitions": num_partitions},
+        iterations=1,
+        rounds=1,
+    )

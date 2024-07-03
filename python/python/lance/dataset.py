@@ -1477,14 +1477,20 @@ class LanceDataset(pa.dataset.Dataset):
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids
-                from .vector import train_ivf_centroids_on_accelerator
+                from .vector import (
+                    compute_partitions,
+                    train_ivf_centroids_on_accelerator,
+                )
 
-                ivf_centroids, partitions_file = train_ivf_centroids_on_accelerator(
+                ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
                     num_partitions,
                     metric,
                     accelerator,
+                )
+                partitions_file = compute_partitions(
+                    self, column[0], kmeans, batch_size=20480
                 )
                 kwargs["precomputed_partitions_file"] = partitions_file
 
