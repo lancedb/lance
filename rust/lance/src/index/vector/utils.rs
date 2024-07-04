@@ -68,20 +68,22 @@ pub async fn maybe_sample_training_data(
 }
 
 #[derive(Debug)]
-pub (crate) struct PartitionLoadLock {
+pub struct PartitionLoadLock {
     partition_locks: Vec<Arc<Mutex<()>>>,
 }
 
 impl PartitionLoadLock {
     pub fn new(num_partitions: usize) -> Self {
         Self {
-            partition_locks: (0..num_partitions).map(|_| Arc::new(Mutex::new(()))).collect(),
+            partition_locks: (0..num_partitions)
+                .map(|_| Arc::new(Mutex::new(())))
+                .collect(),
         }
     }
 
     pub fn get_partition_mutex(&self, partition_id: usize) -> Arc<Mutex<()>> {
         let mtx = &self.partition_locks[partition_id];
-        
+
         mtx.clone()
     }
 }
