@@ -159,7 +159,6 @@ impl Shuffler for IvfShuffler {
                             let writer = object_store.create(&part_path).await?;
                             FileWriter::try_new(
                                 writer,
-                                part_path.to_string(),
                                 lance_core::datatypes::Schema::try_from(schema.as_ref())?,
                                 Default::default(),
                             )

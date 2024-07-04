@@ -308,39 +308,46 @@ impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String
     }
 }
 
+struct V2WriterAdapter {
+    writer: v2::writer::FileWriter,
+    path: String,
+}
+
 #[async_trait::async_trait]
-impl GenericWriter for v2::writer::FileWriter {
+impl GenericWriter for V2WriterAdapter {
     fn multipart_id(&self) -> &str {
-        self.multipart_id()
+        self.writer.multipart_id()
     }
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         for batch in batches {
-            self.write_batch(batch).await?;
+            self.writer.write_batch(batch).await?;
         }
         Ok(())
     }
     async fn tell(&mut self) -> Result<u64> {
-        Ok(self.tell().await?)
+        Ok(self.writer.tell().await?)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
         let field_ids = self
+            .writer
             .field_id_to_column_indices()
             .iter()
             .map(|(field_id, _)| *field_id)
             .collect::<Vec<_>>();
         let column_indices = self
+            .writer
             .field_id_to_column_indices()
             .iter()
             .map(|(_, column_index)| *column_index)
             .collect::<Vec<_>>();
         let data_file = DataFile::new(
-            self.path(),
+            std::mem::take(&mut self.path),
             field_ids,
             column_indices,
             MAJOR_VERSION as u32,
             MINOR_VERSION_NEXT as u32,
         );
-        let num_rows = self.finish().await? as u32;
+        let num_rows = self.writer.finish().await? as u32;
         Ok((num_rows, data_file))
     }
 }
@@ -368,12 +375,13 @@ pub async fn open_writer(
         ))
     } else {
         let writer = object_store.create(&full_path).await?;
-        Box::new(v2::writer::FileWriter::try_new(
-            writer,
-            filename,
-            schema.clone(),
-            FileWriterOptions::default(),
-        )?) as Box<dyn GenericWriter>
+        let file_writer =
+            v2::writer::FileWriter::try_new(writer, schema.clone(), FileWriterOptions::default())?;
+        let writer_adapter = V2WriterAdapter {
+            writer: file_writer,
+            path: filename,
+        };
+        Box::new(writer_adapter) as Box<dyn GenericWriter>
     };
     Ok(writer)
 }

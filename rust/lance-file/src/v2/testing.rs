@@ -49,13 +49,7 @@ pub async fn write_lance_file(
 
     let lance_schema = lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap();
 
-    let mut file_writer = FileWriter::try_new(
-        writer,
-        fs.tmp_path.to_string(),
-        lance_schema.clone(),
-        options,
-    )
-    .unwrap();
+    let mut file_writer = FileWriter::try_new(writer, lance_schema.clone(), options).unwrap();
 
     let data = data
         .collect::<std::result::Result<Vec<_>, ArrowError>>()

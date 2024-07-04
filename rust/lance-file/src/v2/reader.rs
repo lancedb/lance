@@ -1388,7 +1388,6 @@ pub mod tests {
 
         let mut file_writer = FileWriter::try_new(
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
-            fs.tmp_path.to_string(),
             lance_schema.clone(),
             FileWriterOptions::default(),
         )
