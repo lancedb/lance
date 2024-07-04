@@ -17,7 +17,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 
 use crate::{
-    decoder::{PrimitivePageDecoder, PageScheduler},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{BufferEncoder, EncodedBuffer},
 };
 
@@ -256,19 +256,19 @@ impl PageScheduler for BitpackedScheduler {
         let byte_ranges = ranges
             .iter()
             .map(|range| {
-                let start_byte_offset = range.start as u64 * self.bits_per_value / 8;
-                let mut end_byte_offset = range.end as u64 * self.bits_per_value / 8;
-                if range.end as u64 * self.bits_per_value % 8 != 0 {
+                let start_byte_offset = range.start * self.bits_per_value / 8;
+                let mut end_byte_offset = range.end * self.bits_per_value / 8;
+                if range.end * self.bits_per_value % 8 != 0 {
                     // If the end of the range is not byte-aligned, we need to read one more byte
                     end_byte_offset += 1;
 
-                    let end_bit_offset = range.end as u64 * self.bits_per_value % 8;
+                    let end_bit_offset = range.end * self.bits_per_value % 8;
                     buffer_bit_end_offsets.push(Some(end_bit_offset as u8));
                 } else {
                     buffer_bit_end_offsets.push(None);
                 }
 
-                let start_bit_offset = range.start as u64 * self.bits_per_value % 8;
+                let start_bit_offset = range.start * self.bits_per_value % 8;
                 buffer_bit_start_offsets.push(start_bit_offset as u8);
 
                 let start = self.buffer_offset + start_byte_offset;
@@ -326,21 +326,6 @@ struct BitpackedPageDecoder {
 }
 
 impl PrimitivePageDecoder for BitpackedPageDecoder {
-    // fn update_capacity(
-    //     &self,
-    //     _rows_to_skip: u32,
-    //     num_rows: u32,
-    //     buffers: &mut [(u64, bool)],
-    //     _all_null: &mut bool,
-    // ) {
-    //     // currently decoding is only supported into buffers with types with sizes that
-    //     // are multiples of 8 bits.
-    //     debug_assert!(self.uncompressed_bits_per_value % 8 == 0);
-
-    //     buffers[0].0 = self.uncompressed_bits_per_value / 8 * num_rows as u64;
-    //     buffers[0].1 = true;
-    // }
-
     fn decode(
         &self,
         rows_to_skip: u64,
@@ -348,7 +333,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
         _all_null: &mut bool,
         // dest_buffers: &mut [BytesMut],
     ) -> Result<Vec<BytesMut>> {
-        let num_bytes = self.uncompressed_bits_per_value / 8 * num_rows as u64;
+        let num_bytes = self.uncompressed_bits_per_value / 8 * num_rows;
         let mut dest_buffers = vec![BytesMut::with_capacity(num_bytes as usize)];
 
         // current maximum supported bits per value = 64
@@ -515,7 +500,7 @@ fn compute_start_offset(
         return StartOffset::SkipFull(rows_in_buffer);
     }
 
-    let start_bit = rows_to_skip as u64 * bits_per_value + buffer_start_bit_offset as u64;
+    let start_bit = rows_to_skip * bits_per_value + buffer_start_bit_offset as u64;
     let start_byte = start_bit / 8;
 
     StartOffset::SkipSome(BufferStartOffset {

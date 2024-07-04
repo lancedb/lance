@@ -23,7 +23,10 @@ use crate::{
         DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression,
         LogicalPageDecoder, NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{ArrayEncoder, CoreBufferEncodingStrategy, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
+    encoder::{
+        ArrayEncoder, CoreBufferEncodingStrategy, EncodeTask, EncodedArray, EncodedColumn,
+        EncodedPage, FieldEncoder,
+    },
     encodings::{
         logical::r#struct::SimpleStructScheduler,
         physical::{

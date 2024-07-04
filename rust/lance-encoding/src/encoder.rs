@@ -99,7 +99,7 @@ impl EncodedArray {
         (
             self.buffers
                 .into_iter()
-                .map(|b| EncodedBuffer { 
+                .map(|b| EncodedBuffer {
                     parts: b.parts,
                     bits_per_value: 0, // TODO
                     compression_scheme: None,
@@ -230,7 +230,7 @@ pub trait FieldEncoder: Send {
     ///
     /// By default, returns an empty Vec (no column metadata buffers)
     fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>>;
-    
+
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
 }
