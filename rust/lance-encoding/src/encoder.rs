@@ -45,11 +45,6 @@ pub struct EncodedBuffer {
     /// For example, if we are asked to write 3 primitive arrays of 1000 rows and we can write them all
     /// as one page then this will be the value buffers from the 3 primitive arrays
     pub parts: Vec<Buffer>,
-    //     pub bits_per_value: u64,
-
-    //     pub bitpacked_bits_per_value: Option<u64>,
-
-    //     pub compression_scheme: Option<CompressionScheme>,
 }
 
 // Custom impl because buffers shouldn't be included in debug output
@@ -98,12 +93,7 @@ impl EncodedArray {
         (
             self.buffers
                 .into_iter()
-                .map(|b| EncodedBuffer {
-                    parts: b.parts,
-                    // bits_per_value: 0,
-                    // compression_scheme: None,
-                    // bitpacked_bits_per_value: None,
-                })
+                .map(|b| EncodedBuffer { parts: b.parts })
                 .collect(),
             self.encoding,
         )
