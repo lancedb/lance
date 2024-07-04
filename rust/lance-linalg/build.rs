@@ -25,9 +25,10 @@ fn main() -> Result<(), String> {
     }
 
     if cfg!(target_os = "windows") {
-        return Err(
-            "cargo:warning=fp16 kernels are not supported on Windows.  Please remove fp16kernels feature".to_string()
+        println!(
+            "cargo:warning=fp16 kernels are not supported on Windows. Skipping compilation of kernels."
         );
+        return Ok(());
     }
 
     if cfg!(all(target_arch = "aarch64", target_os = "macos")) {

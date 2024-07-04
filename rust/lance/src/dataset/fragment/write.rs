@@ -87,7 +87,6 @@ impl<'a> FragmentCreateBuilder<'a> {
         let obj_writer = object_store.create(&full_path).await?;
         let mut writer = lance_file::v2::writer::FileWriter::try_new(
             obj_writer,
-            full_path.to_string(),
             schema,
             FileWriterOptions::default(),
         )?;
