@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{AsArray, ListBuilder, UInt64Builder};
@@ -17,6 +17,7 @@ use lance_core::{Error, Result, ROW_ID};
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 
+use crate::vector::graph::OrderedFloat;
 use crate::Index;
 
 use super::{IndexReader, IndexStore, ScalarIndex, ScalarQuery};
@@ -45,6 +46,44 @@ impl InvertedIndex {
             .iter()
             .filter_map(|text| self.tokens.get(text))
             .collect()
+    }
+
+    // search the documents that contain the query
+    // return the row ids of the documents sorted by bm25 score
+    fn bm25_search(&self, token_ids: Vec<u32>) -> Vec<(u64, f32)> {
+        const K1: f32 = 1.2;
+        const B: f32 = 0.75;
+
+        let avgdl = self.docs.average_length();
+        let mut bm25 = HashMap::new();
+
+        token_ids
+            .into_iter()
+            .filter_map(|token| self.invert_list.retrieve(token))
+            .for_each(|(row_ids, freq)| {
+                // TODO: this can be optimized by parallelizing the calculation
+                row_ids
+                    .iter()
+                    .zip(freq.iter())
+                    .for_each(|(&row_id, &freq)| {
+                        let freq = freq as f32;
+                        let bm25 = bm25.entry(row_id).or_insert(0.0);
+                        *bm25 += self.idf(row_ids.len()) * freq * (K1 + 1.0)
+                            / (freq
+                                + K1 * (1.0 - B
+                                    + B * self.docs.num_tokens[row_id as usize] as f32 / avgdl));
+                    });
+            });
+
+        bm25.into_iter()
+            .sorted_unstable_by_key(|r| OrderedFloat(-r.1))
+            .collect_vec()
+    }
+
+    #[inline]
+    fn idf(&self, nq: usize) -> f32 {
+        let num_docs = self.docs.row_ids.len() as f32;
+        ((num_docs - nq as f32 + 0.5) / (nq as f32 + 0.5) + 1.0).ln()
     }
 }
 
@@ -88,12 +127,9 @@ impl ScalarIndex for InvertedIndex {
         let row_ids = match query {
             ScalarQuery::FullTextSearch(tokens) => {
                 let token_ids = self.map(tokens);
-                let mut results = HashSet::<u64>::new();
-                token_ids
-                    .iter()
-                    .filter_map(|token| self.invert_list.retrieve(*token))
-                    .for_each(|(row_ids, _)| results.extend(row_ids));
-                results.into_iter()
+                self.bm25_search(token_ids)
+                    .into_iter()
+                    .map(|(row_id, _)| row_id)
             }
             query => {
                 return Err(Error::invalid_input(
@@ -102,6 +138,8 @@ impl ScalarIndex for InvertedIndex {
                 ))
             }
         };
+
+        // sort the row ids (documents) by bm25 score
 
         Ok(UInt64Array::from_iter_values(row_ids))
     }
@@ -389,18 +427,6 @@ impl InvertedList {
         let pos = self.tokens.binary_search(&token_id).ok()?;
         Some((&self.row_ids_list[pos], &self.frequencies_list[pos]))
     }
-
-    // fn rank(&self, row_ids: &[u64]) -> Vec<(u64, u64)> {
-    //     let mut ranked = Vec::with_capacity(row_ids.len());
-    //     for row_id in row_ids {
-    //         if let Some(pos) = self.row_ids.binary_search(row_id).ok() {
-    //             ranked.push((self.row_ids[pos], self.occurrences[pos]));
-    //         }
-    //     }
-
-    //     ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    //     ranked
-    // }
 }
 
 // DocSet is a mapping from row ids to the number of tokens in the document
@@ -409,9 +435,14 @@ impl InvertedList {
 struct DocSet {
     row_ids: Vec<u64>,
     num_tokens: Vec<u32>,
+    total_tokens: u64,
 }
 
 impl DocSet {
+    fn average_length(&self) -> f32 {
+        self.total_tokens as f32 / self.row_ids.len() as f32
+    }
+
     fn to_batch(&self) -> Result<RecordBatch> {
         let row_id_col = UInt64Array::from(self.row_ids.clone());
         let num_tokens_col = UInt32Array::from(self.num_tokens.clone());
@@ -434,6 +465,7 @@ impl DocSet {
     async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let mut row_ids = Vec::new();
         let mut num_tokens = Vec::new();
+        let mut total_tokens = 0;
         for i in 0..reader.num_batches().await {
             let batch = reader.read_record_batch(i).await?;
             let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
@@ -441,11 +473,13 @@ impl DocSet {
 
             row_ids.extend(row_id_col.iter().map(|v| v.unwrap()));
             num_tokens.extend(num_tokens_col.iter().map(|v| v.unwrap()));
+            total_tokens += num_tokens.iter().map(|v| *v as u64).sum::<u64>();
         }
 
         Ok(Self {
             row_ids,
             num_tokens,
+            total_tokens,
         })
     }
 
