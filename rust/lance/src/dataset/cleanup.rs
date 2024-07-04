@@ -39,14 +39,13 @@ use lance_core::Result;
 use lance_table::{
     format::{Index, Manifest},
     io::{
-        commit::parse_version_from_path,
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
 };
 use object_store::path::Path;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     future,
     sync::{Mutex, MutexGuard},
 };
@@ -157,9 +156,9 @@ impl<'a> CleanupTask<'a> {
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
         let is_latest = dataset_version <= manifest.version;
-        let is_dataset_version_tagged = tagged_versions.contains(&dataset_version);
+        let is_manifest_version_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set =
-            is_latest || manifest.timestamp() >= self.before || is_dataset_version_tagged;
+            is_latest || manifest.timestamp() >= self.before || is_manifest_version_tagged;
         let indexes = read_manifest_indexes(&self.dataset.object_store, &path, &manifest).await?;
 
         let mut inspection = inspection.lock().unwrap();
@@ -213,7 +212,6 @@ impl<'a> CleanupTask<'a> {
         }
         Ok(())
     }
-
 
     async fn delete_unreferenced_files(
         &self,
@@ -414,7 +412,6 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow_array::{RecordBatchIterator, RecordBatchReader};
-    use datafusion::common::assert_contains;
     use lance_core::utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, WrappingObjectStore};
@@ -792,27 +789,26 @@ mod tests {
             .clock
             .set_system_time(TimeDelta::try_days(10).unwrap());
 
-        assert_contains!(
-            fixture
+        let mut removed = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
-            .await.err().unwrap().to_string(),
-            "2 tagged version(s) have been marked for cleanup. Please delete the following tag(s) to enable cleanup:"
-        );
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 0);
 
         dataset.delete_tag("old-tag").await.unwrap();
 
-        assert_contains!(
-            fixture
+        removed = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
-            .await.err().unwrap().to_string(),
-            "1 tagged version(s) have been marked for cleanup. Please delete the following tag(s) to enable cleanup:"
-        );
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 0);
 
         dataset.delete_tag("another-old-tag").await.unwrap();
 
         let before_count = fixture.count_files().await.unwrap();
 
-        let removed = fixture
+        removed = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
             .await
             .unwrap();

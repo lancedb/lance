@@ -628,7 +628,7 @@ def test_cleanup_old_versions(tmp_path):
     assert stats.old_versions == 1
 
 
-def test_cleanup_old_tagged_versions(tmp_path):
+def test_dont_cleanup_old_tagged_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
@@ -640,18 +640,14 @@ def test_cleanup_old_tagged_versions(tmp_path):
     dataset.create_tag("another-old-tag", 1)
     dataset.create_tag("tag-latest", dataset.latest_version)
 
-    with pytest.raises(OSError) as exception:
-        dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
-    assert "Cleanup error: 2 tagged version(s) have been marked for cleanup." in str(
-        exception.value
-    )
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed == 0
+    assert stats.old_versions == 0
 
     dataset.delete_tag("old-tag")
-    with pytest.raises(OSError) as exception:
-        dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
-    assert "Cleanup error: 1 tagged version(s) have been marked for cleanup." in str(
-        exception.value
-    )
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed == 0
+    assert stats.old_versions == 0
 
     dataset.delete_tag("another-old-tag")
     stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
