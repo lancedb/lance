@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, FixedSizeListArray};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
-use log::error;
 use snafu::{location, Location};
 use tokio::sync::Mutex;
 
@@ -72,51 +68,20 @@ pub async fn maybe_sample_training_data(
 }
 
 #[derive(Debug)]
-pub struct PartitionLoadLock {
-    partition_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+pub (crate) struct PartitionLoadLock {
+    partition_locks: Vec<Arc<Mutex<()>>>,
 }
 
 impl PartitionLoadLock {
-    pub fn new() -> Self {
+    pub fn new(num_partitions: usize) -> Self {
         Self {
-            partition_locks: RwLock::new(HashMap::new()),
+            partition_locks: (0..num_partitions).map(|_| Arc::new(Mutex::new(()))).collect(),
         }
     }
 
-    pub fn get_partition_mutex(&self, partition_key: &str) -> Result<Arc<Mutex<()>>> {
-        let read_guard = self.partition_locks.read().map_err(|e| {
-            error!("mutex poisoned");
-            Error::Internal {
-                message: e.to_string(),
-                location: location!(),
-            }
-        })?;
-
-        if !read_guard.contains_key(partition_key) {
-            drop(read_guard);
-
-            let mut write_guard = self.partition_locks.write().map_err(|e| {
-                error!("mutex poisoned");
-                Error::Internal {
-                    message: e.to_string(),
-                    location: location!(),
-                }
-            })?;
-            if !write_guard.contains_key(partition_key) {
-                write_guard.insert(partition_key.to_string(), Arc::new(Mutex::new(())));
-            }
-            drop(write_guard);
-        }
-
-        let read_guard = self.partition_locks.read().map_err(|e| {
-            error!("mutex poisoned");
-            Error::Internal {
-                message: e.to_string(),
-                location: location!(),
-            }
-        })?;
-        let mtx = read_guard.get(partition_key).unwrap();
-
-        Ok(mtx.clone())
+    pub fn get_partition_mutex(&self, partition_id: usize) -> Arc<Mutex<()>> {
+        let mtx = &self.partition_locks[partition_id];
+        
+        mtx.clone()
     }
 }

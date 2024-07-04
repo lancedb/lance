@@ -141,6 +141,8 @@ impl IVFIndex {
                 location: location!(),
             });
         }
+
+        let num_partitions = ivf.num_partitions();
         Ok(Self {
             uuid: uuid.to_owned(),
             session: Arc::downgrade(&session),
@@ -148,7 +150,7 @@ impl IVFIndex {
             reader,
             sub_index,
             metric_type,
-            partition_locks: PartitionLoadLock::new(),
+            partition_locks: PartitionLoadLock::new(num_partitions),
         })
     }
 
@@ -173,7 +175,7 @@ impl IVFIndex {
         let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
             part_idx
         } else {
-            let mtx = self.partition_locks.get_partition_mutex(&cache_key)?;
+            let mtx = self.partition_locks.get_partition_mutex(partition_id);
             let _guard = mtx.lock().await;
             // check the cache again, as the partition may have been loaded by another
             // thread that held the lock on loading the partition

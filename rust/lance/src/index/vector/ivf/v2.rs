@@ -172,13 +172,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         .await?;
         let storage = IvfQuantizationStorage::try_new(storage_reader).await?;
 
+        let num_partitions = ivf.num_partitions();
         Ok(Self {
             uuid,
             ivf,
             reader: index_reader,
             storage,
             partition_cache: Cache::new(DEFAULT_INDEX_CACHE_SIZE as u64),
-            partition_locks: PartitionLoadLock::new(),
+            partition_locks: PartitionLoadLock::new(num_partitions),
             sub_index_metadata,
             distance_type,
             session,
@@ -207,7 +208,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 });
             }
 
-            let mtx = self.partition_locks.get_partition_mutex(&cache_key)?;
+            let mtx = self.partition_locks.get_partition_mutex(partition_id);
             let _guard = mtx.lock().await;
 
             // check the cache again, as the partition may have been loaded by another
