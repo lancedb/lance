@@ -16,6 +16,7 @@ use snafu::{location, Location};
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 
+use crate::encoder::EncodedBufferMeta;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{BufferEncoder, EncodedBuffer},
@@ -52,7 +53,7 @@ where
 pub struct BitpackingBufferEncoder {}
 
 impl BufferEncoder for BitpackingBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
         // TODO -- num bits can be a struct field now that we have the strategy
         let mut num_bits = 0;
         for arr in arrays {
@@ -88,12 +89,19 @@ impl BufferEncoder for BitpackingBufferEncoder {
         }
 
         let data_type = arrays[0].data_type();
-        Ok(EncodedBuffer {
-            parts: vec![dst_buffer.into()],
-            bits_per_value: (data_type.byte_width() * 8) as u64,
-            bitpacked_bits_per_value: Some(num_bits),
-            compression_scheme: None,
-        })
+        Ok((
+            EncodedBuffer {
+                parts: vec![dst_buffer.into()],
+                // bits_per_value: (data_type.byte_width() * 8) as u64,
+                // bitpacked_bits_per_value: Some(num_bits),
+                // compression_scheme: None,
+            },
+            EncodedBufferMeta {
+                bits_per_value: (data_type.byte_width() * 8) as u64,
+                bitpacked_bits_per_value: Some(num_bits),
+                compression_scheme: None,
+            },
+        ))
     }
 }
 
@@ -545,7 +553,7 @@ pub mod test {
             1, 2, 1, 2, 1, 2, 1, 2, 1, 2,
         ])) as ArrayRef];
         let encoder = BitpackingBufferEncoder::default();
-        let result = encoder.encode(&arrays).unwrap();
+        let (result, _) = encoder.encode(&arrays).unwrap();
 
         let parts = result.parts.clone();
         let part_0 = parts[0].clone();

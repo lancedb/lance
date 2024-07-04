@@ -255,13 +255,13 @@ impl ArrayEncoder for ValueEncoder {
         let buffer_encoder = self
             .buffer_encoding_strategy
             .create_buffer_encoder(arrays)?;
-        let encoded_buffer = buffer_encoder.encode(arrays)?;
+        let (encoded_buffer, encoded_buffer_meta) = buffer_encoder.encode(arrays)?;
 
         let array_encoding =
-            if let Some(bitpacked_bits_per_value) = encoded_buffer.bitpacked_bits_per_value {
+            if let Some(bitpacked_bits_per_value) = encoded_buffer_meta.bitpacked_bits_per_value {
                 pb::array_encoding::ArrayEncoding::Bitpacked(pb::Bitpacked {
                     compressed_bits_per_value: bitpacked_bits_per_value,
-                    uncompressed_bits_per_value: encoded_buffer.bits_per_value,
+                    uncompressed_bits_per_value: encoded_buffer_meta.bits_per_value,
                     buffer: Some(pb::Buffer {
                         buffer_index: index,
                         buffer_type: pb::buffer::BufferType::Page as i32,
@@ -269,16 +269,16 @@ impl ArrayEncoder for ValueEncoder {
                 })
             } else {
                 pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
-                    bits_per_value: encoded_buffer.bits_per_value,
+                    bits_per_value: encoded_buffer_meta.bits_per_value,
                     buffer: Some(pb::Buffer {
                         buffer_index: index,
                         buffer_type: pb::buffer::BufferType::Page as i32,
                     }),
-                    compression: encoded_buffer.compression_scheme.map(|compression_scheme| {
-                        pb::Compression {
+                    compression: encoded_buffer_meta
+                        .compression_scheme
+                        .map(|compression_scheme| pb::Compression {
                             scheme: compression_scheme.to_string(),
-                        }
-                    }),
+                        }),
                 })
             };
 

@@ -45,12 +45,11 @@ pub struct EncodedBuffer {
     /// For example, if we are asked to write 3 primitive arrays of 1000 rows and we can write them all
     /// as one page then this will be the value buffers from the 3 primitive arrays
     pub parts: Vec<Buffer>,
+    //     pub bits_per_value: u64,
 
-    pub bits_per_value: u64,
+    //     pub bitpacked_bits_per_value: Option<u64>,
 
-    pub bitpacked_bits_per_value: Option<u64>,
-
-    pub compression_scheme: Option<CompressionScheme>,
+    //     pub compression_scheme: Option<CompressionScheme>,
 }
 
 // Custom impl because buffers shouldn't be included in debug output
@@ -101,9 +100,9 @@ impl EncodedArray {
                 .into_iter()
                 .map(|b| EncodedBuffer {
                     parts: b.parts,
-                    bits_per_value: 0, // TODO
-                    compression_scheme: None,
-                    bitpacked_bits_per_value: None,
+                    // bits_per_value: 0,
+                    // compression_scheme: None,
+                    // bitpacked_bits_per_value: None,
                 })
                 .collect(),
             self.encoding,
@@ -133,7 +132,15 @@ pub trait BufferEncoder: std::fmt::Debug + Send + Sync {
     /// This method may receive multiple chunks and should encode them all into
     /// a single EncodedBuffer (though that buffer may have multiple parts).  All
     /// parts will be written to the file as one contiguous block.
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer>;
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)>;
+}
+
+pub struct EncodedBufferMeta {
+    pub bits_per_value: u64,
+
+    pub bitpacked_bits_per_value: Option<u64>,
+
+    pub compression_scheme: Option<CompressionScheme>,
 }
 
 /// Encodes data from Arrow format into some kind of on-disk format
