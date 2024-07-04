@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::ArrayRef;
-use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
@@ -14,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::encoder::BufferEncodingStrategy;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
+    encoder::{ArrayEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
 };
