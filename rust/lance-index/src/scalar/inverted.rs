@@ -93,7 +93,7 @@ impl ScalarIndex for InvertedIndex {
                     .iter()
                     .filter_map(|token| self.invert_list.retrieve(*token))
                     .for_each(|(row_ids, _)| results.extend(row_ids));
-                results.into_iter().collect_vec()
+                results.into_iter()
             }
             query => {
                 return Err(Error::invalid_input(
@@ -103,7 +103,7 @@ impl ScalarIndex for InvertedIndex {
             }
         };
 
-        Ok(UInt64Array::from(row_ids))
+        Ok(UInt64Array::from_iter_values(row_ids))
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
