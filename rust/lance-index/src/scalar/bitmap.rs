@@ -2,18 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    any::Any, cmp::Ordering, collections::{BTreeMap, BinaryHeap, HashMap}, fmt::{Debug, Display}, ops::Bound, sync::Arc
+    any::Any, collections::{BTreeMap, BinaryHeap, HashMap}, fmt::{Debug, Display}, ops::Bound, sync::Arc
 };
 
-use arrow::array::{BinaryBuilder, FixedSizeListBuilder, ListBuilder, UInt64Builder};
-use arrow_array::{Array, BinaryArray, ListArray, RecordBatch, UInt64Array};
-use arrow_array::types::UInt8Type;
-use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow::{array::{BinaryBuilder,  UInt64Builder}, datatypes::UInt64Type};
+use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use datafusion::physical_plan::{
-    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
-};
+use datafusion::physical_plan:: SendableRecordBatchStream;
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::Accumulator;
 use datafusion_physical_expr::{
@@ -41,40 +37,29 @@ use crate::{Index, IndexType};
 use super::{
     btree::{BTreeSubIndex, BtreeTrainingSource}, flat::FlatIndexMetadata, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery
 };
-use std::collections::HashSet;
-
 use super::btree::OrderableScalarValue;
-use bytes::Bytes;
-
 
 const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
-const BITMAP_PAGES_NAME: &str = "bitmap_page_data.lance";
 
 #[derive(Clone, Debug)]
-pub struct LanceRoaringTreemap(RoaringTreemap);
-
-impl DeepSizeOf for LanceRoaringTreemap {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        0
-    }
-}
-
-#[derive(Clone, Debug, DeepSizeOf)]
 pub struct BitmapIndex {
-    index_map: BTreeMap<OrderableScalarValue, LanceRoaringTreemap>,
-    page_map: BTreeMap<OrderableScalarValue, Vec<u64>>,
+    index_map: BTreeMap<OrderableScalarValue, UInt64Array>,
+    null_rows: UInt64Array,
+    bitmap_array_total_sz: usize,
     store: Arc<dyn IndexStore>,
 }
 
 impl BitmapIndex {
     fn new(
-        index_map: BTreeMap<OrderableScalarValue, LanceRoaringTreemap>,
-        page_map: BTreeMap<OrderableScalarValue, Vec<u64>>,
+        index_map: BTreeMap<OrderableScalarValue, UInt64Array>,
+        null_rows: UInt64Array,
+        bitmap_array_total_sz: usize,
         store: Arc<dyn IndexStore>,
     ) -> Self {
         Self {
             index_map,
-            page_map,
+            null_rows,
+            bitmap_array_total_sz,
             store,
         }
     }
@@ -91,25 +76,45 @@ impl BitmapIndex {
 
         let dict_keys = data.column(0);
         let binary_bitmaps = data.column(1);
-        let pages_column = data.column(2);
+        // let null_rows = data.column(2).as_any().downcast_ref::<UInt64Array>().unwrap().clone();
         let bitmap_binary_array = binary_bitmaps.as_any().downcast_ref::<BinaryArray>().unwrap();
-        let pages_array = pages_column.as_any().downcast_ref::<ListArray>().unwrap();
 
-        let mut index_map: BTreeMap<OrderableScalarValue, LanceRoaringTreemap> = BTreeMap::new();
-        let mut page_map: BTreeMap<OrderableScalarValue, Vec<u64>> = BTreeMap::new();
+        let null_rows: Vec<u64> = Vec::new();
+        let mut index_map: BTreeMap<OrderableScalarValue, UInt64Array> = BTreeMap::new();
 
+        let mut bitmap_array_total_sz = 0;
         for idx in 0..data.num_rows() {
             let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
             let bitmap_bytes = bitmap_binary_array.value(idx);
-            let bitmap = LanceRoaringTreemap(RoaringTreemap::deserialize_from(bitmap_bytes).unwrap());
+            let bitmap = RoaringTreemap::deserialize_from(bitmap_bytes).unwrap();
+            let bitmap_vec: Vec<u64> = bitmap.into_iter().collect();
+            let bitmap_array = UInt64Array::from(bitmap_vec);
 
-            let page_numbers = pages_array.value(idx).as_any().downcast_ref::<UInt64Array>().unwrap().values().to_vec();
-
-            index_map.insert(key.clone(), bitmap);
-            page_map.insert(key, page_numbers);
+            index_map.insert(key.clone(), bitmap_array.clone());
+            bitmap_array_total_sz += bitmap_array.len()*8;
         }
 
-        Ok(Self::new(index_map, page_map, store))
+        let null_rows = UInt64Array::from(null_rows);
+        Ok(Self::new(index_map, null_rows, bitmap_array_total_sz, store))
+    }
+}
+
+impl DeepSizeOf for BitmapIndex {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        let mut total_size = 0;
+
+        // Size of BTreeMap keys
+        for (key, _) in &self.index_map {
+            total_size += key.deep_size_of();
+        }
+        
+        // Size of BTreeMap values
+        total_size += self.bitmap_array_total_sz;
+
+        // Size of Arc<dyn IndexStore> contents
+        total_size += self.store.deep_size_of();
+
+        total_size
     }
 }
 
@@ -146,8 +151,56 @@ impl Index for BitmapIndex {
 #[async_trait]
 impl ScalarIndex for BitmapIndex {
     async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+        
+        let empty_vec: Vec<u64> = Vec::new();
+        let empty_array = UInt64Array::from(empty_vec);
 
-        unimplemented!()
+        let row_ids = match query {
+            ScalarQuery::Equals(val) => {
+                let key = OrderableScalarValue(val.clone());
+                self.index_map.get(&key).unwrap_or(&empty_array).clone()
+            }
+            ScalarQuery::Range(start, end) => {
+
+                let range_start = match start {
+                    Bound::Included(val) => Bound::Included(OrderableScalarValue(val.clone())),
+                    Bound::Excluded(val) => Bound::Excluded(OrderableScalarValue(val.clone())),
+                    Bound::Unbounded => Bound::Unbounded,
+                };
+
+                let range_end = match end {
+                    Bound::Included(val) => Bound::Included(OrderableScalarValue(val.clone())),
+                    Bound::Excluded(val) => Bound::Excluded(OrderableScalarValue(val.clone())),
+                    Bound::Unbounded => Bound::Unbounded,
+                };
+
+                let range_iter = self.index_map.range((range_start, range_end));
+                let total_len: usize = range_iter.clone().map(|(_, arr)| arr.len()).sum();
+                let mut builder = UInt64Builder::with_capacity(total_len);
+                
+                for (_, array) in range_iter {
+                    builder.append_slice(array.values());
+                }
+
+                builder.finish()
+            }
+            ScalarQuery::IsIn(values) => {
+                let mut builder = UInt64Builder::new();
+                for val in values {
+                    let key = OrderableScalarValue(val.clone());
+                    if let Some(array) = self.index_map.get(&key) {
+                        builder.append_slice(array.values());
+                    }
+                }
+
+                builder.finish()
+            }
+            ScalarQuery::IsNull() => {
+                self.null_rows.clone()
+            }
+        };
+
+        Ok(row_ids)
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
@@ -181,18 +234,18 @@ impl ScalarIndex for BitmapIndex {
     }
 }
 
-fn get_batch_from_arrays(keys: Arc<dyn Array>, binary_bitmaps: Arc<dyn Array>, pages: Arc<dyn Array>) -> Result<RecordBatch> 
+fn get_batch_from_arrays(keys: Arc<dyn Array>, binary_bitmaps: Arc<dyn Array>) -> Result<RecordBatch> 
 {
     let schema = Arc::new(Schema::new(vec![
         Field::new("keys", keys.data_type().clone(), true),
         Field::new("bitmaps", binary_bitmaps.data_type().clone(), true),
-        Field::new("pages", pages.data_type().clone(), true),
+        // Field::new("nulls", nulls.data_type().clone(), false),
     ]));
 
     let columns = vec![
         keys,
         binary_bitmaps,
-        pages
+        // nulls
     ];
 
     Ok(RecordBatch::try_new(schema, columns)?)
@@ -217,36 +270,15 @@ where
     Arc::new(builder.finish())
 }
 
-// Takes an iterator of HashSet<u64> and processes each set
-// to turn it into an Array UInt64Array. The entire collection is stored 
-// as a variable length ListArray
-fn get_pages_from_iter<I>(iter: I) -> Arc<dyn Array>
-where
-    I: Iterator<Item = HashSet<u64>>
-{
-    let mut builder = ListBuilder::new(UInt64Builder::new());
-    iter.for_each(|set| {
-        let pages_vec: Vec<u64> = set.into_iter().collect();
-        builder.values().append_slice(&pages_vec);
-        builder.append(true);
-    });
-
-    let pages_array = builder.finish();
-
-    Arc::new(pages_array)
-}
-
 pub async fn train_bitmap_index(
     data_source: Box<dyn BtreeTrainingSource + Send>,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
-    let mut batch_idx = 0;
     let mut batches_source = data_source.scan_ordered_chunks(4096).await?;
 
-    // mapping from item to list of row ids where it is present
+    // mapping from item to list of the row ids where it is present
     let mut dictionary: HashMap<ScalarValue, Vec<u64>> = HashMap::new();
-    // mapping from item to set of pages where it is present
-    let mut page_dictionary: HashMap<ScalarValue, HashSet<u64>> = HashMap::new();
+    // let mut null_row_ids = Vec::new();
 
     while let Some(batch) = batches_source.try_next().await? {
 
@@ -258,21 +290,18 @@ pub async fn train_bitmap_index(
         for i in 0..key_column.len() {
             let key = ScalarValue::try_from_array(key_column.as_ref(), i)?;
             dictionary.entry(key.clone()).or_insert_with(Vec::new).push(i as u64);
-            page_dictionary.entry(key).or_insert_with(HashSet::new).insert(batch_idx);
         }
-
-        batch_idx += 1;
     }
 
     let keys_iter = dictionary.keys().cloned();
     let values_iter = dictionary.values().cloned();
-    let pages_iter = page_dictionary.values().cloned();
 
     let keys_array = ScalarValue::iter_to_array(keys_iter)?;
     let binary_bitmap_array = get_bitmaps_from_iter(values_iter);
-    let pages_array = get_pages_from_iter(pages_iter);
+    // let null_array = Arc::new(UInt64Array::from(null_row_ids));
 
-    let record_batch = get_batch_from_arrays(keys_array, binary_bitmap_array, pages_array)?;
+    let record_batch = get_batch_from_arrays(keys_array, binary_bitmap_array)?;
+    println!("Record batch: {:?}", record_batch);
     
     let mut bitmap_index_file = index_store
         .new_index_file(BITMAP_LOOKUP_NAME, record_batch.schema())
