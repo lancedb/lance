@@ -70,6 +70,7 @@ fn train_ivf_model(
     centroids.to_pyarrow(py)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_train_pq_model(
     dataset: &Dataset,
     column: &str,
