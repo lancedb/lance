@@ -537,7 +537,7 @@ pub(crate) mod tests {
                     ),
                 ),
             ),
-            // check that more than one byte for multi-byte type
+            // // check that more than one byte for multi-byte type
             (
                 DataType::UInt32,
                 Box::new(
@@ -569,6 +569,7 @@ pub(crate) mod tests {
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
                         Uniform::new(129, 259),
+                        // Uniform::new(1, 3)
                     ),
                 ),
             ),
@@ -579,6 +580,15 @@ pub(crate) mod tests {
                     DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
                         // this range should always give 8 bits
                         Uniform::new(200, 250),
+                    ),
+                ),
+            ),
+            // check where the num_bits divides evenly into the bit length of the type
+            (
+                DataType::UInt64,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
+                        Uniform::new(1, 3) // 2 bits
                     ),
                 ),
             ),

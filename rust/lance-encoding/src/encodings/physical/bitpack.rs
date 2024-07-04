@@ -204,7 +204,7 @@ fn pack_bits(
 
             // if we didn't write the full byte for the last byte, increment by one because
             // we wrote a partial byte
-            if bit_len % num_bits != 0 {
+            if bit_len % num_bits != 0 || partial_bytes_written == 0 {
                 partial_bytes_written += 1;
             }
 
@@ -433,7 +433,7 @@ impl PhysicalPageDecoder for BitpackedPageDecoder {
 
                     // if we didn't write the full byte for the last byte, increment by one because
                     // we wrote a partial byte
-                    if self.uncompressed_bits_per_value % self.bits_per_value != 0 {
+                    if self.uncompressed_bits_per_value % self.bits_per_value != 0 || partial_bytes_written == 0 {
                         partial_bytes_written += 1;
                     }
 
@@ -540,14 +540,44 @@ fn rows_in_buffer(
 #[cfg(test)]
 pub mod test {
     use super::*;
-    use std::sync::Arc;
+    use std::{io::Read, sync::Arc};
 
     use arrow_array::{
         types::{UInt16Type, UInt8Type},
-        Float64Array,
+        Float64Array, UInt64Array,
     };
 
     use lance_datagen::{array::fill, gen, ArrayGenerator, ArrayGeneratorExt, RowCount};
+
+    #[test]
+    fn test_round_trip() {
+        let arrays = vec![
+            Arc::new(UInt64Array::from_iter_values(vec![1, 2, 1, 2, 1, 2, 1, 2, 1, 2])) as ArrayRef
+        ];
+        let encoder = BitpackingBufferEncoder::default();
+        let result = encoder.encode(&arrays).unwrap();
+
+        let parts = result.parts.clone();
+        let part_0 = parts[0].clone();
+        let byte_slice = part_0.bytes();
+        let bytes_raw: Vec<u8> = byte_slice.into_iter().map(|e| e.unwrap()).collect();
+
+        let bytes = Bytes::copy_from_slice(&bytes_raw);
+
+        let decoder = BitpackedPageDecoder {
+            buffer_bit_start_offsets: vec![0],
+            buffer_bit_end_offsets: vec![None],
+            bits_per_value: 2,
+            uncompressed_bits_per_value: 64,
+            data: vec![bytes],
+        };
+
+        let dest = BytesMut::new();
+        let mut dests = vec![dest];
+        decoder.decode_into(0, 8, &mut dests).unwrap();
+    
+        println!("{:?}", dests[0])
+    }
 
     #[test]
     fn test_num_compressed_bits() {
