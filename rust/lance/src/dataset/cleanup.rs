@@ -112,20 +112,27 @@ impl<'a> CleanupTask<'a> {
     async fn run(self) -> Result<RemovalStats> {
         // First we process all manifest files in parallel to figure
         // out which files are referenced by valid manifests
-        let inspection = self.process_manifests().await?;
-        self.check_unreferenced_files_are_not_tagged(&inspection)
-            .await?;
+
+        // get protected manifests first, and include those in process_manifests
+        // pass on option to process manifests around whether to return error
+        // or clean around the manifest
+        let tags = self.dataset.tags().await?;
+        let tagged_versions: HashSet<u64> = tags.iter().map(|(_, v)| v.version).collect();
+        let inspection = self.process_manifests(&tagged_versions).await?;
         self.delete_unreferenced_files(inspection).await
     }
 
-    async fn process_manifests(&'a self) -> Result<CleanupInspection> {
+    async fn process_manifests(
+        &'a self,
+        tagged_versions: &HashSet<u64>,
+    ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
             .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
             .await?
             .try_for_each_concurrent(num_cpus::get(), |path| {
-                self.process_manifest_file(path, &inspection)
+                self.process_manifest_file(path, &inspection, &tagged_versions)
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -135,6 +142,7 @@ impl<'a> CleanupTask<'a> {
         &self,
         path: Path,
         inspection: &Mutex<CleanupInspection>,
+        tagged_versions: &HashSet<u64>,
     ) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
@@ -144,11 +152,14 @@ impl<'a> CleanupTask<'a> {
 
         let manifest = read_manifest(&self.dataset.object_store, &path).await?;
         let dataset_version = self.dataset.version().version;
-        // Don't delete the latest version, even if it is old.  Also don't delete manifests
-        // if their version is newer than the dataset version.  These are either in-progress
-        // or newly added since we started.
+
+        // Don't delete the latest version, even if it is old. Don't delete tagged versions,
+        // regardless of age. Don't delete manifests if their version is newer than the dataset
+        // version.  These are either in-progress or newly added since we started.
         let is_latest = dataset_version <= manifest.version;
-        let in_working_set = is_latest || manifest.timestamp() >= self.before;
+        let is_dataset_version_tagged = tagged_versions.contains(&dataset_version);
+        let in_working_set =
+            is_latest || manifest.timestamp() >= self.before || is_dataset_version_tagged;
         let indexes = read_manifest_indexes(&self.dataset.object_store, &path, &manifest).await?;
 
         let mut inspection = inspection.lock().unwrap();
@@ -203,41 +214,6 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
-    async fn check_unreferenced_files_are_not_tagged(
-        &self,
-        inspection: &CleanupInspection,
-    ) -> Result<()> {
-        let tags = self.dataset.tags().await?;
-
-        let unreferenced_versions: HashSet<u64> = HashSet::from_iter(
-            inspection
-                .old_manifests
-                .iter()
-                .map(|p| parse_version_from_path(p).unwrap()),
-        );
-
-        let unreferenced_tags: HashMap<String, u64> = tags
-            .iter()
-            .filter_map(|(k, &v)| {
-                if unreferenced_versions.contains(&v.version) {
-                    Some((k.clone(), v.version))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        match unreferenced_tags.len() {
-            0 => Ok(()),
-            _ => Err(Error::Cleanup {
-                message: format!(
-                    "{} tagged version(s) have been marked for cleanup. Please delete the following tag(s) to enable cleanup: {:?}",
-                    unreferenced_tags.len(),
-                    unreferenced_tags
-                ),
-            }),
-        }
-    }
 
     async fn delete_unreferenced_files(
         &self,
