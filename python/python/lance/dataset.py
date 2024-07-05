@@ -1467,7 +1467,9 @@ class LanceDataset(pa.dataset.Dataset):
                     " precomputed_partiton_dataset is provided"
                 )
             if precomputed_partiton_dataset is not None:
-                precomputed_ds = LanceDataset(precomputed_partiton_dataset, storage_options=storage_options)
+                precomputed_ds = LanceDataset(
+                    precomputed_partiton_dataset, storage_options=storage_options
+                )
                 if len(precomputed_ds.get_fragments()) != 1:
                     raise ValueError(
                         "precomputed_partiton_dataset must have only one fragment"
@@ -1570,7 +1572,9 @@ class LanceDataset(pa.dataset.Dataset):
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
-        self._ds.create_index(column, index_type, name, replace, storage_options, kwargs)
+        self._ds.create_index(
+            column, index_type, name, replace, storage_options, kwargs
+        )
         return self
 
     def session(self) -> Session:

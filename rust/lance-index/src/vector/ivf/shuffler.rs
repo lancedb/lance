@@ -89,7 +89,8 @@ pub async fn shuffle_dataset(
     } else {
         info!(
             "Calculating IVF partitions for vectors (num_partitions={}, precomputed_partitions={})",
-            num_partitions, precomputed_partitions.is_some()
+            num_partitions,
+            precomputed_partitions.is_some()
         );
         let mut shuffler = IvfShuffler::try_new(num_partitions, None)?;
 
