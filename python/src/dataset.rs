@@ -910,6 +910,7 @@ impl Dataset {
         index_type: &str,
         name: Option<String>,
         replace: Option<bool>,
+        storage_options: Option<HashMap<String, String>>,
         kwargs: Option<&PyDict>,
     ) -> PyResult<()> {
         let index_type = index_type.to_uppercase();
@@ -931,7 +932,7 @@ impl Dataset {
                 Some(f) => f.data_type().clone(),
                 None => return Err(PyValueError::new_err("Column not found in dataset schema.")),
             };
-            prepare_vector_index_params(&index_type, &column_type, kwargs)?
+            prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)?
         };
 
         let replace = replace.unwrap_or(true);
@@ -1220,6 +1221,7 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
 fn prepare_vector_index_params(
     index_type: &str,
     column_type: &DataType,
+    storage_options: Option<HashMap<String, String>>,
     kwargs: Option<&PyDict>,
 ) -> PyResult<Box<dyn IndexParams>> {
     let mut m_type = MetricType::L2;
@@ -1281,6 +1283,10 @@ fn prepare_vector_index_params(
         if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
             ivf_params.precomputed_partitons_file = Some(f.to_string());
         };
+
+        if let Some(storage_options) = storage_options {
+            ivf_params.storage_options = Some(storage_options);
+        }
 
         match (
                 kwargs.get_item("precomputed_shuffle_buffers")?,

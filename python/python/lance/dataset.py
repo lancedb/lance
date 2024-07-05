@@ -1253,6 +1253,7 @@ class LanceDataset(pa.dataset.Dataset):
         # experimental parameters
         ivf_centroids_file: Optional[str] = None,
         precomputed_partiton_dataset: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1306,6 +1307,9 @@ class LanceDataset(pa.dataset.Dataset):
 
             By making this value smaller, this shuffle will consume less memory but will
             take longer to complete, and vice versa.
+        storage_options : optional, dict
+            Extra options that make sense for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1463,7 +1467,7 @@ class LanceDataset(pa.dataset.Dataset):
                     " precomputed_partiton_dataset is provided"
                 )
             if precomputed_partiton_dataset is not None:
-                precomputed_ds = LanceDataset(precomputed_partiton_dataset)
+                precomputed_ds = LanceDataset(precomputed_partiton_dataset, storage_options=storage_options)
                 if len(precomputed_ds.get_fragments()) != 1:
                     raise ValueError(
                         "precomputed_partiton_dataset must have only one fragment"
@@ -1566,7 +1570,7 @@ class LanceDataset(pa.dataset.Dataset):
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
-        self._ds.create_index(column, index_type, name, replace, kwargs)
+        self._ds.create_index(column, index_type, name, replace, storage_options, kwargs)
         return self
 
     def session(self) -> Session:
