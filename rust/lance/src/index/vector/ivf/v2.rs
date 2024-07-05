@@ -322,7 +322,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             }
         };
         let mut sub_index_stats: serde_json::Value =
-            if let Some(metadata) = self.sub_index_metadata.iter().find(|m| m.len() > 0) {
+            if let Some(metadata) = self.sub_index_metadata.iter().find(|m| !m.is_empty()) {
                 serde_json::from_str(metadata)?
             } else {
                 json!({})
