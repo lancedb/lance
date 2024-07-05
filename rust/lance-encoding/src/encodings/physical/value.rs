@@ -489,7 +489,7 @@ pub(crate) mod tests {
         DataType: ArrowPrimitiveType,
     {
         fn new(dist: Dist) -> Self {
-            DistributionArrayGeneratorProvider::<DataType, Dist> {
+            Self {
                 distribution: dist,
                 phantom: Default::default(),
             }
@@ -504,13 +504,12 @@ pub(crate) mod tests {
         DataType: ArrowPrimitiveType,
     {
         fn provide(&self) -> Box<dyn ArrayGenerator> {
-            let generator = rand_with_distribution::<DataType, Dist>(self.distribution.clone());
-            generator
+            rand_with_distribution::<DataType, Dist>(self.distribution.clone())
         }
 
         fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
-            Box::new(DistributionArrayGeneratorProvider::<DataType, Dist> {
-                phantom: self.phantom.clone(),
+            Box::new(Self {
+                phantom: self.phantom,
                 distribution: self.distribution.clone(),
             })
         }
