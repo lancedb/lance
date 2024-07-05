@@ -47,6 +47,7 @@ use moka::sync::Cache;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
+use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -321,7 +322,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             }
         };
         let mut sub_index_stats: serde_json::Value =
-            serde_json::from_str(self.sub_index_metadata[0].as_str())?;
+            if let Some(metadata) = self.sub_index_metadata.iter().find(|m| m.len() > 0) {
+                serde_json::from_str(metadata)?
+            } else {
+                json!({})
+            };
         sub_index_stats["index_type"] = S::name().into();
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type,
