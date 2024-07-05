@@ -47,6 +47,7 @@ use moka::sync::Cache;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
+use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -321,7 +322,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             }
         };
         let mut sub_index_stats: serde_json::Value =
-            serde_json::from_str(self.sub_index_metadata[0].as_str())?;
+            if let Some(metadata) = self.sub_index_metadata.iter().find(|m| !m.is_empty()) {
+                serde_json::from_str(metadata)?
+            } else {
+                json!({})
+            };
         sub_index_stats["index_type"] = S::name().into();
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type,
@@ -702,6 +707,49 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let nlist = 4;
+        let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::new(nlist);
+        let sq_params = SQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_index".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats = dataset.index_statistics("test_index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(stats.as_str()).unwrap();
+
+        assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+        for index in stats["indices"].as_array().unwrap() {
+            assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+            assert_eq!(
+                index["num_partitions"].as_number().unwrap(),
+                &serde_json::Number::from(nlist)
+            );
+            assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_stats_empty_partition() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let nlist = 1000;
         let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(nlist);
