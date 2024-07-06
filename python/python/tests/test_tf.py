@@ -11,7 +11,7 @@ import pyarrow as pa
 import pytest
 from lance.arrow import BFloat16Type, ImageArray, bfloat16_array
 
-pytest.skip("Skip tensorflow tests", allow_module_level=True)
+pytest.skip("Skip tensorflow tests", allow_module_level=True)  # noqa: F401
 
 try:
     with warnings.catch_warnings():
