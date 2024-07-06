@@ -10,8 +10,10 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from lance.arrow import BFloat16Type, ImageArray, bfloat16_array
+import lance
+from lance.fragment import LanceFragment
 
-pytest.skip("Skip tensorflow tests", allow_module_level=True)  # noqa: F401
+pytest.skip("Skip tensorflow tests", allow_module_level=True)
 
 try:
     with warnings.catch_warnings():
@@ -24,15 +26,13 @@ except ImportError:
         allow_module_level=True,
     )
 
-import lance
-from lance.fragment import LanceFragment
 from lance.tf.data import (
     from_lance,
     from_lance_batches,
     lance_fragments,
     lance_take_batches,
-)
-from lance.tf.tfrecord import infer_tfrecord_schema, read_tfrecord
+)  # noqa: E402
+from lance.tf.tfrecord import infer_tfrecord_schema, read_tfrecord  # noqa: E402
 
 
 @pytest.fixture
