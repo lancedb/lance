@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import os
+import warnings
 
 import ml_dtypes
 import numpy as np
@@ -9,6 +10,20 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from lance.arrow import BFloat16Type, ImageArray, bfloat16_array
+
+pytest.skip("Skip tensorflow tests", allow_module_level=True)
+
+try:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        import tensorflow as tf  # noqa: F401
+except ImportError:
+    pytest.skip(
+        "Tensorflow is not installed. Please install tensorflow to "
+        + "test lance.tf module.",
+        allow_module_level=True,
+    )
+
 import lance
 from lance.fragment import LanceFragment
 from lance.tf.data import (
@@ -18,11 +33,6 @@ from lance.tf.data import (
     lance_take_batches,
 )
 from lance.tf.tfrecord import infer_tfrecord_schema, read_tfrecord
-
-pytest.skip(
-    "Tensorflow tests are ignored",
-    allow_module_level=True,
-)
 
 
 @pytest.fixture
