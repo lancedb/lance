@@ -4,13 +4,13 @@
 import os
 import warnings
 
+import lance
 import ml_dtypes
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
 from lance.arrow import BFloat16Type, ImageArray, bfloat16_array
-import lance
 from lance.fragment import LanceFragment
 
 pytest.skip("Skip tensorflow tests", allow_module_level=True)
@@ -26,12 +26,12 @@ except ImportError:
         allow_module_level=True,
     )
 
-from lance.tf.data import (
+from lance.tf.data import (  # noqa: E402
     from_lance,
     from_lance_batches,
     lance_fragments,
     lance_take_batches,
-)  # noqa: E402
+)
 from lance.tf.tfrecord import infer_tfrecord_schema, read_tfrecord  # noqa: E402
 
 
