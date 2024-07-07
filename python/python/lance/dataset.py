@@ -296,6 +296,9 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        fast_search:  bool, default False
+            If True, then the search will only be performed on the indexed data, which
+            yields faster search time.
 
         Notes
         -----
