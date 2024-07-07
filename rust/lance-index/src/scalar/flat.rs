@@ -248,6 +248,10 @@ impl ScalarIndex for FlatIndex {
                     &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
                 )?,
             },
+            ScalarQuery::FullTextSearch(_) => return Err(Error::invalid_input(
+                "full text search is not supported for flat index, build a inverted index for it",
+                location!(),
+            )),
         };
         Ok(arrow_select::filter::filter(self.ids(), &predicate)?
             .as_any()
