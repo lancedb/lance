@@ -2202,8 +2202,8 @@ class ScannerBuilder:
     def fast_search(self, flag: bool) -> ScannerBuilder:
         """Enable fast search, which only perform search on the indexed data.
 
-        Users can use `Table::optimize()` or `create_index()` to include the new data into index,
-        thus make new data searchable.
+        Users can use `Table::optimize()` or `create_index()` to include the new data
+        into index, thus make new data searchable.
         """
         self.fast_search = flag
         return self
