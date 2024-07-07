@@ -202,6 +202,12 @@ impl ScalarIndex for BitmapIndex {
                     empty_array
                 }
             }
+            ScalarQuery::FullTextSearch(_) => {
+                return Err(Error::NotSupported {
+                    source: "full text search is not supported for bitmap indexes".into(),
+                    location: location!(),
+                });
+            }
         };
 
         Ok(row_ids)
