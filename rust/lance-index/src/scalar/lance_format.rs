@@ -155,7 +155,7 @@ impl IndexStore for LanceIndexStore {
 #[cfg(test)]
 mod tests {
 
-    use std::{ops::Bound, path::Path};
+    use std::{collections::HashMap, ops::Bound, path::Path};
 
     use crate::scalar::{
         bitmap::{train_bitmap_index, BitmapIndex},
@@ -168,7 +168,7 @@ mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Float32Type, Int32Type, UInt64Type},
-        RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array, UInt64Array,
+        RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
     };
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
@@ -176,7 +176,6 @@ mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
-    use object_store::path::Path as OtherPath;
     use tempfile::{tempdir, TempDir};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
@@ -661,10 +660,7 @@ mod tests {
     async fn train_bitmap(
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
-        value_type: DataType,
     ) {
-        // let sub_index_trainer = FlatIndexMetadata::new(value_type);
-
         let data = Box::new(MockTrainingSource::new(data).await);
         train_bitmap_index(data, index_store.as_ref())
             .await
@@ -705,11 +701,9 @@ mod tests {
 
         let batches = vec![batch1, batch2];
         let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        train_bitmap(&index_store, data, DataType::Int32).await;
-        println!("Index Trained");
+        train_bitmap(&index_store, data).await;
 
         let index = BitmapIndex::load(index_store).await.unwrap();
-        println!("Index Loaded");
 
         let row_ids = index
             .search(&ScalarQuery::Equals(ScalarValue::Utf8(None)))
@@ -717,7 +711,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(1, row_ids.len());
-        assert_eq!(Some(2), row_ids.values().into_iter().copied().next());
+        assert_eq!(2, row_ids.values()[0]);
 
         let row_ids = index
             .search(&ScalarQuery::Equals(ScalarValue::Utf8(Some(
@@ -726,11 +720,8 @@ mod tests {
             .await
             .unwrap();
 
-        // println!("Row Ids: {:?}", row_ids);
-
-        let expected = &vec![1, 3, 6];
-        let expected_arr = UInt64Array::from_iter_values(expected.iter().copied());
-        // println!("Expected: {:?}", expected_arr);
+        let expected = vec![1, 3, 6];
+        let expected_arr = UInt64Array::from_iter_values(expected.into_iter());
 
         assert_eq!(3, row_ids.len());
         assert_eq!(expected_arr, row_ids);
@@ -738,23 +729,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_bitmap() {
-
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
         let data = gen()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
-        train_bitmap(&index_store, data, DataType::Int32).await;
+        train_bitmap(&index_store, data).await;
         let index = BitmapIndex::load(index_store).await.unwrap();
 
         let row_ids = index
-        .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
-        .await
-        .unwrap();
+            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
+            .await
+            .unwrap();
 
         assert_eq!(1, row_ids.len());
-        assert_eq!(Some(10000), row_ids.values().into_iter().copied().next());
+        assert_eq!(10000, row_ids.values()[0]);
 
         let row_ids = index
             .search(&ScalarQuery::Range(
@@ -776,7 +766,6 @@ mod tests {
 
         assert_eq!(100, row_ids.len());
     }
-
 
     async fn check_bitmap(index: &BitmapIndex, query: ScalarQuery, expected: &[u64]) {
         let results = index.search(&query).await.unwrap();
@@ -816,7 +805,7 @@ mod tests {
             Field::new("row_ids", DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        train_bitmap(&index_store, data, DataType::Int32).await;
+        train_bitmap(&index_store, data).await;
         let index = BitmapIndex::load(index_store).await.unwrap();
 
         // The above should create four pages
@@ -992,5 +981,102 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_update() {
+        let index_dir = tempdir().unwrap();
+        let index_store = test_store(&index_dir);
+        let data = gen()
+            .col("values", array::step::<Int32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store).await.unwrap();
+
+        let data = gen()
+            .col("values", array::step_custom::<Int32Type>(4096, 1))
+            .col("row_ids", array::step_custom::<UInt64Type>(4096, 1))
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+
+        let updated_index_dir = tempdir().unwrap();
+        let updated_index_store = test_store(&updated_index_dir);
+        index
+            .update(
+                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                updated_index_store.as_ref(),
+            )
+            .await
+            .unwrap();
+        let updated_index = BitmapIndex::load(updated_index_store).await.unwrap();
+
+        let row_ids = updated_index
+            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(5000))))
+            .await
+            .unwrap();
+
+        assert_eq!(1, row_ids.len());
+        assert_eq!(
+            vec![5000],
+            row_ids.values().into_iter().copied().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_remap() {
+        let index_dir = tempdir().unwrap();
+        let index_store = test_store(&index_dir);
+        let data = gen()
+            .col("values", array::step::<Int32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store).await.unwrap();
+
+        let mapping = (0..50)
+            .map(|i| {
+                let map_result = if i == 5 {
+                    Some(65)
+                } else if i == 7 {
+                    None
+                } else {
+                    Some(i)
+                };
+                (i, map_result)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let remapped_dir = tempdir().unwrap();
+        let remapped_store = test_store(&remapped_dir);
+        index
+            .remap(&mapping, remapped_store.as_ref())
+            .await
+            .unwrap();
+        let remapped_index = BitmapIndex::load(remapped_store).await.unwrap();
+
+        // Remapped to new value
+        assert_eq!(
+            remapped_index
+                .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(5))))
+                .await
+                .unwrap()
+                .value(0),
+            65
+        );
+        // Deleted
+        assert!(remapped_index
+            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(7))))
+            .await
+            .unwrap()
+            .is_empty());
+        // Not remapped
+        assert_eq!(
+            remapped_index
+                .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(3))))
+                .await
+                .unwrap()
+                .value(0),
+            3
+        );
     }
 }
