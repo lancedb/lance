@@ -1103,7 +1103,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_scalar_index(
         self,
         column: str,
-        index_type: Literal["BTREE"],
+        index_type: Union[Literal["BTREE"], Literal["BITMAP"]],
         name: Optional[str] = None,
         *,
         replace: bool = True,
@@ -1159,9 +1159,15 @@ class LanceDataset(pa.dataset.Dataset):
         that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
         ``MaterializeIndex`` operator.
 
-        Currently, the only type of scalar index available is ``BTREE``. This index
-        combines is inspired by the btree data structure although only the first few
-        layers of the btree are cached in memory.
+        There are two types of scalar indices available today.  The most common
+        type is ``BTREE``. This index is inspired by the btree data structure
+        although only the first few layers of the btree are cached in memory.  It iwll
+        perform well on columns with a large number of unique values and few rows per
+        value.
+
+        The other index type is ``BITMAP``.  This index stores a bitmap for each unique
+        value in the column.  This index is useful for columns with a small number of
+        unique values and many rows per value.
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
@@ -1175,7 +1181,7 @@ class LanceDataset(pa.dataset.Dataset):
             The column to be indexed.  Must be a boolean, integer, float,
             or string column.
         index_type : str
-            The type of the index.  Only ``"BTREE"`` is supported now.
+            The type of the index.  One of ``"BTREE"`` or ``"BITMAP"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1226,12 +1232,10 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         index_type = index_type.upper()
-        if index_type != "BTREE":
+        if index_type not in ["BTREE", "BITMAP"]:
             raise NotImplementedError(
-                (
-                    'Only "BTREE" is supported for ',
-                    f"index_type.  Received {index_type}",
-                )
+                'Only "BTREE" or "BITMAP" are supported for ',
+                f"scalar columns.  Received {index_type}",
             )
 
         self._ds.create_index([column], index_type, name, replace)

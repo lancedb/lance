@@ -28,7 +28,7 @@ use crate::{Index, IndexType};
 use super::btree::OrderableScalarValue;
 use super::{btree::BtreeTrainingSource, IndexStore, ScalarIndex, ScalarQuery};
 
-const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
+pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
 /// A scalar index that stores a bitmap for each possible value
 ///

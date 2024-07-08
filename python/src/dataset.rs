@@ -37,6 +37,7 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
+use lance::index::scalar::ScalarIndexType;
 use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
@@ -920,7 +921,7 @@ impl Dataset {
     ) -> PyResult<()> {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
-            "BTREE" => IndexType::Scalar,
+            "BTREE" | "BITMAP" => IndexType::Scalar,
             "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -932,6 +933,11 @@ impl Dataset {
         // Only VectorParams are supported.
         let params: Box<dyn IndexParams> = if index_type == "BTREE" {
             Box::<ScalarIndexParams>::default()
+        } else if index_type == "BITMAP" {
+            Box::new(ScalarIndexParams {
+                // Temporary workaround until we add support for auto-detection of scalar index type
+                force_index_type: Some(ScalarIndexType::Bitmap),
+            })
         } else {
             let column_type = match self.ds.schema().field(columns[0]) {
                 Some(f) => f.data_type().clone(),
