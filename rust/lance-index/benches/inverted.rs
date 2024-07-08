@@ -22,7 +22,7 @@ use object_store::path::Path;
 use pprof::criterion::{Output, PProfProfiler};
 
 fn bench_inverted(c: &mut Criterion) {
-    const TOTAL: usize = 30_000_000;
+    const TOTAL: usize = 1_000_000;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
