@@ -63,6 +63,7 @@ lance-datagen.workspace = true
 lance-testing.workspace = true
 tempfile.workspace = true
 datafusion-sql.workspace = true
+random_word = { version = "0.4.3", features = ["en"] }
 
 [build-dependencies]
 prost-build.workspace = true
@@ -89,4 +90,8 @@ harness = false
 
 [[bench]]
 name = "sq"
+harness = false
+
+[[bench]]
+name = "inverted"
 harness = false
