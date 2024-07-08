@@ -432,6 +432,7 @@ impl Dataset {
         with_row_id: Option<bool>,
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
+        fast_search: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -494,6 +495,10 @@ impl Dataset {
 
         if let Some(use_stats) = use_stats {
             scanner.use_stats(use_stats);
+        }
+
+        if let Some(true) = fast_search {
+            scanner.fast_search();
         }
 
         if let Some(fragments) = fragments {

@@ -21,6 +21,7 @@ use crate::Index;
 pub mod btree;
 pub mod expression;
 pub mod flat;
+pub mod inverted;
 pub mod lance_format;
 
 /// Trait for storing an index (or parts of an index) into storage
@@ -82,6 +83,8 @@ pub enum ScalarQuery {
     IsIn(Vec<ScalarValue>),
     /// Retrieve all row ids where the value is exactly the given value
     Equals(ScalarValue),
+    /// Retrieve all row ids where the value matches the given full text search query
+    FullTextSearch(Vec<String>),
     /// Retrieve all row ids where the value is null
     IsNull(),
 }
@@ -125,6 +128,9 @@ impl ScalarQuery {
                     .collect::<Vec<_>>(),
                 false,
             ),
+            Self::FullTextSearch(values) => {
+                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(values.join("|")))))
+            }
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
         }
@@ -161,6 +167,9 @@ impl ScalarQuery {
                         .collect::<Vec<_>>()
                         .join(",")
                 )
+            }
+            Self::FullTextSearch(values) => {
+                format!("{} LIKE '{}'", col, values.join("|"))
             }
             Self::IsNull() => {
                 format!("{} IS NULL", col)

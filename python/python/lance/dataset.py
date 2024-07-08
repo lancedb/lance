@@ -243,6 +243,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        fast_search: bool = False,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -295,6 +296,9 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        fast_search:  bool, default False
+            If True, then the search will only be performed on the indexed data, which
+            yields faster search time.
 
         Notes
         -----
@@ -331,6 +335,7 @@ class LanceDataset(pa.dataset.Dataset):
             .with_fragments(fragments)
             .with_row_id(with_row_id)
             .use_stats(use_stats)
+            .fast_search(fast_search)
         )
         if nearest is not None:
             builder = builder.nearest(**nearest)
@@ -2018,6 +2023,7 @@ class ScannerBuilder:
         self._fragments = None
         self._with_row_id = False
         self._use_stats = True
+        self._fast_search = None
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -2199,6 +2205,15 @@ class ScannerBuilder:
         }
         return self
 
+    def fast_search(self, flag: bool) -> ScannerBuilder:
+        """Enable fast search, which only perform search on the indexed data.
+
+        Users can use `Table::optimize()` or `create_index()` to include the new data
+        into index, thus make new data searchable.
+        """
+        self.fast_search = flag
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -2216,6 +2231,7 @@ class ScannerBuilder:
             self._with_row_id,
             self._use_stats,
             self._substrait_filter,
+            self._fast_search,
         )
         return LanceScanner(scanner, self.ds)
 
