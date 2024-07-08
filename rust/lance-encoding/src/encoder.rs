@@ -225,7 +225,7 @@ pub trait FieldEncoder: Send {
     ///
     /// This is called only once, after all encode tasks have completed
     ///
-    /// By default, returns an empty Vec (no column metadata buffers)
+    /// This returns a Vec because a single field may have created multiple columns
     fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>>;
 
     /// The number of output columns this encoding will create
@@ -393,7 +393,7 @@ impl CoreBufferEncodingStrategy {
             return None;
         }
 
-        Some(BitpackingBufferEncoder::default())
+        Some(BitpackingBufferEncoder::new(num_bits))
     }
 }
 
