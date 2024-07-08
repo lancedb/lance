@@ -447,10 +447,6 @@ impl DocSet {
         self.token_count.len()
     }
 
-    fn is_empty(&self) -> bool {
-        self.token_count.is_empty()
-    }
-
     fn average_length(&self) -> f32 {
         self.total_tokens as f32 / self.token_count.len() as f32
     }
