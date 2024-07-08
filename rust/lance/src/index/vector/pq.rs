@@ -518,9 +518,16 @@ mod tests {
         let (dataset, vectors) = generate_dataset(test_uri, 100.0..120.0).await;
 
         let ivf_params = IvfBuildParams::new(4);
-        let ivf = build_ivf_model(&dataset, "vector", DIM, MetricType::Cosine, &ivf_params)
-            .await
-            .unwrap();
+        let ivf = build_ivf_model(
+            &dataset,
+            "vector",
+            DIM,
+            MetricType::Cosine,
+            &ivf_params,
+            None,
+        )
+        .await
+        .unwrap();
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(
             &dataset,

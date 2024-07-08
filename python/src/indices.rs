@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use arrow::pyarrow::ToPyArrow;
 use arrow_array::Array;
 use arrow_data::ArrayData;
@@ -8,7 +10,7 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_linalg::distance::DistanceType;
 use pyo3::{pyfunction, types::PyModule, wrap_pyfunction, PyObject, PyResult, Python};
 
-use crate::{dataset::Dataset, error::PythonErrorExt, RT};
+use crate::{dataset::Dataset, error::PythonErrorExt, utils::TqdmProgressCallback, RT};
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -27,12 +29,14 @@ async fn do_train_ivf_model(
         num_partitions: num_partitions as usize,
         ..Default::default()
     };
+    let progress = Arc::new(TqdmProgressCallback::default());
     let ivf_model = lance::index::vector::ivf::build_ivf_model(
         dataset.ds.as_ref(),
         column,
         dimension,
         distance_type,
         &params,
+        Some(progress),
     )
     .await
     .infer_error()?;

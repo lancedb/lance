@@ -12,4 +12,5 @@ pub(crate) mod test;
 pub mod tfrecord;
 
 // Re-export
+pub use lance_core::utils::progress::GenericProgressCallback;
 pub use lance_linalg::kmeans;
