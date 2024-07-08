@@ -628,7 +628,7 @@ def test_cleanup_old_versions(tmp_path):
     assert stats.old_versions == 1
 
 
-def test_dont_cleanup_old_tagged_versions(tmp_path):
+def test_do_not_cleanup_old_tagged_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)

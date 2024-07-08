@@ -8,9 +8,11 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
 use deepsize::DeepSizeOf;
+use futures::future;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use itertools::Itertools;
 use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
@@ -1217,19 +1219,32 @@ impl Dataset {
     pub async fn tags(&self) -> Result<HashMap<String, TagContents>> {
         let mut tags = HashMap::<String, TagContents>::new();
 
-        let tag_names = self
+        let tag_files = self
             .object_store()
             .read_dir(base_tags_path(&self.base))
             .await?;
 
-        for n in tag_names.iter() {
-            let tag_name = n.strip_suffix(".json").unwrap();
-            let tag_path = tag_path(&self.base, tag_name);
-            tags.insert(
-                tag_name.to_string(),
-                TagContents::from_path(&tag_path, self.object_store()).await?,
-            );
-        }
+        let tag_names = tag_files
+            .iter()
+            .filter_map(|name| name.strip_suffix(".json"))
+            .map(|name| name.to_string())
+            .collect_vec();
+
+        futures::stream::iter(tag_names)
+            .map(|tag_name| {
+                let tag_file = tag_path(&self.base, &tag_name);
+                async move {
+                    let contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+                    Ok((tag_name, contents))
+                }
+            })
+            .buffer_unordered(10)
+            .try_for_each(|result| {
+                let (tag_name, contents) = result;
+                tags.insert(tag_name, contents);
+                future::ready(Ok::<(), Error>(()))
+            })
+            .await?;
 
         Ok(tags)
     }
