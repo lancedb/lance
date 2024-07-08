@@ -155,9 +155,10 @@ impl IndexStore for LanceIndexStore {
 #[cfg(test)]
 mod tests {
 
-    use std::{ops::Bound, path::Path};
+    use std::{collections::HashMap, ops::Bound, path::Path};
 
     use crate::scalar::{
+        bitmap::{train_bitmap_index, BitmapIndex},
         btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
         flat::FlatIndexMetadata,
         ScalarIndex, ScalarQuery,
@@ -167,8 +168,9 @@ mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Float32Type, Int32Type, UInt64Type},
-        RecordBatchIterator, RecordBatchReader, UInt64Array,
+        RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
     };
+    use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
@@ -653,5 +655,428 @@ mod tests {
 
         let row_ids = index.search(&ScalarQuery::IsNull()).await.unwrap();
         assert_eq!(row_ids.len(), 4096);
+    }
+
+    async fn train_bitmap(
+        index_store: &Arc<dyn IndexStore>,
+        data: impl RecordBatchReader + Send + Sync + 'static,
+    ) {
+        let data = Box::new(MockTrainingSource::new(data).await);
+        train_bitmap_index(data, index_store.as_ref())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_working() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("values", DataType::Utf8, true),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("abcd"), None, Some("abcd")])),
+                Arc::new(UInt64Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("apple"),
+                    Some("hello"),
+                    Some("abcd"),
+                ])),
+                Arc::new(UInt64Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .unwrap();
+
+        let batches = vec![batch1, batch2];
+        let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        train_bitmap(&index_store, data).await;
+
+        let index = BitmapIndex::load(index_store).await.unwrap();
+
+        let row_ids = index
+            .search(&ScalarQuery::Equals(ScalarValue::Utf8(None)))
+            .await
+            .unwrap();
+
+        assert_eq!(1, row_ids.len());
+        assert_eq!(2, row_ids.values()[0]);
+
+        let row_ids = index
+            .search(&ScalarQuery::Equals(ScalarValue::Utf8(Some(
+                "abcd".to_string(),
+            ))))
+            .await
+            .unwrap();
+
+        let expected = vec![1, 3, 6];
+        let expected_arr = UInt64Array::from_iter_values(expected.into_iter());
+
+        assert_eq!(3, row_ids.len());
+        assert_eq!(expected_arr, row_ids);
+    }
+
+    #[tokio::test]
+    async fn test_basic_bitmap() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let data = gen()
+            .col("values", array::step::<Int32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store).await.unwrap();
+
+        let row_ids = index
+            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
+            .await
+            .unwrap();
+
+        assert_eq!(1, row_ids.len());
+        assert_eq!(10000, row_ids.values()[0]);
+
+        let row_ids = index
+            .search(&ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int32(Some(-100))),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(0, row_ids.len());
+
+        let row_ids = index
+            .search(&ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int32(Some(100))),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(100, row_ids.len());
+    }
+
+    async fn check_bitmap(index: &BitmapIndex, query: ScalarQuery, expected: &[u64]) {
+        let results = index.search(&query).await.unwrap();
+        let expected_arr = UInt64Array::from_iter_values(expected.iter().copied());
+        assert_eq!(results, expected_arr);
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_with_gaps() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let batch_one = gen()
+            .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
+            .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
+            .into_batch_rows(RowCount::from(4));
+        let batch_two = gen()
+            .col("values", array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
+            .col("row_ids", array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .into_batch_rows(RowCount::from(4));
+        let batch_three = gen()
+            .col("values", array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
+            .col(
+                "row_ids",
+                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+            )
+            .into_batch_rows(RowCount::from(4));
+        let batch_four = gen()
+            .col("values", array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
+            .col(
+                "row_ids",
+                array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
+            )
+            .into_batch_rows(RowCount::from(4));
+        let batches = vec![batch_one, batch_two, batch_three, batch_four];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Int32, false),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+        let data = RecordBatchIterator::new(batches, schema);
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store).await.unwrap();
+
+        // The above should create four pages
+        //
+        // 0 - 5
+        // 10 - 15
+        // 15 - 15
+        // 15 - 20
+        //
+        // This will help us test various indexing corner cases
+
+        // No results (off the left side)
+        check_bitmap(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(-3))),
+            &[],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(-3))),
+            ),
+            &[],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(-10))),
+                Bound::Included(ScalarValue::Int32(Some(-3))),
+            ),
+            &[],
+        )
+        .await;
+
+        // Hitting the middle of a bucket
+        check_bitmap(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(4))),
+            &[2],
+        )
+        .await;
+
+        // Hitting a gap between two buckets
+        check_bitmap(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(7))),
+            &[],
+        )
+        .await;
+
+        // Hitting the lowest of the overlapping buckets
+        check_bitmap(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(11))),
+            &[50, 60],
+        )
+        .await;
+
+        // Hitting the 15 shared on all three buckets
+        check_bitmap(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(15))),
+            &[70, 400, 500, 600, 700, 4000],
+        )
+        .await;
+
+        // Hitting the upper part of the three overlapping buckets
+        check_bitmap(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(20))),
+            &[6000, 7000],
+        )
+        .await;
+
+        // Ranges that capture multiple buckets
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
+            &[0, 1, 2, 3, 40, 50, 60],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
+            &[0, 1, 2, 3, 40],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
+            &[2, 3, 40, 50, 60],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
+            &[2, 3, 40],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
+            &[3, 40, 50, 60],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
+            &[3, 40],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            ScalarQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(-50))),
+                Bound::Excluded(ScalarValue::Int32(Some(1000))),
+            ),
+            &[
+                0, 1, 2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_update() {
+        let index_dir = tempdir().unwrap();
+        let index_store = test_store(&index_dir);
+        let data = gen()
+            .col("values", array::step::<Int32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store).await.unwrap();
+
+        let data = gen()
+            .col("values", array::step_custom::<Int32Type>(4096, 1))
+            .col("row_ids", array::step_custom::<UInt64Type>(4096, 1))
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+
+        let updated_index_dir = tempdir().unwrap();
+        let updated_index_store = test_store(&updated_index_dir);
+        index
+            .update(
+                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                updated_index_store.as_ref(),
+            )
+            .await
+            .unwrap();
+        let updated_index = BitmapIndex::load(updated_index_store).await.unwrap();
+
+        let row_ids = updated_index
+            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(5000))))
+            .await
+            .unwrap();
+
+        assert_eq!(1, row_ids.len());
+        assert_eq!(
+            vec![5000],
+            row_ids.values().into_iter().copied().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_remap() {
+        let index_dir = tempdir().unwrap();
+        let index_store = test_store(&index_dir);
+        let data = gen()
+            .col("values", array::step::<Int32Type>())
+            .col("row_ids", array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store).await.unwrap();
+
+        let mapping = (0..50)
+            .map(|i| {
+                let map_result = if i == 5 {
+                    Some(65)
+                } else if i == 7 {
+                    None
+                } else {
+                    Some(i)
+                };
+                (i, map_result)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let remapped_dir = tempdir().unwrap();
+        let remapped_store = test_store(&remapped_dir);
+        index
+            .remap(&mapping, remapped_store.as_ref())
+            .await
+            .unwrap();
+        let remapped_index = BitmapIndex::load(remapped_store).await.unwrap();
+
+        // Remapped to new value
+        assert_eq!(
+            remapped_index
+                .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(5))))
+                .await
+                .unwrap()
+                .value(0),
+            65
+        );
+        // Deleted
+        assert!(remapped_index
+            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(7))))
+            .await
+            .unwrap()
+            .is_empty());
+        // Not remapped
+        assert_eq!(
+            remapped_index
+                .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(3))))
+                .await
+                .unwrap()
+                .value(0),
+            3
+        );
     }
 }

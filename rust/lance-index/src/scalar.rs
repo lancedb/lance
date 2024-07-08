@@ -18,6 +18,7 @@ use lance_core::Result;
 
 use crate::Index;
 
+pub mod bitmap;
 pub mod btree;
 pub mod expression;
 pub mod flat;

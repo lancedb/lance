@@ -49,7 +49,7 @@ const BTREE_PAGES_NAME: &str = "page_data.lance";
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
-struct OrderableScalarValue(ScalarValue);
+pub struct OrderableScalarValue(pub ScalarValue);
 
 impl DeepSizeOf for OrderableScalarValue {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
