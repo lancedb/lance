@@ -579,6 +579,16 @@ impl Dataset {
                 true
             };
 
+            let ef: Option<usize> = if let Some(ef) = nearest.get_item("ef")? {
+                if ef.is_none() {
+                    None
+                } else {
+                    PyAny::downcast::<PyLong>(ef)?.extract()?
+                }
+            } else {
+                None
+            };
+
             scanner
                 .nearest(column.as_str(), &q, k)
                 .map(|s| {
@@ -588,6 +598,9 @@ impl Dataset {
                     }
                     if let Some(m) = metric_type {
                         s = s.distance_metric(m);
+                    }
+                    if let Some(ef) = ef {
+                        s = s.ef(ef);
                     }
                     s.use_index(use_index);
                     s

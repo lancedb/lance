@@ -2166,6 +2166,7 @@ class ScannerBuilder:
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
         use_index: bool = True,
+        ef: Optional[int] = None,
     ) -> ScannerBuilder:
         q = _coerce_query_vector(q)
 
@@ -2192,6 +2193,10 @@ class ScannerBuilder:
             raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
         if refine_factor is not None and int(refine_factor) < 1:
             raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
+        if ef is not None and int(ef) <= 0:
+            # `ef` should be >= `k`, but `k` could be None so we can't check it here
+            # the rust code will check it
+            raise ValueError(f"ef must be > 0 but got {ef}")
         self._nearest = {
             "column": column,
             "q": q,
@@ -2200,6 +2205,7 @@ class ScannerBuilder:
             "nprobes": nprobes,
             "refine_factor": refine_factor,
             "use_index": use_index,
+            "ef": ef,
         }
         return self
 
