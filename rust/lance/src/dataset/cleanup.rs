@@ -129,11 +129,11 @@ impl<'a> CleanupTask<'a> {
         // or clean around the manifest
 
         let tags = self.dataset.tags().await?;
-        let tagged_versions: HashSet<u64> = tags.iter().map(|(_, v)| v.version).collect();
+        let tagged_versions: HashSet<u64> = tags.values().map(|v| v.version).collect();
 
         let inspection = self.process_manifests(&tagged_versions).await?;
 
-        if self.error_if_old_versions_tagged && inspection.tagged_old_versions.len() > 0 {
+        if self.error_if_old_versions_tagged && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
                 &tags,
                 &inspection.tagged_old_versions,
@@ -153,7 +153,7 @@ impl<'a> CleanupTask<'a> {
             .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
             .await?
             .try_for_each_concurrent(num_cpus::get(), |path| {
-                self.process_manifest_file(path, &inspection, &tagged_versions)
+                self.process_manifest_file(path, &inspection, tagged_versions)
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -453,13 +453,13 @@ fn tagged_old_versions_cleanup_error(
         })
         .collect();
 
-    return Error::Cleanup {
+    Error::Cleanup {
         message: format!(
             "{} tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup: {:?}",
             unreferenced_tags.len(),
             unreferenced_tags
         ),
-    };
+    }
 }
 
 #[cfg(test)]
