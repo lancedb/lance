@@ -40,6 +40,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
+log.workspace = true
 
 # This is used to detect CPU features at runtime.
 # See src/utils/cpu.rs

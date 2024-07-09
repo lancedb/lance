@@ -87,7 +87,6 @@ impl<'a> FragmentCreateBuilder<'a> {
         let obj_writer = object_store.create(&full_path).await?;
         let mut writer = lance_file::v2::writer::FileWriter::try_new(
             obj_writer,
-            full_path.to_string(),
             schema,
             FileWriterOptions::default(),
         )?;
@@ -147,7 +146,11 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
-        let (object_store, base_path) = ObjectStore::from_uri(self.dataset_uri).await?;
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            self.dataset_uri,
+            &params.store_params.clone().unwrap_or_default(),
+        )
+        .await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());

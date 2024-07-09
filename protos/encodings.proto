@@ -191,6 +191,13 @@ message Fsst {
   bytes symbol_table = 2;
 }
 
+// An array encoding for dictionary-encoded fields
+message Dictionary {
+  ArrayEncoding indices = 1;
+  ArrayEncoding items = 2;
+  uint32 num_dictionary_items = 3;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -201,6 +208,7 @@ message ArrayEncoding {
         SimpleStruct struct = 5;
         Binary binary = 6;
         Fsst fsst = 7;
+        Dictionary dictionary = 7;
     }
 }
 

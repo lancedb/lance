@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
@@ -19,12 +19,15 @@ use crate::{
             list::ListFieldEncoder, primitive::PrimitiveFieldEncoder, r#struct::StructFieldEncoder,
         },
         physical::{
-            basic::BasicEncoder, binary::BinaryEncoder, fixed_size_list::FslEncoder,
-            value::ValueEncoder,
+            basic::BasicEncoder, binary::BinaryEncoder, dictionary::DictionaryEncoder,
+            fixed_size_list::FslEncoder, value::ValueEncoder,
         },
     },
     format::pb,
 };
+
+use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
+use std::collections::hash_map::RandomState;
 
 /// An encoded buffer
 pub struct EncodedBuffer {
@@ -232,27 +235,34 @@ impl CoreArrayEncodingStrategy {
     fn array_encoder_from_type(
         data_type: &DataType,
         data_size: u64,
+        use_dict_encoding: bool,
     ) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
-                    Self::array_encoder_from_type(inner.data_type(), data_size)?,
+                    Self::array_encoder_from_type(inner.data_type(), data_size, use_dict_encoding)?,
                     *dimension as u32,
                 )))))
             }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
-                let bin_indices_encoder =
-                    Self::array_encoder_from_type(&DataType::UInt64, data_size)?;
-                let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8, data_size)?;
+                if use_dict_encoding {
+                    let dict_indices_encoder =
+                        Self::array_encoder_from_type(&DataType::UInt8, false)?;
+                    let dict_items_encoder = Self::array_encoder_from_type(&DataType::Utf8, data_size, false)?;
 
-                let bin_encoder =
-                    Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
-
-                if matches!(data_type, DataType::Utf8 | DataType::Binary) && data_size > 1024 * 1024
-                {
-                    Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+                    Ok(Box::new(DictionaryEncoder::new(
+                        dict_indices_encoder,
+                        dict_items_encoder,
+                    )))
                 } else {
-                    Ok(bin_encoder)
+                    let bin_indices_encoder =
+                        Self::array_encoder_from_type(&DataType::UInt64, data_size, false)?;
+                    let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8, data_size, false)?;
+
+                    Ok(Box::new(BinaryEncoder::new(
+                        bin_indices_encoder,
+                        bin_bytes_encoder,
+                    )))
                 }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
@@ -262,13 +272,54 @@ impl CoreArrayEncodingStrategy {
     }
 }
 
+fn get_dict_encoding_threshold() -> u64 {
+    env::var("LANCE_DICT_ENCODING_THRESHOLD")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(100)
+}
+
+// check whether we want to use dictionary encoding or not
+// by applying a threshold on cardinality
+// returns true if cardinality < threshold but false if the total number of rows is less than the threshold
+// The choice to use 100 is just a heuristic for now
+// hyperloglog is used for cardinality estimation
+// error rate = 1.04 / sqrt(2^p), where p is the precision
+// and error rate is 1.04 / sqrt(2^12) = 1.56%
+fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
+    let num_total_rows = arrays.iter().map(|arr| arr.len()).sum::<usize>();
+    if num_total_rows < threshold as usize {
+        return false;
+    }
+    const PRECISION: u8 = 12;
+
+    let mut hll: HyperLogLogPlus<String, RandomState> =
+        HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+
+    for arr in arrays {
+        let string_array = arrow_array::cast::as_string_array(arr);
+        for value in string_array.iter().flatten() {
+            hll.insert(value);
+            let estimated_cardinality = hll.count() as u64;
+            if estimated_cardinality >= threshold {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     fn create_array_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn ArrayEncoder>> {
         let data_size = arrays
             .iter()
             .map(|arr| arr.get_buffer_memory_size() as u64)
             .sum::<u64>();
-        Self::array_encoder_from_type(arrays[0].data_type(), data_size)
+        let data_type = arrays[0].data_type();
+        let use_dict_encoding = data_type == &DataType::Utf8
+            && check_dict_encoding(arrays, get_dict_encoding_threshold());
+        Self::array_encoder_from_type(data_type, data_size, use_dict_encoding)
     }
 }
 
@@ -567,4 +618,52 @@ pub async fn encode_batch(
         schema,
         num_rows: batch.num_rows() as u64,
     })
+}
+
+#[cfg(test)]
+pub mod tests {
+    use arrow_array::{ArrayRef, StringArray};
+    use std::sync::Arc;
+
+    use super::check_dict_encoding;
+
+    fn is_dict_encoding_applicable(arr: Vec<Option<&str>>, threshold: u64) -> bool {
+        let arr = StringArray::from(arr);
+        let arr = Arc::new(arr) as ArrayRef;
+        check_dict_encoding(&[arr], threshold)
+    }
+
+    #[test]
+    fn test_dict_encoding_should_be_applied_if_cardinality_less_than_threshold() {
+        assert!(is_dict_encoding_applicable(
+            vec![Some("a"), Some("b"), Some("a"), Some("b")],
+            3,
+        ));
+    }
+
+    #[test]
+    fn test_dict_encoding_should_not_be_applied_if_cardinality_larger_than_threshold() {
+        assert!(!is_dict_encoding_applicable(
+            vec![Some("a"), Some("b"), Some("c"), Some("d")],
+            3,
+        ));
+    }
+
+    #[test]
+    fn test_dict_encoding_should_not_be_applied_if_cardinality_equal_to_threshold() {
+        assert!(!is_dict_encoding_applicable(
+            vec![Some("a"), Some("b"), Some("c"), Some("a")],
+            3,
+        ));
+    }
+
+    #[test]
+    fn test_dict_encoding_should_not_be_applied_for_empty_arrays() {
+        assert!(!is_dict_encoding_applicable(vec![], 3));
+    }
+
+    #[test]
+    fn test_dict_encoding_should_not_be_applied_for_smaller_than_threshold_arrays() {
+        assert!(!is_dict_encoding_applicable(vec![Some("a"), Some("a")], 3));
+    }
 }

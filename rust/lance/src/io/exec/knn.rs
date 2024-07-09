@@ -306,7 +306,7 @@ pub fn new_knn_exec(
     let sub_index = ANNIvfSubIndexExec::try_new(
         Arc::new(ivf_node),
         dataset,
-        Arc::new(indices.to_vec()),
+        indices.to_vec(),
         query.clone(),
         prefilter_source,
     )?;
@@ -479,7 +479,7 @@ pub struct ANNIvfSubIndexExec {
 
     dataset: Arc<Dataset>,
 
-    indices: Arc<Vec<Index>>,
+    indices: Vec<Index>,
 
     /// Vector Query.
     query: Query,
@@ -495,7 +495,7 @@ impl ANNIvfSubIndexExec {
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
-        indices: Arc<Vec<Index>>,
+        indices: Vec<Index>,
         query: Query,
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {

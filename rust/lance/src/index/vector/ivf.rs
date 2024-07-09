@@ -24,6 +24,7 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
+use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
 use lance_file::{
@@ -57,13 +58,10 @@ use lance_io::{
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
+use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_linalg::{
     distance::Normalize,
     kernels::{normalize_arrow, normalize_fsl},
-};
-use lance_linalg::{
-    distance::{DistanceType, Dot, MetricType, L2},
-    MatrixView,
 };
 use log::info;
 use object_store::path::Path;
@@ -75,9 +73,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
-use self::io::write_hnsw_quantization_index_partitions;
-
-use super::builder::IvfIndexBuilder;
+use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
@@ -94,7 +90,7 @@ use crate::{
     session::Session,
 };
 
-mod builder;
+pub mod builder;
 mod io;
 pub mod v2;
 
@@ -109,6 +105,8 @@ pub struct IVFIndex {
 
     /// Index in each partition.
     sub_index: Arc<dyn VectorIndex>,
+
+    partition_locks: PartitionLoadLock,
 
     metric_type: MetricType,
 
@@ -143,6 +141,8 @@ impl IVFIndex {
                 location: location!(),
             });
         }
+
+        let num_partitions = ivf.num_partitions();
         Ok(Self {
             uuid: uuid.to_owned(),
             session: Arc::downgrade(&session),
@@ -150,6 +150,7 @@ impl IVFIndex {
             reader,
             sub_index,
             metric_type,
+            partition_locks: PartitionLoadLock::new(num_partitions),
         })
     }
 
@@ -174,32 +175,40 @@ impl IVFIndex {
         let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
             part_idx
         } else {
-            if partition_id >= self.ivf.num_partitions() {
-                return Err(Error::Index {
-                    message: format!(
-                        "partition id {} is out of range of {} partitions",
-                        partition_id,
-                        self.ivf.num_partitions()
-                    ),
-                    location: location!(),
-                });
-            }
+            let mtx = self.partition_locks.get_partition_mutex(partition_id);
+            let _guard = mtx.lock().await;
+            // check the cache again, as the partition may have been loaded by another
+            // thread that held the lock on loading the partition
+            if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
+                part_idx
+            } else {
+                if partition_id >= self.ivf.num_partitions() {
+                    return Err(Error::Index {
+                        message: format!(
+                            "partition id {} is out of range of {} partitions",
+                            partition_id,
+                            self.ivf.num_partitions()
+                        ),
+                        location: location!(),
+                    });
+                }
 
-            let range = self.ivf.row_range(partition_id);
-            let idx = self
-                .sub_index
-                .load_partition(
-                    self.reader.clone(),
-                    range.start,
-                    range.end - range.start,
-                    partition_id,
-                )
-                .await?;
-            let idx: Arc<dyn VectorIndex> = idx.into();
-            if write_cache {
-                session.index_cache.insert_vector(&cache_key, idx.clone());
+                let range = self.ivf.row_range(partition_id);
+                let idx = self
+                    .sub_index
+                    .load_partition(
+                        self.reader.clone(),
+                        range.start,
+                        range.end - range.start,
+                        partition_id,
+                    )
+                    .await?;
+                let idx: Arc<dyn VectorIndex> = idx.into();
+                if write_cache {
+                    session.index_cache.insert_vector(&cache_key, idx.clone());
+                }
+                idx
             }
-            idx
         };
         Ok(part_index)
     }
@@ -236,7 +245,7 @@ pub(crate) async fn optimize_vector_indices(
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
-    // Senity check the indices
+    // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::Index {
             message: "optimizing vector index: no existing index found".to_string(),
@@ -589,16 +598,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
         Quantizer::Product(pq) => {
-            let mat = MatrixView::<Float32Type>::new(
-                Arc::new(
-                    pq.codebook_as_fsl()
-                        .values()
-                        .as_primitive::<Float32Type>()
-                        .clone(),
-                ),
-                pq.dimension(),
-            );
-            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
             aux_writer
                 .object_writer
@@ -903,7 +903,7 @@ pub struct IvfPQIndexMetadata {
     pub(crate) ivf: IvfModel,
 
     /// Product Quantizer
-    pub(crate) pq: Arc<dyn ProductQuantizer>,
+    pub(crate) pq: ProductQuantizer,
 
     /// Transforms to be applied before search.
     transforms: Vec<pb::Transform>,
@@ -931,9 +931,9 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 )?)),
             },
             pb::VectorIndexStage {
-                stage: Some(pb::vector_index_stage::Stage::Pq(
-                    idx.pq.as_ref().try_into()?,
-                )),
+                stage: Some(pb::vector_index_stage::Stage::Pq(pb::Pq::try_from(
+                    &idx.pq,
+                )?)),
             },
         ]);
 
@@ -1044,7 +1044,7 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
 ///
 /// Visibility: pub(super) for testing
 #[instrument(level = "debug", skip_all, name = "build_ivf_model")]
-pub(super) async fn build_ivf_model(
+pub async fn build_ivf_model(
     dataset: &Dataset,
     column: &str,
     dim: usize,
@@ -1103,7 +1103,7 @@ async fn build_ivf_model_and_pq(
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
-) -> Result<(IvfModel, Arc<dyn ProductQuantizer>)> {
+) -> Result<(IvfModel, ProductQuantizer)> {
     sanity_check_params(ivf_params, pq_params)?;
 
     info!(
@@ -1154,7 +1154,11 @@ async fn load_precomputed_partitions_if_available(
     match &ivf_params.precomputed_partitons_file {
         Some(file) => {
             info!("Loading precomputed partitions from file: {}", file);
-            let ds = DatasetBuilder::from_uri(file).load().await?;
+            let mut builder = DatasetBuilder::from_uri(file);
+            if let Some(storage_options) = &ivf_params.storage_options {
+                builder = builder.with_storage_options(storage_options.clone());
+            }
+            let ds = builder.load().await?;
             let stream = ds.scan().try_into_stream().await?;
             Ok(Some(
                 load_precomputed_partitions(stream, ds.count_rows(None).await?).await?,
@@ -1362,7 +1366,7 @@ async fn write_ivf_pq_file(
     uuid: &str,
     transformers: &[Box<dyn Transformer>],
     mut ivf: IvfModel,
-    pq: Arc<dyn ProductQuantizer>,
+    pq: ProductQuantizer,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<HashMap<u64, u32>>,
@@ -1402,7 +1406,7 @@ async fn write_ivf_pq_file(
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),
         column: column.to_string(),
-        dimension: pq.dimension() as u32,
+        dimension: pq.dimension as u32,
         dataset_version: dataset.version().version,
         metric_type,
         ivf,
@@ -1486,16 +1490,7 @@ async fn write_ivf_hnsw_file(
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
         Quantizer::Product(pq) => {
-            let mat = MatrixView::<Float32Type>::new(
-                Arc::new(
-                    pq.codebook_as_fsl()
-                        .values()
-                        .as_primitive::<Float32Type>()
-                        .clone(),
-                ),
-                pq.dimension(),
-            );
-            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
             aux_writer
                 .object_writer
@@ -1632,6 +1627,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
+    use lance_linalg::MatrixView;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
@@ -1856,7 +1852,7 @@ mod tests {
         test_uri: &str,
         range: Range<f32>,
     ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range(1000 * DIM, range);
+        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
@@ -2654,7 +2650,7 @@ mod tests {
         // PQ code is on residual space
         pq_idx
             .pq
-            .codebook_as_fsl()
+            .codebook
             .values()
             .as_primitive::<Float32Type>()
             .values()
