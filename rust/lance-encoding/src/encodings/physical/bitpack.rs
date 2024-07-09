@@ -103,11 +103,7 @@ impl BufferEncoder for BitpackingBufferEncoder {
 fn count_items_to_pack(arrays: &[ArrayRef]) -> usize {
     let mut count = 0;
     for arr in arrays {
-        let data = arr.to_data();
-        let buffers = data.buffers();
-        for buffer in buffers {
-            count += buffer.len();
-        }
+        count += arr.len();
     }
 
     count
