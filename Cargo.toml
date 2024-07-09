@@ -110,6 +110,7 @@ deepsize = "0.2.0"
 either = "1.0"
 futures = "0.3"
 http = "0.2.9"
+hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.12"
 lazy_static = "1"
 log = "0.4"

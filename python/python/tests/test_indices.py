@@ -4,7 +4,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.indices import IndicesBuilder, IvfModel
+from lance.indices import IndicesBuilder, IvfModel, PqModel
 
 
 def gen_dataset(tmpdir, datatype=np.float32):
@@ -76,3 +76,23 @@ def test_num_partitions(tmpdir):
 
     ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16, num_partitions=10)
     assert ivf.num_partitions == 10
+
+
+@pytest.fixture
+def ds_with_ivf(tmpdir):
+    ds = gen_dataset(tmpdir)
+    ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16)
+    return ds, ivf
+
+
+def test_gen_pq(tmpdir, ds_with_ivf):
+    ds, ivf = ds_with_ivf
+
+    pq = IndicesBuilder(ds).train_pq("vectors", ivf, sample_rate=16)
+    assert pq.dimension == 128
+    assert pq.num_subvectors == 8
+
+    pq.save(str(tmpdir / "pq"))
+    reloaded = PqModel.load(str(tmpdir / "pq"))
+    assert pq.dimension == reloaded.dimension
+    assert pq.codebook == reloaded.codebook
