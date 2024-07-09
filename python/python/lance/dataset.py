@@ -1107,6 +1107,7 @@ class LanceDataset(pa.dataset.Dataset):
         older_than: Optional[timedelta] = None,
         *,
         delete_unverified: bool = False,
+        error_if_tagged_old_versions: bool = True,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -1135,11 +1136,19 @@ class LanceDataset(pa.dataset.Dataset):
             This should only be set to True if you can guarantee that no other process
             is currently working on this dataset.  Otherwise the dataset could be put
             into a corrupted state.
+
+        error_if_tagged_old_versions: bool, default True
+            Some versions may have tags associated with them. Tagged versions will
+            not be cleaned up, regardless of how old they are. If this argument is
+            set to `False`, untagged old versions will be cleaned, and tagged old
+            versions will be kept. If this argument is set to `True`, then no cleanup
+            will take place if an old version is tagged, and an exception will be
+            raised.
         """
         if older_than is None:
             older_than = timedelta(days=14)
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than), delete_unverified
+            td_to_micros(older_than), delete_unverified, error_if_tagged_old_versions
         )
 
     def tags(self) -> dict[str, int]:

@@ -927,12 +927,17 @@ impl Dataset {
         &self,
         older_than_micros: i64,
         delete_unverified: Option<bool>,
+        error_if_old_versions_tagged: Option<bool>,
     ) -> PyResult<CleanupStats> {
         let older_than = Duration::microseconds(older_than_micros);
         let cleanup_stats = RT
             .block_on(
                 None,
-                self.ds.cleanup_old_versions(older_than, delete_unverified),
+                self.ds.cleanup_old_versions(
+                    older_than,
+                    delete_unverified,
+                    error_if_old_versions_tagged,
+                ),
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {
