@@ -155,7 +155,7 @@ pub fn decoder_from_array_encoding(
             let inner =
                 decoder_from_array_encoding(fsst.binary.as_ref().unwrap(), buffers, data_type);
 
-            Box::new(FsstPageScheduler::new(inner, fsst.symbol_table.clone())
+            Box::new(FsstPageScheduler::new(inner, fsst.symbol_table.clone()))
         }
         pb::array_encoding::ArrayEncoding::Dictionary(dictionary) => {
             let indices_encoding = dictionary.indices.as_ref().unwrap();

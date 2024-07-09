@@ -247,8 +247,9 @@ impl CoreArrayEncodingStrategy {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
                     let dict_indices_encoder =
-                        Self::array_encoder_from_type(&DataType::UInt8, false)?;
-                    let dict_items_encoder = Self::array_encoder_from_type(&DataType::Utf8, data_size, false)?;
+                        Self::array_encoder_from_type(&DataType::UInt8, data_size, false)?;
+                    let dict_items_encoder =
+                        Self::array_encoder_from_type(&DataType::Utf8, data_size, false)?;
 
                     Ok(Box::new(DictionaryEncoder::new(
                         dict_indices_encoder,
@@ -257,12 +258,18 @@ impl CoreArrayEncodingStrategy {
                 } else {
                     let bin_indices_encoder =
                         Self::array_encoder_from_type(&DataType::UInt64, data_size, false)?;
-                    let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8, data_size, false)?;
+                    let bin_bytes_encoder =
+                        Self::array_encoder_from_type(&DataType::UInt8, data_size, false)?;
 
-                    Ok(Box::new(BinaryEncoder::new(
-                        bin_indices_encoder,
-                        bin_bytes_encoder,
-                    )))
+                    let bin_encoder =
+                        Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
+                    if matches!(data_type, DataType::Utf8 | DataType::Binary)
+                        && data_size > 4 * 1024 * 1024
+                    {
+                        Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+                    } else {
+                        Ok(bin_encoder)
+                    }
                 }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(

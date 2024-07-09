@@ -207,8 +207,8 @@ message ArrayEncoding {
         List list = 4;
         SimpleStruct struct = 5;
         Binary binary = 6;
-        Fsst fsst = 7;
         Dictionary dictionary = 7;
+        Fsst fsst = 8;
     }
 }
 
