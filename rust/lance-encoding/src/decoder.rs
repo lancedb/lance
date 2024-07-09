@@ -637,6 +637,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     file_buffers: buffers,
                     positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
                 };
+                let item_field_name = items_field.name().clone();
                 let (chain, items_scheduler) = chain.new_child(
                     /*child_idx=*/ 0,
                     &field.children[0],
@@ -688,6 +689,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     Ok(Arc::new(ListFieldScheduler::new(
                         inner,
                         items_scheduler,
+                        item_field_name.clone(),
                         items_type,
                         offset_type,
                         null_offset_adjustments,
