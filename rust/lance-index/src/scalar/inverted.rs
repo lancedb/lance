@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::array::{AsArray, ListBuilder, UInt64Builder};
@@ -15,6 +16,7 @@ use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result, ROW_ID};
+use lazy_static::lazy_static;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tantivy::tokenizer::TokenFilter;
@@ -24,14 +26,25 @@ use crate::Index;
 
 use super::{AnyQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex};
 
-const TOKENS_FILE: &str = "tokens.lance";
-const INVERT_LIST_FILE: &str = "invert.lance";
-const DOCS_FILE: &str = "docs.lance";
+pub const TOKENS_FILE: &str = "tokens.lance";
+pub const INVERT_LIST_FILE: &str = "invert.lance";
+pub const DOCS_FILE: &str = "docs.lance";
 
 const TOKEN_COL: &str = "_token";
 const TOKEN_ID_COL: &str = "_token_id";
 const FREQUENCY_COL: &str = "_frequency";
 const NUM_TOKEN_COL: &str = "_num_tokens";
+
+lazy_static! {
+    pub static ref TOKENIZER: tantivy::tokenizer::TextAnalyzer = {
+        let stopword_filter =
+            tantivy::tokenizer::StopWordFilter::new(tantivy::tokenizer::Language::English).unwrap();
+        tantivy::tokenizer::TextAnalyzer::builder(
+            stopword_filter.transform(tantivy::tokenizer::SimpleTokenizer::default()),
+        )
+        .build()
+    };
+}
 
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct InvertedIndex {
@@ -41,6 +54,10 @@ pub struct InvertedIndex {
 }
 
 impl InvertedIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     // map tokens to token ids
     // ignore tokens that are not in the index cause they won't contribute to the search
     fn map(&self, texts: &[String]) -> Vec<u32> {
@@ -125,8 +142,9 @@ impl ScalarIndex for InvertedIndex {
     async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
-            SargableQuery::FullTextSearch(tokens) => {
-                let token_ids = self.map(tokens);
+            SargableQuery::FullTextSearch(query) => {
+                let tokens = collect_tokens(query);
+                let token_ids = self.map(&tokens);
                 self.bm25_search(token_ids)
                     .into_iter()
                     .map(|(row_id, _)| row_id)
@@ -179,12 +197,8 @@ impl ScalarIndex for InvertedIndex {
         let mut token_set = self.tokens.clone();
         let mut invert_list = self.invert_list.clone();
         let mut docs = self.docs.clone();
-        let stopword_filter =
-            tantivy::tokenizer::StopWordFilter::new(tantivy::tokenizer::Language::English).unwrap();
-        let mut tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
-            stopword_filter.transform(tantivy::tokenizer::SimpleTokenizer::default()),
-        )
-        .build();
+
+        let mut tokenizer = TOKENIZER.clone();
         let mut stream = new_data.peekable();
         while let Some(batch) = stream.try_next().await? {
             let doc_col = batch.column(0).as_string::<i64>();
@@ -501,6 +515,39 @@ impl DocSet {
     }
 }
 
+pub fn flat_full_text_search(
+    batches: &[&RecordBatch],
+    doc_col: &str,
+    query: &str,
+) -> Result<Vec<u64>> {
+    let mut results = Vec::new();
+    let query_tokens = collect_tokens(query).into_iter().collect::<HashSet<_>>();
+    for batch in batches {
+        let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let doc_array = batch[doc_col].as_string::<i64>();
+        for i in 0..row_id_array.len() {
+            let doc = doc_array.value(i);
+            let doc_tokens = collect_tokens(doc);
+            if doc_tokens.iter().any(|token| query_tokens.contains(token)) {
+                results.push(row_id_array.value(i));
+                assert!(doc.contains(query));
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn collect_tokens(text: &str) -> Vec<String> {
+    let mut tokenizer = TOKENIZER.clone();
+    let mut stream = tokenizer.token_stream(text);
+    let mut tokens = Vec::new();
+    while let Some(token) = stream.next() {
+        tokens.push(token.text.to_owned());
+    }
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -550,9 +597,7 @@ mod tests {
 
         let invert_index = super::InvertedIndex::load(Arc::new(store)).await.unwrap();
         let row_ids = invert_index
-            .search(&super::SargableQuery::FullTextSearch(vec![
-                "lance".to_string()
-            ]))
+            .search(&super::SargableQuery::FullTextSearch("lance".to_owned()))
             .await
             .unwrap();
         assert_eq!(row_ids.len(), Some(3));
@@ -561,9 +606,7 @@ mod tests {
         assert!(row_ids.contains(2));
 
         let row_ids = invert_index
-            .search(&super::SargableQuery::FullTextSearch(vec![
-                "database".to_string()
-            ]))
+            .search(&super::SargableQuery::FullTextSearch("database".to_owned()))
             .await
             .unwrap();
         assert_eq!(row_ids.len(), Some(3));

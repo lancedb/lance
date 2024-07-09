@@ -31,8 +31,10 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
+use lance_core::datatypes::Field;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
+use lance_index::scalar::ScalarQuery;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -137,6 +139,9 @@ pub struct Scanner {
     /// Optional filter expression.
     pub(crate) filter: Option<Expr>,
 
+    /// Optional full text search query
+    full_text_query: Option<(Field, String)>,
+
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
 
@@ -206,6 +211,7 @@ impl Scanner {
             requested_output_expr: None,
             prefilter: false,
             filter: None,
+            full_text_query: None,
             batch_size: None,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
             fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
@@ -352,6 +358,15 @@ impl Scanner {
         let planner = Planner::new(schema);
         self.filter = Some(planner.parse_filter(filter)?);
         self.filter = Some(planner.optimize_expr(self.filter.take().unwrap())?);
+        Ok(self)
+    }
+
+    pub fn full_text_search(&mut self, column: &str, query: &str) -> Result<&mut Self> {
+        let column = self.dataset.schema().field(column).ok_or(Error::io(
+            format!("Column {} not found", column),
+            location!(),
+        ))?;
+        self.full_text_query = Some((column.to_owned(), query.to_owned()));
         Ok(self)
     }
 
@@ -882,6 +897,20 @@ impl Scanner {
         } else {
             FilterPlan::default()
         };
+
+        if let Some((field, query)) = &self.full_text_query {
+            let full_text_search_index_expr = ScalarIndexExpr::Query(
+                field.name.clone(),
+                ScalarQuery::FullTextSearch(query.clone()),
+            );
+            let scalar_index_query = match filter_plan.index_query {
+                Some(index_expr) => {
+                    ScalarIndexExpr::And(index_expr.into(), full_text_search_index_expr.into())
+                }
+                None => full_text_search_index_expr,
+            };
+            filter_plan.index_query = Some(scalar_index_query);
+        }
 
         // Stage 1: source (either an (K|A)NN search or a (full|indexed) scan)
         let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {

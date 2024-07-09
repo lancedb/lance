@@ -584,3 +584,68 @@ impl ExecutionPlan for MaterializeIndexExec {
         &self.properties
     }
 }
+
+// #[derive(Debug)]
+// pub struct FtsExec {
+//     dataset: Arc<Dataset>,
+//     index: Arc<InvertedIndex>,
+//     query: ScalarQuery,
+//     properties: PlanProperties,
+// }
+
+// impl DisplayAs for FtsExec {
+//     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+//         match t {
+//             DisplayFormatType::Default | DisplayFormatType::Verbose => {
+//                 write!(f, "Fts: query={:?}", self.query)
+//             }
+//         }
+//     }
+// }
+
+// impl ExecutionPlan for FtsExec {
+//     fn as_any(&self) -> &dyn std::any::Any {
+//         self
+//     }
+
+//     fn schema(&self) -> SchemaRef {
+//         SCALAR_INDEX_SCHEMA.clone()
+//     }
+
+//     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+//         vec![]
+//     }
+
+//     fn with_new_children(
+//         self: Arc<Self>,
+//         _children: Vec<Arc<dyn ExecutionPlan>>,
+//     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+//         todo!()
+//     }
+
+//     fn execute(
+//         &self,
+//         _partition: usize,
+//         _context: Arc<datafusion::execution::context::TaskContext>,
+//     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+//        self.index.search(query).map(|row_ids| {
+
+//        })
+//         let stream = futures::stream::iter(vec![batch_fut])
+//             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
+//             .boxed()
+//             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
+//         Ok(Box::pin(RecordBatchStreamAdapter::new(
+//             SCALAR_INDEX_SCHEMA.clone(),
+//             stream,
+//         )))
+//     }
+
+//     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
+//         Ok(Statistics::new_unknown(&SCALAR_INDEX_SCHEMA))
+//     }
+
+//     fn properties(&self) -> &PlanProperties {
+//         &self.properties
+//     }
+// }

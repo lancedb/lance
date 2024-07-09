@@ -65,9 +65,9 @@ fn bench_inverted(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             black_box(
                 invert_index
-                    .search(&SargableQuery::FullTextSearch(vec![tokens
-                        [rand::random::<usize>() % tokens.len()]
-                    .to_owned()]))
+                    .search(&SargableQuery::FullTextSearch(
+                        tokens[rand::random::<usize>() % tokens.len()].to_owned(),
+                    ))
                     .await
                     .unwrap(),
             );

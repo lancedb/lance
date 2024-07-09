@@ -116,7 +116,7 @@ pub enum SargableQuery {
     /// Retrieve all row ids where the value is exactly the given value
     Equals(ScalarValue),
     /// Retrieve all row ids where the value matches the given full text search query
-    FullTextSearch(Vec<String>),
+    FullTextSearch(String),
     /// Retrieve all row ids where the value is null
     IsNull(),
 }
@@ -158,8 +158,8 @@ impl AnyQuery for SargableQuery {
                         .join(",")
                 )
             }
-            Self::FullTextSearch(values) => {
-                format!("{} LIKE '{}'", col, values.join("|"))
+            Self::FullTextSearch(query) => {
+                format!("{} LIKE '{}'", col, query)
             }
             Self::IsNull() => {
                 format!("{} IS NULL", col)
@@ -208,8 +208,8 @@ impl AnyQuery for SargableQuery {
                     .collect::<Vec<_>>(),
                 false,
             ),
-            Self::FullTextSearch(values) => {
-                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(values.join("|")))))
+            Self::FullTextSearch(value) => {
+                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(value.clone()))))
             }
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
