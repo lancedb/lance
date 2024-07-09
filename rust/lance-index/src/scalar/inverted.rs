@@ -51,6 +51,7 @@ impl InvertedIndex {
 
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
+    // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     fn bm25_search(&self, token_ids: Vec<u32>) -> Vec<(u64, f32)> {
         const K1: f32 = 1.2;
         const B: f32 = 0.75;
@@ -284,14 +285,12 @@ impl TokenSet {
             let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
             let frequency_col = batch[FREQUENCY_COL].as_primitive::<datatypes::UInt64Type>();
 
-            for ((token, token_id), frequency) in token_col
+            for ((token, &token_id), &frequency) in token_col
                 .iter()
-                .zip(token_id_col.iter())
-                .zip(frequency_col.iter())
+                .zip(token_id_col.values().iter())
+                .zip(frequency_col.values().iter())
             {
                 let token = token.unwrap();
-                let token_id = token_id.unwrap();
-                let frequency = frequency.unwrap();
                 tokens.insert(token.to_owned(), (token_id, frequency));
                 next_id = next_id.max(token_id + 1);
             }
@@ -393,12 +392,12 @@ impl InvertedList {
             let row_ids_col = batch[ROW_ID].as_list::<i32>();
             let frequencies_col = batch[FREQUENCY_COL].as_list::<i32>();
 
-            for ((token_id, row_ids), frequencies) in token_col
+            for ((&token_id, row_ids), frequencies) in token_col
+                .values()
                 .iter()
                 .zip(row_ids_col.iter())
                 .zip(frequencies_col.iter())
             {
-                let token_id = token_id.unwrap();
                 let row_ids = row_ids.unwrap();
                 let frequencies = frequencies.unwrap();
                 let row_ids = row_ids.as_primitive::<UInt64Type>().values();
@@ -478,9 +477,11 @@ impl DocSet {
             let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
             let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
 
-            for (row_id, num_tokens) in row_id_col.iter().zip(num_tokens_col.iter()) {
-                let row_id = row_id.unwrap();
-                let num_tokens = num_tokens.unwrap();
+            for (&row_id, &num_tokens) in row_id_col
+                .values()
+                .iter()
+                .zip(num_tokens_col.values().iter())
+            {
                 token_count.insert(row_id, num_tokens);
                 total_tokens += num_tokens as u64;
             }
