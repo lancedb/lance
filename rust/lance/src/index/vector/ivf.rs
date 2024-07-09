@@ -1154,7 +1154,11 @@ async fn load_precomputed_partitions_if_available(
     match &ivf_params.precomputed_partitons_file {
         Some(file) => {
             info!("Loading precomputed partitions from file: {}", file);
-            let ds = DatasetBuilder::from_uri(file).load().await?;
+            let mut builder = DatasetBuilder::from_uri(file);
+            if let Some(storage_options) = &ivf_params.storage_options {
+                builder = builder.with_storage_options(storage_options.clone());
+            }
+            let ds = builder.load().await?;
             let stream = ds.scan().try_into_stream().await?;
             Ok(Some(
                 load_precomputed_partitions(stream, ds.count_rows(None).await?).await?,

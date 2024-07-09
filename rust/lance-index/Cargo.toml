@@ -49,10 +49,12 @@ rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
+tantivy.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
 crossbeam-queue.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 approx.workspace = true

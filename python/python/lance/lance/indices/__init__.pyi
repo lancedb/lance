@@ -23,3 +23,13 @@ def train_ivf_model(
     sample_rate: int,
     max_iters: int,
 ) -> pa.Array: ...
+def train_pq_model(
+    dataset,
+    column: str,
+    dimension: int,
+    num_subvectors: int,
+    distance_type: str,
+    sample_rate: int,
+    max_iters: int,
+    ivf_model: pa.Array,
+) -> pa.Array: ...

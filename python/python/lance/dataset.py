@@ -243,6 +243,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        fast_search: bool = False,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -295,6 +296,9 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        fast_search:  bool, default False
+            If True, then the search will only be performed on the indexed data, which
+            yields faster search time.
 
         Notes
         -----
@@ -331,6 +335,7 @@ class LanceDataset(pa.dataset.Dataset):
             .with_fragments(fragments)
             .with_row_id(with_row_id)
             .use_stats(use_stats)
+            .fast_search(fast_search)
         )
         if nearest is not None:
             builder = builder.nearest(**nearest)
@@ -1098,7 +1103,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_scalar_index(
         self,
         column: str,
-        index_type: Literal["BTREE"],
+        index_type: Union[Literal["BTREE"], Literal["BITMAP"]],
         name: Optional[str] = None,
         *,
         replace: bool = True,
@@ -1154,9 +1159,15 @@ class LanceDataset(pa.dataset.Dataset):
         that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
         ``MaterializeIndex`` operator.
 
-        Currently, the only type of scalar index available is ``BTREE``. This index
-        combines is inspired by the btree data structure although only the first few
-        layers of the btree are cached in memory.
+        There are two types of scalar indices available today.  The most common
+        type is ``BTREE``. This index is inspired by the btree data structure
+        although only the first few layers of the btree are cached in memory.  It iwll
+        perform well on columns with a large number of unique values and few rows per
+        value.
+
+        The other index type is ``BITMAP``.  This index stores a bitmap for each unique
+        value in the column.  This index is useful for columns with a small number of
+        unique values and many rows per value.
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
@@ -1170,7 +1181,7 @@ class LanceDataset(pa.dataset.Dataset):
             The column to be indexed.  Must be a boolean, integer, float,
             or string column.
         index_type : str
-            The type of the index.  Only ``"BTREE"`` is supported now.
+            The type of the index.  One of ``"BTREE"`` or ``"BITMAP"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1221,12 +1232,10 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         index_type = index_type.upper()
-        if index_type != "BTREE":
+        if index_type not in ["BTREE", "BITMAP"]:
             raise NotImplementedError(
-                (
-                    'Only "BTREE" is supported for ',
-                    f"index_type.  Received {index_type}",
-                )
+                'Only "BTREE" or "BITMAP" are supported for ',
+                f"scalar columns.  Received {index_type}",
             )
 
         self._ds.create_index([column], index_type, name, replace)
@@ -1253,6 +1262,7 @@ class LanceDataset(pa.dataset.Dataset):
         # experimental parameters
         ivf_centroids_file: Optional[str] = None,
         precomputed_partiton_dataset: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1306,6 +1316,9 @@ class LanceDataset(pa.dataset.Dataset):
 
             By making this value smaller, this shuffle will consume less memory but will
             take longer to complete, and vice versa.
+        storage_options : optional, dict
+            Extra options that make sense for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1463,7 +1476,9 @@ class LanceDataset(pa.dataset.Dataset):
                     " precomputed_partiton_dataset is provided"
                 )
             if precomputed_partiton_dataset is not None:
-                precomputed_ds = LanceDataset(precomputed_partiton_dataset)
+                precomputed_ds = LanceDataset(
+                    precomputed_partiton_dataset, storage_options=storage_options
+                )
                 if len(precomputed_ds.get_fragments()) != 1:
                     raise ValueError(
                         "precomputed_partiton_dataset must have only one fragment"
@@ -1566,7 +1581,9 @@ class LanceDataset(pa.dataset.Dataset):
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
-        self._ds.create_index(column, index_type, name, replace, kwargs)
+        self._ds.create_index(
+            column, index_type, name, replace, storage_options, kwargs
+        )
         return self
 
     def session(self) -> Session:
@@ -2010,6 +2027,7 @@ class ScannerBuilder:
         self._fragments = None
         self._with_row_id = False
         self._use_stats = True
+        self._fast_search = None
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -2185,6 +2203,15 @@ class ScannerBuilder:
         }
         return self
 
+    def fast_search(self, flag: bool) -> ScannerBuilder:
+        """Enable fast search, which only perform search on the indexed data.
+
+        Users can use `Table::optimize()` or `create_index()` to include the new data
+        into index, thus make new data searchable.
+        """
+        self.fast_search = flag
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -2202,6 +2229,7 @@ class ScannerBuilder:
             self._with_row_id,
             self._use_stats,
             self._substrait_filter,
+            self._fast_search,
         )
         return LanceScanner(scanner, self.ds)
 
