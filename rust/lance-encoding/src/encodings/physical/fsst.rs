@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::{cast::AsArray, Array, BinaryArray};
@@ -87,7 +90,7 @@ impl PrimitivePageDecoder for FsstPageDecoder {
 
         // Need to adjust offsets to account for symbol table
         // TODO: Don't do this with a copy
-        /* 
+        /*
         let mut compressed_offsets = Vec::with_capacity(offsets.len());
         compressed_offsets.extend(
             offsets
@@ -97,19 +100,18 @@ impl PrimitivePageDecoder for FsstPageDecoder {
         */
 
         // Need to insert symbol table back in front of compressed bytes
-        /* 
+        /*
         let mut compressed_bytes = Vec::with_capacity(self.symbol_table.len() + bytes.len());
         compressed_bytes.extend_from_slice(&self.symbol_table);
         compressed_bytes.extend_from_slice(&bytes);
         */
 
         let mut decompressed_offsets = vec![0_i32; offsets.len()];
-        let mut decompressed_bytes = vec![0_u8; bytes.len() * 5];
+        let mut decompressed_bytes = vec![0_u8; bytes.len() * 3];
         // Safety: Exposes uninitialized memory but we're about to clobber it
         unsafe {
             decompressed_bytes.set_len(decompressed_bytes.capacity());
         }
-        //println!("inside fsst page decoder");
         fsst::fsst::decompress3(
             &self.symbol_table,
             &bytes,
@@ -117,7 +119,6 @@ impl PrimitivePageDecoder for FsstPageDecoder {
             &mut decompressed_bytes,
             &mut decompressed_offsets,
         )?;
-        //println!("first string: {:?}", std::str::from_utf8(&decompressed_bytes[decompressed_offsets[0] as usize ..decompressed_offsets[1] as usize].to_vec()));
 
         // TODO: Change PrimitivePageDecoder to use Vec instead of BytesMut
         // since there is no way to get BytesMut from Vec but these copies should be avoidable
@@ -184,11 +185,6 @@ impl ArrayEncoder for FsstArrayEncoder {
             &mut dest_offsets,
             &mut symbol_table,
         )?;
-        //println!("fsst header after encoding: {:?}", symbol_table[0..8].to_vec());
-        /* 
-        let symbol_table_num_bytes = dest_offsets[0] as usize;
-        let symbol_table = dest_values[0..symbol_table_num_bytes].to_vec();
-        */
 
         let dest_array = Arc::new(BinaryArray::new(
             OffsetBuffer::new(ScalarBuffer::from(dest_offsets)),
@@ -214,43 +210,9 @@ impl ArrayEncoder for FsstArrayEncoder {
 #[cfg(test)]
 mod tests {
 
-    use arrow_schema::DataType;
     use lance_datagen::{ByteCount, RowCount};
 
-    use crate::{
-        encoder::ArrayEncoder,
-        encodings::physical::{
-            basic::BasicEncoder,
-            binary::BinaryEncoder,
-            value::{CompressionScheme, ValueEncoder},
-        }, testing::{check_round_trip_encoding_of_data, TestCases},
-    };
-
-    use super::FsstArrayEncoder;
-
-    #[test]
-    fn test_encode() {
-        let indices_encoder = Box::new(BasicEncoder::new(Box::new(
-            ValueEncoder::try_new(&DataType::UInt64, CompressionScheme::None).unwrap(),
-        )));
-        let bytes_encoder = Box::new(BasicEncoder::new(Box::new(
-            ValueEncoder::try_new(&DataType::UInt8, CompressionScheme::None).unwrap(),
-        )));
-        let string_encoder = Box::new(BinaryEncoder::new(indices_encoder, bytes_encoder));
-        let encoder = FsstArrayEncoder::new(string_encoder);
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(16), false))
-            .into_batch_rows(RowCount::from(10000))
-            .unwrap()
-            .column(0)
-            .clone();
-        let mut buf_index = 0;
-
-        let encoded = encoder.encode(&[arr], &mut buf_index).unwrap();
-
-        dbg!(encoded);
-    }
+    use crate::testing::{check_round_trip_encoding_of_data, TestCases};
 
     #[test_log::test(tokio::test)]
     async fn test_fsst() {
@@ -262,5 +224,4 @@ mod tests {
             .clone();
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default()).await;
     }
-
 }
