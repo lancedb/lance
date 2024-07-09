@@ -67,7 +67,15 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
 }
 
-/// A query that a scalar index can satisfy
+pub trait ScalarQueryType {
+    fn as_any(&self) -> &dyn Any;
+    fn unparse(query: &dyn ScalarQueryType) -> Expr;
+    fn parse(expr: Expr) -> Result<Self>
+    where
+        Self: Sized;
+}
+
+/// A query that a basic scalar index (e.g. btree / bitmap) can satisfy
 ///
 /// This is a subset of expression operators that is often referred to as the
 /// "sargable" operators
@@ -77,7 +85,7 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 /// you can grab all rows where the value = 7 and then do an inverted take (or use
 /// a block list instead of an allow list for prefiltering)
 #[derive(Debug, Clone, PartialEq)]
-pub enum ScalarQuery {
+pub enum SargableQuery {
     /// Retrieve all row ids where the value is in the given [min, max) range
     Range(Bound<ScalarValue>, Bound<ScalarValue>),
     /// Retrieve all row ids where the value is in the given set of values
@@ -90,7 +98,7 @@ pub enum ScalarQuery {
     IsNull(),
 }
 
-impl ScalarQuery {
+impl SargableQuery {
     pub fn to_expr(&self, col: String) -> Expr {
         let col_expr = Expr::Column(Column::new_unqualified(col));
         match self {
@@ -182,13 +190,21 @@ impl ScalarQuery {
     }
 }
 
+/// A query that a basic scalar index on a List<T> column can satisfy
+pub enum TagQuery {
+    /// Retrieve all row ids where every tag is in the list of values for the row
+    HasAllTags(Vec<ScalarValue>),
+    /// Retrieve all row ids where at least one of the given tags is in the list of values for the row
+    HasOneTag(Vec<ScalarValue>),
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not neccesarily ordered
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array>;
+    async fn search(&self, query: &SargableQuery) -> Result<UInt64Array>;
 
     /// Load the scalar index from storage
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>

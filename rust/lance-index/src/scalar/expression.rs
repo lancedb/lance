@@ -17,7 +17,7 @@ use lance_core::{
 use lance_datafusion::expr::safe_coerce_scalar;
 use tracing::instrument;
 
-use super::{ScalarIndex, ScalarQuery};
+use super::{ScalarIndex, ScalarQueryType};
 
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
@@ -47,14 +47,14 @@ use super::{ScalarIndex, ScalarQuery};
 /// When an operation cannot be performed we fallback to the original expression-only
 /// representation
 #[derive(Debug, PartialEq)]
-pub struct IndexedExpression {
+pub struct IndexedExpression<T: ScalarQueryType> {
     /// The portion of the query that can be satisfied by scalar indices
-    pub scalar_query: Option<ScalarIndexExpr>,
+    pub scalar_query: Option<ScalarIndexExpr<T>>,
     /// The portion of the query that cannot be satisfied by scalar indices
     pub refine_expr: Option<Expr>,
 }
 
-impl IndexedExpression {
+impl<T: ScalarQueryType> IndexedExpression<T> {
     /// Create an expression that only does refine
     fn refine_only(refine_expr: Expr) -> Self {
         Self {
@@ -64,7 +64,7 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query
-    fn index_query(column: String, query: ScalarQuery) -> Self {
+    fn index_query(column: String, query: T) -> Self {
         Self {
             scalar_query: Some(ScalarIndexExpr::Query(column, query)),
             refine_expr: None,
@@ -189,14 +189,14 @@ pub trait ScalarIndexLoader: Send + Sync {
 /// This is a tree of operations beacause we may need to logically combine or
 /// modify the results of scalar lookups
 #[derive(Debug, Clone, PartialEq)]
-pub enum ScalarIndexExpr {
-    Not(Box<ScalarIndexExpr>),
-    And(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
-    Or(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
-    Query(String, ScalarQuery),
+pub enum ScalarIndexExpr<T: ScalarQueryType> {
+    Not(Box<ScalarIndexExpr<T>>),
+    And(Box<ScalarIndexExpr<T>>, Box<ScalarIndexExpr<T>>),
+    Or(Box<ScalarIndexExpr<T>>, Box<ScalarIndexExpr<T>>),
+    Query(String, T),
 }
 
-impl std::fmt::Display for ScalarIndexExpr {
+impl<T: ScalarQueryType> std::fmt::Display for ScalarIndexExpr<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Not(inner) => write!(f, "NOT({})", inner),
@@ -207,7 +207,7 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-impl ScalarIndexExpr {
+impl<T: ScalarQueryType> ScalarIndexExpr<T> {
     /// Evaluates the scalar index expression
     ///
     /// This will result in loading one or more scalar indices and searching them
