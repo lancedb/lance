@@ -739,9 +739,16 @@ impl Dataset {
         &self,
         older_than: Duration,
         delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<Result<RemovalStats>> {
         let before = utc_now() - older_than;
-        cleanup::cleanup_old_versions(self, before, delete_unverified).boxed()
+        cleanup::cleanup_old_versions(
+            self,
+            before,
+            delete_unverified,
+            error_if_tagged_old_versions,
+        )
+        .boxed()
     }
 
     /// Commit changes to the dataset
