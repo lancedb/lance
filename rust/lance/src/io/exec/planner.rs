@@ -1422,4 +1422,21 @@ mod tests {
         let columns = Planner::column_names_in_expr(&expr);
         assert_eq!(columns, vec!["s0", "st.s1", "st.st.s2"]);
     }
+
+    #[test]
+    fn test_parse_binary_expr() {
+        let bin_str = "x'616263'";
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "binary",
+            DataType::Binary,
+            true,
+        )]));
+        let planner = Planner::new(schema);
+        let expr = planner.parse_expr(bin_str).unwrap();
+        assert_eq!(
+            expr,
+            Expr::Literal(ScalarValue::Binary(Some(vec![b'a', b'b', b'c'])))
+        );
+    }
 }
