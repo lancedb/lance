@@ -33,6 +33,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
+use scalar::ScalarIndexParams;
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -201,7 +202,14 @@ impl DatasetIndexExt for Dataset {
         let index_id = Uuid::new_v4();
         match (index_type, params.index_name()) {
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
-                build_scalar_index(self, column, &index_id.to_string()).await?;
+                let params = params
+                    .as_any()
+                    .downcast_ref::<ScalarIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Scalar index type must take a ScalarIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+                build_scalar_index(self, column, &index_id.to_string(), params).await?;
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
