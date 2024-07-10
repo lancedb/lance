@@ -41,7 +41,8 @@ use snafu::{location, Location};
 use crate::{Index, IndexType};
 
 use super::{
-    flat::FlatIndexMetadata, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,
+    flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, SargableQuery,
+    ScalarIndex,
 };
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
@@ -672,7 +673,7 @@ impl BTreeIndex {
 
     async fn search_page(
         &self,
-        query: &ScalarQuery,
+        query: &SargableQuery,
         page_number: u32,
         index_reader: Arc<dyn IndexReader>,
     ) -> Result<UInt64Array> {
@@ -835,22 +836,23 @@ impl Index for BTreeIndex {
 
 #[async_trait]
 impl ScalarIndex for BTreeIndex {
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array> {
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let pages = match query {
-            ScalarQuery::Equals(val) => self
+            SargableQuery::Equals(val) => self
                 .page_lookup
                 .pages_eq(&OrderableScalarValue(val.clone())),
-            ScalarQuery::Range(start, end) => self
+            SargableQuery::Range(start, end) => self
                 .page_lookup
                 .pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref())),
-            ScalarQuery::IsIn(values) => self
+            SargableQuery::IsIn(values) => self
                 .page_lookup
                 .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
-            ScalarQuery::FullTextSearch(_) => return Err(Error::invalid_input(
+            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
                 "full text search is not supported for BTree index, build a inverted index for it",
                 location!(),
             )),
-            ScalarQuery::IsNull() => self.page_lookup.pages_null(),
+            SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let page_tasks = pages

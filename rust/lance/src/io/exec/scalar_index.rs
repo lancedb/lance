@@ -26,7 +26,7 @@ use lance_core::{
 use lance_index::{
     scalar::{
         expression::{ScalarIndexExpr, ScalarIndexLoader},
-        ScalarIndex, ScalarQuery,
+        SargableQuery, ScalarIndex,
     },
     DatasetIndexExt,
 };
@@ -205,7 +205,10 @@ impl MapIndexExec {
         let index_vals = (0..index_vals.len())
             .map(|idx| ScalarValue::try_from_array(index_vals, idx))
             .collect::<datafusion::error::Result<Vec<_>>>()?;
-        let query = ScalarIndexExpr::Query(column_name.clone(), ScalarQuery::IsIn(index_vals));
+        let query = ScalarIndexExpr::Query(
+            column_name.clone(),
+            Arc::new(SargableQuery::IsIn(index_vals)),
+        );
         let mut row_addresses = query.evaluate(dataset.as_ref()).await?;
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {

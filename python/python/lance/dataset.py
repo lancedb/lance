@@ -1103,7 +1103,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_scalar_index(
         self,
         column: str,
-        index_type: Union[Literal["BTREE"], Literal["BITMAP"]],
+        index_type: Union[Literal["BTREE"], Literal["BITMAP"], Literal["TAG"]],
         name: Optional[str] = None,
         *,
         replace: bool = True,
@@ -1159,15 +1159,21 @@ class LanceDataset(pa.dataset.Dataset):
         that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
         ``MaterializeIndex`` operator.
 
-        There are two types of scalar indices available today.  The most common
+        There are three types of scalar indices available today.  The most common
         type is ``BTREE``. This index is inspired by the btree data structure
         although only the first few layers of the btree are cached in memory.  It iwll
         perform well on columns with a large number of unique values and few rows per
         value.
 
-        The other index type is ``BITMAP``.  This index stores a bitmap for each unique
-        value in the column.  This index is useful for columns with a small number of
-        unique values and many rows per value.
+        The other common index type is ``BITMAP``.  This index stores a bitmap for each
+        unique value in the column.  This index is useful for columns with a small
+        number of unique values and many rows per value.
+
+        The ``TAG`` index type is a special index that is used to index list columns
+        whose values have small cardinality.  For example, a column that contains
+        lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed with a
+        ``TAG`` index.  This index can only speedup queries with ``array_has_any``
+        or ``array_has_all`` filters.
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
@@ -1213,29 +1219,35 @@ class LanceDataset(pa.dataset.Dataset):
         if column not in self.schema.names:
             raise KeyError(f"{column} not found in schema")
 
-        field = self.schema.field(column)
-        if (
-            not pa.types.is_integer(field.type)
-            and not pa.types.is_floating(field.type)
-            and not pa.types.is_boolean(field.type)
-            and not pa.types.is_string(field.type)
-            and not pa.types.is_temporal(field.type)
-        ):
-            raise TypeError(
-                f"Scalar index column {column} must be int",
-                ", float, bool, str, or temporal",
+        index_type = index_type.upper()
+        if index_type not in ["BTREE", "BITMAP", "TAG"]:
+            raise NotImplementedError(
+                (
+                    'Only "BTREE", "TAG", or "BITMAP" are supported for '
+                    f"scalar columns.  Received {index_type}",
+                )
             )
+
+        field = self.schema.field(column)
+        if index_type in ["BTREE", "BITMAP"]:
+            if (
+                not pa.types.is_integer(field.type)
+                and not pa.types.is_floating(field.type)
+                and not pa.types.is_boolean(field.type)
+                and not pa.types.is_string(field.type)
+                and not pa.types.is_temporal(field.type)
+            ):
+                raise TypeError(
+                    f"BTREE/BITMAP index column {column} must be int",
+                    ", float, bool, str, or temporal",
+                )
+        elif index_type == "TAG":
+            if not pa.types.is_list(field.type):
+                raise TypeError(f"TAG index column {column} must be a list")
 
         if pa.types.is_duration(field.type):
             raise TypeError(
                 f"Scalar index column {column} cannot currently be a duration"
-            )
-
-        index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP"]:
-            raise NotImplementedError(
-                'Only "BTREE" or "BITMAP" are supported for ',
-                f"scalar columns.  Received {index_type}",
             )
 
         self._ds.create_index([column], index_type, name, replace)

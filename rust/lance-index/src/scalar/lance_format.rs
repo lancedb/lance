@@ -161,10 +161,12 @@ mod tests {
         bitmap::{train_bitmap_index, BitmapIndex},
         btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
         flat::FlatIndexMetadata,
-        ScalarIndex, ScalarQuery,
+        tag::{train_tag_index, TagIndex},
+        SargableQuery, ScalarIndex, TagQuery,
     };
 
     use super::*;
+    use arrow::datatypes::UInt8Type;
     use arrow_array::{
         cast::AsArray,
         types::{Float32Type, Int32Type, UInt64Type},
@@ -236,7 +238,7 @@ mod tests {
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         let row_ids = index
-            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
+            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
             .await
             .unwrap();
 
@@ -244,7 +246,7 @@ mod tests {
         assert_eq!(Some(10000), row_ids.values().into_iter().copied().next());
 
         let row_ids = index
-            .search(&ScalarQuery::Range(
+            .search(&SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(-100))),
             ))
@@ -254,7 +256,7 @@ mod tests {
         assert_eq!(0, row_ids.len());
 
         let row_ids = index
-            .search(&ScalarQuery::Range(
+            .search(&SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(100))),
             ))
@@ -292,7 +294,7 @@ mod tests {
         let updated_index = BTreeIndex::load(updated_index_store).await.unwrap();
 
         let row_ids = updated_index
-            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
+            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
             .await
             .unwrap();
 
@@ -303,7 +305,7 @@ mod tests {
         );
     }
 
-    async fn check(index: &BTreeIndex, query: ScalarQuery, expected: &[u64]) {
+    async fn check(index: &BTreeIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query).await.unwrap();
         let expected_arr = UInt64Array::from_iter_values(expected.iter().copied());
         assert_eq!(results, expected_arr);
@@ -356,14 +358,14 @@ mod tests {
         // No results (off the left side)
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(-3))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(-3))),
             &[],
         )
         .await;
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Included(ScalarValue::Int32(Some(-3))),
             ),
@@ -373,7 +375,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(-10))),
                 Bound::Included(ScalarValue::Int32(Some(-3))),
             ),
@@ -384,7 +386,7 @@ mod tests {
         // Hitting the middle of a bucket
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(4))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(4))),
             &[2],
         )
         .await;
@@ -392,7 +394,7 @@ mod tests {
         // Hitting a gap between two buckets
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(7))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(7))),
             &[],
         )
         .await;
@@ -400,7 +402,7 @@ mod tests {
         // Hitting the lowest of the overlapping buckets
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(11))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(11))),
             &[50, 60],
         )
         .await;
@@ -408,7 +410,7 @@ mod tests {
         // Hitting the 15 shared on all three buckets
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(15))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(15))),
             &[70, 400, 500, 600, 700, 4000],
         )
         .await;
@@ -416,7 +418,7 @@ mod tests {
         // Hitting the upper part of the three overlapping buckets
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(20))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(20))),
             &[6000, 7000],
         )
         .await;
@@ -424,7 +426,7 @@ mod tests {
         // Ranges that capture multiple buckets
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Included(ScalarValue::Int32(Some(11))),
             ),
@@ -434,7 +436,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(11))),
             ),
@@ -444,7 +446,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(4))),
                 Bound::Unbounded,
             ),
@@ -456,7 +458,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(4))),
                 Bound::Included(ScalarValue::Int32(Some(11))),
             ),
@@ -466,7 +468,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(4))),
                 Bound::Excluded(ScalarValue::Int32(Some(11))),
             ),
@@ -476,7 +478,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(4))),
                 Bound::Unbounded,
             ),
@@ -488,7 +490,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(4))),
                 Bound::Included(ScalarValue::Int32(Some(11))),
             ),
@@ -498,7 +500,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(4))),
                 Bound::Excluded(ScalarValue::Int32(Some(11))),
             ),
@@ -508,7 +510,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(-50))),
                 Bound::Excluded(ScalarValue::Int32(Some(1000))),
             ),
@@ -580,7 +582,7 @@ mod tests {
             let index = BTreeIndex::load(index_store).await.unwrap();
 
             let row_ids = index
-                .search(&ScalarQuery::Equals(sample_value))
+                .search(&SargableQuery::Equals(sample_value))
                 .await
                 .unwrap();
 
@@ -646,14 +648,14 @@ mod tests {
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         let row_ids = index
-            .search(&ScalarQuery::Equals(ScalarValue::Utf8(Some(
+            .search(&SargableQuery::Equals(ScalarValue::Utf8(Some(
                 "foo".to_string(),
             ))))
             .await
             .unwrap();
         assert!(row_ids.is_empty());
 
-        let row_ids = index.search(&ScalarQuery::IsNull()).await.unwrap();
+        let row_ids = index.search(&SargableQuery::IsNull()).await.unwrap();
         assert_eq!(row_ids.len(), 4096);
     }
 
@@ -706,7 +708,7 @@ mod tests {
         let index = BitmapIndex::load(index_store).await.unwrap();
 
         let row_ids = index
-            .search(&ScalarQuery::Equals(ScalarValue::Utf8(None)))
+            .search(&SargableQuery::Equals(ScalarValue::Utf8(None)))
             .await
             .unwrap();
 
@@ -714,7 +716,7 @@ mod tests {
         assert_eq!(2, row_ids.values()[0]);
 
         let row_ids = index
-            .search(&ScalarQuery::Equals(ScalarValue::Utf8(Some(
+            .search(&SargableQuery::Equals(ScalarValue::Utf8(Some(
                 "abcd".to_string(),
             ))))
             .await
@@ -739,7 +741,7 @@ mod tests {
         let index = BitmapIndex::load(index_store).await.unwrap();
 
         let row_ids = index
-            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
+            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
             .await
             .unwrap();
 
@@ -747,7 +749,7 @@ mod tests {
         assert_eq!(10000, row_ids.values()[0]);
 
         let row_ids = index
-            .search(&ScalarQuery::Range(
+            .search(&SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(-100))),
             ))
@@ -757,7 +759,7 @@ mod tests {
         assert_eq!(0, row_ids.len());
 
         let row_ids = index
-            .search(&ScalarQuery::Range(
+            .search(&SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(100))),
             ))
@@ -767,7 +769,7 @@ mod tests {
         assert_eq!(100, row_ids.len());
     }
 
-    async fn check_bitmap(index: &BitmapIndex, query: ScalarQuery, expected: &[u64]) {
+    async fn check_bitmap(index: &BitmapIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query).await.unwrap();
         let expected_arr = UInt64Array::from_iter_values(expected.iter().copied());
         assert_eq!(results, expected_arr);
@@ -820,14 +822,14 @@ mod tests {
         // No results (off the left side)
         check_bitmap(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(-3))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(-3))),
             &[],
         )
         .await;
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Included(ScalarValue::Int32(Some(-3))),
             ),
@@ -837,7 +839,7 @@ mod tests {
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(-10))),
                 Bound::Included(ScalarValue::Int32(Some(-3))),
             ),
@@ -848,7 +850,7 @@ mod tests {
         // Hitting the middle of a bucket
         check_bitmap(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(4))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(4))),
             &[2],
         )
         .await;
@@ -856,7 +858,7 @@ mod tests {
         // Hitting a gap between two buckets
         check_bitmap(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(7))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(7))),
             &[],
         )
         .await;
@@ -864,7 +866,7 @@ mod tests {
         // Hitting the lowest of the overlapping buckets
         check_bitmap(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(11))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(11))),
             &[50, 60],
         )
         .await;
@@ -872,7 +874,7 @@ mod tests {
         // Hitting the 15 shared on all three buckets
         check_bitmap(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(15))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(15))),
             &[70, 400, 500, 600, 700, 4000],
         )
         .await;
@@ -880,7 +882,7 @@ mod tests {
         // Hitting the upper part of the three overlapping buckets
         check_bitmap(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(20))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(20))),
             &[6000, 7000],
         )
         .await;
@@ -888,7 +890,7 @@ mod tests {
         // Ranges that capture multiple buckets
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Included(ScalarValue::Int32(Some(11))),
             ),
@@ -898,7 +900,7 @@ mod tests {
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(11))),
             ),
@@ -908,7 +910,7 @@ mod tests {
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(4))),
                 Bound::Unbounded,
             ),
@@ -920,7 +922,7 @@ mod tests {
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(4))),
                 Bound::Included(ScalarValue::Int32(Some(11))),
             ),
@@ -930,7 +932,7 @@ mod tests {
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(4))),
                 Bound::Excluded(ScalarValue::Int32(Some(11))),
             ),
@@ -940,7 +942,7 @@ mod tests {
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(4))),
                 Bound::Unbounded,
             ),
@@ -952,7 +954,7 @@ mod tests {
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(4))),
                 Bound::Included(ScalarValue::Int32(Some(11))),
             ),
@@ -962,7 +964,7 @@ mod tests {
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(4))),
                 Bound::Excluded(ScalarValue::Int32(Some(11))),
             ),
@@ -972,7 +974,7 @@ mod tests {
 
         check_bitmap(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(-50))),
                 Bound::Excluded(ScalarValue::Int32(Some(1000))),
             ),
@@ -1011,7 +1013,7 @@ mod tests {
         let updated_index = BitmapIndex::load(updated_index_store).await.unwrap();
 
         let row_ids = updated_index
-            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(5000))))
+            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5000))))
             .await
             .unwrap();
 
@@ -1057,7 +1059,7 @@ mod tests {
         // Remapped to new value
         assert_eq!(
             remapped_index
-                .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(5))))
+                .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5))))
                 .await
                 .unwrap()
                 .value(0),
@@ -1065,18 +1067,84 @@ mod tests {
         );
         // Deleted
         assert!(remapped_index
-            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(7))))
+            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(7))))
             .await
             .unwrap()
             .is_empty());
         // Not remapped
         assert_eq!(
             remapped_index
-                .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(3))))
+                .search(&SargableQuery::Equals(ScalarValue::Int32(Some(3))))
                 .await
                 .unwrap()
                 .value(0),
             3
         );
+    }
+
+    async fn train_tag(
+        index_store: &Arc<dyn IndexStore>,
+        data: impl RecordBatchReader + Send + Sync + 'static,
+    ) {
+        let data = Box::new(MockTrainingSource::new(data).await);
+        train_tag_index(data, index_store.as_ref()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tag_index() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let data = gen()
+            .col(
+                "values",
+                array::rand_type(&DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::UInt8,
+                    false,
+                )))),
+            )
+            .col("row_ids", array::step::<UInt64Type>())
+            .into_batch_rows(RowCount::from(40960))
+            .unwrap();
+
+        let batch_reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema().clone());
+
+        // This is probably enough data that we can be assured each tag is used at least once
+        train_tag(&index_store, batch_reader).await;
+        let index = TagIndex::load(index_store).await.unwrap();
+
+        let row_ids = index
+            .search(&TagQuery::HasOneTag(vec![ScalarValue::UInt8(Some(1))]))
+            .await
+            .unwrap();
+
+        let row_ids_set = row_ids
+            .values()
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+
+        for (list, row_id) in data
+            .column(0)
+            .as_list::<i32>()
+            .iter()
+            .zip(data.column(1).as_primitive::<UInt64Type>())
+        {
+            let list = list.unwrap();
+            let row_id = row_id.unwrap();
+            if row_ids_set.contains(&row_id) {
+                assert!(list
+                    .as_primitive::<UInt8Type>()
+                    .values()
+                    .iter()
+                    .any(|val| *val == 1));
+            } else {
+                assert!(list
+                    .as_primitive::<UInt8Type>()
+                    .values()
+                    .iter()
+                    .all(|val| *val != 1));
+            }
+        }
     }
 }
