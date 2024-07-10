@@ -65,7 +65,7 @@ use crate::{
     index::DatasetIndexInternalExt,
     io::{
         commit::commit_transaction,
-        exec::{scalar_index::MapIndexExec, utils::ReplayExec, Planner, ProjectionExec, TakeExec},
+        exec::{project, scalar_index::MapIndexExec, utils::ReplayExec, Planner, TakeExec},
     },
     Dataset,
 };
@@ -373,10 +373,7 @@ impl MergeInsertJob {
         let field = schema.field_with_name(&self.params.on[0])?;
         let key_only_schema =
             lance_core::datatypes::Schema::try_from(&Schema::new(vec![field.clone()]))?; // schema for only the key join column
-        let index_mapper_input = Arc::new(ProjectionExec::try_new(
-            shared_input.clone(),
-            Arc::new(key_only_schema),
-        )?);
+        let index_mapper_input = Arc::new(project(shared_input.clone(), &key_only_schema)?);
 
         // Then we pass the key column into the index mapper
         let index_column = self.params.on[0].clone();
@@ -403,7 +400,7 @@ impl MergeInsertJob {
         let mut columns = fields[1..].to_vec();
         columns.push(fields[0].clone());
         let projected_schema = lance_core::datatypes::Schema::try_from(&Schema::new(columns))?;
-        target = Arc::new(ProjectionExec::try_new(target, Arc::new(projected_schema))?);
+        target = Arc::new(project(target, &projected_schema)?);
 
         // 5a - We also need to scan any new unindexed data and union it in
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;

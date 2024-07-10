@@ -22,6 +22,6 @@ pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec, Pr
 pub use planner::{FilterPlan, Planner};
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
-pub use rowids::RowAddrExpr;
+pub use rowids::AddRowAddrExec;
 pub use scan::LanceScanExec;
 pub use take::TakeExec;

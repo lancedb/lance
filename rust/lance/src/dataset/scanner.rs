@@ -1020,11 +1020,7 @@ impl Scanner {
         // Stage 6: physical projection -- reorder physical columns needed before final projection
         let output_arrow_schema = physical_schema.as_ref().into();
         if plan.schema().as_ref() != &output_arrow_schema {
-            plan = Arc::new(project(
-                plan,
-                &None, // TODO,
-                &physical_schema,
-            )?);
+            plan = Arc::new(project(plan, &physical_schema)?);
         }
 
         // Stage 7: final projection
@@ -1188,7 +1184,7 @@ impl Scanner {
             // knn_node: _distance, _rowid, vector
             // topk_appended: vector, <filter columns?>, _rowid, _distance
             let new_schema = Schema::try_from(knn_node.schema().as_ref())?;
-            let topk_appended = project(topk_appended, &None, &new_schema)?;
+            let topk_appended = project(topk_appended, &new_schema)?;
             assert_eq!(topk_appended.schema(), knn_node.schema());
             // union
             let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
@@ -1305,11 +1301,7 @@ impl Scanner {
             );
             let filtered = Arc::new(FilterExec::try_new(physical_refine_expr, new_data_scan)?);
             let projection = Schema::try_from(plan.schema().as_ref())?;
-            Some(Arc::new(project(
-                filtered,
-                &None, // TODO
-                &projection,
-            )?))
+            Some(Arc::new(project(filtered, &projection)?))
         } else {
             None
         };
