@@ -15,8 +15,8 @@ use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
-use std::cmp::min;
-use std::collections::HashMap;
+use std::cmp::{min, Reverse};
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Debug;
 use std::iter;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -620,8 +620,14 @@ impl IvfSubIndex for HNSW {
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
-        let schema = VECTOR_RESULT_SCHEMA.clone();
+        if params.ef < k {
+            return Err(Error::Index {
+                message: "ef must be greater than or equal to k".to_string(),
+                location: location!(),
+            });
+        }
 
+        let schema = VECTOR_RESULT_SCHEMA.clone();
         if self.is_empty() {
             return Ok(RecordBatch::new_empty(schema));
         }
@@ -640,14 +646,34 @@ impl IvfSubIndex for HNSW {
             )
         };
 
-        if params.ef < k {
-            return Err(Error::Index {
-                message: "ef must be greater than or equal to k".to_string(),
-                location: location!(),
-            });
-        }
-
-        let results = self.search_basic(query.clone(), k, params.ef, bitmap, storage)?;
+        let keep_count = bitmap.as_ref().map(|b| b.len()).unwrap_or_default() as usize;
+        let results = if keep_count < self.len() * 80 / 100 {
+            log::info!("too many rows filtered, using flat search");
+            let bitmap = bitmap.unwrap();
+            let node_ids = storage
+                .row_ids()
+                .enumerate()
+                .filter_map(|(node_id, row_id)| {
+                    bitmap.contains(*row_id as u32).then_some(node_id as u32)
+                });
+            let dist_calc = storage.dist_calculator(query);
+            let mut heap = BinaryHeap::<Reverse<OrderedNode>>::with_capacity(k);
+            for node_id in node_ids {
+                let dist = dist_calc.distance(node_id).into();
+                if heap.len() < k {
+                    heap.push(Reverse((dist, node_id).into()));
+                } else if dist < heap.peek().unwrap().0.dist {
+                    heap.pop();
+                    heap.push(Reverse((dist, node_id).into()));
+                }
+            }
+            heap.into_iter()
+                .map(|x| x.0)
+                .sorted_unstable()
+                .collect_vec()
+        } else {
+            self.search_basic(query.clone(), k, params.ef, bitmap, storage)?
+        };
 
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| storage.row_id(x.id)));
         let distances = Arc::new(Float32Array::from_iter_values(
