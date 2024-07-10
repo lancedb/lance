@@ -36,6 +36,13 @@ mod kernel {
     }
 }
 
+impl Normalize for u8 {
+    #[inline]
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, f32, 16>(vector)
+    }
+}
+
 impl Normalize for f16 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {

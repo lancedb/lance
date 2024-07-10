@@ -17,7 +17,10 @@ use datafusion::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{
-    utils::{address::RowAddress, mask::RowIdTreeMap},
+    utils::{
+        address::RowAddress,
+        mask::{RowIdMask, RowIdTreeMap},
+    },
     Error, Result, ROW_ID_FIELD,
 };
 use lance_index::{
@@ -33,6 +36,7 @@ use snafu::{location, Location};
 use tracing::{debug_span, instrument};
 
 use crate::{
+    dataset::rowids::load_row_id_sequences,
     index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
     Dataset,
 };
@@ -194,7 +198,7 @@ impl MapIndexExec {
     async fn map_batch(
         column_name: String,
         dataset: Arc<Dataset>,
-        deletion_mask: Option<Arc<RowIdTreeMap>>,
+        deletion_mask: Option<Arc<RowIdMask>>,
         batch: RecordBatch,
     ) -> datafusion::error::Result<RecordBatch> {
         let index_vals = batch.column(0);
@@ -202,9 +206,18 @@ impl MapIndexExec {
             .map(|idx| ScalarValue::try_from_array(index_vals, idx))
             .collect::<datafusion::error::Result<Vec<_>>>()?;
         let query = ScalarIndexExpr::Query(column_name.clone(), ScalarQuery::IsIn(index_vals));
-        let row_addresses = query.evaluate(dataset.as_ref()).await?;
-        debug_assert!(row_addresses.block_list.is_none());
-        if let Some(allow_list) = row_addresses.allow_list {
+        let mut row_addresses = query.evaluate(dataset.as_ref()).await?;
+
+        if let Some(deletion_mask) = deletion_mask.as_ref() {
+            row_addresses = row_addresses & deletion_mask.as_ref().clone();
+        }
+
+        if let Some(mut allow_list) = row_addresses.allow_list {
+            // Flatten the allow list
+            if let Some(block_list) = row_addresses.block_list {
+                allow_list -= &block_list;
+            }
+
             let allow_list =
                 allow_list
                     .row_ids()
@@ -212,11 +225,7 @@ impl MapIndexExec {
                         "IndexedLookupExec: row addresses didn't have an iterable allow list"
                             .into(),
                     ))?;
-            let mut allow_list = allow_list.map(u64::from).collect::<Vec<_>>();
-            if let Some(deletion_mask) = deletion_mask {
-                allow_list.retain(|row_id| !deletion_mask.contains(*row_id));
-            }
-            let allow_list = UInt64Array::from(allow_list);
+            let allow_list: UInt64Array = allow_list.map(u64::from).collect();
             Ok(RecordBatch::try_new(
                 INDEX_LOOKUP_SCHEMA.clone(),
                 vec![Arc::new(allow_list)],
@@ -325,14 +334,14 @@ impl DisplayAs for MaterializeIndexExec {
     }
 }
 
-struct FragIdIter {
-    src: Arc<Vec<Fragment>>,
+struct FragIdIter<'a> {
+    src: &'a [Fragment],
     frag_idx: usize,
     idx_in_frag: usize,
 }
 
-impl FragIdIter {
-    fn new(src: Arc<Vec<Fragment>>) -> Self {
+impl<'a> FragIdIter<'a> {
+    fn new(src: &'a [Fragment]) -> Self {
         Self {
             src,
             frag_idx: 0,
@@ -341,7 +350,7 @@ impl FragIdIter {
     }
 }
 
-impl Iterator for FragIdIter {
+impl<'a> Iterator for FragIdIter<'a> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -402,54 +411,126 @@ impl MaterializeIndexExec {
         });
         let mask = if let Some(prefilter) = prefilter {
             let (mask, prefilter) = futures::try_join!(mask, prefilter)?;
-            mask.also_block((*prefilter).clone())
+            mask & (*prefilter).clone()
         } else {
             mask.await?
         };
-        let span = debug_span!("make_ids");
-        let ids = span.in_scope(|| match (mask.allow_list, mask.block_list) {
-            (None, None) => FragIdIter::new(fragments).collect::<Vec<_>>(),
-            (Some(mut allow_list), None) => {
-                allow_list.remove_fragments(fragments.iter().map(|frag| frag.id as u32));
-                if let Some(allow_list_iter) = allow_list.row_ids() {
-                    allow_list_iter.map(u64::from).collect::<Vec<_>>()
-                } else {
-                    FragIdIter::new(fragments)
-                        .filter(|row_id| allow_list.contains(*row_id))
-                        .collect()
-                }
-            }
-            (None, Some(block_list)) => FragIdIter::new(fragments)
-                .filter(|row_id| !block_list.contains(*row_id))
-                .collect(),
-            (Some(mut allow_list), Some(block_list)) => {
-                allow_list.remove_fragments(fragments.iter().map(|frag| frag.id as u32));
-                if let Some(allow_list_iter) = allow_list.row_ids() {
-                    allow_list_iter
-                        .filter_map(|addr| {
-                            let row_id = u64::from(addr);
-                            if !block_list.contains(row_id) {
-                                Some(row_id)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    FragIdIter::new(fragments)
-                        .filter(|row_id| {
-                            !block_list.contains(*row_id) && allow_list.contains(*row_id)
-                        })
-                        .collect()
-                }
-            }
-        });
+        let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);
         Ok(RecordBatch::try_new(
             MATERIALIZE_INDEX_SCHEMA.clone(),
             vec![Arc::new(ids)],
         )?)
     }
+}
+
+#[instrument(name = "make_row_ids", skip(mask, dataset, fragments))]
+async fn row_ids_for_mask(
+    mask: RowIdMask,
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<Vec<u64>> {
+    match (mask.allow_list, mask.block_list) {
+        (None, None) => {
+            // Matches all row ids in the given fragments.
+            if dataset.manifest.uses_move_stable_row_ids() {
+                let sequences = load_row_id_sequences(dataset, fragments)
+                    .map_ok(|(_frag_id, sequence)| sequence)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                let capacity = sequences.iter().map(|seq| seq.len() as usize).sum();
+                let mut row_ids = Vec::with_capacity(capacity);
+                for sequence in sequences {
+                    row_ids.extend(sequence.iter());
+                }
+                Ok(row_ids)
+            } else {
+                Ok(FragIdIter::new(fragments).collect::<Vec<_>>())
+            }
+        }
+        (Some(mut allow_list), None) => {
+            retain_fragments(&mut allow_list, fragments, dataset).await?;
+
+            if let Some(allow_list_iter) = allow_list.row_ids() {
+                Ok(allow_list_iter.map(u64::from).collect::<Vec<_>>())
+            } else {
+                // We shouldn't hit this branch if the row ids are stable.
+                debug_assert!(!dataset.manifest.uses_move_stable_row_ids());
+                Ok(FragIdIter::new(fragments)
+                    .filter(|row_id| allow_list.contains(*row_id))
+                    .collect())
+            }
+        }
+        (None, Some(block_list)) => {
+            if dataset.manifest.uses_move_stable_row_ids() {
+                let sequences = load_row_id_sequences(dataset, fragments)
+                    .map_ok(|(_frag_id, sequence)| sequence)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                let mut capacity = sequences.iter().map(|seq| seq.len() as usize).sum();
+                capacity -= block_list.len().expect("unknown block list len") as usize;
+                let mut row_ids = Vec::with_capacity(capacity);
+                for sequence in sequences {
+                    row_ids.extend(
+                        sequence
+                            .iter()
+                            .filter(|row_id| !block_list.contains(*row_id)),
+                    );
+                }
+                Ok(row_ids)
+            } else {
+                Ok(FragIdIter::new(fragments)
+                    .filter(|row_id| !block_list.contains(*row_id))
+                    .collect())
+            }
+        }
+        (Some(mut allow_list), Some(block_list)) => {
+            // We need to filter out irrelevant fragments as well.
+            retain_fragments(&mut allow_list, fragments, dataset).await?;
+
+            if let Some(allow_list_iter) = allow_list.row_ids() {
+                Ok(allow_list_iter
+                    .filter_map(|addr| {
+                        let row_id = u64::from(addr);
+                        if !block_list.contains(row_id) {
+                            Some(row_id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>())
+            } else {
+                // We shouldn't hit this branch if the row ids are stable.
+                debug_assert!(!dataset.manifest.uses_move_stable_row_ids());
+                Ok(FragIdIter::new(fragments)
+                    .filter(|row_id| !block_list.contains(*row_id) && allow_list.contains(*row_id))
+                    .collect())
+            }
+        }
+    }
+}
+
+async fn retain_fragments(
+    allow_list: &mut RowIdTreeMap,
+    fragments: &[Fragment],
+    dataset: &Dataset,
+) -> Result<()> {
+    if dataset.manifest.uses_move_stable_row_ids() {
+        let fragment_ids = load_row_id_sequences(dataset, fragments)
+            .map_ok(|(_frag_id, sequence)| RowIdTreeMap::from(sequence.as_ref()))
+            .try_fold(RowIdTreeMap::new(), |mut acc, tree| async {
+                acc |= tree;
+                Ok(acc)
+            })
+            .await?;
+        *allow_list &= fragment_ids;
+    } else {
+        // Assume row ids are addresses, so we can filter out fragments by their ids.
+        allow_list.retain_fragments(fragments.iter().map(|frag| frag.id as u32));
+    }
+    Ok(())
 }
 
 impl ExecutionPlan for MaterializeIndexExec {

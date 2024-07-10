@@ -447,6 +447,22 @@ def test_optimize_index(dataset, tmp_path):
     assert len(list(indices_dir.iterdir())) == 2
 
 
+def test_create_index_dot(dataset, tmp_path):
+    dataset_uri = tmp_path / "dataset.lance"
+    assert not dataset.has_index
+    ds = lance.write_dataset(dataset.to_table(), dataset_uri)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="dot",
+        num_partitions=4,
+        num_sub_vectors=2,
+    )
+
+    assert ds.has_index
+    assert "dot" == ds.stats.index_stats("vector_idx")["indices"][0]["metric_type"]
+
+
 def create_uniform_table(min, max, nvec, offset, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     # rowid = np.arange(offset, offset + nvec)
@@ -491,8 +507,8 @@ def test_optimize_index_recall(tmp_path: Path):
         for query in sample_queries:
             results = dataset.to_table(nearest=query).column("vector")
             assert has_target(query["q"], results)
-            plan = dataset.scanner(nearest=query).explain_plan()
-            assert ("KNNFlat" in plan) == has_knn_combined
+            plan = dataset.scanner(nearest=query).explain_plan(verbose=True)
+            assert ("KNNVectorDistance" in plan) == has_knn_combined
         for query in sample_delete_queries:
             results = dataset.to_table(nearest=query).column("vector")
             assert delete_has_happened != has_target(query["q"], results)
@@ -589,7 +605,7 @@ def test_index_cache_size(tmp_path):
 
     indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=1)
     # query using the same vector, we should get a very high hit rate
-    query_index(indexed_dataset, 100, q=rng.standard_normal(16))
+    query_index(indexed_dataset, 200, q=rng.standard_normal(16))
     assert indexed_dataset._ds.index_cache_hit_rate() > 0.99
 
     last_hit_rate = indexed_dataset._ds.index_cache_hit_rate()

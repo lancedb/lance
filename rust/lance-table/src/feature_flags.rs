@@ -21,7 +21,7 @@ pub const FLAG_USE_V2_FORMAT: u64 = 4;
 pub const FLAG_UNKNOWN: u64 = 8;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
-pub fn apply_feature_flags(manifest: &mut Manifest) -> Result<()> {
+pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) -> Result<()> {
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -41,7 +41,7 @@ pub fn apply_feature_flags(manifest: &mut Manifest) -> Result<()> {
         .fragments
         .iter()
         .any(|frag| frag.row_id_meta.is_some());
-    if has_row_ids {
+    if has_row_ids || enable_stable_row_id {
         if !manifest
             .fragments
             .iter()

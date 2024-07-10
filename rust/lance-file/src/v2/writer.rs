@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -70,14 +71,15 @@ pub struct FileWriterOptions {
 
 pub struct FileWriter {
     writer: ObjectWriter,
-    path: String,
-    schema: LanceSchema,
+    schema: Option<LanceSchema>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
     field_id_to_column_indices: Vec<(i32, i32)>,
     num_columns: u32,
     rows_written: u64,
     global_buffers: Vec<(u64, u64)>,
+    schema_metadata: HashMap<String, String>,
+    options: FileWriterOptions,
 }
 
 fn initial_column_metadata() -> pbfile::ColumnMetadata {
@@ -90,48 +92,34 @@ fn initial_column_metadata() -> pbfile::ColumnMetadata {
 }
 
 impl FileWriter {
-    /// Create a new FileWriter
+    /// Create a new FileWriter with a desired output schema
     pub fn try_new(
         object_writer: ObjectWriter,
-        path: String,
         schema: LanceSchema,
         options: FileWriterOptions,
     ) -> Result<Self> {
-        let cache_bytes_per_column = if let Some(data_cache_bytes) = options.data_cache_bytes {
-            data_cache_bytes / schema.fields.len() as u64
-        } else {
-            8 * 1024 * 1024
-        };
+        let mut writer = Self::new_lazy(object_writer, options);
+        writer.initialize(schema)?;
+        Ok(writer)
+    }
 
-        schema.validate()?;
-
-        let keep_original_array = options.keep_original_array.unwrap_or(false);
-        let encoding_strategy = options
-            .encoding_strategy
-            .unwrap_or_else(|| Arc::new(CoreFieldEncodingStrategy::default()));
-
-        let encoder = BatchEncoder::try_new(
-            &schema,
-            encoding_strategy.as_ref(),
-            cache_bytes_per_column,
-            keep_original_array,
-        )?;
-        let num_columns = encoder.num_columns();
-
-        let column_writers = encoder.field_encoders;
-        let column_metadata = vec![initial_column_metadata(); num_columns as usize];
-
-        Ok(Self {
+    /// Create a new FileWriter without a desired output schema
+    ///
+    /// The output schema will be set based on the first batch of data to arrive.
+    /// If no data arrives and the writer is finished then the write will fail.
+    pub fn new_lazy(object_writer: ObjectWriter, options: FileWriterOptions) -> Self {
+        Self {
             writer: object_writer,
-            path,
-            schema,
-            column_writers,
-            column_metadata,
-            num_columns,
+            schema: None,
+            column_writers: Vec::new(),
+            column_metadata: Vec::new(),
+            num_columns: 0,
             rows_written: 0,
-            field_id_to_column_indices: encoder.field_id_to_column_index,
+            field_id_to_column_indices: Vec::new(),
             global_buffers: Vec::new(),
-        })
+            schema_metadata: HashMap::new(),
+            options,
+        }
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
@@ -208,6 +196,47 @@ impl FileWriter {
         Ok(())
     }
 
+    fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
+        let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
+            data_cache_bytes / schema.fields.len() as u64
+        } else {
+            8 * 1024 * 1024
+        };
+
+        schema.validate()?;
+
+        let keep_original_array = self.options.keep_original_array.unwrap_or(false);
+        let encoding_strategy = self
+            .options
+            .encoding_strategy
+            .clone()
+            .unwrap_or_else(|| Arc::new(CoreFieldEncodingStrategy::default()));
+
+        let encoder = BatchEncoder::try_new(
+            &schema,
+            encoding_strategy.as_ref(),
+            cache_bytes_per_column,
+            keep_original_array,
+        )?;
+        self.num_columns = encoder.num_columns();
+
+        self.column_writers = encoder.field_encoders;
+        self.column_metadata = vec![initial_column_metadata(); self.num_columns as usize];
+        self.field_id_to_column_indices = encoder.field_id_to_column_index;
+        self.schema_metadata
+            .extend(std::mem::take(&mut schema.metadata));
+        self.schema = Some(schema);
+        Ok(())
+    }
+
+    fn ensure_initialized(&mut self, batch: &RecordBatch) -> Result<&LanceSchema> {
+        if self.schema.is_none() {
+            let schema = LanceSchema::try_from(batch.schema().as_ref())?;
+            self.initialize(schema)?;
+        }
+        Ok(self.schema.as_ref().unwrap())
+    }
+
     /// Schedule a batch of data to be written to the file
     ///
     /// Note: the future returned by this method may complete before the data has been fully
@@ -217,6 +246,8 @@ impl FileWriter {
             "write_batch called with {} bytes of data",
             batch.get_array_memory_size()
         );
+        self.ensure_initialized(batch)?;
+        let schema = self.schema.as_ref().unwrap();
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -235,8 +266,7 @@ impl FileWriter {
         };
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
-        let encoding_tasks = self
-            .schema
+        let encoding_tasks = schema
             .fields
             .iter()
             .zip(self.column_writers.iter_mut())
@@ -300,7 +330,9 @@ impl FileWriter {
     }
 
     async fn write_global_buffers(&mut self) -> Result<Vec<(u64, u64)>> {
-        let file_descriptor = Self::make_file_descriptor(&self.schema, self.rows_written)?;
+        let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created", location!()))?;
+        schema.metadata = std::mem::take(&mut self.schema_metadata);
+        let file_descriptor = Self::make_file_descriptor(schema, self.rows_written)?;
         let file_descriptor_bytes = file_descriptor.encode_to_vec();
         let file_descriptor_len = file_descriptor_bytes.len() as u64;
         let file_descriptor_position = self.writer.tell().await? as u64;
@@ -317,7 +349,7 @@ impl FileWriter {
     /// data has been written.  This method allows you to alter the schema metadata.  It
     /// must be called before `finish` is called.
     pub fn add_schema_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.schema.metadata.insert(key.into(), value.into());
+        self.schema_metadata.insert(key.into(), value.into());
     }
 
     /// Adds a global buffer to the file
@@ -449,10 +481,6 @@ impl FileWriter {
 
     pub fn field_id_to_column_indices(&self) -> &[(i32, i32)] {
         &self.field_id_to_column_indices
-    }
-
-    pub fn path(&self) -> &str {
-        &self.path
     }
 }
 
@@ -599,13 +627,8 @@ mod tests {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
 
-        let mut file_writer = FileWriter::try_new(
-            writer,
-            tmp_path.to_string(),
-            lance_schema,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(writer, lance_schema, FileWriterOptions::default()).unwrap();
 
         for batch in reader {
             file_writer.write_batch(&batch.unwrap()).await.unwrap();
@@ -632,13 +655,8 @@ mod tests {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
 
-        let mut file_writer = FileWriter::try_new(
-            writer,
-            tmp_path.to_string(),
-            lance_schema,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(writer, lance_schema, FileWriterOptions::default()).unwrap();
 
         for batch in reader {
             file_writer.write_batch(&batch.unwrap()).await.unwrap();

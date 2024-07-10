@@ -49,7 +49,7 @@ const BTREE_PAGES_NAME: &str = "page_data.lance";
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
-struct OrderableScalarValue(ScalarValue);
+pub struct OrderableScalarValue(pub ScalarValue);
 
 impl DeepSizeOf for OrderableScalarValue {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
@@ -846,6 +846,10 @@ impl ScalarIndex for BTreeIndex {
             ScalarQuery::IsIn(values) => self
                 .page_lookup
                 .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
+            ScalarQuery::FullTextSearch(_) => return Err(Error::invalid_input(
+                "full text search is not supported for BTree index, build a inverted index for it",
+                location!(),
+            )),
             ScalarQuery::IsNull() => self.page_lookup.pages_null(),
         };
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;

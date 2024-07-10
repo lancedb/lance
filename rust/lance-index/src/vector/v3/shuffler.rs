@@ -151,15 +151,14 @@ impl Shuffler for IvfShuffler {
                     .expect("there should be at least one batch");
                 writers = stream::iter(0..self.num_partitions)
                     .map(|partition_id| {
-                        let path = self.output_dir.clone();
+                        let part_path =
+                            self.output_dir.child(format!("ivf_{}.lance", partition_id));
                         let object_store = self.object_store.clone();
                         let schema = schema.clone();
                         async move {
-                            let part_path = path.child(format!("ivf_{}.lance", partition_id));
                             let writer = object_store.create(&part_path).await?;
                             FileWriter::try_new(
                                 writer,
-                                part_path.to_string(),
                                 lance_core::datatypes::Schema::try_from(schema.as_ref())?,
                                 Default::default(),
                             )
@@ -200,10 +199,7 @@ impl Shuffler for IvfShuffler {
         }
 
         // finish all writers
-        for (writer, &size) in writers.iter_mut().zip(partition_sizes.iter()) {
-            if size == 0 {
-                continue;
-            }
+        for writer in writers.iter_mut() {
             writer.finish().await?;
         }
 
@@ -216,7 +212,7 @@ impl Shuffler for IvfShuffler {
 }
 
 pub struct IvfShufflerReader {
-    object_store: Arc<ObjectStore>,
+    scheduler: Arc<ScanScheduler>,
     output_dir: Path,
     partition_sizes: Vec<usize>,
 }
@@ -227,8 +223,9 @@ impl IvfShufflerReader {
         output_dir: Path,
         partition_sizes: Vec<usize>,
     ) -> Self {
+        let scheduler = ScanScheduler::new(object_store, 32);
         Self {
-            object_store,
+            scheduler,
             output_dir,
             partition_sizes,
         }
@@ -241,11 +238,10 @@ impl ShuffleReader for IvfShufflerReader {
         &self,
         partition_id: usize,
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
-        let scheduler = ScanScheduler::new(self.object_store.clone(), 32);
         let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
 
         let reader = FileReader::try_open(
-            scheduler.open_file(&partition_path).await?,
+            self.scheduler.open_file(&partition_path).await?,
             None,
             DecoderMiddlewareChain::default(),
         )

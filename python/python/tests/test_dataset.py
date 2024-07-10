@@ -1339,6 +1339,26 @@ def test_update_dataset_all_types(tmp_path: Path):
     assert dataset.to_table() == expected
 
 
+def test_update_with_binary_field(tmp_path: Path):
+    # Create a lance dataset with binary fields
+    table = pa.Table.from_pydict(
+        {
+            "a": [f"str-{i}" for i in range(100)],
+            "b": [b"bin-{i}" for i in range(100)],
+            "c": list(range(100)),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Update binary field
+    dataset.update({"b": "X'616263'"}, where="c < 2")
+
+    ds = lance.dataset(tmp_path)
+    assert ds.scanner(filter="c < 2").to_table().column(
+        "b"
+    ).combine_chunks() == pa.array([b"abc", b"abc"])
+
+
 def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):
     base_dir = tmp_path / "dataset"
 

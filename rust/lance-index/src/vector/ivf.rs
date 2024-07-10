@@ -150,7 +150,7 @@ impl IvfTransformer {
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
         vector_column: &str,
-        pq: Arc<dyn ProductQuantizer>,
+        pq: ProductQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];

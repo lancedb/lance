@@ -141,12 +141,10 @@ pub async fn take_rows(
         return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
     }
 
-    let row_addrs = if dataset.manifest.uses_move_stable_row_ids() {
-        // Need to map the row ids to addresses
-        let index = get_row_id_index(dataset).await?;
+    let row_addrs = if let Some(row_id_index) = get_row_id_index(dataset).await? {
         let addresses = row_ids
             .iter()
-            .filter_map(|id| index.get(*id).map(|address| address.into()))
+            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
             .collect::<Vec<_>>();
         Cow::Owned(addresses)
     } else {
@@ -465,7 +463,9 @@ mod test {
     #[tokio::test]
     async fn test_take_rows_out_of_bound(#[values(false, true)] use_legacy_format: bool) {
         // a dataset with 1 fragment and 400 rows
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+            .await
+            .unwrap();
         let ds = test_ds.dataset;
 
         // take the last row of first fragment

@@ -19,7 +19,7 @@ use lance_arrow::{ArrowFloatType, FloatArray};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
-use num_traits::{AsPrimitive, Float, Num};
+use num_traits::{AsPrimitive, Num};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -64,7 +64,7 @@ pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
 #[inline]
 pub fn l2_scalar<
     T: AsPrimitive<Output>,
-    Output: Float + Sum + AddAssign + 'static,
+    Output: Num + Copy + Sum + AddAssign + 'static,
     const LANES: usize,
 >(
     from: &[T],
@@ -96,6 +96,13 @@ pub fn l2_scalar<
     }
 
     s + sums.iter().copied().sum()
+}
+
+impl L2 for u8 {
+    #[inline]
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
+        l2_distance_uint_scalar(x, y)
+    }
 }
 
 impl L2 for bf16 {

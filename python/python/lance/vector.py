@@ -183,7 +183,7 @@ def train_ivf_centroids_on_accelerator(
         np.save(f, centroids)
     logging.info("Saved centroids to %s", f.name)
 
-    return centroids, compute_partitions(dataset, column, kmeans, batch_size=20480)
+    return centroids, kmeans
 
 
 def compute_partitions(
