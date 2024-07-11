@@ -59,17 +59,17 @@ lance-test-macros = { version = "=0.14.2", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=0.14.2", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "51.0.0", optional = false, features = ["prettyprint"] }
-arrow-arith = "51.0"
-arrow-array = "51.0"
-arrow-buffer = "51.0"
-arrow-cast = "51.0"
-arrow-data = "51.0"
-arrow-ipc = { version = "51.0", features = ["zstd"] }
-arrow-ord = "51.0"
-arrow-row = "51.0"
-arrow-schema = "51.0"
-arrow-select = "51.0"
+arrow = { version = "52.0", optional = false, features = ["prettyprint"] }
+arrow-arith = "52.0"
+arrow-array = "52.0"
+arrow-buffer = "52.0"
+arrow-cast = "52.0"
+arrow-data = "52.0"
+arrow-ipc = { version = "52.0", features = ["zstd"] }
+arrow-ord = "52.0"
+arrow-row = "52.0"
+arrow-schema = "52.0"
+arrow-select = "52.0"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "0.57"
@@ -93,17 +93,17 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "37.1", default-features = false, features = [
+datafusion = { version = "39.0", default-features = false, features = [
     "array_expressions",
     "regex_expressions",
 ] }
-datafusion-common = "37.1"
-datafusion-functions = { version = "37.1", features = ["regex_expressions"] }
-datafusion-sql = "37.1"
-datafusion-expr = "37.1"
-datafusion-execution = "37.1"
-datafusion-optimizer = "37.1"
-datafusion-physical-expr = { version = "37.1", features = [
+datafusion-common = "39.0"
+datafusion-functions = { version = "39.0", features = ["regex_expressions"] }
+datafusion-sql = "39.0"
+datafusion-expr = "39.0"
+datafusion-execution = "39.0"
+datafusion-optimizer = "39.0"
+datafusion-physical-expr = { version = "39.0", features = [
     "regex_expressions",
 ] }
 deepsize = "0.2.0"
@@ -119,8 +119,8 @@ mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = "0.11"
 num-traits = "0.2"
 num_cpus = "1.0"
-object_store = { version = "0.9.0" }
-parquet = "51.0"
+object_store = { version = "0.10.1" }
+parquet = "52.0"
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }

@@ -350,7 +350,7 @@ mod tests {
         let some_path = Path::parse("foo").unwrap();
         let base_store = Arc::new(InMemory::new());
         base_store
-            .put(&some_path, Bytes::from(vec![0; 1000]))
+            .put(&some_path, vec![0; 1000].into())
             .await
             .unwrap();
 
@@ -374,6 +374,7 @@ mod tests {
             Url::parse("mem://").unwrap(),
             None,
             None,
+            false,
         ));
 
         let scan_scheduler = ScanScheduler::new(obj_store, 1);
