@@ -9,12 +9,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
-from lance.tracing import trace_to_chrome
-
-trace_to_chrome(level="debug", file="/tmp/foo.json")
 
 N_DIMS = 768
-NUM_ROWS = 16_000_000
+NUM_ROWS = 100_000
 NEW_ROWS = 10_000
 
 
@@ -54,8 +51,6 @@ def create_table(num_rows, offset) -> pa.Table:
     filterable = pa.array(range(offset, offset + num_rows))
     categories = pa.array(np.random.randint(0, 100, num_rows))
     genres_values = pa.array(np.random.choice(GENRES, num_rows * 3))
-    if isinstance(genres_values, pa.ChunkedArray):
-        genres_values = pa.concat_arrays(genres_values.iterchunks())
     genre_offsets = pa.array(np.arange(0, (num_rows + 1) * 3, 3, dtype=np.int32))
     genres = pa.ListArray.from_arrays(genre_offsets, genres_values)
     return pa.table(
