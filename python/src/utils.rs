@@ -58,13 +58,40 @@ pub struct KMeans {
 #[pymethods]
 impl KMeans {
     #[new]
-    #[pyo3(signature = (k, metric_type="l2", max_iters=50))]
-    fn new(k: usize, metric_type: &str, max_iters: u32) -> PyResult<Self> {
+    #[pyo3(signature = (k, metric_type="l2", max_iters=50, centroids_arr=None))]
+    fn new(
+        k: usize,
+        metric_type: &str,
+        max_iters: u32,
+        centroids_arr: Option<&PyAny>,
+    ) -> PyResult<Self> {
+        let trained_kmeans = if let Some(arr) = centroids_arr {
+            let data = ArrayData::from_pyarrow(arr)?;
+            if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
+                return Err(PyValueError::new_err("Must be a FixedSizeList"));
+            }
+            let fixed_size_arr = FixedSizeListArray::from(data);
+            let params = KMeansParams {
+                distance_type: metric_type.try_into().unwrap(),
+                max_iters,
+                ..Default::default()
+            };
+            let kmeans =
+                LanceKMeans::new_with_params(&fixed_size_arr, k, &params).map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "Error initialing KMeans from existing centroids: {}",
+                        e
+                    ))
+                })?;
+            Some(kmeans)
+        } else {
+            None
+        };
         Ok(Self {
             k,
             metric_type: metric_type.try_into().unwrap(),
             max_iters,
-            trained_kmeans: None,
+            trained_kmeans,
         })
     }
 
