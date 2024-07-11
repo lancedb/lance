@@ -101,4 +101,7 @@ jobs:
           mvn release:prepare -DskipTests -DdryRun=true
       - name: Publish with Java 8
         run: |
-          mvn -DskipTests clean deploy -DdryRun=true -P deploy-to-ossrh
+          mvn -DskipTests --batch-mode clean deploy -DdryRun=true -P deploy-to-ossrh
+        env:
+          MAVEN_USERNAME: ${{ secrets.SONATYPE_USER }}
+          MAVEN_PASSWORD: ${{ secrets.SONATYPE_TOKEN }}
