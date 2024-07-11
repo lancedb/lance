@@ -1139,11 +1139,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         error_if_tagged_old_versions: bool, default True
             Some versions may have tags associated with them. Tagged versions will
-            not be cleaned up, regardless of how old they are. If this argument is
-            set to `False`, untagged old versions will be cleaned, and tagged old
-            versions will be kept. If this argument is set to `True`, then no cleanup
-            will take place if an old version is tagged, and an exception will be
-            raised.
+            not be cleaned up, regardless of how old they are. If this argument
+            is set to `True` (the default), an exception will be raised if any
+            tagged versions match the parameters. Otherwise, tagged versions will
+            be ignored without any error and only untagged versions will be
+            cleaned up.
         """
         if older_than is None:
             older_than = timedelta(days=14)
