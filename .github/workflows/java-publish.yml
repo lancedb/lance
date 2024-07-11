@@ -100,10 +100,10 @@ jobs:
           cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
       - name: Build and publish with Java 8
         run: |
-          mvn release:prepare -DskipTests -DdryRun=true
+          mvn release:prepare -DskipTests
       - name: Publish with Java 8
         run: |
-          mvn -DskipTests --batch-mode clean deploy -DdryRun=true -P deploy-to-ossrh
+          mvn -DskipTests --batch-mode clean deploy -P deploy-to-ossrh
         env:
           MAVEN_USERNAME: ${{ secrets.SONATYPE_USER }}
           MAVEN_PASSWORD: ${{ secrets.SONATYPE_TOKEN }}
