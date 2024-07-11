@@ -177,21 +177,22 @@ impl TryFrom<PbIvf> for IvfModel {
 
     fn try_from(proto: PbIvf) -> Result<Self> {
         let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
+            // For new index format and IVFIndex
             debug!("Ivf: loading IVF centroids from index format v2");
             Some(FixedSizeListArray::try_from(tensor)?)
-        } else {
-            debug!("Ivf: loading IVF centroids from index format v1");
+        } else if !proto.centroids.is_empty() {
             // For backward-compatibility
-            assert!(
-                !proto.centroids.is_empty(),
-                "the IVF model broken in the file, the centroids should not be empty."
-            );
+            debug!("Ivf: loading IVF centroids from index format v1");
             let f32_centroids = Float32Array::from(proto.centroids.clone());
             let dimension = f32_centroids.len() / proto.lengths.len();
             Some(FixedSizeListArray::try_new_from_values(
                 f32_centroids,
                 dimension as i32,
             )?)
+        } else {
+            // We also use IvfModel to track the offsets/lengths of sub-index like HNSW
+            // which does not have centroids.
+            None
         };
         // We are not using offsets from the protobuf, which was the file offset in the
         // v1 index format. It will be deprecated soon.
