@@ -653,7 +653,8 @@ impl IvfSubIndex for HNSW {
             .unwrap_or(storage.len());
         let results = if remained < self.len() * 10 / 100 {
             log::debug!("too many rows filtered, using flat search");
-            let prefilter_bitset = prefilter_bitset.unwrap();
+            let prefilter_bitset =
+                prefilter_bitset.expect("the prefilter bitset must be set for flat search");
             let node_ids = storage
                 .row_ids()
                 .enumerate()
