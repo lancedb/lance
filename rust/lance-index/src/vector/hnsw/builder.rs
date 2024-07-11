@@ -13,9 +13,8 @@ use itertools::Itertools;
 
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
-use roaring::RoaringBitmap;
 use snafu::{location, Location};
-use std::cmp::{min, Reverse};
+use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Debug;
 use std::iter;
@@ -32,7 +31,7 @@ use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, 
 use crate::prefilter::PreFilter;
 use crate::vector::flat::storage::FlatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
-use crate::vector::graph::greedy_search;
+use crate::vector::graph::{greedy_search, Visited};
 use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
@@ -164,7 +163,7 @@ impl HNSW {
         query: ArrayRef,
         k: usize,
         ef: usize,
-        bitset: Option<RoaringBitmap>,
+        bitset: Option<Visited>,
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
@@ -198,7 +197,7 @@ impl HNSW {
         query: ArrayRef,
         k: usize,
         ef: usize,
-        bitset: Option<RoaringBitmap>,
+        bitset: Option<Visited>,
         storage: &impl VectorStore,
     ) -> Result<Vec<OrderedNode>> {
         let mut visited_generator = self
@@ -572,7 +571,7 @@ impl IvfSubIndex for HNSW {
         }
 
         let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get() * 2));
-        for _ in 0..(num_cpus::get() * 2) {
+        for _ in 0..num_cpus::get() * 2 {
             visited_generator_queue
                 .push(VisitedGenerator::new(0))
                 .unwrap();
@@ -632,48 +631,61 @@ impl IvfSubIndex for HNSW {
             return Ok(RecordBatch::new_empty(schema));
         }
 
-        let bitmap = if prefilter.is_empty() {
+        let mut prefilter_generator = self
+            .inner
+            .visited_generator_queue
+            .pop()
+            .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
+        let prefilter_bitset = if prefilter.is_empty() {
             None
         } else {
             let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
-            Some(
-                RoaringBitmap::from_sorted_iter(indices.into_iter().map(|i| i as u32)).map_err(
-                    |e| Error::Index {
-                        message: format!("Error creating RoaringBitmap: {}", e),
-                        location: location!(),
-                    },
-                )?,
-            )
+            let mut bitset = prefilter_generator.generate(storage.len());
+            for indices in indices {
+                bitset.insert(indices as u32);
+            }
+            Some(bitset)
         };
 
-        let keep_count = bitmap.as_ref().map(|b| b.len()).unwrap_or_default() as usize;
-        let results = if keep_count < self.len() * 80 / 100 {
-            log::info!("too many rows filtered, using flat search");
-            let bitmap = bitmap.unwrap();
+        let remained = prefilter_bitset
+            .as_ref()
+            .map(|b| b.count_ones())
+            .unwrap_or(storage.len()) as usize;
+        let results = if remained < self.len() * 10 / 100 {
+            log::debug!("too many rows filtered, using flat search");
+            let prefilter_bitset = prefilter_bitset.unwrap();
             let node_ids = storage
                 .row_ids()
                 .enumerate()
-                .filter_map(|(node_id, row_id)| {
-                    bitmap.contains(*row_id as u32).then_some(node_id as u32)
-                });
+                .filter_map(|(node_id, _)| {
+                    prefilter_bitset
+                        .contains(node_id as u32)
+                        .then_some(node_id as u32)
+                })
+                .collect_vec();
             let dist_calc = storage.dist_calculator(query);
-            let mut heap = BinaryHeap::<Reverse<OrderedNode>>::with_capacity(k);
-            for node_id in node_ids {
+            let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
+            for i in 0..node_ids.len() {
+                if let Some(ahead) = self.inner.params.prefetch_distance {
+                    if i + ahead < node_ids.len() {
+                        dist_calc.prefetch(node_ids[i + ahead]);
+                    }
+                }
+                let node_id = node_ids[i];
                 let dist = dist_calc.distance(node_id).into();
                 if heap.len() < k {
-                    heap.push(Reverse((dist, node_id).into()));
-                } else if dist < heap.peek().unwrap().0.dist {
+                    heap.push((dist, node_id).into());
+                } else if dist < heap.peek().unwrap().dist {
                     heap.pop();
-                    heap.push(Reverse((dist, node_id).into()));
+                    heap.push((dist, node_id).into());
                 }
             }
-            heap.into_iter()
-                .map(|x| x.0)
-                .sorted_unstable()
-                .collect_vec()
+            heap.into_sorted_vec()
         } else {
-            self.search_basic(query.clone(), k, params.ef, bitmap, storage)?
+            self.search_basic(query.clone(), k, params.ef, prefilter_bitset, storage)?
         };
+        // if the queue is full, we just don't push it back, so ignore the error here
+        let _ = self.inner.visited_generator_queue.push(prefilter_generator);
 
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| storage.row_id(x.id)));
         let distances = Arc::new(Float32Array::from_iter_values(

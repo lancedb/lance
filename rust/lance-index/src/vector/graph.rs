@@ -163,6 +163,10 @@ impl<'a> Visited<'a> {
         let node_id_usize = node_id as usize;
         self.visited[node_id_usize]
     }
+
+    pub fn count_ones(&self) -> usize {
+        self.visited.count_ones()
+    }
 }
 
 impl<'a> Drop for Visited<'a> {
@@ -230,7 +234,7 @@ pub fn beam_search(
     ep: &OrderedNode,
     k: usize,
     dist_calc: &impl DistCalculator,
-    bitset: Option<&roaring::bitmap::RoaringBitmap>,
+    bitset: Option<&Visited>,
     prefetch_distance: Option<usize>,
     visited: &mut Visited,
 ) -> Vec<OrderedNode> {
