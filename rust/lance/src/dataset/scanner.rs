@@ -1731,6 +1731,9 @@ mod test {
     use datafusion::logical_expr::{col, lit};
     use half::f16;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
@@ -2582,6 +2585,16 @@ mod test {
     async fn test_ann_prefilter(
         #[values(false, true)] use_legacy_format: bool,
         #[values(false, true)] stable_row_ids: bool,
+        #[values(
+            VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                MetricType::L2,
+                IvfBuildParams::default(),
+                HnswBuildParams::default(),
+                SQBuildParams::default()
+            )
+        )]
+        index_params: VectorIndexParams,
     ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -2618,7 +2631,7 @@ mod test {
                 &["vector"],
                 IndexType::Vector,
                 None,
-                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+                &index_params,
                 false,
             )
             .await
