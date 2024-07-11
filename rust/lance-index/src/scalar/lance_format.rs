@@ -1124,7 +1124,7 @@ mod tests {
                 let row_ids_set = row_ids
                     .row_ids()
                     .unwrap()
-                    .map(|addr| u64::from(addr))
+                    .map(u64::from)
                     .collect::<std::collections::HashSet<_>>();
 
                 for (list, row_id) in data
