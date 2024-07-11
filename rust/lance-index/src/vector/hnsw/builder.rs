@@ -650,7 +650,7 @@ impl IvfSubIndex for HNSW {
         let remained = prefilter_bitset
             .as_ref()
             .map(|b| b.count_ones())
-            .unwrap_or(storage.len()) as usize;
+            .unwrap_or(storage.len());
         let results = if remained < self.len() * 10 / 100 {
             log::debug!("too many rows filtered, using flat search");
             let prefilter_bitset = prefilter_bitset.unwrap();
