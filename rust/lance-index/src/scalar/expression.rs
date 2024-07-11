@@ -21,7 +21,7 @@ use lance_core::{
 use lance_datafusion::expr::safe_coerce_scalar;
 use tracing::instrument;
 
-use super::{AnyQuery, SargableQuery, ScalarIndex, TagQuery};
+use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex};
 
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
@@ -157,9 +157,9 @@ impl ScalarQueryParser for SargableQueryParser {
 }
 
 #[derive(Debug, Default)]
-pub struct TagQueryParser {}
+pub struct LabelListQueryParser {}
 
-impl ScalarQueryParser for TagQueryParser {
+impl ScalarQueryParser for LabelListQueryParser {
     fn visit_between(&self, _: &str, _: ScalarValue, _: ScalarValue) -> Option<IndexedExpression> {
         None
     }
@@ -190,21 +190,21 @@ impl ScalarQueryParser for TagQueryParser {
         if args.len() != 2 {
             return None;
         }
-        let tag_list = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::List(list_arr) = tag_list {
+        let label_list = maybe_scalar(&args[1], data_type)?;
+        if let ScalarValue::List(list_arr) = label_list {
             let list_values = list_arr.values();
             let mut scalars = Vec::with_capacity(list_values.len());
             for idx in 0..list_values.len() {
                 scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
             }
             if func.name() == "array_has_all" {
-                let query = TagQuery::HasAllTags(scalars);
+                let query = LabelListQuery::HasAllLabels(scalars);
                 Some(IndexedExpression::index_query(
                     column.to_string(),
                     Arc::new(query),
                 ))
             } else if func.name() == "array_has_any" {
-                let query = TagQuery::HasOneTag(scalars);
+                let query = LabelListQuery::HasAnyLabel(scalars);
                 Some(IndexedExpression::index_query(
                     column.to_string(),
                     Arc::new(query),

@@ -16,7 +16,7 @@ use lance_file::v2;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
-    IndexInformationProvider, SargableQueryParser, ScalarQueryParser, TagQueryParser,
+    IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
@@ -662,7 +662,7 @@ impl DatasetIndexInternalExt for Dataset {
             let field = schema.field_by_id(field).ok_or_else(|| Error::Internal { message: format!("Index referenced a field with id {field} which did not exist in the schema"), location: location!() });
             field.map(|field| {
                 let query_parser = if let DataType::List(_) = field.data_type() {
-                    Box::<TagQueryParser>::default() as Box<dyn ScalarQueryParser>
+                    Box::<LabelListQueryParser>::default() as Box<dyn ScalarQueryParser>
                 } else {
                     Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
                 };

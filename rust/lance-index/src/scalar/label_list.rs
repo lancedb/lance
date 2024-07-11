@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
-use futures::TryStreamExt;
+use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
@@ -24,31 +24,32 @@ use crate::{Index, IndexType};
 
 use super::{bitmap::train_bitmap_index, SargableQuery};
 use super::{
-    bitmap::BitmapIndex, btree::BtreeTrainingSource, AnyQuery, IndexStore, ScalarIndex, TagQuery,
+    bitmap::BitmapIndex, btree::BtreeTrainingSource, AnyQuery, IndexStore, LabelListQuery,
+    ScalarIndex,
 };
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
-trait TagSubIndex: ScalarIndex + DeepSizeOf {}
+trait LabelListSubIndex: ScalarIndex + DeepSizeOf {}
 
-impl<T: ScalarIndex + DeepSizeOf> TagSubIndex for T {}
+impl<T: ScalarIndex + DeepSizeOf> LabelListSubIndex for T {}
 
 /// A scalar index that can be used on List<T> columns to
 /// support queries with array_contains_all and array_contains_any
 /// using an underlying bitmap index.
 #[derive(Clone, Debug, DeepSizeOf)]
-pub struct TagIndex {
-    values_index: Arc<dyn TagSubIndex>,
+pub struct LabelListIndex {
+    values_index: Arc<dyn LabelListSubIndex>,
 }
 
-impl TagIndex {
-    fn new(values_index: Arc<dyn TagSubIndex>) -> Self {
+impl LabelListIndex {
+    fn new(values_index: Arc<dyn LabelListSubIndex>) -> Self {
         Self { values_index }
     }
 }
 
 #[async_trait]
-impl Index for TagIndex {
+impl Index for LabelListIndex {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -59,7 +60,7 @@ impl Index for TagIndex {
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
         Err(Error::NotSupported {
-            source: "TagIndex is not a vector index".into(),
+            source: "LabeListIndex is not a vector index".into(),
             location: location!(),
         })
     }
@@ -77,53 +78,55 @@ impl Index for TagIndex {
     }
 }
 
-impl TagIndex {
-    async fn search_values(&self, values: &Vec<ScalarValue>) -> Result<Vec<UInt64Array>> {
-        let mut value_results = Vec::with_capacity(values.len());
-        for value in values {
-            let value_query = SargableQuery::Equals(value.clone());
-            value_results.push(self.values_index.search(&value_query).await?);
-        }
-        Ok(value_results)
+impl LabelListIndex {
+    fn search_values<'a>(&'a self, values: &'a Vec<ScalarValue>) -> BoxStream<Result<UInt64Array>> {
+        futures::stream::iter(values)
+            .then(move |value| {
+                let value_query = SargableQuery::Equals(value.clone());
+                async move { self.values_index.search(&value_query).await }
+            })
+            .boxed()
     }
 
-    fn set_union(&self, sets: Vec<UInt64Array>) -> UInt64Array {
-        if sets.len() == 1 {
-            sets.into_iter().next().unwrap()
-        } else {
-            let combined = sets
-                .iter()
-                .flat_map(|arr| arr.values())
-                .copied()
-                .collect::<HashSet<_>>();
-            UInt64Array::from_iter_values(combined)
+    async fn set_union<'a>(
+        &'a self,
+        mut sets: impl TryStream<Ok = UInt64Array, Error = Error> + 'a + Unpin,
+    ) -> Result<UInt64Array> {
+        let first_bitmap = sets.try_next().await?.unwrap();
+        let mut all: HashSet<_> = first_bitmap.into_iter().collect();
+        while let Some(next) = sets.try_next().await? {
+            all.extend(&next);
         }
+        Ok(all.into_iter().collect())
     }
 
-    fn set_intersection(&self, sets: Vec<UInt64Array>) -> UInt64Array {
-        let mut set_iter = sets.into_iter();
-        let mut all: HashSet<_> = set_iter.next().unwrap().into_iter().collect();
-        for next in set_iter {
+    async fn set_intersection<'a>(
+        &'a self,
+        mut sets: impl TryStream<Ok = UInt64Array, Error = Error> + 'a + Unpin,
+    ) -> Result<UInt64Array> {
+        let first_bitmap = sets.try_next().await?.unwrap();
+        let mut all: HashSet<_> = first_bitmap.into_iter().collect();
+        while let Some(next) = sets.try_next().await? {
             let next_set = next.into_iter().collect::<HashSet<_>>();
-            all.retain(|item| !next_set.contains(item));
+            all.retain(|item| next_set.contains(item));
         }
-        all.into_iter().collect()
+        Ok(all.into_iter().collect())
     }
 }
 
 #[async_trait]
-impl ScalarIndex for TagIndex {
+impl ScalarIndex for LabelListIndex {
     async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array> {
-        let query = query.as_any().downcast_ref::<TagQuery>().unwrap();
+        let query = query.as_any().downcast_ref::<LabelListQuery>().unwrap();
 
         match query {
-            TagQuery::HasAllTags(tags) => {
-                let values_results = self.search_values(tags).await?;
-                Ok(self.set_union(values_results))
+            LabelListQuery::HasAllLabels(labels) => {
+                let values_results = self.search_values(labels);
+                self.set_intersection(values_results).await
             }
-            TagQuery::HasOneTag(tags) => {
-                let values_results = self.search_values(tags).await?;
-                Ok(self.set_intersection(values_results))
+            LabelListQuery::HasAnyLabel(labels) => {
+                let values_results = self.search_values(labels);
+                self.set_union(values_results).await
             }
         }
     }
@@ -276,8 +279,8 @@ impl BtreeTrainingSource for UnnestTrainingSource {
     }
 }
 
-/// Trains a new tag index
-pub async fn train_tag_index(
+/// Trains a new label list index
+pub async fn train_label_list_index(
     data_source: Box<dyn BtreeTrainingSource + Send>,
     index_store: &dyn IndexStore,
 ) -> Result<()> {

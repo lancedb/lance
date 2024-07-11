@@ -93,7 +93,7 @@ def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
 
     dataset.create_scalar_index("filterable", "BTREE")
     dataset.create_scalar_index("category", "BITMAP")
-    dataset.create_scalar_index("genres", "TAG")
+    dataset.create_scalar_index("genres", "LABEL_LIST")
 
     return lance.dataset(tmp_path, index_cache_size=64 * 1024)
 
@@ -442,7 +442,7 @@ def test_bitmap_index_search(test_dataset, benchmark, filter: str):
     ),
     ids=["none", "one"],
 )
-def test_tag_index_prefilter(test_dataset, benchmark, filter: str):
+def test_label_list_index_prefilter(test_dataset, benchmark, filter: str):
     q = pc.random(N_DIMS).cast(pa.float32())
     if filter is None:
         benchmark(

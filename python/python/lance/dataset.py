@@ -1103,7 +1103,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_scalar_index(
         self,
         column: str,
-        index_type: Union[Literal["BTREE"], Literal["BITMAP"], Literal["TAG"]],
+        index_type: Union[Literal["BTREE"], Literal["BITMAP"], Literal["LABEL_LIST"]],
         name: Optional[str] = None,
         *,
         replace: bool = True,
@@ -1169,11 +1169,11 @@ class LanceDataset(pa.dataset.Dataset):
         unique value in the column.  This index is useful for columns with a small
         number of unique values and many rows per value.
 
-        The ``TAG`` index type is a special index that is used to index list columns
-        whose values have small cardinality.  For example, a column that contains
-        lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed with a
-        ``TAG`` index.  This index can only speedup queries with ``array_has_any``
-        or ``array_has_all`` filters.
+        The ``LABEL_LIST`` index type is a special index that is used to index list
+        columns whose values have small cardinality.  For example, a column that
+        contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
+        with a ``LABEL_LIST`` index.  This index can only speedup queries with
+        ``array_has_any`` or ``array_has_all`` filters.
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
@@ -1220,10 +1220,10 @@ class LanceDataset(pa.dataset.Dataset):
             raise KeyError(f"{column} not found in schema")
 
         index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "TAG"]:
+        if index_type not in ["BTREE", "BITMAP", "LABEL_LIST"]:
             raise NotImplementedError(
                 (
-                    'Only "BTREE", "TAG", or "BITMAP" are supported for '
+                    'Only "BTREE", "LABEL_LIST", or "BITMAP" are supported for '
                     f"scalar columns.  Received {index_type}",
                 )
             )
@@ -1241,9 +1241,9 @@ class LanceDataset(pa.dataset.Dataset):
                     f"BTREE/BITMAP index column {column} must be int",
                     ", float, bool, str, or temporal",
                 )
-        elif index_type == "TAG":
+        elif index_type == "LABEL_LIST":
             if not pa.types.is_list(field.type):
-                raise TypeError(f"TAG index column {column} must be a list")
+                raise TypeError(f"LABEL_LIST index column {column} must be a list")
 
         if pa.types.is_duration(field.type):
             raise TypeError(

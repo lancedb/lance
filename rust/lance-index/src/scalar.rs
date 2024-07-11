@@ -25,8 +25,8 @@ pub mod btree;
 pub mod expression;
 pub mod flat;
 pub mod inverted;
+pub mod label_list;
 pub mod lance_format;
-pub mod tag;
 
 /// Trait for storing an index (or parts of an index) into storage
 #[async_trait]
@@ -223,16 +223,16 @@ impl AnyQuery for SargableQuery {
     }
 }
 
-/// A query that a TagIndex can satisfy
+/// A query that a LabelListIndex can satisfy
 #[derive(Debug, Clone, PartialEq)]
-pub enum TagQuery {
-    /// Retrieve all row ids where every tag is in the list of values for the row
-    HasAllTags(Vec<ScalarValue>),
-    /// Retrieve all row ids where at least one of the given tags is in the list of values for the row
-    HasOneTag(Vec<ScalarValue>),
+pub enum LabelListQuery {
+    /// Retrieve all row ids where every label is in the list of values for the row
+    HasAllLabels(Vec<ScalarValue>),
+    /// Retrieve all row ids where at least one of the given labels is in the list of values for the row
+    HasAnyLabel(Vec<ScalarValue>),
 }
 
-impl AnyQuery for TagQuery {
+impl AnyQuery for LabelListQuery {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -243,43 +243,43 @@ impl AnyQuery for TagQuery {
 
     fn to_expr(&self, col: String) -> Expr {
         match self {
-            Self::HasAllTags(tags) => {
-                let tags_arr = ScalarValue::iter_to_array(tags.iter().cloned()).unwrap();
+            Self::HasAllLabels(labels) => {
+                let labels_arr = ScalarValue::iter_to_array(labels.iter().cloned()).unwrap();
                 let offsets_buffer =
-                    OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, tags_arr.len() as i32]));
-                let tags_list = ListArray::try_new(
-                    Arc::new(Field::new("item", tags_arr.data_type().clone(), false)),
+                    OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
+                let labels_list = ListArray::try_new(
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
                     offsets_buffer,
-                    tags_arr,
+                    labels_arr,
                     None,
                 )
                 .unwrap();
-                let tags_arr = Arc::new(tags_list);
+                let labels_arr = Arc::new(labels_list);
                 Expr::ScalarFunction(ScalarFunction {
                     func_def: ScalarFunctionDefinition::Name("array_contains_all".into()),
                     args: vec![
                         Expr::Column(Column::new_unqualified(col)),
-                        Expr::Literal(ScalarValue::List(tags_arr)),
+                        Expr::Literal(ScalarValue::List(labels_arr)),
                     ],
                 })
             }
-            Self::HasOneTag(tags) => {
-                let tags_arr = ScalarValue::iter_to_array(tags.iter().cloned()).unwrap();
+            Self::HasAnyLabel(labels) => {
+                let labels_arr = ScalarValue::iter_to_array(labels.iter().cloned()).unwrap();
                 let offsets_buffer =
-                    OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, tags_arr.len() as i32]));
-                let tags_list = ListArray::try_new(
-                    Arc::new(Field::new("item", tags_arr.data_type().clone(), false)),
+                    OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
+                let labels_list = ListArray::try_new(
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
                     offsets_buffer,
-                    tags_arr,
+                    labels_arr,
                     None,
                 )
                 .unwrap();
-                let tags_arr = Arc::new(tags_list);
+                let labels_arr = Arc::new(labels_list);
                 Expr::ScalarFunction(ScalarFunction {
                     func_def: ScalarFunctionDefinition::Name("array_contains_any".into()),
                     args: vec![
                         Expr::Column(Column::new_unqualified(col)),
-                        Expr::Literal(ScalarValue::List(tags_arr)),
+                        Expr::Literal(ScalarValue::List(labels_arr)),
                     ],
                 })
             }

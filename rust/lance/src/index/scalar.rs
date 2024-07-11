@@ -15,8 +15,8 @@ use lance_index::{
         bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
         btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
         flat::FlatIndexMetadata,
+        label_list::{train_label_list_index, LabelListIndex},
         lance_format::LanceIndexStore,
-        tag::{train_tag_index, TagIndex},
         ScalarIndex,
     },
     IndexType,
@@ -38,7 +38,7 @@ pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
-    Tag,
+    LabelList,
 }
 
 #[derive(Default)]
@@ -108,7 +108,7 @@ pub async fn build_scalar_index(
     })?;
     // In theory it should be possible to create a btree/bitmap index on a nested field but
     // performance would be poor and I'm not sure we want to allow that unless there is a need.
-    if !matches!(params.force_index_type, Some(ScalarIndexType::Tag))
+    if !matches!(params.force_index_type, Some(ScalarIndexType::LabelList))
         && field.data_type().is_nested()
     {
         return Err(Error::InvalidInput {
@@ -119,7 +119,9 @@ pub async fn build_scalar_index(
     let index_store = LanceIndexStore::from_dataset(dataset, uuid);
     match params.force_index_type {
         Some(ScalarIndexType::Bitmap) => train_bitmap_index(training_request, &index_store).await,
-        Some(ScalarIndexType::Tag) => train_tag_index(training_request, &index_store).await,
+        Some(ScalarIndexType::LabelList) => {
+            train_label_list_index(training_request, &index_store).await
+        }
         _ => {
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
             train_btree_index(training_request, &flat_index_trainer, &index_store).await
@@ -144,7 +146,7 @@ pub async fn open_scalar_index(
         location: location!(),
     })?;
     if let DataType::List(_) = col.data_type() {
-        let tag_index = TagIndex::load(index_store).await?;
+        let tag_index = LabelListIndex::load(index_store).await?;
         Ok(tag_index as Arc<dyn ScalarIndex>)
     } else {
         let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);

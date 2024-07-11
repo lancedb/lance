@@ -934,7 +934,7 @@ impl Dataset {
     ) -> PyResult<()> {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
-            "BTREE" | "BITMAP" | "TAG" => IndexType::Scalar,
+            "BTREE" | "BITMAP" | "LABEL_LIST" => IndexType::Scalar,
             "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -951,9 +951,9 @@ impl Dataset {
                 // Temporary workaround until we add support for auto-detection of scalar index type
                 force_index_type: Some(ScalarIndexType::Bitmap),
             })
-        } else if index_type == "TAG" {
+        } else if index_type == "LABEL_LIST" {
             Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::Tag),
+                force_index_type: Some(ScalarIndexType::LabelList),
             })
         } else {
             let column_type = match self.ds.schema().field(columns[0]) {

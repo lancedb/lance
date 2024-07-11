@@ -161,12 +161,12 @@ mod tests {
         bitmap::{train_bitmap_index, BitmapIndex},
         btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
         flat::FlatIndexMetadata,
-        tag::{train_tag_index, TagIndex},
-        SargableQuery, ScalarIndex, TagQuery,
+        label_list::{train_label_list_index, LabelListIndex},
+        LabelListQuery, SargableQuery, ScalarIndex,
     };
 
     use super::*;
-    use arrow::datatypes::UInt8Type;
+    use arrow::{buffer::ScalarBuffer, datatypes::UInt8Type};
     use arrow_array::{
         cast::AsArray,
         types::{Float32Type, Int32Type, UInt64Type},
@@ -1087,11 +1087,13 @@ mod tests {
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
         let data = Box::new(MockTrainingSource::new(data).await);
-        train_tag_index(data, index_store.as_ref()).await.unwrap();
+        train_label_list_index(data, index_store.as_ref())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn test_tag_index() {
+    async fn test_label_list_index() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
         let data = gen()
@@ -1111,40 +1113,80 @@ mod tests {
 
         // This is probably enough data that we can be assured each tag is used at least once
         train_tag(&index_store, batch_reader).await;
-        let index = TagIndex::load(index_store).await.unwrap();
 
-        let row_ids = index
-            .search(&TagQuery::HasOneTag(vec![ScalarValue::UInt8(Some(1))]))
-            .await
-            .unwrap();
+        // We scan through each list, if it was a match we run match_fn to check
+        // if the match was correct if it was not a match we run no_match_fn to check
+        // if the no-match was correct
+        type MatchFn = Box<dyn Fn(&ScalarBuffer<u8>) -> bool>;
+        let check = |query: LabelListQuery, match_fn: MatchFn, no_match_fn: MatchFn| {
+            let index_store = index_store.clone();
+            let data = data.clone();
+            async move {
+                let index = LabelListIndex::load(index_store).await.unwrap();
+                let row_ids = index.search(&query).await.unwrap();
 
-        let row_ids_set = row_ids
-            .values()
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-
-        for (list, row_id) in data
-            .column(0)
-            .as_list::<i32>()
-            .iter()
-            .zip(data.column(1).as_primitive::<UInt64Type>())
-        {
-            let list = list.unwrap();
-            let row_id = row_id.unwrap();
-            if row_ids_set.contains(&row_id) {
-                assert!(list
-                    .as_primitive::<UInt8Type>()
+                let row_ids_set = row_ids
                     .values()
                     .iter()
-                    .any(|val| *val == 1));
-            } else {
-                assert!(list
-                    .as_primitive::<UInt8Type>()
-                    .values()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>();
+
+                for (list, row_id) in data
+                    .column(0)
+                    .as_list::<i32>()
                     .iter()
-                    .all(|val| *val != 1));
+                    .zip(data.column(1).as_primitive::<UInt64Type>())
+                {
+                    let list = list.unwrap();
+                    let row_id = row_id.unwrap();
+                    let vals = list.as_primitive::<UInt8Type>().values();
+                    if row_ids_set.contains(&row_id) {
+                        println!("Match: {:?}", vals);
+                        assert!(match_fn(vals));
+                    } else {
+                        println!("NoMatch: {:?}", vals);
+                        assert!(no_match_fn(vals));
+                    }
+                }
             }
-        }
+        };
+
+        // Simple check for 1 value (doesn't matter intersection vs union)
+        check(
+            LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]),
+            Box::new(|vals| vals.iter().any(|val| *val == 1)),
+            Box::new(|vals| vals.iter().all(|val| *val != 1)),
+        )
+        .await;
+        check(
+            LabelListQuery::HasAllLabels(vec![ScalarValue::UInt8(Some(1))]),
+            Box::new(|vals| vals.iter().any(|val| *val == 1)),
+            Box::new(|vals| vals.iter().all(|val| *val != 1)),
+        )
+        .await;
+        // Set intersection
+        check(
+            LabelListQuery::HasAllLabels(vec![
+                ScalarValue::UInt8(Some(1)),
+                ScalarValue::UInt8(Some(2)),
+            ]),
+            // Match must have 1 and 2
+            Box::new(|vals| vals.iter().any(|val| *val == 1) && vals.iter().any(|val| *val == 2)),
+            // No-match must either not have 1 or not have 2
+            Box::new(|vals| vals.iter().all(|val| *val != 1) || vals.iter().all(|val| *val != 2)),
+        )
+        .await;
+        // Set union
+        check(
+            LabelListQuery::HasAnyLabel(vec![
+                ScalarValue::UInt8(Some(1)),
+                ScalarValue::UInt8(Some(2)),
+            ]),
+            // Match either have 1 or have 2
+            Box::new(|vals| vals.iter().any(|val| *val == 1) || vals.iter().any(|val| *val == 2)),
+            // No-match must not have 1 and not have 2
+            Box::new(|vals| vals.iter().all(|val| *val != 1) && vals.iter().all(|val| *val != 2)),
+        )
+        .await;
     }
 }
