@@ -32,7 +32,7 @@ jobs:
           if-no-files-found: error
   linux-arm64:
     name: Build on Linux Arm64
-    runs-on: warp-ubuntu-2204-x64-8x
+    runs-on: warp-ubuntu-2204-arm64-8x
     timeout-minutes: 30
     defaults:
       run:
@@ -41,8 +41,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "1.79.0"
@@ -50,7 +48,6 @@ jobs:
           # Disable full debug symbol generation to speed up CI build and keep memory down
           # "1" means line tables only, which is useful for panic tracebacks.
           rustflags: "-C debuginfo=1"
-          components: "rustfmt,clippy"
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
@@ -66,7 +63,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
   linux-x86:
-    runs-on: ubuntu-22.04
+    runs-on: warp-ubuntu-2204-x64-8x
     timeout-minutes: 30
     needs: [macos-arm64, linux-arm64]
     defaults:
@@ -89,8 +86,8 @@ jobs:
           gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+          sudo apt -y -qq update
+          sudo apt install -y protobuf-compiler libssl-dev pkg-config
       - name: Download artifact
         uses: actions/download-artifact@v4
       - name: Copy native libs
@@ -100,7 +97,7 @@ jobs:
           cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
       - name: Build and publish with Java 8
         run: |
-          mvn release:prepare -B -DskipTests
+          mvn release:prepare -B -DskipTests -DpushChanges=false
       - name: Publish with Java 8
         run: |
           mvn --batch-mode -DskipTests clean deploy -P deploy-to-ossrh
