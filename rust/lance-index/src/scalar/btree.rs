@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
@@ -29,7 +29,7 @@ use futures::{
     stream::{self},
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
-use lance_core::{Error, Result};
+use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
@@ -676,7 +676,7 @@ impl BTreeIndex {
         query: &SargableQuery,
         page_number: u32,
         index_reader: Arc<dyn IndexReader>,
-    ) -> Result<UInt64Array> {
+    ) -> Result<RowIdTreeMap> {
         let serialized_page = index_reader.read_record_batch(page_number).await?;
         let subindex = self.sub_index.load_subindex(serialized_page).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
@@ -836,7 +836,7 @@ impl Index for BTreeIndex {
 
 #[async_trait]
 impl ScalarIndex for BTreeIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let pages = match query {
             SargableQuery::Equals(val) => self
@@ -862,19 +862,10 @@ impl ScalarIndex for BTreeIndex {
                     .boxed()
             })
             .collect::<Vec<_>>();
-        let row_id_lists = stream::iter(page_tasks)
+        stream::iter(page_tasks)
             .buffered(num_cpus::get())
-            .try_collect::<Vec<UInt64Array>>()
-            .await?;
-        let total_size = row_id_lists
-            .iter()
-            .map(|row_id_list| row_id_list.len())
-            .sum();
-        let mut all_row_ids = Vec::with_capacity(total_size);
-        for row_id_list in row_id_lists {
-            all_row_ids.extend(row_id_list.values());
-        }
-        Ok(UInt64Array::from_iter_values(all_row_ids))
+            .try_collect::<RowIdTreeMap>()
+            .await
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {

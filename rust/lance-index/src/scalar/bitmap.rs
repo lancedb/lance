@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow::array::{BinaryBuilder, UInt64Builder};
+use arrow::array::BinaryBuilder;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -17,11 +17,11 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{Error, Result};
-use roaring::treemap::RoaringTreemap;
+use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
+use tracing::instrument;
 
 use crate::{Index, IndexType};
 
@@ -36,7 +36,7 @@ pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 /// The bitmap stores a list of row ids where the value is present.
 #[derive(Clone, Debug)]
 pub struct BitmapIndex {
-    index_map: BTreeMap<OrderableScalarValue, UInt64Array>,
+    index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap>,
     // Memoized index_map size for DeepSizeOf
     index_map_size_bytes: usize,
     store: Arc<dyn IndexStore>,
@@ -44,7 +44,7 @@ pub struct BitmapIndex {
 
 impl BitmapIndex {
     fn new(
-        index_map: BTreeMap<OrderableScalarValue, UInt64Array>,
+        index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap>,
         index_map_size_bytes: usize,
         store: Arc<dyn IndexStore>,
     ) -> Self {
@@ -71,19 +71,18 @@ impl BitmapIndex {
             .downcast_ref::<BinaryArray>()
             .unwrap();
 
-        let mut index_map: BTreeMap<OrderableScalarValue, UInt64Array> = BTreeMap::new();
+        let mut index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap> = BTreeMap::new();
 
         let mut index_map_size_bytes = 0;
         for idx in 0..data.num_rows() {
             let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
             let bitmap_bytes = bitmap_binary_array.value(idx);
-            let bitmap = RoaringTreemap::deserialize_from(bitmap_bytes).unwrap();
-            let bitmap_vec: Vec<u64> = bitmap.into_iter().collect();
-            let bitmap_array = UInt64Array::from(bitmap_vec);
+            let bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
             index_map_size_bytes += key.deep_size_of();
-            index_map_size_bytes += bitmap_array.get_array_memory_size();
-            index_map.insert(key, bitmap_array);
+            // This should be a reasonable approximation of the RowIdTreeMap size
+            index_map_size_bytes += bitmap_bytes.len();
+            index_map.insert(key, bitmap);
         }
 
         Ok(Self::new(index_map, index_map_size_bytes, store))
@@ -147,15 +146,14 @@ impl Index for BitmapIndex {
 
 #[async_trait]
 impl ScalarIndex for BitmapIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array> {
+    #[instrument(name = "bitmap_search", level = "debug", skip_all)]
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        let empty_vec: Vec<u64> = Vec::new();
-        let empty_array = UInt64Array::from(empty_vec);
 
         let row_ids = match query {
             SargableQuery::Equals(val) => {
                 let key = OrderableScalarValue(val.clone());
-                self.index_map.get(&key).unwrap_or(&empty_array).clone()
+                self.index_map.get(&key).cloned().unwrap_or_default()
             }
             SargableQuery::Range(start, end) => {
                 let range_start = match start {
@@ -171,25 +169,24 @@ impl ScalarIndex for BitmapIndex {
                 };
 
                 let range_iter = self.index_map.range((range_start, range_end));
-                let total_len: usize = range_iter.clone().map(|(_, arr)| arr.len()).sum();
-                let mut builder = UInt64Builder::with_capacity(total_len);
+                let mut union_bitmap = RowIdTreeMap::default();
 
-                for (_, array) in range_iter {
-                    builder.append_slice(array.values());
+                for (_, bitmap) in range_iter {
+                    union_bitmap |= bitmap.clone();
                 }
 
-                builder.finish()
+                union_bitmap
             }
             SargableQuery::IsIn(values) => {
-                let mut builder = UInt64Builder::new();
+                let mut union_bitmap = RowIdTreeMap::default();
                 for val in values {
                     let key = OrderableScalarValue(val.clone());
-                    if let Some(array) = self.index_map.get(&key) {
-                        builder.append_slice(array.values());
+                    if let Some(bitmap) = self.index_map.get(&key) {
+                        union_bitmap |= bitmap.clone();
                     }
                 }
 
-                builder.finish()
+                union_bitmap
             }
             SargableQuery::IsNull() => {
                 if let Some(array) = self
@@ -200,7 +197,7 @@ impl ScalarIndex for BitmapIndex {
                 {
                     array.clone()
                 } else {
-                    empty_array
+                    RowIdTreeMap::default()
                 }
             }
             SargableQuery::FullTextSearch(_) => {
@@ -234,11 +231,12 @@ impl ScalarIndex for BitmapIndex {
             .index_map
             .iter()
             .map(|(key, bitmap)| {
-                let bitmap = bitmap
-                    .values()
-                    .iter()
-                    .filter_map(|row_id| *mapping.get(row_id)?)
-                    .collect::<Vec<_>>();
+                let bitmap = RowIdTreeMap::from_iter(
+                    bitmap
+                        .row_ids()
+                        .unwrap()
+                        .filter_map(|addr| *mapping.get(&u64::from(addr))?),
+                );
                 (key.0.clone(), bitmap)
             })
             .collect::<HashMap<_, _>>();
@@ -254,12 +252,7 @@ impl ScalarIndex for BitmapIndex {
         let state = self
             .index_map
             .iter()
-            .map(|(key, bitmap)| {
-                (
-                    key.0.clone(),
-                    Vec::from_iter(bitmap.values().iter().copied()),
-                )
-            })
+            .map(|(key, bitmap)| (key.0.clone(), bitmap.clone()))
             .collect::<HashMap<_, _>>();
         do_train_bitmap_index(new_data, state, dest_store).await
     }
@@ -284,12 +277,10 @@ fn get_batch_from_arrays(
 // serialized to bytes. The entire collection is converted to a BinaryArray
 fn get_bitmaps_from_iter<I>(iter: I) -> Arc<dyn Array>
 where
-    I: Iterator<Item = Vec<u64>>,
+    I: Iterator<Item = RowIdTreeMap>,
 {
     let mut builder = BinaryBuilder::new();
-    iter.for_each(|vec| {
-        let mut bitmap = RoaringTreemap::new();
-        bitmap.extend(vec);
+    iter.for_each(|bitmap| {
         let mut bytes = Vec::new();
         bitmap.serialize_into(&mut bytes).unwrap();
         builder.append_value(&bytes);
@@ -299,7 +290,7 @@ where
 }
 
 async fn write_bitmap_index(
-    state: HashMap<ScalarValue, Vec<u64>>,
+    state: HashMap<ScalarValue, RowIdTreeMap>,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
     let keys_iter = state.keys().cloned();
@@ -320,7 +311,7 @@ async fn write_bitmap_index(
 
 async fn do_train_bitmap_index(
     mut data_source: SendableRecordBatchStream,
-    mut state: HashMap<ScalarValue, Vec<u64>>,
+    mut state: HashMap<ScalarValue, RowIdTreeMap>,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
     while let Some(batch) = data_source.try_next().await? {
@@ -337,7 +328,7 @@ async fn do_train_bitmap_index(
         for i in 0..key_column.len() {
             let row_id = row_id_column.value(i);
             let key = ScalarValue::try_from_array(key_column.as_ref(), i)?;
-            state.entry(key.clone()).or_default().push(row_id);
+            state.entry(key.clone()).or_default().insert(row_id);
         }
     }
 
@@ -351,7 +342,7 @@ pub async fn train_bitmap_index(
     let batches_source = data_source.scan_ordered_chunks(4096).await?;
 
     // mapping from item to list of the row ids where it is present
-    let dictionary: HashMap<ScalarValue, Vec<u64>> = HashMap::new();
+    let dictionary: HashMap<ScalarValue, RowIdTreeMap> = HashMap::new();
 
     do_train_bitmap_index(batches_source, dictionary, index_store).await
 }

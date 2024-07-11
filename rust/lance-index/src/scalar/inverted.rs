@@ -13,6 +13,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result, ROW_ID};
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
@@ -123,7 +124,7 @@ impl Index for InvertedIndex {
 #[async_trait]
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
-    async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
             SargableQuery::FullTextSearch(tokens) => {
@@ -142,7 +143,7 @@ impl ScalarIndex for InvertedIndex {
 
         // sort the row ids (documents) by bm25 score
 
-        Ok(UInt64Array::from_iter_values(row_ids))
+        Ok(RowIdTreeMap::from_iter(row_ids))
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
@@ -537,18 +538,18 @@ mod tests {
             .search(&super::SargableQuery::FullTextSearch(vec!["a".to_string()]))
             .await
             .unwrap();
-        assert_eq!(row_ids.len(), 3);
-        assert!(row_ids.values().contains(&0));
-        assert!(row_ids.values().contains(&1));
-        assert!(row_ids.values().contains(&2));
+        assert_eq!(row_ids.len(), Some(3));
+        assert!(row_ids.contains(0));
+        assert!(row_ids.contains(1));
+        assert!(row_ids.contains(2));
 
         let row_ids = invert_index
             .search(&super::SargableQuery::FullTextSearch(vec!["b".to_string()]))
             .await
             .unwrap();
-        assert_eq!(row_ids.len(), 3);
-        assert!(row_ids.values().contains(&0));
-        assert!(row_ids.values().contains(&1));
-        assert!(row_ids.values().contains(&3));
+        assert_eq!(row_ids.len(), Some(3));
+        assert!(row_ids.contains(0));
+        assert!(row_ids.contains(1));
+        assert!(row_ids.contains(3));
     }
 }

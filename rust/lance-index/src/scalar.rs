@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::{any::Any, ops::Bound, sync::Arc};
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_array::{ListArray, RecordBatch, UInt64Array};
+use arrow_array::{ListArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -16,6 +16,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{Expr, ScalarFunctionDefinition};
 use deepsize::DeepSizeOf;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::Result;
 
 use crate::Index;
@@ -300,7 +301,7 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not neccesarily ordered
-    async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array>;
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap>;
 
     /// Load the scalar index from storage
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
