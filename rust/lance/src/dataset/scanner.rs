@@ -2589,7 +2589,7 @@ mod test {
             VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
             VectorIndexParams::with_ivf_hnsw_sq_params(
                 MetricType::L2,
-                IvfBuildParams::default(),
+                IvfBuildParams::new(2),
                 HnswBuildParams::default(),
                 SQBuildParams::default()
             )
