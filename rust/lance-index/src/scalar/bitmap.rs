@@ -25,8 +25,8 @@ use snafu::{location, Location};
 
 use crate::{Index, IndexType};
 
-use super::btree::OrderableScalarValue;
-use super::{btree::BtreeTrainingSource, IndexStore, ScalarIndex, ScalarQuery};
+use super::{btree::BtreeTrainingSource, AnyQuery, IndexStore, ScalarIndex};
+use super::{btree::OrderableScalarValue, SargableQuery};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
@@ -147,16 +147,17 @@ impl Index for BitmapIndex {
 
 #[async_trait]
 impl ScalarIndex for BitmapIndex {
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array> {
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let empty_vec: Vec<u64> = Vec::new();
         let empty_array = UInt64Array::from(empty_vec);
 
         let row_ids = match query {
-            ScalarQuery::Equals(val) => {
+            SargableQuery::Equals(val) => {
                 let key = OrderableScalarValue(val.clone());
                 self.index_map.get(&key).unwrap_or(&empty_array).clone()
             }
-            ScalarQuery::Range(start, end) => {
+            SargableQuery::Range(start, end) => {
                 let range_start = match start {
                     Bound::Included(val) => Bound::Included(OrderableScalarValue(val.clone())),
                     Bound::Excluded(val) => Bound::Excluded(OrderableScalarValue(val.clone())),
@@ -179,7 +180,7 @@ impl ScalarIndex for BitmapIndex {
 
                 builder.finish()
             }
-            ScalarQuery::IsIn(values) => {
+            SargableQuery::IsIn(values) => {
                 let mut builder = UInt64Builder::new();
                 for val in values {
                     let key = OrderableScalarValue(val.clone());
@@ -190,7 +191,7 @@ impl ScalarIndex for BitmapIndex {
 
                 builder.finish()
             }
-            ScalarQuery::IsNull() => {
+            SargableQuery::IsNull() => {
                 if let Some(array) = self
                     .index_map
                     .iter()
@@ -202,7 +203,7 @@ impl ScalarIndex for BitmapIndex {
                     empty_array
                 }
             }
-            ScalarQuery::FullTextSearch(_) => {
+            SargableQuery::FullTextSearch(_) => {
                 return Err(Error::NotSupported {
                     source: "full text search is not supported for bitmap indexes".into(),
                     location: location!(),

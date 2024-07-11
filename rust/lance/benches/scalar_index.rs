@@ -19,7 +19,7 @@ use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
     flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
-    IndexStore, ScalarIndex, ScalarQuery,
+    IndexStore, SargableQuery, ScalarIndex,
 };
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -114,7 +114,7 @@ async fn baseline_equality_search(fixture: &BenchmarkFixture) {
 
 async fn warm_indexed_equality_search(index: &BTreeIndex) {
     let row_ids = index
-        .search(&ScalarQuery::Equals(ScalarValue::UInt32(Some(10000))))
+        .search(&SargableQuery::Equals(ScalarValue::UInt32(Some(10000))))
         .await
         .unwrap();
     assert_eq!(row_ids.len(), 1);
@@ -140,7 +140,7 @@ async fn baseline_inequality_search(fixture: &BenchmarkFixture) {
 
 async fn warm_indexed_inequality_search(index: &BTreeIndex) {
     let row_ids = index
-        .search(&ScalarQuery::Range(
+        .search(&SargableQuery::Range(
             std::ops::Bound::Included(ScalarValue::UInt32(Some(50_000_000))),
             std::ops::Bound::Unbounded,
         ))
@@ -152,7 +152,7 @@ async fn warm_indexed_inequality_search(index: &BTreeIndex) {
 
 async fn warm_indexed_isin_search(index: &BTreeIndex) {
     let row_ids = index
-        .search(&ScalarQuery::IsIn(vec![
+        .search(&SargableQuery::IsIn(vec![
             ScalarValue::UInt32(Some(10000)),
             ScalarValue::UInt32(Some(50000000)),
             ScalarValue::UInt32(Some(150000000)), // Not found
