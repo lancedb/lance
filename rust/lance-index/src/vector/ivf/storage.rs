@@ -3,9 +3,10 @@
 
 use std::ops::Range;
 
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt32Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt32Array};
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
@@ -179,7 +180,18 @@ impl TryFrom<PbIvf> for IvfModel {
             debug!("Ivf: loading IVF centroids from index format v2");
             Some(FixedSizeListArray::try_from(tensor)?)
         } else {
-            None
+            debug!("Ivf: loading IVF centroids from index format v1");
+            // For backward-compatibility
+            assert!(
+                !proto.centroids.is_empty(),
+                "the IVF model broken in the file, the centroids should not be empty."
+            );
+            let f32_centroids = Float32Array::from(proto.centroids.clone());
+            let dimension = f32_centroids.len() / proto.lengths.len();
+            Some(FixedSizeListArray::try_new_from_values(
+                f32_centroids,
+                dimension as i32,
+            )?)
         };
         // We are not using offsets from the protobuf, which was the file offset in the
         // v1 index format. It will be deprecated soon.
@@ -223,6 +235,8 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_table::format::SelfDescribingFileReader;
     use object_store::path::Path;
+
+    use crate::pb;
 
     use super::*;
 
@@ -271,5 +285,22 @@ mod tests {
         let ivf2 = IvfModel::load(&reader).await.unwrap();
         assert_eq!(ivf, ivf2);
         assert_eq!(ivf2.num_partitions(), 2);
+    }
+
+    #[test]
+    fn test_load_v1_format_ivf() {
+        // in v1 format, the centroids are stored as a flat array in field `centroids`.
+        let pb_ivf = pb::Ivf {
+            centroids: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            lengths: vec![2, 2],
+            offsets: vec![0, 2],
+            centroids_tensor: None,
+        };
+
+        let ivf = IvfModel::try_from(pb_ivf).unwrap();
+        assert_eq!(ivf.num_partitions(), 2);
+        assert_eq!(ivf.dimension(), 3);
+        assert_eq!(ivf.centroids.as_ref().unwrap().len(), 2);
+        assert_eq!(ivf.centroids.as_ref().unwrap().value_length(), 3);
     }
 }
