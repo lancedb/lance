@@ -85,6 +85,8 @@ jobs:
           server-id: ossrh
           server-username: ${{ secrets.SONATYPE_USER }}
           server-password: ${{ secrets.SONATYPE_TOKEN }}
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
       - name: Install dependencies
         run: |
           sudo apt update
@@ -105,3 +107,4 @@ jobs:
         env:
           MAVEN_USERNAME: ${{ secrets.SONATYPE_USER }}
           MAVEN_PASSWORD: ${{ secrets.SONATYPE_TOKEN }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
