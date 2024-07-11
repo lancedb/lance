@@ -2627,13 +2627,7 @@ mod test {
             .unwrap();
 
         dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                None,
-                &index_params,
-                false,
-            )
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, false)
             .await
             .unwrap();
 
