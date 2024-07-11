@@ -20,7 +20,7 @@ use snafu::{location, Location};
 use crate::vector::graph::OrderedFloat;
 use crate::Index;
 
-use super::{IndexReader, IndexStore, ScalarIndex, ScalarQuery};
+use super::{AnyQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex};
 
 const TOKENS_FILE: &str = "tokens.lance";
 const INVERT_LIST_FILE: &str = "invert.lance";
@@ -123,9 +123,10 @@ impl Index for InvertedIndex {
 #[async_trait]
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array> {
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
-            ScalarQuery::FullTextSearch(tokens) => {
+            SargableQuery::FullTextSearch(tokens) => {
                 let token_ids = self.map(tokens);
                 self.bm25_search(token_ids)
                     .into_iter()
@@ -533,7 +534,7 @@ mod tests {
 
         let invert_index = super::InvertedIndex::load(Arc::new(store)).await.unwrap();
         let row_ids = invert_index
-            .search(&super::ScalarQuery::FullTextSearch(vec!["a".to_string()]))
+            .search(&super::SargableQuery::FullTextSearch(vec!["a".to_string()]))
             .await
             .unwrap();
         assert_eq!(row_ids.len(), 3);
@@ -542,7 +543,7 @@ mod tests {
         assert!(row_ids.values().contains(&2));
 
         let row_ids = invert_index
-            .search(&super::ScalarQuery::FullTextSearch(vec!["b".to_string()]))
+            .search(&super::SargableQuery::FullTextSearch(vec!["b".to_string()]))
             .await
             .unwrap();
         assert_eq!(row_ids.len(), 3);

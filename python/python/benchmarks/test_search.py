@@ -31,16 +31,34 @@ def find_or_clean(dataset_path: Path) -> Union[lance.LanceDataset, None]:
     return None
 
 
+GENRES = [
+    "action",
+    "comedy",
+    "drama",
+    "horror",
+    "romance",
+    "thriller",
+    "western",
+    "sci-fi",
+    "fantasy",
+    "documentary",
+]
+
+
 def create_table(num_rows, offset) -> pa.Table:
     values = pc.random(num_rows * N_DIMS).cast(pa.float32())
     vectors = pa.FixedSizeListArray.from_arrays(values, N_DIMS)
     filterable = pa.array(range(offset, offset + num_rows))
     categories = pa.array(np.random.randint(0, 100, num_rows))
+    genres_values = pa.array(np.random.choice(GENRES, num_rows * 3))
+    genre_offsets = pa.array(np.arange(0, (num_rows + 1) * 3, 3, dtype=np.int32))
+    genres = pa.ListArray.from_arrays(genre_offsets, genres_values)
     return pa.table(
         {
             "vector": vectors,
             "filterable": filterable,
             "category": categories,
+            "genres": genres,
         }
     )
 
@@ -75,6 +93,7 @@ def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
 
     dataset.create_scalar_index("filterable", "BTREE")
     dataset.create_scalar_index("category", "BITMAP")
+    dataset.create_scalar_index("genres", "LABEL_LIST")
 
     return lance.dataset(tmp_path, index_cache_size=64 * 1024)
 
@@ -409,6 +428,54 @@ def test_bitmap_index_search(test_dataset, benchmark, filter: str):
             test_dataset.to_table,
             columns=[],
             with_row_id=True,
+            prefilter=True,
+            filter=filter,
+        )
+
+
+@pytest.mark.benchmark(group="query_ann")
+@pytest.mark.parametrize(
+    "filter",
+    (
+        None,
+        "array_has_any(genres, ['comedy'])",
+    ),
+    ids=["none", "one"],
+)
+def test_label_list_index_prefilter(test_dataset, benchmark, filter: str):
+    q = pc.random(N_DIMS).cast(pa.float32())
+    if filter is None:
+        benchmark(
+            test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
+            nearest=dict(
+                column="vector",
+                q=q,
+                k=100,
+                nprobes=10,
+            ),
+        )
+    else:
+        print(
+            test_dataset.scanner(
+                columns=[],
+                with_row_id=True,
+                nearest=dict(column="vector", q=q, k=100, nprobes=10),
+                prefilter=True,
+                filter=filter,
+            ).explain_plan(True)
+        )
+        benchmark(
+            test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
+            nearest=dict(
+                column="vector",
+                q=q,
+                k=100,
+                nprobes=10,
+            ),
             prefilter=True,
             filter=filter,
         )
