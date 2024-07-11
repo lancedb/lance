@@ -1081,7 +1081,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
-    def checkout_version(self, version) -> "LanceDataset":
+    def checkout_version(self, version: int | str) -> "LanceDataset":
         """
         Load the given version of the dataset.
 
@@ -1156,19 +1156,6 @@ class LanceDataset(pa.dataset.Dataset):
         Return all tags in this dataset.
         """
         return self._ds.tags()
-
-    def checkout_tag(self, tag: str) -> "LanceDataset":
-        """
-        Load the version of the dataset associated with the given tag.
-
-        Unlike the :func:`dataset` constructor, this will re-use the
-        current cache.
-        This is a no-op if the dataset is already at the version associated
-        with the given tag.
-        """
-        ds = copy.copy(self)
-        ds._ds = self._ds.checkout_tag(tag)
-        return ds
 
     def create_tag(self, tag: str, version: int) -> None:
         """

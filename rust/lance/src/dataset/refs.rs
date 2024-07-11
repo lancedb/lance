@@ -6,6 +6,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
+pub enum Ref {
+    Version(u64),
+    Tag(String),
+}
+
+impl From<u64> for Ref {
+    fn from(ref_: u64) -> Self {
+        Self::Version(ref_)
+    }
+}
+
+impl From<&str> for Ref {
+    fn from(ref_: &str) -> Self {
+        Self::Tag(ref_.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TagContents {

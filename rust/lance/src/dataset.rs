@@ -290,7 +290,15 @@ impl Dataset {
     }
 
     /// Check out the specified version of this dataset
-    pub async fn checkout_version(&self, version: u64) -> Result<Self> {
+    pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
+        let ref_: refs::Ref = version.into();
+        match ref_ {
+            refs::Ref::Version(version) => self.checkout_by_version_number(version).await,
+            refs::Ref::Tag(tag) => self.checkout_by_tag(tag.as_str()).await,
+        }
+    }
+
+    async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
         let manifest_file = self
             .commit_handler
@@ -314,7 +322,7 @@ impl Dataset {
     }
 
     /// Check out the specified tagged version of this dataset
-    pub async fn checkout_tag(&self, tag: &str) -> Result<Self> {
+    async fn checkout_by_tag(&self, tag: &str) -> Result<Self> {
         check_valid_ref(tag)?;
 
         let tag_file = tag_path(&self.base, tag);
@@ -327,7 +335,7 @@ impl Dataset {
 
         let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
 
-        self.checkout_version(tag_contents.version).await
+        self.checkout_by_version_number(tag_contents.version).await
     }
 
     async fn load_manifest(
@@ -3026,13 +3034,13 @@ mod tests {
 
         assert_eq!(dataset.tags().await.unwrap().len(), 3);
 
-        let bad_checkout = dataset.checkout_tag("tag3").await;
+        let bad_checkout = dataset.checkout_version("tag3").await;
         assert_eq!(
             bad_checkout.err().unwrap().to_string(),
             "Ref not found error: tag tag3 does not exist"
         );
 
-        dataset = dataset.checkout_tag("tag1").await.unwrap();
+        dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 1);
     }
 

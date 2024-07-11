@@ -278,10 +278,10 @@ def test_tag(tmp_path: Path):
 
     assert len(ds.tags()) == 2
 
-    with pytest.raises(ValueError):
-        ds.checkout_tag("tag3")
+    with pytest.raises(OSError):
+        ds.checkout_version("tag3")
 
-    assert ds.checkout_tag("tag1").version == 1
+    assert ds.checkout_version("tag1").version == 1
 
 
 def test_sample(tmp_path: Path):
