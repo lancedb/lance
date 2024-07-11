@@ -608,7 +608,35 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
+    use crate::v2::reader::FileReader;
     use crate::v2::writer::{FileWriter, FileWriterOptions};
+    use futures::StreamExt;
+    use lance_io::scheduler::ScanScheduler;
+    use tempfile::TempDir;
+
+    struct FsFixture {
+        _tmp_dir: TempDir,
+        tmp_path: Path,
+        object_store: Arc<ObjectStore>,
+        scheduler: Arc<ScanScheduler>,
+    }
+
+    impl Default for FsFixture {
+        fn default() -> Self {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
+            let tmp_path = Path::parse(tmp_path).unwrap();
+            let tmp_path = tmp_path.child("some_file.lance");
+            let object_store = Arc::new(ObjectStore::local());
+            let scheduler = ScanScheduler::new(object_store.clone(), 8);
+            Self {
+                _tmp_dir: tmp_dir,
+                object_store,
+                tmp_path,
+                scheduler,
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_basic_write() {
@@ -662,6 +690,158 @@ mod tests {
             file_writer.write_batch(&batch.unwrap()).await.unwrap();
         }
         file_writer.add_schema_metadata("foo", "bar");
+        file_writer.finish().await.unwrap();
+    }
+
+    async fn helper_verify_num_rows(
+        tmp_path: &Path,
+        expected_rows_per_batch: u64,
+        expected_batches: u64,
+    ) {
+        let fs = FsFixture::default();
+        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+
+        let file_reader = FileReader::try_open(file_scheduler.clone(), None)
+            .await
+            .unwrap();
+
+        let mut batch_stream = file_reader
+            .read_stream(lance_io::ReadBatchParams::RangeFull, 1024, 16)
+            .unwrap();
+
+        let mut batch_count = 0;
+        let mut total_rows = 0;
+
+        while let Some(batch) = batch_stream.next().await {
+            batch_count += 1;
+            let mut batch = batch.unwrap();
+            let mut rows_to_verify = batch.num_rows() as u64;
+
+            assert_eq!(rows_to_verify, expected_rows_per_batch);
+        }
+
+        assert_eq!(batch_count, expected_batches);
+    }
+
+    #[tokio::test]
+    async fn test_write_zero_batches() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = Path::parse(tmp_path).unwrap();
+        let tmp_path = tmp_path.child("some_file.lance");
+        let obj_store = Arc::new(ObjectStore::local());
+
+        let reader = gen()
+            .col("score", array::rand::<Float64Type>())
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(0));
+
+        let writer = obj_store.create(&tmp_path).await.unwrap();
+
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
+
+        let mut file_writer = FileWriter::try_new(
+            writer,
+            tmp_path.to_string(),
+            lance_schema,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        for batch in reader {
+            file_writer.write_batch(&batch.unwrap()).await.unwrap();
+        }
+
+        file_writer.finish().await.unwrap();
+        helper_verify_num_rows(&tmp_path, 1000, 0).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_zero_rows_all_batches() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = Path::parse(tmp_path).unwrap();
+        let tmp_path = tmp_path.child("some_file.lance");
+        let obj_store = Arc::new(ObjectStore::local());
+
+        let reader = gen()
+            .col("score", array::rand::<Float64Type>())
+            .into_reader_rows(RowCount::from(0), BatchCount::from(10));
+
+        let writer = obj_store.create(&tmp_path).await.unwrap();
+
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
+
+        let mut file_writer = FileWriter::try_new(
+            writer,
+            tmp_path.to_string(),
+            lance_schema,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        for batch in reader {
+            file_writer.write_batch(&batch.unwrap()).await.unwrap();
+        }
+
+        file_writer.finish().await.unwrap();
+        helper_verify_num_rows(&tmp_path, 0, 0).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_zero_rows_some_batches() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = Path::parse(tmp_path).unwrap();
+        let tmp_path = tmp_path.child("some_file.lance");
+        let obj_store = Arc::new(ObjectStore::local());
+
+        let nonzero_reader1 = gen()
+            .col("score", array::rand::<Float64Type>())
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(10));
+
+        let zero_reader1 = gen()
+            .col("score", array::rand::<Float64Type>())
+            .into_reader_rows(RowCount::from(0), BatchCount::from(10));
+
+        let nonzero_reader2 = gen()
+            .col("score", array::rand::<Float64Type>())
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(20));
+
+        let zero_reader2 = gen()
+            .col("score", array::rand::<Float64Type>())
+            .into_reader_rows(RowCount::from(0), BatchCount::from(20));
+
+        let writer = obj_store.create(&tmp_path).await.unwrap();
+
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(zero_reader1.schema().as_ref()).unwrap();
+
+        let mut file_writer = FileWriter::try_new(
+            writer,
+            tmp_path.to_string(),
+            lance_schema,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        for batch in nonzero_reader1 {
+            file_writer.write_batch(&batch.unwrap()).await.unwrap();
+        }
+
+        for batch in zero_reader1 {
+            file_writer.write_batch(&batch.unwrap()).await.unwrap();
+        }
+
+        for batch in nonzero_reader2 {
+            file_writer.write_batch(&batch.unwrap()).await.unwrap();
+        }
+
+        for batch in zero_reader2 {
+            file_writer.write_batch(&batch.unwrap()).await.unwrap();
+        }
+
         file_writer.finish().await.unwrap();
     }
 }
