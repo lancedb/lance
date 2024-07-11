@@ -26,12 +26,6 @@
         </license>
     </licenses>
 
-    <scm>
-      <developerConnection>scm:git:git@github.com:lancedb/lance.git</developerConnection>
-      <tag>HEAD</tag>
-      <url>scm:git:git@github.com:lancedb/lance.git</url>
-    </scm>
-
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <arrow.version>15.0.0</arrow.version>
