@@ -15,9 +15,7 @@ use crate::encodings::physical::value::{parse_compression_scheme, CompressionSch
 use crate::{
     decoder::{ColumnInfo, PageInfo},
     encodings::{
-        logical::{
-            list::ListFieldEncoder, primitive::PrimitiveFieldEncoder, r#struct::StructFieldEncoder,
-        },
+        logical::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder},
         physical::{
             basic::BasicEncoder, binary::BinaryEncoder, dictionary::DictionaryEncoder,
             fixed_size_list::FslEncoder, value::ValueEncoder,
@@ -265,9 +263,7 @@ impl CoreArrayEncodingStrategy {
                 }
             }
             DataType::Struct(fields) => {
-                println!("Creating packed struct encoding...");
                 let inner_datatype = fields[0].data_type();
-                println!("Inner datatype: {:?}", inner_datatype);
                 let inner_encoder =
                     Self::array_encoder_from_type(inner_datatype, use_dict_encoding)?;
                 Ok(Box::new(PackedStructEncoder::new(inner_encoder)))
@@ -430,6 +426,8 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
             | DataType::LargeBinary
             | DataType::Utf8
             | DataType::LargeUtf8
+            // TODO: Check metadata for presence of user flag before deciding whether to use PrimitiveFieldEncoder
+            // or StructFieldEncoder
             | DataType::Struct(_) => Ok(Box::new(PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_column,
                 keep_original_array,

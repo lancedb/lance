@@ -3,12 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{ArrayBuilder, StringBuilder};
-use arrow_array::types::{UInt64Type, UInt8Type};
-use arrow_array::{
-    Array, ArrayRef, DictionaryArray, PrimitiveArray, StringArray, StructArray, UInt64Array,
-    UInt8Array,
-};
+use arrow_array::{Array, ArrayRef, StructArray, UInt64Array};
 use futures::{future::BoxFuture, FutureExt};
 
 use crate::{
@@ -22,25 +17,22 @@ use arrow_schema::DataType;
 use bytes::BytesMut;
 use lance_core::Result;
 
-use crate::encodings::utils::{new_primitive_array, primitive_array_from_buffers};
-use arrow_array::cast::AsArray;
-
 #[derive(Debug)]
 pub struct PackedStructPageScheduler {
     inner_scheduler: Arc<dyn PageScheduler>,
-    num_elements_per_field: u64,
+    num_struct_fields: u64,
     struct_datatype: DataType,
 }
 
 impl PackedStructPageScheduler {
     pub fn new(
         inner_scheduler: Arc<dyn PageScheduler>,
-        num_elements_per_field: u64,
+        num_struct_fields: u64,
         struct_datatype: DataType,
     ) -> Self {
         Self {
             inner_scheduler,
-            num_elements_per_field,
+            num_struct_fields,
             struct_datatype,
         }
     }
@@ -53,15 +45,21 @@ impl PageScheduler for PackedStructPageScheduler {
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
-        
         // Schedule inner values for decoding
-        println!("Ranges: {:?}", ranges);
+        let adjusted_ranges = ranges
+            .iter()
+            .map(|range| {
+                let start = range.start * self.num_struct_fields;
+                let end = range.end * self.num_struct_fields;
+                start..end
+            })
+            .collect::<Vec<_>>();
 
         let inner_page_decoder =
             self.inner_scheduler
-                .schedule_ranges(&ranges, scheduler, top_level_row);
+                .schedule_ranges(&adjusted_ranges, scheduler, top_level_row);
 
-        let copy_num_elements_per_field = self.num_elements_per_field.clone();
+        // let copy_num_struct_fields = self.num_struct_fields.clone();
         let copy_struct_datatype = self.struct_datatype.clone();
 
         tokio::spawn(async move {
@@ -69,7 +67,6 @@ impl PageScheduler for PackedStructPageScheduler {
 
             Ok(Box::new(PackedStructPageDecoder {
                 inner_decoder,
-                num_elements_per_field: copy_num_elements_per_field,
                 struct_datatype: copy_struct_datatype,
             }) as Box<dyn PrimitivePageDecoder>)
         })
@@ -80,7 +77,6 @@ impl PageScheduler for PackedStructPageScheduler {
 
 struct PackedStructPageDecoder {
     inner_decoder: Arc<dyn PrimitivePageDecoder>,
-    num_elements_per_field: u64,
     struct_datatype: DataType,
 }
 
@@ -92,58 +88,27 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
         all_null: &mut bool,
     ) -> Result<Vec<BytesMut>> {
         // e.g.
-        // row 0 {x: [1, 2, 3], y: [4, 5, 6], z: [7, 8, 9]}
-        // row 1 {a: [10, 11, 12], b: [13, 14, 15], c: [16, 17, 18]}
+        // rows 0-2: {x: [1, 2, 3], y: [4, 5, 6], z: [7, 8, 9]}
+        // rows 3-5: {x: [10, 11, 12], y: [13, 14, 15], z: [16, 17, 18]}
         // packed encoding: [
         // [1, 4, 7, 2, 5, 8, 3, 6, 9],
         // [10, 13, 16, 11, 14, 17, 12, 15, 18]
         // ]
-        // If user asks for row #1, we should decode elements from num_struct_elements*1 to num_struct_elements*2
+        // If user asks for rows i..j, we should decode num_struct_fields*i..num_struct_fields*j
 
         let DataType::Struct(fields) = &self.struct_datatype else {
             panic!("Struct datatype expected");
         };
-        
-        let num_struct_fields = fields.len();
-        let num_elements_per_struct = (num_struct_fields as u64) * self.num_elements_per_field; 
 
-        println!("Num struct fields: {:?}", num_struct_fields);
-        println!("Num elements per field: {:?}", self.num_elements_per_field);
-        println!("Num elements per struct: {:?}", num_elements_per_struct);
-        println!("Rows to skip: {:?}", rows_to_skip);
-        println!("Num rows: {:?}", num_rows);
+        let num_struct_fields = fields.len() as u64;
 
-        let inner_buffers = self
-            .inner_decoder
-            .decode(rows_to_skip*num_elements_per_struct, num_rows*num_elements_per_struct, all_null)?;
+        let inner_buffers = self.inner_decoder.decode(
+            rows_to_skip * num_struct_fields,
+            num_rows * num_struct_fields,
+            all_null,
+        )?;
 
-        let num_fields = fields.len();
-        let inner_datatype = fields[0].data_type();
-        let packed_array = primitive_array_from_buffers(inner_datatype, inner_buffers, num_rows).unwrap();
-        let inner_array = packed_array.as_any().downcast_ref::<UInt64Array>().unwrap();
-        println!("Inner array: {:?}", inner_array);
-
-        let mut child_vecs = vec![Vec::new(); num_fields];
-
-        for (i, value) in inner_array.iter().enumerate() {
-            if let Some(v) = value {
-                child_vecs[i % num_fields].push(v);
-            }
-        }
-
-        let child_arrays = child_vecs
-            .into_iter()
-            .map(|field_data| Arc::new(PrimitiveArray::from(field_data)) as ArrayRef)
-            .collect::<Vec<_>>();
-
-        for arr in &child_arrays {
-            println!("Child array: {:?}", arr);
-        }
-
-        let struct_array = Arc::new(StructArray::try_new(fields.clone(), child_arrays, None).unwrap());
-
-        // Ok(inner_buffers)
-        Ok(vec![])
+        Ok(inner_buffers)
     }
 
     fn num_buffers(&self) -> u32 {
@@ -193,25 +158,23 @@ fn encode_packed_struct(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
 impl ArrayEncoder for PackedStructEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let packed_arrays = encode_packed_struct(arrays);
-        let num_elements_per_field = arrays[0]
+        let num_struct_fields = arrays[0]
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap()
-            .column(0).len();
+            .num_columns();
 
-        println!("Packed arrays length: {:?}", packed_arrays.len());
         println!("Packed arrays: {:?}", packed_arrays.clone());
         let encoded_packed_struct = self.inner_encoder.encode(&packed_arrays, buffer_index)?;
         let encoded_buffers = encoded_packed_struct.buffers;
 
-        println!("Encoded packed struct");
         Ok(EncodedArray {
             buffers: encoded_buffers,
             encoding: pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::PackedStruct(Box::new(
                     pb::PackedStruct {
                         inner: Some(Box::new(encoded_packed_struct.encoding)),
-                        num_elements_per_field: num_elements_per_field as u32,
+                        num_struct_fields: num_struct_fields as u32,
                     },
                 ))),
             },
@@ -245,8 +208,8 @@ pub mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_specific_packed_struct() {
-        let array1 = Arc::new(UInt64Array::from(vec![1, 2, 3]));
-        let array2 = Arc::new(UInt64Array::from(vec![4, 5, 6]));
+        let array1 = Arc::new(UInt64Array::from(vec![1, 2, 3, 4]));
+        let array2 = Arc::new(UInt64Array::from(vec![5, 6, 7, 8]));
 
         let struct_array1 = Arc::new(StructArray::from(vec![
             (
@@ -259,8 +222,8 @@ pub mod tests {
             ),
         ]));
 
-        let array3 = Arc::new(UInt64Array::from(vec![10, 11, 12]));
-        let array4 = Arc::new(UInt64Array::from(vec![13, 14, 15]));
+        let array3 = Arc::new(UInt64Array::from(vec![10, 11, 12, 13]));
+        let array4 = Arc::new(UInt64Array::from(vec![14, 15, 16, 17]));
 
         let struct_array2 = Arc::new(StructArray::from(vec![
             (
@@ -274,7 +237,10 @@ pub mod tests {
         ]));
 
         let test_cases = TestCases::default()
-        .with_range(0..1);
+            .with_range(0..2)
+            .with_range(0..6)
+            .with_range(1..5)
+            .with_indices(vec![1, 3, 7]);
 
         check_round_trip_encoding_of_data(vec![struct_array1, struct_array2], &test_cases).await;
     }

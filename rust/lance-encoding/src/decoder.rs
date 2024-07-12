@@ -595,10 +595,10 @@ impl CoreFieldDecoderStrategy {
 
     fn check_packed_struct(column_info: &ColumnInfo) -> bool {
         let encoding = &column_info.page_infos[0].encoding;
-        match encoding.array_encoding.as_ref().unwrap() {
-            pb::array_encoding::ArrayEncoding::PackedStruct(_) => true,
-            _ => false,
-        }
+        matches!(
+            encoding.array_encoding.as_ref().unwrap(),
+            pb::array_encoding::ArrayEncoding::PackedStruct(_)
+        )
     }
 }
 
@@ -708,7 +708,6 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 let column_info = column_infos.pop_front().unwrap();
 
                 if Self::check_packed_struct(&column_info) {
-                    println!("Using packed struct encoding");
                     // use packed struct encoding
                     let scheduler = Self::create_primitive_scheduler(
                         &data_type,
@@ -718,7 +717,6 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     )?;
                     return Ok((chain, std::future::ready(Ok(scheduler)).boxed()));
                 } else {
-                    println!("Using default struct encoding");
                     // use default struct encoding
                     Self::check_simple_struct(&column_info, chain.current_path()).unwrap();
                     let (chain, child_schedulers) = field.children.iter().enumerate().try_fold(

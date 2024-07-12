@@ -63,7 +63,6 @@ impl PrimitiveFieldScheduler {
             })
             .collect::<Vec<_>>();
         let num_rows = page_schedulers.iter().map(|p| p.num_rows).sum();
-        println!("Original num rows: {}", num_rows);
         Self {
             data_type,
             page_schedulers,

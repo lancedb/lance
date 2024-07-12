@@ -195,7 +195,7 @@ message Dictionary {
 
 message PackedStruct {
   ArrayEncoding inner = 1;
-  uint32 num_elements_per_field = 2;
+  uint32 num_struct_fields = 2;
 }
 
 // Encodings that decode into an Arrow array

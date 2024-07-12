@@ -106,6 +106,40 @@ pub fn bytes_to_validity(bytes: BytesMut, num_rows: u64) -> Option<NullBuffer> {
     }
 }
 
+pub fn new_struct_from_packed_row_buffers(
+    buffers: Vec<BytesMut>,
+    num_rows: u64,
+    fields: &Fields,
+) -> ArrayRef {
+    let num_fields = fields.len();
+    let inner_datatype = fields[0].data_type();
+    let packed_array =
+        primitive_array_from_buffers(inner_datatype, buffers, num_rows * (num_fields as u64))
+            .unwrap();
+    let inner_array = packed_array.as_any().downcast_ref::<UInt64Array>().unwrap();
+    // println!("Inner array: {:?}", inner_array);
+
+    let mut child_vecs = vec![Vec::new(); num_fields];
+
+    for (i, value) in inner_array.iter().enumerate() {
+        if let Some(v) = value {
+            child_vecs[i % num_fields].push(v);
+        }
+    }
+
+    let child_arrays = child_vecs
+        .into_iter()
+        .map(|field_data| Arc::new(PrimitiveArray::from(field_data)) as ArrayRef)
+        .collect::<Vec<_>>();
+
+    // for arr in &child_arrays {
+    //     println!("Child array: {:?}", arr);
+    // }
+
+    Arc::new(StructArray::try_new(fields.clone(), child_arrays, None).unwrap())
+    // println!("Struct array: {:?}", struct_array);
+}
+
 pub fn primitive_array_from_buffers(
     data_type: &DataType,
     buffers: Vec<BytesMut>,
@@ -272,6 +306,9 @@ pub fn primitive_array_from_buffers(
         )),
         DataType::LargeBinary => Ok(new_generic_byte_array::<GenericBinaryType<i64>>(
             buffers, num_rows,
+        )),
+        DataType::Struct(fields) => Ok(new_struct_from_packed_row_buffers(
+            buffers, num_rows, fields,
         )),
         _ => Err(Error::io(
             format!(
