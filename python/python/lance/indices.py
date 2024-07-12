@@ -319,13 +319,14 @@ class IndicesBuilder:
     def assign_ivf_partitions(
         self,
         ivf_model: IvfModel,
-        dst_dataset_uri: Optional[str],
         accelerator: Union[str, "torch.Device"],
+        *,
+        output_uri: Optional[str] = None,
     ) -> str:
         """
         Calculates which IVF partition each vector belongs to.  This searches the
         IVF centroids and assigns the closest centroid to the vector.  The result is
-        stored in a Lance dataset located at dst_dataset_uri.  The schema of the
+        stored in a Lance dataset located at output_uri.  The schema of the
         partition assignment dataset is:
 
         row_id: uint64
@@ -340,18 +341,18 @@ class IndicesBuilder:
         ivf_model: IvfModel
             An IvfModel, previously created by ``train_ivf`` which the data will be
             assigned to.
-        dst_dataset_uri: Optional[str]
-            Destination Lance dataset where the partition assignments will be written
-            Can be None in which case a random directory will be used.
-        accelerator: Optional[Union[str, torch.Device]] = None
+        accelerator: Union[str, torch.Device]
             An optional accelerator to use to offload computation to specialized
             hardware.  Currently supported values are the same as those in ``train_ivf``
+        output_uri: Optional[str], default None
+            Destination Lance dataset where the partition assignments will be written
+            Can be None in which case a random directory will be used.
 
         Returns
         -------
         str
             The path of the partition assignment dataset (will be equal to
-            dst_dataset_uri unless the input is None)
+            output_uri unless the value is None)
         """
         from .dependencies import torch
         from .torch.kmeans import KMeans
@@ -367,7 +368,7 @@ class IndicesBuilder:
             centroids=centroids,
         )
         return compute_partitions(
-            self.dataset, self.column[0], kmeans, dst_dataset_uri=dst_dataset_uri
+            self.dataset, self.column[0], kmeans, dst_dataset_uri=output_uri
         )
 
     def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):

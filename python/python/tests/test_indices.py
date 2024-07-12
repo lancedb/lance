@@ -104,9 +104,9 @@ def test_assign_partitions(tmpdir):
     builder = IndicesBuilder(ds, "vectors")
 
     ivf = builder.train_ivf(sample_rate=16, num_partitions=20)
-    builder.assign_ivf_partitions(ivf, str(tmpdir / "partitions"), accelerator="cuda")
+    partitions_uri = builder.assign_ivf_partitions(ivf, accelerator="cuda")
 
-    partitions = lance.dataset(str(tmpdir / "partitions"))
+    partitions = lance.dataset(partitions_uri)
     found_row_ids = set()
     for batch in partitions.to_batches():
         row_ids = batch["row_id"]
