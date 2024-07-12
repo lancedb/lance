@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
+use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -263,6 +264,14 @@ impl CoreArrayEncodingStrategy {
                     )))
                 }
             }
+            DataType::Struct(fields) => {
+                println!("Creating packed struct encoding...");
+                let inner_datatype = fields[0].data_type();
+                println!("Inner datatype: {:?}", inner_datatype);
+                let inner_encoder =
+                    Self::array_encoder_from_type(inner_datatype, use_dict_encoding)?;
+                Ok(Box::new(PackedStructEncoder::new(inner_encoder)))
+            }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::try_new(data_type, get_compression_scheme())?,
             )))),
@@ -420,7 +429,8 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
             | DataType::Binary
             | DataType::LargeBinary
             | DataType::Utf8
-            | DataType::LargeUtf8 => Ok(Box::new(PrimitiveFieldEncoder::try_new(
+            | DataType::LargeUtf8
+            | DataType::Struct(_) => Ok(Box::new(PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_column,
                 keep_original_array,
                 self.array_encoding_strategy.clone(),
@@ -443,27 +453,27 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                     list_idx,
                 )))
             }
-            DataType::Struct(_) => {
-                let header_idx = column_index.next_column_index(field.id);
-                let children_encoders = field
-                    .children
-                    .iter()
-                    .map(|field| {
-                        self.create_field_encoder(
-                            encoding_strategy_root,
-                            field,
-                            column_index,
-                            cache_bytes_per_column,
-                            keep_original_array,
-                            &field.metadata,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(Box::new(StructFieldEncoder::new(
-                    children_encoders,
-                    header_idx,
-                )))
-            }
+            // DataType::Struct(_) => {
+            //     let header_idx = column_index.next_column_index(field.id);
+            //     let children_encoders = field
+            //         .children
+            //         .iter()
+            //         .map(|field| {
+            //             self.create_field_encoder(
+            //                 encoding_strategy_root,
+            //                 field,
+            //                 column_index,
+            //                 cache_bytes_per_column,
+            //                 keep_original_array,
+            //                 &field.metadata,
+            //             )
+            //         })
+            //         .collect::<Result<Vec<_>>>()?;
+            //     Ok(Box::new(StructFieldEncoder::new(
+            //         children_encoders,
+            //         header_idx,
+            //     )))
+            // }
             _ => todo!("Implement encoding for field {}", field),
         }
     }

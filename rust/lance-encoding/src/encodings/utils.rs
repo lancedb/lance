@@ -16,10 +16,10 @@ use arrow_array::{
         UInt32Type, UInt64Type, UInt8Type,
     },
     ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, GenericByteArray,
-    PrimitiveArray,
+    PrimitiveArray, StructArray, UInt64Array,
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, IntervalUnit, TimeUnit};
+use arrow_schema::{DataType, Fields, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use snafu::{location, Location};
 

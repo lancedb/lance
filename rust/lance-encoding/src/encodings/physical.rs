@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::DataType;
+use packed_struct::PackedStructPageScheduler;
 
 use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PageScheduler, format::pb};
@@ -19,6 +20,7 @@ pub mod bitmap;
 pub mod buffers;
 pub mod dictionary;
 pub mod fixed_size_list;
+pub mod packed_struct;
 pub mod value;
 
 /// These contain the file buffers shared across the entire file
@@ -162,6 +164,17 @@ pub fn decoder_from_array_encoding(
                 indices_scheduler.into(),
                 items_scheduler.into(),
                 num_dictionary_items,
+            ))
+        }
+        pb::array_encoding::ArrayEncoding::PackedStruct(packed_struct) => {
+            let inner_encoding = packed_struct.inner.as_ref().unwrap();
+            let num_elements_per_field = packed_struct.num_elements_per_field;
+            let inner_scheduler = decoder_from_array_encoding(inner_encoding, buffers, data_type);
+
+            Box::new(PackedStructPageScheduler::new(
+                inner_scheduler.into(),
+                num_elements_per_field as u64,
+                data_type.clone(),
             ))
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column

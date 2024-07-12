@@ -592,6 +592,14 @@ impl CoreFieldDecoderStrategy {
             _ => Err(Error::InvalidInput { source: format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into(), location: location!() }),
         }
     }
+
+    fn check_packed_struct(column_info: &ColumnInfo) -> bool {
+        let encoding = &column_info.page_infos[0].encoding;
+        match encoding.array_encoding.as_ref().unwrap() {
+            pb::array_encoding::ArrayEncoding::PackedStruct(_) => true,
+            _ => false,
+        }
+    }
 }
 
 impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
@@ -698,32 +706,47 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             }
             DataType::Struct(fields) => {
                 let column_info = column_infos.pop_front().unwrap();
-                Self::check_simple_struct(&column_info, chain.current_path()).unwrap();
-                let (chain, child_schedulers) = field.children.iter().enumerate().try_fold(
-                    (chain, FuturesOrdered::new()),
-                    |(chain, mut fields), (field_idx, field)| {
-                        let (chain, field) =
-                            chain.new_child(field_idx as u32, field, column_infos, buffers)?;
-                        fields.push_back(field);
-                        Result::Ok((chain, fields))
-                    },
-                )?;
 
-                let fields = fields.clone();
-                let struct_fut = async move {
-                    let child_schedulers = child_schedulers.try_collect::<Vec<_>>().await?;
-                    Ok(
-                        Arc::new(SimpleStructScheduler::new(child_schedulers, fields))
-                            as Arc<dyn FieldScheduler>,
-                    )
+                if Self::check_packed_struct(&column_info) {
+                    println!("Using packed struct encoding");
+                    // use packed struct encoding
+                    let scheduler = Self::create_primitive_scheduler(
+                        &data_type,
+                        chain.current_path(),
+                        &column_info,
+                        buffers,
+                    )?;
+                    return Ok((chain, std::future::ready(Ok(scheduler)).boxed()));
+                } else {
+                    println!("Using default struct encoding");
+                    // use default struct encoding
+                    Self::check_simple_struct(&column_info, chain.current_path()).unwrap();
+                    let (chain, child_schedulers) = field.children.iter().enumerate().try_fold(
+                        (chain, FuturesOrdered::new()),
+                        |(chain, mut fields), (field_idx, field)| {
+                            let (chain, field) =
+                                chain.new_child(field_idx as u32, field, column_infos, buffers)?;
+                            fields.push_back(field);
+                            Result::Ok((chain, fields))
+                        },
+                    )?;
+
+                    let fields = fields.clone();
+                    let struct_fut = async move {
+                        let child_schedulers = child_schedulers.try_collect::<Vec<_>>().await?;
+                        Ok(
+                            Arc::new(SimpleStructScheduler::new(child_schedulers, fields))
+                                as Arc<dyn FieldScheduler>,
+                        )
+                    }
+                    .boxed();
+
+                    // For now, we don't record nullability for structs.  As a result, there is always
+                    // only one "page" of struct data.  In the future, this will change.  A null-aware
+                    // struct scheduler will need to first calculate how many rows are in the struct page
+                    // and then find the child pages that overlap.  This should be doable.
+                    Ok((chain, struct_fut))
                 }
-                .boxed();
-
-                // For now, we don't record nullability for structs.  As a result, there is always
-                // only one "page" of struct data.  In the future, this will change.  A null-aware
-                // struct scheduler will need to first calculate how many rows are in the struct page
-                // and then find the child pages that overlap.  This should be doable.
-                Ok((chain, struct_fut))
             }
             // TODO: Still need support for dictionary / RLE
             _ => chain.next(field, column_infos, buffers),
