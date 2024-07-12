@@ -352,7 +352,6 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
     for IVFIndex<S, Q>
 {
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
-        pre_filter.wait_for_ready().await?;
         let mut query = query.clone();
         if self.distance_type == DistanceType::Cosine {
             let key = normalize_arrow(&query.key)?;
@@ -417,6 +416,7 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true).await?;
+        pre_filter.wait_for_ready().await?;
 
         let query = self.preprocess_query(partition_id, query)?;
         let param = (&query).into();
