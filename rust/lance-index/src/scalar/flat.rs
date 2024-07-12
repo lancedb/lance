@@ -14,6 +14,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
@@ -191,7 +192,7 @@ impl Index for FlatIndex {
 
 #[async_trait]
 impl ScalarIndex for FlatIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
@@ -255,11 +256,12 @@ impl ScalarIndex for FlatIndex {
                 location!(),
             )),
         };
-        Ok(arrow_select::filter::filter(self.ids(), &predicate)?
+        let matching_ids = arrow_select::filter::filter(self.ids(), &predicate)?;
+        let matching_ids = matching_ids
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .expect("Result of arrow_select::filter::filter did not match input type")
-            .clone())
+            .expect("Result of arrow_select::filter::filter did not match input type");
+        Ok(RowIdTreeMap::from_iter(matching_ids.values()))
     }
 
     // Note that there is no write/train method for flat index at the moment and so it isn't
@@ -323,7 +325,7 @@ mod tests {
     async fn check_index(query: &SargableQuery, expected: &[u64]) {
         let index = example_index();
         let actual = index.search(query).await.unwrap();
-        let expected = UInt64Array::from_iter_values(expected.iter().copied());
+        let expected = RowIdTreeMap::from_iter(expected);
         assert_eq!(actual, expected);
     }
 

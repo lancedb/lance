@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    any::Any,
-    collections::{HashMap, HashSet},
-    fmt::Debug,
-    sync::Arc,
-};
+use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow_array::{Array, RecordBatch, UInt64Array};
@@ -16,9 +11,10 @@ use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecord
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
-use lance_core::{Error, Result};
+use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
+use tracing::instrument;
 
 use crate::{Index, IndexType};
 
@@ -79,7 +75,10 @@ impl Index for LabelListIndex {
 }
 
 impl LabelListIndex {
-    fn search_values<'a>(&'a self, values: &'a Vec<ScalarValue>) -> BoxStream<Result<UInt64Array>> {
+    fn search_values<'a>(
+        &'a self,
+        values: &'a Vec<ScalarValue>,
+    ) -> BoxStream<Result<RowIdTreeMap>> {
         futures::stream::iter(values)
             .then(move |value| {
                 let value_query = SargableQuery::Equals(value.clone());
@@ -90,43 +89,50 @@ impl LabelListIndex {
 
     async fn set_union<'a>(
         &'a self,
-        mut sets: impl TryStream<Ok = UInt64Array, Error = Error> + 'a + Unpin,
-    ) -> Result<UInt64Array> {
-        let first_bitmap = sets.try_next().await?.unwrap();
-        let mut all: HashSet<_> = first_bitmap.into_iter().collect();
-        while let Some(next) = sets.try_next().await? {
-            all.extend(&next);
+        mut sets: impl TryStream<Ok = RowIdTreeMap, Error = Error> + 'a + Unpin,
+        single_set: bool,
+    ) -> Result<RowIdTreeMap> {
+        let mut union_bitmap = sets.try_next().await?.unwrap();
+        if single_set {
+            return Ok(union_bitmap);
         }
-        Ok(all.into_iter().collect())
+        while let Some(next) = sets.try_next().await? {
+            union_bitmap |= next;
+        }
+        Ok(union_bitmap)
     }
 
     async fn set_intersection<'a>(
         &'a self,
-        mut sets: impl TryStream<Ok = UInt64Array, Error = Error> + 'a + Unpin,
-    ) -> Result<UInt64Array> {
-        let first_bitmap = sets.try_next().await?.unwrap();
-        let mut all: HashSet<_> = first_bitmap.into_iter().collect();
-        while let Some(next) = sets.try_next().await? {
-            let next_set = next.into_iter().collect::<HashSet<_>>();
-            all.retain(|item| next_set.contains(item));
+        mut sets: impl TryStream<Ok = RowIdTreeMap, Error = Error> + 'a + Unpin,
+        single_set: bool,
+    ) -> Result<RowIdTreeMap> {
+        let mut intersect_bitmap = sets.try_next().await?.unwrap();
+        if single_set {
+            return Ok(intersect_bitmap);
         }
-        Ok(all.into_iter().collect())
+        while let Some(next) = sets.try_next().await? {
+            intersect_bitmap &= next;
+        }
+        Ok(intersect_bitmap)
     }
 }
 
 #[async_trait]
 impl ScalarIndex for LabelListIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<UInt64Array> {
+    #[instrument(skip(self), level = "debug")]
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
         let query = query.as_any().downcast_ref::<LabelListQuery>().unwrap();
 
         match query {
             LabelListQuery::HasAllLabels(labels) => {
                 let values_results = self.search_values(labels);
-                self.set_intersection(values_results).await
+                self.set_intersection(values_results, labels.len() == 1)
+                    .await
             }
             LabelListQuery::HasAnyLabel(labels) => {
                 let values_results = self.search_values(labels);
-                self.set_union(values_results).await
+                self.set_union(values_results, labels.len() == 1).await
             }
         }
     }

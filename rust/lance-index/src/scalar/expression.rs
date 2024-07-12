@@ -14,10 +14,7 @@ use datafusion_expr::{
 };
 
 use futures::join;
-use lance_core::{
-    utils::mask::{RowIdMask, RowIdTreeMap},
-    Result,
-};
+use lance_core::{utils::mask::RowIdMask, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use tracing::instrument;
 
@@ -413,10 +410,9 @@ impl ScalarIndexExpr {
             Self::Query(column, query) => {
                 let index = index_loader.load_index(column).await?;
                 let matching_row_ids = index.search(query.as_ref()).await?;
-                let allow_list = RowIdTreeMap::from_iter(matching_row_ids.values().iter());
                 Ok(RowIdMask {
                     block_list: None,
-                    allow_list: Some(allow_list),
+                    allow_list: Some(matching_row_ids),
                 })
             }
         }

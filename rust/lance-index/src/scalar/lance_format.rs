@@ -177,6 +177,7 @@ mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
+    use lance_core::utils::mask::RowIdTreeMap;
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -242,8 +243,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(1, row_ids.len());
-        assert_eq!(Some(10000), row_ids.values().into_iter().copied().next());
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(10000));
 
         let row_ids = index
             .search(&SargableQuery::Range(
@@ -253,7 +254,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(0, row_ids.len());
+        assert_eq!(Some(0), row_ids.len());
 
         let row_ids = index
             .search(&SargableQuery::Range(
@@ -263,7 +264,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(100, row_ids.len());
+        assert_eq!(Some(100), row_ids.len());
     }
 
     #[tokio::test]
@@ -278,8 +279,8 @@ mod tests {
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         let data = gen()
-            .col("values", array::step::<Int32Type>())
-            .col("row_ids", array::step::<UInt64Type>())
+            .col("values", array::step_custom::<Int32Type>(4096 * 100, 1))
+            .col("row_ids", array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = tempdir().unwrap();
@@ -298,16 +299,21 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(2, row_ids.len());
-        assert_eq!(
-            vec![10000, 10000],
-            row_ids.values().into_iter().copied().collect::<Vec<_>>()
-        );
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(10000));
+
+        let row_ids = updated_index
+            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(500_000))))
+            .await
+            .unwrap();
+
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(500_000));
     }
 
     async fn check(index: &BTreeIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query).await.unwrap();
-        let expected_arr = UInt64Array::from_iter_values(expected.iter().copied());
+        let expected_arr = RowIdTreeMap::from_iter(expected);
         assert_eq!(results, expected_arr);
     }
 
@@ -589,8 +595,8 @@ mod tests {
             // The random data may have had duplicates so there might be more than 1 result
             // but even for boolean we shouldn't match the entire thing
             assert!(!row_ids.is_empty());
-            assert!(row_ids.len() < data.num_rows());
-            assert!(row_ids.values().iter().any(|val| *val == sample_row_id));
+            assert!(row_ids.len().unwrap() < data.num_rows() as u64);
+            assert!(row_ids.contains(sample_row_id));
         }
     }
 
@@ -629,7 +635,7 @@ mod tests {
                 "values",
                 array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
             )
-            .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1]))
+            .col("row_ids", array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(4096));
         assert_eq!(batch.as_ref().unwrap()["values"].null_count(), 4096);
         let batches = vec![batch];
@@ -656,7 +662,7 @@ mod tests {
         assert!(row_ids.is_empty());
 
         let row_ids = index.search(&SargableQuery::IsNull()).await.unwrap();
-        assert_eq!(row_ids.len(), 4096);
+        assert_eq!(row_ids.len(), Some(4096));
     }
 
     async fn train_bitmap(
@@ -712,8 +718,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(1, row_ids.len());
-        assert_eq!(2, row_ids.values()[0]);
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(2));
 
         let row_ids = index
             .search(&SargableQuery::Equals(ScalarValue::Utf8(Some(
@@ -722,11 +728,10 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = vec![1, 3, 6];
-        let expected_arr = UInt64Array::from_iter_values(expected.into_iter());
-
-        assert_eq!(3, row_ids.len());
-        assert_eq!(expected_arr, row_ids);
+        assert_eq!(Some(3), row_ids.len());
+        assert!(row_ids.contains(1));
+        assert!(row_ids.contains(3));
+        assert!(row_ids.contains(6));
     }
 
     #[tokio::test]
@@ -745,8 +750,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(1, row_ids.len());
-        assert_eq!(10000, row_ids.values()[0]);
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(10000));
 
         let row_ids = index
             .search(&SargableQuery::Range(
@@ -756,7 +761,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(0, row_ids.len());
+        assert!(row_ids.is_empty());
 
         let row_ids = index
             .search(&SargableQuery::Range(
@@ -766,12 +771,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(100, row_ids.len());
+        assert_eq!(Some(100), row_ids.len());
     }
 
     async fn check_bitmap(index: &BitmapIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query).await.unwrap();
-        let expected_arr = UInt64Array::from_iter_values(expected.iter().copied());
+        let expected_arr = RowIdTreeMap::from_iter(expected);
         assert_eq!(results, expected_arr);
     }
 
@@ -1017,11 +1022,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(1, row_ids.len());
-        assert_eq!(
-            vec![5000],
-            row_ids.values().into_iter().copied().collect::<Vec<_>>()
-        );
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(5000));
     }
 
     #[tokio::test]
@@ -1057,14 +1059,11 @@ mod tests {
         let remapped_index = BitmapIndex::load(remapped_store).await.unwrap();
 
         // Remapped to new value
-        assert_eq!(
-            remapped_index
-                .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5))))
-                .await
-                .unwrap()
-                .value(0),
-            65
-        );
+        assert!(remapped_index
+            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5))))
+            .await
+            .unwrap()
+            .contains(65));
         // Deleted
         assert!(remapped_index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(7))))
@@ -1072,14 +1071,11 @@ mod tests {
             .unwrap()
             .is_empty());
         // Not remapped
-        assert_eq!(
-            remapped_index
-                .search(&SargableQuery::Equals(ScalarValue::Int32(Some(3))))
-                .await
-                .unwrap()
-                .value(0),
-            3
-        );
+        assert!(remapped_index
+            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(3))))
+            .await
+            .unwrap()
+            .contains(3));
     }
 
     async fn train_tag(
@@ -1126,9 +1122,9 @@ mod tests {
                 let row_ids = index.search(&query).await.unwrap();
 
                 let row_ids_set = row_ids
-                    .values()
-                    .iter()
-                    .copied()
+                    .row_ids()
+                    .unwrap()
+                    .map(u64::from)
                     .collect::<std::collections::HashSet<_>>();
 
                 for (list, row_id) in data
@@ -1141,10 +1137,8 @@ mod tests {
                     let row_id = row_id.unwrap();
                     let vals = list.as_primitive::<UInt8Type>().values();
                     if row_ids_set.contains(&row_id) {
-                        println!("Match: {:?}", vals);
                         assert!(match_fn(vals));
                     } else {
-                        println!("NoMatch: {:?}", vals);
                         assert!(no_match_fn(vals));
                     }
                 }
