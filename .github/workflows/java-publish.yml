@@ -104,8 +104,7 @@ jobs:
           mvn release:prepare -B -DskipTests -DpushChanges=false
       - name: Publish with Java 8
         run: |
-          mvn --batch-mode -DskipTests -DpushChanges=false deploy -P deploy-to-ossrh
+          mvn --batch-mode -DskipTests -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
         env:
           MAVEN_USERNAME: ${{ secrets.SONATYPE_USER }}
           MAVEN_PASSWORD: ${{ secrets.SONATYPE_TOKEN }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
