@@ -99,14 +99,12 @@ jobs:
         run: |
           git config --global user.email "Lance Github Runner"
           git config --global user.name "dev+gha@lancedb.com"
-          echo "GPG_TTY=$(tty)" >> ~/.bashrc
-          export GPG_TTY=$(tty)
       - name: Release prepare with Java 8
         run: |
           mvn release:prepare -B -DskipTests -DpushChanges=false
       - name: Publish with Java 8
         run: |
-          mvn --batch-mode -DskipTests -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
+          GPG_TTY=$(tty) mvn --batch-mode -DskipTests -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
         env:
           MAVEN_USERNAME: ${{ secrets.SONATYPE_USER }}
           MAVEN_PASSWORD: ${{ secrets.SONATYPE_TOKEN }}
