@@ -1299,7 +1299,7 @@ pub(crate) async fn write_manifest_file(
             manifest,
             indices,
             base_path,
-            &object_store.inner,
+            object_store,
             write_manifest_file_to_path,
         )
         .await?;
@@ -1308,7 +1308,7 @@ pub(crate) async fn write_manifest_file(
 }
 
 fn write_manifest_file_to_path<'a>(
-    object_store: &'a dyn object_store::ObjectStore,
+    object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,

@@ -148,8 +148,8 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         self.output_schema.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -404,7 +404,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         &self.properties
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -549,11 +549,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         KNN_INDEX_SCHEMA.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
-            PreFilterSource::None => vec![self.input.clone()],
-            PreFilterSource::FilteredRowIds(src) => vec![self.input.clone(), src.clone()],
-            PreFilterSource::ScalarIndexQuery(src) => vec![self.input.clone(), src.clone()],
+            PreFilterSource::None => vec![&self.input],
+            PreFilterSource::FilteredRowIds(src) => vec![&self.input, &src],
+            PreFilterSource::ScalarIndexQuery(src) => vec![&self.input, &src],
         }
     }
 

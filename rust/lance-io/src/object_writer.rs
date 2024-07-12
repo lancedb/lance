@@ -274,6 +274,21 @@ impl ObjectWriter {
     }
 }
 
+impl Drop for ObjectWriter {
+    fn drop(&mut self) {
+        // If there is a multipart upload started but not finished, we should abort it.
+        if matches!(self.state, UploadState::InProgress { .. }) {
+            // Take ownership of the state.
+            let state = std::mem::replace(&mut self.state, UploadState::Done);
+            if let UploadState::InProgress { mut upload, .. } = state {
+                tokio::task::spawn(async move {
+                    let _ = upload.abort().await;
+                });
+            }
+        }
+    }
+}
+
 /// Returned error from trying to upload a part.
 /// Has the part_idx and buffer so we can pass
 /// them to the retry logic.
@@ -309,6 +324,7 @@ impl AsyncWrite for ObjectWriter {
         let remaining_capacity = self.buffer.capacity() - self.buffer.len();
         let bytes_to_write = std::cmp::min(remaining_capacity, buf.len());
         self.buffer.extend_from_slice(&buf[..bytes_to_write]);
+        self.cursor += bytes_to_write;
 
         // Rust needs a little help to borrow self mutably and immutably at the same time
         // through a Pin.

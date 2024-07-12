@@ -257,8 +257,8 @@ impl ExecutionPlan for TakeExec {
         ArrowSchema::from(&self.output_schema).into()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     /// This preserves the output schema.

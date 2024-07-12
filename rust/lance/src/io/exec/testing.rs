@@ -55,7 +55,7 @@ impl ExecutionPlan for TestingExec {
         self.batches[0].schema()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 

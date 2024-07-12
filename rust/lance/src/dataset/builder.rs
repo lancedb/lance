@@ -206,6 +206,7 @@ impl DatasetBuilder {
                     store.1.clone(),
                     self.options.block_size,
                     self.options.object_store_wrapper,
+                    self.options.use_constant_size_upload_parts,
                 ),
                 Path::from(store.1.path()),
                 commit_handler,

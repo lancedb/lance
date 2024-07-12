@@ -15,6 +15,7 @@ use datafusion_expr::{
     simplify::SimplifyContext,
     Accumulator, Expr,
 };
+use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
 use futures::{future::BoxFuture, FutureExt};

@@ -27,7 +27,8 @@ use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredenti
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
 use snafu::{location, Location};
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::RwLock;
 use url::Url;
 
 use super::local::LocalObjectReader;
@@ -307,6 +308,11 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
+    /// Use constant size upload parts for multipart uploads. Only necessary
+    /// for Cloudflare R2, which doesn't support variable size parts. When this
+    /// is false, max upload size is 2.5TB. When this is true, the max size is
+    /// 50GB.
+    pub use_constant_size_upload_parts: bool,
 }
 
 impl Default for ObjectStoreParams {
@@ -318,6 +324,7 @@ impl Default for ObjectStoreParams {
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
+            use_constant_size_upload_parts: false,
         }
     }
 }

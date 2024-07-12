@@ -293,7 +293,7 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     /// Scan is the leaf node, so returns an empty vector.
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 

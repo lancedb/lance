@@ -1171,9 +1171,7 @@ const MS_PER_DAY: i64 = 86400000;
 
 pub mod array {
 
-    use arrow::datatypes::{
-        Int16Type, Int64Type, Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType,
-    };
+    use arrow::datatypes::{Int16Type, Int64Type, Int8Type};
     use arrow_array::types::{
         Decimal128Type, Decimal256Type, DurationMicrosecondType, DurationMillisecondType,
         DurationNanosecondType, DurationSecondType, Float16Type, Float32Type, Float64Type,
@@ -1384,7 +1382,7 @@ pub mod array {
             _ => panic!(),
         };
 
-        let data_type = DataType::Time32(resolution.clone());
+        let data_type = DataType::Time32(*resolution);
         let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
         let dist = Uniform::new(start, end);
         let sample_fn = move |rng: &mut _| dist.sample(rng);
@@ -1412,7 +1410,7 @@ pub mod array {
             _ => panic!(),
         };
 
-        let data_type = DataType::Time64(resolution.clone());
+        let data_type = DataType::Time64(*resolution);
         let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
         let dist = Uniform::new(start, end);
         let sample_fn = move |rng: &mut _| dist.sample(rng);
@@ -1664,8 +1662,11 @@ pub mod array {
                 TimeUnit::Nanosecond => rand::<DurationNanosecondType>(),
             },
             DataType::Interval(unit) => match unit {
-                IntervalUnit::DayTime => rand::<IntervalDayTimeType>(),
-                IntervalUnit::MonthDayNano => rand::<IntervalMonthDayNanoType>(),
+                // TODO: fix these. In Arrow they changed to have specialized
+                // Native types, which don't support Distribution.
+                // IntervalUnit::DayTime => rand::<IntervalDayTimeType>(),
+                // IntervalUnit::MonthDayNano => rand::<IntervalMonthDayNanoType>(),
+                IntervalUnit::DayTime | IntervalUnit::MonthDayNano => todo!(),
                 IntervalUnit::YearMonth => rand::<IntervalYearMonthType>(),
             },
             DataType::Date32 => rand_date32(),

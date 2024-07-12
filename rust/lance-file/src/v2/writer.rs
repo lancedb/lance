@@ -471,10 +471,6 @@ impl FileWriter {
         Ok(self.rows_written)
     }
 
-    pub fn multipart_id(&self) -> &str {
-        &self.writer.multipart_id
-    }
-
     pub async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await? as u64)
     }

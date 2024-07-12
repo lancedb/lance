@@ -160,6 +160,20 @@ impl Ord for OrderableScalarValue {
                 }
             }
             (Float64(_), _) => panic!("Attempt to compare f64 with non-f64"),
+            (Float16(v1), Float16(v2)) => match (v1, v2) {
+                (Some(f1), Some(f2)) => f1.total_cmp(f2),
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            (Float16(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Float16(_), _) => panic!("Attempt to compare f16 with non-f16"),
             (Int8(v1), Int8(v2)) => v1.cmp(v2),
             (Int8(v1), Null) => {
                 if v1.is_none() {
