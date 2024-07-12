@@ -37,6 +37,10 @@ impl SimulatedScheduler {
     }
 
     fn satisfy_request(&self, req: Range<u64>) -> Bytes {
+        if req.is_empty() {
+            // Some filesystems (e.g. S3 will return an error if an empty request is made and so we need to avoid those)
+            panic!("Empty request")
+        }
         self.data.slice(req.start as usize..req.end as usize)
     }
 }

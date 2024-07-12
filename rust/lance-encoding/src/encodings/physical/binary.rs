@@ -184,7 +184,9 @@ impl PageScheduler for BinaryPageScheduler {
                 let last = indices_builder
                     .normalize(*indices.values().last().unwrap())
                     .1;
-                bytes_ranges.push(first..last);
+                if first != last {
+                    bytes_ranges.push(first..last);
+                }
 
                 indices_builder.extend(indices, curr_row_range.start == 0);
 
@@ -604,7 +606,8 @@ pub mod tests {
             let test_cases = TestCases::default()
                 .with_indices(vec![1])
                 .with_indices(vec![0])
-                .with_indices(vec![2]);
+                .with_indices(vec![2])
+                .with_indices(vec![0, 1]);
             check_round_trip_encoding_of_data(vec![string_array.clone()], &test_cases).await;
             let test_cases = test_cases.with_batch_size(1);
             check_round_trip_encoding_of_data(vec![string_array], &test_cases).await;
