@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
@@ -14,6 +15,7 @@ use lance_index::{
         bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
         btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
         flat::FlatIndexMetadata,
+        label_list::{train_label_list_index, LabelListIndex},
         lance_format::LanceIndexStore,
         ScalarIndex,
     },
@@ -36,6 +38,7 @@ pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
+    LabelList,
 }
 
 #[derive(Default)]
@@ -103,9 +106,11 @@ pub async fn build_scalar_index(
         source: format!("No column with name {}", column).into(),
         location: location!(),
     })?;
-    // In theory it should be possible to create a scalar index (e.g. btree) on a nested field but
+    // In theory it should be possible to create a btree/bitmap index on a nested field but
     // performance would be poor and I'm not sure we want to allow that unless there is a need.
-    if field.data_type().is_nested() {
+    if !matches!(params.force_index_type, Some(ScalarIndexType::LabelList))
+        && field.data_type().is_nested()
+    {
         return Err(Error::InvalidInput {
             source: "A scalar index can only be created on a non-nested field.".into(),
             location: location!(),
@@ -114,6 +119,9 @@ pub async fn build_scalar_index(
     let index_store = LanceIndexStore::from_dataset(dataset, uuid);
     match params.force_index_type {
         Some(ScalarIndexType::Bitmap) => train_bitmap_index(training_request, &index_store).await,
+        Some(ScalarIndexType::LabelList) => {
+            train_label_list_index(training_request, &index_store).await
+        }
         _ => {
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
             train_btree_index(training_request, &flat_index_trainer, &index_store).await
@@ -121,17 +129,33 @@ pub async fn build_scalar_index(
     }
 }
 
-pub async fn open_scalar_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn ScalarIndex>> {
+pub async fn open_scalar_index(
+    dataset: &Dataset,
+    column: &str,
+    uuid: &str,
+) -> Result<Arc<dyn ScalarIndex>> {
     let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, uuid));
     let index_dir = dataset.indices_dir().child(uuid);
-    // This works at the moment, since we only have two index types, may need to introduce better
+    // This works at the moment, since we only have a few index types, may need to introduce better
     // detection method in the future.
-    let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
-    if dataset.object_store.exists(&bitmap_page_lookup).await? {
-        let bitmap_index = BitmapIndex::load(index_store).await?;
-        Ok(bitmap_index as Arc<dyn ScalarIndex>)
+    let col = dataset.schema().field(column).ok_or(Error::Internal {
+        message: format!(
+            "Index refers to column {} which does not exist in dataset schema",
+            column
+        ),
+        location: location!(),
+    })?;
+    if let DataType::List(_) = col.data_type() {
+        let tag_index = LabelListIndex::load(index_store).await?;
+        Ok(tag_index as Arc<dyn ScalarIndex>)
     } else {
-        let btree_index = BTreeIndex::load(index_store).await?;
-        Ok(btree_index as Arc<dyn ScalarIndex>)
+        let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
+        if dataset.object_store.exists(&bitmap_page_lookup).await? {
+            let bitmap_index = BitmapIndex::load(index_store).await?;
+            Ok(bitmap_index as Arc<dyn ScalarIndex>)
+        } else {
+            let btree_index = BTreeIndex::load(index_store).await?;
+            Ok(btree_index as Arc<dyn ScalarIndex>)
+        }
     }
 }

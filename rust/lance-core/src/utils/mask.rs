@@ -677,6 +677,32 @@ impl<'a> Extend<&'a u64> for RowIdTreeMap {
     }
 }
 
+// Extending with RowIdTreeMap is basically a cumulative set union
+impl Extend<RowIdTreeMap> for RowIdTreeMap {
+    fn extend<T: IntoIterator<Item = RowIdTreeMap>>(&mut self, iter: T) {
+        for other in iter {
+            for (fragment, set) in other.inner {
+                match self.inner.get_mut(&fragment) {
+                    None => {
+                        self.inner.insert(fragment, set);
+                    }
+                    Some(RowIdSelection::Full) => {
+                        // If the fragment is already selected then there is nothing to do
+                    }
+                    Some(RowIdSelection::Partial(lhs_set)) => match set {
+                        RowIdSelection::Full => {
+                            self.inner.insert(fragment, RowIdSelection::Full);
+                        }
+                        RowIdSelection::Partial(rhs_set) => {
+                            *lhs_set |= rhs_set;
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

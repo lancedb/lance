@@ -4,15 +4,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{AsArray, LargeStringBuilder, ListBuilder, UInt32Builder, UInt64Builder};
+use arrow::array::{AsArray, ListBuilder, UInt64Builder};
 use arrow::datatypes::{self, UInt64Type};
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{ArrayRef, LargeStringArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result, ROW_ID};
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
@@ -21,7 +22,7 @@ use tantivy::tokenizer::TokenFilter;
 use crate::vector::graph::OrderedFloat;
 use crate::Index;
 
-use super::{IndexReader, IndexStore, ScalarIndex, ScalarQuery};
+use super::{AnyQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex};
 
 const TOKENS_FILE: &str = "tokens.lance";
 const INVERT_LIST_FILE: &str = "invert.lance";
@@ -121,9 +122,10 @@ impl Index for InvertedIndex {
 #[async_trait]
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
-            ScalarQuery::FullTextSearch(tokens) => {
+            SargableQuery::FullTextSearch(tokens) => {
                 let token_ids = self.map(tokens);
                 self.bm25_search(token_ids)
                     .into_iter()
@@ -139,7 +141,7 @@ impl ScalarIndex for InvertedIndex {
 
         // sort the row ids (documents) by bm25 score
 
-        Ok(UInt64Array::from_iter_values(row_ids))
+        Ok(RowIdTreeMap::from_iter(row_ids))
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
@@ -245,19 +247,19 @@ struct TokenSet {
 
 impl TokenSet {
     fn to_batch(&self) -> Result<RecordBatch> {
-        let mut tokens_builder = LargeStringBuilder::with_capacity(self.tokens.len(), 32);
-        let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
-        let mut frequency_builder = UInt64Builder::with_capacity(self.tokens.len());
+        let mut tokens = Vec::with_capacity(self.tokens.len());
+        let mut token_ids = Vec::with_capacity(self.tokens.len());
+        let mut frequencies = Vec::with_capacity(self.tokens.len());
         self.tokens
             .iter()
             .for_each(|(token, (token_id, frequency))| {
-                tokens_builder.append_value(token);
-                token_id_builder.append_value(*token_id);
-                frequency_builder.append_value(*frequency);
+                tokens.push(token.clone());
+                token_ids.push(*token_id);
+                frequencies.push(*frequency);
             });
-        let token_col = tokens_builder.finish();
-        let token_id_col = token_id_builder.finish();
-        let frequency_col = frequency_builder.finish();
+        let token_col = LargeStringArray::from(tokens);
+        let token_id_col = UInt32Array::from(token_ids);
+        let frequency_col = UInt64Array::from(frequencies);
 
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(TOKEN_COL, DataType::LargeUtf8, false),
@@ -329,22 +331,20 @@ impl TokenSet {
 // it's used to retrieve the documents that contain a token
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 struct InvertedList {
+    // token_id => [(row_id, frequency)]
     inverted_list: HashMap<u32, Vec<(u64, u64)>>,
-    // tokens: Vec<u32>,
-    // row_ids_list: Vec<Vec<u64>>,
-    // frequencies_list: Vec<Vec<u64>>,
 }
 
 impl InvertedList {
     fn to_batch(&self) -> Result<RecordBatch> {
-        let mut token_id_builder = UInt32Builder::with_capacity(self.inverted_list.len());
+        let mut tokens = Vec::with_capacity(self.inverted_list.len());
         let mut row_ids_list_builder =
             ListBuilder::with_capacity(UInt64Builder::new(), self.inverted_list.len());
         let mut frequencies_list_builder =
             ListBuilder::with_capacity(UInt64Builder::new(), self.inverted_list.len());
 
         for (token_id, list) in &self.inverted_list {
-            token_id_builder.append_value(*token_id);
+            tokens.push(*token_id);
             let row_ids_builder = row_ids_list_builder.values();
             let frequencies_builder = frequencies_list_builder.values();
             for (row_id, frequency) in list {
@@ -355,7 +355,7 @@ impl InvertedList {
             frequencies_list_builder.append(true);
         }
 
-        let token_id_col = token_id_builder.finish();
+        let token_id_col = UInt32Array::from(tokens);
         let row_ids_col = row_ids_list_builder.finish();
         let frequencies_col = frequencies_list_builder.finish();
 
@@ -436,8 +436,6 @@ impl InvertedList {
 struct DocSet {
     // row id -> num tokens
     token_count: HashMap<u64, u32>,
-    // row_ids: Vec<u64>,
-    // num_tokens: Vec<u32>,
     total_tokens: u64,
 }
 
@@ -552,25 +550,25 @@ mod tests {
 
         let invert_index = super::InvertedIndex::load(Arc::new(store)).await.unwrap();
         let row_ids = invert_index
-            .search(&super::ScalarQuery::FullTextSearch(vec![
+            .search(&super::SargableQuery::FullTextSearch(vec![
                 "lance".to_string()
             ]))
             .await
             .unwrap();
-        assert_eq!(row_ids.len(), 3);
-        assert!(row_ids.values().contains(&0));
-        assert!(row_ids.values().contains(&1));
-        assert!(row_ids.values().contains(&2));
+        assert_eq!(row_ids.len(), Some(3));
+        assert!(row_ids.contains(0));
+        assert!(row_ids.contains(1));
+        assert!(row_ids.contains(2));
 
         let row_ids = invert_index
-            .search(&super::ScalarQuery::FullTextSearch(vec![
+            .search(&super::SargableQuery::FullTextSearch(vec![
                 "database".to_string()
             ]))
             .await
             .unwrap();
-        assert_eq!(row_ids.len(), 3);
-        assert!(row_ids.values().contains(&0));
-        assert!(row_ids.values().contains(&1));
-        assert!(row_ids.values().contains(&3));
+        assert_eq!(row_ids.len(), Some(3));
+        assert!(row_ids.contains(0));
+        assert!(row_ids.contains(1));
+        assert!(row_ids.contains(3));
     }
 }
