@@ -1267,7 +1267,8 @@ mod tests {
             let test_cases = TestCases::default()
                 .with_indices(vec![1])
                 .with_indices(vec![0])
-                .with_indices(vec![2]);
+                .with_indices(vec![2])
+                .with_indices(vec![0, 1]);
             check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
             let test_cases = test_cases.with_batch_size(1);
             check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
