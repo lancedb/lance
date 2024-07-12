@@ -370,6 +370,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        fast_search: bool = False,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -437,6 +438,7 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
             use_stats=use_stats,
+            fast_search=fast_search,
         ).to_table()
 
     @property
