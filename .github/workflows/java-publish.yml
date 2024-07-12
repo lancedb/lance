@@ -80,8 +80,8 @@ jobs:
           java-version: 8
           cache: "maven"
           server-id: ossrh
-          server-username: ${{ secrets.SONATYPE_USER }}
-          server-password: ${{ secrets.SONATYPE_TOKEN }}
+          server-username: SONATYPE_USER
+          server-password: SONATYPE_TOKEN
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
           gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
       - name: Install dependencies
@@ -109,5 +109,5 @@ jobs:
           export GPG_TTY=$(tty)
           mvn --batch-mode -DskipTests -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
         env:
-          MAVEN_USERNAME: ${{ secrets.SONATYPE_USER }}
-          MAVEN_PASSWORD: ${{ secrets.SONATYPE_TOKEN }}
+          SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
+          SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
