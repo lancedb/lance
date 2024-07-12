@@ -193,6 +193,7 @@ impl HNSW {
         .collect())
     }
 
+    #[instrument(level = "debug", skip(self, query, bitset, storage))]
     pub fn search_basic(
         &self,
         query: ArrayRef,
