@@ -20,7 +20,7 @@ def gen_dataset(tmpdir, datatype=np.float32):
 def test_ivf_centroids(tmpdir):
     ds = gen_dataset(tmpdir)
 
-    ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16)
+    ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16)
 
     assert ivf.distance_type == "l2"
     assert len(ivf.centroids) == 100
@@ -34,7 +34,7 @@ def test_ivf_centroids(tmpdir):
 @pytest.mark.cuda
 def test_ivf_centroids_cuda(tmpdir):
     ds = gen_dataset(tmpdir)
-    ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16, accelerator="cuda")
+    ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16, accelerator="cuda")
 
     assert ivf.distance_type == "l2"
     assert len(ivf.centroids) == 100
@@ -43,7 +43,7 @@ def test_ivf_centroids_cuda(tmpdir):
 def test_ivf_centroids_column_type(tmpdir):
     def check(column_type, typename):
         ds = gen_dataset(tmpdir / typename, column_type)
-        ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16)
+        ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16)
         assert len(ivf.centroids) == 100
         ivf.save(str(tmpdir / f"ivf_{typename}"))
         reloaded = IvfModel.load(str(tmpdir / f"ivf_{typename}"))
@@ -58,8 +58,8 @@ def test_ivf_centroids_distance_type(tmpdir):
     ds = gen_dataset(tmpdir)
 
     def check(distance_type):
-        ivf = IndicesBuilder(ds).train_ivf(
-            "vectors", sample_rate=16, distance_type=distance_type
+        ivf = IndicesBuilder(ds, "vectors").train_ivf(
+            sample_rate=16, distance_type=distance_type
         )
         assert ivf.distance_type == distance_type
         ivf.save(str(tmpdir / "ivf"))
@@ -74,21 +74,21 @@ def test_ivf_centroids_distance_type(tmpdir):
 def test_num_partitions(tmpdir):
     ds = gen_dataset(tmpdir)
 
-    ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16, num_partitions=10)
+    ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16, num_partitions=10)
     assert ivf.num_partitions == 10
 
 
 @pytest.fixture
 def ds_with_ivf(tmpdir):
     ds = gen_dataset(tmpdir)
-    ivf = IndicesBuilder(ds).train_ivf("vectors", sample_rate=16)
+    ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16)
     return ds, ivf
 
 
 def test_gen_pq(tmpdir, ds_with_ivf):
     ds, ivf = ds_with_ivf
 
-    pq = IndicesBuilder(ds).train_pq("vectors", ivf, sample_rate=16)
+    pq = IndicesBuilder(ds, "vectors").train_pq(ivf, sample_rate=16)
     assert pq.dimension == 128
     assert pq.num_subvectors == 8
 
@@ -96,3 +96,23 @@ def test_gen_pq(tmpdir, ds_with_ivf):
     reloaded = PqModel.load(str(tmpdir / "pq"))
     assert pq.dimension == reloaded.dimension
     assert pq.codebook == reloaded.codebook
+
+
+@pytest.mark.cuda
+def test_assign_partitions(tmpdir):
+    ds = gen_dataset(tmpdir)
+    builder = IndicesBuilder(ds, "vectors")
+
+    ivf = builder.train_ivf(sample_rate=16, num_partitions=20)
+    partitions_uri = builder.assign_ivf_partitions(ivf, accelerator="cuda")
+
+    partitions = lance.dataset(partitions_uri)
+    found_row_ids = set()
+    for batch in partitions.to_batches():
+        row_ids = batch["row_id"]
+        for row_id in row_ids:
+            found_row_ids.add(row_id)
+        part_ids = batch["partition"]
+        for part_id in part_ids:
+            assert part_id.as_py() < 20
+    assert len(found_row_ids) == ds.count_rows()
