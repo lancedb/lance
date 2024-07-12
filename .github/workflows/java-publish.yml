@@ -95,7 +95,11 @@ jobs:
           mkdir -p ./core/target/classes/nativelib/darwin-aarch64 ./core/target/classes/nativelib/linux-aarch64
           cp ../liblance_jni_darwin_aarch64.zip/liblance_jni.dylib ./core/target/classes/nativelib/darwin-aarch64/liblance_jni.dylib
           cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
-      - name: Build and publish with Java 8
+      - name: Set github
+        run: |
+          git config --global user.email "Lance Github Runner"
+          git config --global user.name "dev+gha@lancedb.com"
+      - name: Release prepare with Java 8
         run: |
           mvn release:prepare -B -DskipTests -DpushChanges=false
       - name: Publish with Java 8
