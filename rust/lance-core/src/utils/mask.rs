@@ -678,8 +678,8 @@ impl<'a> Extend<&'a u64> for RowIdTreeMap {
 }
 
 // Extending with RowIdTreeMap is basically a cumulative set union
-impl Extend<RowIdTreeMap> for RowIdTreeMap {
-    fn extend<T: IntoIterator<Item = RowIdTreeMap>>(&mut self, iter: T) {
+impl Extend<Self> for RowIdTreeMap {
+    fn extend<T: IntoIterator<Item = Self>>(&mut self, iter: T) {
         for other in iter {
             for (fragment, set) in other.inner {
                 match self.inner.get_mut(&fragment) {
