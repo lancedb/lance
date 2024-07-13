@@ -99,9 +99,6 @@ jobs:
         run: |
           git config --global user.email "Lance Github Runner"
           git config --global user.name "dev+gha@lancedb.com"
-      - name: Release prepare with Java 8
-        run: |
-          mvn release:prepare -B -DskipTests -DpushChanges=false
       - name: Publish with Java 8
         run: |
           echo "use-agent" >> ~/.gnupg/gpg.conf
