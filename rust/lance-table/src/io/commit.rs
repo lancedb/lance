@@ -316,6 +316,12 @@ pub trait CommitHandler: Debug + Send + Sync {
     ) -> std::result::Result<(), CommitError>;
 }
 
+
+pub trait WrappingCommitHandler: Debug + Send + Sync {
+    fn wrap(&self, original: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandler>;
+}
+
+
 /// Adapt an object_store credentials into AWS SDK creds
 #[cfg(feature = "dynamodb")]
 #[derive(Debug)]

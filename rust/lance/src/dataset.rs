@@ -390,8 +390,12 @@ impl Dataset {
         params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut params = params.unwrap_or_default();
-        let (object_store, base, commit_handler) =
+        let (object_store, base, mut commit_handler) =
             Self::params_from_uri(uri, &params.commit_handler, &params.store_params).await?;
+
+        if let Some(commit_handler_wrapper) = params.commit_handler_wrapper.as_ref() {
+            commit_handler = commit_handler_wrapper.wrap(commit_handler);
+        }
 
         // Read expected manifest path for the dataset
         let dataset_exists = match commit_handler

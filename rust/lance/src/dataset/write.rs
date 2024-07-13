@@ -15,7 +15,7 @@ use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::{DataFile, Fragment};
-use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::{CommitHandler, WrappingCommitHandler};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -96,6 +96,11 @@ pub struct WriteParams {
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
 
+    /// If present, will be used to wrap the commit handler implementation.
+    /// 
+    /// This can be used to augment the behavior of the commit of the commit handler implementation.
+    pub commit_handler_wrapper: Option<Arc<dyn WrappingCommitHandler>>,
+
     /// If set to true then the Lance v1 writer will be used instead of the Lance v2 writer
     ///
     /// Unless you are intentionally testing the v2 writer, you should leave this as true
@@ -121,6 +126,7 @@ impl Default for WriteParams {
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
+            commit_handler_wrapper: None,
             use_legacy_format: true,
             enable_move_stable_row_ids: false,
         }
