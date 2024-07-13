@@ -63,10 +63,10 @@ impl KMeans {
         k: usize,
         metric_type: &str,
         max_iters: u32,
-        centroids_arr: Option<&PyAny>,
+        centroids_arr: Option<&Bound<PyAny>>,
     ) -> PyResult<Self> {
         let trained_kmeans = if let Some(arr) = centroids_arr {
-            let data = ArrayData::from_pyarrow(arr)?;
+            let data = ArrayData::from_pyarrow_bound(arr)?;
             if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
                 return Err(PyValueError::new_err("Must be a FixedSizeList"));
             }
