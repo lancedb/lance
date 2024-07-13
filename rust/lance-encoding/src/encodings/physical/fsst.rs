@@ -88,31 +88,13 @@ impl PrimitivePageDecoder for FsstPageDecoder {
             num_rows as usize + 1,
         );
 
-        // Need to adjust offsets to account for symbol table
-        // TODO: Don't do this with a copy
-        /*
-        let mut compressed_offsets = Vec::with_capacity(offsets.len());
-        compressed_offsets.extend(
-            offsets
-                .iter()
-                .map(|val| *val + self.symbol_table.len() as i32),
-        );
-        */
-
-        // Need to insert symbol table back in front of compressed bytes
-        /*
-        let mut compressed_bytes = Vec::with_capacity(self.symbol_table.len() + bytes.len());
-        compressed_bytes.extend_from_slice(&self.symbol_table);
-        compressed_bytes.extend_from_slice(&bytes);
-        */
-
         let mut decompressed_offsets = vec![0_i32; offsets.len()];
         let mut decompressed_bytes = vec![0_u8; bytes.len() * 3];
         // Safety: Exposes uninitialized memory but we're about to clobber it
         unsafe {
             decompressed_bytes.set_len(decompressed_bytes.capacity());
         }
-        fsst::fsst::decompress3(
+        fsst::fsst::decompress(
             &self.symbol_table,
             &bytes,
             &offsets,
@@ -178,12 +160,12 @@ impl ArrayEncoder for FsstArrayEncoder {
         let mut dest_values = vec![0_u8; values.len() * 2];
         let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
 
-        fsst::fsst::compress3(
+        fsst::fsst::compress(
+            &mut symbol_table,
             values.as_slice(),
             offsets,
             &mut dest_values,
             &mut dest_offsets,
-            &mut symbol_table,
         )?;
 
         let dest_array = Arc::new(BinaryArray::new(

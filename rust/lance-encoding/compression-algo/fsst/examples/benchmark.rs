@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use fsst::fsst::{compress, decompress};
+use fsst::fsst::{compress, decompress, FSST_SYMBOL_TABLE_SIZE};
 use rand::Rng;
 
 const TEST_NUM: usize = 10;
@@ -36,9 +36,11 @@ fn read_random_8_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error>
 fn benchmark(file_path: &str) {
     // Step 1: load data in memory
     let mut inputs: Vec<StringArray> = vec![];
+    let mut symbol_tables: Vec<[u8; FSST_SYMBOL_TABLE_SIZE]> = vec![];
     for _ in 0..TEST_NUM {
         let this_input = read_random_8_m_chunk(&file_path).unwrap();
         inputs.push(this_input);
+        symbol_tables.push([0u8; FSST_SYMBOL_TABLE_SIZE]);
     }
 
     // Step 2: allocate memory for compression and decompression outputs
@@ -65,6 +67,7 @@ fn benchmark(file_path: &str) {
     let start = std::time::Instant::now();
     for i in 0..TEST_NUM {
         compress(
+            symbol_tables[i].as_mut(),
             &inputs[i].values(),
             inputs[i].value_offsets(),
             &mut compression_out_bufs[i],
@@ -76,6 +79,7 @@ fn benchmark(file_path: &str) {
 
     for i in 0..TEST_NUM {
         decompress(
+            &symbol_tables[i],
             &compression_out_bufs[i],
             &compression_out_offsets_bufs[i],
             &mut decompression_out_bufs[i],
