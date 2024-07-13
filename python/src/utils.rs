@@ -96,8 +96,8 @@ impl KMeans {
     }
 
     /// Train the model
-    fn fit(&mut self, _py: Python, arr: &PyAny) -> PyResult<()> {
-        let data = ArrayData::from_pyarrow(arr)?;
+    fn fit(&mut self, _py: Python, arr: &Bound<PyAny>) -> PyResult<()> {
+        let data = ArrayData::from_pyarrow_bound(arr)?;
         if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
         }
@@ -113,11 +113,11 @@ impl KMeans {
         Ok(())
     }
 
-    fn predict(&self, py: Python, array: &PyAny) -> PyResult<PyObject> {
+    fn predict(&self, py: Python, array: &Bound<PyAny>) -> PyResult<PyObject> {
         let Some(kmeans) = self.trained_kmeans.as_ref() else {
             return Err(PyRuntimeError::new_err("KMeans must fit (train) first"));
         };
-        let data = ArrayData::from_pyarrow(array)?;
+        let data = ArrayData::from_pyarrow_bound(array)?;
         if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
         }
@@ -178,7 +178,7 @@ impl Hnsw {
         distance_type="l2",
     ))]
     fn build(
-        vectors_array: &PyIterator,
+        vectors_array: &Bound<PyIterator>,
         max_level: u16,
         m: usize,
         ef_construction: usize,
@@ -191,7 +191,7 @@ impl Hnsw {
 
         let mut data: Vec<Arc<dyn Array>> = Vec::new();
         for vectors in vectors_array {
-            let vectors = ArrayData::from_pyarrow(vectors?)?;
+            let vectors = ArrayData::from_pyarrow_bound(&vectors?)?;
             if !matches!(vectors.data_type(), DataType::FixedSizeList(_, _)) {
                 return Err(PyValueError::new_err("Must be a FixedSizeList"));
             }
