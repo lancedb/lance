@@ -217,6 +217,7 @@ impl PreFilter for DatasetPreFilter {
     /// search is running.  When you are ready to use the prefilter you
     /// must first call this method to ensure it is fully loaded.  This
     /// allows `filter_row_ids` to be a synchronous method.
+    #[instrument(level = "debug", skip(self))]
     async fn wait_for_ready(&self) -> Result<()> {
         if let Some(filtered_ids) = &self.filtered_ids {
             filtered_ids.wait_ready().await?;
