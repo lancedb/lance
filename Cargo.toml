@@ -96,6 +96,7 @@ crossbeam-queue = "0.3"
 datafusion = { version = "40.0", default-features = false, features = [
     "array_expressions",
     "regex_expressions",
+    "unicode_expressions",
 ] }
 datafusion-common = "40.0"
 datafusion-functions = { version = "40.0", features = ["regex_expressions"] }

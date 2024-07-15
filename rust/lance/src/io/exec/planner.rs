@@ -18,6 +18,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
     AggregateUDF, ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility, WindowUDF,
@@ -405,7 +406,7 @@ impl Planner {
             }
         }
         let context_provider = LanceContextProvider::default();
-        let sql_to_rel = SqlToRel::new_with_options(
+        let mut sql_to_rel = SqlToRel::new_with_options(
             &context_provider,
             ParserOptions {
                 parse_float_as_decimal: false,
@@ -413,6 +414,12 @@ impl Planner {
                 support_varchar_with_length: false,
             },
         );
+        // These planners are not automatically propagated.
+        // See: https://github.com/apache/datafusion/issues/11477
+        for planner in context_provider.state.expr_planners() {
+            sql_to_rel = sql_to_rel.with_user_defined_planner(planner.clone());
+        }
+
         let mut planner_context = PlannerContext::default();
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
         Ok(sql_to_rel.sql_to_expr(function, &schema, &mut planner_context)?)
