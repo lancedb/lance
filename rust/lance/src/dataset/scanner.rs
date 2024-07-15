@@ -361,6 +361,19 @@ impl Scanner {
         Ok(self)
     }
 
+    /// Filter by full text search
+    /// The column must be a string column.
+    /// The query is a string to search for.
+    /// The search is case-insensitive, BM25 scoring is used.
+    /// 
+    /// ```rust,ignore
+    /// let dataset = Dataset::open(uri).await.unwrap();
+    /// let stream = dataset.scan()
+    ///    .project(&["col", "col2.subfield"]).unwrap()
+    ///    .full_text_search("col", "query").unwrap()
+    ///    .limit(10)
+    ///    .into_stream();
+    /// ```
     pub fn full_text_search(&mut self, column: &str, query: &str) -> Result<&mut Self> {
         let column = self.dataset.schema().field(column).ok_or(Error::io(
             format!("Column {} not found", column),
