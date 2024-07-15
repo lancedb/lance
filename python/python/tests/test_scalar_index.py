@@ -17,14 +17,16 @@ def create_table(nvec=1000, ndim=128):
     mat = np.random.randn(nvec, ndim)
     price = np.random.rand(nvec) * 100
 
-    def gen_str(n):
-        return "".join(random.choices(string.ascii_letters + string.digits, k=n))
+    def gen_str(n, split="", char_set=string.ascii_letters + string.digits):
+        return "".join(random.choices(char_set, k=n))
 
-    meta = [gen_str(100) for _ in range(nvec)]
+    meta = np.array([gen_str(100) for _ in range(nvec)])
+    doc = [gen_str(10, " ", string.ascii_letters) for _ in range(nvec)]
     tbl = (
         vec_to_table(data=mat)
         .append_column("price", pa.array(price))
-        .append_column("meta", pa.array(meta, type=pa.large_string()))
+        .append_column("meta", pa.array(meta))
+        .append_column("doc", pa.array(doc, pa.large_string()))
         .append_column("id", pa.array(range(nvec)))
     )
     return tbl
@@ -209,11 +211,12 @@ def test_lance_mem_pool_env_var(tmp_path):
 
 
 def test_full_text_search(dataset):
-    dataset.create_scalar_index("meta", index_type="INVERTED")
-    row = dataset.take(indices=[0], columns=["meta"])
+    dataset.create_scalar_index("doc", index_type="INVERTED")
+    row = dataset.take(indices=[0], columns=["doc"])
     query = row.column(0)[0].as_py()
+    query = query.split(" ")[0]
     results = dataset.scanner(
-        columns=["meta"], full_text_query=("meta", query)
+        columns=["doc"], full_text_query=("doc", query)
     ).to_table()
     results = results.column(0)
     for row in results:

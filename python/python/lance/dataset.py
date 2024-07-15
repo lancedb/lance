@@ -1252,7 +1252,6 @@ class LanceDataset(pa.dataset.Dataset):
                 and not pa.types.is_floating(field.type)
                 and not pa.types.is_boolean(field.type)
                 and not pa.types.is_string(field.type)
-                and not pa.types.is_large_string(field.type)
                 and not pa.types.is_temporal(field.type)
             ):
                 raise TypeError(
