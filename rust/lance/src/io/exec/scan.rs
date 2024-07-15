@@ -284,6 +284,10 @@ impl LanceScanExec {
 }
 
 impl ExecutionPlan for LanceScanExec {
+    fn name(&self) -> &str {
+        "LanceScanExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -157,6 +157,10 @@ impl ProjectionExec {
 }
 
 impl ExecutionPlan for ProjectionExec {
+    fn name(&self) -> &str {
+        "ProjectionExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

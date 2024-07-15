@@ -103,10 +103,9 @@ impl LancePushdownScanExec {
     ) -> Result<Self> {
         // This should be infallible.
         let columns: Vec<_> = predicate
-            .to_columns()
-            .unwrap()
+            .column_refs()
             .into_iter()
-            .map(|col| col.name)
+            .map(|col| col.name.as_str())
             .collect();
         let dataset_schema = dataset.schema();
         let predicate_projection = Arc::new(dataset_schema.project(&columns)
@@ -147,6 +146,10 @@ impl LancePushdownScanExec {
 }
 
 impl ExecutionPlan for LancePushdownScanExec {
+    fn name(&self) -> &str {
+        "LancePushdownScanExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -362,10 +365,9 @@ impl FragmentScanner {
                 // 1. Load needed filter columns, which might be a subset of all filter
                 //    columns if statistics obviated the need for some columns.
                 let columns: Vec<_> = predicate
-                    .to_columns()
-                    .unwrap()
+                    .column_refs()
                     .into_iter()
-                    .map(|col| col.name)
+                    .map(|col| col.name.as_str())
                     .collect();
                 let predicate_projection =
                     Arc::new(self.fragment.dataset().schema().project(&columns).unwrap());

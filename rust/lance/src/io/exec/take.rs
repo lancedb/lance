@@ -249,6 +249,10 @@ impl TakeExec {
 }
 
 impl ExecutionPlan for TakeExec {
+    fn name(&self) -> &str {
+        "TakeExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

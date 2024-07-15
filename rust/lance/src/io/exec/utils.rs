@@ -123,6 +123,10 @@ impl RecordBatchStream for ShareableRecordBatchStreamAdapter {
 }
 
 impl ExecutionPlan for ReplayExec {
+    fn name(&self) -> &str {
+        "ReplayExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

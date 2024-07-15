@@ -410,6 +410,7 @@ impl Planner {
             ParserOptions {
                 parse_float_as_decimal: false,
                 enable_ident_normalization: false,
+                support_varchar_with_length: false,
             },
         );
         let mut planner_context = PlannerContext::default();

@@ -246,33 +246,33 @@ impl Ord for OrderableScalarValue {
                 }
             }
             (UInt64(_), _) => panic!("Attempt to compare Int16 with non-UInt64"),
-            (Utf8(v1), Utf8(v2)) => v1.cmp(v2),
-            (Utf8(v1), Null) => {
+            (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Utf8(v2) | Utf8View(v2) | LargeUtf8(v2)) => {
+                v1.cmp(v2)
+            }
+            (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Null) => {
                 if v1.is_none() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
             }
-            (Utf8(_), _) => panic!("Attempt to compare Utf8 with non-Utf8"),
-            (LargeUtf8(v1), LargeUtf8(v2)) => v1.cmp(v2),
-            (LargeUtf8(v1), Null) => {
+            (Utf8(_) | Utf8View(_) | LargeUtf8(_), _) => {
+                panic!("Attempt to compare Utf8 with non-Utf8")
+            }
+            (
+                Binary(v1) | LargeBinary(v1) | BinaryView(v1),
+                Binary(v2) | LargeBinary(v2) | BinaryView(v2),
+            ) => v1.cmp(v2),
+            (Binary(v1) | LargeBinary(v1) | BinaryView(v1), Null) => {
                 if v1.is_none() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
             }
-            (LargeUtf8(_), _) => panic!("Attempt to compare LargeUtf8 with non-LargeUtf8"),
-            (Binary(v1), Binary(v2)) => v1.cmp(v2),
-            (Binary(v1), Null) => {
-                if v1.is_none() {
-                    Ordering::Equal
-                } else {
-                    Ordering::Greater
-                }
+            (Binary(_) | LargeBinary(_) | BinaryView(_), _) => {
+                panic!("Attempt to compare Binary with non-Binary")
             }
-            (Binary(_), _) => panic!("Attempt to compare Binary with non-Binary"),
             (FixedSizeBinary(_, v1), FixedSizeBinary(_, v2)) => v1.cmp(v2),
             (FixedSizeBinary(_, v1), Null) => {
                 if v1.is_none() {
@@ -284,15 +284,6 @@ impl Ord for OrderableScalarValue {
             (FixedSizeBinary(_, _), _) => {
                 panic!("Attempt to compare FixedSizeBinary with non-FixedSizeBinary")
             }
-            (LargeBinary(v1), LargeBinary(v2)) => v1.cmp(v2),
-            (LargeBinary(v1), Null) => {
-                if v1.is_none() {
-                    Ordering::Equal
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (LargeBinary(_), _) => panic!("Attempt to compare LargeBinary with non-LargeBinary"),
             (FixedSizeList(left), FixedSizeList(right)) => {
                 if left.eq(right) {
                     todo!()
@@ -324,6 +315,17 @@ impl Ord for OrderableScalarValue {
                 panic!("Attempt to compare List with non-List")
             }
             (LargeList(_), _) => todo!(),
+            (Map(_), Map(_)) => todo!(),
+            (Map(left), Null) => {
+                if left.is_null(0) {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Map(_), _) => {
+                panic!("Attempt to compare Map with non-Map")
+            }
             (Date32(v1), Date32(v2)) => v1.cmp(v2),
             (Date32(v1), Null) => {
                 if v1.is_none() {

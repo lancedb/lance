@@ -59,17 +59,17 @@ lance-test-macros = { version = "=0.15.0", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=0.15.0", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "52.0", optional = false, features = ["prettyprint"] }
-arrow-arith = "52.0"
-arrow-array = "52.0"
-arrow-buffer = "52.0"
-arrow-cast = "52.0"
-arrow-data = "52.0"
-arrow-ipc = { version = "52.0", features = ["zstd"] }
-arrow-ord = "52.0"
-arrow-row = "52.0"
-arrow-schema = "52.0"
-arrow-select = "52.0"
+arrow = { version = "52.1", optional = false, features = ["prettyprint"] }
+arrow-arith = "52.1"
+arrow-array = "52.1"
+arrow-buffer = "52.1"
+arrow-cast = "52.1"
+arrow-data = "52.1"
+arrow-ipc = { version = "52.1", features = ["zstd"] }
+arrow-ord = "52.1"
+arrow-row = "52.1"
+arrow-schema = "52.1"
+arrow-select = "52.1"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "0.57"
@@ -93,17 +93,17 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "39.0", default-features = false, features = [
+datafusion = { version = "40.0", default-features = false, features = [
     "array_expressions",
     "regex_expressions",
 ] }
-datafusion-common = "39.0"
-datafusion-functions = { version = "39.0", features = ["regex_expressions"] }
-datafusion-sql = "39.0"
-datafusion-expr = "39.0"
-datafusion-execution = "39.0"
-datafusion-optimizer = "39.0"
-datafusion-physical-expr = { version = "39.0", features = [
+datafusion-common = "40.0"
+datafusion-functions = { version = "40.0", features = ["regex_expressions"] }
+datafusion-sql = "40.0"
+datafusion-expr = "40.0"
+datafusion-execution = "40.0"
+datafusion-optimizer = "40.0"
+datafusion-physical-expr = { version = "40.0", features = [
     "regex_expressions",
 ] }
 deepsize = "0.2.0"

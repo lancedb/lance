@@ -11,7 +11,8 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
-use datafusion::logical_expr::{AggregateFunction, Expr};
+use datafusion::functions_aggregate::count::count_udaf;
+use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
@@ -19,10 +20,11 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
-    expressions::{create_aggregate_expr, Literal},
+    expressions::Literal,
     filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
+    udaf::create_aggregate_expr,
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
@@ -738,12 +740,14 @@ impl Scanner {
         // Datafusion interprets COUNT(*) as COUNT(1)
         let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
         let count_expr = create_aggregate_expr(
-            &AggregateFunction::Count,
-            false,
+            &count_udaf(),
             &[one],
+            &[lit(1)],
+            &[],
             &[],
             &plan.schema(),
             "",
+            false,
             false,
         )?;
         let plan_schema = plan.schema().clone();

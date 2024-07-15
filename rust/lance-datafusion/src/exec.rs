@@ -97,6 +97,10 @@ impl DisplayAs for OneShotExec {
 }
 
 impl ExecutionPlan for OneShotExec {
+    fn name(&self) -> &str {
+        "OneShotExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

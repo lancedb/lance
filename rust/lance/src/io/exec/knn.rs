@@ -139,6 +139,10 @@ impl KNNVectorDistanceExec {
 }
 
 impl ExecutionPlan for KNNVectorDistanceExec {
+    fn name(&self) -> &str {
+        "KNNVectorDistanceExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -385,6 +389,10 @@ impl DisplayAs for ANNIvfPartitionExec {
 }
 
 impl ExecutionPlan for ANNIvfPartitionExec {
+    fn name(&self) -> &str {
+        "ANNIVFPartitionExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -541,6 +549,10 @@ impl DisplayAs for ANNIvfSubIndexExec {
 }
 
 impl ExecutionPlan for ANNIvfSubIndexExec {
+    fn name(&self) -> &str {
+        "ANNSubIndexExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -108,6 +108,10 @@ impl ScalarIndexExec {
 }
 
 impl ExecutionPlan for ScalarIndexExec {
+    fn name(&self) -> &str {
+        "ScalarIndexExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -268,6 +272,10 @@ impl MapIndexExec {
 }
 
 impl ExecutionPlan for MapIndexExec {
+    fn name(&self) -> &str {
+        "MapIndexExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -537,6 +545,10 @@ async fn retain_fragments(
 }
 
 impl ExecutionPlan for MaterializeIndexExec {
+    fn name(&self) -> &str {
+        "MaterializeIndexExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
