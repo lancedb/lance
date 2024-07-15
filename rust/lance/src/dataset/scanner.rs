@@ -365,7 +365,7 @@ impl Scanner {
     /// The column must be a string column.
     /// The query is a string to search for.
     /// The search is case-insensitive, BM25 scoring is used.
-    /// 
+    ///
     /// ```rust,ignore
     /// let dataset = Dataset::open(uri).await.unwrap();
     /// let stream = dataset.scan()
