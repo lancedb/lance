@@ -2254,6 +2254,12 @@ class ScannerBuilder:
         return self
 
     def full_text_search(self, column: str, query: str) -> ScannerBuilder:
+        """
+        Filter rows by full text searching. *Experimental API*,
+        may remove it after we support to do this within `filter` SQL-like expression
+
+        Must create inverted index on the given column before searching,
+        """
         self._full_text_query = (column, query)
         return self
 
