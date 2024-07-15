@@ -1114,7 +1114,12 @@ class LanceDataset(pa.dataset.Dataset):
     def create_scalar_index(
         self,
         column: str,
-        index_type: Union[Literal["BTREE"], Literal["BITMAP"], Literal["LABEL_LIST"]],
+        index_type: Union[
+            Literal["BTREE"],
+            Literal["BITMAP"],
+            Literal["LABEL_LIST"],
+            Literal["INVERTED"],
+        ],
         name: Optional[str] = None,
         *,
         replace: bool = True,
@@ -1231,10 +1236,11 @@ class LanceDataset(pa.dataset.Dataset):
             raise KeyError(f"{column} not found in schema")
 
         index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "LABEL_LIST"]:
+        if index_type not in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
             raise NotImplementedError(
                 (
-                    'Only "BTREE", "LABEL_LIST", or "BITMAP" are supported for '
+                    'Only "BTREE", "LABEL_LIST", "INVERTED", '
+                    'or "BITMAP" are supported for '
                     f"scalar columns.  Received {index_type}",
                 )
             )
@@ -1255,6 +1261,11 @@ class LanceDataset(pa.dataset.Dataset):
         elif index_type == "LABEL_LIST":
             if not pa.types.is_list(field.type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
+        elif index_type == "INVERTED":
+            if not pa.types.is_large_string(field.type):
+                raise TypeError(
+                    f"INVERTED index column {column} must be a large string"
+                )
 
         if pa.types.is_duration(field.type):
             raise TypeError(

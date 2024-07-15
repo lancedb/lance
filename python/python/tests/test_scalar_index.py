@@ -20,11 +20,11 @@ def create_table(nvec=1000, ndim=128):
     def gen_str(n):
         return "".join(random.choices(string.ascii_letters + string.digits, k=n))
 
-    meta = np.array([gen_str(100) for _ in range(nvec)])
+    meta = [gen_str(100) for _ in range(nvec)]
     tbl = (
         vec_to_table(data=mat)
         .append_column("price", pa.array(price))
-        .append_column("meta", pa.array(meta))
+        .append_column("meta", pa.array(meta, type=pa.large_string()))
         .append_column("id", pa.array(range(nvec)))
     )
     return tbl
@@ -206,3 +206,15 @@ def test_lance_mem_pool_env_var(tmp_path):
     finally:
         del os.environ["LANCE_MEM_POOL_SIZE"]
         del os.environ["LANCE_BYPASS_SPILLING"]
+
+
+def test_full_text_search(dataset):
+    dataset.create_scalar_index("meta", index_type="INVERTED")
+    row = dataset.take(indices=[0], columns=["meta"])
+    query = row.column(0)[0].as_py()
+    results = dataset.scanner(
+        columns=["meta"], full_text_query=("meta", query)
+    ).to_table()
+    results = results.column(0)
+    for row in results:
+        assert query in row.as_py()
