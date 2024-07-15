@@ -2255,6 +2255,7 @@ class ScannerBuilder:
 
     def full_text_search(self, column: str, query: str) -> ScannerBuilder:
         self._full_text_query = (column, query)
+        return self
 
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
