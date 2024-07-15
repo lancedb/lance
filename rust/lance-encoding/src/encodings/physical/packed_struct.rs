@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, StructArray, UInt64Array};
+use arrow_array::{cast::AsArray, types::UInt64Type, Array, ArrayRef, StructArray, UInt64Array};
 use futures::{future::BoxFuture, FutureExt};
 
 use crate::{
@@ -118,54 +118,113 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
 
 #[derive(Debug)]
 pub struct PackedStructEncoder {
-    inner_encoder: Box<dyn ArrayEncoder>,
+    inner_encoders: Vec<Box<dyn ArrayEncoder>>,
 }
 
 impl PackedStructEncoder {
-    pub fn new(inner_encoder: Box<dyn ArrayEncoder>) -> Self {
-        Self { inner_encoder }
+    pub fn new(inner_encoders: Vec<Box<dyn ArrayEncoder>>) -> Self {
+        Self { inner_encoders }
     }
 }
 
 // Encodes the struct in a packed row format
 // TODO: support different inner datatypes for the struct
 // Right now only supports struct of uint64
-fn encode_packed_struct(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
-    let mut packed_vec = Vec::new();
-    for arr in arrays {
-        let struct_array = arr.as_any().downcast_ref::<StructArray>().unwrap();
-        // let inner_datatype = struct_array.column(0).data_type();
+// fn encode_packed_struct(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
+//     let mut packed_vec = Vec::new();
+//     for arr in arrays {
+//         let struct_array = arr.as_any().downcast_ref::<StructArray>().unwrap();
+//         // let inner_datatype = struct_array.column(0).data_type();
 
-        let num_rows = struct_array.len();
-        let num_columns = struct_array.num_columns();
+//         let num_rows = struct_array.len();
+//         let num_columns = struct_array.num_columns();
 
-        let mut packed_row = Vec::with_capacity(num_rows * num_columns);
+//         let mut packed_row = Vec::with_capacity(num_rows * num_columns);
 
-        for row in 0..num_rows {
-            for column in struct_array.columns() {
-                let inner_array = column.as_any().downcast_ref::<UInt64Array>().unwrap();
-                packed_row.push(inner_array.value(row));
-            }
-        }
+//         for row in 0..num_rows {
+//             for column in struct_array.columns() {
+//                 let inner_array = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+//                 packed_row.push(inner_array.value(row));
+//             }
+//         }
 
-        let packed_array = Arc::new(UInt64Array::from(packed_row)) as ArrayRef;
-        packed_vec.push(packed_array);
+//         let packed_array = Arc::new(UInt64Array::from(packed_row)) as ArrayRef;
+//         packed_vec.push(packed_array);
+//     }
+
+//     packed_vec
+// }
+
+fn get_bits_per_value_from_datatype(datatype: &DataType) -> u64 {
+    match datatype {
+        DataType::UInt64 => 64,
+        DataType::UInt32 => 32,
+        DataType::UInt16 => 16,
+        DataType::UInt8 => 8,
+        DataType::Int64 => 64,
+        DataType::Int32 => 32,
+        DataType::Int16 => 16,
+        DataType::Int8 => 8,
+        _ => panic!("Unsupported datatype"),
     }
+}
 
-    packed_vec
+fn pack(encoded_fields: Vec<EncodedArray>, children_bits_per_value: Vec<u64>) {
+    // let num_rows = encoded_children[0].buffers[0].len() as u64;
+    let num_fields = encoded_fields.len() as u64;
+
+    // let mut packed_buffers = Vec::new();
+    for i in 0..num_fields {
+        // let encoded_field = &encoded_fields[i as usize].into_parts(); // encoded array for field i
+
+        let encoded_field = &encoded_fields[i as usize];
+        let child_encoded_buffer = &encoded_field.buffers[0].parts; // encoded buffers for field i
+        // let child_buffer_index = encoded_child.encoding; // encoding for field i
+
+        // let page_index = child_encoded_buffer
+    }
 }
 
 impl ArrayEncoder for PackedStructEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let packed_arrays = encode_packed_struct(arrays);
+        // let packed_arrays = encode_packed_struct(arrays);
         let num_struct_fields = arrays[0]
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap()
             .num_columns();
+        
+        for arr in arrays {
+            println!("Processing array: {:?}", arr);
+            let struct_array = arr.as_any().downcast_ref::<StructArray>().unwrap();
 
-        println!("Packed arrays: {:?}", packed_arrays.clone());
-        let encoded_packed_struct = self.inner_encoder.encode(&packed_arrays, buffer_index)?;
+            let mut encoded_children = Vec::new();
+            let mut children_bits_per_value = Vec::new();
+            for i in 0..num_struct_fields {
+                let field_datatype = struct_array.column(i).data_type();
+                
+                let child_array = struct_array.column(i).clone();
+                let encoded_child = self.inner_encoders[i].encode(&[child_array.clone()], &mut 0)?;
+                let child_buffers = encoded_child.buffers;
+                println!("Length of child {:?}: {:?}", i, child_buffers.len());
+
+                let bits_per_value = get_bits_per_value_from_datatype(field_datatype);
+                children_bits_per_value.push(bits_per_value);
+
+                for j in 0..child_buffers.len() {
+                    println!("Buffer: {:?}", child_buffers[j].parts);
+                }
+                let encoded_child = self.inner_encoders[i].encode(&[child_array], &mut 0)?;
+                encoded_children.push(encoded_child);
+
+                // let encoded_buffer = encoded_child.buffers;
+            }
+
+            // let packed_array = pack(encoded_children);
+        }
+
+        // println!("Packed arrays: {:?}", packed_arrays.clone());
+        let encoded_packed_struct = self.inner_encoders[0].encode(&vec![], buffer_index)?;
         let encoded_buffers = encoded_packed_struct.buffers;
 
         Ok(EncodedArray {
@@ -186,14 +245,13 @@ impl ArrayEncoder for PackedStructEncoder {
 pub mod tests {
 
     use arrow_array::{
-        builder::{LargeStringBuilder, StringBuilder},
-        ArrayRef, StringArray, StructArray, UInt64Array,
+        builder::{LargeStringBuilder, StringBuilder}, ArrayRef, Int32Array, StringArray, StructArray, UInt64Array
     };
     use arrow_schema::{DataType, Field, Fields};
-    use std::{sync::Arc, vec};
+    use std::{collections::HashMap, sync::Arc, vec};
 
     use crate::testing::{
-        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+        check_round_trip_encoding_of_data, check_round_trip_encoding_of_data_with_metadata, check_round_trip_encoding_random, TestCases
     };
 
     #[test_log::test(tokio::test)]
@@ -209,7 +267,7 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_specific_packed_struct() {
         let array1 = Arc::new(UInt64Array::from(vec![1, 2, 3, 4]));
-        let array2 = Arc::new(UInt64Array::from(vec![5, 6, 7, 8]));
+        let array2 = Arc::new(Int32Array::from(vec![5, 6, 7, 8]));
 
         let struct_array1 = Arc::new(StructArray::from(vec![
             (
@@ -217,13 +275,13 @@ pub mod tests {
                 array1.clone() as ArrayRef,
             ),
             (
-                Arc::new(Field::new("y", DataType::UInt64, false)),
+                Arc::new(Field::new("y", DataType::Int32, false)),
                 array2.clone() as ArrayRef,
             ),
         ]));
 
         let array3 = Arc::new(UInt64Array::from(vec![10, 11, 12, 13]));
-        let array4 = Arc::new(UInt64Array::from(vec![14, 15, 16, 17]));
+        let array4 = Arc::new(Int32Array::from(vec![14, 15, 16, 17]));
 
         let struct_array2 = Arc::new(StructArray::from(vec![
             (
@@ -231,7 +289,7 @@ pub mod tests {
                 array3.clone() as ArrayRef,
             ),
             (
-                Arc::new(Field::new("y", DataType::UInt64, false)),
+                Arc::new(Field::new("y", DataType::Int32, false)),
                 array4.clone() as ArrayRef,
             ),
         ]));
@@ -242,7 +300,10 @@ pub mod tests {
             .with_range(1..5)
             .with_indices(vec![1, 3, 7]);
 
-        check_round_trip_encoding_of_data(vec![struct_array1, struct_array2], &test_cases).await;
+        let mut metadata = HashMap::new();
+        metadata.insert("packed".to_string(), "true".to_string());
+
+        check_round_trip_encoding_of_data_with_metadata(vec![struct_array1, struct_array2], &test_cases, metadata).await;
     }
 
     #[test_log::test(tokio::test)]

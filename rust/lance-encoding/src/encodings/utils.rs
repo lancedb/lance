@@ -4,8 +4,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    new_null_array,
-    types::{
+    cast::as_primitive_array, new_null_array, types::{
         ArrowPrimitiveType, ByteArrayType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
         DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
         DurationSecondType, Float16Type, Float32Type, Float64Type, GenericBinaryType,
@@ -14,9 +13,7 @@ use arrow_array::{
         Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
         UInt32Type, UInt64Type, UInt8Type,
-    },
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, GenericByteArray,
-    PrimitiveArray, StructArray, UInt64Array,
+    }, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, GenericByteArray, Int32Array, Int64Array, PrimitiveArray, StructArray, UInt32Array, UInt64Array
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Fields, IntervalUnit, TimeUnit};
@@ -106,6 +103,15 @@ pub fn bytes_to_validity(bytes: BytesMut, num_rows: u64) -> Option<NullBuffer> {
     }
 }
 
+// fn downcast_to_primitive_array<T>(array: &Arc<dyn Array>, data_type: &DataType) -> &PrimitiveArray<T>
+// where
+//     T: arrow::datatypes::ArrowPrimitiveType,
+// {
+//     assert_eq!(array.data_type(), data_type, "Data type mismatch");
+//     array.as_any().downcast_ref::<PrimitiveArray<T>>()
+//         .unwrap_or_else(|| panic!("Failed to downcast to PrimitiveArray<{}>", std::any::type_name::<T>()))
+// }
+
 pub fn new_struct_from_packed_row_buffers(
     buffers: Vec<BytesMut>,
     num_rows: u64,
@@ -116,7 +122,13 @@ pub fn new_struct_from_packed_row_buffers(
     let packed_array =
         primitive_array_from_buffers(inner_datatype, buffers, num_rows * (num_fields as u64))
             .unwrap();
+    
     let inner_array = packed_array.as_any().downcast_ref::<UInt64Array>().unwrap();
+
+    // let inner_array = as_primitive_array::<inner_type>(&packed_array);
+    //     DataType::Int64 => as_primitive_array::<Int64Type>(&packed_array),
+    //     _ => panic!("Unsupported data type for struct array"),
+    // }
     // println!("Inner array: {:?}", inner_array);
 
     let mut child_vecs = vec![Vec::new(); num_fields];

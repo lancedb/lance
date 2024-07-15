@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
+use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
 use crate::{
@@ -263,10 +264,17 @@ impl CoreArrayEncodingStrategy {
                 }
             }
             DataType::Struct(fields) => {
-                let inner_datatype = fields[0].data_type();
-                let inner_encoder =
-                    Self::array_encoder_from_type(inner_datatype, use_dict_encoding)?;
-                Ok(Box::new(PackedStructEncoder::new(inner_encoder)))
+                let num_fields = fields.len();
+                let mut inner_encoders = Vec::new();
+
+                for i in 0..num_fields {
+                    let inner_datatype = fields[i].data_type();
+                    let inner_encoder =
+                        Self::array_encoder_from_type(inner_datatype, use_dict_encoding)?;
+                    inner_encoders.push(inner_encoder);
+                }
+
+                Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::try_new(data_type, get_compression_scheme())?,
@@ -425,10 +433,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
             | DataType::Binary
             | DataType::LargeBinary
             | DataType::Utf8
-            | DataType::LargeUtf8
-            // TODO: Check metadata for presence of user flag before deciding whether to use PrimitiveFieldEncoder
-            // or StructFieldEncoder
-            | DataType::Struct(_) => Ok(Box::new(PrimitiveFieldEncoder::try_new(
+            | DataType::LargeUtf8 => Ok(Box::new(PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_column,
                 keep_original_array,
                 self.array_encoding_strategy.clone(),
@@ -451,27 +456,38 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                     list_idx,
                 )))
             }
-            // DataType::Struct(_) => {
-            //     let header_idx = column_index.next_column_index(field.id);
-            //     let children_encoders = field
-            //         .children
-            //         .iter()
-            //         .map(|field| {
-            //             self.create_field_encoder(
-            //                 encoding_strategy_root,
-            //                 field,
-            //                 column_index,
-            //                 cache_bytes_per_column,
-            //                 keep_original_array,
-            //                 &field.metadata,
-            //             )
-            //         })
-            //         .collect::<Result<Vec<_>>>()?;
-            //     Ok(Box::new(StructFieldEncoder::new(
-            //         children_encoders,
-            //         header_idx,
-            //     )))
-            // }
+            DataType::Struct(_) => {
+                let field_metadata = &field.metadata;
+                if field_metadata.get("packed").map(|v| *v == "true".to_string()).unwrap_or(false) {
+                    Ok(Box::new(PrimitiveFieldEncoder::try_new(
+                        cache_bytes_per_column,
+                        keep_original_array,
+                        self.array_encoding_strategy.clone(),
+                        column_index.next_column_index(field.id),
+                    )?))
+                }
+                else {
+                    let header_idx = column_index.next_column_index(field.id);
+                    let children_encoders = field
+                        .children
+                        .iter()
+                        .map(|field| {
+                            self.create_field_encoder(
+                                encoding_strategy_root,
+                                field,
+                                column_index,
+                                cache_bytes_per_column,
+                                keep_original_array,
+                                &field.metadata,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Box::new(StructFieldEncoder::new(
+                        children_encoders,
+                        header_idx,
+                    )))
+                }
+            }
             _ => todo!("Implement encoding for field {}", field),
         }
     }

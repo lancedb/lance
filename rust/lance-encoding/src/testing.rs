@@ -201,6 +201,29 @@ pub async fn check_round_trip_encoding_of_data(data: Vec<Arc<dyn Array>>, test_c
     }
 }
 
+pub async fn check_round_trip_encoding_of_data_with_metadata(data: Vec<Arc<dyn Array>>, test_cases: &TestCases, metadata: HashMap<String, String>) {
+    let example_data = data.first().expect("Data must have at least one array");
+    let mut field = Field::new("", example_data.data_type().clone(), true);
+    field = field.with_metadata(metadata);
+    let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    for page_size in [4096, 1024 * 1024] {
+        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_config = HashMap::new();
+        let mut column_index_seq = ColumnIndexSequence::default();
+        let encoder = encoding_strategy
+            .create_field_encoder(
+                &encoding_strategy,
+                &lance_field,
+                &mut column_index_seq,
+                page_size,
+                true,
+                &encoding_config,
+            )
+            .unwrap();
+        check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases).await
+    }
+}
+
 struct SimulatedWriter {
     page_infos: Vec<Vec<PageInfo>>,
     encoded_data: BytesMut,
