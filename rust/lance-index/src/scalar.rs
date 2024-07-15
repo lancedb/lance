@@ -159,7 +159,7 @@ impl AnyQuery for SargableQuery {
                 )
             }
             Self::FullTextSearch(query) => {
-                format!("{} LIKE '{}'", col, query)
+                format!("{}:{}", col, query)
             }
             Self::IsNull() => {
                 format!("{} IS NULL", col)

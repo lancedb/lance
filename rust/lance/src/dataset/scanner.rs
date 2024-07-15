@@ -34,7 +34,7 @@ use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::datatypes::Field;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
-use lance_index::scalar::ScalarQuery;
+use lance_index::scalar::SargableQuery;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -901,7 +901,7 @@ impl Scanner {
         if let Some((field, query)) = &self.full_text_query {
             let full_text_search_index_expr = ScalarIndexExpr::Query(
                 field.name.clone(),
-                ScalarQuery::FullTextSearch(query.clone()),
+                Arc::new(SargableQuery::FullTextSearch(query.clone())),
             );
             let scalar_index_query = match filter_plan.index_query {
                 Some(index_expr) => {
