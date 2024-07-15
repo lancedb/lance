@@ -239,6 +239,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
         fragments: Optional[Iterable[LanceFragment]] = None,
+        full_text_query: Optional[tuple[str, str]] = None,
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
@@ -337,6 +338,8 @@ class LanceDataset(pa.dataset.Dataset):
             .use_stats(use_stats)
             .fast_search(fast_search)
         )
+        if full_text_query is not None:
+            builder = builder.full_text_search(full_text_query[0], full_text_query[1])
         if nearest is not None:
             builder = builder.nearest(**nearest)
         return builder.to_scanner()
@@ -371,6 +374,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_id: bool = False,
         use_stats: bool = True,
         fast_search: bool = False,
+        full_text_query: Optional[tuple[str, str]] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -418,6 +422,8 @@ class LanceDataset(pa.dataset.Dataset):
             Return row ID.
         use_stats: bool, default True
             Use stats pushdown during filters.
+        full_text_query: (str, str), optional
+            The string column to search and the query string to search for.
 
         Notes
         -----
@@ -439,6 +445,7 @@ class LanceDataset(pa.dataset.Dataset):
             with_row_id=with_row_id,
             use_stats=use_stats,
             fast_search=fast_search,
+            full_text_query=full_text_query,
         ).to_table()
 
     @property
@@ -488,6 +495,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        full_text_query: Optional[tuple[str, str]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -514,6 +522,7 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
             use_stats=use_stats,
+            full_text_query=full_text_query,
         ).to_batches()
 
     def sample(
@@ -2042,6 +2051,7 @@ class ScannerBuilder:
         self._with_row_id = False
         self._use_stats = True
         self._fast_search = None
+        self._full_text_query = None
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -2232,6 +2242,9 @@ class ScannerBuilder:
         self.fast_search = flag
         return self
 
+    def full_text_search(self, column: str, query: str) -> ScannerBuilder:
+        self._full_text_query = (column, query)
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -2250,6 +2263,7 @@ class ScannerBuilder:
             self._use_stats,
             self._substrait_filter,
             self._fast_search,
+            self._full_text_query,
         )
         return LanceScanner(scanner, self.ds)
 

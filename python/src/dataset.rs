@@ -434,6 +434,7 @@ impl Dataset {
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
+        full_text_query: Option<(String, String)>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -462,6 +463,11 @@ impl Dataset {
             }
             scanner
                 .filter(f.as_str())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some((column, query)) = full_text_query {
+            scanner
+                .full_text_search(column.as_str(), query.as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
