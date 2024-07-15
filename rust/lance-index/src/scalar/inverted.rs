@@ -183,10 +183,40 @@ impl ScalarIndex for InvertedIndex {
 
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
-        _dest_store: &dyn IndexStore,
+        mapping: &HashMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        unimplemented!()
+        let token_set = self.tokens.clone();
+        let mut invert_list = self.invert_list.clone();
+        let mut docs = self.docs.clone();
+
+        let token_set_batch = token_set.to_batch()?;
+        invert_list.remap(mapping);
+        let invert_list_batch = invert_list.to_batch()?;
+        docs.remap(mapping);
+        let docs_batch = docs.to_batch()?;
+
+        let mut token_set_writer = dest_store
+            .new_index_file(TOKENS_FILE, token_set_batch.schema())
+            .await?;
+        token_set_writer.write_record_batch(token_set_batch).await?;
+        token_set_writer.finish().await?;
+
+        let mut invert_list_writer = dest_store
+            .new_index_file(INVERT_LIST_FILE, invert_list_batch.schema())
+            .await?;
+        invert_list_writer
+            .write_record_batch(invert_list_batch)
+            .await?;
+        invert_list_writer.finish().await?;
+
+        let mut docs_writer = dest_store
+            .new_index_file(DOCS_FILE, docs_batch.schema())
+            .await?;
+        docs_writer.write_record_batch(docs_batch).await?;
+        docs_writer.finish().await?;
+
+        Ok(())
     }
 
     async fn update(
@@ -428,6 +458,20 @@ impl InvertedList {
         Ok(Self { inverted_list })
     }
 
+    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
+        for list in self.inverted_list.values_mut() {
+            let mut new_list = Vec::new();
+            for (row_id, freq) in list.iter() {
+                match mapping.get(row_id) {
+                    Some(Some(new_row_id)) => new_list.push((*new_row_id, *freq)),
+                    Some(None) => continue,
+                    None => new_list.push((*row_id, *freq)),
+                }
+            }
+            *list = new_list;
+        }
+    }
+
     // for efficiency, we don't check if the row_id exists
     // we assume that the row_id is unique and doesn't exist in the list
     fn add(&mut self, token_cnt: HashMap<u32, u64>, row_id: u64) {
@@ -503,6 +547,21 @@ impl DocSet {
             token_count,
             total_tokens,
         })
+    }
+
+    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
+        for (old_row_id, new_row_id) in mapping {
+            match new_row_id {
+                Some(new_row_id) => {
+                    if let Some(num_tokens) = self.token_count.remove(old_row_id) {
+                        self.token_count.insert(*new_row_id, num_tokens);
+                    }
+                }
+                None => {
+                    self.token_count.remove(old_row_id);
+                }
+            }
+        }
     }
 
     fn num_tokens(&self, row_id: u64) -> u32 {

@@ -137,7 +137,6 @@ def test_index_with_nans(tmp_path):
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
-        accelerator=torch.device("cpu"),
     )
     validate_vector_index(dataset, "vector")
 
