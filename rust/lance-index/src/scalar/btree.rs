@@ -34,6 +34,7 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
+use moka::sync::Cache;
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::{location, Location};
@@ -650,6 +651,8 @@ impl BTreeLookup {
     }
 }
 
+pub type ScalarIndexCache = Arc<Cache<u32, Arc<dyn ScalarIndex>>>;
+
 /// A btree index satisfies scalar queries using a b tree
 ///
 /// The upper layers of the btree are expected to be cached and, when unloaded,
@@ -665,11 +668,21 @@ impl BTreeLookup {
 ///
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
 /// for faster lookup
-#[derive(Clone, Debug, DeepSizeOf)]
+#[derive(Clone, Debug)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
+
+    index_cache: ScalarIndexCache,
+}
+
+impl DeepSizeOf for BTreeIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.page_lookup.deep_size_of_children(context)
+            + self.store.deep_size_of_children(context)
+            + self.sub_index.deep_size_of_children(context)
+    }
 }
 
 impl BTreeIndex {
@@ -684,6 +697,9 @@ impl BTreeIndex {
             page_lookup,
             store,
             sub_index,
+            index_cache: Arc::new(Cache::builder().weigher(|_, v: &Arc<dyn ScalarIndex>| {
+                v.deep_size_of() as u32
+            }).max_capacity(1024 * 1024 * 1024 * 4).build()),
         }
     }
 
@@ -693,8 +709,18 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: Arc<dyn IndexReader>,
     ) -> Result<RowIdTreeMap> {
-        let serialized_page = index_reader.read_record_batch(page_number).await?;
-        let subindex = self.sub_index.load_subindex(serialized_page).await?;
+        let subindex = if let Some(subindex) = self.index_cache.get(&page_number) {
+            subindex
+        } else {
+            let serialized_page = index_reader.read_record_batch(page_number).await?;
+            let subindex = self.sub_index.load_subindex(serialized_page).await?;
+
+            // this is a sync cache, don't use it across await point
+            self.index_cache.insert(page_number, subindex.clone());
+
+            subindex
+        };
+
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
         // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
