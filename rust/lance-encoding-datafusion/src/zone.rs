@@ -583,6 +583,8 @@ mod tests {
     };
 
     #[test_log::test(tokio::test)]
+    #[ignore] // Stats currently disabled until https://github.com/lancedb/lance/issues/2605
+              // is addressed
     async fn test_basic_stats() {
         let data = lance_datagen::gen()
             .col("0", lance_datagen::array::step::<Int32Type>())

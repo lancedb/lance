@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, DEFAULT_CLOUD_IO_PARALLELISM};
 use lance_table::{
     format::Manifest,
     io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation},
@@ -207,6 +207,9 @@ impl DatasetBuilder {
                     self.options.block_size,
                     self.options.object_store_wrapper,
                     self.options.use_constant_size_upload_parts,
+                    // If user supplied an object store then we just assume it's probably
+                    // cloud-like
+                    DEFAULT_CLOUD_IO_PARALLELISM,
                 ),
                 Path::from(store.1.path()),
                 commit_handler,

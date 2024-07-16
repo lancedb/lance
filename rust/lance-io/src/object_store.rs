@@ -15,6 +15,7 @@ use aws_credential_types::provider::ProvideCredentials;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
@@ -36,6 +37,14 @@ mod tracing;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
+
+// Local disks tend to do fine with a few threads
+// Note: the number of threads here also impacts the number of files
+// we need to read in some situations.  So keeping this at 8 keeps the
+// RAM on our scanner down.
+pub const DEFAULT_LOCAL_IO_PARALLELISM: u32 = 8;
+// Cloud disks often need many many threads to saturate the network
+pub const DEFAULT_CLOUD_IO_PARALLELISM: u32 = 64;
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -85,6 +94,7 @@ pub struct ObjectStore {
     scheme: String,
     block_size: usize,
     pub use_constant_size_upload_parts: bool,
+    io_parallelism: u32,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -403,6 +413,7 @@ impl ObjectStore {
                 scheme: String::from(scheme),
                 block_size: 4 * 1024, // 4KB block size
                 use_constant_size_upload_parts: false,
+                io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             },
             Path::from_absolute_path(expanded_path.as_path())?,
         ))
@@ -423,6 +434,7 @@ impl ObjectStore {
             scheme: String::from("file"),
             block_size: 4 * 1024, // 4KB block size
             use_constant_size_upload_parts: false,
+            io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
         }
     }
 
@@ -433,6 +445,7 @@ impl ObjectStore {
             scheme: String::from("memory"),
             block_size: 64 * 1024,
             use_constant_size_upload_parts: false,
+            io_parallelism: get_num_compute_intensive_cpus() as u32,
         }
     }
 
@@ -447,6 +460,26 @@ impl ObjectStore {
 
     pub fn set_block_size(&mut self, new_size: usize) {
         self.block_size = new_size;
+    }
+
+    pub fn set_io_parallelism(&mut self, io_parallelism: u32) {
+        self.io_parallelism = io_parallelism;
+    }
+
+    pub fn io_parallelism(&self) -> Result<u32> {
+        std::env::var("LANCE_IO_THREADS")
+            .map(|val| {
+                val.parse::<u32>().map_err(|parse_err| {
+                    Error::invalid_input(
+                        format!(
+                            "The LANCE_IO_THREADS variable is not set to an integer: {}",
+                            parse_err
+                        ),
+                        location!(),
+                    )
+                })
+            })
+            .unwrap_or(Ok(self.io_parallelism))
     }
 
     /// Open a file for path.
@@ -752,6 +785,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 scheme: String::from(url.scheme()),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts,
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             })
         }
         "gs" => {
@@ -768,6 +802,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 scheme: String::from("gs"),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts: false,
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             })
         }
         "az" => {
@@ -780,6 +815,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 scheme: String::from("az"),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts: false,
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             })
         }
         // we have a bypass logic to use `tokio::fs` directly to lower overhead
@@ -795,6 +831,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             scheme: String::from("memory"),
             block_size: 64 * 1024,
             use_constant_size_upload_parts: false,
+            io_parallelism: get_num_compute_intensive_cpus() as u32,
         }),
         unknown_scheme => {
             let err = lance_core::Error::from(object_store::Error::NotSupported {
@@ -812,6 +849,7 @@ impl ObjectStore {
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
         use_constant_size_upload_parts: bool,
+        io_parallelism: u32,
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
@@ -826,6 +864,7 @@ impl ObjectStore {
             scheme: scheme.into(),
             block_size,
             use_constant_size_upload_parts,
+            io_parallelism,
         }
     }
 }
