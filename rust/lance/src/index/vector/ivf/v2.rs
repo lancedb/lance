@@ -263,6 +263,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// preprocess the query vector given the partition id.
     ///
     /// Internal API with no stability guarantees.
+    #[instrument(level = "debug", skip(self))]
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         if S::use_residual() {
             let partition_centroids =
@@ -409,6 +410,7 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
     //     )
     // }
 
+    #[instrument(level = "debug", skip(self, pre_filter))]
     async fn search_in_partition(
         &self,
         partition_id: usize,

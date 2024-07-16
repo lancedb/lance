@@ -21,6 +21,7 @@ use std::iter;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
+use tracing::instrument;
 
 use lance_core::{Error, Result};
 use rand::{thread_rng, Rng};
@@ -192,6 +193,7 @@ impl HNSW {
         .collect())
     }
 
+    #[instrument(level = "debug", skip(self, query, bitset, storage))]
     pub fn search_basic(
         &self,
         query: ArrayRef,
@@ -223,6 +225,44 @@ impl HNSW {
         }
 
         result
+    }
+
+    #[instrument(level = "debug", skip(self, storage, query, prefilter_bitset))]
+    fn flat_search(
+        &self,
+        storage: &impl VectorStore,
+        query: ArrayRef,
+        k: usize,
+        prefilter_bitset: Visited,
+    ) -> Vec<OrderedNode> {
+        let node_ids = storage
+            .row_ids()
+            .enumerate()
+            .filter_map(|(node_id, _)| {
+                prefilter_bitset
+                    .contains(node_id as u32)
+                    .then_some(node_id as u32)
+            })
+            .collect_vec();
+
+        let dist_calc = storage.dist_calculator(query);
+        let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
+        for i in 0..node_ids.len() {
+            if let Some(ahead) = self.inner.params.prefetch_distance {
+                if i + ahead < node_ids.len() {
+                    dist_calc.prefetch(node_ids[i + ahead]);
+                }
+            }
+            let node_id = node_ids[i];
+            let dist = dist_calc.distance(node_id).into();
+            if heap.len() < k {
+                heap.push((dist, node_id).into());
+            } else if dist < heap.peek().unwrap().dist {
+                heap.pop();
+                heap.push((dist, node_id).into());
+            }
+        }
+        heap.into_sorted_vec()
     }
 
     /// Returns the metadata of this [`HNSW`].
@@ -493,6 +533,7 @@ impl<'a> Graph for HnswBottomView<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct HnswQueryParams {
     pub ef: usize,
 }
@@ -611,6 +652,7 @@ impl IvfSubIndex for HNSW {
         .into()
     }
 
+    #[instrument(level = "debug", skip(self, query, storage, prefilter))]
     fn search(
         &self,
         query: ArrayRef,
@@ -652,38 +694,11 @@ impl IvfSubIndex for HNSW {
             .map(|b| b.count_ones())
             .unwrap_or(storage.len());
         let results = if remained < self.len() * 10 / 100 {
-            log::debug!("too many rows filtered, using flat search");
             let prefilter_bitset =
                 prefilter_bitset.expect("the prefilter bitset must be set for flat search");
-            let node_ids = storage
-                .row_ids()
-                .enumerate()
-                .filter_map(|(node_id, _)| {
-                    prefilter_bitset
-                        .contains(node_id as u32)
-                        .then_some(node_id as u32)
-                })
-                .collect_vec();
-            let dist_calc = storage.dist_calculator(query);
-            let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
-            for i in 0..node_ids.len() {
-                if let Some(ahead) = self.inner.params.prefetch_distance {
-                    if i + ahead < node_ids.len() {
-                        dist_calc.prefetch(node_ids[i + ahead]);
-                    }
-                }
-                let node_id = node_ids[i];
-                let dist = dist_calc.distance(node_id).into();
-                if heap.len() < k {
-                    heap.push((dist, node_id).into());
-                } else if dist < heap.peek().unwrap().dist {
-                    heap.pop();
-                    heap.push((dist, node_id).into());
-                }
-            }
-            heap.into_sorted_vec()
+            self.flat_search(storage, query, k, prefilter_bitset)
         } else {
-            self.search_basic(query.clone(), k, params.ef, prefilter_bitset, storage)?
+            self.search_basic(query, k, params.ef, prefilter_bitset, storage)?
         };
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
