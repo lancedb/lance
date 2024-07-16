@@ -455,6 +455,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             item_decoder: None,
             rows_drained: 0,
             lists_available: 0,
+            item_field_name: self.scheduler.item_field_name.clone(),
             num_rows,
             unloaded: Some(indirect_fut),
             items_type: self.scheduler.items_type.clone(),
@@ -491,6 +492,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
 pub struct ListFieldScheduler {
     offsets_scheduler: Arc<dyn FieldScheduler>,
     items_scheduler: Arc<dyn FieldScheduler>,
+    item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
     list_type: DataType,
@@ -512,6 +514,7 @@ impl ListFieldScheduler {
     pub fn new(
         offsets_scheduler: Arc<dyn FieldScheduler>,
         items_scheduler: Arc<dyn FieldScheduler>,
+        item_field_name: String,
         items_type: DataType,
         // Should be int32 or int64
         offset_type: DataType,
@@ -529,6 +532,7 @@ impl ListFieldScheduler {
         Self {
             offsets_scheduler,
             items_scheduler,
+            item_field_name,
             items_type,
             offset_type,
             offset_page_info,
@@ -573,6 +577,7 @@ struct ListPageDecoder {
     lists_available: u64,
     num_rows: u64,
     rows_drained: u64,
+    item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
     data_type: DataType,
@@ -583,6 +588,7 @@ struct ListDecodeTask {
     validity: BooleanBuffer,
     // Will be None if there are no items (all empty / null lists)
     items: Option<Box<dyn DecodeArrayTask>>,
+    item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
 }
@@ -601,7 +607,11 @@ impl DecodeArrayTask for ListDecodeTask {
 
         // TODO: we default to nullable true here, should probably use the nullability given to
         // us from the input schema
-        let item_field = Arc::new(Field::new("item", self.items_type.clone(), true));
+        let item_field = Arc::new(Field::new(
+            self.item_field_name,
+            self.items_type.clone(),
+            true,
+        ));
 
         // The offsets are already decoded but they need to be shifted back to 0 and cast
         // to the appropriate type
@@ -756,6 +766,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             task: Box::new(ListDecodeTask {
                 offsets,
                 validity,
+                item_field_name: self.item_field_name.clone(),
                 items: item_decode,
                 items_type: self.items_type.clone(),
                 offset_type: self.offset_type.clone(),
@@ -1256,7 +1267,8 @@ mod tests {
             let test_cases = TestCases::default()
                 .with_indices(vec![1])
                 .with_indices(vec![0])
-                .with_indices(vec![2]);
+                .with_indices(vec![2])
+                .with_indices(vec![0, 1]);
             check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
             let test_cases = test_cases.with_batch_size(1);
             check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;

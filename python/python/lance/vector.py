@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Union
 
 import pyarrow as pa
@@ -19,6 +18,8 @@ from .dependencies import _check_for_numpy, torch
 from .dependencies import numpy as np
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from . import LanceDataset
 
 
@@ -191,7 +192,7 @@ def compute_partitions(
     column: str,
     kmeans: Any,  # KMeans
     batch_size: int = 10240,
-    spill_dir: Union[str, Path] = None,
+    dst_dataset_uri: Union[str, Path] = None,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -205,8 +206,9 @@ def compute_partitions(
         KMeans model to use to compute partitions.
     batch_size: int, default 10240
         The batch size used to read the dataset.
-    spill_dir: Path
-        The path to store the partitions.
+    dst_dataset_uri: Union[str, Path], optional
+        The path to store the partitions.  If not specified a random
+        directory is used instead
 
     Returns
     -------
@@ -214,6 +216,8 @@ def compute_partitions(
         The absolute path of the partition dataset.
     """
     from lance.torch.data import LanceDataset as PytorchLanceDataset
+
+    num_rows = dataset.count_rows()
 
     torch_ds = PytorchLanceDataset(
         dataset,
@@ -227,6 +231,8 @@ def compute_partitions(
             pa.field("partition", pa.uint32()),
         ]
     )
+
+    progress = tqdm(total=num_rows)
 
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
@@ -254,27 +260,25 @@ def compute_partitions(
                         len(part_batch) - len(ids),
                     )
 
+                progress.update(part_batch.num_rows)
                 yield part_batch
 
-    rbr = pa.RecordBatchReader.from_batches(
-        output_schema, tqdm(_partition_assignment())
-    )
+    rbr = pa.RecordBatchReader.from_batches(output_schema, _partition_assignment())
 
-    if spill_dir is None:
-        spill_dir = tempfile.mkdtemp()
-
-    spill_uri = Path(spill_dir) / "precomputed_partitions.lance"
-
+    if dst_dataset_uri is None:
+        dst_dataset_uri = tempfile.mkdtemp()
     ds = write_dataset(
         rbr,
-        spill_uri,
+        dst_dataset_uri,
         schema=output_schema,
         max_rows_per_file=dataset.count_rows(),
+        use_legacy_format=True,
     )
     assert len(ds.get_fragments()) == 1
     files = ds.get_fragments()[0].data_files()
     assert len(files) == 1
 
-    logging.info("Saved recomputed partitions to %s", spill_uri.absolute())
+    progress.close()
 
-    return str(spill_uri)
+    logging.info("Saved precomputed partitions to %s", dst_dataset_uri)
+    return str(dst_dataset_uri)

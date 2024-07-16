@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
@@ -156,3 +157,35 @@ def test_metadata(tmp_path):
     assert page.buffers[0].size == 24
 
     assert len(page.encoding) > 0
+
+
+def test_round_trip_parquet(tmp_path):
+    pq_path = tmp_path / "foo.parquet"
+    table = pa.table({"int": [1, 2], "list_str": [["x", "yz", "abc"], ["foo", "bar"]]})
+    pq.write_table(table, str(pq_path))
+    table = pq.read_table(str(pq_path))
+
+    lance_path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(lance_path)) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(lance_path))
+    round_tripped = reader.read_all().to_table()
+    assert round_tripped == table
+
+
+def test_list_field_name(tmp_path):
+    weird_field = pa.field("why does this name even exist", pa.string())
+    weird_string_type = pa.list_(weird_field)
+    schema = pa.schema([pa.field("list_str", weird_string_type)])
+    table = pa.table({"list_str": [["x", "yz", "abc"], ["foo", "bar"]]}, schema=schema)
+
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(path))
+    round_tripped = reader.read_all().to_table()
+
+    assert round_tripped == table
+    assert round_tripped.schema.field("list_str").type == weird_string_type

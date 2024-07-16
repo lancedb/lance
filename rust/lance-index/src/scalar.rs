@@ -6,14 +6,17 @@
 use std::collections::HashMap;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::Schema;
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_array::{ListArray, RecordBatch};
+use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
 
-use datafusion_expr::Expr;
+use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::{Expr, ScalarFunctionDefinition};
 use deepsize::DeepSizeOf;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::Result;
 
 use crate::Index;
@@ -23,6 +26,7 @@ pub mod btree;
 pub mod expression;
 pub mod flat;
 pub mod inverted;
+pub mod label_list;
 pub mod lance_format;
 
 /// Trait for storing an index (or parts of an index) into storage
@@ -67,7 +71,34 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
 }
 
-/// A query that a scalar index can satisfy
+/// Different scalar indices may support different kinds of queries
+///
+/// For example, a btree index can support a wide range of queries (e.g. x > 7)
+/// while an index based on FTS only supports queries like "x LIKE 'foo'"
+///
+/// This trait is used when we need an object that can represent any kind of query
+///
+/// Note: if you are implementing this trait for a query type then you probably also
+/// need to implement the [crate::scalar::expression::ScalarQueryParser] trait to
+/// create instances of your query at parse time.
+pub trait AnyQuery: std::fmt::Debug + Any + Send + Sync {
+    /// Cast the query as Any to allow for downcasting
+    fn as_any(&self) -> &dyn Any;
+    /// Format the query as a string
+    fn format(&self, col: &str) -> String;
+    /// Convert the query to a datafusion expression
+    fn to_expr(&self, col: String) -> Expr;
+    /// Compare this query to another query
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool;
+}
+
+impl PartialEq for dyn AnyQuery {
+    fn eq(&self, other: &Self) -> bool {
+        self.dyn_eq(other)
+    }
+}
+
+/// A query that a basic scalar index (e.g. btree / bitmap) can satisfy
 ///
 /// This is a subset of expression operators that is often referred to as the
 /// "sargable" operators
@@ -77,7 +108,7 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 /// you can grab all rows where the value = 7 and then do an inverted take (or use
 /// a block list instead of an allow list for prefiltering)
 #[derive(Debug, Clone, PartialEq)]
-pub enum ScalarQuery {
+pub enum SargableQuery {
     /// Retrieve all row ids where the value is in the given [min, max) range
     Range(Bound<ScalarValue>, Bound<ScalarValue>),
     /// Retrieve all row ids where the value is in the given set of values
@@ -90,8 +121,56 @@ pub enum ScalarQuery {
     IsNull(),
 }
 
-impl ScalarQuery {
-    pub fn to_expr(&self, col: String) -> Expr {
+impl AnyQuery for SargableQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        match self {
+            Self::Range(lower, upper) => match (lower, upper) {
+                (Bound::Unbounded, Bound::Unbounded) => "true".to_string(),
+                (Bound::Unbounded, Bound::Included(rhs)) => format!("{} <= {}", col, rhs),
+                (Bound::Unbounded, Bound::Excluded(rhs)) => format!("{} < {}", col, rhs),
+                (Bound::Included(lhs), Bound::Unbounded) => format!("{} >= {}", col, lhs),
+                (Bound::Included(lhs), Bound::Included(rhs)) => {
+                    format!("{} >= {} && {} <= {}", col, lhs, col, rhs)
+                }
+                (Bound::Included(lhs), Bound::Excluded(rhs)) => {
+                    format!("{} >= {} && {} < {}", col, lhs, col, rhs)
+                }
+                (Bound::Excluded(lhs), Bound::Unbounded) => format!("{} > {}", col, lhs),
+                (Bound::Excluded(lhs), Bound::Included(rhs)) => {
+                    format!("{} > {} && {} <= {}", col, lhs, col, rhs)
+                }
+                (Bound::Excluded(lhs), Bound::Excluded(rhs)) => {
+                    format!("{} > {} && {} < {}", col, lhs, col, rhs)
+                }
+            },
+            Self::IsIn(values) => {
+                format!(
+                    "{} IN [{}]",
+                    col,
+                    values
+                        .iter()
+                        .map(|val| val.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }
+            Self::FullTextSearch(values) => {
+                format!("{} LIKE '{}'", col, values.join("|"))
+            }
+            Self::IsNull() => {
+                format!("{} IS NULL", col)
+            }
+            Self::Equals(val) => {
+                format!("{} = {}", col, val)
+            }
+        }
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
         let col_expr = Expr::Column(Column::new_unqualified(col));
         match self {
             Self::Range(lower, upper) => match (lower, upper) {
@@ -137,47 +216,81 @@ impl ScalarQuery {
         }
     }
 
-    pub fn fmt_with_col(&self, col: &str) -> String {
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+}
+
+/// A query that a LabelListIndex can satisfy
+#[derive(Debug, Clone, PartialEq)]
+pub enum LabelListQuery {
+    /// Retrieve all row ids where every label is in the list of values for the row
+    HasAllLabels(Vec<ScalarValue>),
+    /// Retrieve all row ids where at least one of the given labels is in the list of values for the row
+    HasAnyLabel(Vec<ScalarValue>),
+}
+
+impl AnyQuery for LabelListQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        format!("{}", self.to_expr(col.to_string()))
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
         match self {
-            Self::Range(lower, upper) => match (lower, upper) {
-                (Bound::Unbounded, Bound::Unbounded) => "true".to_string(),
-                (Bound::Unbounded, Bound::Included(rhs)) => format!("{} <= {}", col, rhs),
-                (Bound::Unbounded, Bound::Excluded(rhs)) => format!("{} < {}", col, rhs),
-                (Bound::Included(lhs), Bound::Unbounded) => format!("{} >= {}", col, lhs),
-                (Bound::Included(lhs), Bound::Included(rhs)) => {
-                    format!("{} >= {} && {} <= {}", col, lhs, col, rhs)
-                }
-                (Bound::Included(lhs), Bound::Excluded(rhs)) => {
-                    format!("{} >= {} && {} < {}", col, lhs, col, rhs)
-                }
-                (Bound::Excluded(lhs), Bound::Unbounded) => format!("{} > {}", col, lhs),
-                (Bound::Excluded(lhs), Bound::Included(rhs)) => {
-                    format!("{} > {} && {} <= {}", col, lhs, col, rhs)
-                }
-                (Bound::Excluded(lhs), Bound::Excluded(rhs)) => {
-                    format!("{} > {} && {} < {}", col, lhs, col, rhs)
-                }
-            },
-            Self::IsIn(values) => {
-                format!(
-                    "{} IN [{}]",
-                    col,
-                    values
-                        .iter()
-                        .map(|val| val.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
+            Self::HasAllLabels(labels) => {
+                let labels_arr = ScalarValue::iter_to_array(labels.iter().cloned()).unwrap();
+                let offsets_buffer =
+                    OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
+                let labels_list = ListArray::try_new(
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
+                    offsets_buffer,
+                    labels_arr,
+                    None,
                 )
+                .unwrap();
+                let labels_arr = Arc::new(labels_list);
+                Expr::ScalarFunction(ScalarFunction {
+                    func_def: ScalarFunctionDefinition::Name("array_contains_all".into()),
+                    args: vec![
+                        Expr::Column(Column::new_unqualified(col)),
+                        Expr::Literal(ScalarValue::List(labels_arr)),
+                    ],
+                })
             }
-            Self::FullTextSearch(values) => {
-                format!("{} LIKE '{}'", col, values.join("|"))
+            Self::HasAnyLabel(labels) => {
+                let labels_arr = ScalarValue::iter_to_array(labels.iter().cloned()).unwrap();
+                let offsets_buffer =
+                    OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
+                let labels_list = ListArray::try_new(
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
+                    offsets_buffer,
+                    labels_arr,
+                    None,
+                )
+                .unwrap();
+                let labels_arr = Arc::new(labels_list);
+                Expr::ScalarFunction(ScalarFunction {
+                    func_def: ScalarFunctionDefinition::Name("array_contains_any".into()),
+                    args: vec![
+                        Expr::Column(Column::new_unqualified(col)),
+                        Expr::Literal(ScalarValue::List(labels_arr)),
+                    ],
+                })
             }
-            Self::IsNull() => {
-                format!("{} IS NULL", col)
-            }
-            Self::Equals(val) => {
-                format!("{} = {}", col, val)
-            }
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
         }
     }
 }
@@ -188,7 +301,7 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not neccesarily ordered
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array>;
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap>;
 
     /// Load the scalar index from storage
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
