@@ -31,10 +31,10 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
-use lance_core::datatypes::Field;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
-use lance_index::scalar::SargableQuery;
+use lance_index::scalar::expression::IndexInformationProvider;
+use lance_index::scalar::{FullTextSearchQuery, SargableQuery};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -140,7 +140,7 @@ pub struct Scanner {
     pub(crate) filter: Option<Expr>,
 
     /// Optional full text search query
-    full_text_query: Option<(Field, String)>,
+    full_text_query: Option<FullTextSearchQuery>,
 
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
@@ -374,12 +374,21 @@ impl Scanner {
     ///    .limit(10)
     ///    .into_stream();
     /// ```
-    pub fn full_text_search(&mut self, column: &str, query: &str) -> Result<&mut Self> {
-        let column = self.dataset.schema().field(column).ok_or(Error::io(
-            format!("Column {} not found", column),
-            location!(),
-        ))?;
-        self.full_text_query = Some((column.to_owned(), query.to_owned()));
+    pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
+        if !query.columns.is_empty() {
+            for column in &query.columns {
+                if self.dataset.schema().field(column).is_none() {
+                    return Err(Error::io(
+                        format!("Column {} not found", column),
+                        location!(),
+                    ));
+                }
+            }
+        }
+
+        // push down the limit to the full text search
+        let query = query.limit(self.limit);
+        self.full_text_query = Some(query);
         Ok(self)
     }
 
@@ -462,6 +471,11 @@ impl Scanner {
         }
         self.limit = limit;
         self.offset = offset;
+
+        if let Some(query) = &mut self.full_text_query {
+            query.limit = limit;
+        }
+
         Ok(self)
     }
 
@@ -911,9 +925,56 @@ impl Scanner {
             FilterPlan::default()
         };
 
-        if let Some((field, query)) = &self.full_text_query {
+        if let Some(query) = &self.full_text_query {
+            let index_info = self.dataset.scalar_index_info().await?;
+            let columns = if query.columns.is_empty() {
+                self.dataset
+                    .schema()
+                    .fields
+                    .iter()
+                    .filter_map(|f| {
+                        if f.data_type() == DataType::LargeUtf8 {
+                            index_info.get_index(&f.name).map(|_| f.name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                for column in &query.columns {
+                    let (data_type, _) = index_info.get_index(column).ok_or(Error::io(
+                        format!(
+                            "Column {} has to to be with inverted index for full text search",
+                            column
+                        ),
+                        location!(),
+                    ))?;
+                    if *data_type != DataType::LargeUtf8 {
+                        return Err(Error::io(
+                            format!(
+                                "Column {} data type is {} but must be LargeUtf8 for full text search",
+                                column,
+                                data_type,
+                            ),
+                            location!(),
+                        ));
+                    }
+                }
+                query.columns.clone()
+            };
+
+            // Now the full text search supports only one column
+            if columns.len() != 1 {
+                return Err(Error::io(
+                    format!(
+                        "Full text search supports only one column, but got {} columns",
+                        columns.len()
+                    ),
+                    location!(),
+                ));
+            }
             let full_text_search_index_expr = ScalarIndexExpr::Query(
-                field.name.clone(),
+                columns[0].clone(),
                 Arc::new(SargableQuery::FullTextSearch(query.clone())),
             );
             let scalar_index_query = match filter_plan.index_query {

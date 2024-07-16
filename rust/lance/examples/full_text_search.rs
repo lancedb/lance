@@ -18,62 +18,68 @@ use lance::index::scalar::{ScalarIndexParams, ScalarIndexType};
 use lance::Dataset;
 use lance_core::ROW_ID;
 use lance_index::scalar::inverted::flat_full_text_search;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::DatasetIndexExt;
 use object_store::path::Path;
 
 #[tokio::main]
 async fn main() {
-    const TOTAL: usize = 10_000;
+    const TOTAL: usize = 10_000_000;
     let tempdir = tempfile::tempdir().unwrap();
     let dataset_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
-    let tokens = (0..1000)
+    let tokens = (0..10_000)
         .map(|_| random_word::gen(random_word::Lang::En))
         .collect_vec();
-    let row_id_col = Arc::new(UInt64Array::from(
-        (0..TOTAL).map(|i| i as u64).collect_vec(),
-    ));
-    let docs = (0..TOTAL)
-        .map(|_| {
-            let num_words = rand::random::<usize>() % 10 + 1;
-            let doc = (0..num_words)
-                .map(|_| tokens[rand::random::<usize>() % tokens.len()])
-                .collect::<Vec<_>>();
-            doc.join(" ")
-        })
-        .collect_vec();
-    let doc_col = Arc::new(LargeStringArray::from(docs));
-    let batch = RecordBatch::try_new(
-        arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("doc", arrow_schema::DataType::LargeUtf8, false),
-            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
-        ])
-        .into(),
-        vec![doc_col.clone(), row_id_col.clone()],
-    )
-    .unwrap();
-
-    let batches = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-    let mut dataset = Dataset::write(batches, dataset_dir.as_ref(), None)
-        .await
-        .unwrap();
-    let scalar_index_params = ScalarIndexParams {
-        force_index_type: Some(ScalarIndexType::Inverted),
-    };
-    dataset
-        .create_index(
-            &["doc"],
-            lance_index::IndexType::Scalar,
-            None,
-            &scalar_index_params,
-            true,
+    let create_index = false;
+    if create_index {
+        let row_id_col = Arc::new(UInt64Array::from(
+            (0..TOTAL).map(|i| i as u64).collect_vec(),
+        ));
+        let docs = (0..TOTAL)
+            .map(|_| {
+                let num_words = rand::random::<usize>() % 300 + 1;
+                let doc = (0..num_words)
+                    .map(|_| tokens[rand::random::<usize>() % tokens.len()])
+                    .collect::<Vec<_>>();
+                doc.join(" ")
+            })
+            .collect_vec();
+        let doc_col = Arc::new(LargeStringArray::from(docs));
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("doc", arrow_schema::DataType::LargeUtf8, false),
+                arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            ])
+            .into(),
+            vec![doc_col.clone(), row_id_col.clone()],
         )
-        .await
         .unwrap();
+
+        let batches = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(batches, dataset_dir.as_ref(), None)
+            .await
+            .unwrap();
+        let scalar_index_params = ScalarIndexParams {
+            force_index_type: Some(ScalarIndexType::Inverted),
+        };
+        dataset
+            .create_index(
+                &["doc"],
+                lance_index::IndexType::Scalar,
+                None,
+                &scalar_index_params,
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    let dataset = Dataset::open(dataset_dir.as_ref()).await.unwrap();
     let query = tokens[0];
     println!("query: {:?}", query);
     let batch = dataset
         .scan()
-        .full_text_search("doc", query)
+        .full_text_search(FullTextSearchQuery::new(query.to_owned()))
         .unwrap()
         .try_into_batch()
         .await
@@ -83,6 +89,16 @@ async fn main() {
         .iter()
         .map(|v| v.unwrap())
         .collect::<HashSet<_>>();
+
+    let start = std::time::Instant::now();
+    dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new(query.to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    println!("full_text_search: {:?}", start.elapsed());
 
     let batch = dataset
         .scan()

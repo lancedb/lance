@@ -216,7 +216,8 @@ def test_full_text_search(dataset):
     query = row.column(0)[0].as_py()
     query = query.split(" ")[0]
     results = dataset.scanner(
-        columns=["doc"], full_text_query=("doc", query)
+        columns=["doc"],
+        full_text_query=query,
     ).to_table()
     results = results.column(0)
     for row in results:
