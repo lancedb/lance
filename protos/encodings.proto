@@ -194,7 +194,7 @@ message Dictionary {
 }
 
 message PackedStruct {
-  ArrayEncoding inner = 1;
+  repeated ArrayEncoding inner = 1;
   uint32 num_struct_fields = 2;
 }
 

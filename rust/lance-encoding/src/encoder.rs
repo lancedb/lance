@@ -71,7 +71,7 @@ impl std::fmt::Debug for EncodedArrayBuffer {
 ///
 /// Maps to a single Arrow array
 ///
-/// This may contain multiple buffers.  For example, a nullable int32 array will contain two buffers,
+/// This may contain multiple EncodedArrayBuffers.  For example, a nullable int32 array will contain two buffers,
 /// one for the null bitmap and one for the values
 #[derive(Debug)]
 pub struct EncodedArray {

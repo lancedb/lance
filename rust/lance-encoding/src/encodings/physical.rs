@@ -167,12 +167,25 @@ pub fn decoder_from_array_encoding(
             ))
         }
         pb::array_encoding::ArrayEncoding::PackedStruct(packed_struct) => {
-            let inner_encoding = packed_struct.inner.as_ref().unwrap();
+            let inner_encodings = &packed_struct.inner;
             let num_struct_fields = packed_struct.num_struct_fields;
-            let inner_scheduler = decoder_from_array_encoding(inner_encoding, buffers, data_type);
+            let fields = match data_type {
+                DataType::Struct(fields) => Some(fields),
+                _ => None,
+            }.unwrap();
+            
+            let inner_datatypes = fields.iter().map(|field| field.data_type()).collect::<Vec<_>>();
+            
+            let mut inner_schedulers = Vec::new();
+            for i in 0..num_struct_fields {
+                let inner_encoding = &inner_encodings[i as usize];
+                let inner_datatype = inner_datatypes[i as usize];
+                let inner_scheduler = decoder_from_array_encoding(inner_encoding, buffers, inner_datatype);
+                inner_schedulers.push(inner_scheduler);
+            }
 
             Box::new(PackedStructPageScheduler::new(
-                inner_scheduler.into(),
+                inner_schedulers,
                 num_struct_fields as u64,
                 data_type.clone(),
             ))

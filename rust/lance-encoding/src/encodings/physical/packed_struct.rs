@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, ArrayRef, StructArray, UInt64Array};
+use arrow_buffer::{builder, MutableBuffer};
 use futures::{future::BoxFuture, FutureExt};
 
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray},
+    encoder::{ArrayEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
 };
@@ -16,22 +17,23 @@ use crate::{
 use arrow_schema::DataType;
 use bytes::BytesMut;
 use lance_core::Result;
+use arrow_buffer::buffer::Buffer;
 
 #[derive(Debug)]
 pub struct PackedStructPageScheduler {
-    inner_scheduler: Arc<dyn PageScheduler>,
+    inner_schedulers: Vec<Box<dyn PageScheduler>>,
     num_struct_fields: u64,
     struct_datatype: DataType,
 }
 
 impl PackedStructPageScheduler {
     pub fn new(
-        inner_scheduler: Arc<dyn PageScheduler>,
+        inner_schedulers: Vec<Box<dyn PageScheduler>>,
         num_struct_fields: u64,
         struct_datatype: DataType,
     ) -> Self {
         Self {
-            inner_scheduler,
+            inner_schedulers,
             num_struct_fields,
             struct_datatype,
         }
@@ -155,7 +157,7 @@ impl PackedStructEncoder {
 //     packed_vec
 // }
 
-fn get_bits_per_value_from_datatype(datatype: &DataType) -> u64 {
+fn get_bits_per_value_from_datatype(datatype: &DataType) -> usize {
     match datatype {
         DataType::UInt64 => 64,
         DataType::UInt32 => 32,
@@ -169,20 +171,48 @@ fn get_bits_per_value_from_datatype(datatype: &DataType) -> u64 {
     }
 }
 
-fn pack(encoded_fields: Vec<EncodedArray>, children_bits_per_value: Vec<u64>) {
-    // let num_rows = encoded_children[0].buffers[0].len() as u64;
-    let num_fields = encoded_fields.len() as u64;
+fn pack(encoded_fields: Vec<EncodedArray>, children_bits_per_value: Vec<usize>) -> Vec<Buffer> {
 
-    // let mut packed_buffers = Vec::new();
-    for i in 0..num_fields {
-        // let encoded_field = &encoded_fields[i as usize].into_parts(); // encoded array for field i
+    let num_fields = encoded_fields.len();
 
-        let encoded_field = &encoded_fields[i as usize];
-        let child_encoded_buffer = &encoded_field.buffers[0].parts; // encoded buffers for field i
-        // let child_buffer_index = encoded_child.encoding; // encoding for field i
+    // Each EncodedArray can have several EncodedArrayBuffers (e.g. validity, offsets, bytes, etc)
+    // Each EncodedArrayBuffer object has several parts. Each part is a Vec<Buffer>
+    // The code below assumes that for all fields:
+    // (i) Each EncodedArray has only one EncodedArrayBuffer
+    // (ii) The total number of buffers across all parts in the EncodedArrayBuffer is the same
+    // This workflow will have to change as we adapt the packed encoding to support more complex datatypes
+    let num_buffers_per_field: usize = encoded_fields[0].buffers[0].parts.iter()
+        .map(|buf| buf.len() / (children_bits_per_value[0] / 8))
+        .sum();
 
-        // let page_index = child_encoded_buffer
+    let mut packed_vec: Vec<Option<Buffer>> = vec![None; num_buffers_per_field * num_fields];
+
+    println!("Num encoded fields: {:?}", encoded_fields.len());
+    for (field_index, encoded_field) in encoded_fields.iter().enumerate() {
+        
+        let bytes_per_value = children_bits_per_value[field_index as usize] / 8;
+        let parts = &encoded_field.buffers[0].parts;
+        println!("Parts: {:?}", parts.len());
+        
+        let mut packed_global_index = 0;
+        for buf in parts {
+            println!("Processing buffer: {:?}", buf);
+            let num_values = buf.len() / bytes_per_value;
+            for value_index in 0..num_values {
+                let start = value_index * bytes_per_value;
+                let packed_index = packed_global_index * num_fields + field_index;
+                println!("Packed index: {:}", packed_index);
+
+                let buffer_slice = Some(buf.slice_with_length(start, bytes_per_value));
+
+                packed_vec[packed_index] = buffer_slice.clone();
+                println!("added buffer: {:?}", buffer_slice.unwrap().as_slice());
+                packed_global_index += 1;
+            }
+        }
     }
+
+    packed_vec.iter().map(|buf| buf.clone().unwrap()).collect::<Vec<Buffer>>()
 }
 
 impl ArrayEncoder for PackedStructEncoder {
@@ -194,48 +224,56 @@ impl ArrayEncoder for PackedStructEncoder {
             .unwrap()
             .num_columns();
         
-        for arr in arrays {
-            println!("Processing array: {:?}", arr);
+        let mut encoded_buffers = Vec::new();
+        let mut inner_encodings = Vec::new();
+
+        for (arr_index, arr) in arrays.iter().enumerate() {
+
             let struct_array = arr.as_any().downcast_ref::<StructArray>().unwrap();
 
-            let mut encoded_children = Vec::new();
-            let mut children_bits_per_value = Vec::new();
-            for i in 0..num_struct_fields {
-                let field_datatype = struct_array.column(i).data_type();
-                
-                let child_array = struct_array.column(i).clone();
-                let encoded_child = self.inner_encoders[i].encode(&[child_array.clone()], &mut 0)?;
-                let child_buffers = encoded_child.buffers;
-                println!("Length of child {:?}: {:?}", i, child_buffers.len());
+            let encoded_fields = Vec::new();
+            let mut field_bits_per_value = Vec::new();
 
+            for field_index in 0..num_struct_fields {
+                let field_datatype = struct_array.column(field_index).data_type();
+                let field_array = struct_array.column(field_index).clone();
+
+                // Compute encoded inner arrays
+                let encoded_field = self.inner_encoders[field_index].encode(&[field_array], &mut 0)?;
+                let child_buffers = encoded_field.buffers;
+
+                // We assume there is only one outer buffer per field
+                assert_eq!(child_buffers.len(), 1);
+
+                // Compute bits per value for each field
                 let bits_per_value = get_bits_per_value_from_datatype(field_datatype);
-                children_bits_per_value.push(bits_per_value);
+                field_bits_per_value.push(bits_per_value);
 
-                for j in 0..child_buffers.len() {
-                    println!("Buffer: {:?}", child_buffers[j].parts);
+                // Only need to do this once
+                if arr_index == 0 {
+                    inner_encodings.push(encoded_field.encoding);
                 }
-                let encoded_child = self.inner_encoders[i].encode(&[child_array], &mut 0)?;
-                encoded_children.push(encoded_child);
-
-                // let encoded_buffer = encoded_child.buffers;
             }
 
-            // let packed_array = pack(encoded_children);
-        }
+            let packed_vec = pack(encoded_fields, field_bits_per_value);
 
-        // println!("Packed arrays: {:?}", packed_arrays.clone());
-        let encoded_packed_struct = self.inner_encoders[0].encode(&vec![], buffer_index)?;
-        let encoded_buffers = encoded_packed_struct.buffers;
+            let packed_buffer = EncodedArrayBuffer {
+                parts: packed_vec,
+                index: 0,
+            };
+
+            encoded_buffers.push(packed_buffer);
+        }
 
         Ok(EncodedArray {
             buffers: encoded_buffers,
             encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::PackedStruct(Box::new(
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::PackedStruct(
                     pb::PackedStruct {
-                        inner: Some(Box::new(encoded_packed_struct.encoding)),
+                        inner: inner_encodings,
                         num_struct_fields: num_struct_fields as u32,
                     },
-                ))),
+                )),
             },
         })
     }
