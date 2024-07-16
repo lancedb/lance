@@ -50,6 +50,7 @@ impl std::fmt::Debug for EncodedBuffer {
     }
 }
 
+#[derive(Clone)]
 pub struct EncodedArrayBuffer {
     /// The data making up the buffer
     pub parts: Vec<Buffer>,
@@ -73,7 +74,7 @@ impl std::fmt::Debug for EncodedArrayBuffer {
 ///
 /// This may contain multiple EncodedArrayBuffers.  For example, a nullable int32 array will contain two buffers,
 /// one for the null bitmap and one for the values
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EncodedArray {
     /// The encoded buffers
     pub buffers: Vec<EncodedArrayBuffer>,
@@ -458,15 +459,18 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
             }
             DataType::Struct(_) => {
                 let field_metadata = &field.metadata;
-                if field_metadata.get("packed").map(|v| *v == "true".to_string()).unwrap_or(false) {
+                if field_metadata
+                    .get("packed")
+                    .map(|v| v.as_str() == "true")
+                    .unwrap_or(false)
+                {
                     Ok(Box::new(PrimitiveFieldEncoder::try_new(
                         cache_bytes_per_column,
                         keep_original_array,
                         self.array_encoding_strategy.clone(),
                         column_index.next_column_index(field.id),
                     )?))
-                }
-                else {
+                } else {
                     let header_idx = column_index.next_column_index(field.id);
                     let children_encoders = field
                         .children

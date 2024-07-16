@@ -125,6 +125,34 @@ pub async fn check_round_trip_encoding_random(field: Field) {
     }
 }
 
+/// Given a field this will test the round trip encoding and decoding of random data
+pub async fn check_round_trip_encoding_random_with_metadata(
+    field: Field,
+    metadata: HashMap<String, String>,
+) {
+    let field = field.with_metadata(metadata);
+    let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    for page_size in [4096, 1024 * 1024] {
+        debug!("Testing random data with a page size of {}", page_size);
+        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_config = HashMap::new();
+        let encoder_factory = || {
+            let mut column_index_seq = ColumnIndexSequence::default();
+            encoding_strategy
+                .create_field_encoder(
+                    &encoding_strategy,
+                    &lance_field,
+                    &mut column_index_seq,
+                    page_size,
+                    true,
+                    &encoding_config,
+                )
+                .unwrap()
+        };
+        check_round_trip_field_encoding_random(encoder_factory, field.clone()).await
+    }
+}
+
 fn supports_nulls(data_type: &DataType) -> bool {
     // We don't yet have nullability support for all types.  Don't test nullability for the
     // types we don't support.
@@ -201,7 +229,11 @@ pub async fn check_round_trip_encoding_of_data(data: Vec<Arc<dyn Array>>, test_c
     }
 }
 
-pub async fn check_round_trip_encoding_of_data_with_metadata(data: Vec<Arc<dyn Array>>, test_cases: &TestCases, metadata: HashMap<String, String>) {
+pub async fn check_round_trip_encoding_of_data_with_metadata(
+    data: Vec<Arc<dyn Array>>,
+    test_cases: &TestCases,
+    metadata: HashMap<String, String>,
+) {
     let example_data = data.first().expect("Data must have at least one array");
     let mut field = Field::new("", example_data.data_type().clone(), true);
     field = field.with_metadata(metadata);

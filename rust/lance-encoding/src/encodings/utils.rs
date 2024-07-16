@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    cast::as_primitive_array, new_null_array, types::{
+    new_null_array,
+    types::{
         ArrowPrimitiveType, ByteArrayType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
         DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
         DurationSecondType, Float16Type, Float32Type, Float64Type, GenericBinaryType,
@@ -13,10 +14,12 @@ use arrow_array::{
         Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
         UInt32Type, UInt64Type, UInt8Type,
-    }, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, GenericByteArray, Int32Array, Int64Array, PrimitiveArray, StructArray, UInt32Array, UInt64Array
+    },
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, GenericByteArray,
+    PrimitiveArray, StructArray,
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, Fields, IntervalUnit, TimeUnit};
+use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use bytes::BytesMut;
 use snafu::{location, Location};
 
@@ -42,6 +45,8 @@ pub fn new_primitive_array<T: ArrowPrimitiveType>(
 
     let data_buffer = buffer_iter.next().unwrap().freeze();
     let data_buffer = Buffer::from_bytes(data_buffer.into());
+    println!("Data buffer length: {:?}", data_buffer.len());
+    println!("Number of rows: {:?}", num_rows);
     let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
 
     // The with_data_type is needed here to recover the parameters for types like Decimal/Timestamp
@@ -101,55 +106,6 @@ pub fn bytes_to_validity(bytes: BytesMut, num_rows: u64) -> Option<NullBuffer> {
             num_rows as usize,
         )))
     }
-}
-
-// fn downcast_to_primitive_array<T>(array: &Arc<dyn Array>, data_type: &DataType) -> &PrimitiveArray<T>
-// where
-//     T: arrow::datatypes::ArrowPrimitiveType,
-// {
-//     assert_eq!(array.data_type(), data_type, "Data type mismatch");
-//     array.as_any().downcast_ref::<PrimitiveArray<T>>()
-//         .unwrap_or_else(|| panic!("Failed to downcast to PrimitiveArray<{}>", std::any::type_name::<T>()))
-// }
-
-pub fn new_struct_from_packed_row_buffers(
-    buffers: Vec<BytesMut>,
-    num_rows: u64,
-    fields: &Fields,
-) -> ArrayRef {
-    let num_fields = fields.len();
-    let inner_datatype = fields[0].data_type();
-    let packed_array =
-        primitive_array_from_buffers(inner_datatype, buffers, num_rows * (num_fields as u64))
-            .unwrap();
-    
-    let inner_array = packed_array.as_any().downcast_ref::<UInt64Array>().unwrap();
-
-    // let inner_array = as_primitive_array::<inner_type>(&packed_array);
-    //     DataType::Int64 => as_primitive_array::<Int64Type>(&packed_array),
-    //     _ => panic!("Unsupported data type for struct array"),
-    // }
-    // println!("Inner array: {:?}", inner_array);
-
-    let mut child_vecs = vec![Vec::new(); num_fields];
-
-    for (i, value) in inner_array.iter().enumerate() {
-        if let Some(v) = value {
-            child_vecs[i % num_fields].push(v);
-        }
-    }
-
-    let child_arrays = child_vecs
-        .into_iter()
-        .map(|field_data| Arc::new(PrimitiveArray::from(field_data)) as ArrayRef)
-        .collect::<Vec<_>>();
-
-    // for arr in &child_arrays {
-    //     println!("Child array: {:?}", arr);
-    // }
-
-    Arc::new(StructArray::try_new(fields.clone(), child_arrays, None).unwrap())
-    // println!("Struct array: {:?}", struct_array);
 }
 
 pub fn primitive_array_from_buffers(
@@ -319,9 +275,26 @@ pub fn primitive_array_from_buffers(
         DataType::LargeBinary => Ok(new_generic_byte_array::<GenericBinaryType<i64>>(
             buffers, num_rows,
         )),
-        DataType::Struct(fields) => Ok(new_struct_from_packed_row_buffers(
-            buffers, num_rows, fields,
-        )),
+        DataType::Struct(fields) => {
+            let mut field_arrays = Vec::new();
+
+            for (field_index, field) in fields.iter().enumerate() {
+                let field_bytes = &buffers[field_index];
+                let null_bytes = BytesMut::default();
+                let field_array = primitive_array_from_buffers(
+                    field.data_type(),
+                    vec![null_bytes, field_bytes.clone()],
+                    num_rows,
+                )?;
+                println!("Field array: {:?}", field_array);
+
+                field_arrays.push(field_array);
+            }
+
+            Ok(Arc::new(
+                StructArray::try_new(fields.clone(), field_arrays, None).unwrap(),
+            ))
+        }
         _ => Err(Error::io(
             format!(
                 "The data type {} cannot be decoded from a primitive encoding",
