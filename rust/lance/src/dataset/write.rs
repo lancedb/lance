@@ -235,10 +235,7 @@ pub async fn write_fragments_internal(
 
         if writer.is_none() {
             let (new_writer, new_fragment) = writer_generator.new_writer().await?;
-            // rustc has a hard time analyzing the lifetime of the &str returned
-            // by multipart_id(), so we convert it to an owned value here.
-            let multipart_id = new_writer.multipart_id().to_string();
-            params.progress.begin(&new_fragment, &multipart_id).await?;
+            params.progress.begin(&new_fragment).await?;
             writer = Some(new_writer);
             fragments.push(new_fragment);
         }
@@ -274,10 +271,6 @@ pub async fn write_fragments_internal(
 
 #[async_trait::async_trait]
 pub trait GenericWriter: Send {
-    /// Get a unique id associated with the fragment being written
-    ///
-    /// This is used for progress reporting
-    fn multipart_id(&self) -> &str;
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
     /// Get the current position in the file
@@ -291,9 +284,6 @@ pub trait GenericWriter: Send {
 
 #[async_trait::async_trait]
 impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String) {
-    fn multipart_id(&self) -> &str {
-        self.0.multipart_id()
-    }
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.0.write(batches).await
     }
@@ -315,9 +305,6 @@ struct V2WriterAdapter {
 
 #[async_trait::async_trait]
 impl GenericWriter for V2WriterAdapter {
-    fn multipart_id(&self) -> &str {
-        self.writer.multipart_id()
-    }
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         for batch in batches {
             self.writer.write_batch(batch).await?;

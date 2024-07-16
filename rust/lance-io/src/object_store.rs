@@ -27,13 +27,12 @@ use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredenti
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
 use snafu::{location, Location};
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::RwLock;
 use url::Url;
 
 use super::local::LocalObjectReader;
-mod gcs_wrapper;
 mod tracing;
-use self::gcs_wrapper::PatchedGoogleCloudStorage;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -85,6 +84,7 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
     block_size: usize,
+    pub use_constant_size_upload_parts: bool,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -308,6 +308,11 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
+    /// Use constant size upload parts for multipart uploads. Only necessary
+    /// for Cloudflare R2, which doesn't support variable size parts. When this
+    /// is false, max upload size is 2.5TB. When this is true, the max size is
+    /// 50GB.
+    pub use_constant_size_upload_parts: bool,
 }
 
 impl Default for ObjectStoreParams {
@@ -319,6 +324,7 @@ impl Default for ObjectStoreParams {
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
+            use_constant_size_upload_parts: false,
         }
     }
 }
@@ -396,6 +402,7 @@ impl ObjectStore {
                 inner: Arc::new(LocalFileSystem::new()).traced(),
                 scheme: String::from(scheme),
                 block_size: 4 * 1024, // 4KB block size
+                use_constant_size_upload_parts: false,
             },
             Path::from_absolute_path(expanded_path.as_path())?,
         ))
@@ -415,6 +422,7 @@ impl ObjectStore {
             inner: Arc::new(LocalFileSystem::new()).traced(),
             scheme: String::from("file"),
             block_size: 4 * 1024, // 4KB block size
+            use_constant_size_upload_parts: false,
         }
     }
 
@@ -424,6 +432,7 @@ impl ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
             block_size: 64 * 1024,
+            use_constant_size_upload_parts: false,
         }
     }
 
@@ -489,11 +498,10 @@ impl ObjectStore {
 
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
-        ObjectWriter::new(self.inner.as_ref(), path).await
+        ObjectWriter::new(self, path).await
     }
 
     /// A helper function to create a file and write content to it.
-    ///
     pub async fn put(&self, path: &Path, content: &[u8]) -> Result<()> {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
@@ -714,6 +722,12 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             )
             .await?;
 
+            // Cloudflare does not support varying part sizes.
+            let use_constant_size_upload_parts = storage_options
+                .get(&AmazonS3ConfigKey::Endpoint)
+                .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
+                .unwrap_or(false);
+
             // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
             url.set_scheme("s3").map_err(|()| Error::Internal {
                 message: "could not set scheme".into(),
@@ -737,6 +751,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 inner: Arc::new(store),
                 scheme: String::from(url.scheme()),
                 block_size: 64 * 1024,
+                use_constant_size_upload_parts,
             })
         }
         "gs" => {
@@ -746,15 +761,13 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 builder = builder.with_config(key, value);
             }
             let store = builder.build()?;
-            // Temporary fix for having larger object sizes. Replace when
-            // object_store 0.10.0 is available.
-            let store = PatchedGoogleCloudStorage(Arc::new(store));
             let store = Arc::new(store);
 
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("gs"),
                 block_size: 64 * 1024,
+                use_constant_size_upload_parts: false,
             })
         }
         "az" => {
@@ -766,6 +779,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 inner: store,
                 scheme: String::from("az"),
                 block_size: 64 * 1024,
+                use_constant_size_upload_parts: false,
             })
         }
         // we have a bypass logic to use `tokio::fs` directly to lower overhead
@@ -780,10 +794,11 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
             block_size: 64 * 1024,
+            use_constant_size_upload_parts: false,
         }),
-        unknow_scheme => {
+        unknown_scheme => {
             let err = lance_core::Error::from(object_store::Error::NotSupported {
-                source: format!("Unsupported URI scheme: {}", unknow_scheme).into(),
+                source: format!("Unsupported URI scheme: {}", unknown_scheme).into(),
             });
             Err(err)
         }
@@ -796,6 +811,7 @@ impl ObjectStore {
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        use_constant_size_upload_parts: bool,
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
@@ -809,6 +825,7 @@ impl ObjectStore {
             inner: store,
             scheme: scheme.into(),
             block_size,
+            use_constant_size_upload_parts,
         }
     }
 }

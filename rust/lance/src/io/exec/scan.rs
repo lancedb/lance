@@ -284,6 +284,10 @@ impl LanceScanExec {
 }
 
 impl ExecutionPlan for LanceScanExec {
+    fn name(&self) -> &str {
+        "LanceScanExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -293,7 +297,7 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     /// Scan is the leaf node, so returns an empty vector.
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 

@@ -561,7 +561,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
             if let Some(relation) = column.relation {
                 match relation {
                     TableReference::Bare { table } => {
-                        if table == "dummy" {
+                        if table.as_ref() == "dummy" {
                             Ok(Transformed::yes(Expr::Column(Column {
                                 relation: None,
                                 name: column.name,

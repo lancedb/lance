@@ -108,6 +108,10 @@ impl ScalarIndexExec {
 }
 
 impl ExecutionPlan for ScalarIndexExec {
+    fn name(&self) -> &str {
+        "ScalarIndexExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -116,7 +120,7 @@ impl ExecutionPlan for ScalarIndexExec {
         SCALAR_INDEX_SCHEMA.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -268,6 +272,10 @@ impl MapIndexExec {
 }
 
 impl ExecutionPlan for MapIndexExec {
+    fn name(&self) -> &str {
+        "MapIndexExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -276,8 +284,8 @@ impl ExecutionPlan for MapIndexExec {
         INDEX_LOOKUP_SCHEMA.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -537,6 +545,10 @@ async fn retain_fragments(
 }
 
 impl ExecutionPlan for MaterializeIndexExec {
+    fn name(&self) -> &str {
+        "MaterializeIndexExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -545,7 +557,7 @@ impl ExecutionPlan for MaterializeIndexExec {
         MATERIALIZE_INDEX_SCHEMA.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 

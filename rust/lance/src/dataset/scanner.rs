@@ -11,7 +11,8 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
-use datafusion::logical_expr::{AggregateFunction, Expr};
+use datafusion::functions_aggregate::count::count_udaf;
+use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
@@ -19,10 +20,11 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
-    expressions::{create_aggregate_expr, Literal},
+    expressions::Literal,
     filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
+    udaf::create_aggregate_expr,
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
@@ -738,12 +740,14 @@ impl Scanner {
         // Datafusion interprets COUNT(*) as COUNT(1)
         let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
         let count_expr = create_aggregate_expr(
-            &AggregateFunction::Count,
-            false,
+            &count_udaf(),
             &[one],
+            &[lit(1)],
+            &[],
             &[],
             &plan.schema(),
             "",
+            false,
             false,
         )?;
         let plan_schema = plan.schema().clone();
@@ -4250,7 +4254,7 @@ mod test {
                     .project(&["_rowid", "_distance"])
             },
             "Projection: fields=[_rowid, _distance]
-  SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]
+  SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
       ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
@@ -4266,7 +4270,7 @@ mod test {
                     .project(&["_rowid", "_distance"])
             },
             "Projection: fields=[_rowid, _distance]
-  SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]
+  SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
       ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
@@ -4283,17 +4287,17 @@ mod test {
             },
             "Projection: fields=[_rowid, _distance]
   FilterExec: _distance@2 IS NOT NULL
-    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]
+    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
       KNNVectorDistance: metric=l2
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             Projection: fields=[_distance, _rowid, vec]
               FilterExec: _distance@2 IS NOT NULL
-                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]
+                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2
                     LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
             Take: columns=\"_distance, _rowid, vec\"
-              SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]
+              SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
                 ANNSubIndex: name=idx, k=34, deltas=1
                   ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
