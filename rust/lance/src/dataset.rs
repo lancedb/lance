@@ -242,39 +242,6 @@ impl Dataset {
         Ok((object_store, base_path, commit_handler))
     }
 
-    /// Open a dataset with read params.
-    #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
-    #[instrument(skip(params))]
-    pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_read_params(params.clone())
-            .load()
-            .await
-    }
-
-    /// Check out a version of the dataset.
-    #[deprecated(note = "Please use `DatasetBuilder` instead.")]
-    pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_version(version)
-            .load()
-            .await
-    }
-
-    /// Check out a version of the dataset with read params.
-    #[deprecated(note = "Please use `DatasetBuilder` instead.")]
-    pub async fn checkout_with_params(
-        uri: &str,
-        version: u64,
-        params: &ReadParams,
-    ) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_version(version)
-            .with_read_params(params.clone())
-            .load()
-            .await
-    }
-
     /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
