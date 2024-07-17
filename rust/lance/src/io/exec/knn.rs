@@ -113,12 +113,11 @@ impl KNNVectorDistanceExec {
         if output_schema.column_with_name(DIST_COL).is_some() {
             output_schema = output_schema.without_column(DIST_COL);
         }
-        let output_schema = Arc::new(Schema::new(
-            output_schema
-                .try_with_column(Field::new(DIST_COL, DataType::Float32, true))
-                .unwrap()
-                .fields,
-        ));
+        let output_schema = Arc::new(output_schema.try_with_column(Field::new(
+            DIST_COL,
+            DataType::Float32,
+            true,
+        ))?);
 
         // This node has the same partitioning & boundedness as the input node
         // but it destroys any ordering.

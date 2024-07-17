@@ -371,9 +371,11 @@ impl MergeInsertJob {
         // First, we need to project to the key column
         let schema = shared_input.schema();
         let field = schema.field_with_name(&self.params.on[0])?;
-        let key_only_schema =
-            lance_core::datatypes::Schema::try_from(&Schema::new(vec![field.clone()]))?; // schema for only the key join column
-        let index_mapper_input = Arc::new(project(shared_input.clone(), &key_only_schema)?);
+        let index_mapper_input = Arc::new(project(
+            shared_input.clone(),
+            // schema for only the key join column
+            &Schema::new(vec![field.clone()]),
+        )?);
 
         // Then we pass the key column into the index mapper
         let index_column = self.params.on[0].clone();
@@ -399,8 +401,7 @@ impl MergeInsertJob {
         let fields = schema.fields();
         let mut columns = fields[1..].to_vec();
         columns.push(fields[0].clone());
-        let projected_schema = lance_core::datatypes::Schema::try_from(&Schema::new(columns))?;
-        target = Arc::new(project(target, &projected_schema)?);
+        target = Arc::new(project(target, &Schema::new(columns))?);
 
         // 5a - We also need to scan any new unindexed data and union it in
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
