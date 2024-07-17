@@ -146,7 +146,7 @@ pub struct Scanner {
     batch_readahead: usize,
 
     /// Number of fragments to read concurrently
-    fragment_readahead: usize,
+    fragment_readahead: Option<usize>,
 
     limit: Option<i64>,
     offset: Option<i64>,
@@ -210,7 +210,7 @@ impl Scanner {
             filter: None,
             batch_size: None,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
-            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
+            fragment_readahead: None,
             limit: None,
             offset: None,
             ordering: None,
@@ -391,7 +391,7 @@ impl Scanner {
     ///
     /// This is only used if ``scan_in_order`` is set to false.
     pub fn fragment_readahead(&mut self, nfragments: usize) -> &mut Self {
-        self.fragment_readahead = nfragments;
+        self.fragment_readahead = Some(nfragments);
         self
     }
 
@@ -1377,7 +1377,9 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let config = ScanConfig {
             batch_readahead: self.batch_readahead,
-            fragment_readahead: self.fragment_readahead,
+            fragment_readahead: self
+                .fragment_readahead
+                .unwrap_or(DEFAULT_FRAGMENT_READAHEAD),
             with_row_id: self.with_row_id,
             with_row_address: self.with_row_address,
             make_deletions_null,

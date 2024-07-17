@@ -80,7 +80,6 @@ async fn test_decode(
         &DecoderMiddlewareChain::default(),
         io,
     )
-    .await
     .unwrap();
 
     let (tx, rx) = mpsc::unbounded_channel();

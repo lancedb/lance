@@ -152,7 +152,7 @@ impl ScanScheduler {
     ///
     /// * object_store - the store to wrap
     /// * io_capacity - the maximum number of parallel requests that will be allowed
-    pub fn new(object_store: Arc<ObjectStore>, io_capacity: u32) -> Arc<Self> {
+    pub fn new(object_store: Arc<ObjectStore>) -> Arc<Self> {
         // TODO: we don't have any backpressure in place if the compute thread falls
         // behind.  The scheduler thread will schedule ALL of the I/O and then the
         // loaded data will eventually pile up.
@@ -164,6 +164,7 @@ impl ScanScheduler {
         // from `when_done` futures to delivering data into a queue.  That queue should fill
         // up, causing the I/O loop to pause.
         let (reg_tx, reg_rx) = async_priority_channel::unbounded();
+        let io_capacity = object_store.io_parallelism().unwrap();
         let scheduler = Self {
             object_store,
             io_submitter: reg_tx,
@@ -315,7 +316,7 @@ mod tests {
         rand::thread_rng().fill_bytes(&mut some_data);
         obj_store.put(&tmp_file, &some_data).await.unwrap();
 
-        let scheduler = ScanScheduler::new(obj_store, 16);
+        let scheduler = ScanScheduler::new(obj_store);
 
         let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
 
@@ -375,9 +376,10 @@ mod tests {
             None,
             None,
             false,
+            1,
         ));
 
-        let scan_scheduler = ScanScheduler::new(obj_store, 1);
+        let scan_scheduler = ScanScheduler::new(obj_store);
 
         let file_scheduler = scan_scheduler
             .open_file(&Path::parse("foo").unwrap())
