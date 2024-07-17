@@ -232,6 +232,12 @@ fn get_compression_scheme() -> CompressionScheme {
 }
 
 impl CoreArrayEncodingStrategy {
+    fn can_use_fsst(data_type: &DataType, data_size: u64) -> bool {
+        std::env::var("LANCE_USE_FSST").is_ok()
+            && matches!(data_type, DataType::Utf8 | DataType::Binary)
+            && data_size > 4 * 1024 * 1024
+    }
+
     fn array_encoder_from_type(
         data_type: &DataType,
         data_size: u64,
@@ -263,9 +269,7 @@ impl CoreArrayEncodingStrategy {
 
                     let bin_encoder =
                         Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
-                    if matches!(data_type, DataType::Utf8 | DataType::Binary)
-                        && data_size > 4 * 1024 * 1024
-                    {
+                    if Self::can_use_fsst(data_type, data_size) {
                         Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
                     } else {
                         Ok(bin_encoder)
