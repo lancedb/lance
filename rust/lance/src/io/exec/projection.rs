@@ -28,9 +28,9 @@ fn get_make_struct_func() -> Arc<ScalarUDF> {
 }
 
 /// Make a DataFusion projection node from a schema.
-/// 
+///
 /// The `projection` schema must be a subset of the input schema. This can be
-/// used to select a subset of fields, either at the top-level or within 
+/// used to select a subset of fields, either at the top-level or within
 /// nested structs.
 pub fn project(input: Arc<dyn ExecutionPlan>, projection: &ArrowSchema) -> Result<ProjectionExec> {
     // Use input schema and projection schema to create a list of physical expressions.
