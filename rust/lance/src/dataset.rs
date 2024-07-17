@@ -1299,7 +1299,7 @@ pub(crate) async fn write_manifest_file(
             manifest,
             indices,
             base_path,
-            &object_store.inner,
+            object_store,
             write_manifest_file_to_path,
         )
         .await?;
@@ -1308,7 +1308,7 @@ pub(crate) async fn write_manifest_file(
 }
 
 fn write_manifest_file_to_path<'a>(
-    object_store: &'a dyn object_store::ObjectStore,
+    object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
@@ -1662,7 +1662,10 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
-            let reader = fragment.open(dataset.schema(), false, false).await.unwrap();
+            let reader = fragment
+                .open(dataset.schema(), false, false, None)
+                .await
+                .unwrap();
             // No group / batch concept in v2
             if use_legacy_format {
                 assert_eq!(reader.legacy_num_batches(), 10);

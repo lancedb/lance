@@ -246,11 +246,6 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         self.object_writer.tell().await
     }
 
-    /// Returns the in-flight multipart ID.
-    pub fn multipart_id(&self) -> &str {
-        &self.object_writer.multipart_id
-    }
-
     /// Return the id of the next batch to be written.
     pub fn next_batch_id(&self) -> i32 {
         self.batch_id

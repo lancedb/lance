@@ -44,7 +44,7 @@ fn bench_reader(c: &mut Criterion) {
             let file_path = &file_path;
             let data = &data;
             rt.block_on(async move {
-                let store_scheduler = ScanScheduler::new(Arc::new(object_store.clone()), 8);
+                let store_scheduler = ScanScheduler::new(Arc::new(object_store.clone()));
                 let scheduler = store_scheduler.open_file(file_path).await.unwrap();
                 let reader = FileReader::try_open(
                     scheduler.clone(),

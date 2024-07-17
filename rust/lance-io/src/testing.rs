@@ -3,27 +3,26 @@
 use std::fmt::{self, Display, Formatter};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::stream::BoxStream;
 use mockall::mock;
 use object_store::{
-    path::Path, GetOptions, GetResult, ListResult, MultipartId, ObjectMeta,
-    ObjectStore as OSObjectStore, PutOptions, PutResult, Result as OSResult,
+    path::Path, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    Result as OSResult,
 };
 use std::future::Future;
-use tokio::io::AsyncWrite;
 
 mock! {
     pub ObjectStore {}
 
     #[async_trait]
     impl OSObjectStore for ObjectStore {
-        async fn put_opts(&self, location: &Path, bytes: Bytes, opts: PutOptions) -> OSResult<PutResult>;
-        async fn put_multipart(
+        async fn put_opts(&self, location: &Path, bytes: PutPayload, opts: PutOptions) -> OSResult<PutResult>;
+        async fn put_multipart_opts(
             &self,
             location: &Path,
-        ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)>;
-        async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()>;
+            opts: PutMultipartOpts,
+        ) -> OSResult<Box<dyn MultipartUpload>>;
         fn get_opts<'life0, 'life1, 'async_trait>(
             &'life0 self,
             location: &'life1 Path,

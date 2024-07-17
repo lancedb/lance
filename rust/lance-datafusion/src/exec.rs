@@ -97,6 +97,10 @@ impl DisplayAs for OneShotExec {
 }
 
 impl ExecutionPlan for OneShotExec {
+    fn name(&self) -> &str {
+        "OneShotExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -105,7 +109,7 @@ impl ExecutionPlan for OneShotExec {
         self.schema.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 

@@ -5,11 +5,8 @@
 
 use arrow_schema::DataType;
 
-use datafusion::logical_expr::ScalarFunctionDefinition;
 use datafusion::logical_expr::ScalarUDFImpl;
-use datafusion::logical_expr::{
-    expr::ScalarFunction, BinaryExpr, GetFieldAccess, GetIndexedField, Operator,
-};
+use datafusion::logical_expr::{expr::ScalarFunction, BinaryExpr, Operator};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions::core::getfield::GetFieldFunc;
@@ -67,18 +64,6 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
                 } else {
                     return None;
                 }
-            }
-            Expr::GetIndexedField(GetIndexedField { expr, field }) => {
-                if let GetFieldAccess::NamedStructField {
-                    name: ScalarValue::Utf8(Some(name)),
-                } = field
-                {
-                    field_path.push(name);
-                } else {
-                    // We don't support other kinds of access right now.
-                    return None;
-                }
-                current_expr = expr.as_ref();
             }
             _ => return None,
         }
@@ -144,10 +129,7 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
             }
         }
         Expr::InList(in_list) => {
-            if matches!(
-                in_list.expr.as_ref(),
-                Expr::Column(_) | Expr::GetIndexedField(_)
-            ) {
+            if matches!(in_list.expr.as_ref(), Expr::Column(_)) {
                 if let Some(resolved_type) = resolve_column_type(in_list.expr.as_ref(), schema) {
                     let resolved_values = in_list
                         .list
@@ -200,11 +182,8 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
     match &expr {
         // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
         // instead of hardcoding coerce method for each function
-        Expr::ScalarFunction(ScalarFunction {
-            func_def: ScalarFunctionDefinition::UDF(udf),
-            ..
-        }) => {
-            if udf.name() == "regexp_match" {
+        Expr::ScalarFunction(ScalarFunction { func, .. }) => {
+            if func.name() == "regexp_match" {
                 Ok(Expr::IsNotNull(Box::new(expr)))
             } else {
                 Ok(expr)
@@ -222,6 +201,7 @@ pub mod tests {
 
     use arrow_schema::{Field, Schema as ArrowSchema};
     use datafusion::logical_expr::ScalarUDF;
+    use datafusion_functions::core::expr_ext::FieldAccessor;
 
     // As part of the DF 37 release there are now two different ways to
     // represent a nested field access in `Expr`.  The old way is to use
@@ -242,9 +222,7 @@ pub mod tests {
     impl ExprExt for Expr {
         fn field_newstyle(&self, name: &str) -> Expr {
             Self::ScalarFunction(ScalarFunction {
-                func_def: ScalarFunctionDefinition::UDF(Arc::new(ScalarUDF::new_from_impl(
-                    GetFieldFunc::default(),
-                ))),
+                func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
                 args: vec![
                     self.clone(),
                     Self::Literal(ScalarValue::Utf8(Some(name.to_string()))),

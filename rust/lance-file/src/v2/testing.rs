@@ -30,7 +30,7 @@ impl Default for FsFixture {
         let tmp_path = Path::parse(tmp_path).unwrap();
         let tmp_path = tmp_path.child("some_file.lance");
         let object_store = Arc::new(ObjectStore::local());
-        let scheduler = ScanScheduler::new(object_store.clone(), 8);
+        let scheduler = ScanScheduler::new(object_store.clone());
         Self {
             _tmp_dir: tmp_dir,
             object_store,

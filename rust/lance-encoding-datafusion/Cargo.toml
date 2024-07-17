@@ -14,6 +14,7 @@ rust-version.workspace = true
 [dependencies]
 lance-core = { workspace = true, features = ["datafusion"] }
 lance-datafusion = { workspace = true, features = ["substrait"] }
+
 lance-encoding.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true
@@ -23,6 +24,7 @@ arrow-schema.workspace = true
 bytes.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
+datafusion-functions.workspace = true
 datafusion-optimizer.workspace = true
 datafusion-physical-expr.workspace = true
 futures.workspace = true
