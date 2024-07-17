@@ -10,7 +10,6 @@ use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use roaring::RoaringBitmap;
-use tracing::instrument;
 
 use crate::Result;
 
