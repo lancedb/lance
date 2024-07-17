@@ -96,6 +96,7 @@ async fn test_decode(
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
             assert_eq!(&expected, actual);
+            println!("Asserted\n");
         }
         offset += batch_size as usize;
     }
@@ -309,6 +310,7 @@ async fn check_round_trip_encoding_inner(
     let mut writer = SimulatedWriter::new(encoder.num_columns());
 
     for arr in &data {
+        println!("arr: {:?}", arr);
         for encode_task in encoder.maybe_encode(arr.clone()).unwrap() {
             let encoded_page = encode_task.await.unwrap();
             writer.write_page(encoded_page);
@@ -386,7 +388,7 @@ async fn check_round_trip_encoding_inner(
 
     // Test range scheduling
     for range in &test_cases.ranges {
-        debug!("Testing decode of range {:?}", range);
+        println!("Testing decode of range {:?}", range);
         let num_rows = range.end - range.start;
         let expected = concat_data
             .as_ref()

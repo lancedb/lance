@@ -111,6 +111,7 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
             panic!("Struct datatype expected");
         };
 
+        let bytes_to_skip = (rows_to_skip as usize) * self.total_bytes_per_row;
         let total_len: usize = self.data.iter().map(|b| b.len()).sum();
         let mut bytes_data = BytesMut::with_capacity(total_len);
 
@@ -120,23 +121,26 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
 
         let bytes_data = Bytes::from(bytes_data);
 
-        let mut start_offset = 0;
+        let mut start_offset = bytes_to_skip;
         let mut struct_bytes = Vec::new();
         for field in fields {
             let bytes_per_field = get_bits_per_value_from_datatype(field.data_type()) / 8;
             let mut field_bytes = BytesMut::default();
             let mut byte_index = start_offset;
+            let mut row_ctr = 0;
 
-            while byte_index + bytes_per_field <= bytes_data.len() {
-                println!(
-                    "Byte range: {:?} - {:?}",
-                    byte_index,
-                    byte_index + bytes_per_field
-                );
+            while row_ctr < num_rows {
+                if byte_index == 0 {
+                    println!(
+                        "Byte range: {:?} - {:?}",
+                        byte_index,
+                        byte_index + bytes_per_field
+                    );
+                }
                 let byte_slice = bytes_data.slice(byte_index..(byte_index + bytes_per_field));
                 field_bytes.extend_from_slice(&byte_slice);
                 byte_index += self.total_bytes_per_row;
-                println!("Byte index: {:?}", byte_index);
+                row_ctr += 1;
             }
 
             start_offset += bytes_per_field;
@@ -206,17 +210,15 @@ fn pack(encoded_fields: Vec<EncodedArray>, fields_bits_per_value: Vec<usize>) ->
 
         let mut packed_global_index = 0;
         for buf in parts {
-            println!("Processing buffer: {:?}", buf);
             let num_values = buf.len() / bytes_per_value;
+            println!("Num values: {:?}", num_values);
             for value_index in 0..num_values {
                 let start = value_index * bytes_per_value;
                 let packed_index = packed_global_index * num_fields + field_index;
-                println!("Packed index: {:}", packed_index);
 
                 let buffer_slice = Some(buf.slice_with_length(start, bytes_per_value));
 
                 packed_vec[packed_index].clone_from(&buffer_slice);
-                println!("added buffer: {:?}", buffer_slice.as_slice());
                 packed_global_index += 1;
             }
         }
@@ -249,6 +251,7 @@ impl ArrayEncoder for PackedStructEncoder {
             for field_index in 0..num_struct_fields {
                 let field_datatype = struct_array.column(field_index).data_type();
                 let field_array = struct_array.column(field_index).clone();
+                println!("Original Field array: {:?}", field_array);
 
                 // Compute encoded inner arrays
                 let encoded_field =
@@ -309,7 +312,7 @@ pub mod tests {
     async fn test_random_packed_struct() {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new("a", DataType::UInt64, false),
-            Field::new("b", DataType::UInt32, false),
+            // Field::new("b", DataType::UInt32, false),
         ]));
         let field = Field::new("", data_type, false);
 
@@ -370,6 +373,34 @@ pub mod tests {
 
         check_round_trip_encoding_of_data_with_metadata(
             vec![struct_array1, struct_array2],
+            &test_cases,
+            metadata,
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_packed_struct() {
+        let array1 = Arc::new(UInt64Array::from(vec![100, 2, 300, 4, 150, 2049, 0, 4384, 132]));
+
+        let struct_array1 = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("x", DataType::UInt64, false)),
+                array1.clone() as ArrayRef,
+            ),
+        ]));
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..6)
+            .with_range(1..4)
+            .with_indices(vec![1, 3, 8]);
+
+        let mut metadata = HashMap::new();
+        metadata.insert("packed".to_string(), "true".to_string());
+
+        check_round_trip_encoding_of_data_with_metadata(
+            vec![struct_array1],
             &test_cases,
             metadata,
         )

@@ -46,7 +46,6 @@ pub fn new_primitive_array<T: ArrowPrimitiveType>(
     let data_buffer = buffer_iter.next().unwrap().freeze();
     let data_buffer = Buffer::from_bytes(data_buffer.into());
     println!("Data buffer length: {:?}", data_buffer.len());
-    println!("Number of rows: {:?}", num_rows);
     let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
 
     // The with_data_type is needed here to recover the parameters for types like Decimal/Timestamp
@@ -286,14 +285,13 @@ pub fn primitive_array_from_buffers(
                     vec![null_bytes, field_bytes.clone()],
                     num_rows,
                 )?;
-                println!("Field array: {:?}", field_array);
+                // println!("Field array: {:?}", field_array);
 
                 field_arrays.push(field_array);
             }
 
-            Ok(Arc::new(
-                StructArray::try_new(fields.clone(), field_arrays, None).unwrap(),
-            ))
+            let struct_array = StructArray::try_new(fields.clone(), field_arrays, None).unwrap(); 
+            Ok(Arc::new(struct_array))
         }
         _ => Err(Error::io(
             format!(
