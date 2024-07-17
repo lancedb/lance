@@ -239,8 +239,9 @@ impl ArrayEncoder for PackedStructEncoder {
             .unwrap()
             .num_columns();
 
-        let mut encoded_buffers = Vec::new();
         let mut inner_encodings = Vec::new();
+
+        let mut global_packed_vec: Vec<Buffer> = Vec::new();
 
         for (arr_index, arr) in arrays.iter().enumerate() {
             let struct_array = arr.as_any().downcast_ref::<StructArray>().unwrap();
@@ -273,22 +274,23 @@ impl ArrayEncoder for PackedStructEncoder {
             }
 
             let packed_vec = pack(encoded_fields, field_bits_per_value);
-
-            let packed_buffer = EncodedArrayBuffer {
-                parts: packed_vec,
-                index: 0,
-            };
-
-            encoded_buffers.push(packed_buffer);
+            global_packed_vec.extend(packed_vec);
         }
 
+        let index = *buffer_index;
+        *buffer_index += 1;
+
+        let packed_buffer = EncodedArrayBuffer {
+            parts: global_packed_vec,
+            index,
+        };
+
         Ok(EncodedArray {
-            buffers: encoded_buffers,
+            buffers: vec![packed_buffer],
             encoding: pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::PackedStruct(
                     pb::PackedStruct {
                         inner: inner_encodings,
-                        num_struct_fields: num_struct_fields as u32,
                     },
                 )),
             },
