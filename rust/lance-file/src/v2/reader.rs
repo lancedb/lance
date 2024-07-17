@@ -71,7 +71,6 @@ pub struct CachedFileMetadata {
     pub major_version: u16,
     pub minor_version: u16,
 }
-
 /// Selecting columns from a lance file requires specifying both the
 /// index of the column and the data type of the column
 ///
