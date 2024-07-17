@@ -21,7 +21,7 @@ pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
 pub use lance_datafusion::planner::Planner;
 pub use lance_index::scalar::expression::FilterPlan;
 pub use optimizer::get_physical_optimizer;
-pub use projection::ProjectionExec;
+pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
 pub use scan::LanceScanExec;
 pub use take::TakeExec;
