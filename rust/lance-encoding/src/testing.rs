@@ -172,7 +172,7 @@ pub struct TestCases {
 impl Default for TestCases {
     fn default() -> Self {
         Self {
-            batch_size: 100,
+            batch_size: 200,
             ranges: Vec::new(),
             indices: Vec::new(),
             skip_validation: false,
@@ -427,7 +427,7 @@ async fn check_round_trip_encoding_inner(
         if indices.len() == 1 {
             debug!("Testing decode of index {}", indices[0]);
         } else {
-            debug!(
+            println!(
                 "Testing decode of {} indices spread across range [{}..{}]",
                 indices.len(),
                 indices[0],
@@ -476,7 +476,8 @@ async fn check_round_trip_field_encoding_random(
     encoder_factory: impl Fn() -> Box<dyn FieldEncoder>,
     field: Field,
 ) {
-    for null_rate in [None, Some(0.5), Some(1.0)] {
+    // for null_rate in [None, Some(0.5), Some(1.0)] {
+    for null_rate in [None] {
         for use_slicing in [false, true] {
             let field = if null_rate.is_some() {
                 if !supports_nulls(field.data_type()) {

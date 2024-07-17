@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, StructArray};
 use futures::{future::BoxFuture, FutureExt};
+use lance_arrow::DataTypeExt;
 
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -48,8 +49,8 @@ impl PageScheduler for PackedStructPageScheduler {
         let mut total_bytes_per_row: u64 = 0;
 
         for field in fields {
-            let bits_per_field = get_bits_per_value_from_datatype(field.data_type()) as u64;
-            total_bytes_per_row += bits_per_field / 8;
+            let bytes_per_field = field.data_type().byte_width() as u64;
+            total_bytes_per_row += bytes_per_field;
         }
 
         println!("Ranges: {:?}", ranges);
@@ -82,7 +83,6 @@ impl PageScheduler for PackedStructPageScheduler {
 }
 
 struct PackedStructPageDecoder {
-    // inner_decoders: Vec<Box<dyn PrimitivePageDecoder>>,
     data: Vec<Bytes>,
     struct_datatype: DataType,
     total_bytes_per_row: usize,
@@ -103,10 +103,12 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
         // [10, 13, 16, 11, 14, 17, 12, 15, 18]
         // ]
 
-        println!("Num rows: {:?}", num_rows);
-        println!("Rows to skip: {:?}", rows_to_skip);
-        println!("Total bytes per row: {:?}", self.total_bytes_per_row);
-        println!("Length of Bytes: {:?}", self.data[0].len());
+        if rows_to_skip == 0 {
+            println!("Num rows: {:?}", num_rows);
+            println!("Rows to skip: {:?}", rows_to_skip);
+            println!("Total bytes per row: {:?}", self.total_bytes_per_row);
+            println!("Length of Bytes: {:?}", self.data[0].len());
+        }
         let DataType::Struct(fields) = &self.struct_datatype else {
             panic!("Struct datatype expected");
         };
@@ -124,7 +126,7 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
         let mut start_offset = bytes_to_skip;
         let mut struct_bytes = Vec::new();
         for field in fields {
-            let bytes_per_field = get_bits_per_value_from_datatype(field.data_type()) / 8;
+            let bytes_per_field = field.data_type().byte_width();
             let mut field_bytes = BytesMut::default();
             let mut byte_index = start_offset;
             let mut row_ctr = 0;
@@ -170,21 +172,7 @@ impl PackedStructEncoder {
     }
 }
 
-fn get_bits_per_value_from_datatype(datatype: &DataType) -> usize {
-    match datatype {
-        DataType::UInt64 => 64,
-        DataType::UInt32 => 32,
-        DataType::UInt16 => 16,
-        DataType::UInt8 => 8,
-        DataType::Int64 => 64,
-        DataType::Int32 => 32,
-        DataType::Int16 => 16,
-        DataType::Int8 => 8,
-        _ => panic!("Unsupported datatype"),
-    }
-}
-
-fn pack(encoded_fields: Vec<EncodedArray>, fields_bits_per_value: Vec<usize>) -> Vec<Buffer> {
+fn pack(encoded_fields: Vec<EncodedArray>, fields_bytes_per_value: Vec<usize>) -> Vec<Buffer> {
     let num_fields = encoded_fields.len();
     println!("Num fields: {:?}", num_fields);
 
@@ -197,14 +185,14 @@ fn pack(encoded_fields: Vec<EncodedArray>, fields_bits_per_value: Vec<usize>) ->
     let num_buffers_per_field: usize = encoded_fields[0].buffers[0]
         .parts
         .iter()
-        .map(|buf| buf.len() / (fields_bits_per_value[0] / 8))
+        .map(|buf| buf.len() / fields_bytes_per_value[0])
         .sum();
 
     let mut packed_vec: Vec<Option<Buffer>> = vec![None; num_buffers_per_field * num_fields];
 
     println!("Num encoded fields: {:?}", encoded_fields.len());
     for (field_index, encoded_field) in encoded_fields.iter().enumerate() {
-        let bytes_per_value = fields_bits_per_value[field_index] / 8;
+        let bytes_per_value = fields_bytes_per_value[field_index];
         let parts = &encoded_field.buffers[0].parts;
         println!("Parts: {:?}", parts.len());
 
@@ -247,7 +235,7 @@ impl ArrayEncoder for PackedStructEncoder {
             let struct_array = arr.as_any().downcast_ref::<StructArray>().unwrap();
 
             let mut encoded_fields = Vec::new();
-            let mut field_bits_per_value = Vec::new();
+            let mut field_bytes_per_value = Vec::new();
 
             for field_index in 0..num_struct_fields {
                 let field_datatype = struct_array.column(field_index).data_type();
@@ -264,16 +252,16 @@ impl ArrayEncoder for PackedStructEncoder {
                 // We assume there is only one outer buffer per field
                 assert_eq!(field_buffers.len(), 1);
 
-                // Compute bits per value for each field
-                let bits_per_value = get_bits_per_value_from_datatype(field_datatype);
-                field_bits_per_value.push(bits_per_value);
+                // Compute bytes per value for each field
+                let bytes_per_value = field_datatype.byte_width();
+                field_bytes_per_value.push(bytes_per_value);
 
                 if arr_index == 0 {
                     inner_encodings.push(encoded_field.encoding);
                 }
             }
 
-            let packed_vec = pack(encoded_fields, field_bits_per_value);
+            let packed_vec = pack(encoded_fields, field_bytes_per_value);
             global_packed_vec.extend(packed_vec);
         }
 
@@ -301,7 +289,8 @@ impl ArrayEncoder for PackedStructEncoder {
 #[cfg(test)]
 pub mod tests {
 
-    use arrow_array::{ArrayRef, Int32Array, StructArray, UInt64Array, UInt8Array};
+    use arrow_array::{Array, ArrayRef, FixedSizeListArray, Int32Array, StructArray, UInt64Array, UInt8Array};
+    use arrow_buffer::Buffer;
     use arrow_schema::{DataType, Field, Fields};
     use std::{collections::HashMap, sync::Arc, vec};
 
@@ -309,6 +298,7 @@ pub mod tests {
         check_round_trip_encoding_of_data_with_metadata,
         check_round_trip_encoding_random_with_metadata, TestCases,
     };
+    use arrow::array::ArrayData;
 
     #[test_log::test(tokio::test)]
     async fn test_random_packed_struct() {
@@ -382,27 +372,40 @@ pub mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_packed_struct() {
-        let array1 = Arc::new(UInt64Array::from(vec![100, 2, 300, 4, 150, 2049, 0, 4384, 132]));
+    async fn test_fsl_packed_struct() {
+        // let temp = Arc::new(Int32Array::from(vec![9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]));
+        let int_array = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
 
-        let struct_array1 = Arc::new(StructArray::from(vec![
+        // Create the FixedSizeListArray
+        let list_data_type = DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Int32, false)),
+            3,
+        );
+        let list_data = ArrayData::builder(list_data_type.clone())
+            .len(3)
+            .add_child_data(int_array.into_data())
+            .build()
+            .unwrap();
+        let list_array = FixedSizeListArray::from(list_data);
+        
+        // Create the StructArray
+        let struct_array = Arc::new(StructArray::from(vec![
             (
-                Arc::new(Field::new("x", DataType::UInt64, false)),
-                array1.clone() as ArrayRef,
+                Arc::new(Field::new("x", list_data_type.clone(), false)),
+                Arc::new(list_array) as ArrayRef,
             ),
         ]));
 
         let test_cases = TestCases::default()
-            .with_range(0..2)
-            .with_range(0..6)
-            .with_range(1..4)
-            .with_indices(vec![1, 3, 8]);
+            .with_range(1..2)
+            .with_range(0..1)
+            .with_indices(vec![0, 2]);
 
         let mut metadata = HashMap::new();
         metadata.insert("packed".to_string(), "true".to_string());
 
         check_round_trip_encoding_of_data_with_metadata(
-            vec![struct_array1],
+            vec![struct_array],
             &test_cases,
             metadata,
         )

@@ -285,7 +285,7 @@ pub fn primitive_array_from_buffers(
                     vec![null_bytes, field_bytes.clone()],
                     num_rows,
                 )?;
-                // println!("Field array: {:?}", field_array);
+                println!("Field array: {:?}", field_array);
 
                 field_arrays.push(field_array);
             }
