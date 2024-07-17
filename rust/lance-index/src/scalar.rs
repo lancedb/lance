@@ -193,7 +193,7 @@ impl AnyQuery for SargableQuery {
                 )
             }
             Self::FullTextSearch(query) => {
-                format!("{}", query.query)
+                format!("fts({})", query.query)
             }
             Self::IsNull() => {
                 format!("{} IS NULL", col)
