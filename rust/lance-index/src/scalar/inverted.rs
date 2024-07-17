@@ -17,7 +17,6 @@ use itertools::Itertools;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result, ROW_ID};
 use lazy_static::lazy_static;
-use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tantivy::tokenizer::Language;
@@ -35,7 +34,12 @@ pub const DOCS_FILE: &str = "docs.lance";
 const TOKEN_COL: &str = "_token";
 const TOKEN_ID_COL: &str = "_token_id";
 const FREQUENCY_COL: &str = "_frequency";
+const SCORE_COL: &str = "_score";
 const NUM_TOKEN_COL: &str = "_num_tokens";
+
+// BM25 parameters
+const K1: f32 = 1.2;
+const B: f32 = 0.75;
 
 lazy_static! {
     pub static ref TOKENIZER: tantivy::tokenizer::TextAnalyzer = {
@@ -75,45 +79,29 @@ impl InvertedIndex {
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip(self, token_ids))]
     fn bm25_search(&self, token_ids: Vec<u32>, limit: Option<i64>) -> Vec<(u64, f32)> {
-        const K1: f32 = 1.2;
-        const B: f32 = 0.75;
-
-        let avgdl = self.docs.average_length();
-        let mut bm25 = HashMap::new();
-
+        let mut bm25_scores = HashMap::new();
         token_ids
             .into_iter()
             .filter_map(|token| self.invert_list.retrieve(token))
-            .for_each(|(row_ids, freqs)| {
-                let idf = self.idf(row_ids.len());
-                let mut scores = vec![0.0; row_ids.len()];
-                let doc_norm = row_ids
-                    .par_iter()
-                    .map(|row_id| self.docs.num_tokens(*row_id) as f32 / avgdl)
-                    .collect::<Vec<_>>();
+            .for_each(|(row_ids, _, scores)| {
                 for i in 0..row_ids.len() {
-                    scores[i] =
-                        idf * (K1 + 1.0) * freqs[i] / (freqs[i] + K1 * (1.0 - B + B * doc_norm[i]));
-                }
-                for i in 0..row_ids.len() {
-                    *bm25.entry(row_ids[i]).or_insert(0.0) += scores[i];
+                    let row_id = row_ids[i];
+                    let score = scores[i];
+                    bm25_scores
+                        .entry(row_id)
+                        .and_modify(|s| *s += score)
+                        .or_insert(score);
                 }
             });
 
-        let results = bm25
+        let results = bm25_scores
             .into_iter()
-            .sorted_unstable_by_key(|r| OrderedFloat(-r.1));
+            .sorted_unstable_by_key(|k| OrderedFloat(-k.1));
         if let Some(limit) = limit {
             results.take(limit as usize).collect()
         } else {
             results.collect()
         }
-    }
-
-    #[inline]
-    fn idf(&self, nq: usize) -> f32 {
-        let num_docs = self.docs.len() as f32;
-        ((num_docs - nq as f32 + 0.5) / (nq as f32 + 0.5) + 1.0).ln()
     }
 }
 
@@ -268,6 +256,9 @@ impl ScalarIndex for InvertedIndex {
             }
         }
 
+        // calculate bm25 scores
+        invert_list.calculate_scores(&docs);
+
         let token_set_batch = token_set.to_batch()?;
         let mut token_set_writer = dest_store
             .new_index_file(TOKENS_FILE, token_set_batch.schema())
@@ -390,8 +381,8 @@ impl TokenSet {
 // it's used to retrieve the documents that contain a token
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 struct InvertedList {
-    // token_id => ([row_id], [frequency])
-    inverted_list: HashMap<u32, (Vec<u64>, Vec<f32>)>,
+    // token_id => ([row_id], [frequency], [bm25_score])
+    inverted_list: HashMap<u32, (Vec<u64>, Vec<f32>, Vec<f32>)>,
 }
 
 impl InvertedList {
@@ -401,20 +392,26 @@ impl InvertedList {
             ListBuilder::with_capacity(UInt64Builder::new(), self.inverted_list.len());
         let mut frequencies_list_builder =
             ListBuilder::with_capacity(Float32Builder::new(), self.inverted_list.len());
+        let mut bm25_list_builder =
+            ListBuilder::with_capacity(Float32Builder::new(), self.inverted_list.len());
 
-        for (token_id, (row_ids, freqs)) in &self.inverted_list {
+        for (token_id, (row_ids, freqs, scores)) in &self.inverted_list {
             tokens.push(*token_id);
             let row_ids_builder = row_ids_list_builder.values();
             let frequencies_builder = frequencies_list_builder.values();
+            let bm25_builder = bm25_list_builder.values();
             row_ids_builder.append_slice(row_ids);
             frequencies_builder.append_slice(freqs);
+            bm25_builder.append_slice(scores);
             row_ids_list_builder.append(true);
             frequencies_list_builder.append(true);
+            bm25_list_builder.append(true);
         }
 
         let token_id_col = UInt32Array::from(tokens);
         let row_ids_col = row_ids_list_builder.finish();
         let frequencies_col = frequencies_list_builder.finish();
+        let bm25_col = bm25_list_builder.finish();
 
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
@@ -428,6 +425,11 @@ impl InvertedList {
                 DataType::List(Field::new_list_field(DataType::Float32, true).into()),
                 false,
             ),
+            arrow_schema::Field::new(
+                SCORE_COL,
+                DataType::List(Field::new_list_field(DataType::Float32, true).into()),
+                false,
+            ),
         ]);
 
         let batch = RecordBatch::try_new(
@@ -436,6 +438,7 @@ impl InvertedList {
                 Arc::new(token_id_col) as ArrayRef,
                 Arc::new(row_ids_col) as ArrayRef,
                 Arc::new(frequencies_col) as ArrayRef,
+                Arc::new(bm25_col) as ArrayRef,
             ],
         )?;
         Ok(batch)
@@ -448,18 +451,22 @@ impl InvertedList {
             let token_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
             let row_ids_col = batch[ROW_ID].as_list::<i32>();
             let frequencies_col = batch[FREQUENCY_COL].as_list::<i32>();
+            let scores_col = batch[SCORE_COL].as_list::<i32>();
 
-            for ((&token_id, row_ids), frequencies) in token_col
+            for (((&token_id, row_ids), frequencies), scores) in token_col
                 .values()
                 .iter()
                 .zip(row_ids_col.iter())
                 .zip(frequencies_col.iter())
+                .zip(scores_col.iter())
             {
                 let row_ids = row_ids.unwrap();
                 let frequencies = frequencies.unwrap();
+                let scores = scores.unwrap();
                 let row_ids = row_ids.as_primitive::<UInt64Type>().values().to_vec();
                 let frequencies = frequencies.as_primitive::<Float32Type>().values().to_vec();
-                inverted_list.insert(token_id, (row_ids, frequencies));
+                let scores = scores.as_primitive::<Float32Type>().values().to_vec();
+                inverted_list.insert(token_id, (row_ids, frequencies, scores));
             }
         }
 
@@ -467,24 +474,34 @@ impl InvertedList {
     }
 
     fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
-        for (row_ids, freqs) in self.inverted_list.values_mut() {
+        for (row_ids, freqs, scores) in self.inverted_list.values_mut() {
             let mut new_row_ids = Vec::new();
             let mut new_freqs = Vec::new();
-            for (row_id, freq) in row_ids.iter().zip(freqs.iter()) {
-                match mapping.get(row_id) {
+            let mut new_scores = Vec::new();
+
+            for i in 0..row_ids.len() {
+                let row_id = row_ids[i];
+                let freq = freqs[i];
+                let score = scores[i];
+
+                match mapping.get(&row_id) {
                     Some(Some(new_row_id)) => {
                         new_row_ids.push(*new_row_id);
-                        new_freqs.push(*freq);
+                        new_freqs.push(freq);
+                        new_scores.push(score);
                     }
                     Some(None) => continue,
                     None => {
-                        new_row_ids.push(*row_id);
-                        new_freqs.push(*freq);
+                        new_row_ids.push(row_id);
+                        new_freqs.push(freq);
+                        new_scores.push(score);
                     }
                 }
             }
+
             *row_ids = new_row_ids;
             *freqs = new_freqs;
+            *scores = new_scores;
         }
     }
 
@@ -498,10 +515,24 @@ impl InvertedList {
         }
     }
 
-    fn retrieve(&self, token_id: u32) -> Option<(&[u64], &[f32])> {
+    fn calculate_scores(&mut self, docs: &DocSet) {
+        let avgdl = docs.average_length();
+        for (row_ids, freqs, scores) in self.inverted_list.values_mut() {
+            let idf = idf(row_ids.len(), docs.len());
+            scores.resize(row_ids.len(), 0.0);
+            for i in 0..row_ids.len() {
+                let row_id = row_ids[i];
+                let freq = freqs[i];
+                let doc_norm = docs.num_tokens(row_id) as f32 / avgdl;
+                scores[i] = idf * (K1 + 1.0) * freq / (freq + K1 * (1.0 - B + B * doc_norm));
+            }
+        }
+    }
+
+    fn retrieve(&self, token_id: u32) -> Option<(&[u64], &[f32], &[f32])> {
         self.inverted_list
             .get(&token_id)
-            .map(|list| (list.0.as_slice(), list.1.as_slice()))
+            .map(|list| (list.0.as_slice(), list.1.as_slice(), list.2.as_slice()))
     }
 }
 
@@ -509,7 +540,7 @@ impl InvertedList {
 // It's used to sort the documents by the bm25 score
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 struct DocSet {
-    // row id -> num tokens
+    // row id -> (num tokens, norm_len)
     token_count: HashMap<u64, u32>,
     total_tokens: u64,
 }
@@ -590,6 +621,12 @@ impl DocSet {
         self.token_count.insert(row_id, num_tokens);
         self.total_tokens += num_tokens as u64;
     }
+}
+
+#[inline]
+fn idf(nq: usize, num_docs: usize) -> f32 {
+    let num_docs = num_docs as f32;
+    ((num_docs - nq as f32 + 0.5) / (nq as f32 + 0.5) + 1.0).ln()
 }
 
 #[instrument(level = "debug", skip(batches))]
