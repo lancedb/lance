@@ -66,7 +66,7 @@ impl InvertedIndex {
 
     // map tokens to token ids
     // ignore tokens that are not in the index cause they won't contribute to the search
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     fn map(&self, texts: &[String]) -> Vec<u32> {
         texts
             .iter()
@@ -77,31 +77,24 @@ impl InvertedIndex {
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
-    #[instrument(level = "debug", skip(self, token_ids))]
-    fn bm25_search(&self, token_ids: Vec<u32>, limit: Option<i64>) -> Vec<(u64, f32)> {
+    #[instrument(level = "debug", skip_all)]
+    fn bm25_search(&self, token_ids: Vec<u32>) -> impl Iterator<Item = (u64, f32)> {
         let mut bm25_scores = HashMap::new();
-        token_ids
-            .into_iter()
-            .filter_map(|token| self.invert_list.retrieve(token))
-            .for_each(|list| {
-                for i in 0..list.len() {
-                    let row_id = list.row_ids[i];
-                    let score = list.scores[i];
-                    bm25_scores
-                        .entry(row_id)
-                        .and_modify(|s| *s += score)
-                        .or_insert(score);
-                }
-            });
+        token_ids.into_iter().for_each(|token| {
+            let list = self.invert_list.retrieve(token);
+            for i in 0..list.len() {
+                let row_id = list.row_ids[i];
+                let score = list.scores[i];
+                bm25_scores
+                    .entry(row_id)
+                    .and_modify(|s| *s += score)
+                    .or_insert(score);
+            }
+        });
 
-        let results = bm25_scores
+        bm25_scores
             .into_iter()
-            .sorted_unstable_by_key(|k| OrderedFloat(-k.1));
-        if let Some(limit) = limit {
-            results.take(limit as usize).collect()
-        } else {
-            results.collect()
-        }
+            .sorted_unstable_by_key(|k| OrderedFloat(-k.1))
     }
 }
 
@@ -147,10 +140,16 @@ impl ScalarIndex for InvertedIndex {
         let row_ids = match query {
             SargableQuery::FullTextSearch(query) => {
                 let tokens = collect_tokens(&query.query);
-                let token_ids = self.map(&tokens);
-                self.bm25_search(token_ids, query.limit)
+                let token_ids = self
+                    .map(&tokens)
                     .into_iter()
+                    .sorted_unstable()
+                    .dedup()
+                    .collect();
+
+                self.bm25_search(token_ids)
                     .map(|(row_id, _)| row_id)
+                    .take(query.limit.unwrap_or(i64::MAX) as usize)
             }
             query => {
                 return Err(Error::invalid_input(
@@ -402,12 +401,13 @@ impl PostingList {
 // it's used to retrieve the documents that contain a token
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 struct InvertedList {
-    inverted_list: HashMap<u32, PostingList>,
+    // the index is the token id
+    inverted_list: Vec<PostingList>,
 }
 
 impl InvertedList {
     fn to_batch(&self) -> Result<RecordBatch> {
-        let mut tokens = Vec::with_capacity(self.inverted_list.len());
+        // let mut tokens = Vec::with_capacity(self.inverted_list.len());
         let mut row_ids_list_builder =
             ListBuilder::with_capacity(UInt64Builder::new(), self.inverted_list.len());
         let mut frequencies_list_builder =
@@ -415,8 +415,8 @@ impl InvertedList {
         let mut bm25_list_builder =
             ListBuilder::with_capacity(Float32Builder::new(), self.inverted_list.len());
 
-        for (token_id, list) in &self.inverted_list {
-            tokens.push(*token_id);
+        for list in &self.inverted_list {
+            // tokens.push(*token_id);
             let row_ids_builder = row_ids_list_builder.values();
             let frequencies_builder = frequencies_list_builder.values();
             let bm25_builder = bm25_list_builder.values();
@@ -428,13 +428,13 @@ impl InvertedList {
             bm25_list_builder.append(true);
         }
 
-        let token_id_col = UInt32Array::from(tokens);
+        // let token_id_col = UInt32Array::from(tokens);
         let row_ids_col = row_ids_list_builder.finish();
         let frequencies_col = frequencies_list_builder.finish();
         let bm25_col = bm25_list_builder.finish();
 
         let schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
+            // arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
             arrow_schema::Field::new(
                 ROW_ID,
                 DataType::List(Field::new_list_field(DataType::UInt64, true).into()),
@@ -455,7 +455,7 @@ impl InvertedList {
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
-                Arc::new(token_id_col) as ArrayRef,
+                // Arc::new(token_id_col) as ArrayRef,
                 Arc::new(row_ids_col) as ArrayRef,
                 Arc::new(frequencies_col) as ArrayRef,
                 Arc::new(bm25_col) as ArrayRef,
@@ -465,18 +465,16 @@ impl InvertedList {
     }
 
     async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let mut inverted_list = HashMap::new();
+        let mut inverted_list = Vec::with_capacity(reader.num_rows());
         for i in 0..reader.num_batches().await {
             let batch = reader.read_record_batch(i).await?;
-            let token_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
+            // let token_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
             let row_ids_col = batch[ROW_ID].as_list::<i32>();
             let frequencies_col = batch[FREQUENCY_COL].as_list::<i32>();
             let scores_col = batch[SCORE_COL].as_list::<i32>();
 
-            for (((&token_id, row_ids), frequencies), scores) in token_col
-                .values()
+            for ((row_ids, frequencies), scores) in row_ids_col
                 .iter()
-                .zip(row_ids_col.iter())
                 .zip(frequencies_col.iter())
                 .zip(scores_col.iter())
             {
@@ -486,7 +484,7 @@ impl InvertedList {
                 let row_ids = row_ids.as_primitive::<UInt64Type>().values().to_vec();
                 let frequencies = frequencies.as_primitive::<Float32Type>().values().to_vec();
                 let scores = scores.as_primitive::<Float32Type>().values().to_vec();
-                inverted_list.insert(token_id, PostingList::new(row_ids, frequencies, scores));
+                inverted_list.push(PostingList::new(row_ids, frequencies, scores));
             }
         }
 
@@ -494,7 +492,7 @@ impl InvertedList {
     }
 
     fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
-        for list in self.inverted_list.values_mut() {
+        for list in self.inverted_list.iter_mut() {
             let mut new_row_ids = Vec::new();
             let mut new_freqs = Vec::new();
             let mut new_scores = Vec::new();
@@ -510,12 +508,7 @@ impl InvertedList {
                         new_freqs.push(freq);
                         new_scores.push(score);
                     }
-                    Some(None) => continue,
-                    None => {
-                        new_row_ids.push(row_id);
-                        new_freqs.push(freq);
-                        new_scores.push(score);
-                    }
+                    _ => continue,
                 }
             }
 
@@ -527,7 +520,12 @@ impl InvertedList {
     // we assume that the row_id is unique and doesn't exist in the list
     fn add(&mut self, token_cnt: HashMap<u32, u32>, row_id: u64) {
         for (token_id, freq) in token_cnt {
-            let list = self.inverted_list.entry(token_id).or_default();
+            let token_id = token_id as usize;
+            if token_id >= self.inverted_list.len() {
+                self.inverted_list
+                    .resize_with(token_id + 1, PostingList::default);
+            }
+            let list = &mut self.inverted_list[token_id];
             list.row_ids.push(row_id);
             list.frequencies.push(freq as f32);
         }
@@ -535,7 +533,7 @@ impl InvertedList {
 
     fn calculate_scores(&mut self, docs: &DocSet) {
         let avgdl = docs.average_length();
-        for list in self.inverted_list.values_mut() {
+        for list in self.inverted_list.iter_mut() {
             let idf = idf(list.len(), docs.len());
             list.scores.resize(list.len(), 0.0);
             for i in 0..list.len() {
@@ -547,8 +545,8 @@ impl InvertedList {
         }
     }
 
-    fn retrieve(&self, token_id: u32) -> Option<&PostingList> {
-        self.inverted_list.get(&token_id)
+    fn retrieve(&self, token_id: u32) -> &PostingList {
+        &self.inverted_list[token_id as usize]
     }
 }
 

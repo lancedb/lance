@@ -47,6 +47,8 @@ pub trait IndexReader: Send + Sync {
     async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
     /// Return the number of batches in the file
     async fn num_batches(&self) -> u32;
+    /// Return the number of rows in the file
+    fn num_rows(&self) -> usize;
 }
 
 /// Trait abstracting I/O away from index logic

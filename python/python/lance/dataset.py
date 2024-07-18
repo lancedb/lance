@@ -297,6 +297,15 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        full_text_query: str or dict, optional
+            query string to search for, the results will be ranked by BM25.
+            e.g. "hello world", would match documents contains "hello" or "world".
+            or a dictionary with the following keys:
+            - columns: list[str]
+                The columns to search,
+                currently only supports a single column in the columns list.
+            - query: str
+                The query string to search for.
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
@@ -425,8 +434,15 @@ class LanceDataset(pa.dataset.Dataset):
             Return row ID.
         use_stats: bool, default True
             Use stats pushdown during filters.
-        full_text_query: (str, str), optional
-            The string column to search and the query string to search for.
+        full_text_query: str or dict, optional
+            query string to search for, the results will be ranked by BM25.
+            e.g. "hello world", would match documents contains "hello" or "world".
+            or a dictionary with the following keys:
+            - columns: list[str]
+                The columns to search,
+                currently only supports a single column in the columns list.
+            - query: str
+                The query string to search for.
 
         Notes
         -----
@@ -1178,7 +1194,7 @@ class LanceDataset(pa.dataset.Dataset):
         that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
         ``MaterializeIndex`` operator.
 
-        There are three types of scalar indices available today.  The most common
+        There are 4 types of scalar indices available today.  The most common
         type is ``BTREE``. This index is inspired by the btree data structure
         although only the first few layers of the btree are cached in memory.  It iwll
         perform well on columns with a large number of unique values and few rows per
@@ -1194,6 +1210,10 @@ class LanceDataset(pa.dataset.Dataset):
         with a ``LABEL_LIST`` index.  This index can only speedup queries with
         ``array_has_any`` or ``array_has_all`` filters.
 
+        The ``INVERTED`` index type is used to index document columns.  This index
+        can conduct full-text searches. For example, a column that contains any word
+        of query string "hello world". The results will be ranked by BM25.
+
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
         issues (see https://github.com/apache/datafusion/issues/10073 for more info).
@@ -1206,7 +1226,8 @@ class LanceDataset(pa.dataset.Dataset):
             The column to be indexed.  Must be a boolean, integer, float,
             or string column.
         index_type : str
-            The type of the index.  One of ``"BTREE"`` or ``"BITMAP"``.
+            The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
+            ``"LABEL_LIST"`` or ``"INVERTED"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.

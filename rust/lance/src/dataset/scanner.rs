@@ -967,7 +967,7 @@ impl Scanner {
             if columns.len() != 1 {
                 return Err(Error::io(
                     format!(
-                        "Full text search supports only one column, but got {} columns",
+                        "Full text search supports only one column right now, but got {} columns",
                         columns.len()
                     ),
                     location!(),
