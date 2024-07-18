@@ -250,6 +250,7 @@ pub fn primitive_array_from_buffers(
             let fsl_nulls = bytes_to_validity(fsl_validity, num_rows);
 
             let remaining_buffers = buffers_iter.collect::<Vec<_>>();
+            println!("Remaining buffers: {:?}", remaining_buffers);
             let items_array = primitive_array_from_buffers(
                 items.data_type(),
                 remaining_buffers,
@@ -279,18 +280,19 @@ pub fn primitive_array_from_buffers(
 
             for (field_index, field) in fields.iter().enumerate() {
                 let field_bytes = &buffers[field_index];
+
                 let null_bytes = BytesMut::default();
                 let field_array = primitive_array_from_buffers(
                     field.data_type(),
                     vec![null_bytes, field_bytes.clone()],
                     num_rows,
                 )?;
-                println!("Field array: {:?}", field_array);
+                // println!("Field array: {:?}", field_array);
 
                 field_arrays.push(field_array);
             }
 
-            let struct_array = StructArray::try_new(fields.clone(), field_arrays, None).unwrap(); 
+            let struct_array = StructArray::try_new(fields.clone(), field_arrays, None).unwrap();
             Ok(Arc::new(struct_array))
         }
         _ => Err(Error::io(

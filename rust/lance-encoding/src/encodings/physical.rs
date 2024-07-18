@@ -180,9 +180,9 @@ pub fn decoder_from_array_encoding(
                 .collect::<Vec<_>>();
 
             let mut inner_schedulers = Vec::new();
-            for i  in 0..fields.len() {
-                let inner_encoding = &inner_encodings[i as usize];
-                let inner_datatype = inner_datatypes[i as usize];
+            for i in 0..fields.len() {
+                let inner_encoding = &inner_encodings[i];
+                let inner_datatype = inner_datatypes[i];
                 let inner_scheduler =
                     decoder_from_array_encoding(inner_encoding, buffers, inner_datatype);
                 inner_schedulers.push(inner_scheduler);

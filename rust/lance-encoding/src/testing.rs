@@ -310,7 +310,8 @@ async fn check_round_trip_encoding_inner(
     let mut writer = SimulatedWriter::new(encoder.num_columns());
 
     for arr in &data {
-        println!("arr: {:?}", arr);
+        println!("Encoding array of length {}", arr.len());
+        println!("array: {:?}", arr);
         for encode_task in encoder.maybe_encode(arr.clone()).unwrap() {
             let encoded_page = encode_task.await.unwrap();
             writer.write_page(encoded_page);
@@ -344,6 +345,7 @@ async fn check_round_trip_encoding_inner(
 
         column_infos.push(Arc::new(column_info));
     }
+    println!("Encoding done");
 
     let scheduler =
         Arc::new(SimulatedScheduler::new(writer.encoded_data.freeze())) as Arc<dyn EncodingsIo>;
@@ -358,7 +360,8 @@ async fn check_round_trip_encoding_inner(
     };
 
     // We always try a full decode, regardless of the test cases provided
-    debug!("Testing full decode");
+    println!("Testing full decode");
+    println!("Number of rows : {}", num_rows);
     let scheduler_copy = scheduler.clone();
     test_decode(
         num_rows,
@@ -373,6 +376,7 @@ async fn check_round_trip_encoding_inner(
             (
                 root_decoder,
                 async move {
+                    println!("Running schedule range");
                     decode_scheduler.schedule_range(
                         0..num_rows,
                         &FilterExpression::no_filter(),
@@ -453,6 +457,7 @@ async fn check_round_trip_encoding_inner(
                 (
                     root_decoder,
                     async move {
+                        println!("indices: {:?}", indices);
                         decode_scheduler.schedule_take(
                             &indices,
                             &FilterExpression::no_filter(),
