@@ -188,9 +188,13 @@ pub fn decoder_from_array_encoding(
                 inner_schedulers.push(inner_scheduler);
             }
 
+            let buffer_index = packed_struct.buffer_index;
+            let (buffer_offset, _) = buffers.positions_and_sizes[buffer_index as usize];
+
             Box::new(PackedStructPageScheduler::new(
                 inner_schedulers,
                 data_type.clone(),
+                buffer_offset,
             ))
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column

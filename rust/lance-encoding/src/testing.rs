@@ -96,7 +96,6 @@ async fn test_decode(
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
             assert_eq!(&expected, actual);
-            println!("Asserted\n");
         }
         offset += batch_size as usize;
     }
@@ -172,7 +171,7 @@ pub struct TestCases {
 impl Default for TestCases {
     fn default() -> Self {
         Self {
-            batch_size: 200,
+            batch_size: 100,
             ranges: Vec::new(),
             indices: Vec::new(),
             skip_validation: false,
@@ -310,8 +309,6 @@ async fn check_round_trip_encoding_inner(
     let mut writer = SimulatedWriter::new(encoder.num_columns());
 
     for arr in &data {
-        println!("Encoding array of length {}", arr.len());
-        println!("array: {:?}", arr);
         for encode_task in encoder.maybe_encode(arr.clone()).unwrap() {
             let encoded_page = encode_task.await.unwrap();
             writer.write_page(encoded_page);
@@ -345,7 +342,6 @@ async fn check_round_trip_encoding_inner(
 
         column_infos.push(Arc::new(column_info));
     }
-    println!("Encoding done");
 
     let scheduler =
         Arc::new(SimulatedScheduler::new(writer.encoded_data.freeze())) as Arc<dyn EncodingsIo>;
@@ -360,8 +356,7 @@ async fn check_round_trip_encoding_inner(
     };
 
     // We always try a full decode, regardless of the test cases provided
-    println!("Testing full decode");
-    println!("Number of rows : {}", num_rows);
+    debug!("Testing full decode");
     let scheduler_copy = scheduler.clone();
     test_decode(
         num_rows,
@@ -376,7 +371,6 @@ async fn check_round_trip_encoding_inner(
             (
                 root_decoder,
                 async move {
-                    println!("Running schedule range");
                     decode_scheduler.schedule_range(
                         0..num_rows,
                         &FilterExpression::no_filter(),
@@ -392,7 +386,7 @@ async fn check_round_trip_encoding_inner(
 
     // Test range scheduling
     for range in &test_cases.ranges {
-        println!("Testing decode of range {:?}", range);
+        debug!("Testing decode of range {:?}", range);
         let num_rows = range.end - range.start;
         let expected = concat_data
             .as_ref()
@@ -431,7 +425,7 @@ async fn check_round_trip_encoding_inner(
         if indices.len() == 1 {
             debug!("Testing decode of index {}", indices[0]);
         } else {
-            println!(
+            debug!(
                 "Testing decode of {} indices spread across range [{}..{}]",
                 indices.len(),
                 indices[0],
@@ -457,7 +451,6 @@ async fn check_round_trip_encoding_inner(
                 (
                     root_decoder,
                     async move {
-                        println!("indices: {:?}", indices);
                         decode_scheduler.schedule_take(
                             &indices,
                             &FilterExpression::no_filter(),
@@ -481,8 +474,7 @@ async fn check_round_trip_field_encoding_random(
     encoder_factory: impl Fn() -> Box<dyn FieldEncoder>,
     field: Field,
 ) {
-    // for null_rate in [None, Some(0.5), Some(1.0)] {
-    for null_rate in [None] {
+    for null_rate in [None, Some(0.5), Some(1.0)] {
         for use_slicing in [false, true] {
             let field = if null_rate.is_some() {
                 if !supports_nulls(field.data_type()) {

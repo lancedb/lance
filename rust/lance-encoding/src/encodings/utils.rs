@@ -45,7 +45,6 @@ pub fn new_primitive_array<T: ArrowPrimitiveType>(
 
     let data_buffer = buffer_iter.next().unwrap().freeze();
     let data_buffer = Buffer::from_bytes(data_buffer.into());
-    println!("Data buffer length: {:?}", data_buffer.len());
     let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
 
     // The with_data_type is needed here to recover the parameters for types like Decimal/Timestamp
@@ -250,7 +249,6 @@ pub fn primitive_array_from_buffers(
             let fsl_nulls = bytes_to_validity(fsl_validity, num_rows);
 
             let remaining_buffers = buffers_iter.collect::<Vec<_>>();
-            println!("Remaining buffers: {:?}", remaining_buffers);
             let items_array = primitive_array_from_buffers(
                 items.data_type(),
                 remaining_buffers,
@@ -287,7 +285,6 @@ pub fn primitive_array_from_buffers(
                     vec![null_bytes, field_bytes.clone()],
                     num_rows,
                 )?;
-                // println!("Field array: {:?}", field_array);
 
                 field_arrays.push(field_array);
             }
