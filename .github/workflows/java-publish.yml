@@ -18,6 +18,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - name: Set up Node.js 16
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
       - name: Install dependencies
         run: |
           brew install protobuf
@@ -40,6 +44,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Set up Node.js 16
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
       - uses: Swatinem/rust-cache@v2
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -72,6 +80,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Set up Node.js 16
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
       - uses: Swatinem/rust-cache@v2
       - name: Set up Java 8
         uses: actions/setup-java@v4
@@ -108,3 +120,16 @@ jobs:
         env:
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
+      - name: Find Spark Jar
+        run: |
+          RELATIVE_JAR_PATH=$(find spark/target -name 'lance-spark-2.12-*-jar-with-dependencies.jar')
+          JAR_NAME=$(basename $RELATIVE_JAR_PATH)
+          JAR_PATH=$(readlink -f "$RELATIVE_JAR_PATH")
+          echo "SPARK_JAR_PATH=$JAR_PATH" >> $GITHUB_ENV
+          echo "SPARK_JAR_NAME=$JAR_NAME" >> $GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SPARK_JAR_NAME }}
+          path: ${{ env.SPARK_JAR_PATH }}
+          retention-days: 7
+          if-no-files-found: error
