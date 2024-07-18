@@ -187,7 +187,7 @@ pub fn decoder_from_array_encoding(
                 .map(|field| field.data_type())
                 .collect::<Vec<_>>();
 
-            let mut inner_schedulers = Vec::new();
+            let mut inner_schedulers = Vec::with_capacity(fields.len());
             for i in 0..fields.len() {
                 let inner_encoding = &inner_encodings[i];
                 let inner_datatype = inner_datatypes[i];
@@ -196,8 +196,8 @@ pub fn decoder_from_array_encoding(
                 inner_schedulers.push(inner_scheduler);
             }
 
-            let buffer_index = packed_struct.buffer_index;
-            let (buffer_offset, _) = buffers.positions_and_sizes[buffer_index as usize];
+            let packed_buffer = packed_struct.buffer.as_ref().unwrap();
+            let (buffer_offset, _) = get_buffer(packed_buffer, buffers);
 
             Box::new(PackedStructPageScheduler::new(
                 inner_schedulers,

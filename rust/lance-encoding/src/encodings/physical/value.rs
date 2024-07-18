@@ -311,6 +311,8 @@ impl ArrayEncoder for ValueEncoder {
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::HashMap;
+
     use arrow_schema::{DataType, Field, TimeUnit};
 
     use crate::testing::check_round_trip_encoding_random;
@@ -345,7 +347,7 @@ pub(crate) mod tests {
     async fn test_value_primitive() {
         for data_type in PRIMITIVE_TYPES {
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_random(field).await;
+            check_round_trip_encoding_random(field, HashMap::new()).await;
         }
     }
 }

@@ -481,7 +481,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                 let field_metadata = &field.metadata;
                 if field_metadata
                     .get("packed")
-                    .map(|v| v.as_str() == "true")
+                    .map(|v| v == "true")
                     .unwrap_or(false)
                 {
                     Ok(Box::new(PrimitiveFieldEncoder::try_new(

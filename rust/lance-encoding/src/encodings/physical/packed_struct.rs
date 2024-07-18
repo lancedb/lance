@@ -15,15 +15,18 @@ use crate::{
 };
 
 use arrow_buffer::buffer::Buffer;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Fields};
 use bytes::Bytes;
 use bytes::BytesMut;
 use lance_core::Result;
 
 #[derive(Debug)]
 pub struct PackedStructPageScheduler {
+    // We don't actually need these schedulers right now since we decode all the field bytes directly
+    // But they can be useful if we actually need to use the decoders for the inner fields later
+    // e.g. once bitpacking is added
     _inner_schedulers: Vec<Box<dyn PageScheduler>>,
-    struct_datatype: DataType,
+    fields: Fields,
     buffer_offset: u64,
 }
 
@@ -33,9 +36,12 @@ impl PackedStructPageScheduler {
         struct_datatype: DataType,
         buffer_offset: u64,
     ) -> Self {
+        let DataType::Struct(fields) = struct_datatype else {
+            panic!("Struct datatype expected");
+        };
         Self {
             _inner_schedulers,
-            struct_datatype,
+            fields,
             buffer_offset,
         }
     }
@@ -48,21 +54,18 @@ impl PageScheduler for PackedStructPageScheduler {
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
-        let DataType::Struct(fields) = &self.struct_datatype else {
-            panic!("Struct datatype expected");
-        };
-
         let mut total_bytes_per_row: u64 = 0;
 
-        for field in fields {
+        for field in &self.fields {
             let bytes_per_field = field.data_type().byte_width() as u64;
             total_bytes_per_row += bytes_per_field;
         }
 
-        // To account for potential slicing of the arrays
-        // i.e. parts of the arrays may be encoded in different encoding tasks
-        // In that case ranges won't be enough to slice the bytes on it's own
-        // We need to know the position of the buffer in the page (i.e. the buffer offset)
+        // Parts of the arrays in a page may be encoded in different encoding tasks
+        // In that case decoding two different sets of rows can result in the same ranges parameter being passed in
+        // e.g. we may get ranges[0..2] and ranges[0..2] to decode 4 rows through 2 tasks
+        // So to get the correct byte ranges we need to know the position of the buffer in the page (i.e. the buffer offset)
+        // This is computed directly from the buffer stored in the protobuf
         let byte_ranges = ranges
             .iter()
             .map(|range| {
@@ -75,14 +78,14 @@ impl PageScheduler for PackedStructPageScheduler {
         // Directly creates a future to decode the bytes
         let bytes = scheduler.submit_request(byte_ranges, top_level_row);
 
-        let copy_struct_datatype = self.struct_datatype.clone();
+        let copy_struct_fields = self.fields.clone();
 
         tokio::spawn(async move {
             let bytes = bytes.await?;
 
             Ok(Box::new(PackedStructPageDecoder {
                 data: bytes,
-                struct_datatype: copy_struct_datatype,
+                fields: copy_struct_fields,
                 total_bytes_per_row: total_bytes_per_row as usize,
             }) as Box<dyn PrimitivePageDecoder>)
         })
@@ -93,7 +96,7 @@ impl PageScheduler for PackedStructPageScheduler {
 
 struct PackedStructPageDecoder {
     data: Vec<Bytes>,
-    struct_datatype: DataType,
+    fields: Fields,
     total_bytes_per_row: usize,
 }
 
@@ -118,10 +121,6 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
         // We rearrange this to get [BytesMut(2, 3), BytesMut(5, 6), BytesMut(8, 9)] as a Vec<BytesMut>
         // This is used to reconstruct the struct array later
 
-        let DataType::Struct(fields) = &self.struct_datatype else {
-            panic!("Struct datatype expected");
-        };
-
         let bytes_to_skip = (rows_to_skip as usize) * self.total_bytes_per_row;
         let bytes_to_take = (num_rows as usize) * self.total_bytes_per_row;
 
@@ -136,7 +135,7 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
         let mut struct_bytes = Vec::new();
 
         let mut start_index = 0;
-        for field in fields {
+        for field in &self.fields {
             let bytes_per_field = field.data_type().byte_width();
             let mut field_bytes = BytesMut::default();
 
@@ -156,11 +155,7 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
     }
 
     fn num_buffers(&self) -> u32 {
-        let DataType::Struct(fields) = &self.struct_datatype else {
-            panic!("Struct datatype expected");
-        };
-
-        fields.len() as u32
+        self.fields.len() as u32
     }
 }
 
@@ -175,46 +170,59 @@ impl PackedStructEncoder {
     }
 }
 
-fn pack(encoded_fields: Vec<EncodedArray>, fields_bytes_per_value: Vec<usize>) -> Vec<Buffer> {
-    let num_fields = encoded_fields.len();
-
+fn pack(encoded_fields: Vec<EncodedArray>, fields_bytes_per_value: Vec<usize>) -> Buffer {
     // Each EncodedArray can have several EncodedArrayBuffers (e.g. validity, offsets, bytes, etc)
     // Each EncodedArrayBuffer object has several parts. Each part is a Vec<Buffer>
     // The code below assumes that for all fields:
     // (i) Each EncodedArray has only one EncodedArrayBuffer
-    // (ii) The total number of buffers across all parts in the EncodedArrayBuffer is the same
-    // This workflow will have to change as we adapt the packed encoding to support more complex datatypes
-    let num_buffers_per_field: usize = encoded_fields[0].buffers[0]
-        .parts
+    encoded_fields
         .iter()
-        .map(|buf| buf.len() / fields_bytes_per_value[0])
+        .for_each(|field| debug_assert!(field.buffers.len() == 1));
+    // (ii) The total number of buffers across all parts in the EncodedArrayBuffer is the same
+    if encoded_fields.len() > 1 {
+        debug_assert!(encoded_fields.windows(2).all(|window| {
+            window[0].buffers[0].parts.len() == window[1].buffers[0].parts.len()
+        }));
+    }
+
+    let total_bytes_per_row = fields_bytes_per_value.iter().sum::<usize>();
+    // This workflow will have to change as we adapt the packed encoding to support more complex datatypes
+    let num_total_bytes: usize = encoded_fields
+        .iter()
+        .map(|field| {
+            field.buffers[0]
+                .parts
+                .iter()
+                .map(|buf| buf.len())
+                .sum::<usize>()
+        })
         .sum();
 
-    let mut packed_vec: Vec<Option<Buffer>> = vec![None; num_buffers_per_field * num_fields];
+    let mut packed_vec: Vec<u8> = vec![0; num_total_bytes];
 
+    let mut field_offset = 0;
     for (field_index, encoded_field) in encoded_fields.iter().enumerate() {
         let bytes_per_value = fields_bytes_per_value[field_index];
         let parts = &encoded_field.buffers[0].parts;
 
-        let mut packed_global_index = 0;
+        let mut packed_start = field_offset;
         for buf in parts {
             let num_values = buf.len() / bytes_per_value;
             for value_index in 0..num_values {
                 let start = value_index * bytes_per_value;
-                let packed_index = packed_global_index * num_fields + field_index;
+                let buffer_slice = buf.slice_with_length(start, bytes_per_value);
+                let buffer_slice = buffer_slice.as_slice();
 
-                let buffer_slice = Some(buf.slice_with_length(start, bytes_per_value));
-
-                packed_vec[packed_index].clone_from(&buffer_slice);
-                packed_global_index += 1;
+                packed_vec[packed_start..packed_start + bytes_per_value]
+                    .copy_from_slice(buffer_slice);
+                packed_start += total_bytes_per_row;
             }
         }
+
+        field_offset += bytes_per_value;
     }
 
-    packed_vec
-        .iter()
-        .map(|buf| buf.clone().unwrap())
-        .collect::<Vec<Buffer>>()
+    Buffer::from(packed_vec)
 }
 
 impl ArrayEncoder for PackedStructEncoder {
@@ -257,8 +265,8 @@ impl ArrayEncoder for PackedStructEncoder {
                 }
             }
 
-            let packed_vec = pack(encoded_fields, field_bytes_per_value);
-            global_packed_vec.extend(packed_vec);
+            let packed_buffer = pack(encoded_fields, field_bytes_per_value);
+            global_packed_vec.push(packed_buffer);
         }
 
         let index = *buffer_index;
@@ -275,7 +283,10 @@ impl ArrayEncoder for PackedStructEncoder {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::PackedStruct(
                     pb::PackedStruct {
                         inner: inner_encodings,
-                        buffer_index: index,
+                        buffer: Some(pb::Buffer {
+                            buffer_index: index,
+                            buffer_type: pb::buffer::BufferType::Page as i32,
+                        }),
                     },
                 )),
             },
@@ -294,8 +305,7 @@ pub mod tests {
     use std::{collections::HashMap, sync::Arc, vec};
 
     use crate::testing::{
-        check_round_trip_encoding_of_data_with_metadata,
-        check_round_trip_encoding_random_with_metadata, TestCases,
+        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
     };
 
     #[test_log::test(tokio::test)]
@@ -309,7 +319,7 @@ pub mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("packed".to_string(), "true".to_string());
 
-        check_round_trip_encoding_random_with_metadata(field, metadata).await;
+        check_round_trip_encoding_random(field, metadata).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -361,7 +371,7 @@ pub mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("packed".to_string(), "true".to_string());
 
-        check_round_trip_encoding_of_data_with_metadata(
+        check_round_trip_encoding_of_data(
             vec![struct_array1, struct_array2],
             &test_cases,
             metadata,
@@ -403,7 +413,6 @@ pub mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("packed".to_string(), "true".to_string());
 
-        check_round_trip_encoding_of_data_with_metadata(vec![struct_array], &test_cases, metadata)
-            .await;
+        check_round_trip_encoding_of_data(vec![struct_array], &test_cases, metadata).await;
     }
 }

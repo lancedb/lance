@@ -1192,7 +1192,7 @@ impl FieldEncoder for ListFieldEncoder {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
@@ -1212,13 +1212,13 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_list() {
         let field = Field::new("", make_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_list() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1230,7 +1230,7 @@ mod tests {
         )]));
 
         let field = Field::new("", make_list_type(struct_type), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1248,7 +1248,8 @@ mod tests {
             .with_range(0..3)
             .with_range(1..3)
             .with_indices(vec![1, 3]);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1269,9 +1270,14 @@ mod tests {
                 .with_indices(vec![0])
                 .with_indices(vec![2])
                 .with_indices(vec![0, 1]);
-            check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+            check_round_trip_encoding_of_data(
+                vec![list_array.clone()],
+                &test_cases,
+                HashMap::new(),
+            )
+            .await;
             let test_cases = test_cases.with_batch_size(1);
-            check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
+            check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
         }
 
         // Scenario 2: All lists are empty
@@ -1286,9 +1292,10 @@ mod tests {
         let list_array = Arc::new(list_builder.finish());
 
         let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
+            .await;
         let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1309,6 +1316,6 @@ mod tests {
 
         // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
-        check_round_trip_encoding_of_data(arrs, &test_cases).await;
+        check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 }
