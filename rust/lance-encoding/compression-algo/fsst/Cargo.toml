@@ -1,0 +1,29 @@
+[package]
+name = "fsst"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "FSST string compression"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rand = "0.8.4"
+# this should be put in dev-dependencies, TODO: remove it from here
+arrow = { version = "51.0.0", optional = false, features = ["prettyprint"] }
+
+[dev-dependencies]
+test-log.workspace = true
+tokio.workspace = true
+rand_xoshiro = "0.6.0"
+lance-datagen = { workspace = true }
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"

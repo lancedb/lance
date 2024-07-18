@@ -59,7 +59,7 @@ use pyo3::types::{PyBytes, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
-    types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong},
+    types::{IntoPyDict, PyDict},
     PyObject, PyResult,
 };
 use snafu::{location, Location};
@@ -178,7 +178,7 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
-    pub fn execute(&mut self, new_data: &PyAny) -> PyResult<PyObject> {
+    pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<PyObject> {
         let py = new_data.py();
 
         let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
@@ -188,7 +188,7 @@ impl MergeInsertBuilder {
                     .map_err(|err| PyValueError::new_err(err.to_string()))?,
             )
         } else {
-            Box::new(ArrowArrayStreamReader::from_pyarrow(new_data)?)
+            Box::new(ArrowArrayStreamReader::from_pyarrow_bound(new_data)?)
         };
 
         let job = self
@@ -424,7 +424,7 @@ impl Dataset {
         prefilter: Option<bool>,
         limit: Option<i64>,
         offset: Option<i64>,
-        nearest: Option<&PyDict>,
+        nearest: Option<&Bound<PyDict>>,
         batch_size: Option<usize>,
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
@@ -522,7 +522,7 @@ impl Dataset {
             let qval = nearest
                 .get_item("q")?
                 .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
-            let data = ArrayData::from_pyarrow(qval)?;
+            let data = ArrayData::from_pyarrow_bound(&qval)?;
             let q = Float32Array::from(data);
 
             let k: usize = if let Some(k) = nearest.get_item("k")? {
@@ -530,7 +530,7 @@ impl Dataset {
                     // Use limit if k is not specified, default to 10.
                     limit.unwrap_or(10) as usize
                 } else {
-                    PyAny::downcast::<PyLong>(k)?.extract()?
+                    k.extract()?
                 }
             } else {
                 10
@@ -540,7 +540,7 @@ impl Dataset {
                 if nprobes.is_none() {
                     DEFAULT_NPROBS
                 } else {
-                    PyAny::downcast::<PyLong>(nprobes)?.extract()?
+                    nprobes.extract()?
                 }
             } else {
                 DEFAULT_NPROBS
@@ -567,14 +567,14 @@ impl Dataset {
                 if rf.is_none() {
                     None
                 } else {
-                    PyAny::downcast::<PyLong>(rf)?.extract()?
+                    rf.extract()?
                 }
             } else {
                 None
             };
 
             let use_index: bool = if let Some(idx) = nearest.get_item("use_index")? {
-                PyAny::downcast::<PyBool>(idx)?.extract()?
+                idx.extract()?
             } else {
                 true
             };
@@ -583,7 +583,7 @@ impl Dataset {
                 if ef.is_none() {
                     None
                 } else {
-                    PyAny::downcast::<PyLong>(ef)?.extract()?
+                    ef.extract()?
                 }
             } else {
                 None
@@ -930,11 +930,11 @@ impl Dataset {
         name: Option<String>,
         replace: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
-        kwargs: Option<&PyDict>,
+        kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<()> {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
-            "BTREE" | "BITMAP" => IndexType::Scalar,
+            "BTREE" | "BITMAP" | "LABEL_LIST" => IndexType::Scalar,
             "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -950,6 +950,10 @@ impl Dataset {
             Box::new(ScalarIndexParams {
                 // Temporary workaround until we add support for auto-detection of scalar index type
                 force_index_type: Some(ScalarIndexType::Bitmap),
+            })
+        } else if index_type == "LABEL_LIST" {
+            Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::LabelList),
             })
         } else {
             let column_type = match self.ds.schema().field(columns[0]) {
@@ -1141,7 +1145,7 @@ impl Dataset {
 }
 
 #[pyfunction(name = "_write_dataset")]
-pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<Dataset> {
+pub fn write_dataset(reader: &Bound<PyAny>, uri: String, options: &PyDict) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
     let ds = if reader.is_instance_of::<Scanner>() {
@@ -1153,7 +1157,7 @@ pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
-        let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
+        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     };
@@ -1246,7 +1250,7 @@ fn prepare_vector_index_params(
     index_type: &str,
     column_type: &DataType,
     storage_options: Option<HashMap<String, String>>,
-    kwargs: Option<&PyDict>,
+    kwargs: Option<&Bound<PyDict>>,
 ) -> PyResult<Box<dyn IndexParams>> {
     let mut m_type = MetricType::L2;
     let mut ivf_params = IvfBuildParams::default();
@@ -1263,7 +1267,7 @@ fn prepare_vector_index_params(
 
         // Parse sample rate
         if let Some(sample_rate) = kwargs.get_item("sample_rate")? {
-            let sample_rate = PyAny::downcast::<PyInt>(sample_rate)?.extract()?;
+            let sample_rate: usize = sample_rate.extract()?;
             ivf_params.sample_rate = sample_rate;
             pq_params.sample_rate = sample_rate;
             sq_params.sample_rate = sample_rate;
@@ -1271,15 +1275,15 @@ fn prepare_vector_index_params(
 
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
-            ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
+            ivf_params.num_partitions = n.extract()?
         };
 
         if let Some(n) = kwargs.get_item("shuffle_partition_concurrency")? {
-            ivf_params.shuffle_partition_concurrency = PyAny::downcast::<PyInt>(n)?.extract()?
+            ivf_params.shuffle_partition_concurrency = n.extract()?
         };
 
         if let Some(c) = kwargs.get_item("ivf_centroids")? {
-            let batch = RecordBatch::from_pyarrow(c)?;
+            let batch = RecordBatch::from_pyarrow_bound(&c)?;
             if "_ivf_centroids" != batch.schema().field(0).name() {
                 return Err(PyValueError::new_err(
                     "Expected '_ivf_centroids' as the first column name.",
@@ -1323,7 +1327,7 @@ fn prepare_vector_index_params(
                             e
                         ))
                     })?;
-                    let list = PyAny::downcast::<PyList>(l)?
+                    let list = l.downcast::<PyList>()?
                         .iter()
                         .map(|f| f.to_string())
                         .collect();
@@ -1339,28 +1343,28 @@ fn prepare_vector_index_params(
 
         // Parse HNSW params
         if let Some(max_level) = kwargs.get_item("max_level")? {
-            hnsw_params.max_level = PyAny::downcast::<PyInt>(max_level)?.extract()?;
+            hnsw_params.max_level = max_level.extract()?;
         }
 
         if let Some(m) = kwargs.get_item("m")? {
-            hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
+            hnsw_params.m = m.extract()?;
         }
 
         if let Some(ef_c) = kwargs.get_item("ef_construction")? {
-            hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
+            hnsw_params.ef_construction = ef_c.extract()?;
         }
 
         // Parse PQ params
         if let Some(n) = kwargs.get_item("num_bits")? {
-            pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
+            pq_params.num_bits = n.extract()?
         };
 
         if let Some(n) = kwargs.get_item("num_sub_vectors")? {
-            pq_params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
+            pq_params.num_sub_vectors = n.extract()?
         };
 
         if let Some(c) = kwargs.get_item("pq_codebook")? {
-            let batch = RecordBatch::from_pyarrow(c)?;
+            let batch = RecordBatch::from_pyarrow_bound(&c)?;
             if "_pq_codebook" != batch.schema().field(0).name() {
                 return Err(PyValueError::new_err(
                     "Expected '_pq_codebook' as the first column name.",
@@ -1411,14 +1415,12 @@ impl PyWriteProgress {
 
 #[async_trait]
 impl WriteFragmentProgress for PyWriteProgress {
-    async fn begin(&self, fragment: &Fragment, multipart_id: &str) -> lance::Result<()> {
+    async fn begin(&self, fragment: &Fragment) -> lance::Result<()> {
         let json_str = serde_json::to_string(fragment)?;
 
         Python::with_gil(|py| -> PyResult<()> {
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("multipart_id", multipart_id)?;
             self.py_obj
-                .call_method(py, "_do_begin", (json_str,), Some(kwargs))?;
+                .call_method(py, "_do_begin", (json_str,), None)?;
             Ok(())
         })
         .map_err(|e| {

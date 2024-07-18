@@ -157,6 +157,10 @@ impl ProjectionExec {
 }
 
 impl ExecutionPlan for ProjectionExec {
+    fn name(&self) -> &str {
+        "ProjectionExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -166,8 +170,8 @@ impl ExecutionPlan for ProjectionExec {
         arrow_schema.into()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(

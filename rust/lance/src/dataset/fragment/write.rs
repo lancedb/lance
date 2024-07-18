@@ -80,7 +80,11 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
-        let (object_store, base_path) = ObjectStore::from_uri(self.dataset_uri).await?;
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            self.dataset_uri,
+            &params.store_params.clone().unwrap_or_default(),
+        )
+        .await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
@@ -91,7 +95,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             FileWriterOptions::default(),
         )?;
 
-        progress.begin(&fragment, writer.multipart_id()).await?;
+        progress.begin(&fragment).await?;
 
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
 
@@ -162,7 +166,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         )
         .await?;
 
-        progress.begin(&fragment, writer.multipart_id()).await?;
+        progress.begin(&fragment).await?;
 
         let mut buffered_reader = chunk_stream(stream, params.max_rows_per_group);
         while let Some(batched_chunk) = buffered_reader.next().await {

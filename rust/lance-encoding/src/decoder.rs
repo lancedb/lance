@@ -220,8 +220,8 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
-use futures::stream::{BoxStream, FuturesOrdered};
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
 use log::trace;
@@ -368,7 +368,7 @@ pub struct DecoderMiddlewareChainCursor<'a> {
 
 pub type ChosenFieldScheduler<'a> = (
     DecoderMiddlewareChainCursor<'a>,
-    BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
+    Result<Arc<dyn FieldScheduler>>,
 );
 
 impl<'a> DecoderMiddlewareChainCursor<'a> {
@@ -619,7 +619,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 &primitive_col,
                 buffers,
             )?;
-            return Ok((chain, std::future::ready(Ok(scheduler)).boxed()));
+            return Ok((chain, Ok(scheduler)));
         }
         match &data_type {
             DataType::FixedSizeList(inner, _dimension) => {
@@ -633,7 +633,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                         &primitive_col,
                         buffers,
                     )?;
-                    return Ok((chain, std::future::ready(Ok(scheduler)).boxed()));
+                    Ok((chain, Ok(scheduler)))
                 } else {
                     todo!()
                 }
@@ -645,12 +645,14 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     file_buffers: buffers,
                     positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
                 };
+                let item_field_name = items_field.name().clone();
                 let (chain, items_scheduler) = chain.new_child(
                     /*child_idx=*/ 0,
                     &field.children[0],
                     column_infos,
                     buffers,
                 )?;
+                let items_scheduler = items_scheduler?;
 
                 let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
                     .page_infos
@@ -691,18 +693,15 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     DataType::Int64
                 };
                 let items_type = items_field.data_type().clone();
-                let list_scheduler_fut = async move {
-                    let items_scheduler = items_scheduler.await?;
-                    Ok(Arc::new(ListFieldScheduler::new(
-                        inner,
-                        items_scheduler,
-                        items_type,
-                        offset_type,
-                        null_offset_adjustments,
-                    )) as Arc<dyn FieldScheduler>)
-                }
-                .boxed();
-                Ok((chain, list_scheduler_fut))
+                let list_scheduler = Ok(Arc::new(ListFieldScheduler::new(
+                    inner,
+                    items_scheduler,
+                    item_field_name.clone(),
+                    items_type,
+                    offset_type,
+                    null_offset_adjustments,
+                )) as Arc<dyn FieldScheduler>);
+                Ok((chain, list_scheduler))
             }
             DataType::Struct(fields) => {
                 let column_info = column_infos.pop_front().unwrap();
@@ -719,31 +718,26 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 } else {
                     // use default struct encoding
                     Self::check_simple_struct(&column_info, chain.current_path()).unwrap();
-                    let (chain, child_schedulers) = field.children.iter().enumerate().try_fold(
-                        (chain, FuturesOrdered::new()),
-                        |(chain, mut fields), (field_idx, field)| {
-                            let (chain, field) =
-                                chain.new_child(field_idx as u32, field, column_infos, buffers)?;
-                            fields.push_back(field);
-                            Result::Ok((chain, fields))
-                        },
-                    )?;
+                    let mut child_schedulers = Vec::with_capacity(field.children.len());
+                    let mut chain = chain;
+                    for (i, field) in field.children.iter().enumerate() {
+                        let (next_chain, field_scheduler) =
+                            chain.new_child(i as u32, field, column_infos, buffers)?;
+                        child_schedulers.push(field_scheduler?);
+                        chain = next_chain;
+                    }
 
                     let fields = fields.clone();
-                    let struct_fut = async move {
-                        let child_schedulers = child_schedulers.try_collect::<Vec<_>>().await?;
-                        Ok(
-                            Arc::new(SimpleStructScheduler::new(child_schedulers, fields))
-                                as Arc<dyn FieldScheduler>,
-                        )
-                    }
-                    .boxed();
+                    let struct_scheduler = Ok(Arc::new(SimpleStructScheduler::new(
+                        child_schedulers,
+                        fields,
+                    )) as Arc<dyn FieldScheduler>);
 
                     // For now, we don't record nullability for structs.  As a result, there is always
                     // only one "page" of struct data.  In the future, this will change.  A null-aware
                     // struct scheduler will need to first calculate how many rows are in the struct page
                     // and then find the child pages that overlap.  This should be doable.
-                    Ok((chain, struct_fut))
+                    Ok((chain, struct_scheduler))
                 }
             }
             // TODO: Still need support for dictionary / RLE
@@ -782,7 +776,7 @@ fn root_column(num_rows: u64) -> ColumnInfo {
 impl DecodeBatchScheduler {
     /// Creates a new decode scheduler with the expected schema and the column
     /// metadata of the file.
-    pub async fn try_new<'a>(
+    pub fn try_new<'a>(
         schema: &'a Schema,
         column_infos: &[Arc<ColumnInfo>],
         file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
@@ -800,11 +794,11 @@ impl DecodeBatchScheduler {
         columns.extend(column_infos.iter().map(|col| col.as_ref().clone()));
         let root_type = DataType::Struct(root_fields.clone());
         let root_field = Field::try_from(&ArrowField::new("root", root_type, false))?;
-        let (_, root_scheduler_fut) =
+        let (_, root_scheduler) =
             decoder_strategy
                 .cursor(io)
                 .start(&root_field, &mut columns, buffers)?;
-        let root_scheduler = root_scheduler_fut.await?;
+        let root_scheduler = root_scheduler?;
         Ok(Self {
             root_scheduler,
             root_fields,
@@ -1446,8 +1440,7 @@ pub async fn decode_batch(
         batch.num_rows,
         field_decoder_strategy,
         &io_scheduler,
-    )
-    .await?;
+    )?;
     let (tx, rx) = unbounded_channel();
     decode_scheduler.schedule_range(0..batch.num_rows, filter, tx, io_scheduler);
     #[allow(clippy::single_range_in_vec_init)]

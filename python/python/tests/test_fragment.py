@@ -217,7 +217,6 @@ def test_dataset_progress(tmp_path: Path):
     with open(progress_uri / "fragment_1.in_progress") as f:
         progress_data = json.load(f)
     assert progress_data["fragment_id"] == 1
-    assert isinstance(progress_data["multipart_id"], str)
     # progress contains custom metadata
     assert progress_data["metadata"]["test_key"] == "test_value"
 
@@ -225,11 +224,6 @@ def test_dataset_progress(tmp_path: Path):
     with open(progress_uri / "fragment_1.json") as f:
         metadata = json.load(f)
     assert metadata["id"] == 1
-
-    progress.cleanup_partial_writes(str(dataset_uri))
-
-    assert not (progress_uri / "fragment_1.json").exists()
-    assert not (progress_uri / "fragment_1.in_progress").exists()
 
 
 def test_fragment_meta():

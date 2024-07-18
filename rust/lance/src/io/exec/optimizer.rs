@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use super::TakeExec;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
@@ -13,8 +14,6 @@ use datafusion::{
     physical_plan::{projection::ProjectionExec as DFProjectionExec, ExecutionPlan},
 };
 use datafusion_physical_expr::expressions::Column;
-
-use super::TakeExec;
 
 /// Rule that eliminates [TakeExec] nodes that are immediately followed by another [TakeExec].
 pub struct CoalesceTake;
@@ -26,12 +25,12 @@ impl PhysicalOptimizerRule for CoalesceTake {
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(plan
-            .transform_down(&|plan| {
+            .transform_down(|plan| {
                 if let Some(take) = plan.as_any().downcast_ref::<TakeExec>() {
-                    let child = &take.children()[0];
+                    let child = take.children()[0];
                     if let Some(exec_child) = child.as_any().downcast_ref::<TakeExec>() {
-                        let upstream_plan = exec_child.children();
-                        return Ok(Transformed::yes(plan.with_new_children(upstream_plan)?));
+                        let inner_child = exec_child.children()[0].clone();
+                        return Ok(Transformed::yes(plan.with_new_children(vec![inner_child])?));
                     }
                 }
                 Ok(Transformed::no(plan))
@@ -59,14 +58,14 @@ impl PhysicalOptimizerRule for SimplifyProjection {
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(plan
-            .transform_down(&|plan| {
+            .transform_down(|plan| {
                 if let Some(proj) = plan.as_any().downcast_ref::<DFProjectionExec>() {
-                    let children = &proj.children();
+                    let children = proj.children();
                     if children.len() != 1 {
                         return Ok(Transformed::no(plan));
                     }
 
-                    let input = &children[0];
+                    let input = children[0];
 
                     // TODO: we could try to coalesce consecutive projections, something for later
                     // For now, we just keep things simple and only remove NoOp projections

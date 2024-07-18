@@ -9,7 +9,7 @@ use futures::{Future, FutureExt};
 use tokio::runtime::{Builder, Runtime};
 use tracing::Span;
 
-fn get_num_compute_intensive_cpus() -> usize {
+pub fn get_num_compute_intensive_cpus() -> usize {
     let cpus = num_cpus::get();
 
     if cpus <= *IO_CORE_RESERVATION {

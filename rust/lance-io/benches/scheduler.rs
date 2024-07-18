@@ -87,8 +87,9 @@ fn bench_full_read(c: &mut Criterion) {
                             .output()
                             .unwrap();
                     }
+                    std::env::set_var("IO_THREADS", io_parallelism.to_string());
                     runtime.block_on(async {
-                        let scheduler = ScanScheduler::new(obj_store, params.io_parallelism);
+                        let scheduler = ScanScheduler::new(obj_store);
                         let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
 
                         let (tx, rx) = mpsc::channel(1024);
@@ -173,8 +174,9 @@ fn bench_random_read(c: &mut Criterion) {
                                 .output()
                                 .unwrap();
                         }
+                        std::env::set_var("IO_THREADS", params.io_parallelism.to_string());
                         runtime.block_on(async {
-                            let scheduler = ScanScheduler::new(obj_store, params.io_parallelism);
+                            let scheduler = ScanScheduler::new(obj_store);
                             let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
 
                             let (tx, rx) = mpsc::channel(1024);

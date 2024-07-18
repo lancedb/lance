@@ -24,6 +24,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
@@ -102,10 +103,9 @@ impl LancePushdownScanExec {
     ) -> Result<Self> {
         // This should be infallible.
         let columns: Vec<_> = predicate
-            .to_columns()
-            .unwrap()
+            .column_refs()
             .into_iter()
-            .map(|col| col.name)
+            .map(|col| col.name.as_str())
             .collect();
         let dataset_schema = dataset.schema();
         let predicate_projection = Arc::new(dataset_schema.project(&columns)
@@ -146,6 +146,10 @@ impl LancePushdownScanExec {
 }
 
 impl ExecutionPlan for LancePushdownScanExec {
+    fn name(&self) -> &str {
+        "LancePushdownScanExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -154,7 +158,7 @@ impl ExecutionPlan for LancePushdownScanExec {
         self.output_schema.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -268,7 +272,7 @@ impl FragmentScanner {
 
         // We will call the reader with projections. In order for this to work
         // we must ensure that we open the fragment with the maximal schema.
-        let mut reader = fragment.open(dataset.schema(), false, false).await?;
+        let mut reader = fragment.open(dataset.schema(), false, false, None).await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
@@ -361,10 +365,9 @@ impl FragmentScanner {
                 // 1. Load needed filter columns, which might be a subset of all filter
                 //    columns if statistics obviated the need for some columns.
                 let columns: Vec<_> = predicate
-                    .to_columns()
-                    .unwrap()
+                    .column_refs()
                     .into_iter()
-                    .map(|col| col.name)
+                    .map(|col| col.name.as_str())
                     .collect();
                 let predicate_projection =
                     Arc::new(self.fragment.dataset().schema().project(&columns).unwrap());

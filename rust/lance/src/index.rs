@@ -15,7 +15,9 @@ use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
-use lance_index::scalar::expression::IndexInformationProvider;
+use lance_index::scalar::expression::{
+    IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
+};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
@@ -127,12 +129,14 @@ pub(crate) async fn remap_index(
 
 #[derive(Debug)]
 pub struct ScalarIndexInfo {
-    indexed_columns: HashMap<String, DataType>,
+    indexed_columns: HashMap<String, (DataType, Box<dyn ScalarQueryParser>)>,
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
-    fn get_index(&self, col: &str) -> Option<&DataType> {
-        self.indexed_columns.get(col)
+    fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+        self.indexed_columns
+            .get(col)
+            .map(|(ty, parser)| (ty, parser.as_ref()))
     }
 }
 
@@ -507,12 +511,12 @@ impl DatasetIndexInternalExt for Dataset {
         }
     }
 
-    async fn open_scalar_index(&self, _column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>> {
+    async fn open_scalar_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>> {
         if let Some(index) = self.session.index_cache.get_scalar(uuid) {
             return Ok(index);
         }
 
-        let index = crate::index::scalar::open_scalar_index(self, uuid).await?;
+        let index = crate::index::scalar::open_scalar_index(self, column, uuid).await?;
         self.session.index_cache.insert_scalar(uuid, index.clone());
         Ok(index)
     }
@@ -570,7 +574,7 @@ impl DatasetIndexInternalExt for Dataset {
             }
 
             (0, 3) => {
-                let scheduler = ScanScheduler::new(self.object_store.clone(), 16);
+                let scheduler = ScanScheduler::new(self.object_store.clone());
                 let file = scheduler.open_file(&index_file).await?;
                 let reader =
                     v2::reader::FileReader::try_open(file, None, Default::default()).await?;
@@ -656,8 +660,16 @@ impl DatasetIndexInternalExt for Dataset {
         .map(|idx| {
             let field = idx.fields[0];
             let field = schema.field_by_id(field).ok_or_else(|| Error::Internal { message: format!("Index referenced a field with id {field} which did not exist in the schema"), location: location!() });
-            field.map(|field| (field.name.clone(), field.data_type()))
-        }).collect::<Result<Vec<_>>>()?;
+            field.map(|field| {
+                let query_parser = if let DataType::List(_) = field.data_type() {
+                    Box::<LabelListQueryParser>::default() as Box<dyn ScalarQueryParser>
+                } else {
+                    Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
+                };
+                (field.name.clone(), (field.data_type(), query_parser))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
         let index_info_map = HashMap::from_iter(indexed_fields);
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,

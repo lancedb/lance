@@ -6,7 +6,7 @@ use std::{collections::BTreeSet, io::Cursor, ops::Range, pin::Pin, sync::Arc};
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
-use futures::{stream::BoxStream, FutureExt, Stream, StreamExt};
+use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_encoding::{
     decoder::{
         BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMiddlewareChain,
@@ -71,7 +71,6 @@ pub struct CachedFileMetadata {
     pub major_version: u16,
     pub minor_version: u16,
 }
-
 /// Selecting columns from a lance file requires specifying both the
 /// index of the column and the data type of the column
 ///
@@ -558,7 +557,7 @@ impl FileReader {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn do_read_range(
+    fn do_read_range(
         column_infos: Vec<Arc<ColumnInfo>>,
         scheduler: Arc<dyn EncodingsIo>,
         num_rows: u64,
@@ -582,8 +581,7 @@ impl FileReader {
             num_rows,
             &decoder_strategy,
             &scheduler,
-        )
-        .await?;
+        )?;
 
         let root_decoder = decode_scheduler.new_root_decoder_ranges(&[range.clone()]);
 
@@ -613,32 +611,19 @@ impl FileReader {
         let num_rows = self.num_rows;
         let decoder_strategy = self.decoder_strategy.clone();
         // Create and initialize the stream
-        let stream_fut = async move {
-            let maybe_stream = Self::do_read_range(
-                column_infos,
-                scheduler,
-                num_rows,
-                decoder_strategy,
-                range,
-                batch_size,
-                &projection,
-                filter,
-            )
-            .await;
-            // If something goes wrong then turn that error into a stream with one failing task
-            match maybe_stream {
-                Ok(stream) => stream,
-                Err(err) => futures::stream::once(std::future::ready(ReadBatchTask {
-                    num_rows: 0,
-                    task: std::future::ready(Err(err)).boxed(),
-                }))
-                .boxed(),
-            }
-        };
-        Ok(futures::stream::once(stream_fut).flatten().boxed())
+        Self::do_read_range(
+            column_infos,
+            scheduler,
+            num_rows,
+            decoder_strategy,
+            range,
+            batch_size,
+            &projection,
+            filter,
+        )
     }
 
-    async fn do_take_rows(
+    fn do_take_rows(
         column_infos: Vec<Arc<ColumnInfo>>,
         scheduler: Arc<dyn EncodingsIo>,
         num_rows: u64,
@@ -663,8 +648,7 @@ impl FileReader {
             num_rows,
             &decoder_strategy,
             &scheduler,
-        )
-        .await?;
+        )?;
 
         let root_decoder = decode_scheduler.new_root_decoder_indices(&indices);
 
@@ -692,28 +676,15 @@ impl FileReader {
         let num_rows = self.num_rows;
         let decoder_strategy = self.decoder_strategy.clone();
         // Create and initialize the stream
-        let stream_fut = async move {
-            let maybe_stream = Self::do_take_rows(
-                column_infos,
-                scheduler,
-                num_rows,
-                decoder_strategy,
-                indices,
-                batch_size,
-                &projection,
-            )
-            .await;
-            // If something goes wrong then turn that error into a stream with one failing task
-            match maybe_stream {
-                Ok(stream) => stream,
-                Err(err) => futures::stream::once(std::future::ready(ReadBatchTask {
-                    num_rows: 0,
-                    task: std::future::ready(Err(err)).boxed(),
-                }))
-                .boxed(),
-            }
-        };
-        Ok(futures::stream::once(stream_fut).flatten().boxed())
+        Self::do_take_rows(
+            column_infos,
+            scheduler,
+            num_rows,
+            decoder_strategy,
+            indices,
+            batch_size,
+            &projection,
+        )
     }
 
     /// Creates a stream of "read tasks" to read the data from the file

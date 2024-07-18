@@ -23,6 +23,7 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 bytes.workspace = true
 futures.workspace = true
+fsst.workspace = true
 log.workspace = true
 num_cpus.workspace = true
 prost.workspace = true
@@ -31,6 +32,8 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zstd.workspace = true
+rand = "0.8.4"
+rand_xoshiro = "0.6.0"
 hyperloglogplus.workspace = true
 arrow.workspace = true
 

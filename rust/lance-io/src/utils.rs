@@ -178,13 +178,12 @@ pub fn read_struct_from_buf<
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use bytes::Bytes;
-    use object_store::{memory::InMemory, path::Path};
+    use object_store::path::Path;
 
     use crate::{
         object_reader::CloudObjectReader,
+        object_store::ObjectStore,
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
         utils::read_struct,
@@ -215,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_proto_structs() {
-        let store = InMemory::new();
+        let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
@@ -227,7 +226,7 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let object_reader = CloudObjectReader::new(Arc::new(store), path, 1024, None).unwrap();
+        let object_reader = CloudObjectReader::new(store.inner, path, 1024, None).unwrap();
         let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(some_message, actual);
     }

@@ -110,7 +110,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         uuid: String,
         session: Weak<Session>,
     ) -> Result<Self> {
-        let scheduler = ScanScheduler::new(object_store, 16);
+        let scheduler = ScanScheduler::new(object_store);
 
         let index_reader = FileReader::try_open(
             scheduler
@@ -263,6 +263,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// preprocess the query vector given the partition id.
     ///
     /// Internal API with no stability guarantees.
+    #[instrument(level = "debug", skip(self))]
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         if S::use_residual() {
             let partition_centroids =
@@ -352,7 +353,6 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
     for IVFIndex<S, Q>
 {
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
-        pre_filter.wait_for_ready().await?;
         let mut query = query.clone();
         if self.distance_type == DistanceType::Cosine {
             let key = normalize_arrow(&query.key)?;
@@ -410,6 +410,7 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
     //     )
     // }
 
+    #[instrument(level = "debug", skip(self, pre_filter))]
     async fn search_in_partition(
         &self,
         partition_id: usize,
@@ -417,6 +418,7 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true).await?;
+        pre_filter.wait_for_ready().await?;
 
         let query = self.preprocess_query(partition_id, query)?;
         let param = (&query).into();

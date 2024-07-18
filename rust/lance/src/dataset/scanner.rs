@@ -11,7 +11,8 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
-use datafusion::logical_expr::{AggregateFunction, Expr};
+use datafusion::functions_aggregate::count::count_udaf;
+use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
@@ -19,10 +20,11 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
-    expressions::{create_aggregate_expr, Literal},
+    expressions::Literal,
     filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
+    udaf::create_aggregate_expr,
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
@@ -144,7 +146,7 @@ pub struct Scanner {
     batch_readahead: usize,
 
     /// Number of fragments to read concurrently
-    fragment_readahead: usize,
+    fragment_readahead: Option<usize>,
 
     limit: Option<i64>,
     offset: Option<i64>,
@@ -208,7 +210,7 @@ impl Scanner {
             filter: None,
             batch_size: None,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
-            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
+            fragment_readahead: None,
             limit: None,
             offset: None,
             ordering: None,
@@ -389,7 +391,7 @@ impl Scanner {
     ///
     /// This is only used if ``scan_in_order`` is set to false.
     pub fn fragment_readahead(&mut self, nfragments: usize) -> &mut Self {
-        self.fragment_readahead = nfragments;
+        self.fragment_readahead = Some(nfragments);
         self
     }
 
@@ -738,12 +740,14 @@ impl Scanner {
         // Datafusion interprets COUNT(*) as COUNT(1)
         let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
         let count_expr = create_aggregate_expr(
-            &AggregateFunction::Count,
-            false,
+            &count_udaf(),
             &[one],
+            &[lit(1)],
+            &[],
             &[],
             &plan.schema(),
             "",
+            false,
             false,
         )?;
         let plan_schema = plan.schema().clone();
@@ -1373,7 +1377,9 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let config = ScanConfig {
             batch_readahead: self.batch_readahead,
-            fragment_readahead: self.fragment_readahead,
+            fragment_readahead: self
+                .fragment_readahead
+                .unwrap_or(DEFAULT_FRAGMENT_READAHEAD),
             with_row_id: self.with_row_id,
             with_row_address: self.with_row_address,
             make_deletions_null,
@@ -1731,6 +1737,9 @@ mod test {
     use datafusion::logical_expr::{col, lit};
     use half::f16;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
@@ -2582,6 +2591,16 @@ mod test {
     async fn test_ann_prefilter(
         #[values(false, true)] use_legacy_format: bool,
         #[values(false, true)] stable_row_ids: bool,
+        #[values(
+            VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                SQBuildParams::default()
+            )
+        )]
+        index_params: VectorIndexParams,
     ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -2614,13 +2633,7 @@ mod test {
             .unwrap();
 
         dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                None,
-                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
-                false,
-            )
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, false)
             .await
             .unwrap();
 
@@ -4243,7 +4256,7 @@ mod test {
                     .project(&["_rowid", "_distance"])
             },
             "Projection: fields=[_rowid, _distance]
-  SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]
+  SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
       ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
@@ -4259,7 +4272,7 @@ mod test {
                     .project(&["_rowid", "_distance"])
             },
             "Projection: fields=[_rowid, _distance]
-  SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]
+  SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
       ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
@@ -4276,17 +4289,17 @@ mod test {
             },
             "Projection: fields=[_rowid, _distance]
   FilterExec: _distance@2 IS NOT NULL
-    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]
+    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
       KNNVectorDistance: metric=l2
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             Projection: fields=[_distance, _rowid, vec]
               FilterExec: _distance@2 IS NOT NULL
-                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]
+                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2
                     LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
             Take: columns=\"_distance, _rowid, vec\"
-              SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]
+              SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
                 ANNSubIndex: name=idx, k=34, deltas=1
                   ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )

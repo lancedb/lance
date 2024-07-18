@@ -58,19 +58,46 @@ pub struct KMeans {
 #[pymethods]
 impl KMeans {
     #[new]
-    #[pyo3(signature = (k, metric_type="l2", max_iters=50))]
-    fn new(k: usize, metric_type: &str, max_iters: u32) -> PyResult<Self> {
+    #[pyo3(signature = (k, metric_type="l2", max_iters=50, centroids_arr=None))]
+    fn new(
+        k: usize,
+        metric_type: &str,
+        max_iters: u32,
+        centroids_arr: Option<&Bound<PyAny>>,
+    ) -> PyResult<Self> {
+        let trained_kmeans = if let Some(arr) = centroids_arr {
+            let data = ArrayData::from_pyarrow_bound(arr)?;
+            if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
+                return Err(PyValueError::new_err("Must be a FixedSizeList"));
+            }
+            let fixed_size_arr = FixedSizeListArray::from(data);
+            let params = KMeansParams {
+                distance_type: metric_type.try_into().unwrap(),
+                max_iters,
+                ..Default::default()
+            };
+            let kmeans =
+                LanceKMeans::new_with_params(&fixed_size_arr, k, &params).map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "Error initialing KMeans from existing centroids: {}",
+                        e
+                    ))
+                })?;
+            Some(kmeans)
+        } else {
+            None
+        };
         Ok(Self {
             k,
             metric_type: metric_type.try_into().unwrap(),
             max_iters,
-            trained_kmeans: None,
+            trained_kmeans,
         })
     }
 
     /// Train the model
-    fn fit(&mut self, _py: Python, arr: &PyAny) -> PyResult<()> {
-        let data = ArrayData::from_pyarrow(arr)?;
+    fn fit(&mut self, _py: Python, arr: &Bound<PyAny>) -> PyResult<()> {
+        let data = ArrayData::from_pyarrow_bound(arr)?;
         if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
         }
@@ -86,11 +113,11 @@ impl KMeans {
         Ok(())
     }
 
-    fn predict(&self, py: Python, array: &PyAny) -> PyResult<PyObject> {
+    fn predict(&self, py: Python, array: &Bound<PyAny>) -> PyResult<PyObject> {
         let Some(kmeans) = self.trained_kmeans.as_ref() else {
             return Err(PyRuntimeError::new_err("KMeans must fit (train) first"));
         };
-        let data = ArrayData::from_pyarrow(array)?;
+        let data = ArrayData::from_pyarrow_bound(array)?;
         if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
         }
@@ -151,7 +178,7 @@ impl Hnsw {
         distance_type="l2",
     ))]
     fn build(
-        vectors_array: &PyIterator,
+        vectors_array: &Bound<PyIterator>,
         max_level: u16,
         m: usize,
         ef_construction: usize,
@@ -164,7 +191,7 @@ impl Hnsw {
 
         let mut data: Vec<Arc<dyn Array>> = Vec::new();
         for vectors in vectors_array {
-            let vectors = ArrayData::from_pyarrow(vectors?)?;
+            let vectors = ArrayData::from_pyarrow_bound(&vectors?)?;
             if !matches!(vectors.data_type(), DataType::FixedSizeList(_, _)) {
                 return Err(PyValueError::new_err("Must be a FixedSizeList"));
             }
