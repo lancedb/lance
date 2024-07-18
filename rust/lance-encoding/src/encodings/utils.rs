@@ -277,14 +277,19 @@ pub fn primitive_array_from_buffers(
             let mut field_arrays = Vec::new();
 
             for (field_index, field) in fields.iter().enumerate() {
-                let field_bytes = &buffers[field_index];
-
                 let null_bytes = BytesMut::default();
-                let field_array = primitive_array_from_buffers(
-                    field.data_type(),
-                    vec![null_bytes, field_bytes.clone()],
-                    num_rows,
-                )?;
+                let mut final_buffers = vec![null_bytes];
+
+                // Pushes a null buffer for inner field of the FSL
+                // Right now this works only if inner fields of the FSL are nullable
+                if matches!(field.data_type(), DataType::FixedSizeList(_, _)) {
+                    final_buffers.push(BytesMut::default());
+                }
+
+                final_buffers.push(buffers[field_index].clone());
+
+                let field_array =
+                    primitive_array_from_buffers(field.data_type(), final_buffers, num_rows)?;
 
                 field_arrays.push(field_array);
             }

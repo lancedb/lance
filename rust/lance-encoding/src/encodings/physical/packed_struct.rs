@@ -286,7 +286,10 @@ impl ArrayEncoder for PackedStructEncoder {
 #[cfg(test)]
 pub mod tests {
 
-    use arrow_array::{ArrayRef, Int32Array, StructArray, UInt64Array, UInt8Array};
+    use arrow::array::ArrayData;
+    use arrow_array::{
+        Array, ArrayRef, FixedSizeListArray, Int32Array, StructArray, UInt64Array, UInt8Array,
+    };
     use arrow_schema::{DataType, Field, Fields};
     use std::{collections::HashMap, sync::Arc, vec};
 
@@ -366,40 +369,41 @@ pub mod tests {
         .await;
     }
 
-    // TODO: Test with FixedSizeList currently fails because primitive_array_from_buffers expects
-    // the inner buffers of the FixedSizeList to have both a validity and values buffer
-    // Right now there is no validity buffer being created during decode.
-    // Can leave this for a future PR?
-    // #[test_log::test(tokio::test)]
-    // async fn test_fsl_packed_struct() {
-    //     // let temp = Arc::new(Int32Array::from(vec![9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]));
-    //     let int_array = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_packed_struct() {
+        let int_array = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        let array2 = Arc::new(Int32Array::from(vec![12, 13, 14, 15]));
 
-    //     // Create the FixedSizeListArray
-    //     let list_data_type =
-    //         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 3);
-    //     let list_data = ArrayData::builder(list_data_type.clone())
-    //         .len(3)
-    //         .add_child_data(int_array.into_data())
-    //         .build()
-    //         .unwrap();
-    //     let list_array = FixedSizeListArray::from(list_data);
+        let list_data_type =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 3);
+        let list_data = ArrayData::builder(list_data_type.clone())
+            .len(4)
+            .add_child_data(int_array.into_data())
+            .build()
+            .unwrap();
+        let list_array = FixedSizeListArray::from(list_data);
 
-    //     // Create the StructArray
-    //     let struct_array = Arc::new(StructArray::from(vec![(
-    //         Arc::new(Field::new("x", list_data_type.clone(), false)),
-    //         Arc::new(list_array) as ArrayRef,
-    //     )]));
+        let struct_array = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("x", list_data_type.clone(), false)),
+                Arc::new(list_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("x", DataType::Int32, false)),
+                array2 as ArrayRef,
+            ),
+        ]));
 
-    //     let test_cases = TestCases::default()
-    //         .with_range(1..2)
-    //         .with_range(0..1)
-    //         .with_indices(vec![0, 2]);
+        let test_cases = TestCases::default()
+            .with_range(1..3)
+            .with_range(0..1)
+            .with_range(2..4)
+            .with_indices(vec![0, 2, 3]);
 
-    //     let mut metadata = HashMap::new();
-    //     metadata.insert("packed".to_string(), "true".to_string());
+        let mut metadata = HashMap::new();
+        metadata.insert("packed".to_string(), "true".to_string());
 
-    //     check_round_trip_encoding_of_data_with_metadata(vec![struct_array], &test_cases, metadata)
-    //         .await;
-    // }
+        check_round_trip_encoding_of_data_with_metadata(vec![struct_array], &test_cases, metadata)
+            .await;
+    }
 }
