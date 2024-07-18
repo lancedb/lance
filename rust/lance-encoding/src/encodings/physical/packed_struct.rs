@@ -381,14 +381,14 @@ pub mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_fsl_packed_struct() {
-        let int_array = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        let array2 = Arc::new(Int32Array::from(vec![12, 13, 14, 15]));
+        let int_array = Arc::new(Int32Array::from(vec![12, 13, 14, 15]));
 
         let list_data_type =
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 3);
+        let inner_array = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         let list_data = ArrayData::builder(list_data_type.clone())
             .len(4)
-            .add_child_data(int_array.into_data())
+            .add_child_data(inner_array.into_data())
             .build()
             .unwrap();
         let list_array = FixedSizeListArray::from(list_data);
@@ -400,7 +400,7 @@ pub mod tests {
             ),
             (
                 Arc::new(Field::new("x", DataType::Int32, false)),
-                array2 as ArrayRef,
+                int_array as ArrayRef,
             ),
         ]));
 
