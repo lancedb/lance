@@ -603,7 +603,7 @@ mod tests {
 
         async fn delete_data(&self, predicate: &str) -> Result<()> {
             let mut db = self.open().await?;
-            db.delete(predicate).await?;
+            db.delete(predicate, None).await?;
             Ok(())
         }
 

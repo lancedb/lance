@@ -567,7 +567,7 @@ mod tests {
             let mut dataset = dataset.clone();
             tokio::task::spawn(async move {
                 dataset
-                    .delete("x = 2")
+                    .delete("x = 2", None)
                     .await
                     .map(|_| dataset.manifest.version)
             })

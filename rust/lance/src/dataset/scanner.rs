@@ -2959,7 +2959,7 @@ mod test {
 
             // DELETE top result and search again
 
-            dataset.delete("i = 1").await.unwrap();
+            dataset.delete("i = 1", None).await.unwrap();
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
@@ -3020,7 +3020,7 @@ mod test {
                 .await
                 .unwrap();
 
-            dataset.delete("i < 512").await.unwrap();
+            dataset.delete("i < 512", None).await.unwrap();
 
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
@@ -3317,7 +3317,7 @@ mod test {
             dataset.checkout_version(append_version).await.unwrap();
             dataset.restore().await.unwrap();
 
-            dataset.delete("not_indexed = 75").await.unwrap();
+            dataset.delete("not_indexed = 75", None).await.unwrap();
 
             let append_then_delete_version = dataset.version().version;
 
@@ -3326,7 +3326,7 @@ mod test {
             let mut dataset = dataset.checkout_version(original_version).await.unwrap();
             dataset.restore().await.unwrap();
 
-            dataset.delete("not_indexed = 75").await.unwrap();
+            dataset.delete("not_indexed = 75", None).await.unwrap();
 
             let delete_version = dataset.version().version;
 

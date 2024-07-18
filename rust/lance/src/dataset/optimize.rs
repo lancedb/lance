@@ -1263,10 +1263,10 @@ mod tests {
             .unwrap();
 
         // Delete 1 row from first large fragment
-        dataset.delete("a = 1300").await.unwrap();
+        dataset.delete("a = 1300", None).await.unwrap();
 
         // Delete 20% of rows from second large fragment
-        dataset.delete("a >= 2400 AND a < 2600").await.unwrap();
+        dataset.delete("a >= 2400 AND a < 2600", None).await.unwrap();
 
         // Append 2 small fragments
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(3200, 600))], data.schema());
@@ -1481,7 +1481,7 @@ mod tests {
             .await
             .unwrap();
 
-        dataset.delete("a <= 500").await.unwrap();
+        dataset.delete("a <= 500", None).await.unwrap();
 
         // Threshold must be satisfied
         let mut options = CompactionOptions {

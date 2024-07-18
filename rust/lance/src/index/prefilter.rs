@@ -296,14 +296,14 @@ mod test {
         let no_deletions = Arc::new(dataset.clone());
 
         // This will add a deletion file.
-        dataset.delete("x = 8").await.unwrap();
+        dataset.delete("x = 8", None).await.unwrap();
         let deletions_no_missing_frags = Arc::new(dataset.clone());
 
-        dataset.delete("x >= 3 and x <= 5").await.unwrap();
+        dataset.delete("x >= 3 and x <= 5", None).await.unwrap();
         assert_eq!(dataset.get_fragments().len(), 2);
         let deletions_missing_frags = Arc::new(dataset.clone());
 
-        dataset.delete("x >= 3").await.unwrap();
+        dataset.delete("x >= 3", None).await.unwrap();
         assert_eq!(dataset.get_fragments().len(), 1);
         assert!(dataset.get_fragments()[0]
             .metadata()

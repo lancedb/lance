@@ -1003,7 +1003,11 @@ impl Dataset {
     }
 
     /// Delete rows based on a predicate.
-    pub async fn delete(&mut self, predicate: &str) -> Result<()> {
+    pub async fn delete(
+        &mut self,
+        predicate: &str,
+        write_params: Option<WriteParams>,
+    ) -> Result<()> {
         let mut updated_fragments: Vec<Fragment> = Vec::new();
         let mut deleted_fragment_ids: Vec<u64> = Vec::new();
         stream::iter(self.get_fragments())
@@ -1036,10 +1040,17 @@ impl Dataset {
             None,
         );
 
+        let mut commit_handler = self.commit_handler.clone();
+        if let Some(write_params) = write_params {
+            if let Some(wrapper) = write_params.commit_handler_wrapper {
+                commit_handler = wrapper.wrap(commit_handler);
+            }
+        }
+
         let manifest = commit_transaction(
             self,
             &self.object_store,
-            self.commit_handler.as_ref(),
+            commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -1725,7 +1736,7 @@ mod tests {
         assert_eq!(manifest.reader_feature_flags, 0);
 
         // Create one with deletions
-        dataset.delete("i < 10").await.unwrap();
+        dataset.delete("i < 10", None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // Check it set the flag
@@ -2610,7 +2621,7 @@ mod tests {
             .await;
 
         // Delete nothing
-        dataset.delete("i < 0").await.unwrap();
+        dataset.delete("i < 0", None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // We should not have any deletion file still
@@ -2623,7 +2634,7 @@ mod tests {
         assert!(fragments[1].metadata.deletion_file.is_none());
 
         // Delete rows
-        dataset.delete("i < 10 OR i >= 90").await.unwrap();
+        dataset.delete("i < 10 OR i >= 90", None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // Verify result:
@@ -2680,7 +2691,7 @@ mod tests {
         let second_deletion_file = fragments[1].metadata.deletion_file.clone().unwrap();
 
         // Delete more rows
-        dataset.delete("i < 20").await.unwrap();
+        dataset.delete("i < 20", None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // Verify result
@@ -2704,7 +2715,7 @@ mod tests {
         );
 
         // Delete full fragment
-        dataset.delete("i >= 50").await.unwrap();
+        dataset.delete("i >= 50", None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // Verify second fragment is fully gone
@@ -2771,7 +2782,7 @@ mod tests {
         let original_manifest = dataset.manifest.clone();
 
         // Delete some rows
-        dataset.delete("i > 50").await.unwrap();
+        dataset.delete("i > 50", None).await.unwrap();
         assert_eq!(dataset.manifest.version, 2);
 
         // Checkout a previous version
@@ -2790,7 +2801,7 @@ mod tests {
         assert_eq!(dataset.manifest.schema, original_manifest.schema);
 
         // Delete some rows again (make sure we can still write as usual)
-        dataset.delete("i > 30").await.unwrap();
+        dataset.delete("i > 30", None).await.unwrap();
         assert_eq!(dataset.manifest.version, 4);
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
@@ -2908,7 +2919,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dataset.delete("true").await.unwrap();
+        dataset.delete("true", None).await.unwrap();
 
         let mut stream = dataset
             .scan()
@@ -2943,7 +2954,7 @@ mod tests {
         }
 
         // predicate with redundant whitespace
-        dataset.delete(" True").await.unwrap();
+        dataset.delete(" True", None).await.unwrap();
 
         let mut stream = dataset
             .scan()
@@ -3379,7 +3390,7 @@ mod tests {
         assert!(validate_res.is_err());
 
         // Force a migration.
-        dataset.delete("false").await.unwrap();
+        dataset.delete("false", None).await.unwrap();
         dataset.validate().await.unwrap();
 
         let data = dataset.scan().try_into_batch().await.unwrap();

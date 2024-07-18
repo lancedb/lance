@@ -1039,7 +1039,7 @@ mod test {
             .await
             .unwrap();
 
-        dataset.delete("struct.int = 6").await.unwrap();
+        dataset.delete("struct.int = 6", None).await.unwrap();
 
         dataset
     }
@@ -1373,7 +1373,7 @@ mod test {
         // Group 2: first half deleted
         // Group 3: some indices deleted
         dataset
-            .delete("(int >= 10 AND int < 25) OR int in (33, 35, 37)")
+            .delete("(int >= 10 AND int < 25) OR int in (33, 35, 37)", None)
             .await
             .unwrap();
 
@@ -1430,9 +1430,9 @@ mod test {
             .unwrap();
 
         // Delete group 1
-        dataset.delete("int >= 4 AND int < 8").await.unwrap();
+        dataset.delete("int >= 4 AND int < 8", None).await.unwrap();
         // Delete part of group 2
-        dataset.delete("int = 9").await.unwrap();
+        dataset.delete("int = 9", None).await.unwrap();
 
         let expected_int = [0, 1, 2, 3, 8, 10, 11];
 
