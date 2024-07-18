@@ -146,7 +146,7 @@ class LanceFragment(pa.dataset.Fragment):
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
         *,
-        use_legacy_format=True,
+        use_legacy_format=False,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
@@ -178,9 +178,9 @@ class LanceFragment(pa.dataset.Fragment):
             The write mode. If "append" is specified, the data will be checked
             against the existing dataset's schema. Otherwise, pass "create" or
             "overwrite" to assign new field ids to the schema.
-        use_legacy_format: bool, default True
-            Use the legacy format to write Lance files. The default is True
-            while the v2 format is still in beta.
+        use_legacy_format: bool, default False
+            Use the legacy format to write Lance files.  This can be turned on if
+            issues are encountered with the new writer.
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
@@ -512,7 +512,7 @@ def write_fragments(
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
-    use_legacy_format: bool = True,
+    use_legacy_format: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> List[FragmentMetadata]:
     """
@@ -550,9 +550,9 @@ def write_fragments(
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
-    use_legacy_format : optional, bool, default True
-        Use the Lance v1 writer to write Lance v1 files.  The default is currently
-        True while the v2 format is in beta.
+    use_legacy_format : optional, bool, default False
+        Use the Lance v1 writer to write Lance v1 files.  This can be turned on
+        if issues are encountered with the new writer.
     storage_options : Optional[Dict[str, str]]
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.

@@ -54,7 +54,7 @@ def _write_fragment(
     max_rows_per_file: int = 1024 * 1024,
     max_bytes_per_file: Optional[int] = None,
     max_rows_per_group: int = 1024,  # Only useful for v1 writer.
-    use_legacy_format: bool = True,
+    use_legacy_format: bool = False,
     storage_options: Optional[Dict[str, Any]] = None,
 ) -> Tuple[FragmentMetadata, pa.Schema]:
     from ..dependencies import _PANDAS_AVAILABLE
