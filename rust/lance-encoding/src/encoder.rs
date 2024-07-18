@@ -11,8 +11,8 @@ use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
 use crate::encodings::logical::r#struct::StructFieldEncoder;
-use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
+use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -283,8 +283,11 @@ impl CoreArrayEncodingStrategy {
 
                 for i in 0..num_fields {
                     let inner_datatype = fields[i].data_type();
-                    let inner_encoder =
-                        Self::array_encoder_from_type(inner_datatype, use_dict_encoding)?;
+                    let inner_encoder = Self::array_encoder_from_type(
+                        inner_datatype,
+                        data_size,
+                        use_dict_encoding,
+                    )?;
                     inner_encoders.push(inner_encoder);
                 }
 

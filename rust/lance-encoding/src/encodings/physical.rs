@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::DataType;
-use packed_struct::PackedStructPageScheduler;
 use fsst::FsstPageScheduler;
+use packed_struct::PackedStructPageScheduler;
 
 use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PageScheduler, format::pb};

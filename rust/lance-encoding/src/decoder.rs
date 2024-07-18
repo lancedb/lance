@@ -714,7 +714,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                         &column_info,
                         buffers,
                     )?;
-                    return Ok((chain, std::future::ready(Ok(scheduler)).boxed()));
+                    Ok((chain, Ok(scheduler)))
                 } else {
                     // use default struct encoding
                     Self::check_simple_struct(&column_info, chain.current_path()).unwrap();
