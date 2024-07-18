@@ -926,64 +926,7 @@ impl Scanner {
         };
 
         if let Some(query) = &self.full_text_query {
-            let index_info = self.dataset.scalar_index_info().await?;
-            let columns = if query.columns.is_empty() {
-                self.dataset
-                    .schema()
-                    .fields
-                    .iter()
-                    .filter_map(|f| {
-                        if f.data_type() == DataType::LargeUtf8 {
-                            index_info.get_index(&f.name).map(|_| f.name.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            } else {
-                for column in &query.columns {
-                    let (data_type, _) = index_info.get_index(column).ok_or(Error::io(
-                        format!(
-                            "Column {} has to to be with inverted index for full text search",
-                            column
-                        ),
-                        location!(),
-                    ))?;
-                    if *data_type != DataType::LargeUtf8 {
-                        return Err(Error::io(
-                            format!(
-                                "Column {} data type is {} but must be LargeUtf8 for full text search",
-                                column,
-                                data_type,
-                            ),
-                            location!(),
-                        ));
-                    }
-                }
-                query.columns.clone()
-            };
-
-            // Now the full text search supports only one column
-            if columns.len() != 1 {
-                return Err(Error::io(
-                    format!(
-                        "Full text search supports only one column right now, but got {} columns",
-                        columns.len()
-                    ),
-                    location!(),
-                ));
-            }
-            let full_text_search_index_expr = ScalarIndexExpr::Query(
-                columns[0].clone(),
-                Arc::new(SargableQuery::FullTextSearch(query.clone())),
-            );
-            let scalar_index_query = match filter_plan.index_query {
-                Some(index_expr) => {
-                    ScalarIndexExpr::And(index_expr.into(), full_text_search_index_expr.into())
-                }
-                None => full_text_search_index_expr,
-            };
-            filter_plan.index_query = Some(scalar_index_query);
+            self.fts(&mut filter_plan, query).await?;
         }
 
         // Stage 1: source (either an (K|A)NN search or a (full|indexed) scan)
@@ -1134,6 +1077,70 @@ impl Scanner {
         debug!("Execution plan:\n{:?}", plan);
 
         Ok(plan)
+    }
+
+    // Modify the filter plan to include the full text search query
+    async fn fts(&self, filter_plan: &mut FilterPlan, query: &FullTextSearchQuery) -> Result<()> {
+        let index_info = self.dataset.scalar_index_info().await?;
+        let columns = if query.columns.is_empty() {
+            self.dataset
+                .schema()
+                .fields
+                .iter()
+                .filter_map(|f| {
+                    if f.data_type() == DataType::LargeUtf8 {
+                        index_info.get_index(&f.name).map(|_| f.name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            for column in &query.columns {
+                let (data_type, _) = index_info.get_index(column).ok_or(Error::io(
+                    format!(
+                        "Column {} has to to be with inverted index for full text search",
+                        column
+                    ),
+                    location!(),
+                ))?;
+                if *data_type != DataType::LargeUtf8 {
+                    return Err(Error::io(
+                        format!(
+                            "Column {} data type is {} but must be LargeUtf8 for full text search",
+                            column, data_type,
+                        ),
+                        location!(),
+                    ));
+                }
+            }
+            query.columns.clone()
+        };
+
+        // Now the full text search supports only one column
+        if columns.len() != 1 {
+            return Err(Error::io(
+                format!(
+                    "Full text search supports only one column right now, but got {} columns",
+                    columns.len()
+                ),
+                location!(),
+            ));
+        }
+        let full_text_search_index_expr = ScalarIndexExpr::Query(
+            columns[0].clone(),
+            Arc::new(SargableQuery::FullTextSearch(query.clone())),
+        );
+        let scalar_index_query = match &filter_plan.index_query {
+            Some(index_expr) => ScalarIndexExpr::And(
+                index_expr.to_owned().into(),
+                full_text_search_index_expr.into(),
+            ),
+            None => full_text_search_index_expr,
+        };
+        filter_plan.index_query = Some(scalar_index_query);
+
+        Ok(())
     }
 
     // ANN/KNN search execution node with optional prefilter
