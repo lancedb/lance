@@ -20,7 +20,7 @@ use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_table::io::commit::{
-    commit_handler_from_url, CommitError, CommitHandler, CommitLock, ManifestLocation,
+    commit_handler_from_url, CommitError, CommitHandler, CommitLock, ManifestLocation, WrappingCommitHandler,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
@@ -155,6 +155,11 @@ pub struct ReadParams {
     /// If a custom object store is provided (via store_params.object_store) then this
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
+
+    /// If present, will be used to wrap the commit handler implementation.
+    /// 
+    /// This can be used to augment the behavior of the commit of the commit handler implementation.
+    pub commit_handler_wrapper: Option<Arc<dyn WrappingCommitHandler>>,
 }
 
 impl ReadParams {
@@ -190,6 +195,7 @@ impl Default for ReadParams {
             session: None,
             store_options: None,
             commit_handler: None,
+            commit_handler_wrapper: None,
         }
     }
 }

@@ -6,7 +6,7 @@ use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::{
     format::Manifest,
-    io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation},
+    io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation, WrappingCommitHandler},
 };
 use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
 use prost::Message;
@@ -32,6 +32,7 @@ pub struct DatasetBuilder {
     manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
+    commit_handler_wrapper: Option<Arc<dyn WrappingCommitHandler>>,
     options: ObjectStoreParams,
     version: Option<u64>,
     table_uri: String,
@@ -45,6 +46,7 @@ impl DatasetBuilder {
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
             commit_handler: None,
+            commit_handler_wrapper: None,
             session: None,
             version: None,
             manifest: None,
@@ -84,6 +86,11 @@ impl DatasetBuilder {
 
     pub fn with_commit_handler(mut self, commit_handler: Arc<dyn CommitHandler>) -> Self {
         self.commit_handler = Some(commit_handler);
+        self
+    }
+
+    pub fn with_commit_handler_wrapper(mut self, wrapper: Arc<dyn WrappingCommitHandler>) -> Self {
+        self.commit_handler_wrapper = Some(wrapper);
         self
     }
 
@@ -167,6 +174,10 @@ impl DatasetBuilder {
             self.commit_handler = Some(commit_handler);
         }
 
+        if let Some(wrapper) = read_params.commit_handler_wrapper {
+            self.commit_handler_wrapper = Some(wrapper);
+        }
+
         self
     }
 
@@ -194,10 +205,14 @@ impl DatasetBuilder {
 
     /// Build a lance object store for the given config
     pub async fn build_object_store(self) -> Result<(ObjectStore, Path, Arc<dyn CommitHandler>)> {
-        let commit_handler = match self.commit_handler {
+        let mut commit_handler = match self.commit_handler {
             Some(commit_handler) => Ok(commit_handler),
             None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await,
         }?;
+
+        if let Some(wrapper) = self.commit_handler_wrapper {
+            commit_handler = wrapper.wrap(commit_handler);
+        }
 
         match &self.options.object_store {
             Some(store) => Ok((
