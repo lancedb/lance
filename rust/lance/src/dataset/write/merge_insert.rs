@@ -70,7 +70,7 @@ use crate::{
     Dataset,
 };
 
-use super::{write_fragments_internal, WriteParams};
+use super::write_fragments_internal;
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -208,8 +208,6 @@ pub struct MergeInsertJob {
     dataset: Arc<Dataset>,
     // The parameters controlling how to merge the two streams
     params: MergeInsertParams,
-
-    write_params: Option<WriteParams>,
 }
 
 /// Build a merge insert operation.
@@ -251,7 +249,6 @@ pub struct MergeInsertJob {
 pub struct MergeInsertBuilder {
     dataset: Arc<Dataset>,
     params: MergeInsertParams,
-    write_params: Option<WriteParams>,
 }
 
 impl MergeInsertBuilder {
@@ -278,7 +275,6 @@ impl MergeInsertBuilder {
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
             },
-            write_params: None,
         })
     }
 
@@ -307,12 +303,6 @@ impl MergeInsertBuilder {
         self
     }
 
-
-    pub fn with_write_params(&mut self, params: WriteParams) -> &mut Self {
-        self.write_params = Some(params);
-        self
-    }
-
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
         if !self.params.insert_not_matched
@@ -327,7 +317,6 @@ impl MergeInsertBuilder {
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
-            write_params: self.write_params.clone(),
         })
     }
 }
@@ -543,7 +532,6 @@ impl MergeInsertJob {
             removed_fragment_ids,
             old_fragments,
             new_fragments,
-            self.write_params,
         )
         .await?;
 
@@ -608,7 +596,6 @@ impl MergeInsertJob {
         removed_fragment_ids: Vec<u64>,
         updated_fragments: Vec<Fragment>,
         new_fragments: Vec<Fragment>,
-        write_params: Option<WriteParams>,
     ) -> Result<Arc<Dataset>> {
         let operation = Operation::Update {
             removed_fragment_ids,
@@ -617,17 +604,10 @@ impl MergeInsertJob {
         };
         let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
-        let mut commit_handler = dataset.commit_handler.clone();
-        if let Some(write_params) = write_params {
-            if let Some(wrapper) = write_params.commit_handler_wrapper {
-                commit_handler = wrapper.wrap(commit_handler)    
-            }
-        }
-
         let manifest = commit_transaction(
             dataset.as_ref(),
             dataset.object_store(),
-            commit_handler.as_ref(),
+            dataset.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
