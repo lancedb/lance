@@ -391,7 +391,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
     pub fn next(
         mut self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
     ) -> Result<ChosenFieldScheduler<'a>> {
         if self.cur_idx >= self.chain.chain.len() {
@@ -416,7 +416,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
     pub fn restart_at_current(
         mut self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
     ) -> Result<ChosenFieldScheduler<'a>> {
         self.cur_idx = 0;
@@ -430,7 +430,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
         mut self,
         child_idx: u32,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
     ) -> Result<ChosenFieldScheduler<'a>> {
         self.path.push_back(child_idx);
@@ -442,12 +442,54 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
     pub(crate) fn start(
         mut self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
     ) -> Result<ChosenFieldScheduler<'a>> {
         self.path.clear();
         self.cur_idx = 0;
         self.next(field, column_infos, buffers)
+    }
+}
+
+pub struct ColumnInfoIter<'a> {
+    column_infos: &'a [ColumnInfo],
+    column_indices: &'a [u32],
+    column_info_pos: usize,
+    column_indices_pos: usize,
+}
+
+impl<'a> ColumnInfoIter<'a> {
+    pub fn new(column_infos: &'a [ColumnInfo], column_indices: &'a [u32]) -> Self {
+        let initial_pos = column_indices[0] as usize;
+        Self {
+            column_infos,
+            column_indices,
+            column_info_pos: initial_pos,
+            column_indices_pos: 0,
+        }
+    }
+
+    pub fn peek(&self) -> &'a ColumnInfo {
+        &self.column_infos[self.column_info_pos]
+    }
+
+    pub fn next(&mut self) -> Option<&'a ColumnInfo> {
+        if self.column_info_pos < self.column_infos.len() {
+            let info = &self.column_infos[self.column_info_pos];
+            self.column_info_pos += 1;
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn next_top_level(&mut self) {
+        self.column_indices_pos += 1;
+        if self.column_indices_pos < self.column_indices.len() {
+            self.column_info_pos = self.column_indices[self.column_indices_pos] as usize;
+        } else {
+            self.column_info_pos = self.column_infos.len();
+        }
     }
 }
 
@@ -511,7 +553,7 @@ pub trait FieldDecoderStrategy: Send + Sync + std::fmt::Debug {
     fn create_field_scheduler<'a>(
         &self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         chain: DecoderMiddlewareChainCursor<'a>,
     ) -> Result<ChosenFieldScheduler<'a>>;
@@ -606,13 +648,13 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
     fn create_field_scheduler<'a>(
         &self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         chain: DecoderMiddlewareChainCursor<'a>,
     ) -> Result<ChosenFieldScheduler<'a>> {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
-            let primitive_col = column_infos.pop_front().unwrap();
+            let primitive_col = column_infos.next().unwrap();
             let scheduler = Self::create_primitive_scheduler(
                 &data_type,
                 chain.current_path(),
@@ -626,7 +668,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 // A fixed size list column could either be a physical or a logical decoder
                 // depending on the child data type.
                 if Self::is_primitive(inner.data_type()) {
-                    let primitive_col = column_infos.pop_front().unwrap();
+                    let primitive_col = column_infos.next().unwrap();
                     let scheduler = Self::create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
@@ -639,7 +681,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 }
             }
             DataType::List(items_field) | DataType::LargeList(items_field) => {
-                let offsets_column = column_infos.pop_front().unwrap();
+                let offsets_column = column_infos.next().unwrap();
                 Self::ensure_values_encoded(&offsets_column, chain.current_path())?;
                 let offsets_column_buffers = ColumnBuffers {
                     file_buffers: buffers,
@@ -704,7 +746,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 Ok((chain, list_scheduler))
             }
             DataType::Struct(fields) => {
-                let column_info = column_infos.pop_front().unwrap();
+                let column_info = column_infos.next().unwrap();
 
                 if Self::check_packed_struct(&column_info) {
                     // use packed struct encoding
@@ -718,9 +760,13 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 } else {
                     // use default struct encoding
                     Self::check_simple_struct(&column_info, chain.current_path()).unwrap();
+                    let is_root = field.metadata.contains_key("__lance_decoder_root");
                     let mut child_schedulers = Vec::with_capacity(field.children.len());
                     let mut chain = chain;
                     for (i, field) in field.children.iter().enumerate() {
+                        if is_root {
+                            column_infos.next_top_level();
+                        }
                         let (next_chain, field_scheduler) =
                             chain.new_child(i as u32, field, column_infos, buffers)?;
                         child_schedulers.push(field_scheduler?);
@@ -778,6 +824,7 @@ impl DecodeBatchScheduler {
     /// metadata of the file.
     pub fn try_new<'a>(
         schema: &'a Schema,
+        column_indices: &[u32],
         column_infos: &[Arc<ColumnInfo>],
         file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
         num_rows: u64,
@@ -789,15 +836,23 @@ impl DecodeBatchScheduler {
         };
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields().clone();
-        let mut columns = VecDeque::with_capacity(column_infos.len() + 1);
-        columns.push_back(root_column(num_rows));
+        let mut columns = Vec::with_capacity(column_infos.len() + 1);
+        columns.push(root_column(num_rows));
         columns.extend(column_infos.iter().map(|col| col.as_ref().clone()));
+        let adjusted_column_indices = [0_u32]
+            .into_iter()
+            .chain(column_indices.iter().map(|i| *i + 1))
+            .collect::<Vec<_>>();
+        let mut column_iter = ColumnInfoIter::new(&columns, &adjusted_column_indices);
         let root_type = DataType::Struct(root_fields.clone());
-        let root_field = Field::try_from(&ArrowField::new("root", root_type, false))?;
+        let mut root_field = Field::try_from(&ArrowField::new("root", root_type, false))?;
+        root_field
+            .metadata
+            .insert("__lance_decoder_root".to_string(), "true".to_string());
         let (_, root_scheduler) =
             decoder_strategy
                 .cursor(io)
-                .start(&root_field, &mut columns, buffers)?;
+                .start(&root_field, &mut column_iter, buffers)?;
         let root_scheduler = root_scheduler?;
         Ok(Self {
             root_scheduler,
@@ -1435,6 +1490,7 @@ pub async fn decode_batch(
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),
+        &batch.top_level_columns,
         &batch.page_table,
         &vec![],
         batch.num_rows,
