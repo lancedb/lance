@@ -540,6 +540,9 @@ These options apply to all object stores.
        and IP masks. Any subdomain of the provided domain will be bypassed. For 
        example, ``example.com, 192.168.1.0/24`` would bypass ``https://api.example.com``,
        ``https://www.example.com``, and any IP in the range ``192.168.1.0/24``.
+   * - ``max_concurrent_requests``
+     - Maximum number of concurrent requests. This can be used if many connection
+       reset or 429 errors are being produced. Default, ``64``.
 
 
 S3 Configuration
