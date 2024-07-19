@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use arrow_schema::DataType;
 use lance_core::{
@@ -12,7 +9,7 @@ use lance_core::{
     Result,
 };
 use lance_encoding::{
-    decoder::{ColumnInfo, DecoderMiddlewareChainCursor, FieldDecoderStrategy, FieldScheduler},
+    decoder::{ColumnInfoIter, DecoderMiddlewareChainCursor, FieldDecoderStrategy, FieldScheduler},
     encoder::{ColumnIndexSequence, CoreFieldEncodingStrategy, FieldEncodingStrategy},
     encodings::physical::FileBuffers,
 };
@@ -88,7 +85,7 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
     fn create_field_scheduler<'a>(
         &self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         chain: DecoderMiddlewareChainCursor<'a>,
     ) -> Result<(
@@ -98,7 +95,7 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
         let is_root = self.initialize();
 
         if let Some((rows_per_map, unloaded_pushdown)) = extract_zone_info(
-            column_infos.front_mut().unwrap(),
+            column_infos.next().unwrap(),
             &field.data_type(),
             chain.current_path(),
         ) {

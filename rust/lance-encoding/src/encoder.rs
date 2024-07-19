@@ -539,6 +539,7 @@ pub struct EncodedBatch {
     pub data: Bytes,
     pub page_table: Vec<Arc<ColumnInfo>>,
     pub schema: Arc<Schema>,
+    pub top_level_columns: Vec<u32>,
     pub num_rows: u64,
 }
 
@@ -623,8 +624,14 @@ pub async fn encode_batch(
         }
         col_idx_offset += num_columns;
     }
+    let top_level_columns = batch_encoder
+        .field_id_to_column_index
+        .iter()
+        .map(|(_, idx)| *idx as u32)
+        .collect();
     Ok(EncodedBatch {
         data: data_buffer.freeze(),
+        top_level_columns,
         page_table,
         schema,
         num_rows: batch.num_rows() as u64,

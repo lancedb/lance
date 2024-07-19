@@ -543,17 +543,12 @@ impl FileReader {
         &self,
         projection: &ReaderProjection,
     ) -> Result<Vec<Arc<ColumnInfo>>> {
-        let mut column_infos = Vec::with_capacity(projection.column_indices.len());
-        for (field, starting_column) in projection
-            .schema
-            .fields
+        Ok(self
+            .metadata
+            .column_infos
             .iter()
-            .zip(projection.column_indices.iter())
-        {
-            let mut starting_column = *starting_column as usize;
-            self.collect_columns(field, &mut starting_column, &mut column_infos)?;
-        }
-        Ok(column_infos)
+            .cloned()
+            .collect::<Vec<_>>())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -576,6 +571,7 @@ impl FileReader {
 
         let mut decode_scheduler = DecodeBatchScheduler::try_new(
             &projection.schema,
+            &projection.column_indices,
             &column_infos,
             &vec![],
             num_rows,
@@ -643,6 +639,7 @@ impl FileReader {
 
         let mut decode_scheduler = DecodeBatchScheduler::try_new(
             &projection.schema,
+            &projection.column_indices,
             &column_infos,
             &vec![],
             num_rows,
@@ -884,6 +881,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
     where
         Self: Sized,
     {
+        let projection = FileReader::default_projection(schema);
         let footer = FileReader::decode_footer(&bytes)?;
 
         // Next, read the metadata for the columns
@@ -903,6 +901,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
                 .map(|col| col.page_infos.iter().map(|page| page.num_rows).sum::<u64>())
                 .unwrap_or(0),
             page_table,
+            top_level_columns: projection.column_indices,
             schema: Arc::new(schema.clone()),
         })
     }
@@ -928,6 +927,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
         let schema_bytes = bytes.slice(schema_start..(schema_start + schema_size));
         let (_, schema) = FileReader::decode_schema(schema_bytes)?;
+        let projection = FileReader::default_projection(&schema);
 
         // Next, read the metadata for the columns
         // This is both the column metadata and the CMO table
@@ -946,6 +946,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
                 .map(|col| col.page_infos.iter().map(|page| page.num_rows).sum::<u64>())
                 .unwrap_or(0),
             page_table,
+            top_level_columns: projection.column_indices,
             schema: Arc::new(schema.clone()),
         })
     }
