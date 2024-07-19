@@ -83,8 +83,13 @@ impl PageScheduler for PackedStructPageScheduler {
         tokio::spawn(async move {
             let bytes = bytes.await?;
 
+            let mut combined_bytes = BytesMut::default();
+            for byte_slice in bytes {
+                combined_bytes.extend_from_slice(&byte_slice);
+            }
+
             Ok(Box::new(PackedStructPageDecoder {
-                data: bytes,
+                data: combined_bytes.freeze(),
                 fields: copy_struct_fields,
                 total_bytes_per_row: total_bytes_per_row as usize,
             }) as Box<dyn PrimitivePageDecoder>)
@@ -95,7 +100,7 @@ impl PageScheduler for PackedStructPageScheduler {
 }
 
 struct PackedStructPageDecoder {
-    data: Vec<Bytes>,
+    data: Bytes,
     fields: Fields,
     total_bytes_per_row: usize,
 }
@@ -124,13 +129,9 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
         let bytes_to_skip = (rows_to_skip as usize) * self.total_bytes_per_row;
         let bytes_to_take = (num_rows as usize) * self.total_bytes_per_row;
 
-        let mut bytes = BytesMut::default();
-        for byte_slice in &self.data {
-            bytes.extend_from_slice(byte_slice);
-        }
-
-        let bytes = Bytes::from(bytes);
-        let bytes = bytes.slice(bytes_to_skip..(bytes_to_skip + bytes_to_take));
+        let bytes = self
+            .data
+            .slice(bytes_to_skip..(bytes_to_skip + bytes_to_take));
 
         let mut struct_bytes = Vec::new();
 
