@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use super::super::utils::make_rowid_capture_stream;
-use super::{write_fragments_internal, WriteParams};
+use super::write_fragments_internal;
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
@@ -52,8 +52,6 @@ pub struct UpdateBuilder {
     condition: Option<Expr>,
     /// The updates to apply to matching rows.
     updates: HashMap<String, Expr>,
-
-    write_params: Option<WriteParams>
 }
 
 impl UpdateBuilder {
@@ -62,7 +60,6 @@ impl UpdateBuilder {
             dataset,
             condition: None,
             updates: HashMap::new(),
-            write_params: None,
         }
     }
 
@@ -158,10 +155,8 @@ impl UpdateBuilder {
         Ok(self)
     }
 
-    pub fn with_write_params(mut self, params: WriteParams) -> Self {
-        self.write_params = Some(params);
-        self
-    }
+    // TODO: set write params
+    // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
     pub fn build(self) -> Result<UpdateJob> {
         let mut updates = HashMap::new();
@@ -183,7 +178,6 @@ impl UpdateBuilder {
             dataset: self.dataset,
             condition: self.condition,
             updates,
-            write_params: self.write_params,
         })
     }
 }
@@ -195,7 +189,6 @@ pub struct UpdateJob {
     dataset: Arc<Dataset>,
     condition: Option<Expr>,
     updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
-    write_params: Option<WriteParams>,
 }
 
 impl UpdateJob {
@@ -238,18 +231,13 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let write_params = match self.write_params.as_ref() {
-            Some(write_params) => write_params.clone(),
-            None => Default::default(),
-        };
-
         let new_fragments = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema(),
             Box::pin(stream),
-            write_params,
+            Default::default(),
         )
         .await?;
 
@@ -339,17 +327,10 @@ impl UpdateJob {
         };
         let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
 
-        let mut commit_handler = self.dataset.commit_handler.clone();
-        if let Some(write_params) = self.write_params.as_ref() {
-            if let Some(wrapper) = &write_params.commit_handler_wrapper {
-                commit_handler = wrapper.wrap(commit_handler);
-            }
-        }
-
         let manifest = commit_transaction(
             self.dataset.as_ref(),
             self.dataset.object_store(),
-            commit_handler.as_ref(),
+            self.dataset.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
