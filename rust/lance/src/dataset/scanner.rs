@@ -1088,7 +1088,7 @@ impl Scanner {
                 .fields
                 .iter()
                 .filter_map(|f| {
-                    if f.data_type() == DataType::LargeUtf8 {
+                    if f.data_type() == DataType::Utf8 || f.data_type() == DataType::LargeUtf8 {
                         index_info.get_index(&f.name).map(|_| f.name.clone())
                     } else {
                         None
@@ -1104,10 +1104,11 @@ impl Scanner {
                     ),
                     location!(),
                 ))?;
-                if *data_type != DataType::LargeUtf8 {
+                let data_type = data_type.to_owned();
+                if data_type != DataType::Utf8 && data_type != DataType::LargeUtf8 {
                     return Err(Error::io(
                         format!(
-                            "Column {} data type is {} but must be LargeUtf8 for full text search",
+                            "Column {} data type is {} but must be Utf8 or LargeUtf8 for full text search",
                             column, data_type,
                         ),
                         location!(),
