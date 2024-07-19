@@ -123,6 +123,10 @@ impl RecordBatchStream for ShareableRecordBatchStreamAdapter {
 }
 
 impl ExecutionPlan for ReplayExec {
+    fn name(&self) -> &str {
+        "ReplayExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -131,8 +135,8 @@ impl ExecutionPlan for ReplayExec {
         self.input.schema()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(

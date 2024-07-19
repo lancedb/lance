@@ -470,7 +470,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap());
         let mut partition_storage_metadata = Vec::with_capacity(partition_sizes.len());
         let mut partition_index_metadata = Vec::with_capacity(partition_sizes.len());
-        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), 64);
+        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()));
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
             log::info!("merging partition {}/{}", part_id, ivf.num_partitions());
             if storage_size == 0 {

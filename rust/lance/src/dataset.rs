@@ -242,39 +242,6 @@ impl Dataset {
         Ok((object_store, base_path, commit_handler))
     }
 
-    /// Open a dataset with read params.
-    #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
-    #[instrument(skip(params))]
-    pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_read_params(params.clone())
-            .load()
-            .await
-    }
-
-    /// Check out a version of the dataset.
-    #[deprecated(note = "Please use `DatasetBuilder` instead.")]
-    pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_version(version)
-            .load()
-            .await
-    }
-
-    /// Check out a version of the dataset with read params.
-    #[deprecated(note = "Please use `DatasetBuilder` instead.")]
-    pub async fn checkout_with_params(
-        uri: &str,
-        version: u64,
-        params: &ReadParams,
-    ) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_version(version)
-            .with_read_params(params.clone())
-            .load()
-            .await
-    }
-
     /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
@@ -1299,7 +1266,7 @@ pub(crate) async fn write_manifest_file(
             manifest,
             indices,
             base_path,
-            &object_store.inner,
+            object_store,
             write_manifest_file_to_path,
         )
         .await?;
@@ -1308,7 +1275,7 @@ pub(crate) async fn write_manifest_file(
 }
 
 fn write_manifest_file_to_path<'a>(
-    object_store: &'a dyn object_store::ObjectStore,
+    object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
@@ -1662,7 +1629,10 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
-            let reader = fragment.open(dataset.schema(), false, false).await.unwrap();
+            let reader = fragment
+                .open(dataset.schema(), false, false, None)
+                .await
+                .unwrap();
             // No group / batch concept in v2
             if use_legacy_format {
                 assert_eq!(reader.legacy_num_batches(), 10);

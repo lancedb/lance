@@ -7,8 +7,6 @@ use std::{
 };
 
 use arrow_schema::DataType;
-use futures::future::BoxFuture;
-use futures::FutureExt;
 use lance_core::{
     datatypes::{Field, Schema},
     Result,
@@ -95,7 +93,7 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
         chain: DecoderMiddlewareChainCursor<'a>,
     ) -> Result<(
         DecoderMiddlewareChainCursor<'a>,
-        BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
+        Result<Arc<dyn FieldScheduler>>,
     )> {
         let is_root = self.initialize();
 
@@ -119,39 +117,36 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
             None
         };
         let schema = self.schema.clone();
-        let io = chain.io().clone();
+        let _io = chain.io().clone();
 
-        let scheduler_fut = async move {
-            let next = next.await?;
-            if is_root {
-                let state = state.unwrap();
-                let rows_per_map = state.rows_per_map;
-                let zone_map_buffers = state.zone_map_buffers;
-                let num_rows = next.num_rows();
-                if rows_per_map.is_none() {
-                    // No columns had any pushdown info
-                    Ok(next)
-                } else {
-                    let mut scheduler = ZoneMapsFieldScheduler::new(
-                        next,
-                        schema,
-                        zone_map_buffers,
-                        rows_per_map.unwrap(),
-                        num_rows,
-                    );
-                    // Load all the zone maps from disk
-                    // TODO: it would be slightly more efficient to do this
-                    // later when we know what columns are actually used
-                    // for filtering.
-                    scheduler.initialize(io.as_ref()).await?;
-                    Ok(Arc::new(scheduler) as Arc<dyn FieldScheduler>)
-                }
+        let next = next?;
+        if is_root {
+            let state = state.unwrap();
+            let rows_per_map = state.rows_per_map;
+            let zone_map_buffers = state.zone_map_buffers;
+            let num_rows = next.num_rows();
+            if rows_per_map.is_none() {
+                // No columns had any pushdown info
+                Ok((chain, Ok(next)))
             } else {
-                Ok(next)
+                let mut _scheduler = ZoneMapsFieldScheduler::new(
+                    next,
+                    schema,
+                    zone_map_buffers,
+                    rows_per_map.unwrap(),
+                    num_rows,
+                );
+                // Load all the zone maps from disk
+                // TODO: it would be slightly more efficient to do this
+                // later when we know what columns are actually used
+                // for filtering.
+                // scheduler.initialize(io.as_ref()).await?;
+                // Ok(Arc::new(scheduler) as Arc<dyn FieldScheduler>)
+                todo!()
             }
+        } else {
+            Ok((chain, Ok(next)))
         }
-        .boxed();
-        Ok((chain, scheduler_fut))
     }
 }
 

@@ -95,7 +95,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             FileWriterOptions::default(),
         )?;
 
-        progress.begin(&fragment, writer.multipart_id()).await?;
+        progress.begin(&fragment).await?;
 
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
 
@@ -166,7 +166,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         )
         .await?;
 
-        progress.begin(&fragment, writer.multipart_id()).await?;
+        progress.begin(&fragment).await?;
 
         let mut buffered_reader = chunk_stream(stream, params.max_rows_per_group);
         while let Some(batched_chunk) = buffered_reader.next().await {

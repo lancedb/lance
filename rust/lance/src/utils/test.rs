@@ -15,12 +15,11 @@ use lance_io::object_store::WrappingObjectStore;
 use lance_table::format::Fragment;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore, PutOptions, PutResult,
-    Result as OSResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result as OSResult,
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
-use tokio::io::AsyncWrite;
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
@@ -304,28 +303,25 @@ impl IoTrackingStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for IoTrackingStore {
-    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
+    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         self.target.put(location, bytes).await
     }
 
     async fn put_opts(
         &self,
         location: &Path,
-        bytes: Bytes,
+        bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         self.target.put_opts(location, bytes, opts).await
     }
 
-    async fn put_multipart(
+    async fn put_multipart_opts(
         &self,
         location: &Path,
-    ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
-        self.target.put_multipart(location).await
-    }
-
-    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
-        self.target.abort_multipart(location, multipart_id).await
+        opts: PutMultipartOpts,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {

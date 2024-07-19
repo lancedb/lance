@@ -110,7 +110,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         uuid: String,
         session: Weak<Session>,
     ) -> Result<Self> {
-        let scheduler = ScanScheduler::new(object_store, 16);
+        let scheduler = ScanScheduler::new(object_store);
 
         let index_reader = FileReader::try_open(
             scheduler

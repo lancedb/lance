@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
+use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -231,22 +232,30 @@ fn get_compression_scheme() -> CompressionScheme {
 }
 
 impl CoreArrayEncodingStrategy {
+    fn can_use_fsst(data_type: &DataType, data_size: u64) -> bool {
+        std::env::var("LANCE_USE_FSST").is_ok()
+            && matches!(data_type, DataType::Utf8 | DataType::Binary)
+            && data_size > 4 * 1024 * 1024
+    }
+
     fn array_encoder_from_type(
         data_type: &DataType,
+        data_size: u64,
         use_dict_encoding: bool,
     ) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
-                    Self::array_encoder_from_type(inner.data_type(), use_dict_encoding)?,
+                    Self::array_encoder_from_type(inner.data_type(), data_size, use_dict_encoding)?,
                     *dimension as u32,
                 )))))
             }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
                     let dict_indices_encoder =
-                        Self::array_encoder_from_type(&DataType::UInt8, false)?;
-                    let dict_items_encoder = Self::array_encoder_from_type(&DataType::Utf8, false)?;
+                        Self::array_encoder_from_type(&DataType::UInt8, data_size, false)?;
+                    let dict_items_encoder =
+                        Self::array_encoder_from_type(&DataType::Utf8, data_size, false)?;
 
                     Ok(Box::new(DictionaryEncoder::new(
                         dict_indices_encoder,
@@ -254,13 +263,17 @@ impl CoreArrayEncodingStrategy {
                     )))
                 } else {
                     let bin_indices_encoder =
-                        Self::array_encoder_from_type(&DataType::UInt64, false)?;
-                    let bin_bytes_encoder = Self::array_encoder_from_type(&DataType::UInt8, false)?;
+                        Self::array_encoder_from_type(&DataType::UInt64, data_size, false)?;
+                    let bin_bytes_encoder =
+                        Self::array_encoder_from_type(&DataType::UInt8, data_size, false)?;
 
-                    Ok(Box::new(BinaryEncoder::new(
-                        bin_indices_encoder,
-                        bin_bytes_encoder,
-                    )))
+                    let bin_encoder =
+                        Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
+                    if Self::can_use_fsst(data_type, data_size) {
+                        Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+                    } else {
+                        Ok(bin_encoder)
+                    }
                 }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
@@ -310,10 +323,14 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
 
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     fn create_array_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn ArrayEncoder>> {
+        let data_size = arrays
+            .iter()
+            .map(|arr| arr.get_buffer_memory_size() as u64)
+            .sum::<u64>();
         let data_type = arrays[0].data_type();
         let use_dict_encoding = data_type == &DataType::Utf8
             && check_dict_encoding(arrays, get_dict_encoding_threshold());
-        Self::array_encoder_from_type(data_type, use_dict_encoding)
+        Self::array_encoder_from_type(data_type, data_size, use_dict_encoding)
     }
 }
 

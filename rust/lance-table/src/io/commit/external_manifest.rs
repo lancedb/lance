@@ -233,7 +233,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn object_store::ObjectStore,
+        object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         // path we get here is the path to the manifest we want to write
@@ -253,7 +253,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             .map_err(|_| CommitError::CommitConflict {})?;
 
         // step 4: copy the manifest to the final location
-        object_store.copy(
+        object_store.inner.copy(
             &staging_path,
             &path,
         ).await.map_err(|e| CommitError::OtherError(
@@ -264,7 +264,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         ))?;
 
         // update the _latest.manifest pointer
-        write_latest_manifest(&path, base_path, object_store).await?;
+        write_latest_manifest(&path, base_path, &object_store.inner).await?;
 
         // step 5: flip the external store to point to the final location
         self.external_manifest_store

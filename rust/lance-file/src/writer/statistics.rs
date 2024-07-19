@@ -1564,7 +1564,7 @@ mod tests {
                 },
                 TestCase {
                     source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
-                        min_binary_value.clone().as_ref(),
+                        min_binary_value.as_slice(),
                     ]))],
                     stats: StatisticsRow {
                         null_count: 0,
@@ -1579,12 +1579,9 @@ mod tests {
                     },
                 },
                 TestCase {
-                    source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![vec![
-                        0xFFu8;
-                        BINARY_PREFIX_LENGTH
-                            + 7
-                    ]
-                    .as_ref()]))],
+                    source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
+                        &[0xFFu8; BINARY_PREFIX_LENGTH + 7],
+                    ]))],
                     stats: StatisticsRow {
                         null_count: 0,
                         min_value: ScalarValue::FixedSizeBinary(
@@ -2033,7 +2030,7 @@ mod tests {
             let timeunits = [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond];
 
             let timezone = timezones[timezone_index].clone();
-            let timeunit = timeunits[timeunit_index].clone();
+            let timeunit = timeunits[timeunit_index];
             let value = match timeunit {
                 TimeUnit::Second => ScalarValue::TimestampSecond(value, timezone),
                 TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(value, timezone),

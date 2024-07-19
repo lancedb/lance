@@ -10,11 +10,12 @@ use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_array::{ListArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
+use datafusion::functions_array::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
 
 use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{Expr, ScalarFunctionDefinition};
+use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::Result;
@@ -293,7 +294,7 @@ impl AnyQuery for LabelListQuery {
                 .unwrap();
                 let labels_arr = Arc::new(labels_list);
                 Expr::ScalarFunction(ScalarFunction {
-                    func_def: ScalarFunctionDefinition::Name("array_contains_all".into()),
+                    func: Arc::new(array_has::ArrayHasAll::new().into()),
                     args: vec![
                         Expr::Column(Column::new_unqualified(col)),
                         Expr::Literal(ScalarValue::List(labels_arr)),
@@ -313,7 +314,7 @@ impl AnyQuery for LabelListQuery {
                 .unwrap();
                 let labels_arr = Arc::new(labels_list);
                 Expr::ScalarFunction(ScalarFunction {
-                    func_def: ScalarFunctionDefinition::Name("array_contains_any".into()),
+                    func: Arc::new(array_has::ArrayHasAny::new().into()),
                     args: vec![
                         Expr::Column(Column::new_unqualified(col)),
                         Expr::Literal(ScalarValue::List(labels_arr)),

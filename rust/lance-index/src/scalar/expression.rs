@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
     expr::{InList, ScalarFunction},
-    Between, BinaryExpr, Expr, Operator, ScalarFunctionDefinition,
+    Between, BinaryExpr, Expr, Operator, ScalarUDF,
 };
 
 use futures::join;
@@ -75,7 +75,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
         &self,
         column: &str,
         data_type: &DataType,
-        func: &ScalarFunctionDefinition,
+        func: &ScalarUDF,
         args: &[Expr],
     ) -> Option<IndexedExpression>;
 }
@@ -146,7 +146,7 @@ impl ScalarQueryParser for SargableQueryParser {
         &self,
         _: &str,
         _: &DataType,
-        _: &ScalarFunctionDefinition,
+        _: &ScalarUDF,
         _: &[Expr],
     ) -> Option<IndexedExpression> {
         None
@@ -181,7 +181,7 @@ impl ScalarQueryParser for LabelListQueryParser {
         &self,
         column: &str,
         data_type: &DataType,
-        func: &ScalarFunctionDefinition,
+        func: &ScalarUDF,
         args: &[Expr],
     ) -> Option<IndexedExpression> {
         if args.len() != 2 {
@@ -628,7 +628,7 @@ fn visit_scalar_fn(
         return None;
     }
     let (col, data_type, query_parser) = maybe_indexed_column(&scalar_fn.args[0], index_info)?;
-    query_parser.visit_scalar_function(col, data_type, &scalar_fn.func_def, &scalar_fn.args)
+    query_parser.visit_scalar_function(col, data_type, &scalar_fn.func, &scalar_fn.args)
 }
 
 fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
@@ -739,15 +739,15 @@ mod tests {
             todo!()
         }
 
-        fn udfs_names(&self) -> Vec<String> {
+        fn udf_names(&self) -> Vec<String> {
             todo!()
         }
 
-        fn udafs_names(&self) -> Vec<String> {
+        fn udaf_names(&self) -> Vec<String> {
             todo!()
         }
 
-        fn udwfs_names(&self) -> Vec<String> {
+        fn udwf_names(&self) -> Vec<String> {
             todo!()
         }
     }
