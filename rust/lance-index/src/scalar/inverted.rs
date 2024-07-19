@@ -25,7 +25,7 @@ use tracing::instrument;
 use crate::vector::graph::OrderedFloat;
 use crate::Index;
 
-use super::{AnyQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex};
+use super::{AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex};
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -34,8 +34,11 @@ pub const DOCS_FILE: &str = "docs.lance";
 const TOKEN_COL: &str = "_token";
 const TOKEN_ID_COL: &str = "_token_id";
 const FREQUENCY_COL: &str = "_frequency";
-const SCORE_COL: &str = "_score";
 const NUM_TOKEN_COL: &str = "_num_tokens";
+pub const SCORE_COL: &str = "_score";
+lazy_static! {
+    pub static ref SCORE_FIELD: Field = Field::new(SCORE_COL, DataType::Float32, true);
+}
 
 // BM25 parameters
 const K1: f32 = 1.2;
@@ -72,6 +75,23 @@ impl InvertedIndex {
             .iter()
             .filter_map(|text| self.tokens.get(text))
             .collect()
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub fn full_text_search(
+        &self,
+        query: &FullTextSearchQuery,
+    ) -> impl Iterator<Item = (u64, f32)> {
+        let tokens = collect_tokens(&query.query);
+        let token_ids = self
+            .map(&tokens)
+            .into_iter()
+            .sorted_unstable()
+            .dedup()
+            .collect();
+
+        self.bm25_search(token_ids)
+            .take(query.limit.unwrap_or(i64::MAX) as usize)
     }
 
     // search the documents that contain the query
@@ -139,17 +159,7 @@ impl ScalarIndex for InvertedIndex {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
             SargableQuery::FullTextSearch(query) => {
-                let tokens = collect_tokens(&query.query);
-                let token_ids = self
-                    .map(&tokens)
-                    .into_iter()
-                    .sorted_unstable()
-                    .dedup()
-                    .collect();
-
-                self.bm25_search(token_ids)
-                    .map(|(row_id, _)| row_id)
-                    .take(query.limit.unwrap_or(i64::MAX) as usize)
+                self.full_text_search(query).map(|(row_id, _)| row_id)
             }
             query => {
                 return Err(Error::invalid_input(
