@@ -473,22 +473,26 @@ impl<'a> ColumnInfoIter<'a> {
         &self.column_infos[self.column_info_pos]
     }
 
-    pub fn next(&mut self) -> Option<&'a ColumnInfo> {
-        if self.column_info_pos < self.column_infos.len() {
-            let info = &self.column_infos[self.column_info_pos];
-            self.column_info_pos += 1;
-            Some(info)
-        } else {
-            None
-        }
-    }
-
     pub(crate) fn next_top_level(&mut self) {
         self.column_indices_pos += 1;
         if self.column_indices_pos < self.column_indices.len() {
             self.column_info_pos = self.column_indices[self.column_indices_pos] as usize;
         } else {
             self.column_info_pos = self.column_infos.len();
+        }
+    }
+}
+
+impl<'a> Iterator for ColumnInfoIter<'a> {
+    type Item = &'a ColumnInfo;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.column_info_pos < self.column_infos.len() {
+            let info = &self.column_infos[self.column_info_pos];
+            self.column_info_pos += 1;
+            Some(info)
+        } else {
+            None
         }
     }
 }
@@ -658,7 +662,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             let scheduler = Self::create_primitive_scheduler(
                 &data_type,
                 chain.current_path(),
-                &primitive_col,
+                primitive_col,
                 buffers,
             )?;
             return Ok((chain, Ok(scheduler)));
@@ -672,7 +676,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     let scheduler = Self::create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
-                        &primitive_col,
+                        primitive_col,
                         buffers,
                     )?;
                     Ok((chain, Ok(scheduler)))
@@ -682,7 +686,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             }
             DataType::List(items_field) | DataType::LargeList(items_field) => {
                 let offsets_column = column_infos.next().unwrap();
-                Self::ensure_values_encoded(&offsets_column, chain.current_path())?;
+                Self::ensure_values_encoded(offsets_column, chain.current_path())?;
                 let offsets_column_buffers = ColumnBuffers {
                     file_buffers: buffers,
                     positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
@@ -748,18 +752,18 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             DataType::Struct(fields) => {
                 let column_info = column_infos.next().unwrap();
 
-                if Self::check_packed_struct(&column_info) {
+                if Self::check_packed_struct(column_info) {
                     // use packed struct encoding
                     let scheduler = Self::create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
-                        &column_info,
+                        column_info,
                         buffers,
                     )?;
                     Ok((chain, Ok(scheduler)))
                 } else {
                     // use default struct encoding
-                    Self::check_simple_struct(&column_info, chain.current_path()).unwrap();
+                    Self::check_simple_struct(column_info, chain.current_path()).unwrap();
                     let is_root = field.metadata.contains_key("__lance_decoder_root");
                     let mut child_schedulers = Vec::with_capacity(field.children.len());
                     let mut chain = chain;

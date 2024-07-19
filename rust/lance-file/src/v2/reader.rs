@@ -511,21 +511,6 @@ impl FileReader {
         })
     }
 
-    fn collect_columns(
-        &self,
-        field: &Field,
-        column_idx: &mut usize,
-        column_infos: &mut Vec<Arc<ColumnInfo>>,
-    ) -> Result<()> {
-        column_infos.push(self.metadata.column_infos[*column_idx].clone());
-        *column_idx += 1;
-
-        for child in &field.children {
-            self.collect_columns(child, column_idx, column_infos)?;
-        }
-        Ok(())
-    }
-
     // The actual decoder needs all the column infos that make up a type.  In other words, if
     // the first type in the schema is Struct<i32, i32> then the decoder will need 3 column infos.
     //
@@ -541,14 +526,9 @@ impl FileReader {
     // registry will need to figure out.
     fn collect_columns_from_projection(
         &self,
-        projection: &ReaderProjection,
+        _projection: &ReaderProjection,
     ) -> Result<Vec<Arc<ColumnInfo>>> {
-        Ok(self
-            .metadata
-            .column_infos
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>())
+        Ok(self.metadata.column_infos.to_vec())
     }
 
     #[allow(clippy::too_many_arguments)]
