@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 """
-Integration tests with S3 and DynamoDB.
+Integration tests with S3 and DynamoDB. Also used to test storage_options are
+passed correctly.
 
 See DEVELOPMENT.md under heading "Integration Tests" for more information.
 """
