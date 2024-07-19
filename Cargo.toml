@@ -73,9 +73,9 @@ arrow-schema = "52.1"
 arrow-select = "52.1"
 async-recursion = "1.0"
 async-trait = "0.1"
-aws-config = "1.2.0"
+aws-config = { version = "1.2.0", features = ["behavior-version-latest"] }
 aws-credential-types = "1.2.0"
-aws-sdk-dynamodb = "1.38.0"
+aws-sdk-dynamodb = { version = "1.38.0", features = ["behavior-version-latest"] }
 half = { "version" = "2.4.1", default-features = false, features = [
     "num-traits",
     "std",
