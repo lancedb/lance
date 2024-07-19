@@ -77,6 +77,10 @@ impl FtsExec {
 }
 
 impl ExecutionPlan for FtsExec {
+    fn name(&self) -> &str {
+        "FtsExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -85,7 +89,7 @@ impl ExecutionPlan for FtsExec {
         FTS_SCHEMA.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
