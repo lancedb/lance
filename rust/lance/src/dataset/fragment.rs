@@ -1826,7 +1826,7 @@ mod tests {
         // Creates 400 rows in 10 fragments
         let mut dataset = create_dataset(test_uri, true).await;
         // Delete last 20 rows in first fragment
-        dataset.delete("i >= 20", None).await.unwrap();
+        dataset.delete("i >= 20").await.unwrap();
         // Last fragment has 20 rows but 40 addressible rows
         let fragment = &dataset.get_fragments()[0];
         assert_eq!(fragment.metadata.num_rows().unwrap(), 20);
@@ -1856,7 +1856,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut dataset = create_dataset(test_uri, true).await;
-        dataset.delete("i >= 0 and i < 15", None).await.unwrap();
+        dataset.delete("i >= 0 and i < 15").await.unwrap();
 
         let fragment = &dataset.get_fragments()[0];
         let mut reader = fragment.open(dataset.schema(), true, false).await.unwrap();
@@ -1912,7 +1912,7 @@ mod tests {
             &Int32Array::from(vec![121, 122, 124, 125, 125, 128])
         );
 
-        dataset.delete("i in (122, 123, 125)", None).await.unwrap();
+        dataset.delete("i in (122, 123, 125)").await.unwrap();
         dataset.validate().await.unwrap();
 
         // Deleted rows are skipped
@@ -1960,7 +1960,7 @@ mod tests {
             &Int32Array::from(vec![121, 122, 124, 125, 125, 128])
         );
 
-        dataset.delete("i in (122, 124)", None).await.unwrap();
+        dataset.delete("i in (122, 124)").await.unwrap();
         dataset.validate().await.unwrap();
 
         // Cannot get rows 2 and 4 anymore
@@ -2090,7 +2090,7 @@ mod tests {
             assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 
             if with_delete {
-                dataset.delete("i >= 15 and i < 20", None).await.unwrap();
+                dataset.delete("i >= 15 and i < 20").await.unwrap();
                 dataset.validate().await.unwrap();
                 assert_eq!(dataset.count_rows(None).await.unwrap(), 195);
             }
@@ -2178,7 +2178,7 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 
         let deleted_range = 15..20;
-        dataset.delete("i >= 15 and i < 20", None).await.unwrap();
+        dataset.delete("i >= 15 and i < 20").await.unwrap();
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 195);
 

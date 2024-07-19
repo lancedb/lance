@@ -540,7 +540,7 @@ mod test {
         );
 
         // Delete some rows from a fragment
-        dataset.delete("i in (199, 100)", None).await.unwrap();
+        dataset.delete("i in (199, 100)").await.unwrap();
         dataset.validate().await.unwrap();
         let values = dataset.take_rows(indices, &projection).await.unwrap();
         assert_eq!(
@@ -620,7 +620,7 @@ mod test {
             .await
             .unwrap();
 
-        dataset.delete("i in (1, 2, 3, 7)", None).await.unwrap();
+        dataset.delete("i in (1, 2, 3, 7)").await.unwrap();
 
         let indices = &[0, 4, 6, 5];
         let result = dataset.take_rows(indices, dataset.schema()).await.unwrap();

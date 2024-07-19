@@ -358,7 +358,7 @@ mod test {
             .unwrap();
         assert_eq!(dataset.get_fragments().len(), 3);
 
-        dataset.delete("id = 3 or id = 4", None).await.unwrap();
+        dataset.delete("id = 3 or id = 4").await.unwrap();
 
         let mut scan = dataset.scan();
         scan.with_row_id().with_row_address();
