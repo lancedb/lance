@@ -930,7 +930,7 @@ impl Scanner {
         };
 
         if let Some(query) = &self.full_text_query {
-            self.fts(&mut filter_plan, query).await?;
+            self.fts(&filter_plan, query).await?;
         }
 
         // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
@@ -948,7 +948,7 @@ impl Scanner {
             }
             (None, Some(query)) => {
                 // The source is a full text search
-                self.fts(&mut filter_plan, query).await?
+                self.fts(&filter_plan, query).await?
             }
             (None, None) => {
                 // Avoid pushdown scan node if using v2 files
