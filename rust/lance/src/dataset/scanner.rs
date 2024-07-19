@@ -1102,13 +1102,6 @@ impl Scanner {
         filter_plan: &FilterPlan,
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.prefilter {
-            return Err(Error::io(
-                "Full text search does not support prefiltering for now",
-                location!(),
-            ));
-        }
-
         let columns = if query.columns.is_empty() {
             let index_info = self.dataset.scalar_index_info().await?;
             self.dataset

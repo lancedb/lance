@@ -111,9 +111,7 @@ fn benchmark(file_path: &str) {
 
     // Print tsv headers
     println!("for file: {}", file_path);
-    println!(
-        "Compression ratio\tCompression speed\tDecompression speed"
-    );
+    println!("Compression ratio\tCompression speed\tDecompression speed");
     println!(
         "{:.3}\t\t\t\t{:.2}MB/s\t\t\t{:.2}MB/s",
         compression_ratio, com_speed, d_speed
