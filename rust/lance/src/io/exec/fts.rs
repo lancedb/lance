@@ -16,12 +16,16 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::stream::{self};
 use futures::StreamExt;
 use lance_core::ROW_ID_FIELD;
+use lance_index::prefilter::{FilterLoader, PreFilter};
 use lance_index::scalar::inverted::{InvertedIndex, SCORE_FIELD};
 use lance_index::scalar::FullTextSearchQuery;
+use lance_table::format::Index;
 use tracing::instrument;
 
+use crate::index::prefilter::DatasetPreFilter;
 use crate::{index::DatasetIndexInternalExt, Dataset};
 
+use super::utils::{FilteredRowIdsToPrefilter, SelectionVectorToPrefilter};
 use super::PreFilterSource;
 
 lazy_static::lazy_static! {
@@ -36,10 +40,9 @@ lazy_static::lazy_static! {
 #[derive(Debug)]
 pub struct FtsExec {
     dataset: Arc<Dataset>,
-    index_uuids: Vec<String>,
+    indices: Vec<Index>,
     query: FullTextSearchQuery,
     /// Prefiltering input
-    #[allow(dead_code)]
     prefilter_source: PreFilterSource,
     properties: PlanProperties,
 }
@@ -57,7 +60,7 @@ impl DisplayAs for FtsExec {
 impl FtsExec {
     pub fn new(
         dataset: Arc<Dataset>,
-        index_uuids: Vec<String>,
+        indices: Vec<Index>,
         query: FullTextSearchQuery,
         prefilter_source: PreFilterSource,
     ) -> Self {
@@ -68,7 +71,7 @@ impl FtsExec {
         );
         Self {
             dataset,
-            index_uuids,
+            indices,
             query,
             prefilter_source,
             properties,
@@ -90,7 +93,11 @@ impl ExecutionPlan for FtsExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        match &self.prefilter_source {
+            PreFilterSource::None => vec![],
+            PreFilterSource::FilteredRowIds(src) => vec![&src],
+            PreFilterSource::ScalarIndexQuery(src) => vec![&src],
+        }
     }
 
     fn with_new_children(
@@ -103,19 +110,42 @@ impl ExecutionPlan for FtsExec {
     #[instrument(name = "fts_exec", level = "debug", skip_all)]
     fn execute(
         &self,
-        _partition: usize,
-        _context: Arc<datafusion::execution::context::TaskContext>,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
         let ds = self.dataset.clone();
+        let prefilter_source = self.prefilter_source.clone();
 
-        let stream = stream::iter(self.index_uuids.clone())
-            .map(move |uuid| {
+        let stream = stream::iter(self.indices.clone())
+            .map(move |index_meta| {
+                let uuid = index_meta.uuid.to_string();
                 let query = query.clone();
                 let ds = ds.clone();
+                let context = context.clone();
+                let prefilter_source = prefilter_source.clone();
 
                 async move {
-                    let index = ds.open_scalar_index(&query.columns[0], &uuid).await?;
+                    let prefilter_loader = match &prefilter_source {
+                        PreFilterSource::FilteredRowIds(src_node) => {
+                            let stream = src_node.execute(partition, context.clone())?;
+                            Some(Box::new(FilteredRowIdsToPrefilter(stream))
+                                as Box<dyn FilterLoader>)
+                        }
+                        PreFilterSource::ScalarIndexQuery(src_node) => {
+                            let stream = src_node.execute(partition, context.clone())?;
+                            Some(Box::new(SelectionVectorToPrefilter(stream))
+                                as Box<dyn FilterLoader>)
+                        }
+                        PreFilterSource::None => None,
+                    };
+                    let pre_filter = Arc::new(DatasetPreFilter::new(
+                        ds.clone(),
+                        &[index_meta],
+                        prefilter_loader,
+                    ));
+
+                    let index = ds.open_generic_index(&query.columns[0], &uuid).await?;
 
                     let index =
                         index
@@ -128,7 +158,8 @@ impl ExecutionPlan for FtsExec {
                                 ))
                             })?;
 
-                    let results = index.full_text_search(&query);
+                    pre_filter.wait_for_ready().await?;
+                    let results = index.full_text_search(&query, pre_filter);
 
                     let mut row_ids = Vec::new();
                     let mut scores = Vec::new();
@@ -147,7 +178,7 @@ impl ExecutionPlan for FtsExec {
                     Ok::<_, DataFusionError>(batch)
                 }
             })
-            .buffered(self.index_uuids.len());
+            .buffered(self.indices.len());
         let schema = self.schema();
         Ok(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))

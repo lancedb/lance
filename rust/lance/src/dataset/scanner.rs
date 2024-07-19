@@ -1151,7 +1151,6 @@ impl Scanner {
             .load_indices_by_name(&index.name)
             .await?
             .into_iter()
-            .map(|index| index.uuid.to_string())
             .collect();
 
         let query = query.clone().columns(Some(columns)).limit(self.limit);

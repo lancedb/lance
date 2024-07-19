@@ -22,6 +22,7 @@ use snafu::{location, Location};
 use tantivy::tokenizer::Language;
 use tracing::instrument;
 
+use crate::prefilter::{NoFilter, PreFilter};
 use crate::vector::graph::OrderedFloat;
 use crate::Index;
 
@@ -81,6 +82,7 @@ impl InvertedIndex {
     pub fn full_text_search(
         &self,
         query: &FullTextSearchQuery,
+        prefilter: Arc<dyn PreFilter>,
     ) -> impl Iterator<Item = (u64, f32)> {
         let tokens = collect_tokens(&query.query);
         let token_ids = self
@@ -89,8 +91,7 @@ impl InvertedIndex {
             .sorted_unstable()
             .dedup()
             .collect();
-
-        self.bm25_search(token_ids)
+        self.bm25_search(token_ids, prefilter)
             .take(query.limit.unwrap_or(i64::MAX) as usize)
     }
 
@@ -98,19 +99,40 @@ impl InvertedIndex {
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
-    fn bm25_search(&self, token_ids: Vec<u32>) -> impl Iterator<Item = (u64, f32)> {
+    fn bm25_search(
+        &self,
+        token_ids: Vec<u32>,
+        prefilter: Arc<dyn PreFilter>,
+    ) -> impl Iterator<Item = (u64, f32)> {
         let mut bm25_scores = HashMap::new();
-        token_ids.into_iter().for_each(|token| {
-            let list = self.invert_list.retrieve(token);
-            for i in 0..list.len() {
-                let row_id = list.row_ids[i];
-                let score = list.scores[i];
-                bm25_scores
-                    .entry(row_id)
-                    .and_modify(|s| *s += score)
-                    .or_insert(score);
+
+        if prefilter.is_empty() {
+            for token in &token_ids {
+                let list = self.invert_list.retrieve(*token);
+                for i in 0..list.len() {
+                    let row_id = list.row_ids[i];
+                    let score = list.scores[i];
+                    bm25_scores
+                        .entry(row_id)
+                        .and_modify(|s| *s += score)
+                        .or_insert(score);
+                }
             }
-        });
+        } else {
+            for token in &token_ids {
+                let list = self.invert_list.retrieve(*token);
+                let indices = prefilter.filter_row_ids(Box::new(list.row_ids.iter()));
+                for index in indices {
+                    let index = index as usize;
+                    let row_id = list.row_ids[index];
+                    let score = list.scores[index];
+                    bm25_scores
+                        .entry(row_id)
+                        .and_modify(|s| *s += score)
+                        .or_insert(score);
+                }
+            }
+        }
 
         bm25_scores
             .into_iter()
@@ -158,9 +180,9 @@ impl ScalarIndex for InvertedIndex {
     async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
-            SargableQuery::FullTextSearch(query) => {
-                self.full_text_search(query).map(|(row_id, _)| row_id)
-            }
+            SargableQuery::FullTextSearch(query) => self
+                .full_text_search(query, Arc::new(NoFilter))
+                .map(|(row_id, _)| row_id),
             query => {
                 return Err(Error::invalid_input(
                     format!("unsupported query {:?} for inverted index", query),
