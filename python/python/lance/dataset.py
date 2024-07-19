@@ -1210,7 +1210,7 @@ class LanceDataset(pa.dataset.Dataset):
         with a ``LABEL_LIST`` index.  This index can only speedup queries with
         ``array_has_any`` or ``array_has_all`` filters.
 
-        The ``INVERTED`` index type is used to index document columns.  This index
+        The ``INVERTED`` index type is used to index document columns. This index
         can conduct full-text searches. For example, a column that contains any word
         of query string "hello world". The results will be ranked by BM25.
 
@@ -1286,9 +1286,11 @@ class LanceDataset(pa.dataset.Dataset):
             if not pa.types.is_list(field.type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
         elif index_type == "INVERTED":
-            if not pa.types.is_large_string(field.type):
+            if not pa.types.is_string(field.type) and not pa.types.is_large_string(
+                field.type
+            ):
                 raise TypeError(
-                    f"INVERTED index column {column} must be a large string"
+                    f"INVERTED index column {column} must be string or large string"
                 )
 
         if pa.types.is_duration(field.type):

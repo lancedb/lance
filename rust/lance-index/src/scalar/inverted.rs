@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow::array::{AsArray, Float32Builder, ListBuilder, UInt64Builder};
 use arrow::datatypes::{self, Float32Type, UInt64Type};
-use arrow_array::{ArrayRef, LargeStringArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{ArrayRef, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
@@ -230,28 +230,18 @@ impl ScalarIndex for InvertedIndex {
         let mut invert_list = self.invert_list.clone();
         let mut docs = self.docs.clone();
 
-        let mut tokenizer = TOKENIZER.clone();
-        let mut stream = new_data;
-        while let Some(batch) = stream.try_next().await? {
-            let doc_col = batch.column(0).as_string::<i64>();
-            let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-
-            for (doc, row_id) in doc_col.iter().zip(row_id_col.iter()) {
-                let doc = doc.unwrap();
-                let row_id = row_id.unwrap();
-                let mut token_stream = tokenizer.token_stream(doc);
-                let mut row_token_cnt = HashMap::new();
-                let mut token_cnt = 0;
-                while let Some(token) = token_stream.next() {
-                    let token_id = token_set.add(token.text.to_owned());
-                    row_token_cnt
-                        .entry(token_id)
-                        .and_modify(|cnt| *cnt += 1)
-                        .or_insert(1);
-                    token_cnt += 1;
-                }
-                invert_list.add(row_token_cnt, row_id);
-                docs.add(row_id, token_cnt);
+        match new_data.schema().field(0).data_type() {
+            DataType::Utf8 => {
+                update_index::<i32>(new_data, &mut token_set, &mut invert_list, &mut docs).await?;
+            }
+            DataType::LargeUtf8 => {
+                update_index::<i64>(new_data, &mut token_set, &mut invert_list, &mut docs).await?;
+            }
+            data_type => {
+                return Err(Error::invalid_input(
+                    format!("unsupported data type {} for inverted index", data_type),
+                    location!(),
+                ))
             }
         }
 
@@ -285,6 +275,40 @@ impl ScalarIndex for InvertedIndex {
     }
 }
 
+async fn update_index<Offset: OffsetSizeTrait>(
+    new_data: SendableRecordBatchStream,
+    token_set: &mut TokenSet,
+    invert_list: &mut InvertedList,
+    docs: &mut DocSet,
+) -> Result<()> {
+    let mut tokenizer = TOKENIZER.clone();
+    let mut stream = new_data;
+    while let Some(batch) = stream.try_next().await? {
+        let doc_col = batch.column(0).as_string::<Offset>();
+        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+
+        for (doc, row_id) in doc_col.iter().zip(row_id_col.iter()) {
+            let doc = doc.unwrap();
+            let row_id = row_id.unwrap();
+            let mut token_stream = tokenizer.token_stream(doc);
+            let mut row_token_cnt = HashMap::new();
+            let mut token_cnt = 0;
+            while let Some(token) = token_stream.next() {
+                let token_id = token_set.add(token.text.to_owned());
+                row_token_cnt
+                    .entry(token_id)
+                    .and_modify(|cnt| *cnt += 1)
+                    .or_insert(1);
+                token_cnt += 1;
+            }
+            invert_list.add(row_token_cnt, row_id);
+            docs.add(row_id, token_cnt);
+        }
+    }
+
+    Ok(())
+}
+
 // TokenSet is a mapping from tokens to token ids
 // it also records the frequency of each token
 #[derive(Debug, Clone, Default, DeepSizeOf)]
@@ -306,12 +330,12 @@ impl TokenSet {
                 token_ids.push(*token_id);
                 frequencies.push(*frequency);
             });
-        let token_col = LargeStringArray::from(tokens);
+        let token_col = StringArray::from(tokens);
         let token_id_col = UInt32Array::from(token_ids);
         let frequency_col = UInt64Array::from(frequencies);
 
         let schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(TOKEN_COL, DataType::LargeUtf8, false),
+            arrow_schema::Field::new(TOKEN_COL, DataType::Utf8, false),
             arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
             arrow_schema::Field::new(FREQUENCY_COL, DataType::UInt64, false),
         ]);
@@ -332,7 +356,7 @@ impl TokenSet {
         let mut next_id = 0;
         for i in 0..reader.num_batches().await {
             let batch = reader.read_record_batch(i).await?;
-            let token_col = batch[TOKEN_COL].as_string::<i64>();
+            let token_col = batch[TOKEN_COL].as_string::<i32>();
             let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
             let frequency_col = batch[FREQUENCY_COL].as_primitive::<datatypes::UInt64Type>();
 
@@ -644,7 +668,7 @@ fn idf(nq: usize, num_docs: usize) -> f32 {
 }
 
 #[instrument(level = "debug", skip(batches))]
-pub fn flat_full_text_search(
+pub fn flat_full_text_search<Offset: OffsetSizeTrait>(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
@@ -653,7 +677,7 @@ pub fn flat_full_text_search(
     let query_tokens = collect_tokens(query).into_iter().collect::<HashSet<_>>();
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
-        let doc_array = batch[doc_col].as_string::<i64>();
+        let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
             let doc_tokens = collect_tokens(doc);
@@ -681,7 +705,7 @@ fn collect_tokens(text: &str) -> Vec<String> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, LargeStringArray, RecordBatch, UInt64Array};
+    use arrow_array::{Array, ArrayRef, GenericStringArray, RecordBatch, UInt64Array};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_io::object_store::ObjectStore;
@@ -690,15 +714,14 @@ mod tests {
     use crate::scalar::lance_format::LanceIndexStore;
     use crate::scalar::{FullTextSearchQuery, ScalarIndex};
 
-    #[tokio::test]
-    async fn test_inverted_index() {
+    async fn test_inverted_index<Offset: arrow::array::OffsetSizeTrait>() {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = LanceIndexStore::new(ObjectStore::local(), index_dir, None);
 
         let invert_index = super::InvertedIndex::default();
         let row_id_col = UInt64Array::from(vec![0, 1, 2, 3]);
-        let doc_col = LargeStringArray::from(vec![
+        let doc_col = GenericStringArray::<Offset>::from(vec![
             "lance database search",
             "lance database",
             "lance search",
@@ -706,7 +729,7 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("doc", arrow_schema::DataType::LargeUtf8, false),
+                arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), false),
                 arrow_schema::Field::new(super::ROW_ID, arrow_schema::DataType::UInt64, false),
             ])
             .into(),
@@ -746,5 +769,15 @@ mod tests {
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(3));
+    }
+
+    #[tokio::test]
+    async fn test_inverted_index_with_string() {
+        test_inverted_index::<i32>().await;
+    }
+
+    #[tokio::test]
+    async fn test_inverted_index_with_large_string() {
+        test_inverted_index::<i64>().await;
     }
 }
