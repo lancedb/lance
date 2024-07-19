@@ -668,7 +668,26 @@ fn idf(nq: usize, num_docs: usize) -> f32 {
 }
 
 #[instrument(level = "debug", skip(batches))]
-pub fn flat_full_text_search<Offset: OffsetSizeTrait>(
+pub fn flat_full_text_search(
+    batches: &[&RecordBatch],
+    doc_col: &str,
+    query: &str,
+) -> Result<Vec<u64>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    match batches[0][doc_col].data_type() {
+        DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query),
+        DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query),
+        data_type => Err(Error::invalid_input(
+            format!("unsupported data type {} for inverted index", data_type),
+            location!(),
+        )),
+    }
+}
+
+fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
