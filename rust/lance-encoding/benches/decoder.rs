@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -185,12 +185,86 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
     });
 }
 
+fn bench_decode_packed_struct(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("decode_primitive");
+
+    let fields = vec![
+        Arc::new(Field::new("int_field", DataType::Int32, false)),
+        Arc::new(Field::new("float_field", DataType::Float32, false)),
+        Arc::new(Field::new(
+            "fsl_field",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 5),
+            false,
+        )),
+    ]
+    .into();
+
+    // generate struct column with 1M rows
+    let data = lance_datagen::gen()
+        .anon_col(lance_datagen::array::rand_type(&DataType::Struct(fields)))
+        .into_batch_rows(lance_datagen::RowCount::from(10000))
+        .unwrap();
+
+    let schema = data.schema();
+    let new_fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if matches!(field.data_type(), &DataType::Struct(_)) {
+                println!("Match");
+                let mut metadata = HashMap::new();
+                metadata.insert("packed".to_string(), "true".to_string());
+                let field =
+                    Field::new(field.name(), field.data_type().clone(), field.is_nullable());
+                Arc::new(field.with_metadata(metadata))
+            } else {
+                field.clone()
+            }
+        })
+        .collect();
+
+    let new_schema = Schema::new(new_fields);
+    let data = RecordBatch::try_new(Arc::new(new_schema.clone()), data.columns().to_vec()).unwrap();
+
+    // println!("schema metadata: {:?}", new_schema.metadata());
+    let lance_schema = Arc::new(lance_core::datatypes::Schema::try_from(&new_schema).unwrap());
+    println!("lance schema metadata: {:?}", lance_schema.fields);
+    let input_bytes = data.get_array_memory_size();
+    group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
+    let encoding_strategy = CoreFieldEncodingStrategy::default();
+    let encoded = rt
+        .block_on(encode_batch(
+            &data,
+            lance_schema,
+            &encoding_strategy,
+            1024 * 1024,
+        ))
+        .unwrap();
+
+    // let func_name = format!("{:?}", data_type).to_lowercase();
+    let func_name = "struct";
+    group.bench_function(func_name, |b| {
+        b.iter(|| {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded,
+                    &FilterExpression::no_filter(),
+                    &DecoderMiddlewareChain::default(),
+                ))
+                .unwrap();
+            assert_eq!(data.num_rows(), batch.num_rows());
+        })
+    });
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
-    targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding);
+    // targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding);
+    targets = bench_decode_packed_struct);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]

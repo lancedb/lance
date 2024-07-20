@@ -127,15 +127,11 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
         // This is used to reconstruct the struct array later
 
         let bytes_to_skip = (rows_to_skip as usize) * self.total_bytes_per_row;
-        let bytes_to_take = (num_rows as usize) * self.total_bytes_per_row;
-
-        let bytes = self
-            .data
-            .slice(bytes_to_skip..(bytes_to_skip + bytes_to_take));
 
         let mut struct_bytes = Vec::new();
 
         let mut start_index = 0;
+
         for field in &self.fields {
             let bytes_per_field = field.data_type().byte_width();
             let mut field_bytes = BytesMut::default();
@@ -143,8 +139,8 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
             let mut byte_index = start_index;
 
             for _ in 0..num_rows {
-                field_bytes
-                    .extend_from_slice(&bytes.slice(byte_index..(byte_index + bytes_per_field)));
+                let start = bytes_to_skip + byte_index;
+                field_bytes.extend_from_slice(&self.data[start..(start + bytes_per_field)]);
                 byte_index += self.total_bytes_per_row;
             }
 
