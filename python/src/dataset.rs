@@ -622,6 +622,7 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>,
     ) -> PyResult<PyObject> {
         let projection = if let Some(columns) = columns {
             self_.ds.schema().project(&columns)
