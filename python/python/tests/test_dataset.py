@@ -257,26 +257,26 @@ def test_tag(tmp_path: Path):
     lance.write_dataset(table, base_dir)
     ds = lance.write_dataset(table, base_dir, mode="append")
 
-    assert len(ds.tags()) == 0
+    assert len(ds.tags.list()) == 0
 
     with pytest.raises(ValueError):
-        ds.create_tag("tag1", 3)
+        ds.tags.create("tag1", 3)
 
     with pytest.raises(ValueError):
-        ds.delete_tag("tag1")
+        ds.tags.delete("tag1")
 
-    ds.create_tag("tag1", 1)
-    assert len(ds.tags()) == 1
+    ds.tags.create("tag1", 1)
+    assert len(ds.tags.list()) == 1
 
     with pytest.raises(ValueError):
-        ds.create_tag("tag1", 1)
+        ds.tags.create("tag1", 1)
 
-    ds.delete_tag("tag1")
+    ds.tags.delete("tag1")
 
-    ds.create_tag("tag1", 1)
-    ds.create_tag("tag2", 1)
+    ds.tags.create("tag1", 1)
+    ds.tags.create("tag2", 1)
 
-    assert len(ds.tags()) == 2
+    assert len(ds.tags.list()) == 2
 
     with pytest.raises(OSError):
         ds.checkout_version("tag3")
@@ -637,19 +637,19 @@ def test_cleanup_error_when_tagged_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
-    dataset.create_tag("old-tag", 1)
-    dataset.create_tag("another-old-tag", 2)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
 
     with pytest.raises(OSError):
         dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
     assert len(dataset.versions()) == 3
 
-    dataset.delete_tag("old-tag")
+    dataset.tags.delete("old-tag")
     with pytest.raises(OSError):
         dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
     assert len(dataset.versions()) == 3
 
-    dataset.delete_tag("another-old-tag")
+    dataset.tags.delete("another-old-tag")
     stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
     assert stats.bytes_removed > 0
     assert stats.old_versions == 2
@@ -665,9 +665,9 @@ def test_cleanup_around_tagged_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
-    dataset.create_tag("old-tag", 1)
-    dataset.create_tag("another-old-tag", 2)
-    dataset.create_tag("tag-latest", 3)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
+    dataset.tags.create("tag-latest", 3)
 
     stats = dataset.cleanup_old_versions(
         older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
@@ -675,14 +675,14 @@ def test_cleanup_around_tagged_old_versions(tmp_path):
     assert stats.bytes_removed == 0
     assert stats.old_versions == 0
 
-    dataset.delete_tag("old-tag")
+    dataset.tags.delete("old-tag")
     stats = dataset.cleanup_old_versions(
         older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
     )
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1
 
-    dataset.delete_tag("another-old-tag")
+    dataset.tags.delete("another-old-tag")
     stats = dataset.cleanup_old_versions(
         older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
     )
