@@ -796,27 +796,183 @@ fn decompress_bulk(
     let symbols = decoder.symbols;
     let lens = decoder.lens;
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
-        let mut prev_esc = false;
-        while in_curr < in_end {
-            if prev_esc {
-                out[*out_curr] = compressed_strs[in_curr];
-                *out_curr += 1;
-                prev_esc = false;
+        while in_curr + 4 <= in_end {
+            let next_block;
+            let mut code;
+            let mut len;
+            unsafe {
+                next_block =
+                    ptr::read_unaligned(compressed_strs.as_ptr().add(in_curr) as *const u32);
+            }
+            let escape_mask = (next_block & 0x80808080u32)
+                & ((((!next_block) & 0x7F7F7F7Fu32) + 0x7F7F7F7Fu32) ^ 0x80808080u32);
+            if escape_mask == 0 {
+                // 0th byte
+                code = compressed_strs[in_curr] as usize;
+                len = lens[code] as usize;
+                unsafe {
+                    let src = symbols[code];
+                    ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                }
+                in_curr += 1;
+                *out_curr += len;
+
+                // 1st byte
+                code = compressed_strs[in_curr] as usize;
+                len = lens[code] as usize;
+                unsafe {
+                    let src = symbols[code];
+                    ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                }
+                in_curr += 1;
+                *out_curr += len;
+
+                // 2nd byte
+                code = compressed_strs[in_curr] as usize;
+                len = lens[code] as usize;
+                unsafe {
+                    let src = symbols[code];
+                    ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                }
+                in_curr += 1;
+                *out_curr += len;
+
+                // 3rd byte
+                code = compressed_strs[in_curr] as usize;
+                len = lens[code] as usize;
+                unsafe {
+                    let src = symbols[code];
+                    ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                }
+                in_curr += 1;
+                *out_curr += len;
             } else {
-                let code = compressed_strs[in_curr];
-                if code == FSST_ESC {
-                    prev_esc = true;
+                let first_escape_pos = escape_mask.trailing_zeros() >> 3;
+                if first_escape_pos == 3 {
+                    // 0th byte
+                    code = compressed_strs[in_curr] as usize;
+                    len = lens[code] as usize;
+                    unsafe {
+                        let src = symbols[code];
+                        ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                    }
+                    in_curr += 1;
+                    *out_curr += len;
+
+                    // 1st byte
+                    code = compressed_strs[in_curr] as usize;
+                    len = lens[code] as usize;
+                    unsafe {
+                        let src = symbols[code];
+                        ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                    }
+                    in_curr += 1;
+                    *out_curr += len;
+
+                    // 2nd byte
+                    code = compressed_strs[in_curr] as usize;
+                    len = lens[code] as usize;
+                    unsafe {
+                        let src = symbols[code];
+                        ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                    }
+                    in_curr += 1;
+                    *out_curr += len;
+
+                    // escape byte
+                    in_curr += 2;
+                    out[*out_curr] = compressed_strs[in_curr - 1];
+                    *out_curr += 1;
+                } else if first_escape_pos == 2 {
+                    // 0th byte
+                    code = compressed_strs[in_curr] as usize;
+                    len = lens[code] as usize;
+                    unsafe {
+                        let src = symbols[code];
+                        ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                    }
+                    in_curr += 1;
+                    *out_curr += len;
+
+                    // 1st byte
+                    code = compressed_strs[in_curr] as usize;
+                    len = lens[code] as usize;
+                    unsafe {
+                        let src = symbols[code];
+                        ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                    }
+                    in_curr += 1;
+                    *out_curr += len;
+
+                    // escape byte
+                    in_curr += 2;
+                    out[*out_curr] = compressed_strs[in_curr - 1];
+                    *out_curr += 1;
+                } else if first_escape_pos == 1 {
+                    // 0th byte
+                    code = compressed_strs[in_curr] as usize;
+                    len = lens[code] as usize;
+                    unsafe {
+                        let src = symbols[code];
+                        ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                    }
+                    in_curr += 1;
+                    *out_curr += len;
+
+                    // escape byte
+                    in_curr += 2;
+                    out[*out_curr] = compressed_strs[in_curr - 1];
+                    *out_curr += 1;
                 } else {
-                    let s = symbols[code as usize];
-                    let len = lens[code as usize];
-                    out[*out_curr..*out_curr + len as usize]
-                        .copy_from_slice(&s.to_ne_bytes()[..len as usize]);
-                    *out_curr += len as usize;
+                    // escape byte
+                    in_curr += 2;
+                    out[*out_curr] = compressed_strs[in_curr - 1];
+                    *out_curr += 1;
                 }
             }
-            in_curr += 1;
+        }
+
+        // handle the remaining bytes
+        if in_curr + 2 <= in_end {
+            out[*out_curr] = compressed_strs[in_curr + 1];
+            if compressed_strs[in_curr] != FSST_ESC {
+                let code = compressed_strs[in_curr] as usize;
+                unsafe {
+                    let src = symbols[code];
+                    ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                }
+                in_curr += 1;
+                *out_curr += lens[code] as usize;
+                if compressed_strs[in_curr] != FSST_ESC {
+                    let code = compressed_strs[in_curr] as usize;
+                    unsafe {
+                        let src = symbols[code];
+                        ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+                    }
+                    in_curr += 1;
+                    *out_curr += lens[code] as usize;
+                } else {
+                    in_curr += 2;
+                    out[*out_curr] = compressed_strs[in_curr - 1];
+                    *out_curr += 1;
+                }
+            } else {
+                in_curr += 2;
+                *out_curr += 1;
+            }
+        }
+
+        if in_curr < in_end {
+            // last code cannot be an escape code
+            let code = compressed_strs[in_curr] as usize;
+            unsafe {
+                let src = symbols[code];
+                ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
+            }
+            *out_curr += lens[code] as usize;
         }
     };
+
     let mut out_curr = *out_pos;
     out_offsets[0] = 0;
     for i in 1..offsets.len() {
