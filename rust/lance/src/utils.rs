@@ -4,7 +4,6 @@
 //! Various utilities
 
 pub(crate) mod future;
-pub mod sql;
 pub(crate) mod temporal;
 #[cfg(test)]
 pub(crate) mod test;
@@ -12,4 +11,5 @@ pub(crate) mod test;
 pub mod tfrecord;
 
 // Re-export
+pub use lance_datafusion::sql;
 pub use lance_linalg::kmeans;
