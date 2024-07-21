@@ -170,6 +170,6 @@ impl ProjectionPlan {
         let src = Arc::new(OneShotExec::new(stream));
         let physical_exprs = self.to_physical_exprs()?;
         let projection = Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
-        Ok(execute_plan(projection, LanceExecutionOptions::default())?)
+        execute_plan(projection, LanceExecutionOptions::default())
     }
 }

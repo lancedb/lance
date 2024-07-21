@@ -37,10 +37,7 @@ pub async fn take(
     let mut sorted_indices: Vec<usize> = (0..row_indices.len()).collect();
     sorted_indices.sort_by_key(|&i| row_indices[i]);
 
-    let fragments = dataset
-        .get_fragments()
-        .into_iter()
-        .map(|frag| Arc::new(frag));
+    let fragments = dataset.get_fragments().into_iter().map(Arc::new);
 
     // We will split into sub-requests for each fragment.
     let mut sub_requests: Vec<(Arc<FileFragment>, Range<usize>)> = Vec::new();

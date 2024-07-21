@@ -1451,7 +1451,7 @@ impl Scanner {
         Ok(Arc::new(LancePushdownScanExec::try_new(
             self.dataset.clone(),
             fragments,
-            self.projection_plan.physical_schema.clone().into(),
+            self.projection_plan.physical_schema.clone(),
             predicate,
             config,
         )?))
