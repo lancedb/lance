@@ -10,7 +10,7 @@ use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     error::Result as DFResult,
-    physical_optimizer::PhysicalOptimizerRule,
+    physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule},
     physical_plan::{projection::ProjectionExec as DFProjectionExec, ExecutionPlan},
 };
 use datafusion_physical_expr::expressions::Column;
@@ -98,4 +98,11 @@ impl PhysicalOptimizerRule for SimplifyProjection {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+pub fn get_physical_optimizer() -> PhysicalOptimizer {
+    PhysicalOptimizer::with_rules(vec![
+        Arc::new(crate::io::exec::optimizer::CoalesceTake),
+        Arc::new(crate::io::exec::optimizer::SimplifyProjection),
+    ])
 }

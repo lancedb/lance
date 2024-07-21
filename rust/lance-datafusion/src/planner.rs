@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Exec plan planner
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use crate::expr::safe_coerce_scalar;
+use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
@@ -24,7 +29,6 @@ use datafusion::logical_expr::{
     AggregateUDF, ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
-use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
     Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
@@ -41,39 +45,10 @@ use datafusion::{
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
-use lance_datafusion::expr::safe_coerce_scalar;
-use lance_index::scalar::expression::{
-    apply_scalar_indices, IndexInformationProvider, ScalarIndexExpr,
-};
+use lance_core::datatypes::Schema;
 use snafu::{location, Location};
 
-use crate::datafusion::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt};
-use crate::utils::sql::parse_sql_expr;
-use crate::{
-    datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
-    Result,
-};
-
-#[derive(Default, Debug)]
-pub struct FilterPlan {
-    pub index_query: Option<ScalarIndexExpr>,
-    pub refine_expr: Option<Expr>,
-    pub full_expr: Option<Expr>,
-}
-
-impl FilterPlan {
-    pub fn refine_columns(&self) -> Vec<String> {
-        self.refine_expr
-            .as_ref()
-            .map(Planner::column_names_in_expr)
-            .unwrap_or_default()
-    }
-
-    /// Return true if this has a refine step, regardless of the status of prefilter
-    pub fn has_refine(&self) -> bool {
-        self.refine_expr.is_some()
-    }
-}
+use lance_core::{Error, Result};
 
 #[derive(Debug, Clone)]
 struct CastListF16Udf {
@@ -757,42 +732,6 @@ impl Planner {
         expr.visit(&mut visitor).unwrap();
         visitor.columns.into_iter().collect()
     }
-
-    /// Determine how to apply a provided filter
-    ///
-    /// We parse the filter into a logical expression.  We then
-    /// split the logical expression into a portion that can be
-    /// satisfied by an index search (of one or more indices) and
-    /// a refine portion that must be applied after the index search
-    pub fn create_filter_plan(
-        &self,
-        filter: Expr,
-        index_info: &dyn IndexInformationProvider,
-        use_scalar_index: bool,
-    ) -> Result<FilterPlan> {
-        let logical_expr = self.optimize_expr(filter)?;
-        if use_scalar_index {
-            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info);
-            Ok(FilterPlan {
-                index_query: indexed_expr.scalar_query,
-                refine_expr: indexed_expr.refine_expr,
-                full_expr: Some(logical_expr),
-            })
-        } else {
-            Ok(FilterPlan {
-                index_query: None,
-                refine_expr: Some(logical_expr.clone()),
-                full_expr: Some(logical_expr),
-            })
-        }
-    }
-
-    pub fn get_physical_optimizer() -> PhysicalOptimizer {
-        PhysicalOptimizer::with_rules(vec![
-            Arc::new(crate::io::exec::optimizer::CoalesceTake),
-            Arc::new(crate::io::exec::optimizer::SimplifyProjection),
-        ])
-    }
 }
 
 struct ColumnCapturingVisitor {
@@ -838,7 +777,7 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
 #[cfg(test)]
 mod tests {
 
-    use crate::datafusion::logical_expr::tests::ExprExt;
+    use crate::logical_expr::ExprExt;
 
     use super::*;
 
