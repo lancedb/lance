@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 use tracing::{instrument, Instrument};
 
-use crate::dataset::{Dataset, ROW_ID};
+use crate::dataset::{Dataset, ProjectionRequest, ROW_ID};
 use crate::datatypes::Schema;
 use crate::{arrow::*, Error};
 
@@ -116,7 +116,9 @@ impl Take {
             let rows = if extra.fields.is_empty() {
                 batch
             } else {
-                let new_columns = dataset.take_rows(row_ids.values(), &extra).await?;
+                let new_columns = dataset
+                    .take_rows(row_ids.values(), ProjectionRequest::Schema(extra))
+                    .await?;
                 debug_assert_eq!(batch.num_rows(), new_columns.num_rows());
                 batch.merge(&new_columns)?
             };

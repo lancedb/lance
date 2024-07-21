@@ -599,7 +599,13 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        return pa.Table.from_batches([self._ds.take(indices, columns)])
+        columns_with_transform = None
+        if isinstance(columns, dict):
+            columns_with_transform = list(columns.items())
+            columns = None
+        return pa.Table.from_batches(
+            [self._ds.take(indices, columns, columns_with_transform)]
+        )
 
     def _take_rows(
         self,
@@ -626,7 +632,13 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        return pa.Table.from_batches([self._ds.take_rows(row_ids, columns)])
+        columns_with_transform = None
+        if isinstance(columns, dict):
+            columns_with_transform = list(columns.items())
+            columns = None
+        return pa.Table.from_batches(
+            [self._ds.take_rows(row_ids, columns, columns_with_transform)]
+        )
 
     def head(self, num_rows, **kwargs):
         """

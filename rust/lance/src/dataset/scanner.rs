@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -10,7 +10,6 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
-use datafusion::common::DFSchema;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
@@ -35,6 +34,7 @@ use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
+use lance_datafusion::projection::ProjectionPlan;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::SCORE_COL;
@@ -132,12 +132,7 @@ impl ColumnOrdering {
 pub struct Scanner {
     dataset: Arc<Dataset>,
 
-    /// The physical schema (before dynamic projection) that must be loaded from the table
-    physical_columns: Schema,
-
-    /// The expressions for all the columns to be in the output
-    /// Note: this doesn't include _distance, and _rowid
-    requested_output_expr: Option<Vec<(Expr, String)>>,
+    projection_plan: ProjectionPlan,
 
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
@@ -209,12 +204,10 @@ fn escape_column_name(name: &str) -> String {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        let projection = dataset.schema().clone();
-
+        let projection_plan = ProjectionPlan::new_empty(Arc::new(dataset.schema().clone()));
         Self {
             dataset,
-            physical_columns: projection,
-            requested_output_expr: None,
+            projection_plan,
             prefilter: false,
             filter: None,
             full_text_query: None,
@@ -297,37 +290,9 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
-        let mut output = HashMap::new();
-        let mut physical_cols_set = HashSet::new();
-        let mut physical_cols = vec![];
-        for (output_name, raw_expr) in columns {
-            if output.contains_key(output_name.as_ref()) {
-                return Err(Error::io(
-                    format!("Duplicate column name: {}", output_name.as_ref()),
-                    location!(),
-                ));
-            }
-            let expr = planner.parse_expr(raw_expr.as_ref())?;
-            for col in Planner::column_names_in_expr(&expr) {
-                if physical_cols_set.contains(&col) {
-                    continue;
-                }
-                physical_cols.push(col.clone());
-                physical_cols_set.insert(col);
-            }
-            output.insert(output_name.as_ref().to_string(), expr);
-        }
-
         let physical_schema = self.physical_schema(true)?;
-        let schema_with_meta_columns = self.dataset.schema().merge(physical_schema.as_ref())?;
-        self.physical_columns = schema_with_meta_columns.project(&physical_cols)?;
-
-        let mut output_cols = vec![];
-        for (name, _) in columns {
-            output_cols.push((output[name.as_ref()].clone(), name.as_ref().to_string()));
-        }
-        self.requested_output_expr = Some(output_cols);
+        let base_schema = self.dataset.schema().merge(physical_schema.as_ref())?;
+        self.projection_plan = ProjectionPlan::try_new(&base_schema, columns)?;
         Ok(self)
     }
 
@@ -664,10 +629,11 @@ impl Scanner {
         }
 
         let schema = if !extra_columns.is_empty() {
-            self.physical_columns
+            self.projection_plan
+                .physical_schema
                 .merge(&ArrowSchema::new(extra_columns))?
         } else {
-            self.physical_columns.clone()
+            self.projection_plan.physical_schema.as_ref().clone()
         };
 
         // drop metadata
@@ -685,48 +651,10 @@ impl Scanner {
     }
 
     pub(crate) fn output_expr(&self) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-        let physical_schema = self.physical_schema(false)?;
-
-        // reset the id ordering becuase we will take the batch after projection
-        let physical_schema = ArrowSchema::new(
-            physical_schema
-                .fields
-                .iter()
-                .map(|f| ArrowField::new(f.name.clone(), f.data_type(), f.nullable))
-                .collect::<Vec<_>>(),
-        );
-        let df_schema = Arc::new(DFSchema::try_from(physical_schema.clone())?);
-
-        let project_star = self
-            .physical_columns
-            .fields
-            .iter()
-            .map(|f| {
-                Ok((
-                    expressions::col(f.name.as_str(), &physical_schema)?.clone(),
-                    f.name.clone(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let output_expr = self.requested_output_expr.clone().map(|exprs| {
-            exprs
-                .iter()
-                .map(|(expr, name)| {
-                    Ok((
-                        datafusion::physical_expr::create_physical_expr(
-                            expr,
-                            &df_schema,
-                            &Default::default(),
-                        )?,
-                        name.clone(),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()
-        });
-
         // Append the extra columns
-        let mut output_expr = output_expr.unwrap_or(Ok(project_star))?;
+        let mut output_expr = self.projection_plan.to_physical_exprs()?;
+
+        let physical_schema = ArrowSchema::from(self.physical_schema(false)?.as_ref());
 
         // distance goes before the row_id column
         if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
@@ -878,7 +806,10 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.physical_columns.fields.is_empty() && !self.with_row_id && !self.with_row_address {
+        if self.projection_plan.physical_schema.fields.is_empty()
+            && !self.with_row_id
+            && !self.with_row_address
+        {
             return Err(Error::InvalidInput {
                 source:
                     "no columns were selected and with_row_id is false, there is nothing to scan"
@@ -957,8 +888,11 @@ impl Scanner {
                 };
                 match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
                     (Some(index_query), None) => {
-                        self.scalar_indexed_scan(&self.physical_columns, index_query)
-                            .await?
+                        self.scalar_indexed_scan(
+                            self.projection_plan.physical_schema.as_ref(),
+                            index_query,
+                        )
+                        .await?
                     }
                     // TODO: support combined pushdown and scalar index scan
                     (Some(index_query), Some(_)) => {
@@ -981,7 +915,7 @@ impl Scanner {
                             let columns = filter_plan.refine_columns();
                             Arc::new(self.dataset.schema().project(&columns)?)
                         } else {
-                            Arc::new(self.physical_columns.clone())
+                            self.projection_plan.physical_schema.clone()
                         };
                         self.scan(with_row_id, self.with_row_address, false, schema)
                     }
@@ -1517,7 +1451,7 @@ impl Scanner {
         Ok(Arc::new(LancePushdownScanExec::try_new(
             self.dataset.clone(),
             fragments,
-            self.physical_columns.clone().into(),
+            self.projection_plan.physical_schema.clone().into(),
             predicate,
             config,
         )?))
