@@ -1384,7 +1384,7 @@ mod tests {
             What might be toward, that this sweaty haste  
             Doth make the night joint-labourer with the day?
             Who is't that can inform me?";
-    
+
     const TEST_PARAGRAPH2: &str = "Towards the end of November, during a thaw, at nine o’clock one morning, a train on the Warsaw and Petersburg railway was approaching the latter city at full speed.
 The morning was so damp and misty that it was only with great difficulty that the day succeeded in breaking; 
 and it was impossible to distinguish anything more than a few yards away from the carriage windows. 
@@ -1469,12 +1469,12 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
     async fn test_fsst() {
         let test_input_size = 8 * 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH.len();
-        let test_input = TEST_PARAGRAPH.repeat(repeat_num); 
+        let test_input = TEST_PARAGRAPH.repeat(repeat_num);
         helper(&test_input);
 
         let test_input_size = 16 * 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH.len();
-        let test_input = TEST_PARAGRAPH.repeat(repeat_num); 
+        let test_input = TEST_PARAGRAPH.repeat(repeat_num);
         helper(&test_input);
 
         let test_input_size = 8 * 1024 * 1024;
@@ -1484,7 +1484,7 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
 
         let test_input_size = 16 * 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH2.len();
-        let test_input = TEST_PARAGRAPH2.repeat(repeat_num); 
+        let test_input = TEST_PARAGRAPH2.repeat(repeat_num);
         helper(&test_input);
 
         let test_input_size = 8 * 1024 * 1024;
