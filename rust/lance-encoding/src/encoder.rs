@@ -371,7 +371,7 @@ impl Default for CoreBufferEncodingStrategy {
 impl CoreBufferEncodingStrategy {
     fn try_bitpacked_encoding(&self, arrays: &[ArrayRef]) -> Option<BitpackingBufferEncoder> {
         if std::env::var("LANCE_USE_BITPACKING").is_err() {
-            return None
+            return None;
         }
 
         // calculate the number of bits to compress array items into
