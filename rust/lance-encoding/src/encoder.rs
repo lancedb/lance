@@ -11,11 +11,11 @@ use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
-use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::bitpack::{num_compressed_bits, BitpackingBufferEncoder};
 use crate::encodings::physical::buffers::{
     BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder,
 };
+use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -370,6 +370,10 @@ impl Default for CoreBufferEncodingStrategy {
 
 impl CoreBufferEncodingStrategy {
     fn try_bitpacked_encoding(&self, arrays: &[ArrayRef]) -> Option<BitpackingBufferEncoder> {
+        if std::env::var("LANCE_USE_BITPACKING").is_err() {
+            return None
+        }
+
         // calculate the number of bits to compress array items into
         let mut num_bits = 0;
         for arr in arrays {

@@ -359,6 +359,7 @@ pub(crate) mod tests {
 
     #[test_log::test(test)]
     fn test_will_bitpack_allowed_types_when_possible() {
+        std::env::set_var("LANCE_USE_BITPACKING", "TRUE");
         let test_cases: Vec<(DataType, ArrayRef, u64)> = vec![
             (
                 DataType::UInt8,
@@ -466,6 +467,7 @@ pub(crate) mod tests {
                 }
             }
         }
+        std::env::remove_var("LANCE_USE_BITPACKING");
     }
 
     struct DistributionArrayGeneratorProvider<
@@ -517,6 +519,7 @@ pub(crate) mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_bitpack_primitive() {
+        std::env::set_var("LANCE_USE_BITPACKING", "TRUE");
         let bitpacked_test_cases: &Vec<(DataType, Box<dyn ArrayGeneratorProvider>)> = &vec![
             // check less than one byte for multi-byte type
             (
@@ -608,5 +611,7 @@ pub(crate) mod tests {
             let field = Field::new("", data_type.clone(), false);
             check_round_trip_encoding_generated(field, array_gen_provider.copy()).await;
         }
+
+        std::env::remove_var("LANCE_USE_BITPACKING");
     }
 }
