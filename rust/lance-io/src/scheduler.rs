@@ -179,9 +179,11 @@ impl ScanScheduler {
         let reader = self.object_store.open(path).await?;
         let mut file_counter = self.file_counter.lock().unwrap();
         let file_index = *file_counter;
+        let block_size = self.object_store.block_size() as u64;
         *file_counter += 1;
         Ok(FileScheduler {
             reader: reader.into(),
+            block_size,
             root: self.clone(),
             file_index,
         })
@@ -243,7 +245,17 @@ impl ScanScheduler {
 pub struct FileScheduler {
     reader: Arc<dyn Reader>,
     root: Arc<ScanScheduler>,
+    block_size: u64,
     file_index: u32,
+}
+
+fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
+    debug_assert!(range1.end <= range2.start);
+    range2.start <= (range1.end + block_size)
+}
+
+fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
+    range1.start < range2.end && range2.start < range1.end
 }
 
 impl FileScheduler {
@@ -258,8 +270,61 @@ impl FileScheduler {
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.file_index as u128) << 64) + priority as u128;
-        self.root
-            .submit_request(self.reader.clone(), request, priority)
+
+        let mut updated_requests = Vec::new();
+
+        let copy_request = request.clone();
+
+        if !request.is_empty() {
+            let mut curr_interval = request[0].clone();
+
+            for req in request.iter().skip(1) {
+                if is_close_together(&curr_interval, req, self.block_size) {
+                    curr_interval.end = curr_interval.end.max(req.end);
+                } else {
+                    updated_requests.push(curr_interval);
+                    curr_interval = req.clone();
+                }
+            }
+
+            updated_requests.push(curr_interval);
+        }
+
+        let copy_updated_requests = updated_requests.clone();
+
+        let bytes_vec_fut =
+            self.root
+                .submit_request(self.reader.clone(), updated_requests, priority);
+
+        let mut updated_index = 0;
+        let mut final_bytes = Vec::with_capacity(copy_request.len());
+
+        async move {
+            let bytes_vec = bytes_vec_fut.await?;
+
+            let mut orig_index = 0;
+            while (updated_index < copy_updated_requests.len()) && (orig_index < copy_request.len())
+            {
+                let updated_range = &copy_updated_requests[updated_index];
+                let orig_range = &copy_request[orig_index];
+                let byte_offset = updated_range.start as usize;
+
+                if is_overlapping(updated_range, orig_range) {
+                    // Rescale the ranges since they correspond to the entire set of bytes, while
+                    // But we need to slice into a subset of the bytes in a particular index of bytes_vec
+                    let start = orig_range.start as usize - byte_offset;
+                    let end = orig_range.end as usize - byte_offset;
+
+                    let sliced_range = bytes_vec[updated_index].slice(start..end);
+                    final_bytes.push(sliced_range);
+                    orig_index += 1;
+                } else {
+                    updated_index += 1;
+                }
+            }
+
+            Ok(final_bytes)
+        }
     }
 
     /// Submit a single IOP to the reader
@@ -426,4 +491,38 @@ mod tests {
         semaphore_copy.add_permits(1);
         assert!(second_fut.await.unwrap().unwrap().len() == 20);
     }
+
+    // #[tokio::test]
+    // async fn test_submit_request() {
+    //     let tmpdir = tempdir().unwrap();
+    //     let tmp_path = tmpdir.path().to_str().unwrap();
+    //     let tmp_path = Path::parse(tmp_path).unwrap();
+    //     let tmp_file = tmp_path.child("foo.file");
+
+    //     let obj_store = Arc::new(ObjectStore::local());
+
+    //     // Write 1MiB of data
+    //     // const DATA_SIZE: u64 = 100;
+    //     let some_data = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    //     // let mut some_data = vec![0; DATA_SIZE as usize];
+    //     // rand::thread_rng().fill_bytes(&mut some_data);
+    //     obj_store.put(&tmp_file, &some_data).await.unwrap();
+
+    //     let scheduler = ScanScheduler::new(obj_store);
+    //     let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
+
+    //     let test_cases = vec![
+    //         vec![0..3, 3..4, 7..8, 9..10],
+    //         vec![1..2, 2..3, 3..4, 4..5, 5..6, 6..7, 7..8, 8..9, 9..10, 10..11, 11..12],
+    //     ]
+
+    //     for case in test_cases {
+    //         let bytes = file_scheduler
+    //             .submit_request(case, 0)
+    //             .await
+    //             .unwrap();
+
+    //         assert_eq!()
+    //     }
+    // }
 }
