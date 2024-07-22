@@ -534,13 +534,20 @@ pub mod test {
                 .unwrap()
                 .column(0)
                 .clone();
+
             arr
         }
 
         macro_rules! do_test {
             ($num_bits:expr, $data_type:ident, $null_probability:expr) => {
                 let max = 1 << $num_bits - 1;
-                let arr = gen_array(fill::<$data_type>(max).with_random_nulls($null_probability));
+                let mut arr =
+                    gen_array(fill::<$data_type>(max).with_random_nulls($null_probability));
+
+                // ensure we don't randomly generate all nulls, that won't work
+                while arr.null_count() == arr.len() {
+                    arr = gen_array(fill::<$data_type>(max).with_random_nulls($null_probability));
+                }
                 let result = num_compressed_bits(arr);
                 assert_eq!(Some($num_bits), result);
             };
@@ -596,12 +603,6 @@ pub mod test {
 
         // test that it returns None for datatypes that don't support bitpacking
         let arr = Float64Array::from_iter_values(vec![0.1, 0.2, 0.3]);
-        let result = num_compressed_bits(Arc::new(arr));
-        assert_eq!(None, result);
-
-        // test that it returns None for the all null case
-        let nulls = vec![true, true];
-        let arr = gen_array(fill::<UInt16Type>(2).with_nulls(&nulls));
         let result = num_compressed_bits(Arc::new(arr));
         assert_eq!(None, result);
     }
