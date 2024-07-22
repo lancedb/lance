@@ -27,28 +27,28 @@ use crate::{
 // bitpacking encoding. Returns `None` if the type or array data is not supported.
 pub fn num_compressed_bits(arr: ArrayRef) -> Option<u64> {
     match arr.data_type() {
-        DataType::UInt8 => num_bits_for_type::<UInt8Type>(arr.as_primitive()),
-        DataType::UInt16 => num_bits_for_type::<UInt16Type>(arr.as_primitive()),
-        DataType::UInt32 => num_bits_for_type::<UInt32Type>(arr.as_primitive()),
-        DataType::UInt64 => num_bits_for_type::<UInt64Type>(arr.as_primitive()),
+        DataType::UInt8 => Some(num_bits_for_type::<UInt8Type>(arr.as_primitive())),
+        DataType::UInt16 => Some(num_bits_for_type::<UInt16Type>(arr.as_primitive())),
+        DataType::UInt32 => Some(num_bits_for_type::<UInt32Type>(arr.as_primitive())),
+        DataType::UInt64 => Some(num_bits_for_type::<UInt64Type>(arr.as_primitive())),
         // TODO -- eventually we could support signed types as well
         _ => None,
     }
 }
 
 // Compute the number of bits to to use for bitpacking generically.
-// Returns `None` if the array is empty or only contains null values.
-fn num_bits_for_type<T>(arr: &PrimitiveArray<T>) -> Option<u64>
+fn num_bits_for_type<T>(arr: &PrimitiveArray<T>) -> u64
 where
     T: ArrowPrimitiveType,
     T::Native: PrimInt + AsPrimitive<u64>,
 {
-    let max = arrow::compute::bit_or(arr);
-    let num_bits: Option<u64> =
-        max.map(|x| arr.data_type().byte_width() as u64 * 8 - x.leading_zeros() as u64);
+    // safe to unwrap here because if the array is empty or all nulls it's
+    // handled in BasicEncoder
+    let max = arrow::compute::bit_or(arr).unwrap();
+    let num_bits = arr.data_type().byte_width() as u64 * 8 - max.leading_zeros() as u64;
 
     // we can't bitpack into 0 bits, so the minimum is 1
-    num_bits.map(|x| x.max(1))
+    num_bits.max(1)
 }
 
 #[derive(Debug)]
@@ -318,7 +318,6 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
         rows_to_skip: u64,
         num_rows: u64,
         _all_null: &mut bool,
-        // dest_buffers: &mut [BytesMut],
     ) -> Result<Vec<BytesMut>> {
         let num_bytes = self.uncompressed_bits_per_value / 8 * num_rows;
         let mut dest_buffers = vec![BytesMut::with_capacity(num_bytes as usize)];
