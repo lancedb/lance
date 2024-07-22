@@ -80,10 +80,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Set up Node.js 16
-        uses: actions/setup-node@v4
-        with:
-          node-version: '16'
       - uses: Swatinem/rust-cache@v2
       - name: Set up Java 8
         uses: actions/setup-java@v4
@@ -96,6 +92,10 @@ jobs:
           server-password: SONATYPE_TOKEN
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
           gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
+      - name: Set up Node.js 16
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
