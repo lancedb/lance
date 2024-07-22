@@ -682,7 +682,8 @@ mod test {
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    use crate::{datafusion::logical_expr::tests::ExprExt, dataset::WriteParams};
+    use crate::dataset::WriteParams;
+    use lance_datafusion::logical_expr::ExprExt;
 
     use super::*;
 

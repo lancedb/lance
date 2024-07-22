@@ -8,7 +8,6 @@
 pub mod fts;
 pub(crate) mod knn;
 mod optimizer;
-mod planner;
 mod projection;
 mod pushdown_scan;
 pub mod scalar_index;
@@ -19,7 +18,9 @@ pub mod testing;
 pub mod utils;
 
 pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
-pub use planner::{FilterPlan, Planner};
+pub use lance_datafusion::planner::Planner;
+pub use lance_index::scalar::expression::FilterPlan;
+pub use optimizer::get_physical_optimizer;
 pub use projection::ProjectionExec;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
 pub use scan::LanceScanExec;

@@ -36,6 +36,7 @@ use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_index::scalar::expression::IndexInformationProvider;
+use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::{Query, DIST_COL};
@@ -51,6 +52,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::FtsExec;
+use crate::io::exec::get_physical_optimizer;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     knn::new_knn_exec, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec,
@@ -1085,7 +1087,7 @@ impl Scanner {
         // Stage 7: final projection
         plan = Arc::new(DFProjectionExec::try_new(self.output_expr()?, plan)?);
 
-        let optimizer = Planner::get_physical_optimizer();
+        let optimizer = get_physical_optimizer();
         let options = Default::default();
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
