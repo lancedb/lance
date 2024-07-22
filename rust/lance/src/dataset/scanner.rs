@@ -445,7 +445,9 @@ impl Scanner {
 
     /// Find k-nearest neighbor within the vector column.
     pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
-        self.ensure_not_fragment_scan()?;
+        if !self.prefilter {
+            self.ensure_not_fragment_scan()?;
+        }
 
         if k == 0 {
             return Err(Error::io("k must be positive".to_string(), location!()));
