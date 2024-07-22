@@ -3,18 +3,20 @@
 
 //! Extends logical expression.
 
+use std::sync::Arc;
+
 use arrow_schema::DataType;
 
-use datafusion::logical_expr::ScalarUDFImpl;
+use crate::expr::safe_coerce_scalar;
 use datafusion::logical_expr::{expr::ScalarFunction, BinaryExpr, Operator};
+use datafusion::logical_expr::{ScalarUDF, ScalarUDFImpl};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::DataTypeExt;
-use lance_datafusion::expr::safe_coerce_scalar;
 
-use crate::datatypes::Schema;
-use crate::{Error, Result};
+use lance_core::datatypes::Schema;
+use lance_core::{Error, Result};
 use snafu::{location, Location};
 /// Resolve a Value
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
@@ -193,6 +195,34 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
     }
 }
 
+// As part of the DF 37 release there are now two different ways to
+// represent a nested field access in `Expr`.  The old way is to use
+// `Expr::field` which returns a `GetStructField` and the new way is
+// to use `Expr::ScalarFunction` with a `GetFieldFunc` UDF.
+//
+// Currently, the old path leads to bugs in DF.  This is probably a
+// bug and will probably be fixed in a future version.  In the meantime
+// we need to make sure we are always using the new way to avoid this
+// bug.  This trait adds field_newstyle which lets us easily create
+// logical `Expr` that use the new style.
+pub trait ExprExt {
+    // Helper function to replace Expr::field in DF 37 since DF
+    // confuses itself with the GetStructField returned by Expr::field
+    fn field_newstyle(&self, name: &str) -> Expr;
+}
+
+impl ExprExt for Expr {
+    fn field_newstyle(&self, name: &str) -> Expr {
+        Self::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
+            args: vec![
+                self.clone(),
+                Self::Literal(ScalarValue::Utf8(Some(name.to_string()))),
+            ],
+        })
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use std::sync::Arc;
@@ -200,36 +230,7 @@ pub mod tests {
     use super::*;
 
     use arrow_schema::{Field, Schema as ArrowSchema};
-    use datafusion::logical_expr::ScalarUDF;
     use datafusion_functions::core::expr_ext::FieldAccessor;
-
-    // As part of the DF 37 release there are now two different ways to
-    // represent a nested field access in `Expr`.  The old way is to use
-    // `Expr::field` which returns a `GetStructField` and the new way is
-    // to use `Expr::ScalarFunction` with a `GetFieldFunc` UDF.
-    //
-    // Currently, the old path leads to bugs in DF.  This is probably a
-    // bug and will probably be fixed in a future version.  In the meantime
-    // we need to make sure we are always using the new way to avoid this
-    // bug.  This trait adds field_newstyle which lets us easily create
-    // logical `Expr` that use the new style.
-    pub trait ExprExt {
-        // Helper function to replace Expr::field in DF 37 since DF
-        // confuses itself with the GetStructField returned by Expr::field
-        fn field_newstyle(&self, name: &str) -> Expr;
-    }
-
-    impl ExprExt for Expr {
-        fn field_newstyle(&self, name: &str) -> Expr {
-            Self::ScalarFunction(ScalarFunction {
-                func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
-                args: vec![
-                    self.clone(),
-                    Self::Literal(ScalarValue::Utf8(Some(name.to_string()))),
-                ],
-            })
-        }
-    }
 
     #[test]
     fn test_resolve_large_utf8() {
