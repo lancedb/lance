@@ -446,6 +446,8 @@ impl Scanner {
     /// Find k-nearest neighbor within the vector column.
     pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
         if !self.prefilter {
+            // We can allow fragment scan if the input to nearest is a prefilter.
+            // The fragment scan will be performed by the prefilter.
             self.ensure_not_fragment_scan()?;
         }
 
