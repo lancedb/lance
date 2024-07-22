@@ -15,7 +15,7 @@ use datafusion_expr::{
 
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Result};
-use lance_datafusion::expr::safe_coerce_scalar;
+use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use tracing::instrument;
 
 use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex};
@@ -660,6 +660,67 @@ pub fn apply_scalar_indices(
     index_info: &dyn IndexInformationProvider,
 ) -> IndexedExpression {
     visit_node(&expr, index_info).unwrap_or(IndexedExpression::refine_only(expr))
+}
+
+#[derive(Default, Debug)]
+pub struct FilterPlan {
+    pub index_query: Option<ScalarIndexExpr>,
+    pub refine_expr: Option<Expr>,
+    pub full_expr: Option<Expr>,
+}
+
+impl FilterPlan {
+    pub fn refine_columns(&self) -> Vec<String> {
+        self.refine_expr
+            .as_ref()
+            .map(Planner::column_names_in_expr)
+            .unwrap_or_default()
+    }
+
+    /// Return true if this has a refine step, regardless of the status of prefilter
+    pub fn has_refine(&self) -> bool {
+        self.refine_expr.is_some()
+    }
+}
+
+pub trait PlannerIndexExt {
+    /// Determine how to apply a provided filter
+    ///
+    /// We parse the filter into a logical expression.  We then
+    /// split the logical expression into a portion that can be
+    /// satisfied by an index search (of one or more indices) and
+    /// a refine portion that must be applied after the index search
+    fn create_filter_plan(
+        &self,
+        filter: Expr,
+        index_info: &dyn IndexInformationProvider,
+        use_scalar_index: bool,
+    ) -> Result<FilterPlan>;
+}
+
+impl PlannerIndexExt for Planner {
+    fn create_filter_plan(
+        &self,
+        filter: Expr,
+        index_info: &dyn IndexInformationProvider,
+        use_scalar_index: bool,
+    ) -> Result<FilterPlan> {
+        let logical_expr = self.optimize_expr(filter)?;
+        if use_scalar_index {
+            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info);
+            Ok(FilterPlan {
+                index_query: indexed_expr.scalar_query,
+                refine_expr: indexed_expr.refine_expr,
+                full_expr: Some(logical_expr),
+            })
+        } else {
+            Ok(FilterPlan {
+                index_query: None,
+                refine_expr: Some(logical_expr.clone()),
+                full_expr: Some(logical_expr),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

@@ -367,6 +367,7 @@ async fn build_dynamodb_external_store(
     };
 
     let mut dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
+        .behavior_version_latest()
         .region(Some(Region::new(region.to_string())))
         .credentials_provider(OSObjectStoreToAwsCredAdaptor(creds))
         // caching should be handled by passed AwsCredentialProvider

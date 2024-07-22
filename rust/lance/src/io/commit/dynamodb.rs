@@ -60,6 +60,7 @@ mod test {
 
     async fn make_dynamodb_store() -> Arc<dyn ExternalManifestStore> {
         let dynamodb_local_config = aws_sdk_dynamodb::config::Builder::new()
+            .behavior_version_latest()
             .endpoint_url(
                 // url for dynamodb-local
                 "http://localhost:8000",
