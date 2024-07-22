@@ -15,9 +15,9 @@ import random
 trace_to_chrome(level='debug', file='/tmp/trace.json')
 
 NUM_ROWS = 1_000_000
-RANDOM_ACCESS = "full"
-NUM_INDICES = 10
-NUM_ROUNDS = 5
+RANDOM_ACCESS = "indices"
+NUM_INDICES = 5
+NUM_ROUNDS = 20
 
 # This file compares benchmarks for reading and writing a StructArray column using
 # (i) parquet
@@ -68,7 +68,7 @@ def test_parquet_read(tmp_path: Path, benchmark, test_data, random_indices):
     
     parquet_result = benchmark.pedantic(
         func,
-        rounds=1
+        rounds=5
     )
 
 def read_lance_file_random(lance_path, random_indices):
@@ -98,7 +98,7 @@ def test_lance_read(tmp_path: Path, benchmark, test_data, random_indices):
     )
 
 @pytest.mark.benchmark(group="read")
-def test_lance_read_packed_encoding(tmp_path: Path, benchmark, test_data, random_indices):
+def test_lance_read_packed(tmp_path: Path, benchmark, test_data, random_indices):
     lance_path = str(tmp_path) + "/lance_data"
     field = test_data.schema.field("struct_col")
     metadata = {b'packed': b'true'}
@@ -124,7 +124,7 @@ def test_lance_read_packed_encoding(tmp_path: Path, benchmark, test_data, random
         rounds=NUM_ROUNDS
     )
 
-@pytest.mark.benchmark(group="read")
+@pytest.mark.benchmark(group="write")
 def test_parquet_write(tmp_path: Path, benchmark, test_data):
     parquet_path = tmp_path / "data.parquet"
     benchmark.pedantic(
@@ -149,7 +149,7 @@ def test_lance_write(tmp_path: Path, benchmark, test_data):
     )
 
 @pytest.mark.benchmark(group="write")
-def test_lance_write_packed_encoding(tmp_path: Path, benchmark, test_data):
+def test_lance_write_packed(tmp_path: Path, benchmark, test_data):
     lance_path = str(tmp_path) + "/lance_data"
 
     field = test_data.schema.field("struct_col")
