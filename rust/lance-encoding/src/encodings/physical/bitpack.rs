@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow::array::ArrayData;
 use arrow::datatypes::{ArrowPrimitiveType, UInt16Type, UInt32Type, UInt64Type, UInt8Type};
+use arrow::util::bit_util::ceil;
 use arrow_array::{cast::AsArray, Array, ArrayRef, PrimitiveArray};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
@@ -65,13 +66,9 @@ impl BufferEncoder for BitpackingBufferEncoder {
     fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
         // calculate the total number of bytes we need to allocate for the destination.
         // this will be the number of items in the source array times the number of bits.
-        let count_items = count_items_to_pack(arrays);
-        // TODO: make function for count & round up
-        let mut dst_bytes_total = count_items * self.num_bits as usize / 8;
-        // if if there's a partial byte at the end, we need to allocate one more byte
-        if (count_items * self.num_bits as usize) % 8 != 0 {
-            dst_bytes_total += 1;
-        }
+        // let count_items = count_items_to_pack(arrays);
+        let count_items = arrays.iter().map(|arr| arr.len()).sum::<usize>();
+        let dst_bytes_total = count_items * ceil(self.num_bits as usize, 8);
 
         let mut dst_buffer = vec![0u8; dst_bytes_total];
         let mut dst_idx = 0;
@@ -98,15 +95,6 @@ impl BufferEncoder for BitpackingBufferEncoder {
             },
         ))
     }
-}
-
-fn count_items_to_pack(arrays: &[ArrayRef]) -> usize {
-    let mut count = 0;
-    for arr in arrays {
-        count += arr.len();
-    }
-
-    count
 }
 
 fn pack_array(

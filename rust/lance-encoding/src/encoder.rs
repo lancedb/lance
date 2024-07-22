@@ -187,12 +187,6 @@ impl Default for EncodedColumn {
 /// A task to create a page of data
 pub type EncodeTask = BoxFuture<'static, Result<EncodedPage>>;
 
-/// A buffer of encoded metadata to be placed in the column metadata
-pub struct EncodedMetadataBuffer {
-    // Different parts that will be written to a single buffer on disk
-    pub parts: Vec<Buffer>,
-}
-
 /// Top level encoding trait to code any Arrow array type into one or more pages.
 ///
 /// The field encoder implements buffering and encoding of a single input column
