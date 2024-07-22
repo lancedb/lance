@@ -102,6 +102,7 @@ class _BaseLanceDatasink(ray.data.Datasink):
         uri: str,
         schema: Optional[pa.Schema] = None,
         mode: Literal["create", "append", "overwrite"] = "create",
+        storage_options: Optional[Dict[str, Any]] = None,
         *args,
         **kwargs,
     ):
@@ -112,6 +113,7 @@ class _BaseLanceDatasink(ray.data.Datasink):
         self.mode = mode
 
         self.read_version: int | None = None
+        self.storage_options = storage_options
 
     @property
     def supports_distributed_writes(self) -> bool:
@@ -119,7 +121,7 @@ class _BaseLanceDatasink(ray.data.Datasink):
 
     def on_write_start(self):
         if self.mode == "append":
-            ds = lance.LanceDataset(self.uri)
+            ds = lance.LanceDataset(self.uri, storage_options=self.storage_options)
             self.read_version = ds.version
             if self.schema is None:
                 self.schema = ds.schema
@@ -139,7 +141,12 @@ class _BaseLanceDatasink(ray.data.Datasink):
             op = lance.LanceOperation.Overwrite(schema, fragments)
         elif self.mode == "append":
             op = lance.LanceOperation.Append(fragments)
-        lance.LanceDataset.commit(self.uri, op, read_version=self.read_version)
+        lance.LanceDataset.commit(
+            self.uri,
+            op,
+            read_version=self.read_version,
+            storage_options=self.storage_options,
+        )
 
 
 class LanceDatasink(_BaseLanceDatasink):
@@ -163,6 +170,8 @@ class LanceDatasink(_BaseLanceDatasink):
         The maximum number of rows per file. Default is 1024 * 1024.
     use_legacy_format : bool, optional
         Set True to use the legacy v1 format. Default is False
+    storage_options : Dict[str, Any], optional
+        The storage options for the writer. Default is None.
     """
 
     NAME = "Lance"
@@ -174,10 +183,18 @@ class LanceDatasink(_BaseLanceDatasink):
         mode: Literal["create", "append", "overwrite"] = "create",
         max_rows_per_file: int = 1024 * 1024,
         use_legacy_format: bool = False,
+        storage_options: Optional[Dict[str, Any]] = None,
         *args,
         **kwargs,
     ):
-        super().__init__(uri, schema=schema, mode=mode, *args, **kwargs)
+        super().__init__(
+            uri,
+            schema=schema,
+            mode=mode,
+            storage_options=storage_options,
+            *args,
+            **kwargs,
+        )
 
         self.max_rows_per_file = max_rows_per_file
         self.use_legacy_format = use_legacy_format
@@ -206,6 +223,7 @@ class LanceDatasink(_BaseLanceDatasink):
             schema=self.schema,
             max_rows_per_file=self.max_rows_per_file,
             use_legacy_format=self.use_legacy_format,
+            storage_options=self.storage_options,
         )
         return [
             (pickle.dumps(fragment), pickle.dumps(schema))
@@ -360,7 +378,9 @@ def write_lance(
             storage_options=storage_options,
         ),
         batch_size=max_rows_per_file,
-    ).write_datasink(LanceCommitter(output_uri, schema=schema))
+    ).write_datasink(
+        LanceCommitter(output_uri, schema=schema, storage_options=storage_options)
+    )
 
 
 def _register_hooks():
