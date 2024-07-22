@@ -475,11 +475,6 @@ impl Scanner {
         }
         self.limit = limit;
         self.offset = offset;
-
-        if let Some(query) = &mut self.full_text_query {
-            query.limit = limit;
-        }
-
         Ok(self)
     }
 
@@ -930,10 +925,6 @@ impl Scanner {
         } else {
             FilterPlan::default()
         };
-
-        if let Some(query) = &self.full_text_query {
-            self.fts(&filter_plan, query).await?;
-        }
 
         // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
         let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {

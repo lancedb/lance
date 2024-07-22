@@ -299,7 +299,7 @@ class LanceDataset(pa.dataset.Dataset):
             selective.
         full_text_query: str or dict, optional
             query string to search for, the results will be ranked by BM25.
-            e.g. "hello world", would match documents contains "hello" or "world".
+            e.g. "hello world", would match documents containing "hello" or "world".
             or a dictionary with the following keys:
             - columns: list[str]
                 The columns to search,
