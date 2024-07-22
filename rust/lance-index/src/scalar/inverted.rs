@@ -98,6 +98,8 @@ impl InvertedIndex {
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
+    // For now, we are using the TAAT (Term At A Time) strategy,
+    // but will switch to DAAT (Document At A Time) strategy once we have WAND implementation
     #[instrument(level = "debug", skip_all)]
     fn bm25_search(
         &self,
@@ -109,34 +111,38 @@ impl InvertedIndex {
         if prefilter.is_empty() {
             for token in &token_ids {
                 let list = self.invert_list.retrieve(*token);
-                for i in 0..list.len() {
-                    let row_id = list.row_ids[i];
-                    let score = list.scores[i];
-                    bm25_scores
-                        .entry(row_id)
-                        .and_modify(|s| *s += score)
-                        .or_insert(score);
-                }
+                self.search_posting_list(list, 0..list.len(), &mut bm25_scores);
             }
         } else {
             for token in &token_ids {
                 let list = self.invert_list.retrieve(*token);
-                let indices = prefilter.filter_row_ids(Box::new(list.row_ids.iter()));
-                for index in indices {
-                    let index = index as usize;
-                    let row_id = list.row_ids[index];
-                    let score = list.scores[index];
-                    bm25_scores
-                        .entry(row_id)
-                        .and_modify(|s| *s += score)
-                        .or_insert(score);
-                }
+                let indices = prefilter
+                    .filter_row_ids(Box::new(list.row_ids.iter()))
+                    .into_iter()
+                    .map(|i| i as usize);
+                self.search_posting_list(list, indices, &mut bm25_scores);
             }
         }
 
         bm25_scores
             .into_iter()
             .sorted_unstable_by_key(|k| OrderedFloat(-k.1))
+    }
+
+    fn search_posting_list(
+        &self,
+        list: &PostingList,
+        indices: impl Iterator<Item = usize>,
+        scores: &mut HashMap<u64, f32>,
+    ) {
+        for i in indices {
+            let row_id = list.row_ids[i];
+            let score = list.scores[i];
+            scores
+                .entry(row_id)
+                .and_modify(|s| *s += score)
+                .or_insert(score);
+        }
     }
 }
 
@@ -472,25 +478,47 @@ impl InvertedList {
             ListBuilder::with_capacity(Float32Builder::new(), self.inverted_list.len());
 
         for list in &self.inverted_list {
-            // tokens.push(*token_id);
             let row_ids_builder = row_ids_list_builder.values();
             let frequencies_builder = frequencies_list_builder.values();
             let bm25_builder = bm25_list_builder.values();
-            row_ids_builder.append_slice(list.row_ids.as_slice());
-            frequencies_builder.append_slice(list.frequencies.as_slice());
-            bm25_builder.append_slice(list.scores.as_slice());
+
+            // sort the list by row id,
+            // DAAT (Document At A Time) strategy is based on the assumption that the lists are sorted
+            let indices = (0..list.len())
+                .sorted_unstable_by_key(|i| list.row_ids[*i])
+                .collect_vec();
+
+            row_ids_builder.append_slice(
+                indices
+                    .iter()
+                    .map(|i| list.row_ids[*i])
+                    .collect_vec()
+                    .as_slice(),
+            );
+            frequencies_builder.append_slice(
+                indices
+                    .iter()
+                    .map(|i| list.frequencies[*i])
+                    .collect_vec()
+                    .as_slice(),
+            );
+            bm25_builder.append_slice(
+                indices
+                    .iter()
+                    .map(|i| list.scores[*i])
+                    .collect_vec()
+                    .as_slice(),
+            );
             row_ids_list_builder.append(true);
             frequencies_list_builder.append(true);
             bm25_list_builder.append(true);
         }
 
-        // let token_id_col = UInt32Array::from(tokens);
         let row_ids_col = row_ids_list_builder.finish();
         let frequencies_col = frequencies_list_builder.finish();
         let bm25_col = bm25_list_builder.finish();
 
         let schema = arrow_schema::Schema::new(vec![
-            // arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
             arrow_schema::Field::new(
                 ROW_ID,
                 DataType::List(Field::new_list_field(DataType::UInt64, true).into()),
@@ -511,7 +539,6 @@ impl InvertedList {
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
-                // Arc::new(token_id_col) as ArrayRef,
                 Arc::new(row_ids_col) as ArrayRef,
                 Arc::new(frequencies_col) as ArrayRef,
                 Arc::new(bm25_col) as ArrayRef,
@@ -524,7 +551,6 @@ impl InvertedList {
         let mut inverted_list = Vec::with_capacity(reader.num_rows());
         for i in 0..reader.num_batches().await {
             let batch = reader.read_record_batch(i).await?;
-            // let token_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
             let row_ids_col = batch[ROW_ID].as_list::<i32>();
             let frequencies_col = batch[FREQUENCY_COL].as_list::<i32>();
             let scores_col = batch[SCORE_COL].as_list::<i32>();
