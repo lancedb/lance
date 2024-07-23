@@ -97,8 +97,7 @@ async fn main() {
 
     println!("Loaded {} records", dataset.count_rows(None).await.unwrap());
 
-    let take_projection =
-        ProjectionRequest::from_schema(dataset.schema().project(&[column]).unwrap());
+    let take_projection = ProjectionRequest::from_columns(&[column], dataset.schema()).unwrap();
 
     let q = dataset
         .take(&[0], take_projection)
