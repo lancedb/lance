@@ -1066,10 +1066,13 @@ impl Dataset {
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let object_store_params = storage_options.map(|storage_options| ObjectStoreParams {
-            storage_options: Some(storage_options),
-            ..Default::default()
-        });
+        let object_store_params =
+            storage_options
+                .as_ref()
+                .map(|storage_options| ObjectStoreParams {
+                    storage_options: Some(storage_options.clone()),
+                    ..Default::default()
+                });
 
         let commit_handler = commit_lock.map(|commit_lock| {
             Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
@@ -1077,7 +1080,14 @@ impl Dataset {
         });
         let ds = RT
             .block_on(commit_lock.map(|cl| cl.py()), async move {
-                let dataset = match DatasetBuilder::from_uri(dataset_uri).load().await {
+                let mut builder = DatasetBuilder::from_uri(dataset_uri);
+                if let Some(storage_options) = storage_options {
+                    builder = builder.with_storage_options(storage_options);
+                }
+                if let Some(read_version) = read_version {
+                    builder = builder.with_version(read_version);
+                }
+                let dataset = match builder.load().await {
                     Ok(ds) => Some(ds),
                     Err(lance::Error::DatasetNotFound { .. }) => None,
                     Err(err) => return Err(err),
