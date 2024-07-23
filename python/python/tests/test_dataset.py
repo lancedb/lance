@@ -1036,6 +1036,48 @@ def test_merge_insert(tmp_path: Path):
         check_merge_stats(merge_dict, (None, None, None))
 
 
+def test_merge_insert_subcols(tmp_path: Path):
+    initial_data = pa.table(
+        {
+            "a": range(10),
+            "b": range(10),
+            "c": range(10, 20),
+        }
+    )
+    # Split across two fragments
+    dataset = lance.write_dataset(
+        initial_data, tmp_path / "dataset", max_rows_per_file=5
+    )
+    original_fragments = dataset.get_fragments()
+
+    new_values = pa.table(
+        {
+            "a": range(3, 5),
+            "b": range(20, 22),
+        }
+    )
+    (dataset.merge_insert("a").when_matched_update_all().execute(new_values))
+
+    expected = pa.table(
+        {
+            "a": range(10),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 9],
+            "c": range(10, 20),
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
+
+    # First fragment has new file
+    fragments = dataset.get_fragments()
+    assert fragments[0].fragment_id == original_fragments[0].fragment_id
+    assert fragments[1].fragment_id == original_fragments[1].fragment_id
+
+    assert len(fragments[0].data_files()) == 2
+    assert fragments[0].data_files()[0] == original_fragments[0].data_files()[0]
+    assert len(fragments[1].data_files()) == 1
+    assert fragments[1].data_files()[0] == original_fragments[1].data_files()[0]
+
+
 def test_flat_vector_search_with_delete(tmp_path: Path):
     table = pa.Table.from_pydict(
         {

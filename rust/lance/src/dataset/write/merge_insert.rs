@@ -1278,4 +1278,110 @@ mod tests {
 
         assert_eq!(ds.count_rows(None).await.unwrap(), 2048);
     }
+
+    #[tokio::test]
+    async fn test_merge_insert_subcols() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col("other", array::rand_utf8(4.into(), false))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseduo_uuid_hex());
+        let batch = data.into_batch_rows(RowCount::from(1024)).unwrap();
+        let schema = batch.schema();
+
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(batch.clone())],
+            schema.clone(),
+        ));
+        let write_params = WriteParams {
+            max_rows_per_file: 256,
+            ..Default::default()
+        };
+        let ds = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+
+        // New data with only a subset of columns
+        // TODO: how do I make sure there is overlap in rows?
+        let update_schema = Arc::new(schema.project(&[1, 2]).unwrap());
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(batch["key"].slice(256, 6)),
+                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(update_batch)],
+            update_schema.clone(),
+        ));
+
+        // Should reject when_not_matched_by_source_delete as not yet supported
+        let res = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build();
+        assert!(matches!(
+            res,
+            Err(Error::NotSupported { source, .. })
+                if source.to_string().contains("deleting when not matched by source for subschemas is not yet supported.")
+        ));
+
+        // Should reject when_not_matched_insert_all as invalid
+        let res = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build();
+        assert!(matches!(
+            res,
+            Err(Error::InvalidInput { source, .. })
+                if source.to_string().contains("Cannot insert rows with a partial schema.")
+        ));
+
+        // Should accept when_matched_update_all
+        let fragments_before = ds
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect::<Vec<_>>();
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+
+        job.execute_reader(reader).await.unwrap();
+
+        // Should not rewrite the affected data files
+        let fragments_after = ds
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fragments_before.iter().map(|f| f.id).collect::<Vec<_>>(),
+            fragments_after.iter().map(|f| f.id).collect::<Vec<_>>()
+        );
+        // Only the second fragment should be different.
+        assert_eq!(fragments_before[0], fragments_after[0]);
+        assert_ne!(fragments_before[1], fragments_after[1]);
+        assert_eq!(fragments_before[2], fragments_after[2]);
+        assert_eq!(fragments_before[3], fragments_after[3]);
+
+        // Should add a new data file for updated columns
+        assert_eq!(fragments_after[1].files.len(), 2);
+
+        // Updated columns should be only columns in new data files
+        // -2 field ids are tombstoned.
+        let data_files = fragments_after[1].files.clone();
+        assert_eq!(&data_files[0].fields, &[0, -2, -2]);
+        assert_eq!(&data_files[1].fields, &[1, 2]);
+    }
 }
