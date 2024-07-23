@@ -67,7 +67,7 @@ impl BufferEncoder for BitpackingBufferEncoder {
         // calculate the total number of bytes we need to allocate for the destination.
         // this will be the number of items in the source array times the number of bits.
         let count_items = arrays.iter().map(|arr| arr.len()).sum::<usize>();
-        let dst_bytes_total = count_items * ceil(self.num_bits as usize, 8);
+        let dst_bytes_total = ceil(count_items * self.num_bits as usize, 8);
 
         let mut dst_buffer = vec![0u8; dst_bytes_total];
         let mut dst_idx = 0;
