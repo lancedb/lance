@@ -445,7 +445,11 @@ impl Scanner {
 
     /// Find k-nearest neighbor within the vector column.
     pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
-        self.ensure_not_fragment_scan()?;
+        if !self.prefilter {
+            // We can allow fragment scan if the input to nearest is a prefilter.
+            // The fragment scan will be performed by the prefilter.
+            self.ensure_not_fragment_scan()?;
+        }
 
         if k == 0 {
             return Err(Error::io("k must be positive".to_string(), location!()));
@@ -1533,6 +1537,10 @@ impl Scanner {
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
             (Some(index_query), None, true) => {
+                // Index scan doesn't honor the fragment allowlist today.
+                // TODO: we could filter the index scan results to only include the allowed fragments.
+                self.ensure_not_fragment_scan()?;
+
                 // The filter is completely satisfied by the index.  We
                 // only need to search the index to determine the valid row
                 // ids.
