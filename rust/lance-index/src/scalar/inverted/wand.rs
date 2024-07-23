@@ -123,7 +123,6 @@ impl<'a> Wand<'a> {
         }
 
         while let Some(doc) = self.next() {
-            log::debug!("candidate doc: {}", doc);
             let score = self.score(doc, &scorer);
             if self.candidates.len() < k {
                 self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
@@ -142,6 +141,7 @@ impl<'a> Wand<'a> {
             .collect()
     }
 
+    // calculate the score of the document
     fn score(&self, doc: u64, scorer: &impl Fn(u64, f32) -> f32) -> f32 {
         let mut score = 0.0;
         for posting in &self.postings {
@@ -151,7 +151,7 @@ impl<'a> Wand<'a> {
                 // so we can break early once we find the current doc id is greater than the doc id we are looking for
                 break;
             }
-            assert!(cur_doc == doc);
+            debug_assert!(cur_doc == doc);
 
             score += posting.approximate_upper_bound() * scorer(doc, freq);
         }
@@ -167,6 +167,8 @@ impl<'a> Wand<'a> {
 
             let cur_doc = self.cur_doc.unwrap_or(0);
             if self.cur_doc.is_some() && doc <= cur_doc {
+                // the pivot doc id is less than the current doc id,
+                // that means this doc id has been processed before, so skip it
                 let posting = self.pick_term(cur_doc + 1, self.postings.iter().take(index + 1));
                 let mut posting = self
                     .postings
@@ -182,9 +184,14 @@ impl<'a> Wand<'a> {
                 .expect("the postings can't be empty")
                 == doc
             {
+                // all the posting iterators have reached this doc id,
+                // so that means the sum of upper bound of all terms is not less than the threshold,
+                // this document is a candidate
                 self.cur_doc = Some(doc);
                 return Some(doc);
             } else {
+                // some posting iterators haven't reached this doc id,
+                // so pick one of such term(s) and move it to the doc id
                 let posting = self.pick_term(doc, self.postings.iter().take(index));
                 let mut posting = self
                     .postings
@@ -198,6 +205,8 @@ impl<'a> Wand<'a> {
         None
     }
 
+    // find the first term that the sum of upper bound of all preceding terms and itself,
+    // are greater than or equal to the threshold
     fn find_pivot_term(&self) -> Option<(usize, PostingIterator<'a>)> {
         let mut acc = 0.0;
         for (i, iter) in self.postings.iter().enumerate() {
@@ -209,6 +218,8 @@ impl<'a> Wand<'a> {
         None
     }
 
+    // pick the term that has the maximum upper bound and the current doc id is less than the given doc id
+    // so that we can move the posting iterator to the next doc id that is possible to be candidate
     fn pick_term<'b>(
         &self,
         doc: u64,
