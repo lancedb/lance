@@ -113,6 +113,8 @@ jobs:
           git config --global user.name "dev+gha@lancedb.com"
       - name: Publish with Java 8
         run: |
+          mkdir -p ~/.gnupg
+          touch ~/.gnupg/gpg.conf
           echo "use-agent" >> ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           export GPG_TTY=$(tty)
