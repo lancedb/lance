@@ -1537,6 +1537,10 @@ impl Scanner {
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
             (Some(index_query), None, true) => {
+                // Index scan doesn't honor the fragment allowlist today.
+                // TODO: we could filter the index scan results to only include the allowed fragments.
+                self.ensure_not_fragment_scan()?;
+
                 // The filter is completely satisfied by the index.  We
                 // only need to search the index to determine the valid row
                 // ids.
