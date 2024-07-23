@@ -21,12 +21,15 @@ use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tantivy::tokenizer::Language;
 use tracing::instrument;
+use wand::{PostingIterator, Wand};
 
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::vector::graph::OrderedFloat;
 use crate::Index;
 
 use super::{AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex};
+
+mod wand;
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -83,7 +86,7 @@ impl InvertedIndex {
         &self,
         query: &FullTextSearchQuery,
         prefilter: Arc<dyn PreFilter>,
-    ) -> impl Iterator<Item = (u64, f32)> {
+    ) -> Vec<(u64, f32)> {
         let tokens = collect_tokens(&query.query);
         let token_ids = self
             .map(&tokens)
@@ -91,8 +94,14 @@ impl InvertedIndex {
             .sorted_unstable()
             .dedup()
             .collect();
-        self.bm25_search(token_ids, prefilter)
-            .take(query.limit.unwrap_or(i64::MAX) as usize)
+        self.bm25_search(
+            token_ids,
+            query
+                .limit
+                .map(|limit| limit as usize)
+                .unwrap_or(usize::MAX),
+            prefilter,
+        )
     }
 
     // search the documents that contain the query
@@ -104,45 +113,21 @@ impl InvertedIndex {
     fn bm25_search(
         &self,
         token_ids: Vec<u32>,
+        limit: usize,
         prefilter: Arc<dyn PreFilter>,
-    ) -> impl Iterator<Item = (u64, f32)> {
-        let mut bm25_scores = HashMap::new();
+    ) -> Vec<(u64, f32)> {
+        let mask = prefilter.mask();
 
-        if prefilter.is_empty() {
-            for token in &token_ids {
-                let list = self.invert_list.retrieve(*token);
-                self.search_posting_list(list, 0..list.len(), &mut bm25_scores);
-            }
-        } else {
-            for token in &token_ids {
-                let list = self.invert_list.retrieve(*token);
-                let indices = prefilter
-                    .filter_row_ids(Box::new(list.row_ids.iter()))
-                    .into_iter()
-                    .map(|i| i as usize);
-                self.search_posting_list(list, indices, &mut bm25_scores);
-            }
-        }
-
-        bm25_scores
-            .into_iter()
-            .sorted_unstable_by_key(|k| OrderedFloat(-k.1))
-    }
-
-    fn search_posting_list(
-        &self,
-        list: &PostingList,
-        indices: impl Iterator<Item = usize>,
-        scores: &mut HashMap<u64, f32>,
-    ) {
-        for i in indices {
-            let row_id = list.row_ids[i];
-            let score = list.scores[i];
-            scores
-                .entry(row_id)
-                .and_modify(|s| *s += score)
-                .or_insert(score);
-        }
+        let postings = token_ids.iter().filter_map(|token_id| {
+            let posting = self.invert_list.retrieve(*token_id);
+            PostingIterator::new(*token_id, posting, self.docs.len(), mask.clone())
+        });
+        let mut wand = Wand::new(postings);
+        wand.search(limit, |doc, freq| {
+            let doc_norm =
+                K1 * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
+            freq / (freq + doc_norm)
+        })
     }
 }
 
@@ -188,6 +173,7 @@ impl ScalarIndex for InvertedIndex {
         let row_ids = match query {
             SargableQuery::FullTextSearch(query) => self
                 .full_text_search(query, Arc::new(NoFilter))
+                .into_iter()
                 .map(|(row_id, _)| row_id),
             query => {
                 return Err(Error::invalid_input(
@@ -438,7 +424,7 @@ impl TokenSet {
     }
 }
 
-#[derive(Debug, Clone, Default, DeepSizeOf)]
+#[derive(Debug, PartialEq, Clone, Default, DeepSizeOf)]
 struct PostingList {
     row_ids: Vec<u64>,
     frequencies: Vec<f32>,
@@ -632,6 +618,33 @@ impl InvertedList {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Clone, DeepSizeOf)]
+struct OrderedDoc {
+    row_id: u64,
+    score: OrderedFloat,
+}
+
+impl OrderedDoc {
+    fn new(row_id: u64, score: f32) -> Self {
+        Self {
+            row_id,
+            score: OrderedFloat(score),
+        }
+    }
+}
+
+impl PartialOrd for OrderedDoc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedDoc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score.cmp(&other.score)
+    }
+}
+
 // DocSet is a mapping from row ids to the number of tokens in the document
 // It's used to sort the documents by the bm25 score
 #[derive(Debug, Clone, Default, DeepSizeOf)]
@@ -642,10 +655,12 @@ struct DocSet {
 }
 
 impl DocSet {
+    #[inline]
     fn len(&self) -> usize {
         self.token_count.len()
     }
 
+    #[inline]
     fn average_length(&self) -> f32 {
         self.total_tokens as f32 / self.token_count.len() as f32
     }
@@ -797,13 +812,15 @@ mod tests {
         let store = LanceIndexStore::new(ObjectStore::local(), index_dir, None);
 
         let invert_index = super::InvertedIndex::default();
-        let row_id_col = UInt64Array::from(vec![0, 1, 2, 3]);
         let doc_col = GenericStringArray::<Offset>::from(vec![
             "lance database search",
             "lance database",
             "lance search",
             "database search",
+            "unrelated doc",
+            "unrelated",
         ]);
+        let row_id_col = UInt64Array::from(Vec::from_iter(0..doc_col.len() as u64));
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
                 arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), false),
@@ -827,7 +844,7 @@ mod tests {
         let invert_index = super::InvertedIndex::load(Arc::new(store)).await.unwrap();
         let row_ids = invert_index
             .search(&super::SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("lance".to_owned()),
+                FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
@@ -838,7 +855,7 @@ mod tests {
 
         let row_ids = invert_index
             .search(&super::SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("database".to_owned()),
+                FullTextSearchQuery::new("database".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();

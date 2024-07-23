@@ -74,12 +74,14 @@ async fn main() {
             .unwrap();
     }
 
-    let dataset = Dataset::open(dataset_dir.as_ref()).await.unwrap();
+    let dataset = Dataset::open("/Users/yang/src/lance/fts.lance")
+        .await
+        .unwrap();
     let query = tokens[0];
     println!("query: {:?}", query);
     let batch = dataset
         .scan()
-        .full_text_search(FullTextSearchQuery::new(query.to_owned()))
+        .full_text_search(FullTextSearchQuery::new(query.to_owned()).limit(Some(10)))
         .unwrap()
         .try_into_batch()
         .await
