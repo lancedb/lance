@@ -28,7 +28,6 @@ use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::validate_operation;
-use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -37,6 +36,7 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
+use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::scalar::ScalarIndexType;
 use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
@@ -648,15 +648,23 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
     ) -> PyResult<PyObject> {
-        let projection = if let Some(columns) = columns {
-            self_.ds.schema().project(&columns)
-        } else {
-            Ok(self_.ds.schema().clone())
+        let projection = match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both columns and columns_with_transform",
+                ))
+            }
+            (Some(columns), None) => {
+                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+            }
+            (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
+            (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        .infer_error()?;
         let batch = RT
-            .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))?
+            .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
@@ -666,23 +674,26 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
     ) -> PyResult<PyObject> {
-        let projection = if let Some(columns) = columns {
-            self_.ds.schema().project(&columns)
-        } else {
-            Ok(self_.ds.schema().clone())
+        let projection = match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both columns and columns_with_transform",
+                ))
+            }
+            (Some(columns), None) => {
+                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+            }
+            (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
+            (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }
-        .map_err(|err| {
-            PyIOError::new_err(format!(
-                "TakeRows: failed to run projection over schema: {}",
-                err
-            ))
-        })?;
+        .infer_error()?;
 
         let batch = RT
             .block_on(
                 Some(self_.py()),
-                self_.ds.take_rows(&row_indices, &projection),
+                self_.ds.take_rows(&row_indices, projection),
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 

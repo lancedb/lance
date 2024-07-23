@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
+use lance_datafusion::projection::ProjectionPlan;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -190,6 +191,48 @@ impl Default for ReadParams {
             session: None,
             store_options: None,
             commit_handler: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ProjectionRequest {
+    Schema(Arc<Schema>),
+    Sql(Vec<(String, String)>),
+}
+
+impl ProjectionRequest {
+    pub fn from_columns(
+        columns: impl IntoIterator<Item = impl AsRef<str>>,
+        dataset_schema: &Schema,
+    ) -> Self {
+        let columns = columns
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect::<Vec<_>>();
+        let schema = dataset_schema.project(&columns).unwrap();
+        Self::Schema(Arc::new(schema))
+    }
+
+    pub fn from_schema(schema: Schema) -> Self {
+        Self::Schema(Arc::new(schema))
+    }
+
+    pub fn from_sql(
+        columns: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        Self::Sql(
+            columns
+                .into_iter()
+                .map(|(a, b)| (a.into(), b.into()))
+                .collect(),
+        )
+    }
+
+    pub fn into_projection_plan(self, dataset_schema: &Schema) -> Result<ProjectionPlan> {
+        match self {
+            Self::Schema(schema) => Ok(ProjectionPlan::new_empty(schema)),
+            Self::Sql(columns) => ProjectionPlan::try_new(dataset_schema, &columns),
         }
     }
 }
@@ -936,13 +979,31 @@ impl Dataset {
     }
 
     #[instrument(skip_all, fields(num_rows=row_indices.len()))]
-    pub async fn take(&self, row_indices: &[u64], projection: &Schema) -> Result<RecordBatch> {
-        take::take(self, row_indices, projection).await
+    pub async fn take(
+        &self,
+        row_indices: &[u64],
+        projection: ProjectionRequest,
+    ) -> Result<RecordBatch> {
+        take::take(
+            self,
+            row_indices,
+            &projection.into_projection_plan(self.schema())?,
+        )
+        .await
     }
 
     /// Take rows by the internal ROW ids.
-    pub async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
-        take::take_rows(self, row_ids, projection).await
+    pub async fn take_rows(
+        &self,
+        row_ids: &[u64],
+        projection: ProjectionRequest,
+    ) -> Result<RecordBatch> {
+        take::take_rows(
+            self,
+            row_ids,
+            &projection.into_projection_plan(self.schema())?,
+        )
+        .await
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -962,7 +1023,8 @@ impl Dataset {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
         let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
-        self.take(&ids, projection).await
+        self.take(&ids, ProjectionRequest::from_schema(projection.clone()))
+            .await
     }
 
     /// Delete rows based on a predicate.
@@ -1210,7 +1272,12 @@ impl DatasetTakeRows for Dataset {
     }
 
     async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
-        Self::take_rows(self, row_ids, projection).await
+        Self::take_rows(
+            self,
+            row_ids,
+            ProjectionRequest::from_schema(projection.clone()),
+        )
+        .await
     }
 }
 

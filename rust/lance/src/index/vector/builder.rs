@@ -45,6 +45,7 @@ use prost::Message;
 use snafu::{location, Location};
 use tempfile::{tempdir, TempDir};
 
+use crate::dataset::ProjectionRequest;
 use crate::Dataset;
 
 use super::utils;
@@ -589,11 +590,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
     async fn take_vectors(&self, row_ids: &[u64]) -> Result<Vec<RecordBatch>> {
         let column = self.column.clone();
         let object_store = self.dataset.object_store().clone();
-        let projection = self.dataset.schema().project(&[column.as_str()])?;
+        let projection = Arc::new(self.dataset.schema().project(&[column.as_str()])?);
         // arrow uses i32 for index, so we chunk the row ids to avoid large batch causing overflow
         let mut batches = Vec::new();
         for chunk in row_ids.chunks(object_store.block_size()) {
-            let batch = self.dataset.take_rows(chunk, &projection).await?;
+            let batch = self
+                .dataset
+                .take_rows(chunk, ProjectionRequest::Schema(projection.clone()))
+                .await?;
             let batch = batch.try_with_column(
                 ROW_ID_FIELD.clone(),
                 Arc::new(UInt64Array::from(chunk.to_vec())),
