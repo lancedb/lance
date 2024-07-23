@@ -15,7 +15,7 @@ use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_index::scalar::inverted::InvertedIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{SargableQuery, ScalarIndex};
+use lance_index::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
@@ -65,9 +65,9 @@ fn bench_inverted(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             black_box(
                 invert_index
-                    .search(&SargableQuery::FullTextSearch(vec![tokens
-                        [rand::random::<usize>() % tokens.len()]
-                    .to_owned()]))
+                    .search(&SargableQuery::FullTextSearch(FullTextSearchQuery::new(
+                        tokens[rand::random::<usize>() % tokens.len()].to_owned(),
+                    )))
                     .await
                     .unwrap(),
             );

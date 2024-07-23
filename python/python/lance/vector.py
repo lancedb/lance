@@ -192,7 +192,7 @@ def compute_partitions(
     column: str,
     kmeans: Any,  # KMeans
     batch_size: int = 10240,
-    dst_dataset_uri: Union[str, Path] = None,
+    dst_dataset_uri: Optional[Union[str, Path]] = None,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 

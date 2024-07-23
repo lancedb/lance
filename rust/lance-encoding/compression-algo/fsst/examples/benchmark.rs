@@ -38,7 +38,7 @@ fn benchmark(file_path: &str) {
     let mut inputs: Vec<StringArray> = vec![];
     let mut symbol_tables: Vec<[u8; FSST_SYMBOL_TABLE_SIZE]> = vec![];
     for _ in 0..TEST_NUM {
-        let this_input = read_random_8_m_chunk(&file_path).unwrap();
+        let this_input = read_random_8_m_chunk(file_path).unwrap();
         inputs.push(this_input);
         symbol_tables.push([0u8; FSST_SYMBOL_TABLE_SIZE]);
     }
@@ -68,7 +68,7 @@ fn benchmark(file_path: &str) {
     for i in 0..TEST_NUM {
         compress(
             symbol_tables[i].as_mut(),
-            &inputs[i].values(),
+            inputs[i].values(),
             inputs[i].value_offsets(),
             &mut compression_out_bufs[i],
             &mut compression_out_offsets_bufs[i],
@@ -111,10 +111,7 @@ fn benchmark(file_path: &str) {
 
     // Print tsv headers
     println!("for file: {}", file_path);
-    println!(
-        "{}\t{}\t{}",
-        "Compression ratio", "Compression speed", "Decompression speed"
-    );
+    println!("Compression ratio\tCompression speed\tDecompression speed");
     println!(
         "{:.3}\t\t\t\t{:.2}MB/s\t\t\t{:.2}MB/s",
         compression_ratio, com_speed, d_speed

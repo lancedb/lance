@@ -80,6 +80,10 @@ impl IndexReader for FileReader {
     async fn num_batches(&self) -> u32 {
         self.num_batches() as u32
     }
+
+    fn num_rows(&self) -> usize {
+        self.len()
+    }
 }
 
 #[async_trait]

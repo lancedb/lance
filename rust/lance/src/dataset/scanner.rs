@@ -35,7 +35,10 @@ use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
+use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::expression::PlannerIndexExt;
+use lance_index::scalar::inverted::SCORE_COL;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -48,6 +51,7 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
+use crate::io::exec::fts::FtsExec;
 use crate::io::exec::get_physical_optimizer;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
@@ -141,6 +145,9 @@ pub struct Scanner {
     /// Optional filter expression.
     pub(crate) filter: Option<Expr>,
 
+    /// Optional full text search query
+    full_text_query: Option<FullTextSearchQuery>,
+
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
 
@@ -210,6 +217,7 @@ impl Scanner {
             requested_output_expr: None,
             prefilter: false,
             filter: None,
+            full_text_query: None,
             batch_size: None,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
             fragment_readahead: None,
@@ -356,6 +364,35 @@ impl Scanner {
         let planner = Planner::new(schema);
         self.filter = Some(planner.parse_filter(filter)?);
         self.filter = Some(planner.optimize_expr(self.filter.take().unwrap())?);
+        Ok(self)
+    }
+
+    /// Filter by full text search
+    /// The column must be a string column.
+    /// The query is a string to search for.
+    /// The search is case-insensitive, BM25 scoring is used.
+    ///
+    /// ```rust,ignore
+    /// let dataset = Dataset::open(uri).await.unwrap();
+    /// let stream = dataset.scan()
+    ///    .project(&["col", "col2.subfield"]).unwrap()
+    ///    .full_text_search("col", "query").unwrap()
+    ///    .limit(10)
+    ///    .into_stream();
+    /// ```
+    pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
+        if !query.columns.is_empty() {
+            for column in &query.columns {
+                if self.dataset.schema().field(column).is_none() {
+                    return Err(Error::io(
+                        format!("Column {} not found", column),
+                        location!(),
+                    ));
+                }
+            }
+        }
+
+        self.full_text_query = Some(query);
         Ok(self)
     }
 
@@ -889,59 +926,72 @@ impl Scanner {
             FilterPlan::default()
         };
 
-        // Stage 1: source (either an (K|A)NN search or a (full|indexed) scan)
-        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
-            // The source is an nearest neighbor search
-            if self.prefilter {
-                // If we are prefiltering then the knn node will take care of the filter
-                let source = self.knn(&filter_plan).await?;
-                filter_plan = FilterPlan::default();
-                source
-            } else {
-                self.knn(&FilterPlan::default()).await?
+        // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
+        let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
+            (Some(_), None) => {
+                // The source is an nearest neighbor search
+                if self.prefilter {
+                    // If we are prefiltering then the knn node will take care of the filter
+                    let source = self.knn(&filter_plan).await?;
+                    filter_plan = FilterPlan::default();
+                    source
+                } else {
+                    self.knn(&FilterPlan::default()).await?
+                }
             }
-        } else {
-            // Avoid pushdown scan node if using v2 files
-            let fragments = if let Some(fragments) = self.fragments.as_ref() {
-                fragments
-            } else {
-                self.dataset.fragments()
-            };
-            let use_stats = if fragments.iter().any(|f| !f.has_legacy_files()) {
-                false
-            } else {
-                self.use_stats
-            };
-            match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
-                (Some(index_query), None) => {
-                    self.scalar_indexed_scan(&self.physical_columns, index_query)
-                        .await?
-                }
-                // TODO: support combined pushdown and scalar index scan
-                (Some(index_query), Some(_)) => {
-                    // If there is a filter then just load the filter
-                    // columns (we will `take` the remaining columns afterwards)
-                    let columns = filter_plan.refine_columns();
-                    let filter_schema = Arc::new(self.dataset.schema().project(&columns)?);
-                    self.scalar_indexed_scan(&filter_schema, index_query)
-                        .await?
-                }
-                (None, Some(_)) if use_stats && self.batch_size.is_none() => {
-                    self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
-                }
-                (None, _) => {
-                    // The source is a full scan of the table
-                    let with_row_id = filter_plan.has_refine() || self.with_row_id;
-                    let schema = if filter_plan.has_refine() {
-                        // If there is a filter then only load the filter columns in the
-                        // initial scan.  We will `take` the remaining columns later
+            (None, Some(query)) => {
+                // The source is a full text search
+                self.fts(&filter_plan, query).await?
+            }
+            (None, None) => {
+                // Avoid pushdown scan node if using v2 files
+                let fragments = if let Some(fragments) = self.fragments.as_ref() {
+                    fragments
+                } else {
+                    self.dataset.fragments()
+                };
+                let use_stats = if fragments.iter().any(|f| !f.has_legacy_files()) {
+                    false
+                } else {
+                    self.use_stats
+                };
+                match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
+                    (Some(index_query), None) => {
+                        self.scalar_indexed_scan(&self.physical_columns, index_query)
+                            .await?
+                    }
+                    // TODO: support combined pushdown and scalar index scan
+                    (Some(index_query), Some(_)) => {
+                        // If there is a filter then just load the filter
+                        // columns (we will `take` the remaining columns afterwards)
                         let columns = filter_plan.refine_columns();
-                        Arc::new(self.dataset.schema().project(&columns)?)
-                    } else {
-                        Arc::new(self.physical_columns.clone())
-                    };
-                    self.scan(with_row_id, self.with_row_address, false, schema)
+                        let filter_schema = Arc::new(self.dataset.schema().project(&columns)?);
+                        self.scalar_indexed_scan(&filter_schema, index_query)
+                            .await?
+                    }
+                    (None, Some(_)) if use_stats && self.batch_size.is_none() => {
+                        self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
+                    }
+                    (None, _) => {
+                        // The source is a full scan of the table
+                        let with_row_id = filter_plan.has_refine() || self.with_row_id;
+                        let schema = if filter_plan.has_refine() {
+                            // If there is a filter then only load the filter columns in the
+                            // initial scan.  We will `take` the remaining columns later
+                            let columns = filter_plan.refine_columns();
+                            Arc::new(self.dataset.schema().project(&columns)?)
+                        } else {
+                            Arc::new(self.physical_columns.clone())
+                        };
+                        self.scan(with_row_id, self.with_row_address, false, schema)
+                    }
                 }
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: "Cannot have both nearest and full text search".into(),
+                    location: location!(),
+                })
             }
         };
 
@@ -1037,6 +1087,76 @@ impl Scanner {
         debug!("Execution plan:\n{:?}", plan);
 
         Ok(plan)
+    }
+
+    // Create an execution plan to do full text search
+    async fn fts(
+        &self,
+        filter_plan: &FilterPlan,
+        query: &FullTextSearchQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let columns = if query.columns.is_empty() {
+            let index_info = self.dataset.scalar_index_info().await?;
+            self.dataset
+                .schema()
+                .fields
+                .iter()
+                .filter_map(|f| {
+                    if f.data_type() == DataType::Utf8 || f.data_type() == DataType::LargeUtf8 {
+                        index_info.get_index(&f.name).map(|_| f.name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            query.columns.clone()
+        };
+
+        // Now the full text search supports only one column
+        if columns.len() != 1 {
+            return Err(Error::io(
+                format!(
+                    "Full text search supports only one column right now, but got {} columns",
+                    columns.len()
+                ),
+                location!(),
+            ));
+        }
+        let column = &columns[0];
+        let index = self
+            .dataset
+            .load_scalar_index_for_column(column)
+            .await?
+            .ok_or(Error::io(
+                format!("Column {} has no inverted index", column),
+                location!(),
+            ))?;
+        let index_uuids = self
+            .dataset
+            .load_indices_by_name(&index.name)
+            .await?
+            .into_iter()
+            .collect();
+
+        let query = query.clone().columns(Some(columns)).limit(self.limit);
+        let prefilter_source = self.prefilter_source(filter_plan).await?;
+        let fts_plan = FtsExec::new(self.dataset.clone(), index_uuids, query, prefilter_source);
+        let sort_expr = PhysicalSortExpr {
+            expr: expressions::col(SCORE_COL, fts_plan.schema().as_ref())?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        };
+
+        Ok(Arc::new(
+            SortExec::new(
+                vec![sort_expr],
+                Arc::new(fts_plan) as Arc<dyn ExecutionPlan>,
+            )
+            .with_fetch(self.limit.map(|l| l as usize)),
+        ))
     }
 
     // ANN/KNN search execution node with optional prefilter
@@ -1440,6 +1560,24 @@ impl Scanner {
         index: &[Index],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let prefilter_source = self.prefilter_source(filter_plan).await?;
+
+        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
+        let sort_expr = PhysicalSortExpr {
+            expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
+        Ok(Arc::new(
+            SortExec::new(vec![sort_expr], inner_fanout_search)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+        ))
+    }
+
+    /// Create prefilter source from filter plan
+    async fn prefilter_source(&self, filter_plan: &FilterPlan) -> Result<PreFilterSource> {
         let prefilter_source = match (
             &filter_plan.index_query,
             &filter_plan.refine_expr,
@@ -1487,18 +1625,7 @@ impl Scanner {
             (_, _, false) => PreFilterSource::None,
         };
 
-        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
-        let sort_expr = PhysicalSortExpr {
-            expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
-            options: SortOptions {
-                descending: false,
-                nulls_first: false,
-            },
-        };
-        Ok(Arc::new(
-            SortExec::new(vec![sort_expr], inner_fanout_search)
-                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
-        ))
+        Ok(prefilter_source)
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)

@@ -42,6 +42,7 @@ use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
@@ -434,6 +435,7 @@ impl Dataset {
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
+        full_text_query: Option<&PyDict>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -462,6 +464,30 @@ impl Dataset {
             }
             scanner
                 .filter(f.as_str())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(full_text_query) = full_text_query {
+            let query = full_text_query
+                .get_item("query")?
+                .ok_or_else(|| PyKeyError::new_err("Need column for full text search"))?
+                .to_string();
+            let columns = if let Some(columns) = full_text_query.get_item("columns")? {
+                if columns.is_none() {
+                    None
+                } else {
+                    Some(
+                        PyAny::downcast::<PyList>(columns)?
+                            .iter()
+                            .map(|c| c.extract::<String>())
+                            .collect::<PyResult<Vec<String>>>()?,
+                    )
+                }
+            } else {
+                None
+            };
+            let full_text_query = FullTextSearchQuery::new(query).columns(columns);
+            scanner
+                .full_text_search(full_text_query)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
@@ -934,7 +960,7 @@ impl Dataset {
     ) -> PyResult<()> {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
-            "BTREE" | "BITMAP" | "LABEL_LIST" => IndexType::Scalar,
+            "BTREE" | "BITMAP" | "LABEL_LIST" | "INVERTED" => IndexType::Scalar,
             "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -954,6 +980,10 @@ impl Dataset {
         } else if index_type == "LABEL_LIST" {
             Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),
+            })
+        } else if index_type == "INVERTED" {
+            Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::Inverted),
             })
         } else {
             let column_type = match self.ds.schema().field(columns[0]) {
