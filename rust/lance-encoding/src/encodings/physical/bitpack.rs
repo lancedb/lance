@@ -27,28 +27,28 @@ use crate::{
 // bitpacking encoding. Returns `None` if the type or array data is not supported.
 pub fn num_compressed_bits(arr: ArrayRef) -> Option<u64> {
     match arr.data_type() {
-        DataType::UInt8 => Some(num_bits_for_type::<UInt8Type>(arr.as_primitive())),
-        DataType::UInt16 => Some(num_bits_for_type::<UInt16Type>(arr.as_primitive())),
-        DataType::UInt32 => Some(num_bits_for_type::<UInt32Type>(arr.as_primitive())),
-        DataType::UInt64 => Some(num_bits_for_type::<UInt64Type>(arr.as_primitive())),
+        DataType::UInt8 => num_bits_for_type::<UInt8Type>(arr.as_primitive()),
+        DataType::UInt16 => num_bits_for_type::<UInt16Type>(arr.as_primitive()),
+        DataType::UInt32 => num_bits_for_type::<UInt32Type>(arr.as_primitive()),
+        DataType::UInt64 => num_bits_for_type::<UInt64Type>(arr.as_primitive()),
         // TODO -- eventually we could support signed types as well
         _ => None,
     }
 }
 
-// Compute the number of bits to to use for bitpacking generically.
-fn num_bits_for_type<T>(arr: &PrimitiveArray<T>) -> u64
+// Compute the number bits to to use for bitpacking generically.
+// returns None if the array is empty or all nulls
+fn num_bits_for_type<T>(arr: &PrimitiveArray<T>) -> Option<u64>
 where
     T: ArrowPrimitiveType,
     T::Native: PrimInt + AsPrimitive<u64>,
 {
-    // safe to unwrap here because if the array is empty or all nulls it's
-    // handled in BasicEncoder
-    let max = arrow::compute::bit_or(arr).unwrap();
-    let num_bits = arr.data_type().byte_width() as u64 * 8 - max.leading_zeros() as u64;
+    let max = arrow::compute::bit_or(arr);
+    let num_bits =
+        max.map(|max| arr.data_type().byte_width() as u64 * 8 - max.leading_zeros() as u64);
 
     // we can't bitpack into 0 bits, so the minimum is 1
-    num_bits.max(1)
+    num_bits.map(|num_bits| num_bits.max(1))
 }
 
 #[derive(Debug)]
@@ -66,7 +66,6 @@ impl BufferEncoder for BitpackingBufferEncoder {
     fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
         // calculate the total number of bytes we need to allocate for the destination.
         // this will be the number of items in the source array times the number of bits.
-        // let count_items = count_items_to_pack(arrays);
         let count_items = arrays.iter().map(|arr| arr.len()).sum::<usize>();
         let dst_bytes_total = count_items * ceil(self.num_bits as usize, 8);
 
@@ -133,6 +132,7 @@ fn pack_buffers(
     dst_offset: &mut u8,
 ) {
     let buffers = data.buffers();
+    debug_assert_eq!(buffers.len(), 1);
     for buffer in buffers {
         pack_bits(buffer, num_bits, byte_len, dst, dst_idx, dst_offset);
     }
@@ -148,10 +148,7 @@ fn pack_bits(
 ) {
     let bit_len = byte_len as u64 * 8;
 
-    let mut mask = 0u64;
-    for _ in 0..num_bits {
-        mask = mask << 1 | 1;
-    }
+    let mask = u64::MAX >> (64 - num_bits);
 
     let mut src_idx = 0;
     while src_idx < src.len() {
@@ -332,10 +329,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
         let mut dst_idx = dst.len(); // index for current byte being written to destination buffer
 
         // create bit mask for source bits
-        let mut mask = 0u64;
-        for _ in 0..self.bits_per_value {
-            mask = mask << 1 | 1;
-        }
+        let mask = u64::MAX >> (64 - self.bits_per_value);
 
         for i in 0..self.data.len() {
             let src = &self.data[i];
