@@ -31,10 +31,7 @@ impl Eq for PostingIterator<'_> {}
 
 impl PartialOrd for PostingIterator<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match self.doc().partial_cmp(&other.doc()) {
-            Some(std::cmp::Ordering::Equal) => Some(self.token_id.cmp(&other.token_id)),
-            ord => ord,
-        }
+        Some(self.cmp(other))
     }
 }
 
