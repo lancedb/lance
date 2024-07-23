@@ -178,25 +178,23 @@ impl<'a> Wand<'a> {
                 if posting.next(cur_doc + 1).is_some() {
                     self.postings.insert(posting);
                 }
+            } else if self
+                .postings
+                .first()
+                .and_then(|posting| posting.doc().map(|(d, _)| d))
+                .expect("the postings can't be empty")
+                == doc
+            {
+                self.cur_doc = Some(doc);
+                return Some(doc);
             } else {
-                if self
+                let posting = self.pick_term(doc, self.postings.iter().take(index));
+                let mut posting = self
                     .postings
-                    .first()
-                    .and_then(|posting| posting.doc().map(|(d, _)| d))
-                    .expect("the postings can't be empty")
-                    == doc
-                {
-                    self.cur_doc = Some(doc);
-                    return Some(doc);
-                } else {
-                    let posting = self.pick_term(doc, self.postings.iter().take(index));
-                    let mut posting = self
-                        .postings
-                        .take(&posting)
-                        .expect("we just found it in the previous step");
-                    if posting.next(doc).is_some() {
-                        self.postings.insert(posting);
-                    }
+                    .take(&posting)
+                    .expect("we just found it in the previous step");
+                if posting.next(doc).is_some() {
+                    self.postings.insert(posting);
                 }
             }
         }
