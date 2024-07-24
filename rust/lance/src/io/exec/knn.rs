@@ -8,10 +8,9 @@ use arrow::datatypes::UInt32Type;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
-    ArrayRef, RecordBatch, StringArray, UInt64Array,
+    ArrayRef, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use async_trait::async_trait;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
@@ -23,8 +22,7 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
 use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
-use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_core::ROW_ID_FIELD;
 use lance_index::vector::{
     flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
 };
@@ -38,6 +36,8 @@ use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
+
+use super::utils::{FilteredRowIdsToPrefilter, PreFilterSource, SelectionVectorToPrefilter};
 
 /// Check vector column exists and has the correct data type.
 fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
@@ -222,65 +222,6 @@ impl ExecutionPlan for KNNVectorDistanceExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
-}
-
-// Utility to convert an input (containing row ids) into a prefilter
-struct FilteredRowIdsToPrefilter(SendableRecordBatchStream);
-
-#[async_trait]
-impl FilterLoader for FilteredRowIdsToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
-        let mut allow_list = RowIdTreeMap::new();
-        while let Some(batch) = self.0.next().await {
-            let batch = batch?;
-            let row_ids = batch.column_by_name(ROW_ID).expect(
-                "input batch missing row id column even though it is in the schema for the stream",
-            );
-            let row_ids = row_ids
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("row id column in input batch had incorrect type");
-            allow_list.extend(row_ids.iter().flatten())
-        }
-        Ok(RowIdMask::from_allowed(allow_list))
-    }
-}
-
-// Utility to convert a serialized selection vector into a prefilter
-struct SelectionVectorToPrefilter(SendableRecordBatchStream);
-
-#[async_trait]
-impl FilterLoader for SelectionVectorToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
-        let batch = self
-            .0
-            .try_next()
-            .await?
-            .ok_or_else(|| Error::Internal {
-                message: "Selection vector source for prefilter did not yield any batches".into(),
-                location: location!(),
-            })
-            .unwrap();
-        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
-            Error::Internal {
-                message: format!(
-                    "Expected selection vector input to yield binary arrays but got {}",
-                    batch["result"].data_type()
-                ),
-                location: location!(),
-            }
-        })?)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum PreFilterSource {
-    /// The prefilter input is an array of row ids that match the filter condition
-    FilteredRowIds(Arc<dyn ExecutionPlan>),
-    /// The prefilter input is a selection vector from an index query
-    ScalarIndexQuery(Arc<dyn ExecutionPlan>),
-    /// There is no prefilter
-    None,
 }
 
 lazy_static::lazy_static! {

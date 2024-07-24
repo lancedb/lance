@@ -16,6 +16,7 @@ lance-arrow.workspace = true
 lance-core.workspace = true
 lance-encoding.workspace = true
 lance-io.workspace = true
+lance-testing.workspace = true
 arrow-arith.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true

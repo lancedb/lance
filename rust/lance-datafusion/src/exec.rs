@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
     dataframe::DataFrame,
@@ -17,13 +18,14 @@ use datafusion::{
         TaskContext,
     },
     physical_plan::{
-        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-        SendableRecordBatchStream,
+        stream::RecordBatchStreamAdapter, streaming::PartitionStream, DisplayAs, DisplayFormatType,
+        ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
+use futures::stream;
 use lance_arrow::SchemaExt;
 use lance_core::Result;
 use log::{info, warn};
@@ -56,6 +58,15 @@ impl OneShotExec {
                 datafusion::physical_plan::ExecutionMode::Bounded,
             ),
         }
+    }
+
+    pub fn from_batch(batch: RecordBatch) -> Self {
+        let schema = batch.schema();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        ));
+        Self::new(stream)
     }
 }
 

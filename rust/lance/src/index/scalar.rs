@@ -10,6 +10,8 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
+use lance_index::scalar::bitmap::train_inverted_index;
+use lance_index::scalar::inverted::{InvertedIndex, INVERT_LIST_FILE};
 use lance_index::{
     scalar::{
         bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
@@ -39,6 +41,7 @@ pub enum ScalarIndexType {
     BTree,
     Bitmap,
     LabelList,
+    Inverted,
 }
 
 #[derive(Default)]
@@ -122,6 +125,9 @@ pub async fn build_scalar_index(
         Some(ScalarIndexType::LabelList) => {
             train_label_list_index(training_request, &index_store).await
         }
+        Some(ScalarIndexType::Inverted) => {
+            train_inverted_index(training_request, &index_store).await
+        }
         _ => {
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
             train_btree_index(training_request, &flat_index_trainer, &index_store).await
@@ -145,17 +151,19 @@ pub async fn open_scalar_index(
         ),
         location: location!(),
     })?;
+    let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
+    let inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
     if let DataType::List(_) = col.data_type() {
         let tag_index = LabelListIndex::load(index_store).await?;
         Ok(tag_index as Arc<dyn ScalarIndex>)
+    } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
+        let bitmap_index = BitmapIndex::load(index_store).await?;
+        Ok(bitmap_index as Arc<dyn ScalarIndex>)
+    } else if dataset.object_store.exists(&inverted_list_lookup).await? {
+        let inverted_index = InvertedIndex::load(index_store).await?;
+        Ok(inverted_index as Arc<dyn ScalarIndex>)
     } else {
-        let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
-        if dataset.object_store.exists(&bitmap_page_lookup).await? {
-            let bitmap_index = BitmapIndex::load(index_store).await?;
-            Ok(bitmap_index as Arc<dyn ScalarIndex>)
-        } else {
-            let btree_index = BTreeIndex::load(index_store).await?;
-            Ok(btree_index as Arc<dyn ScalarIndex>)
-        }
+        let btree_index = BTreeIndex::load(index_store).await?;
+        Ok(btree_index as Arc<dyn ScalarIndex>)
     }
 }

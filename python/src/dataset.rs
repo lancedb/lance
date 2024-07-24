@@ -28,7 +28,6 @@ use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::validate_operation;
-use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -37,11 +36,13 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
+use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::scalar::ScalarIndexType;
 use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
@@ -434,6 +435,7 @@ impl Dataset {
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
+        full_text_query: Option<&PyDict>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -462,6 +464,30 @@ impl Dataset {
             }
             scanner
                 .filter(f.as_str())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(full_text_query) = full_text_query {
+            let query = full_text_query
+                .get_item("query")?
+                .ok_or_else(|| PyKeyError::new_err("Need column for full text search"))?
+                .to_string();
+            let columns = if let Some(columns) = full_text_query.get_item("columns")? {
+                if columns.is_none() {
+                    None
+                } else {
+                    Some(
+                        PyAny::downcast::<PyList>(columns)?
+                            .iter()
+                            .map(|c| c.extract::<String>())
+                            .collect::<PyResult<Vec<String>>>()?,
+                    )
+                }
+            } else {
+                None
+            };
+            let full_text_query = FullTextSearchQuery::new(query).columns(columns);
+            scanner
+                .full_text_search(full_text_query)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
@@ -622,15 +648,23 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
     ) -> PyResult<PyObject> {
-        let projection = if let Some(columns) = columns {
-            self_.ds.schema().project(&columns)
-        } else {
-            Ok(self_.ds.schema().clone())
+        let projection = match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both columns and columns_with_transform",
+                ))
+            }
+            (Some(columns), None) => {
+                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+            }
+            (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
+            (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        .infer_error()?;
         let batch = RT
-            .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))?
+            .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
@@ -640,23 +674,26 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
     ) -> PyResult<PyObject> {
-        let projection = if let Some(columns) = columns {
-            self_.ds.schema().project(&columns)
-        } else {
-            Ok(self_.ds.schema().clone())
+        let projection = match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both columns and columns_with_transform",
+                ))
+            }
+            (Some(columns), None) => {
+                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+            }
+            (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
+            (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }
-        .map_err(|err| {
-            PyIOError::new_err(format!(
-                "TakeRows: failed to run projection over schema: {}",
-                err
-            ))
-        })?;
+        .infer_error()?;
 
         let batch = RT
             .block_on(
                 Some(self_.py()),
-                self_.ds.take_rows(&row_indices, &projection),
+                self_.ds.take_rows(&row_indices, projection),
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
@@ -934,7 +971,7 @@ impl Dataset {
     ) -> PyResult<()> {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
-            "BTREE" | "BITMAP" | "LABEL_LIST" => IndexType::Scalar,
+            "BTREE" | "BITMAP" | "LABEL_LIST" | "INVERTED" => IndexType::Scalar,
             "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -954,6 +991,10 @@ impl Dataset {
         } else if index_type == "LABEL_LIST" {
             Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),
+            })
+        } else if index_type == "INVERTED" {
+            Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::Inverted),
             })
         } else {
             let column_type = match self.ds.schema().field(columns[0]) {
@@ -1025,10 +1066,13 @@ impl Dataset {
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let object_store_params = storage_options.map(|storage_options| ObjectStoreParams {
-            storage_options: Some(storage_options),
-            ..Default::default()
-        });
+        let object_store_params =
+            storage_options
+                .as_ref()
+                .map(|storage_options| ObjectStoreParams {
+                    storage_options: Some(storage_options.clone()),
+                    ..Default::default()
+                });
 
         let commit_handler = commit_lock.map(|commit_lock| {
             Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
@@ -1036,7 +1080,14 @@ impl Dataset {
         });
         let ds = RT
             .block_on(commit_lock.map(|cl| cl.py()), async move {
-                let dataset = match DatasetBuilder::from_uri(dataset_uri).load().await {
+                let mut builder = DatasetBuilder::from_uri(dataset_uri);
+                if let Some(storage_options) = storage_options {
+                    builder = builder.with_storage_options(storage_options);
+                }
+                if let Some(read_version) = read_version {
+                    builder = builder.with_version(read_version);
+                }
+                let dataset = match builder.load().await {
                     Ok(ds) => Some(ds),
                     Err(lance::Error::DatasetNotFound { .. }) => None,
                     Err(err) => return Err(err),
