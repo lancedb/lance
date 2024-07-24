@@ -102,7 +102,7 @@ jobs:
       - name: Publish with Java 8
         run: |
           echo "dummy_test"
-          echo "use-agent" >> ~/.gnupg/gpg.conf
+          echo "use-agent" > ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           export GPG_TTY=$(tty)
           mvn --batch-mode -DskipTests -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
