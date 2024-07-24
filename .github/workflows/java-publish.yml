@@ -102,7 +102,7 @@ jobs:
       - name: Publish with Java 8
         run: |
           echo "dummy_test"
-          mkdir -f ~/.gnupg
+          mkdir -p ~/.gnupg
           echo "use-agent" >> ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           export GPG_TTY=$(tty)
