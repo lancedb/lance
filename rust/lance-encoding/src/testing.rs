@@ -63,6 +63,7 @@ async fn test_decode(
     num_rows: u64,
     batch_size: u32,
     schema: &Schema,
+    column_indices: &[u32],
     column_infos: &[Arc<ColumnInfo>],
     expected: Option<Arc<dyn Array>>,
     io: &Arc<dyn EncodingsIo>,
@@ -74,6 +75,7 @@ async fn test_decode(
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
+        column_indices,
         column_infos,
         &Vec::new(),
         num_rows,
@@ -125,7 +127,8 @@ impl ArrayGeneratorProvider for RandomArrayGeneratorProvider {
 }
 
 /// Given a field this will test the round trip encoding and decoding of random data
-pub async fn check_round_trip_encoding_random(field: Field) {
+pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<String, String>) {
+    let field = field.with_metadata(metadata);
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
     };
@@ -219,9 +222,14 @@ impl TestCases {
 /// In other words, these are multiple chunks of one long array and not multiple columns
 /// in a record batch.  To feed a "record batch" you should first convert the record batch
 /// to a struct array.
-pub async fn check_round_trip_encoding_of_data(data: Vec<Arc<dyn Array>>, test_cases: &TestCases) {
+pub async fn check_round_trip_encoding_of_data(
+    data: Vec<Arc<dyn Array>>,
+    test_cases: &TestCases,
+    metadata: HashMap<String, String>,
+) {
     let example_data = data.first().expect("Data must have at least one array");
-    let field = Field::new("", example_data.data_type().clone(), true);
+    let mut field = Field::new("", example_data.data_type().clone(), true);
+    field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         let encoding_strategy = CoreFieldEncodingStrategy::default();
@@ -346,6 +354,7 @@ async fn check_round_trip_encoding_inner(
         num_rows,
         test_cases.batch_size,
         &schema,
+        &[0],
         &column_infos,
         concat_data.clone(),
         &scheduler_copy.clone(),
@@ -381,6 +390,7 @@ async fn check_round_trip_encoding_inner(
             num_rows,
             test_cases.batch_size,
             &schema,
+            &[0],
             &column_infos,
             expected,
             &scheduler.clone(),
@@ -427,6 +437,7 @@ async fn check_round_trip_encoding_inner(
             num_rows,
             test_cases.batch_size,
             &schema,
+            &[0],
             &column_infos,
             expected,
             &scheduler.clone(),

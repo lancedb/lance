@@ -16,7 +16,7 @@ use arrow_array::{
         UInt32Type, UInt64Type, UInt8Type,
     },
     ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, GenericByteArray,
-    PrimitiveArray,
+    PrimitiveArray, StructArray,
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
@@ -273,6 +273,30 @@ pub fn primitive_array_from_buffers(
         DataType::LargeBinary => Ok(new_generic_byte_array::<GenericBinaryType<i64>>(
             buffers, num_rows,
         )),
+        DataType::Struct(fields) => {
+            let mut field_arrays = Vec::new();
+
+            for (field_index, field) in fields.iter().enumerate() {
+                let null_bytes = BytesMut::default();
+                let mut final_buffers = vec![null_bytes];
+
+                // Pushes a null buffer for inner field of the FSL
+                // Right now this works only if inner fields of the FSL are nullable
+                if matches!(field.data_type(), DataType::FixedSizeList(_, _)) {
+                    final_buffers.push(BytesMut::default());
+                }
+
+                final_buffers.push(buffers[field_index].clone());
+
+                let field_array =
+                    primitive_array_from_buffers(field.data_type(), final_buffers, num_rows)?;
+
+                field_arrays.push(field_array);
+            }
+
+            let struct_array = StructArray::try_new(fields.clone(), field_arrays, None).unwrap();
+            Ok(Arc::new(struct_array))
+        }
         _ => Err(Error::io(
             format!(
                 "The data type {} cannot be decoded from a primitive encoding",

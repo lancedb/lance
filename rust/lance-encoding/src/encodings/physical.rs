@@ -3,6 +3,7 @@
 
 use arrow_schema::DataType;
 use fsst::FsstPageScheduler;
+use packed_struct::PackedStructPageScheduler;
 
 use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PageScheduler, format::pb};
@@ -22,6 +23,7 @@ pub mod buffers;
 pub mod dictionary;
 pub mod fixed_size_list;
 pub mod fsst;
+pub mod packed_struct;
 pub mod value;
 
 /// These contain the file buffers shared across the entire file
@@ -187,6 +189,37 @@ pub fn decoder_from_array_encoding(
                 indices_scheduler.into(),
                 items_scheduler.into(),
                 num_dictionary_items,
+            ))
+        }
+        pb::array_encoding::ArrayEncoding::PackedStruct(packed_struct) => {
+            let inner_encodings = &packed_struct.inner;
+            let fields = match data_type {
+                DataType::Struct(fields) => Some(fields),
+                _ => None,
+            }
+            .unwrap();
+
+            let inner_datatypes = fields
+                .iter()
+                .map(|field| field.data_type())
+                .collect::<Vec<_>>();
+
+            let mut inner_schedulers = Vec::with_capacity(fields.len());
+            for i in 0..fields.len() {
+                let inner_encoding = &inner_encodings[i];
+                let inner_datatype = inner_datatypes[i];
+                let inner_scheduler =
+                    decoder_from_array_encoding(inner_encoding, buffers, inner_datatype);
+                inner_schedulers.push(inner_scheduler);
+            }
+
+            let packed_buffer = packed_struct.buffer.as_ref().unwrap();
+            let (buffer_offset, _) = get_buffer(packed_buffer, buffers);
+
+            Box::new(PackedStructPageScheduler::new(
+                inner_schedulers,
+                data_type.clone(),
+                buffer_offset,
             ))
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column

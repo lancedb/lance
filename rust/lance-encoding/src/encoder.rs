@@ -11,18 +11,18 @@ use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
+use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::physical::bitpack::{num_compressed_bits, BitpackingBufferEncoder};
 use crate::encodings::physical::buffers::{
     BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder,
 };
 use crate::encodings::physical::fsst::FsstArrayEncoder;
+use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
 use crate::{
     decoder::{ColumnInfo, PageInfo},
     encodings::{
-        logical::{
-            list::ListFieldEncoder, primitive::PrimitiveFieldEncoder, r#struct::StructFieldEncoder,
-        },
+        logical::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder},
         physical::{
             basic::BasicEncoder, binary::BinaryEncoder, dictionary::DictionaryEncoder,
             fixed_size_list::FslEncoder, value::ValueEncoder,
@@ -56,6 +56,7 @@ impl std::fmt::Debug for EncodedBuffer {
     }
 }
 
+#[derive(Clone)]
 pub struct EncodedArrayBuffer {
     /// The data making up the buffer
     pub parts: Vec<Buffer>,
@@ -77,9 +78,9 @@ impl std::fmt::Debug for EncodedArrayBuffer {
 ///
 /// Maps to a single Arrow array
 ///
-/// This may contain multiple buffers.  For example, a nullable int32 array will contain two buffers,
+/// This may contain multiple EncodedArrayBuffers.  For example, a nullable int32 array will contain two buffers,
 /// one for the null bitmap and one for the values
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EncodedArray {
     /// The encoded buffers
     pub buffers: Vec<EncodedArrayBuffer>,
@@ -289,6 +290,22 @@ impl CoreArrayEncodingStrategy {
                         Ok(bin_encoder)
                     }
                 }
+            }
+            DataType::Struct(fields) => {
+                let num_fields = fields.len();
+                let mut inner_encoders = Vec::new();
+
+                for i in 0..num_fields {
+                    let inner_datatype = fields[i].data_type();
+                    let inner_encoder = Self::array_encoder_from_type(
+                        inner_datatype,
+                        data_size,
+                        use_dict_encoding,
+                    )?;
+                    inner_encoders.push(inner_encoder);
+                }
+
+                Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
@@ -541,25 +558,39 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                 )))
             }
             DataType::Struct(_) => {
-                let header_idx = column_index.next_column_index(field.id);
-                let children_encoders = field
-                    .children
-                    .iter()
-                    .map(|field| {
-                        self.create_field_encoder(
-                            encoding_strategy_root,
-                            field,
-                            column_index,
-                            cache_bytes_per_column,
-                            keep_original_array,
-                            &field.metadata,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(Box::new(StructFieldEncoder::new(
-                    children_encoders,
-                    header_idx,
-                )))
+                let field_metadata = &field.metadata;
+                if field_metadata
+                    .get("packed")
+                    .map(|v| v == "true")
+                    .unwrap_or(false)
+                {
+                    Ok(Box::new(PrimitiveFieldEncoder::try_new(
+                        cache_bytes_per_column,
+                        keep_original_array,
+                        self.array_encoding_strategy.clone(),
+                        column_index.next_column_index(field.id),
+                    )?))
+                } else {
+                    let header_idx = column_index.next_column_index(field.id);
+                    let children_encoders = field
+                        .children
+                        .iter()
+                        .map(|field| {
+                            self.create_field_encoder(
+                                encoding_strategy_root,
+                                field,
+                                column_index,
+                                cache_bytes_per_column,
+                                keep_original_array,
+                                &field.metadata,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Box::new(StructFieldEncoder::new(
+                        children_encoders,
+                        header_idx,
+                    )))
+                }
             }
             _ => todo!("Implement encoding for field {}", field),
         }
@@ -619,6 +650,7 @@ pub struct EncodedBatch {
     pub data: Bytes,
     pub page_table: Vec<Arc<ColumnInfo>>,
     pub schema: Arc<Schema>,
+    pub top_level_columns: Vec<u32>,
     pub num_rows: u64,
 }
 
@@ -703,8 +735,14 @@ pub async fn encode_batch(
         }
         col_idx_offset += num_columns;
     }
+    let top_level_columns = batch_encoder
+        .field_id_to_column_index
+        .iter()
+        .map(|(_, idx)| *idx as u32)
+        .collect();
     Ok(EncodedBatch {
         data: data_buffer.freeze(),
+        top_level_columns,
         page_table,
         schema,
         num_rows: batch.num_rows() as u64,

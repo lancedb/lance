@@ -210,6 +210,11 @@ message Dictionary {
   uint32 num_dictionary_items = 3;
 }
 
+message PackedStruct {
+  repeated ArrayEncoding inner = 1;
+  Buffer buffer = 2;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -221,7 +226,8 @@ message ArrayEncoding {
         Binary binary = 6;
         Dictionary dictionary = 7;
         Fsst fsst = 8;
-        Bitpacked bitpacked = 9;
+        PackedStruct packed_struct = 9;
+        Bitpacked bitpacked = 10;
     }
 }
 
