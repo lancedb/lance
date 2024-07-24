@@ -250,7 +250,7 @@ pub struct FileScheduler {
 }
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
-    debug_assert!(range1.end <= range2.start);
+    // Note that range1.end <= range2.start is possible (e.g. when decoding string arrays)
     range2.start <= (range1.end + block_size)
 }
 
@@ -270,8 +270,9 @@ impl FileScheduler {
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.file_index as u128) << 64) + priority as u128;
+        println!("Number of requests: {}", request.len());
 
-        let mut updated_requests = Vec::new();
+        let mut updated_requests = Vec::with_capacity(request.len());
 
         let copy_request = request.clone();
 
@@ -290,6 +291,7 @@ impl FileScheduler {
             updated_requests.push(curr_interval);
         }
 
+        println!("length of updated_requests: {}", updated_requests.len());
         let copy_updated_requests = updated_requests.clone();
 
         let bytes_vec_fut =
@@ -336,6 +338,7 @@ impl FileScheduler {
         range: Range<u64>,
         priority: u64,
     ) -> impl Future<Output = Result<Bytes>> + Send {
+        println!("Submitting single request");
         self.submit_request(vec![range], priority)
             .map_ok(|vec_bytes| vec_bytes.into_iter().next().unwrap())
     }

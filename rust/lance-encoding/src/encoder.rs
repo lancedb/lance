@@ -51,6 +51,7 @@ impl std::fmt::Debug for EncodedBuffer {
     }
 }
 
+#[derive(Clone)]
 pub struct EncodedArrayBuffer {
     /// The data making up the buffer
     pub parts: Vec<Buffer>,

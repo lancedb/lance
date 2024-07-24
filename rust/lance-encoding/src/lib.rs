@@ -52,6 +52,7 @@ pub trait EncodingsIo: Send + Sync {
         range: std::ops::Range<u64>,
         priority: u64,
     ) -> BoxFuture<'static, lance_core::Result<bytes::Bytes>> {
+        println!("Submitting single request");
         self.submit_request(vec![range], priority)
             .map_ok(|mut v| v.pop().unwrap())
             .boxed()

@@ -9,8 +9,7 @@ use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, ScalarBuffer};
 use bytes::BytesMut;
-use futures::stream::StreamExt;
-use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt};
+use futures::{future::BoxFuture, FutureExt};
 
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -19,12 +18,10 @@ use crate::{
     EncodingsIo,
 };
 
-use crate::decoder::LogicalPageDecoder;
-use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
-
 use arrow_array::{PrimitiveArray, UInt64Array, UInt8Array};
 use arrow_schema::DataType;
 use lance_core::Result;
+use arrow_buffer::Buffer;
 
 struct IndicesNormalizer {
     indices: Vec<u64>,
@@ -77,35 +74,28 @@ impl IndicesNormalizer {
 
 #[derive(Debug)]
 pub struct BinaryPageScheduler {
-    indices_scheduler: Arc<dyn PageScheduler>,
+    // indices_scheduler: Arc<dyn PageScheduler>,
     bytes_scheduler: Arc<dyn PageScheduler>,
     offsets_type: DataType,
+    buffer_offset: u64,
     null_adjustment: u64,
 }
 
 impl BinaryPageScheduler {
     pub fn new(
-        indices_scheduler: Arc<dyn PageScheduler>,
+        // indices_scheduler: Arc<dyn PageScheduler>,
         bytes_scheduler: Arc<dyn PageScheduler>,
         offsets_type: DataType,
+        buffer_offset: u64,
         null_adjustment: u64,
     ) -> Self {
         Self {
-            indices_scheduler,
+            // indices_scheduler,
             bytes_scheduler,
             offsets_type,
+            buffer_offset,
             null_adjustment,
         }
-    }
-}
-
-impl BinaryPageScheduler {
-    fn decode_indices(decoder: Arc<dyn PrimitivePageDecoder>, num_rows: u64) -> Result<ArrayRef> {
-        let mut primitive_wrapper =
-            PrimitiveFieldDecoder::new_from_data(decoder, DataType::UInt64, num_rows);
-        let drained_task = primitive_wrapper.drain(num_rows)?;
-        let indices_decode_task = drained_task.task;
-        indices_decode_task.decode()
     }
 }
 
@@ -120,26 +110,26 @@ impl PageScheduler for BinaryPageScheduler {
         // if user wants row range a..b
         // Case 1: if a != 0, we need indices a-1..b to decode
         // Case 2: if a = 0, we need indices 0..b to decode
-        let indices_ranges = ranges
+        // To get the byte ranges we then multiply these by 8
+        // Then we add the buffer offset to map to the correct buffer in the page, 
+        // since multiple encoding tasks may have been used to create the page
+        let indices_byte_ranges = ranges
             .iter()
             .map(|range| {
                 if range.start != 0 {
-                    (range.start - 1)..(range.end)
+                    (self.buffer_offset + ((range.start - 1) * 8))..(self.buffer_offset + (range.end * 8))
                 } else {
-                    0..(range.end)
+                    self.buffer_offset..(self.buffer_offset + (range.end * 8))
                 }
             })
             .collect::<Vec<std::ops::Range<u64>>>();
 
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
 
-        let mut futures_ordered = indices_ranges
-            .iter()
-            .map(|range| {
-                self.indices_scheduler
-                    .schedule_ranges(&[range.clone()], scheduler, top_level_row)
-            })
-            .collect::<FuturesOrdered<_>>();
+        // We schedule all the indices for decoding together
+        // This is more efficient compared to scheduling them one by one (reduces speed significantly for random access)
+        println!("Binary submit request");
+        let indices_bytes = scheduler.submit_request(indices_byte_ranges, top_level_row);
 
         let ranges = ranges.to_vec();
         let copy_scheduler = scheduler.clone();
@@ -159,20 +149,25 @@ impl PageScheduler for BinaryPageScheduler {
             // Cumulative sum: 0, 4 | 8 | 13
             // These are the normalized offsets stored in decoded_indices
             // Rest of the workflow is continued later in BinaryPageDecoder
+            let decoded_indices_vec = &indices_bytes.await?;
 
             let mut indices_builder = IndicesNormalizer::new(num_rows, null_adjustment);
             let mut bytes_ranges = Vec::new();
-            let mut curr_range_idx = 0;
-            while let Some(indices_page_decoder) = futures_ordered.next().await {
-                let decoder = Arc::from(indices_page_decoder?);
 
-                // Build and run decode task for offsets
-                let curr_indices_range = indices_ranges[curr_range_idx].clone();
-                let curr_row_range = ranges[curr_range_idx].clone();
-                let indices_num_rows = curr_indices_range.end - curr_indices_range.start;
+            for (index, curr_row_range) in ranges.iter().enumerate() {
 
-                let indices = Self::decode_indices(decoder, indices_num_rows)?;
-                let indices = indices.as_primitive::<UInt64Type>();
+                let decoded_indices = &decoded_indices_vec[index];
+                let decoded_indices = UInt64Array::new(Buffer::from(decoded_indices).into(), None);
+
+                let row_start = curr_row_range.start as usize;
+                let curr_range_len = (curr_row_range.end - curr_row_range.start) as usize;
+                let indices;
+                if row_start == 0 {
+                    indices = decoded_indices.slice(0, curr_range_len);
+                }
+                else {
+                    indices = decoded_indices.slice(0, curr_range_len+1);
+                }
 
                 let first = if curr_row_range.start == 0 {
                     0
@@ -188,9 +183,7 @@ impl PageScheduler for BinaryPageScheduler {
                     bytes_ranges.push(first..last);
                 }
 
-                indices_builder.extend(indices, curr_row_range.start == 0);
-
-                curr_range_idx += 1;
+                indices_builder.extend(&indices, curr_row_range.start == 0);
             }
 
             let (indices, validity) = indices_builder.into_parts();
@@ -409,7 +402,6 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
         }
         indices_offset += array.len();
     }
-
     (Arc::new(UInt64Array::from(indices)), null_adjustment)
 }
 
@@ -454,20 +446,30 @@ fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
 impl ArrayEncoder for BinaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let (index_array, null_adjustment) = get_indices_from_string_arrays(arrays);
-        let encoded_indices = self.indices_encoder.encode(&[index_array], buffer_index)?;
+        let encoded_indices = self.indices_encoder.encode(&[index_array], &mut 0)?;
 
         let byte_arrays = get_bytes_from_string_arrays(arrays);
-        let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
+        let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, &mut 1)?;
 
         let mut encoded_buffers = encoded_indices.buffers;
         encoded_buffers.extend(encoded_bytes.buffers);
+
+        for mut buf in encoded_buffers.clone() {
+            buf.index = *buffer_index + buf.index;
+        }
+
+        let index = *buffer_index;
+        *buffer_index += 1;
 
         Ok(EncodedArray {
             buffers: encoded_buffers,
             encoding: pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::Binary(Box::new(
                     pb::Binary {
-                        indices: Some(Box::new(encoded_indices.encoding)),
+                        indices: Some(pb::Buffer {
+                            buffer_index: index,
+                            buffer_type: pb::buffer::BufferType::Page as i32,
+                        }),
                         bytes: Some(Box::new(encoded_bytes.encoding)),
                         null_adjustment,
                     },
@@ -494,7 +496,7 @@ pub mod tests {
     use super::get_indices_from_string_arrays;
 
     #[test_log::test(tokio::test)]
-    async fn test_utf8() {
+    async fn test_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
         check_round_trip_encoding_random(field).await;
     }
