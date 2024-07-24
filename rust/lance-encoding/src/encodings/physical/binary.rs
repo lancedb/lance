@@ -19,9 +19,9 @@ use crate::{
 };
 
 use arrow_array::{PrimitiveArray, UInt64Array, UInt8Array};
+use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use lance_core::Result;
-use arrow_buffer::Buffer;
 
 struct IndicesNormalizer {
     indices: Vec<u64>,
@@ -74,7 +74,6 @@ impl IndicesNormalizer {
 
 #[derive(Debug)]
 pub struct BinaryPageScheduler {
-    // indices_scheduler: Arc<dyn PageScheduler>,
     bytes_scheduler: Arc<dyn PageScheduler>,
     offsets_type: DataType,
     buffer_offset: u64,
@@ -83,14 +82,12 @@ pub struct BinaryPageScheduler {
 
 impl BinaryPageScheduler {
     pub fn new(
-        // indices_scheduler: Arc<dyn PageScheduler>,
         bytes_scheduler: Arc<dyn PageScheduler>,
         offsets_type: DataType,
         buffer_offset: u64,
         null_adjustment: u64,
     ) -> Self {
         Self {
-            // indices_scheduler,
             bytes_scheduler,
             offsets_type,
             buffer_offset,
@@ -111,13 +108,14 @@ impl PageScheduler for BinaryPageScheduler {
         // Case 1: if a != 0, we need indices a-1..b to decode
         // Case 2: if a = 0, we need indices 0..b to decode
         // To get the byte ranges we then multiply these by 8
-        // Then we add the buffer offset to map to the correct buffer in the page, 
+        // Then we add the buffer offset to map to the correct buffer in the page,
         // since multiple encoding tasks may have been used to create the page
         let indices_byte_ranges = ranges
             .iter()
             .map(|range| {
                 if range.start != 0 {
-                    (self.buffer_offset + ((range.start - 1) * 8))..(self.buffer_offset + (range.end * 8))
+                    (self.buffer_offset + ((range.start - 1) * 8))
+                        ..(self.buffer_offset + (range.end * 8))
                 } else {
                     self.buffer_offset..(self.buffer_offset + (range.end * 8))
                 }
@@ -155,21 +153,18 @@ impl PageScheduler for BinaryPageScheduler {
             let mut bytes_ranges = Vec::new();
 
             for (index, curr_row_range) in ranges.iter().enumerate() {
-
                 let decoded_indices = &decoded_indices_vec[index];
                 let decoded_indices = UInt64Array::new(Buffer::from(decoded_indices).into(), None);
 
-                let row_start = curr_row_range.start as usize;
-                let curr_range_len = (curr_row_range.end - curr_row_range.start) as usize;
-                let indices;
-                if row_start == 0 {
-                    indices = decoded_indices.slice(0, curr_range_len);
-                }
-                else {
-                    indices = decoded_indices.slice(0, curr_range_len+1);
-                }
+                let row_start = curr_row_range.start;
+                let curr_range_len = (curr_row_range.end - row_start) as usize;
+                let indices = if row_start == 0 {
+                    decoded_indices.slice(0, curr_range_len)
+                } else {
+                    decoded_indices.slice(0, curr_range_len + 1)
+                };
 
-                let first = if curr_row_range.start == 0 {
+                let first = if row_start == 0 {
                     0
                 } else {
                     indices_builder
@@ -183,7 +178,7 @@ impl PageScheduler for BinaryPageScheduler {
                     bytes_ranges.push(first..last);
                 }
 
-                indices_builder.extend(&indices, curr_row_range.start == 0);
+                indices_builder.extend(&indices, row_start == 0);
             }
 
             let (indices, validity) = indices_builder.into_parts();
@@ -455,7 +450,7 @@ impl ArrayEncoder for BinaryEncoder {
         encoded_buffers.extend(encoded_bytes.buffers);
 
         for mut buf in encoded_buffers.clone() {
-            buf.index = *buffer_index + buf.index;
+            buf.index += *buffer_index;
         }
 
         let index = *buffer_index;
