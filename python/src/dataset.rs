@@ -1094,12 +1094,14 @@ impl Dataset {
                 };
                 let manifest = dataset.as_ref().map(|ds| ds.manifest());
                 validate_operation(manifest, &operation.0)?;
+                let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
                 LanceDataset::commit(
                     dataset_uri,
                     operation.0,
                     read_version,
                     object_store_params,
                     commit_handler,
+                    object_store_registry,
                 )
                 .await
             })?
