@@ -23,10 +23,14 @@ use std::{
 
 use arrow_array::{
     cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchReader, StructArray,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
-    execution::{RecordBatchStream, context::{SessionConfig, SessionContext}},
+    execution::{
+        context::{SessionConfig, SessionContext},
+        RecordBatchStream,
+    },
     logical_expr::{Expr, JoinType},
     physical_plan::{
         joins::{HashJoinExec, PartitionMode},
@@ -38,6 +42,9 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
+use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
+use lance_datafusion::dataframe::DataFrameExt;
+
 use datafusion_physical_expr::expressions::Column;
 use futures::{
     stream::{self},
@@ -47,7 +54,7 @@ use lance_core::{
     datatypes::SchemaCompareOptions,
     error::{box_error, InvalidInputSnafu},
     utils::futures::Capacity,
-    Error, Result,
+    Error, Result, ROW_ADDR,
 };
 use lance_datafusion::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
@@ -61,7 +68,10 @@ use snafu::{location, Location, ResultExt};
 
 use crate::{
     datafusion::dataframe::SessionContextExt,
-    dataset::transaction::{Operation, Transaction},
+    dataset::{
+        transaction::{Operation, Transaction},
+        write::open_writer,
+    },
     index::DatasetIndexInternalExt,
     io::{
         commit::commit_transaction,
@@ -490,6 +500,169 @@ impl MergeInsertJob {
         }
     }
 
+    // Stream needs to already be matched
+    // Needed schema:
+    // _rowaddr
+    // [updated_cols]*
+    async fn update_fragments(
+        dataset: &Dataset,
+        source: SendableRecordBatchStream,
+    ) -> Result<Vec<Fragment>> {
+        use datafusion::logical_expr::{col, lit};
+        let session_config = SessionConfig::default().with_target_partitions(1);
+        let session_ctx = SessionContext::new_with_config(session_config);
+        let mut group_stream = session_ctx
+            .read_one_shot(source)?
+            .sort(vec![col(ROW_ADDR).sort(true, true)])?
+            .select(vec![(col(ROW_ADDR) << lit(32)).alias("_fragment_id")])?
+            .group_by_stream(&["_fragment_id"])
+            .await?;
+
+        // for each fragment, scan the fragment for the new rows, and merge in
+        // the updates.
+        let mut updated_fragments = Vec::new();
+        // TODO: add concurrency while keeping within memory limits of pool.
+        while let Some((frag_id, mut batches)) = group_stream.next().await.transpose()? {
+            let Some(ScalarValue::UInt64(Some(frag_id))) = frag_id.first() else {
+                return Err(Error::Internal {
+                    message: format!("Got non-fragment id from merge result: {:?}", frag_id),
+                    location: location!(),
+                });
+            };
+            let frag_id = *frag_id;
+            let fragment =
+                dataset
+                    .get_fragment(frag_id as usize)
+                    .ok_or_else(|| Error::Internal {
+                        message: format!(
+                            "Got non-existent fragment id from merge result: {}",
+                            frag_id
+                        ),
+                        location: location!(),
+                    })?;
+            let mut metadata = fragment.metadata.clone();
+
+            // batches still have _rowaddr
+            let write_schema = batches[0].schema().as_ref().without_column(ROW_ADDR);
+            let write_schema = dataset.schema().project_by_schema(&write_schema)?;
+
+            let updated_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+            if Some(updated_rows) == metadata.physical_rows {
+                // All rows have been updated and there are no deletions. So we
+                // don't need to merge in existing values.
+                // Also, because we already sorted by row address, the rows
+                // will be in the correct order.
+
+                let mut writer = open_writer(
+                    dataset.object_store(),
+                    &write_schema,
+                    &dataset.base,
+                    fragment.metadata.files[0].is_legacy_file(),
+                )
+                .await?;
+
+                // We need to remove rowaddr before writing.
+                batches
+                    .iter_mut()
+                    .try_for_each(|batch| match batch.drop_column(ROW_ADDR) {
+                        Ok(b) => {
+                            *batch = b;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    })?;
+
+                // TODO: do I need to do batching at this level?
+                writer.write(batches.as_slice()).await?;
+                let (_num_rows, data_file) = writer.finish().await?;
+
+                metadata.files.push(data_file);
+                updated_fragments.push(metadata);
+            } else {
+                // TODO: we can skip scanning row addresses we don't need.
+                let update_schema = batches[0].schema();
+                let read_columns = update_schema.field_names();
+                let mut updater = fragment
+                    .updater(
+                        Some(&read_columns),
+                        Some((write_schema, dataset.schema().clone())),
+                    )
+                    .await?;
+
+                // We will use interleave to update the rows. The first batch
+                // will be the original source data, and all subsequent batches
+                // will be updates.
+                let mut source_batches = Vec::with_capacity(batches.len() + 1);
+                source_batches.push(batches[0].clone()); // placeholder for source data
+                source_batches.extend_from_slice(&batches);
+
+                let mut updated_row_addr_iter = batches
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(batch_idx, batch)| {
+                        // The index in source batches will be one more.
+                        let batch_idx = batch_idx + 1;
+                        let row_addrs = batch
+                            .column_by_name(ROW_ADDR)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap();
+                        row_addrs
+                            .values()
+                            .iter()
+                            .enumerate()
+                            .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
+                    })
+                    .peekable();
+
+                while let Some(batch) = updater.next().await? {
+                    source_batches[0] =
+                        batch.project_by_schema(source_batches[0].schema().as_ref())?;
+
+                    let original_row_addrs = source_batches[0]
+                        .column_by_name(ROW_ADDR)
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    let indices = original_row_addrs
+                        .values()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(original_offset, row_addr)| {
+                            match updated_row_addr_iter.peek() {
+                                Some((updated_row_addr, _)) if *updated_row_addr == *row_addr => {
+                                    updated_row_addr_iter.next().unwrap().1
+                                }
+                                // If we have passed the next updated row address, something went wrong.
+                                Some((updated_row_addr, _)) => {
+                                    debug_assert!(
+                                        *updated_row_addr > *row_addr,
+                                        "Got updated row address that is not in the original batch"
+                                    );
+                                    (0, original_offset)
+                                }
+                                _ => (0, original_offset),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+
+                    let updated_batch = interleave_batches(&source_batches, &indices)?;
+
+                    updater.update(updated_batch).await?;
+                }
+
+                let updated_fragment = updater.finish().await?;
+                updated_fragments.push(updated_fragment);
+            }
+        }
+
+        // Collect the updated fragments, and map the field ids. Tombstone old ones
+        // as needed.
+        Ok(updated_fragments)
+    }
+
     /// Executes the merge insert job
     ///
     /// This will take in the source, merge it with the existing target data, and insert new
@@ -499,11 +672,12 @@ impl MergeInsertJob {
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let schema = source.schema();
-        
-        let is_full_schema = self.dataset.schema().as_ref() == schema.as_ref();
+
+        let full_schema = Schema::from(self.dataset.schema());
+        let is_full_schema = &full_schema == schema.as_ref();
 
         let joined = self.create_joined_stream(source).await?;
-        let merger = Merger::try_new(self.params, schema.clone())?;
+        let merger = Merger::try_new(self.params.clone(), schema.clone())?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
         let stream = joined
@@ -511,10 +685,26 @@ impl MergeInsertJob {
             .try_flatten();
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let committed_ds = if is_full_schema {
+        let committed_ds = if !is_full_schema {
+            if self.params.insert_not_matched {
+                return Err(Error::invalid_input(
+                    "The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data",
+                    location!(),
+                ));
+            }
+
+            if !matches!(
+                self.params.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Keep
+            ) {
+                return Err(Error::NotSupported { source:
+                    "Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data".into(), location: location!() });
+            }
+
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let updated_fragments = todo!();
+            dbg!(stream.schema().as_ref());
+            let updated_fragments = Self::update_fragments(&self.dataset, Box::pin(stream)).await?;
 
             Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
         } else {
@@ -1329,7 +1519,7 @@ mod tests {
         )
         .unwrap();
         let reader = Box::new(RecordBatchIterator::new(
-            [Ok(update_batch)],
+            [Ok(update_batch.clone())],
             update_schema.clone(),
         ));
 
@@ -1341,13 +1531,21 @@ mod tests {
             .try_build()
             .unwrap();
         let res = job.execute_reader(reader).await;
-        assert!(matches!(
-            res,
-            Err(Error::NotSupported { source, .. })
-                if source.to_string().contains("deleting when not matched by source for subschemas is not yet supported.")
-        ));
+        assert!(
+            matches!(
+                &res,
+                &Err(Error::NotSupported { ref source, .. })
+                    if source.to_string().contains("Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data"),
+            ),
+            "Expected NotSupported error, got: {:?}",
+            res
+        );
 
         // Should reject when_not_matched_insert_all as invalid
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(update_batch.clone())],
+            update_schema.clone(),
+        ));
         let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_not_matched(WhenNotMatched::InsertAll)
@@ -1358,10 +1556,14 @@ mod tests {
         assert!(matches!(
             res,
             Err(Error::InvalidInput { source, .. })
-                if source.to_string().contains("Cannot insert rows with a partial schema.")
+                if source.to_string().contains("The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data")
         ));
 
         // Should accept when_matched_update_all
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(update_batch.clone())],
+            update_schema.clone(),
+        ));
         let fragments_before = ds
             .get_fragments()
             .iter()
