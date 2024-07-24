@@ -37,7 +37,6 @@ zstd.workspace = true
 rand = "0.8.4"
 rand_xoshiro = "0.6.0"
 hyperloglogplus.workspace = true
-arrow.workspace = true
 
 [dev-dependencies]
 lance-testing.workspace = true

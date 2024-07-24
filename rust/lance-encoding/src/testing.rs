@@ -128,7 +128,7 @@ impl ArrayGeneratorProvider for RandomArrayGeneratorProvider {
 
 /// Given a field this will test the round trip encoding and decoding of random data
 pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<String, String>) {
-    let field = field.with_metadata(field);
+    let field = field.with_metadata(metadata);
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
     };

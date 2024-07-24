@@ -356,7 +356,7 @@ pub(crate) mod tests {
     async fn test_value_primitive() {
         for data_type in PRIMITIVE_TYPES {
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_random(field).await;
+            check_round_trip_encoding_random(field, HashMap::new()).await;
         }
     }
 
