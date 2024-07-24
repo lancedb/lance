@@ -126,7 +126,6 @@ impl PageScheduler for BinaryPageScheduler {
 
         // We schedule all the indices for decoding together
         // This is more efficient compared to scheduling them one by one (reduces speed significantly for random access)
-        println!("Binary submit request");
         let indices_bytes = scheduler.submit_request(indices_byte_ranges, top_level_row);
 
         let ranges = ranges.to_vec();

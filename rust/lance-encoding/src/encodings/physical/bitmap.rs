@@ -63,7 +63,6 @@ impl PageScheduler for DenseBitmapScheduler {
             min,
             max
         );
-        println!("Bitmap submit request");
         let bytes = scheduler.submit_request(byte_ranges, top_level_row);
 
         async move {

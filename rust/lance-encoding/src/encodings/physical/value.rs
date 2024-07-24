@@ -112,7 +112,6 @@ impl PageScheduler for ValuePageScheduler {
             min,
             max
         );
-        println!("Value submit request");
         let bytes = scheduler.submit_request(byte_ranges, top_level_row);
         let bytes_per_value = self.bytes_per_value;
 
