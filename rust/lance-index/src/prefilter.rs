@@ -42,3 +42,21 @@ pub trait PreFilter: Send + Sync {
     /// This method must be called after `wait_for_ready`
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64>;
 }
+
+/// A prefilter that does nothing
+pub struct NoFilter;
+
+#[async_trait]
+impl PreFilter for NoFilter {
+    async fn wait_for_ready(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        true
+    }
+
+    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        row_ids.enumerate().map(|(i, _)| i as u64).collect()
+    }
+}

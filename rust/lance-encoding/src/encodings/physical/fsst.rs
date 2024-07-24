@@ -192,6 +192,8 @@ impl ArrayEncoder for FsstArrayEncoder {
 #[cfg(test)]
 mod tests {
 
+    use std::collections::HashMap;
+
     use lance_datagen::{ByteCount, RowCount};
 
     use crate::testing::{check_round_trip_encoding_of_data, TestCases};
@@ -204,6 +206,6 @@ mod tests {
             .unwrap()
             .column(0)
             .clone();
-        check_round_trip_encoding_of_data(vec![arr], &TestCases::default()).await;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
     }
 }

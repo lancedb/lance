@@ -7,5 +7,6 @@ pub mod exec;
 pub mod expr;
 pub mod logical_expr;
 pub mod planner;
+pub mod projection;
 pub mod sql;
 pub mod utils;

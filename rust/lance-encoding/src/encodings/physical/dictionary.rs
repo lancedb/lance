@@ -278,7 +278,7 @@ pub mod tests {
         ArrayRef, StringArray, UInt8Array,
     };
     use arrow_schema::{DataType, Field};
-    use std::{sync::Arc, vec};
+    use std::{collections::HashMap, sync::Arc, vec};
 
     use crate::testing::{
         check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
@@ -304,25 +304,25 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_utf8() {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -334,7 +334,12 @@ pub mod tests {
             .with_range(0..3)
             .with_range(1..3)
             .with_indices(vec![1, 3]);
-        check_round_trip_encoding_of_data(vec![Arc::new(string_array)], &test_cases).await;
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -346,7 +351,12 @@ pub mod tests {
             .with_range(0..1)
             .with_range(0..2)
             .with_range(1..2);
-        check_round_trip_encoding_of_data(vec![Arc::new(string_array)], &test_cases).await;
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -365,9 +375,15 @@ pub mod tests {
                 .with_indices(vec![1])
                 .with_indices(vec![0])
                 .with_indices(vec![2]);
-            check_round_trip_encoding_of_data(vec![string_array.clone()], &test_cases).await;
+            check_round_trip_encoding_of_data(
+                vec![string_array.clone()],
+                &test_cases,
+                HashMap::new(),
+            )
+            .await;
             let test_cases = test_cases.with_batch_size(1);
-            check_round_trip_encoding_of_data(vec![string_array], &test_cases).await;
+            check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new())
+                .await;
         }
 
         // Scenario 2: All strings are empty
@@ -377,9 +393,10 @@ pub mod tests {
         let string_array = Arc::new(StringArray::from(vec![Some(""), None, Some("")]));
 
         let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![string_array.clone()], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![string_array.clone()], &test_cases, HashMap::new())
+            .await;
         let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![string_array], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -399,6 +416,6 @@ pub mod tests {
 
         // // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
-        check_round_trip_encoding_of_data(arrs, &test_cases).await;
+        check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 }

@@ -511,21 +511,6 @@ impl FileReader {
         })
     }
 
-    fn collect_columns(
-        &self,
-        field: &Field,
-        column_idx: &mut usize,
-        column_infos: &mut Vec<Arc<ColumnInfo>>,
-    ) -> Result<()> {
-        column_infos.push(self.metadata.column_infos[*column_idx].clone());
-        *column_idx += 1;
-
-        for child in &field.children {
-            self.collect_columns(child, column_idx, column_infos)?;
-        }
-        Ok(())
-    }
-
     // The actual decoder needs all the column infos that make up a type.  In other words, if
     // the first type in the schema is Struct<i32, i32> then the decoder will need 3 column infos.
     //
@@ -541,19 +526,9 @@ impl FileReader {
     // registry will need to figure out.
     fn collect_columns_from_projection(
         &self,
-        projection: &ReaderProjection,
+        _projection: &ReaderProjection,
     ) -> Result<Vec<Arc<ColumnInfo>>> {
-        let mut column_infos = Vec::with_capacity(projection.column_indices.len());
-        for (field, starting_column) in projection
-            .schema
-            .fields
-            .iter()
-            .zip(projection.column_indices.iter())
-        {
-            let mut starting_column = *starting_column as usize;
-            self.collect_columns(field, &mut starting_column, &mut column_infos)?;
-        }
-        Ok(column_infos)
+        Ok(self.metadata.column_infos.to_vec())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -576,6 +551,7 @@ impl FileReader {
 
         let mut decode_scheduler = DecodeBatchScheduler::try_new(
             &projection.schema,
+            &projection.column_indices,
             &column_infos,
             &vec![],
             num_rows,
@@ -643,6 +619,7 @@ impl FileReader {
 
         let mut decode_scheduler = DecodeBatchScheduler::try_new(
             &projection.schema,
+            &projection.column_indices,
             &column_infos,
             &vec![],
             num_rows,
@@ -884,6 +861,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
     where
         Self: Sized,
     {
+        let projection = FileReader::default_projection(schema);
         let footer = FileReader::decode_footer(&bytes)?;
 
         // Next, read the metadata for the columns
@@ -903,6 +881,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
                 .map(|col| col.page_infos.iter().map(|page| page.num_rows).sum::<u64>())
                 .unwrap_or(0),
             page_table,
+            top_level_columns: projection.column_indices,
             schema: Arc::new(schema.clone()),
         })
     }
@@ -928,6 +907,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
         let schema_bytes = bytes.slice(schema_start..(schema_start + schema_size));
         let (_, schema) = FileReader::decode_schema(schema_bytes)?;
+        let projection = FileReader::default_projection(&schema);
 
         // Next, read the metadata for the columns
         // This is both the column metadata and the CMO table
@@ -946,6 +926,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
                 .map(|col| col.page_infos.iter().map(|page| page.num_rows).sum::<u64>())
                 .unwrap_or(0),
             page_table,
+            top_level_columns: projection.column_indices,
             schema: Arc::new(schema.clone()),
         })
     }
@@ -970,6 +951,7 @@ pub mod tests {
         encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch},
     };
     use lance_io::stream::RecordBatchStream;
+    use lance_testing::util::EnvVarGuard;
     use log::debug;
 
     use crate::v2::{
@@ -1241,32 +1223,6 @@ pub mod tests {
         )
         .await
         .is_err());
-    }
-
-    struct EnvVarGuard {
-        key: String,
-        original_value: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn new(key: &str, new_value: &str) -> Self {
-            let original_value = std::env::var(key).ok();
-            std::env::set_var(key, new_value);
-            Self {
-                key: key.to_string(),
-                original_value,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(ref value) = self.original_value {
-                std::env::set_var(&self.key, value);
-            } else {
-                std::env::remove_var(&self.key);
-            }
-        }
     }
 
     #[test_log::test(tokio::test)]
