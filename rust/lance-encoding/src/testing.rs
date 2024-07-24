@@ -16,8 +16,8 @@ use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 
 use crate::{
     decoder::{
-        BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMessage,
-        DecoderMiddlewareChain, FilterExpression, PageInfo,
+        BatchDecodeStream, ColumnInfo, CoreFieldDecoderStrategy, DecodeBatchScheduler,
+        DecoderMessage, DecoderMiddlewareChain, FilterExpression, PageInfo,
     },
     encoder::{
         ColumnIndexSequence, CoreFieldEncodingStrategy, EncodedBuffer, EncodedPage, FieldEncoder,
@@ -74,13 +74,17 @@ async fn test_decode(
     ) -> (SimpleStructDecoder, BoxFuture<'static, ()>),
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
+    let decode_and_validate =
+        DecoderMiddlewareChain::new().add_strategy(Arc::new(CoreFieldDecoderStrategy {
+            validate_data: true,
+        }));
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
         column_indices,
         column_infos,
         &Vec::new(),
         num_rows,
-        &DecoderMiddlewareChain::default(),
+        &decode_and_validate,
         io,
     )
     .unwrap();

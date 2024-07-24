@@ -4,12 +4,12 @@
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, ArrayRef};
-use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
+    data::{DataBlock, DataBlockExt, FixedWidthDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
@@ -74,19 +74,14 @@ pub struct FixedListDecoder {
 }
 
 impl PrimitivePageDecoder for FixedListDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         let rows_to_skip = rows_to_skip * self.dimension;
-        let num_rows = num_rows * self.dimension;
-        self.items_decoder.decode(rows_to_skip, num_rows, all_null)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        self.items_decoder.num_buffers()
+        let num_child_rows = num_rows * self.dimension;
+        let child_data = self.items_decoder.decode(rows_to_skip, num_child_rows)?;
+        let mut child_data = child_data.try_into_layout::<FixedWidthDataBlock>()?;
+        child_data.num_values = num_rows;
+        child_data.bits_per_value = child_data.bits_per_value * self.dimension;
+        Ok(child_data)
     }
 }
 
