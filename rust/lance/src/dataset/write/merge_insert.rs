@@ -27,10 +27,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
-    execution::{
-        context::{SessionConfig, SessionContext},
-        RecordBatchStream,
-    },
+    execution::context::{SessionConfig, SessionContext},
     logical_expr::{Expr, JoinType},
     physical_plan::{
         joins::{HashJoinExec, PartitionMode},
@@ -54,7 +51,7 @@ use lance_core::{
     datatypes::SchemaCompareOptions,
     error::{box_error, InvalidInputSnafu},
     utils::futures::Capacity,
-    Error, Result, ROW_ADDR,
+    Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID,
 };
 use lance_datafusion::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
@@ -331,6 +328,11 @@ impl MergeInsertBuilder {
     }
 }
 
+enum SchemaComparison {
+    FullCompatible,
+    Subschema,
+}
+
 impl MergeInsertJob {
     pub async fn execute_reader(
         self,
@@ -340,15 +342,41 @@ impl MergeInsertJob {
         self.execute(stream).await
     }
 
-    fn check_compatible_schema(&self, schema: &Schema) -> Result<()> {
+    fn check_compatible_schema(&self, schema: &Schema) -> Result<SchemaComparison> {
         let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
-        lance_schema.check_compatible(
+        let is_compatible = lance_schema.check_compatible(
             self.dataset.schema(),
             &SchemaCompareOptions {
                 compare_dictionary: true,
                 ..Default::default()
             },
-        )
+        );
+        // TODO: make this a proper function
+        fn is_subschema(schema: &Schema, candidate: &Schema) -> bool {
+            // Schema::contains() cares about order, but we don't.
+            for field in candidate.fields() {
+                if !schema
+                    .field_with_name(field.name())
+                    .map(|f| f.contains(field))
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+
+        if let Err(e) = is_compatible {
+            // It might be a subschema
+            let dataset_arrow_schema = Schema::from(self.dataset.schema());
+            if is_subschema(&dataset_arrow_schema, schema) {
+                Ok(SchemaComparison::Subschema)
+            } else {
+                Err(e)
+            }
+        } else {
+            Ok(SchemaComparison::FullCompatible)
+        }
     }
 
     async fn join_key_as_scalar_index(&self) -> Result<Option<Index>> {
@@ -465,8 +493,7 @@ impl MergeInsertJob {
         let session_config = SessionConfig::default().with_target_partitions(1);
         let session_ctx = SessionContext::new_with_config(session_config);
         let schema = source.schema();
-        self.check_compatible_schema(&schema)?;
-        let existing = session_ctx.read_lance(self.dataset.clone(), true)?;
+
         let new_data = session_ctx.read_one_shot(source)?;
         let join_cols = self
             .params
@@ -474,8 +501,30 @@ impl MergeInsertJob {
             .iter()
             .map(|c| c.as_str())
             .collect::<Vec<_>>(); // vector of strings of col names to join
-        let joined = new_data.join(existing, JoinType::Full, &join_cols, &join_cols, None)?; // full join
-        Ok(joined.execute_stream().await?)
+
+        match self.check_compatible_schema(&schema)? {
+            SchemaComparison::FullCompatible => {
+                let existing = session_ctx.read_lance(self.dataset.clone(), true, false)?;
+                let joined =
+                    new_data.join(existing, JoinType::Full, &join_cols, &join_cols, None)?; // full join
+                Ok(joined.execute_stream().await?)
+            }
+            SchemaComparison::Subschema => {
+                let existing = session_ctx.read_lance(self.dataset.clone(), true, true)?;
+                let columns = schema
+                    .field_names()
+                    .iter()
+                    .map(|s| s.as_str())
+                    .chain([ROW_ID, ROW_ADDR])
+                    // .chain(join_cols.iter().cloned())
+                    .collect::<Vec<_>>();
+                let projected = existing.select_columns(&columns)?;
+                // We aren't supporting inserts or deletes right now, so we can use inner join
+                let joined =
+                    new_data.join(projected, JoinType::Inner, &join_cols, &join_cols, None)?;
+                Ok(joined.execute_stream().await?)
+            }
+        }
     }
 
     async fn create_joined_stream(
@@ -514,7 +563,7 @@ impl MergeInsertJob {
         let mut group_stream = session_ctx
             .read_one_shot(source)?
             .sort(vec![col(ROW_ADDR).sort(true, true)])?
-            .select(vec![(col(ROW_ADDR) << lit(32)).alias("_fragment_id")])?
+            .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
             .group_by_stream(&["_fragment_id"])
             .await?;
 
@@ -594,7 +643,9 @@ impl MergeInsertJob {
                 // will be updates.
                 let mut source_batches = Vec::with_capacity(batches.len() + 1);
                 source_batches.push(batches[0].clone()); // placeholder for source data
-                source_batches.extend_from_slice(&batches);
+                for batch in &batches {
+                    source_batches.push(batch.drop_column(ROW_ADDR)?);
+                }
 
                 let mut updated_row_addr_iter = batches
                     .iter()
@@ -618,9 +669,9 @@ impl MergeInsertJob {
 
                 while let Some(batch) = updater.next().await? {
                     source_batches[0] =
-                        batch.project_by_schema(source_batches[0].schema().as_ref())?;
+                        batch.project_by_schema(source_batches[1].schema().as_ref())?;
 
-                    let original_row_addrs = source_batches[0]
+                    let original_row_addrs = batch
                         .column_by_name(ROW_ADDR)
                         .unwrap()
                         .as_any()
@@ -660,6 +711,18 @@ impl MergeInsertJob {
 
         // Collect the updated fragments, and map the field ids. Tombstone old ones
         // as needed.
+        for fragment in &mut updated_fragments {
+            let updated_fields = (&fragment.files).last().unwrap().fields.clone();
+            for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
+                for field in &mut data_file.fields {
+                    if updated_fields.contains(field) {
+                        // Tombstone these fields
+                        *field = -2;
+                    }
+                }
+            }
+        }
+
         Ok(updated_fragments)
     }
 
@@ -677,13 +740,14 @@ impl MergeInsertJob {
         let is_full_schema = &full_schema == schema.as_ref();
 
         let joined = self.create_joined_stream(source).await?;
-        let merger = Merger::try_new(self.params.clone(), schema.clone())?;
+        let merger = Merger::try_new(self.params.clone(), schema.clone(), !is_full_schema)?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
+        let merger_schema = merger.schema().clone();
         let stream = joined
             .and_then(move |batch| merger.clone().execute_batch(batch))
             .try_flatten();
-        let stream = RecordBatchStreamAdapter::new(schema, stream);
+        let stream = RecordBatchStreamAdapter::new(merger_schema, stream);
 
         let committed_ds = if !is_full_schema {
             if self.params.insert_not_matched {
@@ -703,7 +767,6 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            dbg!(stream.schema().as_ref());
             let updated_fragments = Self::update_fragments(&self.dataset, Box::pin(stream)).await?;
 
             Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
@@ -848,13 +911,21 @@ struct Merger {
     match_filter_expr: Option<Arc<dyn PhysicalExpr>>,
     // The parameters controlling the merge
     params: MergeInsertParams,
-    // The schema of the dataset, used to recover nullability information
+    // The schema of the input data, used to recover nullability information
     schema: Arc<Schema>,
+    /// Whether the output schema should include a row address column
+    with_row_addr: bool,
+    /// The output schema of the stream.
+    output_schema: Arc<Schema>,
 }
 
 impl Merger {
     // Creates a new merger with an empty set of deleted rows, compiles expressions, if present
-    fn try_new(params: MergeInsertParams, schema: Arc<Schema>) -> Result<Self> {
+    fn try_new(
+        params: MergeInsertParams,
+        schema: Arc<Schema>,
+        with_row_addr: bool,
+    ) -> Result<Self> {
         let delete_expr = if let WhenNotMatchedBySource::DeleteIf(expr) =
             &params.delete_not_matched_by_source
         {
@@ -882,6 +953,12 @@ impl Merger {
         } else {
             None
         };
+        let output_schema = if with_row_addr {
+            Arc::new(schema.try_with_column(ROW_ADDR_FIELD.clone())?)
+        } else {
+            schema.clone()
+        };
+
         Ok(Self {
             deleted_rows: Arc::new(Mutex::new(RoaringTreemap::new())),
             delete_expr,
@@ -889,7 +966,13 @@ impl Merger {
             match_filter_expr,
             params,
             schema,
+            with_row_addr,
+            output_schema,
         })
+    }
+
+    fn schema(&self) -> &Arc<Schema> {
+        &self.output_schema
     }
 
     // Retrieves a bitmap of rows where at least one of the columns in the range
@@ -953,11 +1036,18 @@ impl Merger {
         let mut merge_statistics = self.merge_stats.lock().unwrap();
         let num_fields = batch.schema().fields.len();
         // The schema of the combined batches will be:
-        // source_keys, source_payload, target_keys, target_payload, row_id
+        // source_keys, source_payload, target_keys, target_payload, row_id, row_addr?
         // The keys and non_keys on both sides will be equal
-        debug_assert_eq!(num_fields % 2, 1);
-        let row_id_col = num_fields - 1;
-        let right_offset = num_fields / 2;
+        let (row_id_col, row_addr_col, right_offset) = if num_fields % 2 == 1 {
+            // No rowaddr
+            assert!(!self.with_row_addr);
+            (num_fields - 1, None, num_fields / 2)
+        } else {
+            // Has rowaddr
+            assert!(self.with_row_addr);
+            (num_fields - 2, Some(num_fields - 1), (num_fields - 2) / 2)
+        };
+
         let num_keys = self.params.on.len();
 
         let left_cols = Vec::from_iter(0..right_offset);
@@ -1000,14 +1090,21 @@ impl Merger {
             if matched.num_rows() > 0 {
                 let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
                 deleted_row_ids.extend(row_ids.values());
-                let matched = matched.project(&left_cols)?;
+                let projection = if let Some(row_addr_col) = row_addr_col {
+                    let mut cols = Vec::from_iter(left_cols.iter().cloned());
+                    cols.push(row_addr_col);
+                    cols
+                } else {
+                    left_cols.clone()
+                };
+                let matched = matched.project(&projection)?;
                 // The payload columns of an outer join are always nullable.  We need to restore
                 // non-nullable to columns that were originally non-nullable.  This should be safe
                 // since the not_matched rows should all be valid on the right_cols
                 //
                 // Sadly we can't use with_schema because it doesn't let you toggle nullability
                 let matched = RecordBatch::try_new(
-                    self.schema.clone(),
+                    self.output_schema.clone(),
                     Vec::from_iter(matched.columns().iter().cloned()),
                 )?;
                 batches.push(Ok(matched));
@@ -1528,6 +1625,7 @@ mod tests {
             .unwrap()
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
         let res = job.execute_reader(reader).await;
@@ -1559,6 +1657,8 @@ mod tests {
                 if source.to_string().contains("The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data")
         ));
 
+        // TODO: should reject when data is not a subschema.
+
         // Should accept when_matched_update_all
         let reader = Box::new(RecordBatchIterator::new(
             [Ok(update_batch.clone())],
@@ -1572,6 +1672,7 @@ mod tests {
         let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
 

@@ -206,7 +206,7 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     for fragment in manifest.fragments.iter() {
         for file in fragment.files.iter() {
             for field_id in file.fields.iter() {
-                if !seen_fields.insert(*field_id) {
+                if !seen_fields.insert(*field_id) && *field_id != -2 {
                     fields_with_duplicate_ids.insert(*field_id);
                 }
             }
