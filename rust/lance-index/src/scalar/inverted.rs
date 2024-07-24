@@ -269,9 +269,6 @@ impl ScalarIndex for InvertedIndex {
             }
         }
 
-        // calculate bm25 scores
-        invert_list.calculate_scores(&docs);
-
         let token_set_batch = token_set.to_batch()?;
         let mut token_set_writer = dest_store
             .new_index_file(TOKENS_FILE, token_set_batch.schema())
@@ -428,15 +425,13 @@ impl TokenSet {
 struct PostingList {
     row_ids: Vec<u64>,
     frequencies: Vec<f32>,
-    scores: Vec<f32>,
 }
 
 impl PostingList {
-    fn new(row_ids: Vec<u64>, frequencies: Vec<f32>, scores: Vec<f32>) -> Self {
+    fn new(row_ids: Vec<u64>, frequencies: Vec<f32>) -> Self {
         Self {
             row_ids,
             frequencies,
-            scores,
         }
     }
 
@@ -460,13 +455,10 @@ impl InvertedList {
             ListBuilder::with_capacity(UInt64Builder::new(), self.inverted_list.len());
         let mut frequencies_list_builder =
             ListBuilder::with_capacity(Float32Builder::new(), self.inverted_list.len());
-        let mut bm25_list_builder =
-            ListBuilder::with_capacity(Float32Builder::new(), self.inverted_list.len());
 
         for list in &self.inverted_list {
             let row_ids_builder = row_ids_list_builder.values();
             let frequencies_builder = frequencies_list_builder.values();
-            let bm25_builder = bm25_list_builder.values();
 
             // sort the list by row id,
             // DAAT (Document At A Time) strategy is based on the assumption that the lists are sorted
@@ -488,21 +480,12 @@ impl InvertedList {
                     .collect_vec()
                     .as_slice(),
             );
-            bm25_builder.append_slice(
-                indices
-                    .iter()
-                    .map(|i| list.scores[*i])
-                    .collect_vec()
-                    .as_slice(),
-            );
             row_ids_list_builder.append(true);
             frequencies_list_builder.append(true);
-            bm25_list_builder.append(true);
         }
 
         let row_ids_col = row_ids_list_builder.finish();
         let frequencies_col = frequencies_list_builder.finish();
-        let bm25_col = bm25_list_builder.finish();
 
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(
@@ -515,11 +498,6 @@ impl InvertedList {
                 DataType::List(Field::new_list_field(DataType::Float32, true).into()),
                 false,
             ),
-            arrow_schema::Field::new(
-                SCORE_COL,
-                DataType::List(Field::new_list_field(DataType::Float32, true).into()),
-                false,
-            ),
         ]);
 
         let batch = RecordBatch::try_new(
@@ -527,7 +505,6 @@ impl InvertedList {
             vec![
                 Arc::new(row_ids_col) as ArrayRef,
                 Arc::new(frequencies_col) as ArrayRef,
-                Arc::new(bm25_col) as ArrayRef,
             ],
         )?;
         Ok(batch)
@@ -539,20 +516,13 @@ impl InvertedList {
             let batch = reader.read_record_batch(i).await?;
             let row_ids_col = batch[ROW_ID].as_list::<i32>();
             let frequencies_col = batch[FREQUENCY_COL].as_list::<i32>();
-            let scores_col = batch[SCORE_COL].as_list::<i32>();
 
-            for ((row_ids, frequencies), scores) in row_ids_col
-                .iter()
-                .zip(frequencies_col.iter())
-                .zip(scores_col.iter())
-            {
+            for (row_ids, frequencies) in row_ids_col.iter().zip(frequencies_col.iter()) {
                 let row_ids = row_ids.unwrap();
                 let frequencies = frequencies.unwrap();
-                let scores = scores.unwrap();
                 let row_ids = row_ids.as_primitive::<UInt64Type>().values().to_vec();
                 let frequencies = frequencies.as_primitive::<Float32Type>().values().to_vec();
-                let scores = scores.as_primitive::<Float32Type>().values().to_vec();
-                inverted_list.push(PostingList::new(row_ids, frequencies, scores));
+                inverted_list.push(PostingList::new(row_ids, frequencies));
             }
         }
 
@@ -563,24 +533,21 @@ impl InvertedList {
         for list in self.inverted_list.iter_mut() {
             let mut new_row_ids = Vec::new();
             let mut new_freqs = Vec::new();
-            let mut new_scores = Vec::new();
 
             for i in 0..list.len() {
                 let row_id = list.row_ids[i];
                 let freq = list.frequencies[i];
-                let score = list.scores[i];
 
                 match mapping.get(&row_id) {
                     Some(Some(new_row_id)) => {
                         new_row_ids.push(*new_row_id);
                         new_freqs.push(freq);
-                        new_scores.push(score);
                     }
                     _ => continue,
                 }
             }
 
-            *list = PostingList::new(new_row_ids, new_freqs, new_scores);
+            *list = PostingList::new(new_row_ids, new_freqs);
         }
     }
 
@@ -596,20 +563,6 @@ impl InvertedList {
             let list = &mut self.inverted_list[token_id];
             list.row_ids.push(row_id);
             list.frequencies.push(freq as f32);
-        }
-    }
-
-    fn calculate_scores(&mut self, docs: &DocSet) {
-        let avgdl = docs.average_length();
-        for list in self.inverted_list.iter_mut() {
-            let idf = idf(list.len(), docs.len());
-            list.scores.resize(list.len(), 0.0);
-            for i in 0..list.len() {
-                let row_id = list.row_ids[i];
-                let freq = list.frequencies[i];
-                let doc_norm = docs.num_tokens(row_id) as f32 / avgdl;
-                list.scores[i] = idf * (K1 + 1.0) * freq / (freq + K1 * (1.0 - B + B * doc_norm));
-            }
         }
     }
 
