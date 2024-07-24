@@ -28,7 +28,6 @@ use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::validate_operation;
-use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -37,10 +36,13 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
+use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::index::scalar::ScalarIndexType;
 use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
@@ -58,7 +60,7 @@ use pyo3::types::{PyBytes, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
-    types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong},
+    types::{IntoPyDict, PyDict},
     PyObject, PyResult,
 };
 use snafu::{location, Location};
@@ -177,7 +179,7 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
-    pub fn execute(&mut self, new_data: &PyAny) -> PyResult<PyObject> {
+    pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<PyObject> {
         let py = new_data.py();
 
         let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
@@ -187,7 +189,7 @@ impl MergeInsertBuilder {
                     .map_err(|err| PyValueError::new_err(err.to_string()))?,
             )
         } else {
-            Box::new(ArrowArrayStreamReader::from_pyarrow(new_data)?)
+            Box::new(ArrowArrayStreamReader::from_pyarrow_bound(new_data)?)
         };
 
         let job = self
@@ -423,7 +425,7 @@ impl Dataset {
         prefilter: Option<bool>,
         limit: Option<i64>,
         offset: Option<i64>,
-        nearest: Option<&PyDict>,
+        nearest: Option<&Bound<PyDict>>,
         batch_size: Option<usize>,
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
@@ -432,6 +434,8 @@ impl Dataset {
         with_row_id: Option<bool>,
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
+        fast_search: Option<bool>,
+        full_text_query: Option<&PyDict>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -460,6 +464,30 @@ impl Dataset {
             }
             scanner
                 .filter(f.as_str())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(full_text_query) = full_text_query {
+            let query = full_text_query
+                .get_item("query")?
+                .ok_or_else(|| PyKeyError::new_err("Need column for full text search"))?
+                .to_string();
+            let columns = if let Some(columns) = full_text_query.get_item("columns")? {
+                if columns.is_none() {
+                    None
+                } else {
+                    Some(
+                        PyAny::downcast::<PyList>(columns)?
+                            .iter()
+                            .map(|c| c.extract::<String>())
+                            .collect::<PyResult<Vec<String>>>()?,
+                    )
+                }
+            } else {
+                None
+            };
+            let full_text_query = FullTextSearchQuery::new(query).columns(columns);
+            scanner
+                .full_text_search(full_text_query)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
@@ -496,6 +524,10 @@ impl Dataset {
             scanner.use_stats(use_stats);
         }
 
+        if let Some(true) = fast_search {
+            scanner.fast_search();
+        }
+
         if let Some(fragments) = fragments {
             let fragments = fragments
                 .into_iter()
@@ -516,7 +548,7 @@ impl Dataset {
             let qval = nearest
                 .get_item("q")?
                 .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
-            let data = ArrayData::from_pyarrow(qval)?;
+            let data = ArrayData::from_pyarrow_bound(&qval)?;
             let q = Float32Array::from(data);
 
             let k: usize = if let Some(k) = nearest.get_item("k")? {
@@ -524,7 +556,7 @@ impl Dataset {
                     // Use limit if k is not specified, default to 10.
                     limit.unwrap_or(10) as usize
                 } else {
-                    PyAny::downcast::<PyLong>(k)?.extract()?
+                    k.extract()?
                 }
             } else {
                 10
@@ -534,7 +566,7 @@ impl Dataset {
                 if nprobes.is_none() {
                     DEFAULT_NPROBS
                 } else {
-                    PyAny::downcast::<PyLong>(nprobes)?.extract()?
+                    nprobes.extract()?
                 }
             } else {
                 DEFAULT_NPROBS
@@ -561,16 +593,26 @@ impl Dataset {
                 if rf.is_none() {
                     None
                 } else {
-                    PyAny::downcast::<PyLong>(rf)?.extract()?
+                    rf.extract()?
                 }
             } else {
                 None
             };
 
             let use_index: bool = if let Some(idx) = nearest.get_item("use_index")? {
-                PyAny::downcast::<PyBool>(idx)?.extract()?
+                idx.extract()?
             } else {
                 true
+            };
+
+            let ef: Option<usize> = if let Some(ef) = nearest.get_item("ef")? {
+                if ef.is_none() {
+                    None
+                } else {
+                    ef.extract()?
+                }
+            } else {
+                None
             };
 
             scanner
@@ -582,6 +624,9 @@ impl Dataset {
                     }
                     if let Some(m) = metric_type {
                         s = s.distance_metric(m);
+                    }
+                    if let Some(ef) = ef {
+                        s = s.ef(ef);
                     }
                     s.use_index(use_index);
                     s
@@ -603,15 +648,23 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
     ) -> PyResult<PyObject> {
-        let projection = if let Some(columns) = columns {
-            self_.ds.schema().project(&columns)
-        } else {
-            Ok(self_.ds.schema().clone())
+        let projection = match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both columns and columns_with_transform",
+                ))
+            }
+            (Some(columns), None) => {
+                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+            }
+            (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
+            (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        .infer_error()?;
         let batch = RT
-            .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))?
+            .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
@@ -621,23 +674,26 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
     ) -> PyResult<PyObject> {
-        let projection = if let Some(columns) = columns {
-            self_.ds.schema().project(&columns)
-        } else {
-            Ok(self_.ds.schema().clone())
+        let projection = match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both columns and columns_with_transform",
+                ))
+            }
+            (Some(columns), None) => {
+                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+            }
+            (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
+            (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }
-        .map_err(|err| {
-            PyIOError::new_err(format!(
-                "TakeRows: failed to run projection over schema: {}",
-                err
-            ))
-        })?;
+        .infer_error()?;
 
         let batch = RT
             .block_on(
                 Some(self_.py()),
-                self_.ds.take_rows(&row_indices, &projection),
+                self_.ds.take_rows(&row_indices, projection),
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
@@ -910,11 +966,12 @@ impl Dataset {
         index_type: &str,
         name: Option<String>,
         replace: Option<bool>,
-        kwargs: Option<&PyDict>,
+        storage_options: Option<HashMap<String, String>>,
+        kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<()> {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
-            "BTREE" => IndexType::Scalar,
+            "BTREE" | "BITMAP" | "LABEL_LIST" | "INVERTED" => IndexType::Scalar,
             "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -926,12 +983,25 @@ impl Dataset {
         // Only VectorParams are supported.
         let params: Box<dyn IndexParams> = if index_type == "BTREE" {
             Box::<ScalarIndexParams>::default()
+        } else if index_type == "BITMAP" {
+            Box::new(ScalarIndexParams {
+                // Temporary workaround until we add support for auto-detection of scalar index type
+                force_index_type: Some(ScalarIndexType::Bitmap),
+            })
+        } else if index_type == "LABEL_LIST" {
+            Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::LabelList),
+            })
+        } else if index_type == "INVERTED" {
+            Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::Inverted),
+            })
         } else {
             let column_type = match self.ds.schema().field(columns[0]) {
                 Some(f) => f.data_type().clone(),
                 None => return Err(PyValueError::new_err("Column not found in dataset schema.")),
             };
-            prepare_vector_index_params(&index_type, &column_type, kwargs)?
+            prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)?
         };
 
         let replace = replace.unwrap_or(true);
@@ -994,22 +1064,44 @@ impl Dataset {
         operation: Operation,
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
+        storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
+        let object_store_params =
+            storage_options
+                .as_ref()
+                .map(|storage_options| ObjectStoreParams {
+                    storage_options: Some(storage_options.clone()),
+                    ..Default::default()
+                });
+
         let commit_handler = commit_lock.map(|commit_lock| {
             Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
                 as Arc<dyn CommitHandler>
         });
         let ds = RT
             .block_on(commit_lock.map(|cl| cl.py()), async move {
-                let dataset = match DatasetBuilder::from_uri(dataset_uri).load().await {
+                let mut builder = DatasetBuilder::from_uri(dataset_uri);
+                if let Some(storage_options) = storage_options {
+                    builder = builder.with_storage_options(storage_options);
+                }
+                if let Some(read_version) = read_version {
+                    builder = builder.with_version(read_version);
+                }
+                let dataset = match builder.load().await {
                     Ok(ds) => Some(ds),
                     Err(lance::Error::DatasetNotFound { .. }) => None,
                     Err(err) => return Err(err),
                 };
                 let manifest = dataset.as_ref().map(|ds| ds.manifest());
                 validate_operation(manifest, &operation.0)?;
-                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler)
-                    .await
+                LanceDataset::commit(
+                    dataset_uri,
+                    operation.0,
+                    read_version,
+                    object_store_params,
+                    commit_handler,
+                )
+                .await
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
@@ -1104,7 +1196,7 @@ impl Dataset {
 }
 
 #[pyfunction(name = "_write_dataset")]
-pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<Dataset> {
+pub fn write_dataset(reader: &Bound<PyAny>, uri: String, options: &PyDict) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
     let ds = if reader.is_instance_of::<Scanner>() {
@@ -1116,7 +1208,7 @@ pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
-        let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
+        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     };
@@ -1208,7 +1300,8 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
 fn prepare_vector_index_params(
     index_type: &str,
     column_type: &DataType,
-    kwargs: Option<&PyDict>,
+    storage_options: Option<HashMap<String, String>>,
+    kwargs: Option<&Bound<PyDict>>,
 ) -> PyResult<Box<dyn IndexParams>> {
     let mut m_type = MetricType::L2;
     let mut ivf_params = IvfBuildParams::default();
@@ -1225,7 +1318,7 @@ fn prepare_vector_index_params(
 
         // Parse sample rate
         if let Some(sample_rate) = kwargs.get_item("sample_rate")? {
-            let sample_rate = PyAny::downcast::<PyInt>(sample_rate)?.extract()?;
+            let sample_rate: usize = sample_rate.extract()?;
             ivf_params.sample_rate = sample_rate;
             pq_params.sample_rate = sample_rate;
             sq_params.sample_rate = sample_rate;
@@ -1233,11 +1326,15 @@ fn prepare_vector_index_params(
 
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
-            ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
+            ivf_params.num_partitions = n.extract()?
+        };
+
+        if let Some(n) = kwargs.get_item("shuffle_partition_concurrency")? {
+            ivf_params.shuffle_partition_concurrency = n.extract()?
         };
 
         if let Some(c) = kwargs.get_item("ivf_centroids")? {
-            let batch = RecordBatch::from_pyarrow(c)?;
+            let batch = RecordBatch::from_pyarrow_bound(&c)?;
             if "_ivf_centroids" != batch.schema().field(0).name() {
                 return Err(PyValueError::new_err(
                     "Expected '_ivf_centroids' as the first column name.",
@@ -1266,6 +1363,10 @@ fn prepare_vector_index_params(
             ivf_params.precomputed_partitons_file = Some(f.to_string());
         };
 
+        if let Some(storage_options) = storage_options {
+            ivf_params.storage_options = Some(storage_options);
+        }
+
         match (
                 kwargs.get_item("precomputed_shuffle_buffers")?,
                 kwargs.get_item("precomputed_shuffle_buffers_path")?
@@ -1277,7 +1378,7 @@ fn prepare_vector_index_params(
                             e
                         ))
                     })?;
-                    let list = PyAny::downcast::<PyList>(l)?
+                    let list = l.downcast::<PyList>()?
                         .iter()
                         .map(|f| f.to_string())
                         .collect();
@@ -1293,28 +1394,28 @@ fn prepare_vector_index_params(
 
         // Parse HNSW params
         if let Some(max_level) = kwargs.get_item("max_level")? {
-            hnsw_params.max_level = PyAny::downcast::<PyInt>(max_level)?.extract()?;
+            hnsw_params.max_level = max_level.extract()?;
         }
 
         if let Some(m) = kwargs.get_item("m")? {
-            hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
+            hnsw_params.m = m.extract()?;
         }
 
         if let Some(ef_c) = kwargs.get_item("ef_construction")? {
-            hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
+            hnsw_params.ef_construction = ef_c.extract()?;
         }
 
         // Parse PQ params
         if let Some(n) = kwargs.get_item("num_bits")? {
-            pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
+            pq_params.num_bits = n.extract()?
         };
 
         if let Some(n) = kwargs.get_item("num_sub_vectors")? {
-            pq_params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
+            pq_params.num_sub_vectors = n.extract()?
         };
 
         if let Some(c) = kwargs.get_item("pq_codebook")? {
-            let batch = RecordBatch::from_pyarrow(c)?;
+            let batch = RecordBatch::from_pyarrow_bound(&c)?;
             if "_pq_codebook" != batch.schema().field(0).name() {
                 return Err(PyValueError::new_err(
                     "Expected '_pq_codebook' as the first column name.",
@@ -1365,14 +1466,12 @@ impl PyWriteProgress {
 
 #[async_trait]
 impl WriteFragmentProgress for PyWriteProgress {
-    async fn begin(&self, fragment: &Fragment, multipart_id: &str) -> lance::Result<()> {
+    async fn begin(&self, fragment: &Fragment) -> lance::Result<()> {
         let json_str = serde_json::to_string(fragment)?;
 
         Python::with_gil(|py| -> PyResult<()> {
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("multipart_id", multipart_id)?;
             self.py_obj
-                .call_method(py, "_do_begin", (json_str,), Some(kwargs))?;
+                .call_method(py, "_do_begin", (json_str,), None)?;
             Ok(())
         })
         .map_err(|e| {

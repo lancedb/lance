@@ -433,6 +433,8 @@ impl FileFragment {
     /// - `projection`: The projection schema.
     /// - `with_row_id`: If true, the row id will be included in the output.
     /// - `with_row_address`: If true, the row address will be included in the output.
+    /// - `scan_scheduler`: The scheduler to use for reading data files.  If not supplied
+    ///                     and the data is v2 data then a new scheduler will be created
     ///
     /// `projection` may be an empty schema only if `with_row_id` is true. In that
     /// case, the reader will only be generating row ids.
@@ -441,8 +443,9 @@ impl FileFragment {
         projection: &Schema,
         with_row_id: bool,
         with_row_address: bool,
+        scan_scheduler: Option<Arc<ScanScheduler>>,
     ) -> Result<FragmentReader> {
-        let open_files = self.open_readers(projection);
+        let open_files = self.open_readers(projection, scan_scheduler);
         let deletion_vec_load =
             self.load_deletion_vector(&self.dataset.object_store, &self.metadata);
 
@@ -501,6 +504,7 @@ impl FileFragment {
         &self,
         data_file: &DataFile,
         projection: Option<&Schema>,
+        scan_scheduler: Option<Arc<ScanScheduler>>,
     ) -> Result<Option<(Box<dyn GenericFileReader>, Arc<Schema>)>> {
         let full_schema = self.dataset.schema();
         // The data file may contain fields that are not part of the dataset any longer, remove those
@@ -535,7 +539,8 @@ impl FileFragment {
             Ok(None)
         } else {
             let path = self.dataset.data_dir().child(data_file.path.as_str());
-            let store_scheduler = ScanScheduler::new(self.dataset.object_store.clone(), 16);
+            let store_scheduler = scan_scheduler
+                .unwrap_or_else(|| ScanScheduler::new(self.dataset.object_store.clone()));
             let file_scheduler = store_scheduler.open_file(&path).await?;
             let reader = Arc::new(
                 v2::reader::FileReader::try_open(
@@ -567,10 +572,14 @@ impl FileFragment {
     async fn open_readers(
         &self,
         projection: &Schema,
+        scan_scheduler: Option<Arc<ScanScheduler>>,
     ) -> Result<Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>> {
         let mut opened_files = vec![];
         for data_file in &self.metadata.files {
-            if let Some((reader, schema)) = self.open_reader(data_file, Some(projection)).await? {
+            if let Some((reader, schema)) = self
+                .open_reader(data_file, Some(projection), scan_scheduler.clone())
+                .await?
+            {
                 opened_files.push((reader, schema));
             }
         }
@@ -662,16 +671,16 @@ impl FileFragment {
 
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
-        let (reader, _) =
-            self.open_reader(some_file, None)
-                .await?
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
-                        "The data file {} did not have any fields contained in the dataset schema",
-                        some_file.path
-                    ),
-                    location: location!(),
-                })?;
+        let (reader, _) = self
+            .open_reader(some_file, None, None)
+            .await?
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "The data file {} did not have any fields contained in the dataset schema",
+                    some_file.path
+                ),
+                location: location!(),
+            })?;
 
         Ok(reader.len() as usize)
     }
@@ -756,13 +765,16 @@ impl FileFragment {
         }
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
-            let (reader, _) = self.open_reader(data_file, None).await?.ok_or_else(|| {
-                Error::corrupt_file(
-                    self.dataset.data_dir().child(data_file.path.clone()),
-                    "did not have any fields in common with the dataset schema",
-                    location!(),
-                )
-            })?;
+            let (reader, _) = self
+                .open_reader(data_file, None, None)
+                .await?
+                .ok_or_else(|| {
+                    Error::corrupt_file(
+                        self.dataset.data_dir().child(data_file.path.clone()),
+                        "did not have any fields in common with the dataset schema",
+                        location!(),
+                    )
+                })?;
             Result::Ok(reader.len() as usize)
         });
         let get_lengths = try_join_all(get_lengths);
@@ -951,7 +963,7 @@ impl FileFragment {
         with_row_address: bool,
     ) -> Result<RecordBatch> {
         // TODO: support taking row addresses
-        let reader = self.open(projection, false, with_row_address).await?;
+        let reader = self.open(projection, false, with_row_address, None).await?;
 
         if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =
@@ -1008,7 +1020,7 @@ impl FileFragment {
         }
         // If there is no projection, we at least need to read the row addresses
         let with_row_addr = schema.fields.is_empty();
-        let reader = self.open(&schema, false, with_row_addr);
+        let reader = self.open(&schema, false, with_row_addr, None);
         let deletion_vector = read_deletion_file(
             &self.dataset.base,
             &self.metadata,
@@ -1834,7 +1846,7 @@ mod tests {
 
         for with_row_id in [false, true] {
             let reader = fragment
-                .open(fragment.schema(), with_row_id, false)
+                .open(fragment.schema(), with_row_id, false, None)
                 .await
                 .unwrap();
             for valid_range in [0..40, 20..40] {
@@ -1860,7 +1872,10 @@ mod tests {
         dataset.delete("i >= 0 and i < 15").await.unwrap();
 
         let fragment = &dataset.get_fragments()[0];
-        let mut reader = fragment.open(dataset.schema(), true, false).await.unwrap();
+        let mut reader = fragment
+            .open(dataset.schema(), true, false, None)
+            .await
+            .unwrap();
         reader.with_make_deletions_null();
 
         // Since the first batch is all deleted, it will return an empty batch.
@@ -2363,7 +2378,7 @@ mod tests {
             .get_fragments()
             .first()
             .unwrap()
-            .open(dataset.schema(), false, false)
+            .open(dataset.schema(), false, false, None)
             .await?;
         let actual_data = reader.take_as_batch(&[0, 1, 2]).await?;
         assert_eq!(expected_data.slice(0, 3), actual_data);
@@ -2412,7 +2427,7 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         let reader = fragment
-            .open(&dataset.schema().project::<&str>(&[])?, true, false)
+            .open(&dataset.schema().project::<&str>(&[])?, true, false, None)
             .await?;
         let batch = reader.legacy_read_range_as_batch(0..20).await?;
 
@@ -2424,7 +2439,7 @@ mod tests {
 
         // We should get error if we pass empty schema and with_row_id false
         let res = fragment
-            .open(&dataset.schema().project::<&str>(&[])?, false, false)
+            .open(&dataset.schema().project::<&str>(&[])?, false, false, None)
             .await;
         assert!(matches!(res, Err(Error::IO { .. })));
 

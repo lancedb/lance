@@ -20,7 +20,7 @@ use crate::Result;
 #[async_trait]
 pub trait WriteFragmentProgress: std::fmt::Debug + Sync + Send {
     /// Indicate the beginning of writing a [Fragment], with the in-flight multipart ID.
-    async fn begin(&self, fragment: &Fragment, multipart_id: &str) -> Result<()>;
+    async fn begin(&self, fragment: &Fragment) -> Result<()>;
 
     /// Complete writing a [Fragment].
     async fn complete(&self, fragment: &Fragment) -> Result<()>;
@@ -39,7 +39,7 @@ impl NoopFragmentWriteProgress {
 #[async_trait]
 impl WriteFragmentProgress for NoopFragmentWriteProgress {
     #[inline]
-    async fn begin(&self, _fragment: &Fragment, _multipart_id: &str) -> Result<()> {
+    async fn begin(&self, _fragment: &Fragment) -> Result<()> {
         Ok(())
     }
 

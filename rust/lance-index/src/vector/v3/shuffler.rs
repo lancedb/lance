@@ -159,7 +159,6 @@ impl Shuffler for IvfShuffler {
                             let writer = object_store.create(&part_path).await?;
                             FileWriter::try_new(
                                 writer,
-                                part_path.to_string(),
                                 lance_core::datatypes::Schema::try_from(schema.as_ref())?,
                                 Default::default(),
                             )
@@ -224,7 +223,7 @@ impl IvfShufflerReader {
         output_dir: Path,
         partition_sizes: Vec<usize>,
     ) -> Self {
-        let scheduler = ScanScheduler::new(object_store, 32);
+        let scheduler = ScanScheduler::new(object_store);
         Self {
             scheduler,
             output_dir,

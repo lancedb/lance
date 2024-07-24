@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
+use lance_datafusion::projection::ProjectionPlan;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
@@ -206,6 +207,48 @@ impl Default for ReadParams {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ProjectionRequest {
+    Schema(Arc<Schema>),
+    Sql(Vec<(String, String)>),
+}
+
+impl ProjectionRequest {
+    pub fn from_columns(
+        columns: impl IntoIterator<Item = impl AsRef<str>>,
+        dataset_schema: &Schema,
+    ) -> Self {
+        let columns = columns
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect::<Vec<_>>();
+        let schema = dataset_schema.project(&columns).unwrap();
+        Self::Schema(Arc::new(schema))
+    }
+
+    pub fn from_schema(schema: Schema) -> Self {
+        Self::Schema(Arc::new(schema))
+    }
+
+    pub fn from_sql(
+        columns: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        Self::Sql(
+            columns
+                .into_iter()
+                .map(|(a, b)| (a.into(), b.into()))
+                .collect(),
+        )
+    }
+
+    pub fn into_projection_plan(self, dataset_schema: &Schema) -> Result<ProjectionPlan> {
+        match self {
+            Self::Schema(schema) => Ok(ProjectionPlan::new_empty(schema)),
+            Self::Sql(columns) => ProjectionPlan::try_new(dataset_schema, &columns),
+        }
+    }
+}
+
 impl Dataset {
     /// Open an existing dataset.
     ///
@@ -255,39 +298,6 @@ impl Dataset {
         };
 
         Ok((object_store, base_path, commit_handler))
-    }
-
-    /// Open a dataset with read params.
-    #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
-    #[instrument(skip(params))]
-    pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_read_params(params.clone())
-            .load()
-            .await
-    }
-
-    /// Check out a version of the dataset.
-    #[deprecated(note = "Please use `DatasetBuilder` instead.")]
-    pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_version(version)
-            .load()
-            .await
-    }
-
-    /// Check out a version of the dataset with read params.
-    #[deprecated(note = "Please use `DatasetBuilder` instead.")]
-    pub async fn checkout_with_params(
-        uri: &str,
-        version: u64,
-        params: &ReadParams,
-    ) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_version(version)
-            .with_read_params(params.clone())
-            .load()
-            .await
     }
 
     /// Check out the specified version of this dataset
@@ -997,13 +1007,31 @@ impl Dataset {
     }
 
     #[instrument(skip_all, fields(num_rows=row_indices.len()))]
-    pub async fn take(&self, row_indices: &[u64], projection: &Schema) -> Result<RecordBatch> {
-        take::take(self, row_indices, projection).await
+    pub async fn take(
+        &self,
+        row_indices: &[u64],
+        projection: ProjectionRequest,
+    ) -> Result<RecordBatch> {
+        take::take(
+            self,
+            row_indices,
+            &projection.into_projection_plan(self.schema())?,
+        )
+        .await
     }
 
     /// Take rows by the internal ROW ids.
-    pub async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
-        take::take_rows(self, row_ids, projection).await
+    pub async fn take_rows(
+        &self,
+        row_ids: &[u64],
+        projection: ProjectionRequest,
+    ) -> Result<RecordBatch> {
+        take::take_rows(
+            self,
+            row_ids,
+            &projection.into_projection_plan(self.schema())?,
+        )
+        .await
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -1023,7 +1051,8 @@ impl Dataset {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
         let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
-        self.take(&ids, projection).await
+        self.take(&ids, ProjectionRequest::from_schema(projection.clone()))
+            .await
     }
 
     /// Delete rows based on a predicate.
@@ -1271,7 +1300,12 @@ impl DatasetTakeRows for Dataset {
     }
 
     async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
-        Self::take_rows(self, row_ids, projection).await
+        Self::take_rows(
+            self,
+            row_ids,
+            ProjectionRequest::from_schema(projection.clone()),
+        )
+        .await
     }
 }
 
@@ -1327,7 +1361,7 @@ pub(crate) async fn write_manifest_file(
             manifest,
             indices,
             base_path,
-            &object_store.inner,
+            object_store,
             write_manifest_file_to_path,
         )
         .await?;
@@ -1336,7 +1370,7 @@ pub(crate) async fn write_manifest_file(
 }
 
 fn write_manifest_file_to_path<'a>(
-    object_store: &'a dyn object_store::ObjectStore,
+    object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
@@ -1690,7 +1724,10 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
-            let reader = fragment.open(dataset.schema(), false, false).await.unwrap();
+            let reader = fragment
+                .open(dataset.schema(), false, false, None)
+                .await
+                .unwrap();
             // No group / batch concept in v2
             if use_legacy_format {
                 assert_eq!(reader.legacy_num_batches(), 10);

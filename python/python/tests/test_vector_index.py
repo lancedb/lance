@@ -137,7 +137,6 @@ def test_index_with_nans(tmp_path):
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
-        accelerator=torch.device("cpu"),
     )
     validate_vector_index(dataset, "vector")
 
@@ -605,7 +604,7 @@ def test_index_cache_size(tmp_path):
 
     indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=1)
     # query using the same vector, we should get a very high hit rate
-    query_index(indexed_dataset, 100, q=rng.standard_normal(16))
+    query_index(indexed_dataset, 200, q=rng.standard_normal(16))
     assert indexed_dataset._ds.index_cache_hit_rate() > 0.99
 
     last_hit_rate = indexed_dataset._ds.index_cache_hit_rate()

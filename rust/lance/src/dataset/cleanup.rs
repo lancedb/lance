@@ -35,8 +35,7 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_core::Result;
 use lance_table::{
     format::{Index, Manifest},
     io::{
@@ -394,61 +393,22 @@ pub async fn cleanup_old_versions(
     cleanup.run().await
 }
 
-/// Force cleanup of specific partial writes.
-///
-/// These files can be cleaned up easily with [cleanup_old_versions()] after 7 days,
-/// but if you know specific partial writes have been made, you can call this
-/// function to clean them up immediately.
-///
-/// To find partial writes, you can use the
-/// [crate::dataset::progress::WriteFragmentProgress] trait to track which files
-/// have been started but never finished.
-pub async fn cleanup_partial_writes(
-    store: &ObjectStore,
-    base_path: &Path,
-    objects: impl IntoIterator<Item = (&Path, &String)>,
-) -> Result<()> {
-    futures::stream::iter(objects)
-        .map(Ok)
-        .try_for_each_concurrent(num_cpus::get() * 2, |(path, multipart_id)| async move {
-            let path: Path = base_path
-                .child("data")
-                .parts()
-                .chain(path.parts())
-                .collect();
-            match store.inner.abort_multipart(&path, multipart_id).await {
-                Ok(_) => Ok(()),
-                // We don't care if it's not there.
-                // TODO: once this issue is addressed, we should just use the error
-                // variant. https://github.com/apache/arrow-rs/issues/4749
-                // Err(object_store::Error::NotFound { .. }) => {
-                Err(e)
-                    if e.to_string().contains("No such file or directory")
-                        || e.to_string().contains("cannot find the file") =>
-                {
-                    log::warn!("Partial write not found: {} {}", path, multipart_id);
-                    Ok(())
-                }
-                Err(e) => Err(Error::from(e)),
-            }
-        })
-        .await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use arrow_array::{RecordBatchIterator, RecordBatchReader};
-    use lance_core::utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy};
+    use arrow_array::RecordBatchReader;
+    use lance_core::{
+        utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
+        Error,
+    };
     use lance_index::{DatasetIndexExt, IndexType};
-    use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore};
+    use lance_io::object_store::{
+        ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use snafu::{location, Location};
-    use tokio::io::AsyncWriteExt;
 
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
@@ -1099,37 +1059,5 @@ mod tests {
 
         assert_eq!(after_count.num_data_files, 1);
         assert_eq!(after_count.num_manifest_files, 2);
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_partial_writes() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let schema = ArrowSchema::new(vec![Field::new("a", DataType::Int32, false)]);
-        let reader = RecordBatchIterator::new(vec![], Arc::new(schema));
-        let dataset = Dataset::write(reader, test_uri, Default::default())
-            .await
-            .unwrap();
-        let store = dataset.object_store();
-
-        // Create a partial write
-        let path1 = dataset.base.child("data").child("test");
-        let (multipart_id, mut writer) = store.inner.put_multipart(&path1).await.unwrap();
-        writer.write_all(b"test").await.unwrap();
-
-        // paths are relative to the store data path
-        let path1 = Path::from("test");
-        // Add a non-existant path and id
-        let path2 = Path::from("test2");
-        let non_existent_multipart_id = "non-existant-id".to_string();
-        let objects = vec![
-            (&path1, &multipart_id),
-            (&path2, &non_existent_multipart_id),
-        ];
-
-        cleanup_partial_writes(dataset.object_store(), &dataset.base, objects)
-            .await
-            .unwrap();
     }
 }

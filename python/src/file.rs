@@ -172,24 +172,23 @@ pub struct LanceFileWriter {
 impl LanceFileWriter {
     async fn open(
         uri_or_path: String,
-        schema: PyArrowType<ArrowSchema>,
+        schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
         let object_writer = object_store.create(&path).await.infer_error()?;
-        let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
-        let inner = FileWriter::try_new(
-            object_writer,
-            path.to_string(),
-            lance_schema,
-            FileWriterOptions {
-                data_cache_bytes,
-                keep_original_array,
-                ..Default::default()
-            },
-        )
-        .infer_error()?;
+        let options = FileWriterOptions {
+            data_cache_bytes,
+            keep_original_array,
+            ..Default::default()
+        };
+        let inner = if let Some(schema) = schema {
+            let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
+            FileWriter::try_new(object_writer, lance_schema, options).infer_error()
+        } else {
+            Ok(FileWriter::new_lazy(object_writer, options))
+        }?;
         Ok(Self {
             inner: Box::new(inner),
         })
@@ -201,7 +200,7 @@ impl LanceFileWriter {
     #[new]
     pub fn new(
         path: String,
-        schema: PyArrowType<ArrowSchema>,
+        schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
@@ -266,10 +265,7 @@ pub struct LanceFileReader {
 impl LanceFileReader {
     async fn open(uri_or_path: String) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
-        let io_parallelism = std::env::var("IO_THREADS")
-            .map(|val| val.parse::<u32>().unwrap_or(8))
-            .unwrap_or(8);
-        let scheduler = ScanScheduler::new(Arc::new(object_store), io_parallelism);
+        let scheduler = ScanScheduler::new(Arc::new(object_store));
         let file = scheduler.open_file(&path).await.infer_error()?;
         let inner = FileReader::try_open(file, None, DecoderMiddlewareChain::default())
             .await

@@ -16,13 +16,12 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
-use arrow::datatypes::Float32Type;
 use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::pq::ProductQuantizerImpl;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::{
     hnsw::{
@@ -260,6 +259,7 @@ pub(crate) async fn build_vector_index(
                 location: location!(),
             });
         };
+
         build_ivf_pq_index(
             dataset,
             column,
@@ -422,7 +422,7 @@ pub(crate) async fn open_vector_index(
                         location: location!(),
                     });
                 };
-                let pq = lance_index::vector::pq::builder::from_proto(pq_proto, metric_type)?;
+                let pq = ProductQuantizer::from_proto(pq_proto, metric_type)?;
                 last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
             }
             Some(Stage::Diskann(_)) => {
@@ -473,7 +473,7 @@ pub(crate) async fn open_vector_index_v2(
 
             let ivf_data = IvfModel::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
-            let hnsw = HNSWIndex::<ProductQuantizerImpl<Float32Type>>::try_new(
+            let hnsw = HNSWIndex::<ProductQuantizer>::try_new(
                 reader.object_reader.clone(),
                 aux_reader.into(),
                 options,

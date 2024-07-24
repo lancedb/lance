@@ -167,8 +167,9 @@ jobs:
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
           rustup component add rustfmt
       - name: Run tests
-        run: |
-          cargo build --all-features
+        # Check all benches, even though we aren't going to run them.
+        run: |  
+          cargo build --tests --benches --all-features --workspace
           cargo test --all-features
   windows-build:
     runs-on: windows-latest
@@ -190,6 +191,7 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
       - name: Run tests
+        # Check all benches, even though we aren't going to run them.
         run: |
-          cargo build
+          cargo build --tests --benches --all-features --workspace
           cargo test

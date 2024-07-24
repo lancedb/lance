@@ -148,6 +148,8 @@ impl PrimitivePageDecoder for BitmapDecoder {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use arrow_schema::{DataType, Field};
     use bytes::Bytes;
 
@@ -160,7 +162,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_bitmap_boolean() {
         let field = Field::new("", DataType::Boolean, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test]

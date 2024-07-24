@@ -6,6 +6,7 @@ import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance.indices import IndicesBuilder
 
 N_DIMS = 512
 
@@ -95,3 +96,34 @@ def test_optimize_index(
         lance.write_dataset(small_table, test_large_dataset.uri, mode="append")
 
     benchmark(test_large_dataset.optimize.optimize_indices)
+
+
+@pytest.mark.benchmark(group="optimize_index")
+@pytest.mark.parametrize("num_partitions", [100, 300])
+def test_train_ivf(test_large_dataset, benchmark, num_partitions):
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    benchmark.pedantic(
+        builder.train_ivf,
+        kwargs={"num_partitions": num_partitions},
+        iterations=1,
+        rounds=1,
+    )
+
+
+# Pre-computing partition assigment only makes sense on CUDA and so this benchmark runs
+# only on CUDA.
+@pytest.mark.benchmark(group="assign_partitions")
+@pytest.mark.parametrize("num_partitions", [100, 300])
+def test_partition_assignment(test_large_dataset, benchmark, num_partitions):
+    from lance.dependencies import torch
+
+    try:
+        if not torch.cuda.is_available():
+            return
+    except:  # noqa: E722
+        return
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    ivf = builder.train_ivf(num_partitions=num_partitions)
+    benchmark.pedantic(
+        builder.assign_ivf_partitions, args=[ivf, None, "cuda"], iterations=1, rounds=1
+    )

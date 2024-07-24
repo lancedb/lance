@@ -37,10 +37,12 @@ def parse_version(version: str) -> tuple[int, int, int]:
 
 if __name__ == "__main__":
     new_version = parse_version(get_versions())
+    print(f"New version: {new_version}")
 
     repo = Github().get_repo(os.environ["GITHUB_REPOSITORY"])
     latest_release = repo.get_latest_release()
     last_version = parse_version(latest_release.tag_name[1:])
+    print(f"Last version: {last_version}")
 
     # Check for a breaking-change label in the PRs between the last release and the current commit.
     commits = repo.compare(latest_release.tag_name, os.environ["GITHUB_SHA"]).commits

@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 use tracing::{instrument, Instrument};
 
-use crate::dataset::{Dataset, ROW_ID};
+use crate::dataset::{Dataset, ProjectionRequest, ROW_ID};
 use crate::datatypes::Schema;
 use crate::{arrow::*, Error};
 
@@ -116,7 +116,9 @@ impl Take {
             let rows = if extra.fields.is_empty() {
                 batch
             } else {
-                let new_columns = dataset.take_rows(row_ids.values(), &extra).await?;
+                let new_columns = dataset
+                    .take_rows(row_ids.values(), ProjectionRequest::Schema(extra))
+                    .await?;
                 debug_assert_eq!(batch.num_rows(), new_columns.num_rows());
                 batch.merge(&new_columns)?
             };
@@ -249,6 +251,10 @@ impl TakeExec {
 }
 
 impl ExecutionPlan for TakeExec {
+    fn name(&self) -> &str {
+        "TakeExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -257,8 +263,8 @@ impl ExecutionPlan for TakeExec {
         ArrowSchema::from(&self.output_schema).into()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     /// This preserves the output schema.
@@ -379,7 +385,7 @@ mod tests {
             scan_schema,
             10,
             10,
-            4,
+            Some(4),
             true,
             false,
             false,
@@ -413,7 +419,7 @@ mod tests {
             scan_schema,
             10,
             10,
-            4,
+            Some(4),
             true,
             false,
             false,
@@ -447,7 +453,7 @@ mod tests {
             scan_schema,
             10,
             10,
-            4,
+            Some(4),
             false,
             false,
             false,
@@ -466,7 +472,7 @@ mod tests {
             Arc::new(dataset.schema().project(&["i"])?),
             10,
             10,
-            4,
+            Some(4),
             true,
             false,
             false,

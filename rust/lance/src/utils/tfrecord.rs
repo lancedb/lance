@@ -9,6 +9,7 @@
 use arrow::buffer::OffsetBuffer;
 use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::{ArrayRef, FixedSizeListArray, ListArray};
+use arrow_buffer::ArrowNativeType;
 use arrow_buffer::ScalarBuffer;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -764,13 +765,13 @@ fn append_primitive_from_slice<T>(
     // TensorProto to tell us the original endianness, so it's possible there
     // could be a mismatch here.
     let (prefix, middle, suffix) = unsafe { slice.align_to::<T::Native>() };
-    for val in prefix.chunks_exact(T::get_byte_width()) {
+    for val in prefix.chunks_exact(T::Native::get_byte_width()) {
         builder.append_value(parse_val(val));
     }
 
     builder.append_slice(middle);
 
-    for val in suffix.chunks_exact(T::get_byte_width()) {
+    for val in suffix.chunks_exact(T::Native::get_byte_width()) {
         builder.append_value(parse_val(val));
     }
 }

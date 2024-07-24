@@ -304,6 +304,20 @@ def test_take_with_columns(tmp_path: Path):
     assert table2 == pa.Table.from_pylist([{"b": 2}])
 
 
+def test_take_with_projection(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    table2 = dataset.take([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+
+    assert table2 == pa.Table.from_pylist([{"a2": 2, "bup": "X"}])
+
+    table3 = dataset._take_rows([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+    assert table3 == table2
+
+
 def test_filter(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1337,6 +1351,26 @@ def test_update_dataset_all_types(tmp_path: Path):
         }
     )
     assert dataset.to_table() == expected
+
+
+def test_update_with_binary_field(tmp_path: Path):
+    # Create a lance dataset with binary fields
+    table = pa.Table.from_pydict(
+        {
+            "a": [f"str-{i}" for i in range(100)],
+            "b": [b"bin-{i}" for i in range(100)],
+            "c": list(range(100)),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Update binary field
+    dataset.update({"b": "X'616263'"}, where="c < 2")
+
+    ds = lance.dataset(tmp_path)
+    assert ds.scanner(filter="c < 2").to_table().column(
+        "b"
+    ).combine_chunks() == pa.array([b"abc", b"abc"])
 
 
 def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):

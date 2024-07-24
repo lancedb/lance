@@ -78,6 +78,7 @@ class KMeans:
         k: int,
         metric_type: Literal["l2", "dot", "cosine"] = "l2",
         max_iters: int = 50,
+        centroids: Optional[pa.FixedSizeListArray] = None,
     ):
         """Create a KMeans model.
 
@@ -90,6 +91,7 @@ class KMeans:
             Supported distance metrics: "l2", "cosine", "dot"
         max_iters: int
             The maximum number of iterations to run the KMeans algorithm. Default: 50.
+        centroids (pyarrow.FixedSizeListArray, optional.) – Provide existing centroids.
         """
         metric_type = metric_type.lower()
         if metric_type not in ["l2", "dot", "cosine"]:
@@ -98,7 +100,9 @@ class KMeans:
             )
         self.k = k
         self._metric_type = metric_type
-        self._kmeans = _KMeans(k, metric_type, max_iters=max_iters)
+        self._kmeans = _KMeans(
+            k, metric_type, max_iters=max_iters, centroids_arr=centroids
+        )
 
     def __repr__(self) -> str:
         return f"lance.KMeans(k={self.k}, metric_type={self._metric_type})"

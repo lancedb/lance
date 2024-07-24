@@ -10,52 +10,36 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, PutOptions, PutResult,
-    Result as OSResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts, PutOptions,
+    PutPayload, PutResult, Result as OSResult, UploadPart,
 };
-use pin_project::pin_project;
-use tokio::io::AsyncWrite;
 use tracing::{debug_span, instrument, Span};
 
-#[pin_project]
-pub struct TracedAsyncWrite {
+#[derive(Debug)]
+pub struct TracedMultipartUpload {
     write_span: Span,
-    finish_span: Option<Span>,
-    #[pin]
-    target: Box<dyn AsyncWrite + Unpin + Send>,
+    target: Box<dyn MultipartUpload>,
 }
 
-impl AsyncWrite for TracedAsyncWrite {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        let this = self.project();
-        let _guard = this.write_span.enter();
-        this.target.poll_write(cx, buf)
+#[async_trait::async_trait]
+impl MultipartUpload for TracedMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let write_span = self.write_span.clone();
+        let fut = self.target.put_part(data);
+        Box::pin(async move {
+            let _guard = write_span.enter();
+            fut.await
+        })
     }
 
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        let this = self.project();
-        let _guard = this.write_span.enter();
-        this.target.poll_flush(cx)
+    #[instrument(level = "debug")]
+    async fn complete(&mut self) -> OSResult<PutResult> {
+        self.target.complete().await
     }
 
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        let this = self.project();
-        // TODO: Replace with get_or_insert_with when
-        let _guard = this
-            .finish_span
-            .get_or_insert_with(|| debug_span!("put_multipart_finish"))
-            .enter();
-        this.target.poll_shutdown(cx)
+    #[instrument(level = "debug")]
+    async fn abort(&mut self) -> OSResult<()> {
+        self.target.abort().await
     }
 }
 
@@ -73,7 +57,7 @@ impl std::fmt::Display for TracedObjectStore {
 #[async_trait::async_trait]
 impl object_store::ObjectStore for TracedObjectStore {
     #[instrument(level = "debug", skip(self, bytes))]
-    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
+    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         self.target.put(location, bytes).await
     }
 
@@ -81,30 +65,22 @@ impl object_store::ObjectStore for TracedObjectStore {
     async fn put_opts(
         &self,
         location: &Path,
-        bytes: Bytes,
+        bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         self.target.put_opts(location, bytes, opts).await
     }
 
-    async fn put_multipart(
+    async fn put_multipart_opts(
         &self,
         location: &Path,
-    ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
-        let (multipart_id, async_write) = self.target.put_multipart(location).await?;
-        Ok((
-            multipart_id,
-            Box::new(TracedAsyncWrite {
-                write_span: debug_span!("put_multipart"),
-                finish_span: None,
-                target: async_write,
-            }) as Box<dyn AsyncWrite + Unpin + Send>,
-        ))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
-        self.target.abort_multipart(location, multipart_id).await
+        opts: PutMultipartOpts,
+    ) -> OSResult<Box<dyn object_store::MultipartUpload>> {
+        let upload = self.target.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(TracedMultipartUpload {
+            target: upload,
+            write_span: debug_span!("put_multipart_opts"),
+        }))
     }
 
     #[instrument(level = "debug", skip(self, options))]

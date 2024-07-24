@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -10,8 +10,8 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
-use datafusion::common::DFSchema;
-use datafusion::logical_expr::{AggregateFunction, Expr};
+use datafusion::functions_aggregate::count::count_udaf;
+use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
@@ -19,10 +19,11 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
-    expressions::{create_aggregate_expr, Literal},
+    expressions::Literal,
     filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
+    udaf::create_aggregate_expr,
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
@@ -33,6 +34,11 @@ use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
+use lance_datafusion::projection::ProjectionPlan;
+use lance_index::scalar::expression::IndexInformationProvider;
+use lance_index::scalar::expression::PlannerIndexExt;
+use lance_index::scalar::inverted::SCORE_COL;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -45,6 +51,8 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
+use crate::io::exec::fts::FtsExec;
+use crate::io::exec::get_physical_optimizer;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     knn::new_knn_exec, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec,
@@ -124,18 +132,16 @@ impl ColumnOrdering {
 pub struct Scanner {
     dataset: Arc<Dataset>,
 
-    /// The physical schema (before dynamic projection) that must be loaded from the table
-    phyical_columns: Schema,
-
-    /// The expressions for all the columns to be in the output
-    /// Note: this doesn't include _distance, and _rowid
-    requested_output_expr: Option<Vec<(Expr, String)>>,
+    projection_plan: ProjectionPlan,
 
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
 
     /// Optional filter expression.
     pub(crate) filter: Option<Expr>,
+
+    /// Optional full text search query
+    full_text_query: Option<FullTextSearchQuery>,
 
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
@@ -144,7 +150,7 @@ pub struct Scanner {
     batch_readahead: usize,
 
     /// Number of fragments to read concurrently
-    fragment_readahead: usize,
+    fragment_readahead: Option<usize>,
 
     limit: Option<i64>,
     offset: Option<i64>,
@@ -179,6 +185,14 @@ pub struct Scanner {
 
     /// If set, this scanner serves only these fragments.
     fragments: Option<Vec<Fragment>>,
+
+    /// Only search the data being indexed (weak consistency search).
+    ///
+    /// Default value is false.
+    ///
+    /// This is essentially a weak consistency search. Users can run index or optimize index
+    /// to make the index catch up with the latest data.
+    fast_search: bool,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -190,17 +204,16 @@ fn escape_column_name(name: &str) -> String {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        let projection = dataset.schema().clone();
-
+        let projection_plan = ProjectionPlan::new_empty(Arc::new(dataset.schema().clone()));
         Self {
             dataset,
-            phyical_columns: projection,
-            requested_output_expr: None,
+            projection_plan,
             prefilter: false,
             filter: None,
+            full_text_query: None,
             batch_size: None,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
-            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
+            fragment_readahead: None,
             limit: None,
             offset: None,
             ordering: None,
@@ -210,6 +223,7 @@ impl Scanner {
             with_row_address: false,
             ordered: true,
             fragments: None,
+            fast_search: false,
         }
     }
 
@@ -276,34 +290,9 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
-        let mut output = HashMap::new();
-        let mut physical_cols_set = HashSet::new();
-        let mut physical_cols = vec![];
-        for (output_name, raw_expr) in columns {
-            if output.contains_key(output_name.as_ref()) {
-                return Err(Error::io(
-                    format!("Duplicate column name: {}", output_name.as_ref()),
-                    location!(),
-                ));
-            }
-            let expr = planner.parse_expr(raw_expr.as_ref())?;
-            for col in Planner::column_names_in_expr(&expr) {
-                if physical_cols_set.contains(&col) {
-                    continue;
-                }
-                physical_cols.push(col.clone());
-                physical_cols_set.insert(col);
-            }
-            output.insert(output_name.as_ref().to_string(), expr);
-        }
-        self.phyical_columns = self.dataset.schema().project(&physical_cols)?;
-
-        let mut output_cols = vec![];
-        for (name, _) in columns {
-            output_cols.push((output[name.as_ref()].clone(), name.as_ref().to_string()));
-        }
-        self.requested_output_expr = Some(output_cols);
+        let physical_schema = self.physical_schema(true)?;
+        let base_schema = self.dataset.schema().merge(physical_schema.as_ref())?;
+        self.projection_plan = ProjectionPlan::try_new(&base_schema, columns)?;
         Ok(self)
     }
 
@@ -343,6 +332,35 @@ impl Scanner {
         Ok(self)
     }
 
+    /// Filter by full text search
+    /// The column must be a string column.
+    /// The query is a string to search for.
+    /// The search is case-insensitive, BM25 scoring is used.
+    ///
+    /// ```rust,ignore
+    /// let dataset = Dataset::open(uri).await.unwrap();
+    /// let stream = dataset.scan()
+    ///    .project(&["col", "col2.subfield"]).unwrap()
+    ///    .full_text_search("col", "query").unwrap()
+    ///    .limit(10)
+    ///    .into_stream();
+    /// ```
+    pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
+        if !query.columns.is_empty() {
+            for column in &query.columns {
+                if self.dataset.schema().field(column).is_none() {
+                    return Err(Error::io(
+                        format!("Column {} not found", column),
+                        location!(),
+                    ));
+                }
+            }
+        }
+
+        self.full_text_query = Some(query);
+        Ok(self)
+    }
+
     /// Set a filter using a Substrait ExtendedExpression message
     ///
     /// The message must contain exactly one expression and that expression
@@ -377,7 +395,7 @@ impl Scanner {
     ///
     /// This is only used if ``scan_in_order`` is set to false.
     pub fn fragment_readahead(&mut self, nfragments: usize) -> &mut Self {
-        self.fragment_readahead = nfragments;
+        self.fragment_readahead = Some(nfragments);
         self
     }
 
@@ -427,7 +445,11 @@ impl Scanner {
 
     /// Find k-nearest neighbor within the vector column.
     pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
-        self.ensure_not_fragment_scan()?;
+        if !self.prefilter {
+            // We can allow fragment scan if the input to nearest is a prefilter.
+            // The fragment scan will be performed by the prefilter.
+            self.ensure_not_fragment_scan()?;
+        }
 
         if k == 0 {
             return Err(Error::io("k must be positive".to_string(), location!()));
@@ -494,6 +516,19 @@ impl Scanner {
         if let Some(q) = self.nearest.as_mut() {
             q.ef = Some(ef);
         }
+        self
+    }
+
+    /// Only search the data being indexed.
+    ///
+    /// Default value is false.
+    ///
+    /// This is essentially a weak consistency search, only on the indexed data.
+    pub fn fast_search(&mut self) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.use_index = true;
+        }
+        self.fast_search = true;
         self
     }
 
@@ -582,20 +617,14 @@ impl Scanner {
     }
 
     /// The schema of the Scanner from lance physical takes
-    pub(crate) fn physical_schema(&self) -> Result<Arc<Schema>> {
+    pub(crate) fn physical_schema(&self, in_projection: bool) -> Result<Arc<Schema>> {
         let mut extra_columns = vec![];
 
-        if let Some(q) = self.nearest.as_ref() {
-            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::io(
-                format!("Column {} not found", q.column),
-                location!(),
-            ))?;
-            let vector_field = ArrowField::from(vector_field);
-            extra_columns.push(vector_field);
+        if self.nearest.as_ref().is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
 
-        if self.with_row_id {
+        if self.with_row_id || in_projection {
             extra_columns.push(ROW_ID_FIELD.clone());
         }
 
@@ -604,10 +633,11 @@ impl Scanner {
         }
 
         let schema = if !extra_columns.is_empty() {
-            self.phyical_columns
+            self.projection_plan
+                .physical_schema
                 .merge(&ArrowSchema::new(extra_columns))?
         } else {
-            self.phyical_columns.clone()
+            self.projection_plan.physical_schema.as_ref().clone()
         };
 
         // drop metadata
@@ -625,61 +655,23 @@ impl Scanner {
     }
 
     pub(crate) fn output_expr(&self) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-        let physical_schema = self.physical_schema()?;
-
-        // reset the id ordering becuase we will take the batch after projection
-        let physical_schema = ArrowSchema::new(
-            physical_schema
-                .fields
-                .iter()
-                .map(|f| ArrowField::new(f.name.clone(), f.data_type(), f.nullable))
-                .collect::<Vec<_>>(),
-        );
-        let df_schema = Arc::new(DFSchema::try_from(physical_schema.clone())?);
-
-        let project_star = self
-            .phyical_columns
-            .fields
-            .iter()
-            .map(|f| {
-                Ok((
-                    expressions::col(f.name.as_str(), &physical_schema)?.clone(),
-                    f.name.clone(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let output_expr = self.requested_output_expr.clone().map(|exprs| {
-            exprs
-                .iter()
-                .map(|(expr, name)| {
-                    Ok((
-                        datafusion::physical_expr::create_physical_expr(
-                            expr,
-                            &df_schema,
-                            &Default::default(),
-                        )?,
-                        name.clone(),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()
-        });
-
         // Append the extra columns
-        let mut output_expr = output_expr.unwrap_or(Ok(project_star))?;
+        let mut output_expr = self.projection_plan.to_physical_exprs()?;
+
+        let physical_schema = ArrowSchema::from(self.physical_schema(false)?.as_ref());
 
         // distance goes before the row_id column
-        if self.nearest.is_some() {
+        if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
             let vector_expr = expressions::col(DIST_COL, &physical_schema)?;
             output_expr.push((vector_expr, DIST_COL.to_string()));
         }
 
-        if self.with_row_id {
+        if self.with_row_id && output_expr.iter().all(|(_, name)| name != ROW_ID) {
             let row_id_expr = expressions::col(ROW_ID, &physical_schema)?;
             output_expr.push((row_id_expr, ROW_ID.to_string()));
         }
 
-        if self.with_row_address {
+        if self.with_row_address && output_expr.iter().all(|(_, name)| name != ROW_ADDR) {
             let row_addr_expr = expressions::col(ROW_ADDR, &physical_schema)?;
             output_expr.push((row_addr_expr, ROW_ADDR.to_string()));
         }
@@ -719,12 +711,14 @@ impl Scanner {
         // Datafusion interprets COUNT(*) as COUNT(1)
         let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
         let count_expr = create_aggregate_expr(
-            &AggregateFunction::Count,
-            false,
+            &count_udaf(),
             &[one],
+            &[lit(1)],
+            &[],
             &[],
             &plan.schema(),
             "",
+            false,
             false,
         )?;
         let plan_schema = plan.schema().clone();
@@ -808,7 +802,7 @@ impl Scanner {
     ///     -> Take(remaining_cols) -> Projection()
     /// ```
     ///
-    /// In general, a plan has 4 stages:
+    /// In general, a plan has 5 stages:
     ///
     /// 1. Source (from dataset Scan or from index, may include prefilter)
     /// 2. Filter
@@ -816,7 +810,10 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.phyical_columns.fields.is_empty() && !self.with_row_id && !self.with_row_address {
+        if self.projection_plan.physical_schema.fields.is_empty()
+            && !self.with_row_id
+            && !self.with_row_address
+        {
             return Err(Error::InvalidInput {
                 source:
                     "no columns were selected and with_row_id is false, there is nothing to scan"
@@ -864,59 +861,75 @@ impl Scanner {
             FilterPlan::default()
         };
 
-        // Stage 1: source (either an (K|A)NN search or a (full|indexed) scan)
-        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
-            // The source is an nearest neighbor search
-            if self.prefilter {
-                // If we are prefiltering then the knn node will take care of the filter
-                let source = self.knn(&filter_plan).await?;
-                filter_plan = FilterPlan::default();
-                source
-            } else {
-                self.knn(&FilterPlan::default()).await?
+        // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
+        let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
+            (Some(_), None) => {
+                // The source is an nearest neighbor search
+                if self.prefilter {
+                    // If we are prefiltering then the knn node will take care of the filter
+                    let source = self.knn(&filter_plan).await?;
+                    filter_plan = FilterPlan::default();
+                    source
+                } else {
+                    self.knn(&FilterPlan::default()).await?
+                }
             }
-        } else {
-            // Avoid pushdown scan node if using v2 files
-            let fragments = if let Some(fragments) = self.fragments.as_ref() {
-                fragments
-            } else {
-                self.dataset.fragments()
-            };
-            let use_stats = if fragments.iter().any(|f| !f.has_legacy_files()) {
-                false
-            } else {
-                self.use_stats
-            };
-            match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
-                (Some(index_query), None) => {
-                    self.scalar_indexed_scan(&self.phyical_columns, index_query)
+            (None, Some(query)) => {
+                // The source is a full text search
+                self.fts(&filter_plan, query).await?
+            }
+            (None, None) => {
+                // Avoid pushdown scan node if using v2 files
+                let fragments = if let Some(fragments) = self.fragments.as_ref() {
+                    fragments
+                } else {
+                    self.dataset.fragments()
+                };
+                let use_stats = if fragments.iter().any(|f| !f.has_legacy_files()) {
+                    false
+                } else {
+                    self.use_stats
+                };
+                match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
+                    (Some(index_query), None) => {
+                        self.scalar_indexed_scan(
+                            self.projection_plan.physical_schema.as_ref(),
+                            index_query,
+                        )
                         .await?
-                }
-                // TODO: support combined pushdown and scalar index scan
-                (Some(index_query), Some(_)) => {
-                    // If there is a filter then just load the filter
-                    // columns (we will `take` the remaining columns afterwards)
-                    let columns = filter_plan.refine_columns();
-                    let filter_schema = Arc::new(self.dataset.schema().project(&columns)?);
-                    self.scalar_indexed_scan(&filter_schema, index_query)
-                        .await?
-                }
-                (None, Some(_)) if use_stats && self.batch_size.is_none() => {
-                    self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
-                }
-                (None, _) => {
-                    // The source is a full scan of the table
-                    let with_row_id = filter_plan.has_refine() || self.with_row_id;
-                    let schema = if filter_plan.has_refine() {
-                        // If there is a filter then only load the filter columns in the
-                        // initial scan.  We will `take` the remaining columns later
+                    }
+                    // TODO: support combined pushdown and scalar index scan
+                    (Some(index_query), Some(_)) => {
+                        // If there is a filter then just load the filter
+                        // columns (we will `take` the remaining columns afterwards)
                         let columns = filter_plan.refine_columns();
-                        Arc::new(self.dataset.schema().project(&columns)?)
-                    } else {
-                        Arc::new(self.phyical_columns.clone())
-                    };
-                    self.scan(with_row_id, self.with_row_address, false, schema)
+                        let filter_schema = Arc::new(self.dataset.schema().project(&columns)?);
+                        self.scalar_indexed_scan(&filter_schema, index_query)
+                            .await?
+                    }
+                    (None, Some(_)) if use_stats && self.batch_size.is_none() => {
+                        self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
+                    }
+                    (None, _) => {
+                        // The source is a full scan of the table
+                        let with_row_id = filter_plan.has_refine() || self.with_row_id;
+                        let schema = if filter_plan.has_refine() {
+                            // If there is a filter then only load the filter columns in the
+                            // initial scan.  We will `take` the remaining columns later
+                            let columns = filter_plan.refine_columns();
+                            Arc::new(self.dataset.schema().project(&columns)?)
+                        } else {
+                            self.projection_plan.physical_schema.clone()
+                        };
+                        self.scan(with_row_id, self.with_row_address, false, schema)
+                    }
                 }
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: "Cannot have both nearest and full text search".into(),
+                    location: location!(),
+                })
             }
         };
 
@@ -989,12 +1002,11 @@ impl Scanner {
         }
 
         // Stage 5: take remaining columns required for projection
-        let physical_schema = self.physical_schema()?;
+        let physical_schema = self.physical_schema(false)?;
         let remaining_schema = physical_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
         }
-
         // Stage 6: physical projection -- reorder physical columns needed before final projection
         let output_arrow_schema = physical_schema.as_ref().into();
         if plan.schema().as_ref() != &output_arrow_schema {
@@ -1004,7 +1016,7 @@ impl Scanner {
         // Stage 7: final projection
         plan = Arc::new(DFProjectionExec::try_new(self.output_expr()?, plan)?);
 
-        let optimizer = Planner::get_physical_optimizer();
+        let optimizer = get_physical_optimizer();
         let options = Default::default();
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
@@ -1015,13 +1027,83 @@ impl Scanner {
         Ok(plan)
     }
 
+    // Create an execution plan to do full text search
+    async fn fts(
+        &self,
+        filter_plan: &FilterPlan,
+        query: &FullTextSearchQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let columns = if query.columns.is_empty() {
+            let index_info = self.dataset.scalar_index_info().await?;
+            self.dataset
+                .schema()
+                .fields
+                .iter()
+                .filter_map(|f| {
+                    if f.data_type() == DataType::Utf8 || f.data_type() == DataType::LargeUtf8 {
+                        index_info.get_index(&f.name).map(|_| f.name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            query.columns.clone()
+        };
+
+        // Now the full text search supports only one column
+        if columns.len() != 1 {
+            return Err(Error::io(
+                format!(
+                    "Full text search supports only one column right now, but got {} columns",
+                    columns.len()
+                ),
+                location!(),
+            ));
+        }
+        let column = &columns[0];
+        let index = self
+            .dataset
+            .load_scalar_index_for_column(column)
+            .await?
+            .ok_or(Error::io(
+                format!("Column {} has no inverted index", column),
+                location!(),
+            ))?;
+        let index_uuids = self
+            .dataset
+            .load_indices_by_name(&index.name)
+            .await?
+            .into_iter()
+            .collect();
+
+        let query = query.clone().columns(Some(columns)).limit(self.limit);
+        let prefilter_source = self.prefilter_source(filter_plan).await?;
+        let fts_plan = FtsExec::new(self.dataset.clone(), index_uuids, query, prefilter_source);
+        let sort_expr = PhysicalSortExpr {
+            expr: expressions::col(SCORE_COL, fts_plan.schema().as_ref())?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        };
+
+        Ok(Arc::new(
+            SortExec::new(
+                vec![sort_expr],
+                Arc::new(fts_plan) as Arc<dyn ExecutionPlan>,
+            )
+            .with_fetch(self.limit.map(|l| l as usize)),
+        ))
+    }
+
     // ANN/KNN search execution node with optional prefilter
     async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::io("No nearest query".to_string(), location!()));
         };
 
-        // Santity check
+        // Sanity check
         let schema = self.dataset.schema();
         if let Some(field) = schema.field(&q.column) {
             match field.data_type() {
@@ -1064,9 +1146,10 @@ impl Scanner {
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let ann_node = self.ann(q, &deltas, filter_plan).await?; // _distance, _rowid
 
-            let with_vector = self.dataset.schema().project(&[&q.column])?;
-            let knn_node_with_vector = self.take(ann_node, &with_vector, self.batch_readahead)?;
             let mut knn_node = if q.refine_factor.is_some() {
+                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                let knn_node_with_vector =
+                    self.take(ann_node, &with_vector, self.batch_readahead)?;
                 // TODO: now we just open an index to get its metric type.
                 let idx = self
                     .dataset
@@ -1076,10 +1159,12 @@ impl Scanner {
                 q.metric_type = idx.metric_type();
                 self.flat_knn(knn_node_with_vector, &q)?
             } else {
-                knn_node_with_vector
+                ann_node
             }; // vector, _distance, _rowid
 
-            knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
+            if !self.fast_search {
+                knn_node = self.knn_combined(q, index, knn_node, filter_plan).await?;
+            }
 
             Ok(knn_node)
         } else {
@@ -1108,14 +1193,21 @@ impl Scanner {
     /// Combine ANN results with KNN results for data appended after index creation
     async fn knn_combined(
         &self,
-        q: &&Query,
+        q: &Query,
         index: &Index,
-        knn_node: Arc<dyn ExecutionPlan>,
+        mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Check if we've created new versions since the index
+        // Check if we've created new versions since the index was built.
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
+            // If the vector column is not present, we need to take the vector column, so
+            // that the distance value is comparable with the flat search ones.
+            if knn_node.schema().column_with_name(&q.column).is_none() {
+                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                knn_node = self.take(knn_node, &with_vector, self.batch_readahead)?;
+            }
+
             let mut columns = vec![q.column.clone()];
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 let filter_columns = Planner::column_names_in_expr(expr);
@@ -1345,7 +1437,9 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let config = ScanConfig {
             batch_readahead: self.batch_readahead,
-            fragment_readahead: self.fragment_readahead,
+            fragment_readahead: self
+                .fragment_readahead
+                .unwrap_or(DEFAULT_FRAGMENT_READAHEAD),
             with_row_id: self.with_row_id,
             with_row_address: self.with_row_address,
             make_deletions_null,
@@ -1361,7 +1455,7 @@ impl Scanner {
         Ok(Arc::new(LancePushdownScanExec::try_new(
             self.dataset.clone(),
             fragments,
-            self.phyical_columns.clone().into(),
+            self.projection_plan.physical_schema.clone(),
             predicate,
             config,
         )?))
@@ -1404,6 +1498,24 @@ impl Scanner {
         index: &[Index],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let prefilter_source = self.prefilter_source(filter_plan).await?;
+
+        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
+        let sort_expr = PhysicalSortExpr {
+            expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
+        Ok(Arc::new(
+            SortExec::new(vec![sort_expr], inner_fanout_search)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+        ))
+    }
+
+    /// Create prefilter source from filter plan
+    async fn prefilter_source(&self, filter_plan: &FilterPlan) -> Result<PreFilterSource> {
         let prefilter_source = match (
             &filter_plan.index_query,
             &filter_plan.refine_expr,
@@ -1425,6 +1537,10 @@ impl Scanner {
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
             (Some(index_query), None, true) => {
+                // Index scan doesn't honor the fragment allowlist today.
+                // TODO: we could filter the index scan results to only include the allowed fragments.
+                self.ensure_not_fragment_scan()?;
+
                 // The filter is completely satisfied by the index.  We
                 // only need to search the index to determine the valid row
                 // ids.
@@ -1451,18 +1567,7 @@ impl Scanner {
             (_, _, false) => PreFilterSource::None,
         };
 
-        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
-        let sort_expr = PhysicalSortExpr {
-            expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
-            options: SortOptions {
-                descending: false,
-                nulls_first: false,
-            },
-        };
-        Ok(Arc::new(
-            SortExec::new(vec![sort_expr], inner_fanout_search)
-                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
-        ))
+        Ok(prefilter_source)
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
@@ -1703,6 +1808,9 @@ mod test {
     use datafusion::logical_expr::{col, lit};
     use half::f16;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
@@ -2554,6 +2662,16 @@ mod test {
     async fn test_ann_prefilter(
         #[values(false, true)] use_legacy_format: bool,
         #[values(false, true)] stable_row_ids: bool,
+        #[values(
+            VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                SQBuildParams::default()
+            )
+        )]
+        index_params: VectorIndexParams,
     ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -2586,13 +2704,7 @@ mod test {
             .unwrap();
 
         dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                None,
-                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
-                false,
-            )
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, false)
             .await
             .unwrap();
 
@@ -3906,7 +4018,7 @@ mod test {
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 42),
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=42), expr=...
       ANNSubIndex: name=..., k=42, deltas=1
         ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
@@ -3952,9 +4064,9 @@ mod test {
                     .with_row_id())
             },
             "Projection: fields=[s, vec, _distance, _rowid]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
-    FilterExec: i@3 > 10
-      Take: columns=\"_distance, _rowid, vec, i\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
+    FilterExec: i@2 > 10
+      Take: columns=\"_distance, _rowid, i\"
         SortExec: TopK(fetch=17), expr=...
           ANNSubIndex: name=..., k=17, deltas=1
             ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
@@ -3971,7 +4083,7 @@ mod test {
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=17), expr=...
       ANNSubIndex: name=..., k=17, deltas=1
         ANNIvfPartition: uuid=..., nprobes=1, deltas=1
@@ -4078,7 +4190,7 @@ mod test {
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-  Take: columns=\"_distance, _rowid, vec, i, s\"
+  Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=5), expr=...
       ANNSubIndex: name=..., k=5, deltas=1
         ANNIvfPartition: uuid=..., nprobes=1, deltas=1
@@ -4195,5 +4307,73 @@ mod test {
         .await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_search_plan() {
+        // Create a vector dataset
+        let mut dataset = TestVectorDataset::new(false, true).await.unwrap();
+        dataset.make_vector_index().await.unwrap();
+        dataset.append_new_data().await.unwrap();
+
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.nearest("vec", &q, 32)?
+                    .fast_search()
+                    .project(&["_rowid", "_distance"])
+            },
+            "Projection: fields=[_rowid, _distance]
+  SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
+    ANNSubIndex: name=idx, k=32, deltas=1
+      ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+        )
+        .await
+        .unwrap();
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.nearest("vec", &q, 33)?
+                    .fast_search()
+                    .with_row_id()
+                    .project(&["_rowid", "_distance"])
+            },
+            "Projection: fields=[_rowid, _distance]
+  SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
+    ANNSubIndex: name=idx, k=33, deltas=1
+      ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+        )
+        .await
+        .unwrap();
+
+        // Not `fast_scan` case
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.nearest("vec", &q, 34)?
+                    .with_row_id()
+                    .project(&["_rowid", "_distance"])
+            },
+            "Projection: fields=[_rowid, _distance]
+  FilterExec: _distance@2 IS NOT NULL
+    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
+      KNNVectorDistance: metric=l2
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Projection: fields=[_distance, _rowid, vec]
+              FilterExec: _distance@2 IS NOT NULL
+                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
+                  KNNVectorDistance: metric=l2
+                    LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+            Take: columns=\"_distance, _rowid, vec\"
+              SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
+                ANNSubIndex: name=idx, k=34, deltas=1
+                  ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+        )
+        .await
+        .unwrap();
     }
 }

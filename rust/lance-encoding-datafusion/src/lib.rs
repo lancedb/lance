@@ -1,20 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use arrow_schema::DataType;
-use futures::future::BoxFuture;
-use futures::FutureExt;
 use lance_core::{
     datatypes::{Field, Schema},
     Result,
 };
 use lance_encoding::{
-    decoder::{ColumnInfo, DecoderMiddlewareChainCursor, FieldDecoderStrategy, FieldScheduler},
+    decoder::{ColumnInfoIter, DecoderMiddlewareChainCursor, FieldDecoderStrategy, FieldScheduler},
     encoder::{ColumnIndexSequence, CoreFieldEncodingStrategy, FieldEncodingStrategy},
     encodings::physical::FileBuffers,
 };
@@ -90,17 +85,17 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
     fn create_field_scheduler<'a>(
         &self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         chain: DecoderMiddlewareChainCursor<'a>,
     ) -> Result<(
         DecoderMiddlewareChainCursor<'a>,
-        BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
+        Result<Arc<dyn FieldScheduler>>,
     )> {
         let is_root = self.initialize();
 
         if let Some((rows_per_map, unloaded_pushdown)) = extract_zone_info(
-            column_infos.front_mut().unwrap(),
+            column_infos.next().unwrap(),
             &field.data_type(),
             chain.current_path(),
         ) {
@@ -119,39 +114,36 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
             None
         };
         let schema = self.schema.clone();
-        let io = chain.io().clone();
+        let _io = chain.io().clone();
 
-        let scheduler_fut = async move {
-            let next = next.await?;
-            if is_root {
-                let state = state.unwrap();
-                let rows_per_map = state.rows_per_map;
-                let zone_map_buffers = state.zone_map_buffers;
-                let num_rows = next.num_rows();
-                if rows_per_map.is_none() {
-                    // No columns had any pushdown info
-                    Ok(next)
-                } else {
-                    let mut scheduler = ZoneMapsFieldScheduler::new(
-                        next,
-                        schema,
-                        zone_map_buffers,
-                        rows_per_map.unwrap(),
-                        num_rows,
-                    );
-                    // Load all the zone maps from disk
-                    // TODO: it would be slightly more efficient to do this
-                    // later when we know what columns are actually used
-                    // for filtering.
-                    scheduler.initialize(io.as_ref()).await?;
-                    Ok(Arc::new(scheduler) as Arc<dyn FieldScheduler>)
-                }
+        let next = next?;
+        if is_root {
+            let state = state.unwrap();
+            let rows_per_map = state.rows_per_map;
+            let zone_map_buffers = state.zone_map_buffers;
+            let num_rows = next.num_rows();
+            if rows_per_map.is_none() {
+                // No columns had any pushdown info
+                Ok((chain, Ok(next)))
             } else {
-                Ok(next)
+                let mut _scheduler = ZoneMapsFieldScheduler::new(
+                    next,
+                    schema,
+                    zone_map_buffers,
+                    rows_per_map.unwrap(),
+                    num_rows,
+                );
+                // Load all the zone maps from disk
+                // TODO: it would be slightly more efficient to do this
+                // later when we know what columns are actually used
+                // for filtering.
+                // scheduler.initialize(io.as_ref()).await?;
+                // Ok(Arc::new(scheduler) as Arc<dyn FieldScheduler>)
+                todo!()
             }
+        } else {
+            Ok((chain, Ok(next)))
         }
-        .boxed();
-        Ok((chain, scheduler_fut))
     }
 }
 
