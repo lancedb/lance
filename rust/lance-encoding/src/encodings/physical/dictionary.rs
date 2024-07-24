@@ -9,7 +9,8 @@ use arrow_array::{make_array, Array, ArrayRef, DictionaryArray, StringArray, UIn
 use futures::{future::BoxFuture, FutureExt};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, NullableDataBlock, VariableWidthBlock};
+use crate::data::{DataBlock, DictionaryDataBlock, NullableDataBlock, VariableWidthBlock};
+use crate::format::pb::nullable::AllNull;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
@@ -30,7 +31,11 @@ use arrow_array::cast::AsArray;
 pub struct DictionaryPageScheduler {
     indices_scheduler: Arc<dyn PageScheduler>,
     items_scheduler: Arc<dyn PageScheduler>,
+    // The number of items in the dictionary
     num_dictionary_items: u32,
+    // If true, decode the dictionary items.  If false, leave them dictionary encoded (e.g. the
+    // output type is probably a dictionary type)
+    should_decode_dict: bool,
 }
 
 impl DictionaryPageScheduler {
@@ -38,11 +43,13 @@ impl DictionaryPageScheduler {
         indices_scheduler: Arc<dyn PageScheduler>,
         items_scheduler: Arc<dyn PageScheduler>,
         num_dictionary_items: u32,
+        should_decode_dict: bool,
     ) -> Self {
         Self {
             indices_scheduler,
             items_scheduler,
             num_dictionary_items,
+            should_decode_dict,
         }
     }
 }
@@ -76,30 +83,68 @@ impl PageScheduler for DictionaryPageScheduler {
 
         let copy_size = self.num_dictionary_items as u64;
 
-        tokio::spawn(async move {
-            let items_decoder: Arc<dyn PrimitivePageDecoder> = Arc::from(items_page_decoder.await?);
+        if self.should_decode_dict {
+            tokio::spawn(async move {
+                let items_decoder: Arc<dyn PrimitivePageDecoder> =
+                    Arc::from(items_page_decoder.await?);
 
-            let mut primitive_wrapper = PrimitiveFieldDecoder::new_from_data(
-                items_decoder,
-                DataType::Utf8,
-                copy_size,
-                false,
-            );
+                let mut primitive_wrapper = PrimitiveFieldDecoder::new_from_data(
+                    items_decoder.clone(),
+                    DataType::Utf8,
+                    copy_size,
+                    false,
+                );
 
-            // Decode all items
-            let drained_task = primitive_wrapper.drain(copy_size)?;
-            let items_decode_task = drained_task.task;
-            let decoded_dict = items_decode_task.decode()?;
+                // Decode all items
+                let drained_task = primitive_wrapper.drain(copy_size)?;
+                let items_decode_task = drained_task.task;
+                let decoded_dict = items_decode_task.decode()?;
 
-            let indices_decoder: Box<dyn PrimitivePageDecoder> = indices_page_decoder.await?;
+                let indices_decoder: Box<dyn PrimitivePageDecoder> = indices_page_decoder.await?;
 
-            Ok(Box::new(DictionaryPageDecoder {
-                decoded_dict,
-                indices_decoder,
-            }) as Box<dyn PrimitivePageDecoder>)
-        })
-        .map(|join_handle| join_handle.unwrap())
-        .boxed()
+                Ok(Box::new(DictionaryPageDecoder {
+                    decoded_dict,
+                    indices_decoder,
+                }) as Box<dyn PrimitivePageDecoder>)
+            })
+            .map(|join_handle| join_handle.unwrap())
+            .boxed()
+        } else {
+            let num_dictionary_items = self.num_dictionary_items;
+            tokio::spawn(async move {
+                let items_decoder: Arc<dyn PrimitivePageDecoder> =
+                    Arc::from(items_page_decoder.await?);
+
+                let decoded_dict = items_decoder
+                    .decode(0, num_dictionary_items as u64)?
+                    .borrow_and_clone();
+
+                let indices_decoder = indices_page_decoder.await?;
+
+                Ok(Box::new(DirectDictionaryPageDecoder {
+                    decoded_dict,
+                    indices_decoder,
+                }) as Box<dyn PrimitivePageDecoder>)
+            })
+            .map(|join_handle| join_handle.unwrap())
+            .boxed()
+        }
+    }
+}
+
+struct DirectDictionaryPageDecoder {
+    decoded_dict: Box<dyn DataBlock>,
+    indices_decoder: Box<dyn PrimitivePageDecoder>,
+}
+
+impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+        let indices = self.indices_decoder.decode(rows_to_skip, num_rows)?;
+        let dict = self.decoded_dict.try_clone()?;
+        Ok(Box::new(DictionaryDataBlock {
+            indices,
+            dictionary: dict,
+        }))
     }
 }
 
@@ -151,6 +196,81 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
         } else {
             Ok(string_data)
         }
+    }
+}
+
+/// An encoder for data that is already dictionary encoded.  Stores the
+/// data as a dictionary encoding.
+#[derive(Debug)]
+pub struct AlreadyDictionaryEncoder {
+    indices_encoder: Box<dyn ArrayEncoder>,
+    items_encoder: Box<dyn ArrayEncoder>,
+}
+
+impl AlreadyDictionaryEncoder {
+    pub fn new(
+        indices_encoder: Box<dyn ArrayEncoder>,
+        items_encoder: Box<dyn ArrayEncoder>,
+    ) -> Self {
+        Self {
+            indices_encoder,
+            items_encoder,
+        }
+    }
+}
+
+impl ArrayEncoder for AlreadyDictionaryEncoder {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
+        // If we get multiple dictionary arrays and they don't all have the same dictionary
+        // then we need to normalize the indices.  Otherwise we might have something like:
+        //
+        // First chunk ["hello", "foo"], [0, 0, 1, 1, 1]
+        // Second chunk ["bar", "world"], [0, 1, 0, 1, 1]
+        //
+        // If we simply encode as ["hello", "foo", "bar", "world"], [0, 0, 1, 1, 1, 0, 1, 0, 1, 1]
+        // then we will get the wrong answer.
+        //
+        // A simple way to do this today is to just concatenate all the arrays.
+        //
+        // TODO: We could be more efficient here by checking if the dictionaries are the same
+        //       Also, if they aren't, we can possibly do something cheaper than concatenating
+        let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
+        let array = arrow_select::concat::concat(&array_refs)?;
+        let array_dict = array.as_any_dictionary();
+        let indices = make_array(array_dict.keys().to_data());
+        let items = array_dict.values().clone();
+
+        if items.is_empty() {
+            return Ok(EncodedArray {
+                buffers: Vec::default(),
+                encoding: pb::ArrayEncoding {
+                    array_encoding: Some(pb::array_encoding::ArrayEncoding::Nullable(Box::new(
+                        pb::Nullable {
+                            nullability: Some(pb::nullable::Nullability::AllNulls(AllNull {})),
+                        },
+                    ))),
+                },
+            });
+        }
+
+        let dictionary_size = items.len() as u32;
+        let encoded_indices = self.indices_encoder.encode(&[indices], buffer_index)?;
+        let encoded_items = self.items_encoder.encode(&[items], buffer_index)?;
+        let mut all_buffers = encoded_indices.buffers;
+        all_buffers.extend(encoded_items.buffers);
+
+        Ok(EncodedArray {
+            buffers: all_buffers,
+            encoding: pb::ArrayEncoding {
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::Dictionary(Box::new(
+                    pb::Dictionary {
+                        indices: Some(Box::new(encoded_indices.encoding)),
+                        items: Some(Box::new(encoded_items.encoding)),
+                        num_dictionary_items: dictionary_size,
+                    },
+                ))),
+            },
+        })
     }
 }
 
@@ -269,6 +389,9 @@ pub mod tests {
     };
 
     use super::encode_dict_indices_and_items;
+
+    // These tests cover the case where we opportunistically convert some (or all) pages of
+    // a string column into dictionaries (and decode on read)
 
     #[test]
     fn test_encode_dict_nulls() {
@@ -401,5 +524,17 @@ pub mod tests {
         // // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
+    }
+
+    // These tests cover the case where the input is already dictionary encoded
+
+    #[test_log::test(tokio::test)]
+    async fn test_random_dictionary_input() {
+        let dict_field = Field::new(
+            "",
+            DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+            false,
+        );
+        check_round_trip_encoding_random(dict_field, HashMap::new()).await;
     }
 }

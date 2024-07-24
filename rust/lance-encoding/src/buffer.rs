@@ -6,11 +6,22 @@
 use std::{ops::Deref, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::Buffer;
+use snafu::{location, Location};
+
+use lance_core::{Error, Result};
 
 /// A copy-on-write byte buffer
 ///
 /// It can be created from read-only buffers (e.g. bytes::Bytes or arrow_buffer::Buffer), e.g. "borrowed"
 /// or from writeable buffers (e.g. Vec<u8>), e.g. "owned"
+///
+/// The buffer can switch to borrowed mode without a copy of the data
+///
+/// LanceBuffer does not implement Clone because doing could potentially silently trigger a copy of the data
+/// and we want to make sure that the user is aware of this operation.
+///
+/// If you need to clone a LanceBuffer you can use borrow_and_clone() which will make sure that the buffer
+/// is in borrowed mode before cloning.  This is a zero copy operation (but requires &mut self).
 #[derive(Debug)]
 pub enum LanceBuffer {
     Borrowed(Buffer),
@@ -57,6 +68,50 @@ impl LanceBuffer {
                     Arc::new(bytes),
                 ))
             }
+        }
+    }
+
+    /// Convert into a borrowed buffer, this is a zero-copy operation
+    ///
+    /// This is often called before cloning the buffer
+    pub fn into_borrowed(self) -> Self {
+        match self {
+            LanceBuffer::Borrowed(_) => self,
+            LanceBuffer::Owned(buffer) => LanceBuffer::Borrowed(Buffer::from_vec(buffer)),
+        }
+    }
+
+    /// Creates an owned copy of the buffer, will always involve a full copy of the bytes
+    pub fn to_owned(&self) -> Self {
+        match self {
+            LanceBuffer::Borrowed(buffer) => LanceBuffer::Owned(buffer.to_vec()),
+            LanceBuffer::Owned(buffer) => LanceBuffer::Owned(buffer.clone()),
+        }
+    }
+
+    /// Creates a clone of the buffer but also puts the buffer into borrowed mode
+    ///
+    /// This is a zero-copy operation
+    pub fn borrow_and_clone(&mut self) -> Self {
+        match self {
+            LanceBuffer::Borrowed(buffer) => LanceBuffer::Borrowed(buffer.clone()),
+            LanceBuffer::Owned(buffer) => {
+                let buf_data = std::mem::take(buffer);
+                let buffer = Buffer::from_vec(buf_data);
+                *self = LanceBuffer::Borrowed(buffer.clone());
+                LanceBuffer::Borrowed(buffer)
+            }
+        }
+    }
+
+    /// Clones the buffer but fails if the buffer is in borrowed mode
+    pub fn try_clone(&self) -> Result<Self> {
+        match self {
+            LanceBuffer::Borrowed(buffer) => Ok(LanceBuffer::Borrowed(buffer.clone())),
+            LanceBuffer::Owned(_) => Err(Error::Internal {
+                message: "try_clone called on an owned buffer".to_string(),
+                location: location!(),
+            }),
         }
     }
 }

@@ -397,7 +397,10 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
     ) -> Result<ChosenFieldScheduler<'a>> {
         if self.cur_idx >= self.chain.chain.len() {
             return Err(Error::invalid_input(
-                "The user requested field {:?} from column {:?} but no decoders were registered to handle it",
+                format!(
+                    "The user requested a field {:?} but no decoders were registered to handle it",
+                    field
+                ),
                 location!(),
             ));
         }
@@ -687,6 +690,27 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     Ok((chain, Ok(scheduler)))
                 } else {
                     todo!()
+                }
+            }
+            DataType::Dictionary(_key_type, value_type) => {
+                if Self::is_primitive(&value_type) {
+                    let primitive_col = column_infos.next().unwrap();
+                    let scheduler = self.create_primitive_scheduler(
+                        &data_type,
+                        chain.current_path(),
+                        &primitive_col,
+                        buffers,
+                    )?;
+                    Ok((chain, Ok(scheduler)))
+                } else {
+                    Err(Error::NotSupported {
+                        source: format!(
+                            "No way to decode into a dictionary field of type {}",
+                            value_type
+                        )
+                        .into(),
+                        location: location!(),
+                    })
                 }
             }
             DataType::List(items_field) | DataType::LargeList(items_field) => {

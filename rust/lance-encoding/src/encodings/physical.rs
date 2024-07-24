@@ -3,6 +3,7 @@
 
 use arrow_schema::DataType;
 use fsst::FsstPageScheduler;
+use lance_arrow::DataTypeExt;
 use packed_struct::PackedStructPageScheduler;
 
 use crate::encodings::physical::value::CompressionScheme;
@@ -185,10 +186,13 @@ pub fn decoder_from_array_encoding(
                 decoder_from_array_encoding(indices_encoding, buffers, data_type);
             let items_scheduler = decoder_from_array_encoding(items_encoding, buffers, data_type);
 
+            let should_decode_dict = !data_type.is_dictionary();
+
             Box::new(DictionaryPageScheduler::new(
                 indices_scheduler.into(),
                 items_scheduler.into(),
                 num_dictionary_items,
+                should_decode_dict,
             ))
         }
         pb::array_encoding::ArrayEncoding::PackedStruct(packed_struct) => {
