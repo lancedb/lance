@@ -12,10 +12,10 @@ from lance.tracing import trace_to_chrome
 
 trace_to_chrome(level="debug", file="/tmp/trace.json")
 
-NUM_ROWS = 1_000_000
+NUM_ROWS = 10_000_000
 RANDOM_ACCESS = "indices"
-NUM_INDICES = 5
-NUM_ROUNDS = 20
+NUM_INDICES = 100
+NUM_ROUNDS = 10
 
 # This file compares benchmarks for reading and writing a StructArray column using
 # (i) parquet
@@ -36,12 +36,10 @@ def test_data(tmp_path_factory):
                     pa.FixedSizeListArray.from_arrays(
                         pc.random(NUM_ROWS * 5).cast(pa.float32()), 5
                     ),
+                    pa.array(range(NUM_ROWS), type=pa.int32()),
+                    pa.array(range(NUM_ROWS), type=pa.int32()),
                 ],
-                [
-                    "f",
-                    "i",
-                    "fsl",
-                ],
+                ["f", "i", "fsl", "i2", "i3"],
             )
         }
     )
@@ -94,7 +92,7 @@ def test_lance_read(tmp_path: Path, benchmark, test_data, random_indices):
             read_lance_file_random, args=(lance_path, random_indices), rounds=NUM_ROUNDS
         )
     elif RANDOM_ACCESS == "full":
-        benchmark.pedantic(read_lance_file_full, args=(lance_path), rounds=NUM_ROUNDS)
+        benchmark.pedantic(read_lance_file_full, args=(lance_path,), rounds=NUM_ROUNDS)
 
 
 @pytest.mark.benchmark(group="read")
@@ -117,7 +115,7 @@ def test_lance_read_packed(tmp_path: Path, benchmark, test_data, random_indices)
             read_lance_file_random, args=(lance_path, random_indices), rounds=NUM_ROUNDS
         )
     elif RANDOM_ACCESS == "full":
-        benchmark.pedantic(read_lance_file_full, args=(lance_path), rounds=NUM_ROUNDS)
+        benchmark.pedantic(read_lance_file_full, args=(lance_path,), rounds=NUM_ROUNDS)
 
 
 @pytest.mark.benchmark(group="write")
