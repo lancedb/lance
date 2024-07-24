@@ -26,7 +26,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
-    execution::context::{SessionConfig, SessionContext},
+    execution::{RecordBatchStream, context::{SessionConfig, SessionContext}},
     logical_expr::{Expr, JoinType},
     physical_plan::{
         joins::{HashJoinExec, PartitionMode},
@@ -437,6 +437,7 @@ impl MergeInsertJob {
             )
             .unwrap(),
         );
+        // TODO: return a  plan instead of a stream
         execute_plan(
             joined,
             LanceExecutionOptions {
@@ -498,6 +499,8 @@ impl MergeInsertJob {
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let schema = source.schema();
+        
+        let is_full_schema = self.dataset.schema().as_ref() == schema.as_ref();
 
         let joined = self.create_joined_stream(source).await?;
         let merger = Merger::try_new(self.params, schema.clone())?;
@@ -508,30 +511,37 @@ impl MergeInsertJob {
             .try_flatten();
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let new_fragments = write_fragments_internal(
-            None,
-            self.dataset.object_store.clone(),
-            &self.dataset.base,
-            self.dataset.schema(),
-            Box::pin(stream),
-            Default::default(),
-        )
-        .await?;
+        let committed_ds = if is_full_schema {
+            // We will have a different commit path here too, as we are modifying
+            // fragments rather than writing new ones
+            let updated_fragments = todo!();
 
-        // Apply deletions
-        let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
+            Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
+        } else {
+            let new_fragments = write_fragments_internal(
+                None,
+                self.dataset.object_store.clone(),
+                &self.dataset.base,
+                self.dataset.schema(),
+                Box::pin(stream),
+                Default::default(),
+            )
+            .await?;
+            // Apply deletions
+            let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
 
-        let (old_fragments, removed_fragment_ids) =
-            Self::apply_deletions(&self.dataset, &removed_row_ids).await?;
+            let (old_fragments, removed_fragment_ids) =
+                Self::apply_deletions(&self.dataset, &removed_row_ids).await?;
 
-        // Commit updated and new fragments
-        let committed_ds = Self::commit(
-            self.dataset,
-            removed_fragment_ids,
-            old_fragments,
-            new_fragments,
-        )
-        .await?;
+            // Commit updated and new fragments
+            Self::commit(
+                self.dataset,
+                removed_fragment_ids,
+                old_fragments,
+                new_fragments,
+            )
+            .await?
+        };
 
         let stats = Arc::into_inner(merge_statistics)
             .unwrap()
@@ -1307,12 +1317,14 @@ mod tests {
 
         // New data with only a subset of columns
         // TODO: how do I make sure there is overlap in rows?
-        let update_schema = Arc::new(schema.project(&[1, 2]).unwrap());
+        let update_schema = Arc::new(schema.project(&[2, 1]).unwrap());
         let update_batch = RecordBatch::try_new(
             update_schema.clone(),
             vec![
                 Arc::new(batch["key"].slice(256, 6)),
-                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
+                Arc::new(UInt32Array::from(vec![
+                    4000_u32, 5000, 6000, 7000, 8000, 9000,
+                ])),
             ],
         )
         .unwrap();
@@ -1322,11 +1334,13 @@ mod tests {
         ));
 
         // Should reject when_not_matched_by_source_delete as not yet supported
-        let res = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .when_matched(WhenMatched::UpdateAll)
-            .try_build();
+            .try_build()
+            .unwrap();
+        let res = job.execute_reader(reader).await;
         assert!(matches!(
             res,
             Err(Error::NotSupported { source, .. })
@@ -1334,11 +1348,13 @@ mod tests {
         ));
 
         // Should reject when_not_matched_insert_all as invalid
-        let res = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
             .unwrap()
             .when_not_matched(WhenNotMatched::InsertAll)
             .when_matched(WhenMatched::UpdateAll)
-            .try_build();
+            .try_build()
+            .unwrap();
+        let res = job.execute_reader(reader).await;
         assert!(matches!(
             res,
             Err(Error::InvalidInput { source, .. })
@@ -1357,7 +1373,7 @@ mod tests {
             .try_build()
             .unwrap();
 
-        job.execute_reader(reader).await.unwrap();
+        let (ds, stats) = job.execute_reader(reader).await.unwrap();
 
         // Should not rewrite the affected data files
         let fragments_after = ds
@@ -1383,5 +1399,9 @@ mod tests {
         let data_files = fragments_after[1].files.clone();
         assert_eq!(&data_files[0].fields, &[0, -2, -2]);
         assert_eq!(&data_files[1].fields, &[1, 2]);
+
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(stats.num_updated_rows, 6);
+        assert_eq!(stats.num_deleted_rows, 0);
     }
 }
