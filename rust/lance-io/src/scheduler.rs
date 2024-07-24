@@ -494,38 +494,4 @@ mod tests {
         semaphore_copy.add_permits(1);
         assert!(second_fut.await.unwrap().unwrap().len() == 20);
     }
-
-    // #[tokio::test]
-    // async fn test_submit_request() {
-    //     let tmpdir = tempdir().unwrap();
-    //     let tmp_path = tmpdir.path().to_str().unwrap();
-    //     let tmp_path = Path::parse(tmp_path).unwrap();
-    //     let tmp_file = tmp_path.child("foo.file");
-
-    //     let obj_store = Arc::new(ObjectStore::local());
-
-    //     // Write 1MiB of data
-    //     // const DATA_SIZE: u64 = 100;
-    //     let some_data = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-    //     // let mut some_data = vec![0; DATA_SIZE as usize];
-    //     // rand::thread_rng().fill_bytes(&mut some_data);
-    //     obj_store.put(&tmp_file, &some_data).await.unwrap();
-
-    //     let scheduler = ScanScheduler::new(obj_store);
-    //     let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
-
-    //     let test_cases = vec![
-    //         vec![0..3, 3..4, 7..8, 9..10],
-    //         vec![1..2, 2..3, 3..4, 4..5, 5..6, 6..7, 7..8, 8..9, 9..10, 10..11, 11..12],
-    //     ]
-
-    //     for case in test_cases {
-    //         let bytes = file_scheduler
-    //             .submit_request(case, 0)
-    //             .await
-    //             .unwrap();
-
-    //         assert_eq!()
-    //     }
-    // }
 }
