@@ -227,9 +227,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
     let new_schema = Schema::new(new_fields);
     let data = RecordBatch::try_new(Arc::new(new_schema.clone()), data.columns().to_vec()).unwrap();
 
-    // println!("schema metadata: {:?}", new_schema.metadata());
     let lance_schema = Arc::new(lance_core::datatypes::Schema::try_from(&new_schema).unwrap());
-    println!("lance schema metadata: {:?}", lance_schema.fields);
     let input_bytes = data.get_array_memory_size();
     group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
     let encoding_strategy = CoreFieldEncodingStrategy::default();
@@ -242,7 +240,6 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
         ))
         .unwrap();
 
-    // let func_name = format!("{:?}", data_type).to_lowercase();
     let func_name = "struct";
     group.bench_function(func_name, |b| {
         b.iter(|| {
@@ -263,8 +260,7 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
-    // targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding);
-    targets = bench_decode_packed_struct);
+    targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]

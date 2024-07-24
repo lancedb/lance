@@ -35,14 +35,10 @@ def test_data(tmp_path_factory):
             pa.FixedSizeListArray.from_arrays(
                 pc.random(NUM_ROWS * 5).cast(pa.float32()), 5
             ),
-            # pa.array(range(NUM_ROWS), type=pa.int32()),
-            # pa.array(range(NUM_ROWS), type=pa.int32()),
         ],
         ["f", 
          "i", 
          "fsl", 
-        #  "i2", 
-        #  "i3"
         ],
         )
     })
@@ -57,7 +53,6 @@ def random_indices():
 
 @pytest.mark.benchmark(group="read")
 def test_parquet_read(tmp_path: Path, benchmark, test_data, random_indices):
-    # dataset = lance.write_dataset(table, tmp_path)
     parquet_path = tmp_path / "data.parquet"
     pq.write_table(test_data, parquet_path)
 
@@ -107,8 +102,6 @@ def test_lance_read_packed(tmp_path: Path, benchmark, test_data, random_indices)
     updated_schema = pa.schema([updated_field])
 
     new_table = pa.Table.from_arrays(test_data.columns, schema=updated_schema)
-    # print(new_table.schema)
-    print(new_table.schema.field("struct_col").metadata)
 
     with LanceFileWriter(lance_path, new_table.schema) as writer:
         for batch in new_table.to_batches():
