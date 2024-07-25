@@ -1092,6 +1092,16 @@ class LanceDataset(pa.dataset.Dataset):
         Unlike the :func:`dataset` constructor, this will re-use the
         current cache.
         This is a no-op if the dataset is already at the given version.
+        
+        Parameters
+        ----------
+        version: int | str,
+            The version to checkout. A version number (`int`) or a tag
+            (`str`) can be provided.
+
+        Returns
+        -------
+        LanceDataset
         """
         ds = copy.copy(self)
         if version != ds.version:
@@ -2533,24 +2543,46 @@ class DatasetOptimizer:
 
 
 class Tags:
+    """
+    Dataset tag manager.
+    """
     def __init__(self, dataset: _Dataset):
         self._ds = dataset
 
     def list(self) -> dict[str, int]:
         """
-        Return all tags in this dataset.
+        List all dataset tags.
+
+        Returns
+        -------
+        dict[str, int]
+            A dictionary mapping tag names to version numbers.
         """
         return self._ds.tags()
 
     def create(self, tag: str, version: int) -> None:
         """
         Create a tag for a given dataset version.
+        
+        Parameters
+        ----------
+        tag: str,
+            The name of the tag to create. This name must be unique among all tag
+            names for the dataset.
+        version: int,
+            The dataset version to tag.
         """
         self._ds.create_tag(tag, version)
 
     def delete(self, tag: str) -> None:
         """
         Delete tag from the dataset.
+
+        Parameters
+        ----------
+        tag: str,
+            The name of the tag to delete.
+
         """
         self._ds.delete_tag(tag)
 
