@@ -1317,12 +1317,12 @@ impl Scanner {
         ));
 
         // If there is more than just _rowid in projection
-        let needs_projection = match projection.fields.len() {
+        let needs_take = match projection.fields.len() {
             0 => false,
             1 => projection.fields[0].name != ROW_ID,
             _ => true,
         };
-        if needs_projection {
+        if needs_take {
             plan = self.take(plan, projection, self.batch_readahead)?;
         }
 

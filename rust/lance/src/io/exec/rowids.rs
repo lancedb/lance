@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::{cast::AsArray, types::UInt64Type, Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::common::ColumnStatistics;
@@ -108,14 +108,9 @@ impl AddRowAddrExec {
         row_ids: &ArrayRef,
         row_id_index: Option<&RowIdIndex>,
     ) -> Result<ArrayRef> {
-        let row_id_values = row_ids
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                DataFusionError::Internal(
-                    "AddRowAddrExec: rowid column is not a UInt64Array".into(),
-                )
-            })?;
+        let row_id_values = row_ids.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+            DataFusionError::Internal("AddRowAddrExec: rowid column is not a UInt64Array".into())
+        })?;
         if let Some(row_id_index) = row_id_index {
             if row_id_values.null_count() > 0 {
                 let mut builder = arrow::array::UInt64Builder::with_capacity(row_id_values.len());
