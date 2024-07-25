@@ -35,7 +35,7 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_table::{
     format::{Index, Manifest},
     io::{
@@ -466,8 +466,7 @@ fn tagged_old_versions_cleanup_error(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use arrow_array::{RecordBatchIterator, RecordBatchReader};
+    use arrow_array::RecordBatchReader;
     use datafusion::common::assert_contains;
     use lance_core::utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::{DatasetIndexExt, IndexType};
