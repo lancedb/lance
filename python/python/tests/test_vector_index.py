@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance import LanceFragment
 
 torch = pytest.importorskip("torch")
 from lance.util import validate_vector_index  # noqa: E402
@@ -744,3 +745,56 @@ def test_index_cast_centroids(tmp_path):
         accelerator=torch.device("cpu"),
         ivf_centroids=centroids,
     )
+
+
+def test_fragment_scan_disallowed_on_ann(dataset):
+    q = np.random.randn(128)
+    with pytest.raises(
+        ValueError, match="This operation is not supported for fragment scan"
+    ):
+        scanner = dataset.scanner(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": q,
+            },
+            fragments=[LanceFragment(dataset, 0)],
+        )
+        scanner.explain_plan(True)
+
+
+def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
+    q = np.random.randn(128)
+    scanner = dataset.scanner(
+        prefilter=True,
+        filter="id>0",
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": q,
+        },
+        fragments=[LanceFragment(dataset, 0)],
+    )
+    scanner.explain_plan(True)
+
+
+def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+    dataset.create_scalar_index("id", index_type="BTREE")
+
+    q = np.random.randn(128)
+    with pytest.raises(
+        ValueError, match="This operation is not supported for fragment scan"
+    ):
+        scanner = dataset.scanner(
+            prefilter=True,
+            filter="id=1234",
+            columns=["id"],
+            nearest={"column": "vector", "q": q, "use_index": True},
+            fragments=[LanceFragment(dataset, 0)],
+        )
+        scanner.explain_plan(True)
