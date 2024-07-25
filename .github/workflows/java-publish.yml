@@ -21,7 +21,7 @@ jobs:
       - name: Set up Node.js 16
         uses: actions/setup-node@v4
         with:
-          node-version: '16'
+          node-version: "16"
       - name: Install dependencies
         run: |
           brew install protobuf
@@ -47,7 +47,7 @@ jobs:
       - name: Set up Node.js 16
         uses: actions/setup-node@v4
         with:
-          node-version: '16'
+          node-version: "16"
       - uses: Swatinem/rust-cache@v2
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -90,15 +90,14 @@ jobs:
           server-id: ossrh
           server-username: SONATYPE_USER
           server-password: SONATYPE_TOKEN
-          gpg-private-key: MAVEN_GPG_PRIVATE_KEY
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
         env:
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
       - name: Set up Node.js 16
         uses: actions/setup-node@v4
         with:
-          node-version: '16'
+          node-version: "16"
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
@@ -125,8 +124,6 @@ jobs:
         env:
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
-          MAVEN_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
       - name: Find Spark Jar
         run: |
           RELATIVE_JAR_PATH=$(find spark/target -name 'lance-spark-2.12-*-jar-with-dependencies.jar')
