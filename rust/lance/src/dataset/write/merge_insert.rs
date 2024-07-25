@@ -27,7 +27,10 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
-    execution::context::{SessionConfig, SessionContext},
+    execution::{
+        context::{SessionConfig, SessionContext},
+        memory_pool::MemoryConsumer,
+    },
     logical_expr::{Expr, JoinType},
     physical_plan::{
         joins::{HashJoinExec, PartitionMode},
@@ -40,7 +43,7 @@ use datafusion::{
 };
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::dataframe::DataFrameExt;
+use lance_datafusion::{dataframe::DataFrameExt, exec::get_session_context};
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
@@ -50,7 +53,7 @@ use futures::{
 use lance_core::{
     datatypes::SchemaCompareOptions,
     error::{box_error, InvalidInputSnafu},
-    utils::futures::Capacity,
+    utils::{futures::Capacity, tokio::CPU_RUNTIME},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID,
 };
 use lance_datafusion::{
@@ -62,10 +65,12 @@ use lance_table::format::{Fragment, Index};
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, Location, ResultExt};
+use tokio::task::JoinSet;
 
 use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::{
+        fragment::FileFragment,
         transaction::{Operation, Transaction},
         write::open_writer,
     },
@@ -475,7 +480,6 @@ impl MergeInsertJob {
             )
             .unwrap(),
         );
-        // TODO: return a  plan instead of a stream
         execute_plan(
             joined,
             LanceExecutionOptions {
@@ -554,12 +558,14 @@ impl MergeInsertJob {
     // _rowaddr
     // [updated_cols]*
     async fn update_fragments(
-        dataset: &Dataset,
+        dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
     ) -> Result<Vec<Fragment>> {
         use datafusion::logical_expr::{col, lit};
-        let session_config = SessionConfig::default().with_target_partitions(1);
-        let session_ctx = SessionContext::new_with_config(session_config);
+        let session_ctx = get_session_context(LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        });
         let mut group_stream = session_ctx
             .read_one_shot(source)?
             .sort(vec![col(ROW_ADDR).sort(true, true)])?
@@ -569,9 +575,13 @@ impl MergeInsertJob {
 
         // for each fragment, scan the fragment for the new rows, and merge in
         // the updates.
-        let mut updated_fragments = Vec::new();
-        // TODO: add concurrency while keeping within memory limits of pool.
-        while let Some((frag_id, mut batches)) = group_stream.next().await.transpose()? {
+        let updated_fragments = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = JoinSet::new();
+        let handle = CPU_RUNTIME.handle();
+        let task_limit = handle.metrics().num_workers();
+        let mut reservation =
+            MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
+        while let Some((frag_id, batches)) = group_stream.next().await.transpose()? {
             let Some(ScalarValue::UInt64(Some(frag_id))) = frag_id.first() else {
                 return Err(Error::Internal {
                     message: format!("Got non-fragment id from merge result: {:?}", frag_id),
@@ -589,127 +599,184 @@ impl MergeInsertJob {
                         ),
                         location: location!(),
                     })?;
-            let mut metadata = fragment.metadata.clone();
+            let metadata = fragment.metadata.clone();
 
-            // batches still have _rowaddr
-            let write_schema = batches[0].schema().as_ref().without_column(ROW_ADDR);
-            let write_schema = dataset.schema().project_by_schema(&write_schema)?;
+            async fn handle_fragment(
+                dataset: Arc<Dataset>,
+                fragment: FileFragment,
+                mut metadata: Fragment,
+                mut batches: Vec<RecordBatch>,
+                updated_fragments: Arc<Mutex<Vec<Fragment>>>,
+                reservation_size: usize,
+            ) -> Result<usize> {
+                // batches still have _rowaddr
+                let write_schema = batches[0].schema().as_ref().without_column(ROW_ADDR);
+                let write_schema = dataset.schema().project_by_schema(&write_schema)?;
 
-            let updated_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-            if Some(updated_rows) == metadata.physical_rows {
-                // All rows have been updated and there are no deletions. So we
-                // don't need to merge in existing values.
-                // Also, because we already sorted by row address, the rows
-                // will be in the correct order.
+                let updated_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+                if Some(updated_rows) == metadata.physical_rows {
+                    // All rows have been updated and there are no deletions. So we
+                    // don't need to merge in existing values.
+                    // Also, because we already sorted by row address, the rows
+                    // will be in the correct order.
 
-                let mut writer = open_writer(
-                    dataset.object_store(),
-                    &write_schema,
-                    &dataset.base,
-                    fragment.metadata.files[0].is_legacy_file(),
-                )
-                .await?;
-
-                // We need to remove rowaddr before writing.
-                batches
-                    .iter_mut()
-                    .try_for_each(|batch| match batch.drop_column(ROW_ADDR) {
-                        Ok(b) => {
-                            *batch = b;
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    })?;
-
-                // TODO: do I need to do batching at this level?
-                writer.write(batches.as_slice()).await?;
-                let (_num_rows, data_file) = writer.finish().await?;
-
-                metadata.files.push(data_file);
-                updated_fragments.push(metadata);
-            } else {
-                // TODO: we can skip scanning row addresses we don't need.
-                let update_schema = batches[0].schema();
-                let read_columns = update_schema.field_names();
-                let mut updater = fragment
-                    .updater(
-                        Some(&read_columns),
-                        Some((write_schema, dataset.schema().clone())),
+                    let mut writer = open_writer(
+                        dataset.object_store(),
+                        &write_schema,
+                        &dataset.base,
+                        fragment.metadata.files[0].is_legacy_file(),
                     )
                     .await?;
 
-                // We will use interleave to update the rows. The first batch
-                // will be the original source data, and all subsequent batches
-                // will be updates.
-                let mut source_batches = Vec::with_capacity(batches.len() + 1);
-                source_batches.push(batches[0].clone()); // placeholder for source data
-                for batch in &batches {
-                    source_batches.push(batch.drop_column(ROW_ADDR)?);
-                }
+                    // We need to remove rowaddr before writing.
+                    batches
+                        .iter_mut()
+                        .try_for_each(|batch| match batch.drop_column(ROW_ADDR) {
+                            Ok(b) => {
+                                *batch = b;
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        })?;
 
-                // This function is here to help rustc with lifetimes.
-                fn get_row_addr_iter(
-                    batches: &[RecordBatch],
-                ) -> impl Iterator<Item = (u64, (usize, usize))> + '_ + Send {
-                    batches.iter().enumerate().flat_map(|(batch_idx, batch)| {
-                        // The index in source batches will be one more.
-                        let batch_idx = batch_idx + 1;
-                        let row_addrs = batch
+                    // TODO: do I need to do batching at this level?
+                    writer.write(batches.as_slice()).await?;
+                    let (_num_rows, data_file) = writer.finish().await?;
+
+                    metadata.files.push(data_file);
+                    updated_fragments.lock().unwrap().push(metadata);
+                } else {
+                    // TODO: we can skip scanning row addresses we don't need.
+                    let update_schema = batches[0].schema();
+                    let read_columns = update_schema.field_names();
+                    let mut updater = fragment
+                        .updater(
+                            Some(&read_columns),
+                            Some((write_schema, dataset.schema().clone())),
+                        )
+                        .await?;
+
+                    // We will use interleave to update the rows. The first batch
+                    // will be the original source data, and all subsequent batches
+                    // will be updates.
+                    let mut source_batches = Vec::with_capacity(batches.len() + 1);
+                    source_batches.push(batches[0].clone()); // placeholder for source data
+                    for batch in &batches {
+                        source_batches.push(batch.drop_column(ROW_ADDR)?);
+                    }
+
+                    // This function is here to help rustc with lifetimes.
+                    fn get_row_addr_iter(
+                        batches: &[RecordBatch],
+                    ) -> impl Iterator<Item = (u64, (usize, usize))> + '_ + Send
+                    {
+                        batches.iter().enumerate().flat_map(|(batch_idx, batch)| {
+                            // The index in source batches will be one more.
+                            let batch_idx = batch_idx + 1;
+                            let row_addrs = batch
+                                .column_by_name(ROW_ADDR)
+                                .unwrap()
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .unwrap();
+                            row_addrs
+                                .values()
+                                .iter()
+                                .enumerate()
+                                .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
+                        })
+                    }
+                    let mut updated_row_addr_iter = get_row_addr_iter(&batches).peekable();
+
+                    while let Some(batch) = updater.next().await? {
+                        source_batches[0] =
+                            batch.project_by_schema(source_batches[1].schema().as_ref())?;
+
+                        let original_row_addrs = batch
                             .column_by_name(ROW_ADDR)
                             .unwrap()
                             .as_any()
                             .downcast_ref::<UInt64Array>()
                             .unwrap();
-                        row_addrs
+                        let indices = original_row_addrs
                             .values()
-                            .iter()
+                            .into_iter()
                             .enumerate()
-                            .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
-                    })
-                }
-                let mut updated_row_addr_iter = get_row_addr_iter(&batches).peekable();
-
-                while let Some(batch) = updater.next().await? {
-                    source_batches[0] =
-                        batch.project_by_schema(source_batches[1].schema().as_ref())?;
-
-                    let original_row_addrs = batch
-                        .column_by_name(ROW_ADDR)
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .unwrap();
-                    let indices = original_row_addrs
-                        .values()
-                        .into_iter()
-                        .enumerate()
-                        .map(|(original_offset, row_addr)| {
-                            match updated_row_addr_iter.peek() {
-                                Some((updated_row_addr, _)) if *updated_row_addr == *row_addr => {
-                                    updated_row_addr_iter.next().unwrap().1
-                                }
-                                // If we have passed the next updated row address, something went wrong.
-                                Some((updated_row_addr, _)) => {
-                                    debug_assert!(
+                            .map(|(original_offset, row_addr)| {
+                                match updated_row_addr_iter.peek() {
+                                    Some((updated_row_addr, _))
+                                        if *updated_row_addr == *row_addr =>
+                                    {
+                                        updated_row_addr_iter.next().unwrap().1
+                                    }
+                                    // If we have passed the next updated row address, something went wrong.
+                                    Some((updated_row_addr, _)) => {
+                                        debug_assert!(
                                         *updated_row_addr > *row_addr,
                                         "Got updated row address that is not in the original batch"
                                     );
-                                    (0, original_offset)
+                                        (0, original_offset)
+                                    }
+                                    _ => (0, original_offset),
                                 }
-                                _ => (0, original_offset),
-                            }
-                        })
-                        .collect::<Vec<_>>();
+                            })
+                            .collect::<Vec<_>>();
 
-                    let updated_batch = interleave_batches(&source_batches, &indices)?;
+                        let updated_batch = interleave_batches(&source_batches, &indices)?;
 
-                    updater.update(updated_batch).await?;
+                        updater.update(updated_batch).await?;
+                    }
+
+                    let updated_fragment = updater.finish().await?;
+                    updated_fragments.lock().unwrap().push(updated_fragment);
+                }
+                Ok(reservation_size)
+            }
+
+            // We shouldn't need much more memory beyond what is already in the batches.
+            let mut memory_size = batches
+                .iter()
+                .map(|batch| batch.get_array_memory_size())
+                .sum();
+
+            loop {
+                let have_additional_cpus = tasks.len() < task_limit;
+                if have_additional_cpus {
+                    if reservation.try_grow(memory_size).is_ok() {
+                        break;
+                    } else if tasks.is_empty() {
+                        // If there are no tasks running, we can bypass the pool limits.
+                        memory_size = 0;
+                        break;
+                    }
+                    // If we can't grow the reservation, we will wait for a task to finish
                 }
 
-                let updated_fragment = updater.finish().await?;
-                updated_fragments.push(updated_fragment);
+                if let Some(res) = tasks.join_next().await {
+                    let size = res??;
+                    reservation.shrink(size);
+                }
             }
+
+            let fut = handle_fragment(
+                dataset.clone(),
+                fragment,
+                metadata,
+                batches,
+                updated_fragments.clone(),
+                memory_size,
+            );
+            tasks.spawn_on(fut, handle);
         }
+
+        while let Some(res) = tasks.join_next().await {
+            let size = res??;
+            reservation.shrink(size);
+        }
+        let mut updated_fragments = Arc::try_unwrap(updated_fragments)
+            .unwrap()
+            .into_inner()
+            .unwrap();
 
         // Collect the updated fragments, and map the field ids. Tombstone old ones
         // as needed.
@@ -769,7 +836,8 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let updated_fragments = Self::update_fragments(&self.dataset, Box::pin(stream)).await?;
+            let updated_fragments =
+                Self::update_fragments(self.dataset.clone(), Box::pin(stream)).await?;
 
             Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
         } else {
