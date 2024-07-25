@@ -55,8 +55,8 @@ use crate::io::exec::fts::FtsExec;
 use crate::io::exec::get_physical_optimizer;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
-    knn::new_knn_exec, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec,
-    Planner, PreFilterSource, ProjectionExec, ScanConfig, TakeExec,
+    knn::new_knn_exec, project, FilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
+    LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
@@ -1010,7 +1010,7 @@ impl Scanner {
         // Stage 6: physical projection -- reorder physical columns needed before final projection
         let output_arrow_schema = physical_schema.as_ref().into();
         if plan.schema().as_ref() != &output_arrow_schema {
-            plan = Arc::new(ProjectionExec::try_new(plan, physical_schema)?);
+            plan = Arc::new(project(plan, &physical_schema.as_ref().into())?);
         }
 
         // Stage 7: final projection
@@ -1240,8 +1240,7 @@ impl Scanner {
             // To do a union, we need to make the schemas match. Right now
             // knn_node: _distance, _rowid, vector
             // topk_appended: vector, <filter columns?>, _rowid, _distance
-            let new_schema = Schema::try_from(knn_node.schema().as_ref())?;
-            let topk_appended = ProjectionExec::try_new(topk_appended, new_schema.into())?;
+            let topk_appended = project(topk_appended, knn_node.schema().as_ref())?;
             assert_eq!(topk_appended.schema(), knn_node.schema());
             // union
             let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
@@ -1353,11 +1352,7 @@ impl Scanner {
                 false,
             );
             let filtered = Arc::new(FilterExec::try_new(physical_refine_expr, new_data_scan)?);
-            let projection = Schema::try_from(taken.schema().as_ref())?;
-            Some(Arc::new(ProjectionExec::try_new(
-                filtered,
-                projection.into(),
-            )?))
+            Some(Arc::new(project(filtered, taken.schema().as_ref())?))
         } else {
             None
         };
@@ -2026,6 +2021,7 @@ mod test {
                     ),
                     ArrowField::new(DIST_COL, DataType::Float32, true),
                 ])
+                .with_metadata([("dataset".into(), "vector".into())].into())
             );
 
             let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
@@ -2170,6 +2166,7 @@ mod test {
                 ),
                 ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
+            .with_metadata([("dataset".into(), "vector".into())].into())
         );
 
         // These match the query exactly.  The 5 results must include these 3.
@@ -2299,6 +2296,7 @@ mod test {
                 ),
                 ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
+            .with_metadata([("dataset".into(), "vector".into())].into())
         );
 
         let expected_i = BTreeSet::from_iter(vec![161, 241, 321]);
@@ -2354,6 +2352,7 @@ mod test {
                 ),
                 ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
+            .with_metadata([("dataset".into(), "vector".into())].into())
         );
 
         let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
@@ -3983,7 +3982,7 @@ mod test {
                     .project(&["s"])?
                     .filter("i > 10 and i < 20")
             },
-            "Projection: fields=[s]
+            "ProjectionExec: expr=[s@2 as s]
   Take: columns=\"i, _rowid, s\"
     FilterExec: i@0 > 10 AND i@0 < 20
       LanceScan: uri..., projection=[i], row_id=true, row_addr=false, ordered=true",
@@ -4003,7 +4002,7 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 5),
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
     FilterExec: _distance@2 IS NOT NULL
       SortExec: TopK(fetch=5), expr=...
@@ -4018,7 +4017,7 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 42),
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=42), expr=...
       ANNSubIndex: name=..., k=42, deltas=1
@@ -4029,7 +4028,7 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| Ok(scan.nearest("vec", &q, 10)?.refine(4)),
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=10), expr=...
@@ -4045,7 +4044,7 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| Ok(scan.nearest("vec", &q, 13)?.use_index(false)),
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=13), expr=...
@@ -4064,7 +4063,7 @@ mod test {
                     .project(&["s", "vec"])?
                     .with_row_id())
             },
-            "Projection: fields=[s, vec, _distance, _rowid]
+            "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
   Take: columns=\"_distance, _rowid, i, s, vec\"
     FilterExec: i@2 > 10
       Take: columns=\"_distance, _rowid, i\"
@@ -4083,7 +4082,7 @@ mod test {
                     .filter("i > 10")?
                     .prefilter(true))
             },
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=17), expr=...
       ANNSubIndex: name=..., k=17, deltas=1
@@ -4099,14 +4098,14 @@ mod test {
             |scan| scan.nearest("vec", &q, 6),
             // TODO: we could write an optimizer rule to eliminate the last Projection
             // by doing it as part of the last Take. This would likely have minimal impact though.
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=6), expr=...
         KNNVectorDistance: metric=l2
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
-              Projection: fields=[_distance, _rowid, vec]
+              ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
                 FilterExec: _distance@... IS NOT NULL
                   SortExec: TopK(fetch=6), expr=...
                     KNNVectorDistance: metric=l2
@@ -4122,7 +4121,7 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 15)?.filter("i > 10"),
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: i@3 > 10
       Take: columns=\"_rowid, vec, _distance, i\"
@@ -4131,7 +4130,7 @@ mod test {
             KNNVectorDistance: metric=l2
               RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                 UnionExec
-                  Projection: fields=[_distance, _rowid, vec]
+                  ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
                     FilterExec: _distance@... IS NOT NULL
                       SortExec: TopK(fetch=15), expr=...
                         KNNVectorDistance: metric=l2
@@ -4154,14 +4153,14 @@ mod test {
             },
             // TODO: i is scanned on both sides but is projected away mid-plan
             // only to be taken again later. We should fix this.
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=5), expr=...
         KNNVectorDistance: metric=l2
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
-              Projection: fields=[_distance, _rowid, vec]
+              ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
                 FilterExec: _distance@... IS NOT NULL
                   SortExec: TopK(fetch=5), expr=...
                     KNNVectorDistance: metric=l2
@@ -4190,7 +4189,7 @@ mod test {
                     .filter("i > 10")?
                     .prefilter(true))
             },
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, i, s, vec\"
     SortExec: TopK(fetch=5), expr=...
       ANNSubIndex: name=..., k=5, deltas=1
@@ -4209,14 +4208,14 @@ mod test {
                     .filter("i > 10")?
                     .prefilter(true))
             },
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=8), expr=...
         KNNVectorDistance: metric=l2
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
-              Projection: fields=[_distance, _rowid, vec]
+              ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
                 FilterExec: _distance@... IS NOT NULL
                   SortExec: TopK(fetch=8), expr=...
                     KNNVectorDistance: metric=l2
@@ -4240,14 +4239,14 @@ mod test {
                     .filter("i > 10")?
                     .prefilter(true))
             },
-            "Projection: fields=[i, s, vec, _distance]
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
     FilterExec: _distance@... IS NOT NULL
       SortExec: TopK(fetch=11), expr=...
         KNNVectorDistance: metric=l2
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
-              Projection: fields=[_distance, _rowid, vec]
+              ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
                 FilterExec: _distance@... IS NOT NULL
                   SortExec: TopK(fetch=11), expr=...
                     KNNVectorDistance: metric=l2
@@ -4266,8 +4265,23 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.project(&["s"])?.filter("i > 10"),
-            "Projection: fields=[s]
+            "ProjectionExec: expr=[s@1 as s]
   Take: columns=\"_rowid, s\"
+    MaterializeIndex: query=i > 10",
+        )
+        .await?;
+
+        // Empty projection
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.filter("i > 10")
+                    .unwrap()
+                    .with_row_address()
+                    .project::<&str>(&[])
+            },
+            "ProjectionExec: expr=[_rowaddr@1 as _rowaddr]
+  Take: columns=\"_rowid, _rowaddr\"
     MaterializeIndex: query=i > 10",
         )
         .await?;
@@ -4276,14 +4290,34 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.project(&["s"])?.filter("i > 10"),
-            "Projection: fields=[s]
+            "ProjectionExec: expr=[s@1 as s]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
       Take: columns=\"_rowid, s\"
         MaterializeIndex: query=i > 10
-      Projection: fields=[_rowid, s]
+      ProjectionExec: expr=[_rowid@2 as _rowid, s@0 as s]
         FilterExec: i@1 > 10
           LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
+        )
+        .await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.filter("i > 10")
+                    .unwrap()
+                    .with_row_address()
+                    .project::<&str>(&[])
+            },
+            "ProjectionExec: expr=[_rowaddr@1 as _rowaddr]
+  Take: columns=\"_rowid, _rowaddr\"
+    RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+      UnionExec
+        Take: columns=\"_rowid\"
+          MaterializeIndex: query=i > 10
+        ProjectionExec: expr=[_rowid@1 as _rowid]
+          FilterExec: i@0 > 10
+            LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -4296,12 +4330,12 @@ mod test {
                     .filter("i > 10")
             },
             "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
-  Projection: fields=[s]
+  ProjectionExec: expr=[s@1 as s]
     RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
       UnionExec
         Take: columns=\"_rowid, s\"
           MaterializeIndex: query=i > 10
-        Projection: fields=[_rowid, s]
+        ProjectionExec: expr=[_rowid@2 as _rowid, s@0 as s]
           FilterExec: i@1 > 10
             LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
         )
@@ -4326,7 +4360,7 @@ mod test {
                     .fast_search()
                     .project(&["_rowid", "_distance"])
             },
-            "Projection: fields=[_rowid, _distance]
+            "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
   SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
       ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
@@ -4342,7 +4376,7 @@ mod test {
                     .with_row_id()
                     .project(&["_rowid", "_distance"])
             },
-            "Projection: fields=[_rowid, _distance]
+            "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
   SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
       ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
@@ -4358,13 +4392,13 @@ mod test {
                     .with_row_id()
                     .project(&["_rowid", "_distance"])
             },
-            "Projection: fields=[_rowid, _distance]
+            "ProjectionExec: expr=[_rowid@0 as _rowid, _distance@2 as _distance]
   FilterExec: _distance@2 IS NOT NULL
     SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
       KNNVectorDistance: metric=l2
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            Projection: fields=[_distance, _rowid, vec]
+            ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
               FilterExec: _distance@2 IS NOT NULL
                 SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2

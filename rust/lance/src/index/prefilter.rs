@@ -244,6 +244,16 @@ impl PreFilter for DatasetPreFilter {
         self.deleted_ids.is_none() && self.filtered_ids.is_none()
     }
 
+    /// Get the row id mask for this prefilter
+    fn mask(&self) -> Arc<RowIdMask> {
+        self.final_mask
+            .lock()
+            .unwrap()
+            .get()
+            .expect("mask called without call to wait_for_ready")
+            .clone()
+    }
+
     /// Check whether a slice of row ids should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
@@ -252,14 +262,7 @@ impl PreFilter for DatasetPreFilter {
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        let final_mask = self
-            .final_mask
-            .lock()
-            .unwrap()
-            .get()
-            .expect("filter_row_ids called without call to wait_for_ready")
-            .clone();
-        final_mask.selected_indices(row_ids)
+        self.mask().selected_indices(row_ids)
     }
 }
 
