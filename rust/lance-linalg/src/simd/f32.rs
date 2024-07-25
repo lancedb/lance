@@ -280,7 +280,7 @@ impl SIMD<f32, 8> for f32x8 {
     }
 
     fn find(&self, val: f32) -> Option<i32> {
-        #[cfg(all(target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             for i in 0..8 {
                 if self.as_array().get_unchecked(i) == &val {
