@@ -19,23 +19,23 @@ mod test {
     use aws_sdk_dynamodb::{
         config::Region,
         types::{
-            AttributeDefinition, KeySchemaElement, ProvisionedThroughput, ScalarAttributeType,
+            AttributeDefinition, KeySchemaElement, KeyType, ProvisionedThroughput,
+            ScalarAttributeType,
         },
+        Client,
     };
-    use futures::{future::join_all, StreamExt, TryStreamExt};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
 
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},
-        io::{
-            commit::{
-                external_manifest::ExternalManifestCommitHandler, latest_manifest_path,
-                manifest_path, CommitHandler,
-            },
-            object_store::ObjectStoreParams,
-        },
+        io::{object_store::local::LocalFileSystem, object_store::ObjectStoreParams},
         Dataset,
+    };
+    use lance_table::io::commit::{
+        dynamodb::DynamoDBExternalManifestStore,
+        external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
+        latest_manifest_path, manifest_path, CommitHandler,
     };
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
@@ -79,31 +79,36 @@ mod test {
                 KeySchemaElement::builder()
                     .attribute_name(base_uri!())
                     .key_type(KeyType::Hash)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .key_schema(
                 KeySchemaElement::builder()
                     .attribute_name(version!())
                     .key_type(KeyType::Range)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name(base_uri!())
                     .attribute_type(ScalarAttributeType::S)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name(version!())
                     .attribute_type(ScalarAttributeType::N)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .provisioned_throughput(
                 ProvisionedThroughput::builder()
                     .read_capacity_units(10)
                     .write_capacity_units(10)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .send()
             .await
