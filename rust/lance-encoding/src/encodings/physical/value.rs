@@ -261,30 +261,30 @@ impl ArrayEncoder for ValueEncoder {
             .create_buffer_encoder(arrays)?;
         let (encoded_buffer, encoded_buffer_meta) = buffer_encoder.encode(arrays)?;
 
-        let array_encoding =
-            if let Some(bitpacked_bits_per_value) = encoded_buffer_meta.bitpacked_bits_per_value {
-                pb::array_encoding::ArrayEncoding::Bitpacked(pb::Bitpacked {
-                    compressed_bits_per_value: bitpacked_bits_per_value,
-                    uncompressed_bits_per_value: encoded_buffer_meta.bits_per_value,
-                    buffer: Some(pb::Buffer {
-                        buffer_index: index,
-                        buffer_type: pb::buffer::BufferType::Page as i32,
+        let array_encoding = if let Some(bitpacking_meta) = encoded_buffer_meta.bitpacking {
+            pb::array_encoding::ArrayEncoding::Bitpacked(pb::Bitpacked {
+                compressed_bits_per_value: bitpacking_meta.bits_per_value,
+                uncompressed_bits_per_value: encoded_buffer_meta.bits_per_value,
+                signed: bitpacking_meta.signed,
+                buffer: Some(pb::Buffer {
+                    buffer_index: index,
+                    buffer_type: pb::buffer::BufferType::Page as i32,
+                }),
+            })
+        } else {
+            pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
+                bits_per_value: encoded_buffer_meta.bits_per_value,
+                buffer: Some(pb::Buffer {
+                    buffer_index: index,
+                    buffer_type: pb::buffer::BufferType::Page as i32,
+                }),
+                compression: encoded_buffer_meta
+                    .compression_scheme
+                    .map(|compression_scheme| pb::Compression {
+                        scheme: compression_scheme.to_string(),
                     }),
-                })
-            } else {
-                pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
-                    bits_per_value: encoded_buffer_meta.bits_per_value,
-                    buffer: Some(pb::Buffer {
-                        buffer_index: index,
-                        buffer_type: pb::buffer::BufferType::Page as i32,
-                    }),
-                    compression: encoded_buffer_meta
-                        .compression_scheme
-                        .map(|compression_scheme| pb::Compression {
-                            scheme: compression_scheme.to_string(),
-                        }),
-                })
-            };
+            })
+        };
 
         let array_bufs = vec![EncodedArrayBuffer {
             parts: encoded_buffer.parts,
@@ -310,10 +310,11 @@ pub(crate) mod tests {
     use std::marker::PhantomData;
     use std::sync::Arc;
 
+    use arrow::datatypes::{Int16Type, Int32Type, Int64Type};
     use arrow_array::{
         types::{UInt32Type, UInt64Type, UInt8Type},
-        ArrayRef, ArrowPrimitiveType, Float32Array, PrimitiveArray, UInt16Array, UInt32Array,
-        UInt64Array, UInt8Array,
+        ArrayRef, ArrowPrimitiveType, Float32Array, Int16Array, Int32Array, Int64Array, Int8Array,
+        PrimitiveArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_schema::{DataType, Field, TimeUnit};
     use rand::distributions::Uniform;
@@ -388,6 +389,33 @@ pub(crate) mod tests {
                 Arc::new(UInt64Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 32])),
                 35,
             ),
+            (
+                DataType::Int8,
+                Arc::new(Int8Array::from_iter_values(vec![0, 2, 3, 4, -5])),
+                4,
+            ),
+            (
+                DataType::Int16,
+                Arc::new(Int16Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 8])),
+                12,
+            ),
+            (
+                DataType::Int32,
+                Arc::new(Int32Array::from_iter_values(vec![0, 1, 2, 3, 4, -5 << 16])),
+                20,
+            ),
+            (
+                DataType::Int64,
+                Arc::new(Int64Array::from_iter_values(vec![
+                    0,
+                    1,
+                    2,
+                    -3,
+                    -4,
+                    -5 << 32,
+                ])),
+                36,
+            ),
         ];
 
         for (data_type, arr, bits_per_value) in test_cases {
@@ -452,6 +480,22 @@ pub(crate) mod tests {
                     4,
                     250 << 56,
                 ])),
+            ),
+            (
+                DataType::Int8,
+                Arc::new(Int8Array::from_iter_values(vec![-100])),
+            ),
+            (
+                DataType::Int16,
+                Arc::new(Int16Array::from_iter_values(vec![-100 << 8])),
+            ),
+            (
+                DataType::Int32,
+                Arc::new(Int32Array::from_iter_values(vec![-100 << 24])),
+            ),
+            (
+                DataType::Int64,
+                Arc::new(Int64Array::from_iter_values(vec![-100 << 56])),
             ),
         ];
 
@@ -568,7 +612,6 @@ pub(crate) mod tests {
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
                         Uniform::new(129, 259),
-                        // Uniform::new(1, 3)
                     ),
                 ),
             ),
@@ -607,6 +650,69 @@ pub(crate) mod tests {
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
                         // this range should always always give 16 bits
+                        Uniform::new(0, 1),
+                    ),
+                ),
+            ),
+            // check for signed types
+            (
+                DataType::Int16,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int16Type, Uniform<i16>>::new(
+                        Uniform::new(-5, 5),
+                    ),
+                ),
+            ),
+            (
+                DataType::Int64,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int64Type, Uniform<i64>>::new(
+                        Uniform::new(-1 * (5 << 42), 6 << 42),
+                    ),
+                ),
+            ),
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(-1 * (5 << 7), 6 << 7),
+                    ),
+                ),
+            ),
+            // check signed where packed to < 1 byte for multi-byte type
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(-19, 19),
+                    ),
+                ),
+            ),
+            // check signed byte aligned to single byte
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        // this range should always give 8 bits
+                        Uniform::new(-120, 120),
+                    ),
+                ),
+            ),
+            // check signed byte aligned to multiple bytes
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        // this range should always give 16 bits
+                        Uniform::new(-120 << 8, 120 << 8),
+                    ),
+                ),
+            ),
+            // check that all 0 works for signed type
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
                         Uniform::new(0, 1),
                     ),
                 ),
