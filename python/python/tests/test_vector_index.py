@@ -12,11 +12,11 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance import LanceFragment
 
 torch = pytest.importorskip("torch")
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
-from lance import LanceFragment
 
 
 def create_table(nvec=1000, ndim=128, nans=0):
