@@ -647,10 +647,11 @@ impl MergeInsertJob {
                     source_batches.push(batch.drop_column(ROW_ADDR)?);
                 }
 
-                let mut updated_row_addr_iter = batches
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(batch_idx, batch)| {
+                // This function is here to help rustc with lifetimes.
+                fn get_row_addr_iter(
+                    batches: &[RecordBatch],
+                ) -> impl Iterator<Item = (u64, (usize, usize))> + '_ + Send {
+                    batches.iter().enumerate().flat_map(|(batch_idx, batch)| {
                         // The index in source batches will be one more.
                         let batch_idx = batch_idx + 1;
                         let row_addrs = batch
@@ -665,7 +666,8 @@ impl MergeInsertJob {
                             .enumerate()
                             .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
                     })
-                    .peekable();
+                }
+                let mut updated_row_addr_iter = get_row_addr_iter(&batches).peekable();
 
                 while let Some(batch) = updater.next().await? {
                     source_batches[0] =
@@ -712,7 +714,7 @@ impl MergeInsertJob {
         // Collect the updated fragments, and map the field ids. Tombstone old ones
         // as needed.
         for fragment in &mut updated_fragments {
-            let updated_fields = (&fragment.files).last().unwrap().fields.clone();
+            let updated_fields = fragment.files.last().unwrap().fields.clone();
             for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
                 for field in &mut data_file.fields {
                     if updated_fields.contains(field) {
@@ -743,7 +745,7 @@ impl MergeInsertJob {
         let merger = Merger::try_new(self.params.clone(), schema.clone(), !is_full_schema)?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
-        let merger_schema = merger.schema().clone();
+        let merger_schema = merger.output_schema().clone();
         let stream = joined
             .and_then(move |batch| merger.clone().execute_batch(batch))
             .try_flatten();
@@ -971,7 +973,7 @@ impl Merger {
         })
     }
 
-    fn schema(&self) -> &Arc<Schema> {
+    fn output_schema(&self) -> &Arc<Schema> {
         &self.output_schema
     }
 
@@ -1177,6 +1179,11 @@ mod tests {
     };
 
     use super::*;
+
+    // Used to validate that futures returned are Send.
+    fn require_send<T: Send>(t: T) -> T {
+        t
+    }
 
     async fn check(
         new_data: RecordBatch,
@@ -1628,7 +1635,7 @@ mod tests {
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
-        let res = job.execute_reader(reader).await;
+        let res = require_send(job.execute_reader(reader)).await;
         assert!(
             matches!(
                 &res,
