@@ -42,10 +42,10 @@ impl Tags {
         commit_handler: Arc<dyn CommitHandler>,
         base: Path,
     ) -> Self {
-        Tags {
-            object_store: object_store,
-            commit_handler: commit_handler,
-            base: base,
+        Self {
+            object_store,
+            commit_handler,
+            base,
         }
     }
 
