@@ -4,7 +4,7 @@
 use fsst::fsst::{compress, decompress, FSST_SYMBOL_TABLE_SIZE};
 use rand::Rng;
 
-const TEST_NUM: usize = 10;
+const TEST_NUM: usize = 20;
 const BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
 use arrow::array::StringArray;
