@@ -2610,7 +2610,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_delete(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_delete(
+        #[values(false, true)] use_legacy_format: bool,
+        #[values(false, true)] with_scalar_index: bool,
+    ) {
         use std::collections::HashSet;
 
         fn sequence_data(range: Range<u32>) -> RecordBatch {
@@ -2641,6 +2644,19 @@ mod tests {
         let mut dataset = TestDatasetGenerator::new(batches, use_legacy_format)
             .make_hostile(test_uri)
             .await;
+
+        if with_scalar_index {
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("scalar_index".to_string()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
 
         // Delete nothing
         dataset.delete("i < 0").await.unwrap();
