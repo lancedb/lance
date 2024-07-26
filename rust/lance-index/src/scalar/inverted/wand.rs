@@ -18,15 +18,16 @@ use super::builder::OrderedDoc;
 use super::index::{idf, PostingListReader, FREQUENCY_COL, K1};
 
 // WAND parameters
-pub const MIN_BLOCK_SIZE: usize = 256;
-pub const BLOCK_SIZE_SQUARE: usize = MIN_BLOCK_SIZE * MIN_BLOCK_SIZE;
+// One block consists of rows of a posting list (row id (u64) and frequency (f32)),
+// now set it to 256 cause it's the max number of power of 2 that the total bytes is not greater than 4KB.
+// Increasing the block size can reduce the number of IOs but increase the memory usage, and maybe decrease the probability of skipping blocks.
+pub const BLOCK_SIZE: usize = 256;
 
+// we might change the block size in the future
+// and it could be a function of the total number of documents
 #[inline]
-pub fn block_size(length: usize) -> usize {
-    match length {
-        ..=BLOCK_SIZE_SQUARE => MIN_BLOCK_SIZE,
-        _ => (length as f32).sqrt().ceil() as usize,
-    }
+pub const fn block_size(_length: usize) -> usize {
+    BLOCK_SIZE
 }
 
 #[derive(Clone)]
@@ -105,8 +106,10 @@ impl PostingIterator {
         let block_row_ids = self.list.block_row_ids();
         let block_size = block_size(self.list.len());
 
-        // if the next block is with head_row_id <= least_id,
-        // then we can skip the current block
+        // the binary search version of skipping blocks,
+        // I didn't see obvious performance improvement, so commented it out,
+        // might be useful after benchmarking with large datasets
+        //
         // let start = self.index / block_size;
         // let mut current_block =
         //     start + block_row_ids[start..].partition_point(|&row_id| row_id <= least_id) - 1;
@@ -121,6 +124,8 @@ impl PostingIterator {
         //     }
         // }
 
+        // if the next block is with head_row_id <= least_id,
+        // then we can skip the current block
         let start_block = self.index / block_size;
         let mut current_block = start_block;
         while current_block + 1 < self.list.num_blocks()
