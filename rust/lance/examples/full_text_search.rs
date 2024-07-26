@@ -24,20 +24,20 @@ use object_store::path::Path;
 
 #[tokio::main]
 async fn main() {
-    const TOTAL: usize = 10_000_000;
+    const TOTAL: usize = 10_000;
     let tempdir = tempfile::tempdir().unwrap();
     let dataset_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let tokens = (0..10_000)
         .map(|_| random_word::gen(random_word::Lang::En))
         .collect_vec();
-    let create_index = false;
+    let create_index = true;
     if create_index {
         let row_id_col = Arc::new(UInt64Array::from(
             (0..TOTAL).map(|i| i as u64).collect_vec(),
         ));
         let docs = (0..TOTAL)
             .map(|_| {
-                let num_words = rand::random::<usize>() % 300 + 1;
+                let num_words = rand::random::<usize>() % 100 + 1;
                 let doc = (0..num_words)
                     .map(|_| tokens[rand::random::<usize>() % tokens.len()])
                     .collect::<Vec<_>>();

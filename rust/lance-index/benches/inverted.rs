@@ -13,7 +13,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
 use lance_core::ROW_ID;
-use lance_index::scalar::inverted::InvertedIndex;
+use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
@@ -30,7 +30,7 @@ fn bench_inverted(c: &mut Criterion) {
     let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let store = Arc::new(LanceIndexStore::new(ObjectStore::local(), index_dir, None));
 
-    let invert_index = InvertedIndex::default();
+    let mut builder = InvertedIndexBuilder::default();
     // generate 2000 different tokens
     let tokens = random_word::all(random_word::Lang::En);
     let row_id_col = Arc::new(UInt64Array::from(
@@ -58,7 +58,7 @@ fn bench_inverted(c: &mut Criterion) {
     let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
     let stream = Box::pin(stream);
 
-    rt.block_on(async { invert_index.update(stream, store.as_ref()).await.unwrap() });
+    rt.block_on(async { builder.update(stream, store.as_ref()).await.unwrap() });
     let invert_index = rt.block_on(InvertedIndex::load(store)).unwrap();
 
     c.bench_function(format!("invert({TOTAL})").as_str(), |b| {

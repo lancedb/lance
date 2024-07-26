@@ -77,12 +77,25 @@ impl IndexReader for FileReader {
             .await
     }
 
+    async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
+        self.read_range(range, self.schema()).await
+    }
+
+    async fn take_rows(&self, indices: &[usize]) -> Result<RecordBatch> {
+        let indices = indices.iter().map(|&i| i as u32).collect::<Vec<_>>();
+        self.take(&indices, self.schema()).await
+    }
+
     async fn num_batches(&self) -> u32 {
         self.num_batches() as u32
     }
 
     fn num_rows(&self) -> usize {
         self.len()
+    }
+
+    fn schema(&self) -> &lance_core::datatypes::Schema {
+        Self::schema(self)
     }
 }
 

@@ -25,7 +25,7 @@ use tracing::instrument;
 
 use crate::{Index, IndexType};
 
-use super::inverted::InvertedIndex;
+use super::inverted::InvertedIndexBuilder;
 use super::{btree::BtreeTrainingSource, AnyQuery, IndexStore, ScalarIndex};
 use super::{btree::OrderableScalarValue, SargableQuery};
 
@@ -355,6 +355,6 @@ pub async fn train_inverted_index(
     let batches_source = data_source.scan_ordered_chunks(4096).await?;
 
     // mapping from item to list of the row ids where it is present
-    let inverted_index = InvertedIndex::default();
+    let mut inverted_index = InvertedIndexBuilder::default();
     inverted_index.update(batches_source, index_store).await
 }

@@ -5,59 +5,85 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap};
 use std::sync::Arc;
 
+use arrow::array::AsArray;
+use arrow::datatypes;
+use arrow_array::RecordBatch;
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdMask;
+use lance_core::{Result, ROW_ID};
 
 use crate::vector::graph::OrderedFloat;
 
-use super::{idf, OrderedDoc, PostingList, K1};
+use super::builder::OrderedDoc;
+use super::index::{idf, PostingListReader, FREQUENCY_COL, K1};
 
-#[derive(Clone)]
-pub(crate) struct PostingIterator<'a> {
-    token_id: u32,
-    list: &'a PostingList,
-    index: usize,
-    mask: Arc<RowIdMask>,
-    approximate_upper_bound: f32,
+// WAND parameters
+pub const MIN_BLOCK_SIZE: usize = 256;
+pub const BLOCK_SIZE_SQUARE: usize = MIN_BLOCK_SIZE * MIN_BLOCK_SIZE;
+
+#[inline]
+pub fn block_size(length: usize) -> usize {
+    match length {
+        ..=BLOCK_SIZE_SQUARE => MIN_BLOCK_SIZE,
+        _ => (length as f32).sqrt().ceil() as usize,
+    }
 }
 
-impl PartialEq for PostingIterator<'_> {
+#[derive(Clone)]
+pub struct PostingIterator {
+    token_id: u32,
+    list: PostingListReader,
+    index: usize,
+    doc: (u64, f32),
+    mask: Arc<RowIdMask>,
+    approximate_upper_bound: f32,
+    // cache the current block
+    block_id: Option<usize>,
+    block: Option<RecordBatch>,
+}
+
+impl PartialEq for PostingIterator {
     fn eq(&self, other: &Self) -> bool {
         self.token_id == other.token_id && self.index == other.index
     }
 }
 
-impl Eq for PostingIterator<'_> {}
+impl Eq for PostingIterator {}
 
-impl PartialOrd for PostingIterator<'_> {
+impl PartialOrd for PostingIterator {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for PostingIterator<'_> {
+impl Ord for PostingIterator {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.doc().map(|d| d.0).cmp(&other.doc().map(|d| d.0)) {
+        match self.doc.0.cmp(&other.doc.0) {
             std::cmp::Ordering::Equal => self.token_id.cmp(&other.token_id),
             ord => ord,
         }
     }
 }
 
-impl<'a> PostingIterator<'a> {
+impl PostingIterator {
     pub(crate) fn new(
         token_id: u32,
-        list: &'a PostingList,
+        list: PostingListReader,
         num_doc: usize,
         mask: Arc<RowIdMask>,
-    ) -> Option<Self> {
-        Some(Self {
+    ) -> Self {
+        let first_block = list.block_last_element(0);
+        let approximate_upper_bound = idf(list.len(), num_doc) * (K1 + 1.0);
+        Self {
             token_id,
             list,
             index: 0,
+            doc: first_block,
             mask,
-            approximate_upper_bound: idf(list.len(), num_doc) * (K1 + 1.0),
-        })
+            approximate_upper_bound,
+            block_id: None,
+            block: None,
+        }
     }
 
     #[inline]
@@ -67,46 +93,86 @@ impl<'a> PostingIterator<'a> {
 
     fn doc(&self) -> Option<(u64, f32)> {
         if self.index < self.list.len() {
-            Some((
-                self.list.row_ids[self.index],
-                self.list.frequencies[self.index],
-            ))
+            Some(self.doc)
         } else {
             None
         }
     }
 
     // move to the next row id that is greater than or equal to least_id
-    fn next(&mut self, least_id: u64) -> Option<(u64, usize)> {
-        let block_size = ((self.list.len() - self.index) as f32).sqrt().ceil() as usize;
+    async fn next(&mut self, least_id: u64) -> Result<Option<(u64, usize)>> {
         // skip blocks
-        while self.index + block_size < self.list.len()
-            && self.list.row_ids[self.index + block_size] < least_id
+        let block_row_ids = self.list.block_row_ids();
+        let block_size = block_size(self.list.len());
+        let mut current_block = self.index / block_size;
+        while current_block + 1 < self.list.num_blocks()
+            && block_row_ids[current_block + 1] <= least_id
         {
-            self.index += block_size;
+            current_block += 1;
+            self.index = current_block * block_size;
+            if self.index < self.list.len() {
+                self.doc = self.list.block_last_element(current_block);
+            }
         }
-        // linear search
+
+        // if the first row id of the current block is greater than or equal to least_id
+        // return it directly to avoid IO
+        if self.index == current_block * block_size && block_row_ids[current_block] >= least_id {
+            return Ok(Some((block_row_ids[current_block], self.index)));
+        }
+
+        // read the current block all into memory and do linear search
+        let mut batch = self.read_block(current_block).await?;
+        let mut row_ids = batch[ROW_ID]
+            .as_primitive::<datatypes::UInt64Type>()
+            .values();
+
+        let mut block_offset = current_block * block_size;
         while self.index < self.list.len() {
-            let row_id = self.list.row_ids[self.index];
+            let row_id = row_ids[self.index - block_offset];
             if row_id >= least_id && self.mask.selected(row_id) {
-                return Some((row_id, self.index));
+                let freq = batch[FREQUENCY_COL]
+                    .as_primitive::<datatypes::Float32Type>()
+                    .values()[self.index - block_offset];
+                self.doc = (row_id, freq);
+                return Ok(Some((row_id, self.index)));
             }
             self.index += 1;
+            if self.index == block_offset + block_size {
+                current_block += 1;
+                block_offset += block_size;
+                batch = self.read_block(current_block).await?;
+                row_ids = batch[ROW_ID]
+                    .as_primitive::<datatypes::UInt64Type>()
+                    .values();
+            }
         }
-        None
+        Ok(None)
+    }
+
+    async fn read_block(&mut self, block_id: usize) -> Result<RecordBatch> {
+        match self.block_id {
+            Some(id) if id == block_id => Ok(self.block.as_ref().unwrap().clone()),
+            _ => {
+                let block = self.list.read_block(block_id).await?;
+                self.block_id = Some(block_id);
+                self.block = Some(block.clone());
+                Ok(block)
+            }
+        }
     }
 }
 
-pub(crate) struct Wand<'a> {
+pub struct Wand {
     factor: f32,
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
     cur_doc: Option<u64>,
-    postings: BTreeSet<PostingIterator<'a>>,
+    postings: BTreeSet<PostingIterator>,
     candidates: BinaryHeap<Reverse<OrderedDoc>>,
 }
 
-impl<'a> Wand<'a> {
-    pub(crate) fn new(postings: impl Iterator<Item = PostingIterator<'a>>) -> Self {
+impl Wand {
+    pub(crate) fn new(postings: impl Iterator<Item = PostingIterator>) -> Self {
         Self {
             factor: 1.0,
             threshold: 0.0,
@@ -117,13 +183,17 @@ impl<'a> Wand<'a> {
     }
 
     // search the top-k documents that contain the query
-    pub(crate) fn search(&mut self, k: usize, scorer: impl Fn(u64, f32) -> f32) -> Vec<(u64, f32)> {
+    pub(crate) async fn search(
+        &mut self,
+        k: usize,
+        scorer: impl Fn(u64, f32) -> f32,
+    ) -> Result<Vec<(u64, f32)>> {
         if k == 0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
-        while let Some(doc) = self.next() {
-            let score = self.score(doc, &scorer);
+        while let Some(doc) = self.next().await? {
+            let score = self.score(doc, &scorer).await?;
             if self.candidates.len() < k {
                 self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
             } else if score > self.threshold {
@@ -133,16 +203,17 @@ impl<'a> Wand<'a> {
             }
         }
 
-        self.candidates
+        Ok(self
+            .candidates
             .iter()
             .map(|doc| (doc.0.row_id, doc.0.score))
             .sorted_unstable()
             .map(|(row_id, score)| (row_id, score.0))
-            .collect()
+            .collect())
     }
 
     // calculate the score of the document
-    fn score(&self, doc: u64, scorer: &impl Fn(u64, f32) -> f32) -> f32 {
+    async fn score(&self, doc: u64, scorer: &impl Fn(u64, f32) -> f32) -> Result<f32> {
         let mut score = 0.0;
         for posting in &self.postings {
             let (cur_doc, freq) = posting.doc().expect("empty posting list was removed");
@@ -155,11 +226,11 @@ impl<'a> Wand<'a> {
 
             score += posting.approximate_upper_bound() * scorer(doc, freq);
         }
-        score
+        Ok(score)
     }
 
     // find the next doc candidate
-    fn next(&mut self) -> Option<u64> {
+    async fn next(&mut self) -> Result<Option<u64>> {
         while let Some((index, pivot_posting)) = self.find_pivot_term() {
             let (doc, _) = pivot_posting
                 .doc()
@@ -174,7 +245,7 @@ impl<'a> Wand<'a> {
                     .postings
                     .take(&posting)
                     .expect("we just found it in the previous step");
-                if posting.next(cur_doc + 1).is_some() {
+                if posting.next(cur_doc + 1).await?.is_some() {
                     self.postings.insert(posting);
                 }
             } else if self
@@ -188,7 +259,7 @@ impl<'a> Wand<'a> {
                 // so that means the sum of upper bound of all terms is not less than the threshold,
                 // this document is a candidate
                 self.cur_doc = Some(doc);
-                return Some(doc);
+                return Ok(Some(doc));
             } else {
                 // some posting iterators haven't reached this doc id,
                 // so pick one of such term(s) and move it to the doc id
@@ -197,17 +268,17 @@ impl<'a> Wand<'a> {
                     .postings
                     .take(&posting)
                     .expect("we just found it in the previous step");
-                if posting.next(doc).is_some() {
+                if posting.next(doc).await?.is_some() {
                     self.postings.insert(posting);
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     // find the first term that the sum of upper bound of all preceding terms and itself,
     // are greater than or equal to the threshold
-    fn find_pivot_term(&self) -> Option<(usize, PostingIterator<'a>)> {
+    fn find_pivot_term(&self) -> Option<(usize, PostingIterator)> {
         let mut acc = 0.0;
         for (i, iter) in self.postings.iter().enumerate() {
             acc += iter.approximate_upper_bound();
@@ -223,11 +294,8 @@ impl<'a> Wand<'a> {
     fn pick_term<'b>(
         &self,
         doc: u64,
-        postings: impl Iterator<Item = &'b PostingIterator<'a>>,
-    ) -> PostingIterator<'a>
-    where
-        'a: 'b,
-    {
+        postings: impl Iterator<Item = &'b PostingIterator>,
+    ) -> PostingIterator {
         postings
             .filter(|posting| posting.doc().unwrap().0 < doc)
             .max_by_key(|posting| OrderedFloat(posting.approximate_upper_bound()))

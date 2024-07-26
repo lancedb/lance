@@ -46,10 +46,16 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
+    /// Read the range of rows from the file
+    async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch>;
+    /// Read the rows at the given indices from the file
+    async fn take_rows(&self, indices: &[usize]) -> Result<RecordBatch>;
     /// Return the number of batches in the file
     async fn num_batches(&self) -> u32;
     /// Return the number of rows in the file
     fn num_rows(&self) -> usize;
+    /// Return the metadata of the file
+    fn schema(&self) -> &lance_core::datatypes::Schema;
 }
 
 /// Trait abstracting I/O away from index logic
