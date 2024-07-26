@@ -64,6 +64,10 @@ lazy_static! {
             .filter(tantivy::tokenizer::Stemmer::new(Language::English))
             .build()
     };
+    static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512 * 1024 * 1024);
 }
 
 #[derive(Debug, Clone)]
@@ -388,9 +392,8 @@ impl InvertedListReader {
             .ok_or_else(|| Error::io("lengths not found".to_string(), location!()))?;
         let lengths: Vec<usize> = serde_json::from_str(lengths)?;
 
-        const CACHE_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
         let cache = Cache::builder()
-            .max_capacity(CACHE_SIZE as u64)
+            .max_capacity(*CACHE_SIZE as u64)
             .weigher(|_, posting: &PostingListReader| posting.deep_size_of() as u32)
             .build();
         Ok(Self {
@@ -439,7 +442,7 @@ impl InvertedListReader {
                     .map(|offset| {
                         let offset = offset + num_blocks;
                         let length = min(batch.num_rows() - offset, block_size);
-                        batch.slice(offset, length)
+                        batch.slice(offset, length).into()
                     })
                     .collect();
 
@@ -447,8 +450,8 @@ impl InvertedListReader {
                     reader: self.reader.clone(),
                     term_offset: offset,
                     length,
-                    row_ids,
-                    frequencies,
+                    row_ids: row_ids.values().to_vec(),
+                    frequencies: frequencies.values().to_vec(),
                     block_id: 0,
                     blocks: cached_blocks,
                 })
@@ -527,22 +530,19 @@ pub struct PostingListReader {
     term_offset: usize,
     length: usize,
     // first element of each block
-    row_ids: UInt64Array,
-    frequencies: Float32Array,
+    row_ids: Vec<u64>,
+    frequencies: Vec<f32>,
     // blocks cache
     block_id: usize,
-    blocks: Vec<RecordBatch>,
+    blocks: Vec<Block>,
 }
 
 impl DeepSizeOf for PostingListReader {
     fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        let block_size = block_size(self.len());
-        let num_blocks = self.len().div_ceil(block_size);
-        let num_cached_blocks = num_blocks_to_read(num_blocks, block_size);
-        let num_cached_rows = min(self.len(), num_cached_blocks * block_size);
         size_of_val(self)
-            + self.row_ids.data_type().size() * (self.row_ids.len() + num_cached_rows)
-            + self.frequencies.data_type().size() * (self.frequencies.len() + num_cached_rows)
+            + self.row_ids.deep_size_of()
+            + self.frequencies.deep_size_of()
+            + self.blocks.deep_size_of()
     }
 }
 
@@ -560,32 +560,37 @@ impl PostingListReader {
     }
 
     pub fn block_head_element(&self, block_id: usize) -> (u64, f32) {
-        (
-            self.row_ids.values()[block_id],
-            self.frequencies.values()[block_id],
-        )
+        (self.row_ids[block_id], self.frequencies[block_id])
     }
 
     pub fn block_row_ids(&self) -> &[u64] {
-        self.row_ids.values()
+        &self.row_ids
+    }
+
+    // read the block from cache,
+    // WARNING: this function doesn't check if the block is in the cache,
+    // must call try_fetch_blocks() before calling this function to ensure the block is in the cache,
+    // split these two functions to avoid mutable borrow checker
+    pub fn block(&self, block_id: usize) -> &Block {
+        &self.blocks[block_id - self.block_id]
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn read_block(&mut self, block_id: usize) -> Result<RecordBatch> {
+    pub async fn try_fetch_blocks(&mut self, block_id: usize) -> Result<()> {
         if !self.blocks.is_empty()
             && self.block_id <= block_id
             && block_id < self.block_id + self.blocks.len()
         {
-            return Ok(self.blocks[block_id - self.block_id].clone());
+            return Ok(());
         }
 
         self.block_id = block_id;
         self.blocks = self.read_blocks(block_id).await?;
-        Ok(self.blocks[0].clone())
+        Ok(())
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn read_blocks(&self, block_id: usize) -> Result<Vec<RecordBatch>> {
+    async fn read_blocks(&self, block_id: usize) -> Result<Vec<Block>> {
         let block_size = block_size(self.length);
         let num_blocks = self.length.div_ceil(block_size);
         let num_block_to_read = num_blocks_to_read(num_blocks, block_size);
@@ -593,14 +598,59 @@ impl PostingListReader {
         let end = start + min(self.length, num_block_to_read * block_size);
         let batch = self.reader.read_range(start..end).await?;
 
-        let batches = (0..end - start)
+        let blocks = (0..end - start)
             .step_by(block_size)
             .map(|offset| {
                 let length = min(self.length - offset, block_size);
-                batch.slice(offset, length)
+                batch.slice(offset, length).into()
             })
             .collect();
-        Ok(batches)
+        Ok(blocks)
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct Block {
+    pub row_ids: Vec<u64>,
+    pub frequencies: Vec<f32>,
+}
+
+impl From<RecordBatch> for Block {
+    fn from(batch: RecordBatch) -> Self {
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+        let frequencies = batch[FREQUENCY_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        Self {
+            row_ids,
+            frequencies,
+        }
+    }
+}
+
+impl Block {
+    pub fn len(&self) -> usize {
+        self.row_ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn row_id(&self, i: usize) -> u64 {
+        self.row_ids[i]
+    }
+
+    #[inline]
+    pub fn frequency(&self, i: usize) -> f32 {
+        self.frequencies[i]
+    }
+
+    #[inline]
+    pub fn doc(&self, i: usize) -> (u64, f32) {
+        (self.row_id(i), self.frequency(i))
     }
 }
 

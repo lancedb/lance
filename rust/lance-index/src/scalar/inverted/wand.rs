@@ -5,16 +5,15 @@ use std::cmp::{min, Reverse};
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use arrow::array::AsArray;
-use arrow::datatypes;
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdMask;
-use lance_core::{Result, ROW_ID};
+use lance_core::Result;
 use lazy_static::lazy_static;
 use tracing::instrument;
 
 use super::builder::OrderedDoc;
-use super::index::{idf, PostingListReader, FREQUENCY_COL, K1};
+use super::index::{idf, PostingListReader, K1};
+use super::Block;
 
 // WAND parameters
 // One block consists of rows of a posting list (row id (u64) and frequency (f32)),
@@ -27,7 +26,11 @@ lazy_static! {
     static ref MIN_IO_SIZE: usize = std::env::var("MIN_IO_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256 * 1024); // 256KiB
+        .unwrap_or(1024 * 1024); // 1MiB
+    static ref FACTOR: f32 = std::env::var("WAND_FACTOR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
 }
 
 // we might change the block size in the future
@@ -99,10 +102,7 @@ impl PostingIterator {
 
     #[inline]
     fn approximate_upper_bound(&self) -> f32 {
-        match self.doc() {
-            Some(_) => self.approximate_upper_bound,
-            None => 0.0,
-        }
+        self.approximate_upper_bound
     }
 
     fn doc(&self) -> Option<(u64, f32)> {
@@ -124,30 +124,12 @@ impl PostingIterator {
         // I didn't see obvious performance improvement, so commented it out,
         // might be useful after benchmarking with large datasets
         //
-        // let start = self.index / block_size;
-        // let current_block =
-        //     start + block_row_ids[start..].partition_point(|&row_id| row_id <= least_id) - 1;
-        // if current_block > start {
-        //     self.index = current_block * block_size;
-        //     self.doc = self.list.block_head_element(current_block);
-        //     // if the first row id of the current block is greater than or equal to least_id,
-        //     // and it's not filtered out,
-        //     // return it directly to avoid IO
-        //     if self.doc.0 >= least_id && self.mask.selected(self.doc.0) {
-        //         return Ok(Some((self.doc.0, self.index)));
-        //     }
-        // }
-
-        // if the next block is with head_row_id <= least_id,
-        // then we can skip the current block
-        let start_block = self.index / block_size;
-        let mut current_block = start_block;
-        while current_block + 1 < self.list.num_blocks()
-            && block_row_ids[current_block + 1] <= least_id
-        {
-            current_block += 1;
-        }
-        if current_block > start_block {
+        let span = tracing::span!(tracing::Level::DEBUG, "skip_blocks");
+        let _guard = span.enter();
+        let start = self.index / block_size;
+        let mut current_block =
+            start + block_row_ids[start..].partition_point(|&row_id| row_id <= least_id) - 1;
+        if current_block > start {
             self.index = current_block * block_size;
             self.doc = self.list.block_head_element(current_block);
             // if the first row id of the current block is greater than or equal to least_id,
@@ -158,45 +140,83 @@ impl PostingIterator {
             }
         }
 
+        // if the next block is with head_row_id <= least_id,
+        // then we can skip the current block
+        // let start_block = self.index / block_size;
+        // let mut current_block = start_block;
+        // while current_block + 1 < self.list.num_blocks()
+        //     && block_row_ids[current_block + 1] <= least_id
+        // {
+        //     current_block += 1;
+        // }
+        // if current_block > start_block {
+        //     self.index = current_block * block_size;
+        //     self.doc = self.list.block_head_element(current_block);
+        //     // if the first row id of the current block is greater than or equal to least_id,
+        //     // and it's not filtered out,
+        //     // return it directly to avoid IO
+        //     if self.doc.0 >= least_id && self.mask.selected(self.doc.0) {
+        //         return Ok(Some((self.doc.0, self.index)));
+        //     }
+        // }
+        std::mem::drop(_guard);
+
         // read the current block all into memory and do linear search
-        let mut batch = self.list.read_block(current_block).await?;
-        let mut row_ids = batch[ROW_ID]
-            .as_primitive::<datatypes::UInt64Type>()
-            .values();
+        let span = tracing::span!(tracing::Level::DEBUG, "linear_search_block");
+        let _guard = span.enter();
 
-        let mut block_offset = current_block * block_size;
-        loop {
-            self.index += 1;
-            if self.index >= self.list.len() {
-                return Ok(None);
-            }
-
-            // switch to the next block
-            if self.index == block_offset + block_size {
-                self.doc = self.list.block_head_element(current_block + 1);
-                if self.mask.selected(self.doc.0) {
-                    // the next block must be with first row id greater than least_id
-                    // so return it directly
-                    return Ok(Some((self.doc.0, self.index)));
-                }
-
-                current_block += 1;
-                block_offset += block_size;
-                batch = self.list.read_block(current_block).await?;
-                row_ids = batch[ROW_ID]
-                    .as_primitive::<datatypes::UInt64Type>()
-                    .values();
-            }
-
-            let row_id = row_ids[self.index - block_offset];
-            if row_id >= least_id && self.mask.selected(row_id) {
-                let freq = batch[FREQUENCY_COL]
-                    .as_primitive::<datatypes::Float32Type>()
-                    .values()[self.index - block_offset];
-                self.doc = (row_id, freq);
-                return Ok(Some((row_id, self.index)));
-            }
+        self.list.try_fetch_blocks(current_block).await?;
+        let block = self.list.block(current_block);
+        // do binary search in the first block
+        let block_offset = current_block * block_size;
+        let in_block_index =
+            block.row_ids[self.index - block_offset..].partition_point(|&row_id| row_id < least_id);
+        if let Some((index, doc)) = self.go_through_block(block, in_block_index) {
+            self.index = index;
+            self.doc = doc;
+            return Ok(Some((doc.0, index)));
         }
+
+        // the remaining blocks must be with first row id greater than least_id
+        // so just do linear search to find the first row id that is not filtered out
+        self.index = block_offset + block.len();
+        while self.index < self.list.len() {
+            current_block += 1;
+            self.doc = self.list.block_head_element(current_block);
+            if self.mask.selected(self.doc.0) {
+                // the next block must be with first row id greater than least_id
+                // so return it directly
+                return Ok(Some((self.doc.0, self.index)));
+            }
+
+            self.list.try_fetch_blocks(current_block).await?;
+            let block = self.list.block(current_block);
+            if let Some((index, doc)) = self.go_through_block(block, in_block_index) {
+                self.index = index;
+                self.doc = doc;
+                return Ok(Some((doc.0, index)));
+            }
+            self.index += block.len();
+        }
+        Ok(None)
+    }
+
+    fn go_through_block(
+        &self,
+        block: &Block,
+        mut block_index: usize,
+    ) -> Option<(usize, (u64, f32))> {
+        let mut index = self.index;
+        while block_index < block.len() {
+            let doc = block.doc(block_index);
+            if self.mask.selected(doc.0) {
+                return Some((index, doc));
+            }
+
+            block_index += 1;
+            index += 1;
+        }
+        None
     }
 }
 
@@ -211,7 +231,7 @@ pub struct Wand {
 impl Wand {
     pub(crate) fn new(postings: impl Iterator<Item = PostingIterator>) -> Self {
         Self {
-            factor: 1.0,
+            factor: *FACTOR,
             threshold: 0.0,
             cur_doc: None,
             postings: postings.collect(),
@@ -310,10 +330,13 @@ impl Wand {
     #[instrument(level = "debug", skip_all)]
     fn find_pivot_term(&self) -> Option<&PostingIterator> {
         let mut acc = 0.0;
-        for iter in self.postings.iter() {
-            acc += iter.approximate_upper_bound();
-            if acc >= self.threshold && acc > 0. {
-                return Some(iter);
+        for posting in self.postings.iter() {
+            if posting.doc().is_none() {
+                break;
+            }
+            acc += posting.approximate_upper_bound();
+            if acc >= self.threshold {
+                return Some(posting);
             }
         }
         None
@@ -323,16 +346,24 @@ impl Wand {
     // so that we can move the posting iterator to the next doc id that is possible to be candidate
     #[instrument(level = "debug", skip_all)]
     async fn move_terms<'b>(&mut self, least_id: u64) -> Result<()> {
-        let mut move_tasks = Vec::new();
-        for posting in &mut self.postings {
+        // let mut move_tasks = Vec::new();
+        // for posting in &mut self.postings {
+        //     match posting.doc() {
+        //         Some((d, _)) if d < least_id => {
+        //             move_tasks.push(posting.next(least_id));
+        //         }
+        //         _ => break,
+        //     }
+        // }
+        // futures::future::try_join_all(move_tasks).await?;
+        for posting in self.postings.iter_mut() {
             match posting.doc() {
                 Some((d, _)) if d < least_id => {
-                    move_tasks.push(posting.next(least_id));
+                    posting.next(least_id).await?;
                 }
                 _ => break,
             }
         }
-        futures::future::try_join_all(move_tasks).await?;
 
         self.postings.sort_unstable();
 
