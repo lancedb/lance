@@ -28,7 +28,7 @@ lazy_static! {
     static ref MIN_IO_SIZE: usize = std::env::var("MIN_IO_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(64 * 1024); // 64KB
+        .unwrap_or(1024 * 1024); // 1MB
 }
 
 // we might change the block size in the future
