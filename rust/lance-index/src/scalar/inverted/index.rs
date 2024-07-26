@@ -481,7 +481,7 @@ pub struct PostingListReader {
     reader: Arc<dyn IndexReader>,
     term_offset: usize,
     length: usize,
-    // last element of each block
+    // first element of each block
     row_ids: UInt64Array,
     frequencies: Float32Array,
 }
@@ -499,7 +499,7 @@ impl PostingListReader {
         self.row_ids.len()
     }
 
-    pub fn block_last_element(&self, block_id: usize) -> (u64, f32) {
+    pub fn block_head_element(&self, block_id: usize) -> (u64, f32) {
         (
             self.row_ids.values()[block_id],
             self.frequencies.values()[block_id],

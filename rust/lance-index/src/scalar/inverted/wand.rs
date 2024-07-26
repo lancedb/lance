@@ -72,7 +72,7 @@ impl PostingIterator {
         num_doc: usize,
         mask: Arc<RowIdMask>,
     ) -> Self {
-        let first_block = list.block_last_element(0);
+        let first_block = list.block_head_element(0);
         let approximate_upper_bound = idf(list.len(), num_doc) * (K1 + 1.0);
         Self {
             token_id,
@@ -104,31 +104,62 @@ impl PostingIterator {
         // skip blocks
         let block_row_ids = self.list.block_row_ids();
         let block_size = block_size(self.list.len());
-        let mut current_block = self.index / block_size;
+
+        // if the next block is with head_row_id <= least_id,
+        // then we can skip the current block
+        // let start = self.index / block_size;
+        // let mut current_block =
+        //     start + block_row_ids[start..].partition_point(|&row_id| row_id <= least_id) - 1;
+        // if current_block > start {
+        //     self.index = current_block * block_size;
+        //     self.doc = self.list.block_head_element(current_block);
+        //     // if the first row id of the current block is greater than or equal to least_id,
+        //     // and it's not filtered out,
+        //     // return it directly to avoid IO
+        //     if self.doc.0 >= least_id && self.mask.selected(self.doc.0) {
+        //         return Ok(Some((self.doc.0, self.index)));
+        //     }
+        // }
+
+        let start_block = self.index / block_size;
+        let mut current_block = start_block;
         while current_block + 1 < self.list.num_blocks()
             && block_row_ids[current_block + 1] <= least_id
         {
             current_block += 1;
+        }
+        if current_block > start_block {
             self.index = current_block * block_size;
-            if self.index < self.list.len() {
-                self.doc = self.list.block_last_element(current_block);
+            self.doc = self.list.block_head_element(current_block);
+            // if the first row id of the current block is greater than or equal to least_id,
+            // and it's not filtered out,
+            // return it directly to avoid IO
+            if self.doc.0 >= least_id && self.mask.selected(self.doc.0) {
+                return Ok(Some((self.doc.0, self.index)));
             }
         }
 
-        // if the first row id of the current block is greater than or equal to least_id
-        // return it directly to avoid IO
-        if self.index == current_block * block_size && block_row_ids[current_block] >= least_id {
-            return Ok(Some((block_row_ids[current_block], self.index)));
-        }
-
         // read the current block all into memory and do linear search
-        let mut batch = self.read_block(current_block).await?;
-        let mut row_ids = batch[ROW_ID]
+        let batch = self.read_block(current_block).await?;
+        let row_ids = batch[ROW_ID]
             .as_primitive::<datatypes::UInt64Type>()
             .values();
 
-        let mut block_offset = current_block * block_size;
-        while self.index < self.list.len() {
+        let block_offset = current_block * block_size;
+        loop {
+            self.index += 1;
+            if self.index >= self.list.len() {
+                return Ok(None);
+            }
+
+            // switch to the next block
+            if self.index == block_offset + block_size {
+                // the next block must be with first row id greater than least_id
+                // so return it directly
+                self.doc = self.list.block_head_element(current_block + 1);
+                return Ok(Some((self.doc.0, self.index)));
+            }
+
             let row_id = row_ids[self.index - block_offset];
             if row_id >= least_id && self.mask.selected(row_id) {
                 let freq = batch[FREQUENCY_COL]
@@ -137,17 +168,7 @@ impl PostingIterator {
                 self.doc = (row_id, freq);
                 return Ok(Some((row_id, self.index)));
             }
-            self.index += 1;
-            if self.index == block_offset + block_size {
-                current_block += 1;
-                block_offset += block_size;
-                batch = self.read_block(current_block).await?;
-                row_ids = batch[ROW_ID]
-                    .as_primitive::<datatypes::UInt64Type>()
-                    .values();
-            }
         }
-        Ok(None)
     }
 
     async fn read_block(&mut self, block_id: usize) -> Result<RecordBatch> {
