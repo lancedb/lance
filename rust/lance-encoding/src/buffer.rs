@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Utilities for byte arrays
+
 use std::{ops::Deref, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::Buffer;
 
-// A copy-on-write version of Buffer / MutableBuffer or Bytes / BytesMut
-//
-// It can be created from read-only buffers (e.g. bytes::Bytes or arrow-rs' Buffer), e.g. "borrowed"
-// or from writeable buffers (e.g. Vec<u8>, arrow-rs' MutableBuffer, or bytes::BytesMut), e.g. "owned"
+/// A copy-on-write byte buffer
+///
+/// It can be created from read-only buffers (e.g. bytes::Bytes or arrow_buffer::Buffer), e.g. "borrowed"
+/// or from writeable buffers (e.g. Vec<u8>), e.g. "owned"
 #[derive(Debug)]
 pub enum LanceBuffer {
     Borrowed(Buffer),
@@ -16,7 +18,7 @@ pub enum LanceBuffer {
 }
 
 impl LanceBuffer {
-    // Convert into a mutable buffer.  If this is a borrowed buffer, the data will be copied.
+    /// Convert into a mutable buffer.  If this is a borrowed buffer, the data will be copied.
     pub fn into_owned(self) -> Vec<u8> {
         match self {
             LanceBuffer::Borrowed(buffer) => buffer.to_vec(),
@@ -24,7 +26,7 @@ impl LanceBuffer {
         }
     }
 
-    // Convert into an Arrow buffer.  Never copies data.
+    /// Convert into an Arrow buffer.  Never copies data.
     pub fn into_buffer(self) -> Buffer {
         match self {
             LanceBuffer::Borrowed(buffer) => buffer,
@@ -32,6 +34,13 @@ impl LanceBuffer {
         }
     }
 
+    /// Create a LanceBuffer from a bytes::Bytes object
+    ///
+    /// The alignment must be specified (as `bytes_per_value`) since we want to make
+    /// sure we can safely reinterpret the buffer.
+    ///
+    /// If the buffer is properly aligned this will be zero-copy.  If not, a copy
+    /// will be made and an owned buffer returned.
     pub fn from_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> LanceBuffer {
         if bytes.as_ptr().align_offset(bytes_per_value as usize) != 0 {
             // The original buffer is not aligned, cannot zero-copy

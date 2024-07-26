@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Data layouts to represent encoded data in a sub-Arrow format
+
 use std::any::Any;
 
 use arrow::array::{ArrayData, ArrayDataBuilder};
@@ -11,13 +13,29 @@ use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
 
+/// A DataBlock is a collection of buffers that represents an "array" of data in very generic terms
+///
+/// The output of each decoder is a DataBlock.  Decoders can be chained together to transform
+/// one DataBlock into a different kind of DataBlock.
+///
+/// The DataBlock is somewhere in between Arrow's ArrayData and Array and represents a physical
+/// layout of the data.
+///
+/// A DataBlock can be converted into an Arrow ArrayData (and then Array) for a given array type.
+/// For example, a FixedWidthDataBlock can be converted into any primitive type or a fixed size
+/// list of a primitive type.
 pub trait DataBlock: Any {
+    /// Get a reference to the Any trait object
     fn as_any(&self) -> &dyn Any;
+    /// Convert self into a Box<dyn Any>
     fn as_any_box(self: Box<Self>) -> Box<dyn Any>;
+    /// Convert self into an Arrow ArrayData
     fn into_arrow(self: Box<Self>, data_type: DataType, validate: bool) -> Result<ArrayData>;
 }
 
+/// Extension trait for DataBlock
 pub trait DataBlockExt {
+    /// Try to convert a DataBlock into a specific layout
     fn try_into_layout<T: DataBlock>(self) -> Result<Box<T>>;
 }
 
@@ -32,7 +50,9 @@ impl DataBlockExt for Box<dyn DataBlock> {
     }
 }
 
+/// A data block with no buffers where everything is null
 pub struct AllNullDataBlock {
+    /// The number of values represented by this block
     pub num_values: u64,
 }
 
@@ -50,8 +70,11 @@ impl DataBlock for AllNullDataBlock {
     }
 }
 
+/// Wraps a data block and adds nullability information to it
 pub struct NullableDataBlock {
+    /// The underlying data
     pub data: Box<dyn DataBlock>,
+    /// A bitmap of validity for each value
     pub nulls: LanceBuffer,
 }
 
@@ -76,9 +99,13 @@ impl DataBlock for NullableDataBlock {
     }
 }
 
+/// A data block for a single buffer of data where each element has a fixed number of bits
 pub struct FixedWidthDataBlock {
+    /// The data buffer
     pub data: LanceBuffer,
+    /// The number of bits per value
     pub bits_per_value: u64,
+    /// The number of values represented by this block
     pub num_values: u64,
 }
 
@@ -130,10 +157,15 @@ impl DataBlock for FixedWidthDataBlock {
     }
 }
 
+/// A data block for variable-width data (e.g. strings, packed rows, etc.)
 pub struct VariableWidthBlock {
+    /// The data buffer
     pub data: LanceBuffer,
+    /// The offsets buffer (contains num_values + 1 offsets)
     pub offsets: LanceBuffer,
+    /// The number of bits per offset
     pub bits_per_offset: u32,
+    /// The number of values represented by this block
     pub num_values: u64,
 }
 
@@ -162,7 +194,9 @@ impl DataBlock for VariableWidthBlock {
     }
 }
 
+/// A data block representing a struct
 pub struct StructDataBlock {
+    /// The child arrays
     pub children: Vec<Box<dyn DataBlock>>,
 }
 
