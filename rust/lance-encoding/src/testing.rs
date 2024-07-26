@@ -59,6 +59,7 @@ impl EncodingsIo for SimulatedScheduler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn test_decode(
     num_rows: u64,
     batch_size: u32,
