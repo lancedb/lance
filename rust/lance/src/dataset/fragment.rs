@@ -548,7 +548,7 @@ impl FileFragment {
                     file_scheduler,
                     None,
                     DecoderMiddlewareChain::default(),
-                    file_metadata
+                    file_metadata,
                 )
                 .await?,
             );
@@ -950,14 +950,21 @@ impl FileFragment {
     }
 
     /// Get the file metadata for this fragment, using the cache if available.
-    async fn get_file_metadata(&self, file_scheduler: &FileScheduler) -> Result<Arc<CachedFileMetadata>> {
+    async fn get_file_metadata(
+        &self,
+        file_scheduler: &FileScheduler,
+    ) -> Result<Arc<CachedFileMetadata>> {
         let cache = &self.dataset.session.file_metadata_cache;
         let path = file_scheduler.reader().path();
 
-        cache.get_or_insert(path, |_path| async {
-            let file_metadata = Arc::new(v2::reader::FileReader::read_all_metadata(&file_scheduler).await?);
-            file_metadata
-        }).await
+        let file_metadata = cache
+            .get_or_insert(path, |_path| async {
+                let file_metadata: CachedFileMetadata =
+                    v2::reader::FileReader::read_all_metadata(&file_scheduler).await?;
+                Ok(file_metadata)
+            })
+            .await?;
+        Ok(file_metadata)
     }
 
     /// Take rows based on internal local row offsets

@@ -43,7 +43,7 @@ use super::io::LanceEncodingsIo;
 // use these later we should make them lazily loaded and then cached once loaded.
 //
 // We store their position / length for debugging purposes
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub struct BufferDescriptor {
     pub position: u64,
     pub size: u64,
@@ -77,7 +77,11 @@ impl DeepSizeOf for CachedFileMetadata {
     // TODO: include size for `column_metadatas` and `column_infos`.
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.file_schema.deep_size_of_children(context)
-            + self.file_buffers.iter().map(|file_buffer| file_buffer.deep_size_of_children(context)).sum::<usize>()
+            + self
+                .file_buffers
+                .iter()
+                .map(|file_buffer| file_buffer.deep_size_of_children(context))
+                .sum::<usize>()
     }
 }
 
@@ -507,7 +511,13 @@ impl FileReader {
         decoder_strategy: DecoderMiddlewareChain,
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
-        Self::try_open_with_file_metadata(scheduler, base_projection, decoder_strategy, file_metadata).await
+        Self::try_open_with_file_metadata(
+            scheduler,
+            base_projection,
+            decoder_strategy,
+            file_metadata,
+        )
+        .await
     }
 
     /// Same as `try_open` but with the file metadata already loaded.
@@ -530,8 +540,6 @@ impl FileReader {
             decoder_strategy,
         })
     }
-
-
 
     // The actual decoder needs all the column infos that make up a type.  In other words, if
     // the first type in the schema is Struct<i32, i32> then the decoder will need 3 column infos.
