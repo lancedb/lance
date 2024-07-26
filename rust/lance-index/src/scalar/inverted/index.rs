@@ -398,9 +398,9 @@ impl InvertedListReader {
 
         let token_id = token_id as usize;
         let offset = self.offsets[token_id];
-        let block_tails = self.reader.read_range(offset..offset + num_blocks).await?;
-        let row_ids = block_tails[ROW_ID].as_primitive::<UInt64Type>().clone();
-        let frequencies = block_tails[FREQUENCY_COL]
+        let block_heads = self.reader.read_range(offset..offset + num_blocks).await?;
+        let row_ids = block_heads[ROW_ID].as_primitive::<UInt64Type>().clone();
+        let frequencies = block_heads[FREQUENCY_COL]
             .as_primitive::<Float32Type>()
             .clone();
         Ok(PostingListReader {
