@@ -80,7 +80,7 @@ impl PrimitivePageDecoder for FixedListDecoder {
         let child_data = self.items_decoder.decode(rows_to_skip, num_child_rows)?;
         let mut child_data = child_data.try_into_layout::<FixedWidthDataBlock>()?;
         child_data.num_values = num_rows;
-        child_data.bits_per_value = child_data.bits_per_value * self.dimension;
+        child_data.bits_per_value *= self.dimension;
         Ok(child_data)
     }
 }

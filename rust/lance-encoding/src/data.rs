@@ -44,7 +44,7 @@ impl DataBlockExt for Box<dyn DataBlock> {
         self.as_any_box()
             .downcast::<T>()
             .map_err(|_| Error::Internal {
-                message: format!("Couldn't convert to expected layout"),
+                message: "Couldn't convert to expected layout".to_string(),
                 location: location!(),
             })
     }
@@ -225,10 +225,10 @@ impl DataBlock for StructDataBlock {
                 Ok(unsafe { builder.build_unchecked() })
             }
         } else {
-            return Err(Error::Internal {
+            Err(Error::Internal {
                 message: format!("Expected Struct, got {:?}", data_type),
                 location: location!(),
-            });
+            })
         }
     }
 }
