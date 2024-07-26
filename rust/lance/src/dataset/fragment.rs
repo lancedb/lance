@@ -960,7 +960,7 @@ impl FileFragment {
         let file_metadata = cache
             .get_or_insert(path, |_path| async {
                 let file_metadata: CachedFileMetadata =
-                    v2::reader::FileReader::read_all_metadata(&file_scheduler).await?;
+                    v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)
             })
             .await?;
