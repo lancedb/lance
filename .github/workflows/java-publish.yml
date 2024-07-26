@@ -91,9 +91,7 @@ jobs:
           server-username: SONATYPE_USER
           server-password: SONATYPE_TOKEN
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
-        env:
-          SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
-          SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
+          gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
       - name: Set up Node.js 16
         uses: actions/setup-node@v4
         with:
@@ -115,12 +113,10 @@ jobs:
           git config --global user.name "dev+gha@lancedb.com"
       - name: Publish with Java 8
         run: |
-          mkdir -p ~/.gnupg
-          touch ~/.gnupg/gpg.conf
           echo "use-agent" >> ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           export GPG_TTY=$(tty)
-          mvn --batch-mode -DskipTests -DpushChanges=false deploy -P deploy-to-ossrh
+          mvn --batch-mode -DskipTests -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
         env:
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
