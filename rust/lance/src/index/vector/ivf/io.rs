@@ -233,12 +233,15 @@ pub(super) async fn write_pq_partitions(
             let flattened_row_ids_refs = arrow::compute::concat(&row_ids_refs).unwrap();
 
             // Sort the row_ids_refs and get the sorted indices
-            let sorted_indices = arrow::compute::sort_to_indices(&flattened_row_ids_refs, None, None).unwrap();
+            let sorted_indices =
+                arrow::compute::sort_to_indices(&flattened_row_ids_refs, None, None).unwrap();
 
             // Reorder the flattened_pq_refs based on the sorted indices
-            let sorted_pq_refs = arrow::compute::take(&flattened_pq_refs, &sorted_indices, None).unwrap();
+            let sorted_pq_refs =
+                arrow::compute::take(&flattened_pq_refs, &sorted_indices, None).unwrap();
             // Reorder the flattened_row_ids_refs based on the sorted indices
-            let sorted_row_ids_refs = arrow::compute::take(&flattened_row_ids_refs, &sorted_indices, None).unwrap();
+            let sorted_row_ids_refs =
+                arrow::compute::take(&flattened_row_ids_refs, &sorted_indices, None).unwrap();
 
             PlainEncoder::write(writer, &[&sorted_pq_refs]).await?;
             PlainEncoder::write(writer, &[&sorted_row_ids_refs]).await?;
