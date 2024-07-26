@@ -25,9 +25,8 @@ use tracing::instrument;
 
 use crate::{Index, IndexType};
 
-use super::inverted::InvertedIndexBuilder;
-use super::{btree::BtreeTrainingSource, AnyQuery, IndexStore, ScalarIndex};
 use super::{btree::OrderableScalarValue, SargableQuery};
+use super::{btree::TrainingSource, AnyQuery, IndexStore, ScalarIndex};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
@@ -337,7 +336,7 @@ async fn do_train_bitmap_index(
 }
 
 pub async fn train_bitmap_index(
-    data_source: Box<dyn BtreeTrainingSource + Send>,
+    data_source: Box<dyn TrainingSource + Send>,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
     let batches_source = data_source.scan_ordered_chunks(4096).await?;
@@ -346,15 +345,4 @@ pub async fn train_bitmap_index(
     let dictionary: HashMap<ScalarValue, RowIdTreeMap> = HashMap::new();
 
     do_train_bitmap_index(batches_source, dictionary, index_store).await
-}
-
-pub async fn train_inverted_index(
-    data_source: Box<dyn BtreeTrainingSource + Send>,
-    index_store: &dyn IndexStore,
-) -> Result<()> {
-    let batches_source = data_source.scan_ordered_chunks(4096).await?;
-
-    // mapping from item to list of the row ids where it is present
-    let mut inverted_index = InvertedIndexBuilder::default();
-    inverted_index.update(batches_source, index_store).await
 }

@@ -8,7 +8,8 @@ use arrow::array::AsArray;
 use arrow::compute::concat;
 use arrow::datatypes::{self, Float32Type, UInt64Type};
 use arrow_array::{
-    ArrayRef, Float32Array, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, Float32Array, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
@@ -20,6 +21,7 @@ use itertools::Itertools;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result, ROW_ID};
 use lazy_static::lazy_static;
+use moka::future::Cache;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tantivy::tokenizer::Language;
@@ -220,9 +222,9 @@ impl ScalarIndex for InvertedIndex {
     where
         Self: Sized,
     {
-        let token_reader = store.open_index_file(TOKENS_FILE).await?;
-        let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-        let docs_reader = store.open_index_file(DOCS_FILE).await?;
+        let token_reader = store.open_index_file_v2(TOKENS_FILE).await?;
+        let invert_list_reader = store.open_index_file_v2(INVERT_LIST_FILE).await?;
+        let docs_reader = store.open_index_file_v2(DOCS_FILE).await?;
 
         let tokens = TokenSet::load(token_reader).await?;
         let inverted_list = InvertedListReader::new(invert_list_reader)?;
@@ -343,11 +345,13 @@ impl TokenSet {
     }
 }
 
-#[derive(Clone)]
 struct InvertedListReader {
     reader: Arc<dyn IndexReader>,
     offsets: Vec<usize>,
     lengths: Vec<usize>,
+
+    // cache
+    posting_cache: Cache<u32, PostingListReader>,
 }
 
 impl std::fmt::Debug for InvertedListReader {
@@ -380,10 +384,16 @@ impl InvertedListReader {
             .ok_or_else(|| Error::io("lengths not found".to_string(), location!()))?;
         let lengths: Vec<usize> = serde_json::from_str(lengths)?;
 
+        const CACHE_SIZE: usize = 512 * 1024 * 1024; // 128 MiB
+        let cache = Cache::builder()
+            .max_capacity(CACHE_SIZE as u64)
+            .weigher(|_, posting: &PostingListReader| posting.deep_size_of() as u32)
+            .build();
         Ok(Self {
             reader,
             offsets,
             lengths,
+            posting_cache: cache,
         })
     }
 
@@ -391,25 +401,31 @@ impl InvertedListReader {
         self.lengths[token_id as usize]
     }
 
+    #[instrument(level = "debug", skip(self))]
     pub(crate) async fn posting_reader(&self, token_id: u32) -> Result<PostingListReader> {
-        let length = self.posting_len(token_id);
-        let block_size = block_size(length);
-        let num_blocks = length.div_ceil(block_size);
+        self.posting_cache
+            .try_get_with(token_id, async move {
+                let length = self.posting_len(token_id);
+                let block_size = block_size(length);
+                let num_blocks = length.div_ceil(block_size);
 
-        let token_id = token_id as usize;
-        let offset = self.offsets[token_id];
-        let block_heads = self.reader.read_range(offset..offset + num_blocks).await?;
-        let row_ids = block_heads[ROW_ID].as_primitive::<UInt64Type>().clone();
-        let frequencies = block_heads[FREQUENCY_COL]
-            .as_primitive::<Float32Type>()
-            .clone();
-        Ok(PostingListReader {
-            reader: self.reader.clone(),
-            term_offset: offset,
-            length,
-            row_ids,
-            frequencies,
-        })
+                let token_id = token_id as usize;
+                let offset = self.offsets[token_id];
+                let block_heads = self.reader.read_range(offset..offset + num_blocks).await?;
+                let row_ids = block_heads[ROW_ID].as_primitive::<UInt64Type>().clone();
+                let frequencies = block_heads[FREQUENCY_COL]
+                    .as_primitive::<Float32Type>()
+                    .clone();
+                Result::Ok(PostingListReader {
+                    reader: self.reader.clone(),
+                    term_offset: offset,
+                    length,
+                    row_ids,
+                    frequencies,
+                })
+            })
+            .await
+            .map_err(|e| Error::io(e.to_string(), location!()))
     }
 }
 
@@ -484,6 +500,13 @@ pub struct PostingListReader {
     // first element of each block
     row_ids: UInt64Array,
     frequencies: Float32Array,
+}
+
+impl DeepSizeOf for PostingListReader {
+    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+        self.row_ids.data_type().size() * self.row_ids.len()
+            + self.frequencies.data_type().size() * self.frequencies.len()
+    }
 }
 
 impl PostingListReader {

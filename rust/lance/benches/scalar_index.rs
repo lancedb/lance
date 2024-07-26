@@ -16,7 +16,7 @@ use lance_core::Result;
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
 use lance_index::scalar::{
-    btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+    btree::{train_btree_index, BTreeIndex, TrainingSource},
     flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
     IndexStore, SargableQuery, ScalarIndex,
@@ -43,7 +43,7 @@ impl BenchmarkDataSource {
 }
 
 #[async_trait]
-impl BtreeTrainingSource for BenchmarkDataSource {
+impl TrainingSource for BenchmarkDataSource {
     async fn scan_ordered_chunks(
         self: Box<Self>,
         _chunk_size: u32,

@@ -119,7 +119,7 @@ lazy_static = "1"
 log = "0.4"
 mockall = { version = "0.12.1" }
 mock_instant = { version = "0.3.1", features = ["sync"] }
-moka = "0.11"
+moka = { version = "0.11", features = ["future"] }
 num-traits = "0.2"
 num_cpus = "1.0"
 object_store = { version = "0.10.1" }

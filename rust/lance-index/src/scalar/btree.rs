@@ -1052,7 +1052,14 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>) -> Result<RecordBatch> {
 }
 
 #[async_trait]
-pub trait BtreeTrainingSource: Send {
+pub trait TrainingSource: Send {
+    /// Returns a stream of batches, each with chunk_size rows
+    ///
+    /// The schema for the batch is slightly flexible.
+    /// The first column may have any name or type, these are the values to index
+    /// The second column must be the row ids which must be UInt64Type
+    // async fn scan_chunks(self: Box<Self>, chunk_size: u32) -> Result<SendableRecordBatchStream>;
+
     /// Returns a stream of batches, ordered by the value column (in ascending order)
     ///
     /// Each batch should have chunk_size rows
@@ -1072,7 +1079,7 @@ pub trait BtreeTrainingSource: Send {
 /// and re-chunking into page-size batches.  This is left for simplicity as this feature is still
 /// a work in progress
 pub async fn train_btree_index(
-    data_source: Box<dyn BtreeTrainingSource + Send>,
+    data_source: Box<dyn TrainingSource + Send>,
     sub_index_trainer: &dyn BTreeSubIndex,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
@@ -1122,7 +1129,7 @@ impl BTreeUpdater {
 }
 
 #[async_trait]
-impl BtreeTrainingSource for BTreeUpdater {
+impl TrainingSource for BTreeUpdater {
     async fn scan_ordered_chunks(
         self: Box<Self>,
         chunk_size: u32,

@@ -123,6 +123,10 @@ struct Footer {
 const FOOTER_LEN: usize = 40;
 
 impl FileReader {
+    pub fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+
     pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
         &self.metadata
     }

@@ -7,3 +7,17 @@ mod wand;
 
 pub use builder::InvertedIndexBuilder;
 pub use index::*;
+use lance_core::Result;
+
+use super::btree::TrainingSource;
+use super::IndexStore;
+
+pub async fn train_inverted_index(
+    data_source: Box<dyn TrainingSource>,
+    index_store: &dyn IndexStore,
+) -> Result<()> {
+    let batch_stream = data_source.scan_ordered_chunks(4096).await?;
+    // mapping from item to list of the row ids where it is present
+    let mut inverted_index = InvertedIndexBuilder::default();
+    inverted_index.update(batch_stream, index_store).await
+}

@@ -3,16 +3,21 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
+use std::cmp::min;
 use std::{any::Any, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use futures::TryStreamExt;
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
+use lance_file::v2;
 use lance_file::{
     reader::FileReader,
     writer::{FileWriter, FileWriterOptions, ManifestProvider},
 };
+use lance_io::scheduler::ScanScheduler;
 use snafu::{location, Location};
 
 use lance_core::{cache::FileMetadataCache, Error, Result};
@@ -29,9 +34,10 @@ use super::{IndexReader, IndexStore, IndexWriter};
 /// each collection in a file in the lance format.
 #[derive(Debug)]
 pub struct LanceIndexStore {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     index_dir: Path,
     metadata_cache: Option<FileMetadataCache>,
+    scheduler: Arc<ScanScheduler>,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -49,10 +55,13 @@ impl LanceIndexStore {
         index_dir: Path,
         metadata_cache: Option<FileMetadataCache>,
     ) -> Self {
+        let object_store = Arc::new(object_store);
+        let scheduler = ScanScheduler::new(object_store.clone());
         Self {
             object_store,
             index_dir,
             metadata_cache,
+            scheduler,
         }
     }
 }
@@ -62,6 +71,19 @@ impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write(&[batch]).await?;
+        Ok(offset as u64)
+    }
+
+    async fn finish(&mut self) -> Result<()> {
+        Self::finish(self).await.map(|_| ())
+    }
+}
+
+#[async_trait]
+impl IndexWriter for v2::writer::FileWriter {
+    async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
+        let offset = self.tell().await?;
+        self.write_batch(&batch).await?;
         Ok(offset as u64)
     }
 
@@ -81,17 +103,60 @@ impl IndexReader for FileReader {
         self.read_range(range, self.schema()).await
     }
 
-    async fn take_rows(&self, indices: &[usize]) -> Result<RecordBatch> {
-        let indices = indices.iter().map(|&i| i as u32).collect::<Vec<_>>();
-        self.take(&indices, self.schema()).await
-    }
-
     async fn num_batches(&self) -> u32 {
         self.num_batches() as u32
     }
 
     fn num_rows(&self) -> usize {
         self.len()
+    }
+
+    fn schema(&self) -> &lance_core::datatypes::Schema {
+        Self::schema(self)
+    }
+}
+
+#[async_trait]
+impl IndexReader for v2::reader::FileReader {
+    async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
+        let batch_size = u32::MAX as usize;
+        let offset = offset as usize;
+        let start = offset * batch_size;
+        let end = min(start + batch_size, self.num_rows() as usize);
+        let params = ReadBatchParams::Range(start..end);
+        let batches = self
+            .read_stream(
+                params,
+                batch_size as u32,
+                u32::MAX,
+                FilterExpression::no_filter(),
+            )?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(batches.len(), 1);
+        Ok(batches[0].clone())
+    }
+
+    async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
+        let batches = self
+            .read_stream(
+                ReadBatchParams::Range(range),
+                u32::MAX,
+                u32::MAX,
+                FilterExpression::no_filter(),
+            )?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(batches.len(), 1);
+        Ok(batches[0].clone())
+    }
+
+    async fn num_batches(&self) -> u32 {
+        self.num_rows().div_ceil(u32::MAX as u64) as u32
+    }
+
+    fn num_rows(&self) -> usize {
+        Self::num_rows(self) as usize
     }
 
     fn schema(&self) -> &lance_core::datatypes::Schema {
@@ -122,12 +187,40 @@ impl IndexStore for LanceIndexStore {
         Ok(Box::new(writer))
     }
 
+    async fn new_index_file_v2(
+        &self,
+        name: &str,
+        schema: Arc<Schema>,
+    ) -> Result<Box<dyn IndexWriter>> {
+        let path = self.index_dir.child(name);
+        let schema = schema.as_ref().try_into()?;
+        let writer = self.object_store.create(&path).await?;
+        let writer = v2::writer::FileWriter::try_new(
+            writer,
+            schema,
+            v2::writer::FileWriterOptions::default(),
+        )?;
+        Ok(Box::new(writer))
+    }
+
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
         let file_reader = FileReader::try_new_self_described(
             &self.object_store,
             &path,
             self.metadata_cache.as_ref(),
+        )
+        .await?;
+        Ok(Arc::new(file_reader))
+    }
+
+    async fn open_index_file_v2(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+        let path = self.index_dir.child(name);
+        let file_scheduler = self.scheduler.open_file(&path).await?;
+        let file_reader = v2::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            DecoderMiddlewareChain::default(),
         )
         .await?;
         Ok(Arc::new(file_reader))
@@ -167,6 +260,41 @@ impl IndexStore for LanceIndexStore {
             Ok(())
         }
     }
+
+    async fn copy_index_file_v2(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
+        let path = self.index_dir.child(name);
+
+        let other_store = dest_store.as_any().downcast_ref::<Self>();
+        if let Some(dest_lance_store) = other_store {
+            // If both this store and the destination are lance stores we can use object_store's copy
+            // This does blindly assume that both stores are using the same underlying object_store
+            // but there is no easy way to verify this and it happens to always be true at the moment
+            let dest_path = dest_lance_store.index_dir.child(name);
+            self.object_store.copy(&path, &dest_path).await
+        } else {
+            let reader = self.open_index_file_v2(name).await?;
+            let num_batches = reader.num_batches().await;
+            if num_batches == 0 {
+                return Err(Error::Internal {
+                    message:
+                        "Cannot copy an empty index file because the schema cannot be determined"
+                            .into(),
+                    location: location!(),
+                });
+            }
+            let first_batch = reader.read_record_batch(0).await?;
+            let schema = first_batch.schema();
+            let mut writer = dest_store.new_index_file_v2(name, schema).await?;
+            writer.write_record_batch(first_batch).await?;
+            for batch_index in 1..num_batches {
+                writer
+                    .write_record_batch(reader.read_record_batch(batch_index).await?)
+                    .await?;
+            }
+            writer.finish().await?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,7 +304,7 @@ mod tests {
 
     use crate::scalar::{
         bitmap::{train_bitmap_index, BitmapIndex},
-        btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+        btree::{train_btree_index, BTreeIndex, TrainingSource},
         flat::FlatIndexMetadata,
         label_list::{train_label_list_index, LabelListIndex},
         LabelListQuery, SargableQuery, ScalarIndex,
@@ -222,7 +350,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl BtreeTrainingSource for MockTrainingSource {
+    impl TrainingSource for MockTrainingSource {
         async fn scan_ordered_chunks(
             self: Box<Self>,
             _chunk_size: u32,

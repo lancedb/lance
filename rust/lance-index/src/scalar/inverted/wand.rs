@@ -11,6 +11,8 @@ use arrow_array::RecordBatch;
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::{Result, ROW_ID};
+use lazy_static::lazy_static;
+use tracing::instrument;
 
 use crate::vector::graph::OrderedFloat;
 
@@ -19,15 +21,19 @@ use super::index::{idf, PostingListReader, FREQUENCY_COL, K1};
 
 // WAND parameters
 // One block consists of rows of a posting list (row id (u64) and frequency (f32)),
-// now set it to 256 cause it's the max number of power of 2 that the total bytes is not greater than 4KB.
-// Increasing the block size can reduce the number of IOs but increase the memory usage, and maybe decrease the probability of skipping blocks.
-pub const BLOCK_SIZE: usize = 256;
+// Increasing the block size can decrease the memory usage, but also decrease the probability of skipping blocks.
+lazy_static! {
+    pub static ref BLOCK_SIZE: usize = std::env::var("BLOCK_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+}
 
 // we might change the block size in the future
 // and it could be a function of the total number of documents
 #[inline]
-pub const fn block_size(_length: usize) -> usize {
-    BLOCK_SIZE
+pub fn block_size(_length: usize) -> usize {
+    *BLOCK_SIZE
 }
 
 #[derive(Clone)]
@@ -101,6 +107,7 @@ impl PostingIterator {
     }
 
     // move to the next row id that is greater than or equal to least_id
+    #[instrument(level = "debug", skip(self))]
     async fn next(&mut self, least_id: u64) -> Result<Option<(u64, usize)>> {
         // skip blocks
         let block_row_ids = self.list.block_row_ids();
@@ -176,6 +183,7 @@ impl PostingIterator {
         }
     }
 
+    #[instrument(level = "debug", skip(self))]
     async fn read_block(&mut self, block_id: usize) -> Result<RecordBatch> {
         match self.block_id {
             Some(id) if id == block_id => Ok(self.block.as_ref().unwrap().clone()),
@@ -199,8 +207,12 @@ pub struct Wand {
 
 impl Wand {
     pub(crate) fn new(postings: impl Iterator<Item = PostingIterator>) -> Self {
+        let factor = std::env::var("WAND_FACTOR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         Self {
-            factor: 1.0,
+            factor,
             threshold: 0.0,
             cur_doc: None,
             postings: postings.collect(),

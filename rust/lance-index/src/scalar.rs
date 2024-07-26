@@ -48,8 +48,6 @@ pub trait IndexReader: Send + Sync {
     async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
     /// Read the range of rows from the file
     async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch>;
-    /// Read the rows at the given indices from the file
-    async fn take_rows(&self, indices: &[usize]) -> Result<RecordBatch>;
     /// Return the number of batches in the file
     async fn num_batches(&self) -> u32;
     /// Return the number of rows in the file
@@ -70,14 +68,21 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
         -> Result<Box<dyn IndexWriter>>;
+    async fn new_index_file_v2(
+        &self,
+        name: &str,
+        schema: Arc<Schema>,
+    ) -> Result<Box<dyn IndexWriter>>;
 
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
+    async fn open_index_file_v2(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
 
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
+    async fn copy_index_file_v2(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
 }
 
 /// Different scalar indices may support different kinds of queries
