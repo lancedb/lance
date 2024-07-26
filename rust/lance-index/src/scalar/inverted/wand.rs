@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::BinaryHeap;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -13,8 +14,6 @@ use lance_core::utils::mask::RowIdMask;
 use lance_core::{Result, ROW_ID};
 use lazy_static::lazy_static;
 use tracing::instrument;
-
-use crate::vector::graph::OrderedFloat;
 
 use super::builder::OrderedDoc;
 use super::index::{idf, PostingListReader, FREQUENCY_COL, K1};
@@ -36,6 +35,12 @@ pub fn block_size(_length: usize) -> usize {
     *BLOCK_SIZE
 }
 
+#[inline]
+pub fn num_blocks_to_read(block_size: usize) -> usize {
+    const MIN_IO_SIZE: usize = 64 * 1024;
+    MIN_IO_SIZE / (block_size * (size_of::<u64>() + size_of::<f32>()))
+}
+
 #[derive(Clone)]
 pub struct PostingIterator {
     token_id: u32,
@@ -45,13 +50,17 @@ pub struct PostingIterator {
     mask: Arc<RowIdMask>,
     approximate_upper_bound: f32,
     // cache the current block
-    block_id: Option<usize>,
-    block: Option<RecordBatch>,
+    block_id: usize,
+    blocks: Vec<RecordBatch>,
+
+    // stats
+    skiped_blocks: usize,
+    read_block_miss: usize,
 }
 
 impl PartialEq for PostingIterator {
     fn eq(&self, other: &Self) -> bool {
-        self.token_id == other.token_id && self.index == other.index
+        self.token_id == other.token_id
     }
 }
 
@@ -65,9 +74,11 @@ impl PartialOrd for PostingIterator {
 
 impl Ord for PostingIterator {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.doc.0.cmp(&other.doc.0) {
-            std::cmp::Ordering::Equal => self.token_id.cmp(&other.token_id),
-            ord => ord,
+        match (self.doc(), other.doc()) {
+            (Some((doc1, _)), Some((doc2, _))) => doc1.cmp(&doc2),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
         }
     }
 }
@@ -88,14 +99,19 @@ impl PostingIterator {
             doc: first_block,
             mask,
             approximate_upper_bound,
-            block_id: None,
-            block: None,
+            block_id: 0,
+            blocks: Vec::new(),
+            skiped_blocks: 0,
+            read_block_miss: 0,
         }
     }
 
     #[inline]
     fn approximate_upper_bound(&self) -> f32 {
-        self.approximate_upper_bound
+        match self.doc() {
+            Some(_) => self.approximate_upper_bound,
+            None => 0.0,
+        }
     }
 
     fn doc(&self) -> Option<(u64, f32)> {
@@ -107,7 +123,7 @@ impl PostingIterator {
     }
 
     // move to the next row id that is greater than or equal to least_id
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", name = "posting_iter_next", skip(self))]
     async fn next(&mut self, least_id: u64) -> Result<Option<(u64, usize)>> {
         // skip blocks
         let block_row_ids = self.list.block_row_ids();
@@ -118,7 +134,7 @@ impl PostingIterator {
         // might be useful after benchmarking with large datasets
         //
         // let start = self.index / block_size;
-        // let mut current_block =
+        // let current_block =
         //     start + block_row_ids[start..].partition_point(|&row_id| row_id <= least_id) - 1;
         // if current_block > start {
         //     self.index = current_block * block_size;
@@ -139,6 +155,7 @@ impl PostingIterator {
             && block_row_ids[current_block + 1] <= least_id
         {
             current_block += 1;
+            self.skiped_blocks += 1;
         }
         if current_block > start_block {
             self.index = current_block * block_size;
@@ -152,12 +169,12 @@ impl PostingIterator {
         }
 
         // read the current block all into memory and do linear search
-        let batch = self.read_block(current_block).await?;
-        let row_ids = batch[ROW_ID]
+        let mut batch = self.read_block(current_block).await?;
+        let mut row_ids = batch[ROW_ID]
             .as_primitive::<datatypes::UInt64Type>()
             .values();
 
-        let block_offset = current_block * block_size;
+        let mut block_offset = current_block * block_size;
         loop {
             self.index += 1;
             if self.index >= self.list.len() {
@@ -166,10 +183,19 @@ impl PostingIterator {
 
             // switch to the next block
             if self.index == block_offset + block_size {
-                // the next block must be with first row id greater than least_id
-                // so return it directly
                 self.doc = self.list.block_head_element(current_block + 1);
-                return Ok(Some((self.doc.0, self.index)));
+                if self.mask.selected(self.doc.0) {
+                    // the next block must be with first row id greater than least_id
+                    // so return it directly
+                    return Ok(Some((self.doc.0, self.index)));
+                }
+
+                current_block += 1;
+                block_offset += block_size;
+                batch = self.read_block(current_block).await?;
+                row_ids = batch[ROW_ID]
+                    .as_primitive::<datatypes::UInt64Type>()
+                    .values();
             }
 
             let row_id = row_ids[self.index - block_offset];
@@ -185,15 +211,17 @@ impl PostingIterator {
 
     #[instrument(level = "debug", skip(self))]
     async fn read_block(&mut self, block_id: usize) -> Result<RecordBatch> {
-        match self.block_id {
-            Some(id) if id == block_id => Ok(self.block.as_ref().unwrap().clone()),
-            _ => {
-                let block = self.list.read_block(block_id).await?;
-                self.block_id = Some(block_id);
-                self.block = Some(block.clone());
-                Ok(block)
-            }
+        if self.blocks.len() > 0
+            && self.block_id <= block_id
+            && block_id < self.block_id + self.blocks.len()
+        {
+            return Ok(self.blocks[block_id - self.block_id].clone());
         }
+
+        self.read_block_miss += 1;
+        self.block_id = block_id;
+        self.blocks = self.list.read_blocks(block_id).await?;
+        Ok(self.blocks[0].clone())
     }
 }
 
@@ -201,18 +229,14 @@ pub struct Wand {
     factor: f32,
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
     cur_doc: Option<u64>,
-    postings: BTreeSet<PostingIterator>,
+    postings: Vec<PostingIterator>,
     candidates: BinaryHeap<Reverse<OrderedDoc>>,
 }
 
 impl Wand {
     pub(crate) fn new(postings: impl Iterator<Item = PostingIterator>) -> Self {
-        let factor = std::env::var("WAND_FACTOR")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0);
         Self {
-            factor,
+            factor: 1.0,
             threshold: 0.0,
             cur_doc: None,
             postings: postings.collect(),
@@ -231,7 +255,7 @@ impl Wand {
         }
 
         while let Some(doc) = self.next().await? {
-            let score = self.score(doc, &scorer).await?;
+            let score = self.score(doc, &scorer);
             if self.candidates.len() < k {
                 self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
             } else if score > self.threshold {
@@ -251,25 +275,31 @@ impl Wand {
     }
 
     // calculate the score of the document
-    async fn score(&self, doc: u64, scorer: &impl Fn(u64, f32) -> f32) -> Result<f32> {
+    fn score(&self, doc: u64, scorer: &impl Fn(u64, f32) -> f32) -> f32 {
         let mut score = 0.0;
         for posting in &self.postings {
-            let (cur_doc, freq) = posting.doc().expect("empty posting list was removed");
-            if cur_doc > doc {
-                // the posting list is sorted by its current doc id,
-                // so we can break early once we find the current doc id is greater than the doc id we are looking for
+            if let Some((cur_doc, freq)) = posting.doc() {
+                if cur_doc > doc {
+                    // the posting list is sorted by its current doc id,
+                    // so we can break early once we find the current doc id is less than the doc id we are looking for
+                    break;
+                }
+                debug_assert!(cur_doc == doc);
+
+                score += posting.approximate_upper_bound() * scorer(doc, freq);
+            } else {
+                // the posting list is exhausted
                 break;
             }
-            debug_assert!(cur_doc == doc);
-
-            score += posting.approximate_upper_bound() * scorer(doc, freq);
         }
-        Ok(score)
+        score
     }
 
     // find the next doc candidate
+    #[instrument(level = "debug", name = "wand_next", skip_all)]
     async fn next(&mut self) -> Result<Option<u64>> {
-        while let Some((index, pivot_posting)) = self.find_pivot_term() {
+        self.postings.sort_unstable();
+        while let Some(pivot_posting) = self.find_pivot_term() {
             let (doc, _) = pivot_posting
                 .doc()
                 .expect("pivot posting should have at least one document");
@@ -278,14 +308,7 @@ impl Wand {
             if self.cur_doc.is_some() && doc <= cur_doc {
                 // the pivot doc id is less than the current doc id,
                 // that means this doc id has been processed before, so skip it
-                let posting = self.pick_term(cur_doc + 1, self.postings.iter().take(index + 1));
-                let mut posting = self
-                    .postings
-                    .take(&posting)
-                    .expect("we just found it in the previous step");
-                if posting.next(cur_doc + 1).await?.is_some() {
-                    self.postings.insert(posting);
-                }
+                self.move_terms(cur_doc + 1).await?;
             } else if self
                 .postings
                 .first()
@@ -300,15 +323,8 @@ impl Wand {
                 return Ok(Some(doc));
             } else {
                 // some posting iterators haven't reached this doc id,
-                // so pick one of such term(s) and move it to the doc id
-                let posting = self.pick_term(doc, self.postings.iter().take(index));
-                let mut posting = self
-                    .postings
-                    .take(&posting)
-                    .expect("we just found it in the previous step");
-                if posting.next(doc).await?.is_some() {
-                    self.postings.insert(posting);
-                }
+                // so move such terms to the doc id
+                self.move_terms(doc).await?;
             }
         }
         Ok(None)
@@ -316,12 +332,13 @@ impl Wand {
 
     // find the first term that the sum of upper bound of all preceding terms and itself,
     // are greater than or equal to the threshold
-    fn find_pivot_term(&self) -> Option<(usize, PostingIterator)> {
+    #[instrument(level = "debug", skip_all)]
+    fn find_pivot_term(&self) -> Option<&PostingIterator> {
         let mut acc = 0.0;
-        for (i, iter) in self.postings.iter().enumerate() {
+        for iter in self.postings.iter() {
             acc += iter.approximate_upper_bound();
-            if acc >= self.threshold {
-                return Some((i, iter.clone()));
+            if acc >= self.threshold && acc > 0. {
+                return Some(iter);
             }
         }
         None
@@ -329,15 +346,21 @@ impl Wand {
 
     // pick the term that has the maximum upper bound and the current doc id is less than the given doc id
     // so that we can move the posting iterator to the next doc id that is possible to be candidate
-    fn pick_term<'b>(
-        &self,
-        doc: u64,
-        postings: impl Iterator<Item = &'b PostingIterator>,
-    ) -> PostingIterator {
-        postings
-            .filter(|posting| posting.doc().unwrap().0 < doc)
-            .max_by_key(|posting| OrderedFloat(posting.approximate_upper_bound()))
-            .expect("at least one posting list")
-            .clone()
+    #[instrument(level = "debug", skip_all)]
+    async fn move_terms<'b>(&mut self, least_id: u64) -> Result<()> {
+        let mut move_tasks = Vec::new();
+        for posting in &mut self.postings {
+            match posting.doc() {
+                Some((d, _)) if d < least_id => {
+                    move_tasks.push(posting.next(least_id));
+                }
+                _ => break,
+            }
+        }
+        futures::future::try_join_all(move_tasks).await?;
+
+        self.postings.sort_unstable();
+
+        Ok(())
     }
 }

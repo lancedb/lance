@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -533,15 +534,26 @@ impl PostingListReader {
         self.row_ids.values()
     }
 
-    pub async fn read_block(&self, block_id: usize) -> Result<RecordBatch> {
+    #[instrument(level = "debug", skip(self))]
+    pub async fn read_blocks(&self, block_id: usize) -> Result<Vec<RecordBatch>> {
         let block_size = block_size(self.length);
         let num_blocks = self.length.div_ceil(block_size);
-        let offset = self.term_offset + num_blocks + block_id * block_size;
+        let num_block_to_read = num_blocks_to_read(block_size);
+        let start = self.term_offset + num_blocks + block_id * block_size;
+        let end = start + min(self.length, num_block_to_read * block_size);
         let batch = self
             .reader
-            .read_range(offset..offset + self.block_size(block_id))
+            .read_range(start..end + self.block_size(block_id))
             .await?;
-        Ok(batch)
+
+        let batches = (0..end - start)
+            .step_by(block_size)
+            .map(|offset| {
+                let length = min(self.length - offset, block_size);
+                batch.slice(offset, length)
+            })
+            .collect();
+        Ok(batches)
     }
 
     fn block_size(&self, block_id: usize) -> usize {
