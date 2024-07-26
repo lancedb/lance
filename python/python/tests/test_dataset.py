@@ -304,6 +304,20 @@ def test_take_with_columns(tmp_path: Path):
     assert table2 == pa.Table.from_pylist([{"b": 2}])
 
 
+def test_take_with_projection(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    table2 = dataset.take([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+
+    assert table2 == pa.Table.from_pylist([{"a2": 2, "bup": "X"}])
+
+    table3 = dataset._take_rows([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+    assert table3 == table2
+
+
 def test_filter(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

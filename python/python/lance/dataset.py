@@ -239,6 +239,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
         fragments: Optional[Iterable[LanceFragment]] = None,
+        full_text_query: Optional[Union[str, dict]] = None,
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
@@ -296,6 +297,15 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        full_text_query: str or dict, optional
+            query string to search for, the results will be ranked by BM25.
+            e.g. "hello world", would match documents containing "hello" or "world".
+            or a dictionary with the following keys:
+            - columns: list[str]
+                The columns to search,
+                currently only supports a single column in the columns list.
+            - query: str
+                The query string to search for.
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
@@ -337,6 +347,11 @@ class LanceDataset(pa.dataset.Dataset):
             .use_stats(use_stats)
             .fast_search(fast_search)
         )
+        if full_text_query is not None:
+            if isinstance(full_text_query, str):
+                builder = builder.full_text_search(full_text_query)
+            else:
+                builder = builder.full_text_search(**full_text_query)
         if nearest is not None:
             builder = builder.nearest(**nearest)
         return builder.to_scanner()
@@ -371,6 +386,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_id: bool = False,
         use_stats: bool = True,
         fast_search: bool = False,
+        full_text_query: Optional[Union[str, dict]] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -418,6 +434,15 @@ class LanceDataset(pa.dataset.Dataset):
             Return row ID.
         use_stats: bool, default True
             Use stats pushdown during filters.
+        full_text_query: str or dict, optional
+            query string to search for, the results will be ranked by BM25.
+            e.g. "hello world", would match documents contains "hello" or "world".
+            or a dictionary with the following keys:
+            - columns: list[str]
+                The columns to search,
+                currently only supports a single column in the columns list.
+            - query: str
+                The query string to search for.
 
         Notes
         -----
@@ -439,6 +464,7 @@ class LanceDataset(pa.dataset.Dataset):
             with_row_id=with_row_id,
             use_stats=use_stats,
             fast_search=fast_search,
+            full_text_query=full_text_query,
         ).to_table()
 
     @property
@@ -488,6 +514,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        full_text_query: Optional[Union[str, dict]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -514,6 +541,7 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
             use_stats=use_stats,
+            full_text_query=full_text_query,
         ).to_batches()
 
     def sample(
@@ -571,7 +599,13 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        return pa.Table.from_batches([self._ds.take(indices, columns)])
+        columns_with_transform = None
+        if isinstance(columns, dict):
+            columns_with_transform = list(columns.items())
+            columns = None
+        return pa.Table.from_batches(
+            [self._ds.take(indices, columns, columns_with_transform)]
+        )
 
     def _take_rows(
         self,
@@ -598,7 +632,13 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        return pa.Table.from_batches([self._ds.take_rows(row_ids, columns)])
+        columns_with_transform = None
+        if isinstance(columns, dict):
+            columns_with_transform = list(columns.items())
+            columns = None
+        return pa.Table.from_batches(
+            [self._ds.take_rows(row_ids, columns, columns_with_transform)]
+        )
 
     def head(self, num_rows, **kwargs):
         """
@@ -1105,7 +1145,12 @@ class LanceDataset(pa.dataset.Dataset):
     def create_scalar_index(
         self,
         column: str,
-        index_type: Union[Literal["BTREE"], Literal["BITMAP"], Literal["LABEL_LIST"]],
+        index_type: Union[
+            Literal["BTREE"],
+            Literal["BITMAP"],
+            Literal["LABEL_LIST"],
+            Literal["INVERTED"],
+        ],
         name: Optional[str] = None,
         *,
         replace: bool = True,
@@ -1161,7 +1206,7 @@ class LanceDataset(pa.dataset.Dataset):
         that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
         ``MaterializeIndex`` operator.
 
-        There are three types of scalar indices available today.  The most common
+        There are 4 types of scalar indices available today.  The most common
         type is ``BTREE``. This index is inspired by the btree data structure
         although only the first few layers of the btree are cached in memory.  It iwll
         perform well on columns with a large number of unique values and few rows per
@@ -1177,6 +1222,10 @@ class LanceDataset(pa.dataset.Dataset):
         with a ``LABEL_LIST`` index.  This index can only speedup queries with
         ``array_has_any`` or ``array_has_all`` filters.
 
+        The ``INVERTED`` index type is used to index document columns. This index
+        can conduct full-text searches. For example, a column that contains any word
+        of query string "hello world". The results will be ranked by BM25.
+
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
         issues (see https://github.com/apache/datafusion/issues/10073 for more info).
@@ -1189,7 +1238,8 @@ class LanceDataset(pa.dataset.Dataset):
             The column to be indexed.  Must be a boolean, integer, float,
             or string column.
         index_type : str
-            The type of the index.  One of ``"BTREE"`` or ``"BITMAP"``.
+            The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
+            ``"LABEL_LIST"`` or ``"INVERTED"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1222,10 +1272,11 @@ class LanceDataset(pa.dataset.Dataset):
             raise KeyError(f"{column} not found in schema")
 
         index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "LABEL_LIST"]:
+        if index_type not in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
             raise NotImplementedError(
                 (
-                    'Only "BTREE", "LABEL_LIST", or "BITMAP" are supported for '
+                    'Only "BTREE", "LABEL_LIST", "INVERTED", '
+                    'or "BITMAP" are supported for '
                     f"scalar columns.  Received {index_type}",
                 )
             )
@@ -1246,6 +1297,13 @@ class LanceDataset(pa.dataset.Dataset):
         elif index_type == "LABEL_LIST":
             if not pa.types.is_list(field.type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
+        elif index_type == "INVERTED":
+            if not pa.types.is_string(field.type) and not pa.types.is_large_string(
+                field.type
+            ):
+                raise TypeError(
+                    f"INVERTED index column {column} must be string or large string"
+                )
 
         if pa.types.is_duration(field.type):
             raise TypeError(
@@ -2042,6 +2100,7 @@ class ScannerBuilder:
         self._with_row_id = False
         self._use_stats = True
         self._fast_search = None
+        self._full_text_query = None
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -2232,6 +2291,20 @@ class ScannerBuilder:
         self.fast_search = flag
         return self
 
+    def full_text_search(
+        self,
+        query: str,
+        columns: Optional[List[str]] = None,
+    ) -> ScannerBuilder:
+        """
+        Filter rows by full text searching. *Experimental API*,
+        may remove it after we support to do this within `filter` SQL-like expression
+
+        Must create inverted index on the given column before searching,
+        """
+        self._full_text_query = {"query": query, "columns": columns}
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -2250,6 +2323,7 @@ class ScannerBuilder:
             self._use_stats,
             self._substrait_filter,
             self._fast_search,
+            self._full_text_query,
         )
         return LanceScanner(scanner, self.ds)
 

@@ -48,6 +48,8 @@ pub trait IndexReader: Send + Sync {
     async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
     /// Return the number of batches in the file
     async fn num_batches(&self) -> u32;
+    /// Return the number of rows in the file
+    fn num_rows(&self) -> usize;
 }
 
 /// Trait abstracting I/O away from index logic
@@ -99,6 +101,40 @@ impl PartialEq for dyn AnyQuery {
     }
 }
 
+/// A full text search query
+#[derive(Debug, Clone, PartialEq)]
+pub struct FullTextSearchQuery {
+    /// The columns to search,
+    /// if empty, search all indexed columns
+    pub columns: Vec<String>,
+    /// The full text search query
+    pub query: String,
+    /// The maximum number of results to return
+    pub limit: Option<i64>,
+}
+
+impl FullTextSearchQuery {
+    pub fn new(query: String) -> Self {
+        Self {
+            query,
+            limit: None,
+            columns: vec![],
+        }
+    }
+
+    pub fn columns(mut self, columns: Option<Vec<String>>) -> Self {
+        if let Some(columns) = columns {
+            self.columns = columns;
+        }
+        self
+    }
+
+    pub fn limit(mut self, limit: Option<i64>) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
 /// A query that a basic scalar index (e.g. btree / bitmap) can satisfy
 ///
 /// This is a subset of expression operators that is often referred to as the
@@ -117,7 +153,7 @@ pub enum SargableQuery {
     /// Retrieve all row ids where the value is exactly the given value
     Equals(ScalarValue),
     /// Retrieve all row ids where the value matches the given full text search query
-    FullTextSearch(Vec<String>),
+    FullTextSearch(FullTextSearchQuery),
     /// Retrieve all row ids where the value is null
     IsNull(),
 }
@@ -159,8 +195,8 @@ impl AnyQuery for SargableQuery {
                         .join(",")
                 )
             }
-            Self::FullTextSearch(values) => {
-                format!("{} LIKE '{}'", col, values.join("|"))
+            Self::FullTextSearch(query) => {
+                format!("fts({})", query.query)
             }
             Self::IsNull() => {
                 format!("{} IS NULL", col)
@@ -209,8 +245,8 @@ impl AnyQuery for SargableQuery {
                     .collect::<Vec<_>>(),
                 false,
             ),
-            Self::FullTextSearch(values) => {
-                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(values.join("|")))))
+            Self::FullTextSearch(query) => {
+                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(query.query.clone()))))
             }
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
