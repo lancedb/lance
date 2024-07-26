@@ -43,7 +43,7 @@ use datafusion::{
 };
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::{dataframe::DataFrameExt, exec::get_session_context};
+use lance_datafusion::{chunker::chunk_stream, dataframe::DataFrameExt, exec::get_session_context};
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
@@ -556,14 +556,11 @@ impl MergeInsertJob {
         }
     }
 
-    // Stream needs to already be matched
-    // Needed schema:
-    // _rowaddr
-    // [updated_cols]*
     async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
     ) -> Result<Vec<Fragment>> {
+        // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
         let session_ctx = get_session_context(LanceExecutionOptions {
             use_spilling: true,
@@ -576,8 +573,7 @@ impl MergeInsertJob {
             .group_by_stream(&["_fragment_id"])
             .await?;
 
-        // for each fragment, scan the fragment for the new rows, and merge in
-        // the updates.
+        // Can update the fragments in parallel.
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
         let handle = CPU_RUNTIME.handle();
@@ -623,11 +619,13 @@ impl MergeInsertJob {
                     // Also, because we already sorted by row address, the rows
                     // will be in the correct order.
 
+                    let use_legacy_file = fragment.metadata.files[0].is_legacy_file();
+
                     let mut writer = open_writer(
                         dataset.object_store(),
                         &write_schema,
                         &dataset.base,
-                        fragment.metadata.files[0].is_legacy_file(),
+                        use_legacy_file,
                     )
                     .await?;
 
@@ -642,14 +640,30 @@ impl MergeInsertJob {
                             Err(e) => Err(e),
                         })?;
 
-                    // TODO: do I need to do batching at this level?
-                    writer.write(batches.as_slice()).await?;
+                    if use_legacy_file {
+                        // Need to match the existing batch size exactly, otherwise
+                        // we'll get errors.
+                        let reader = fragment.open(dataset.schema(), false, true, None).await?;
+                        let batch_size = reader.legacy_num_rows_in_batch(0).unwrap();
+                        let stream = stream::iter(batches.into_iter().map(Ok));
+                        let stream = Box::pin(RecordBatchStreamAdapter::new(
+                            Arc::new((&write_schema).into()),
+                            stream,
+                        ));
+                        let mut stream = chunk_stream(stream, batch_size as usize);
+                        while let Some(chunk) = stream.next().await {
+                            writer.write(&chunk?).await?;
+                        }
+                    } else {
+                        writer.write(batches.as_slice()).await?;
+                    }
+
                     let (_num_rows, data_file) = writer.finish().await?;
 
                     metadata.files.push(data_file);
                     updated_fragments.lock().unwrap().push(metadata);
                 } else {
-                    // TODO: we can skip scanning row addresses we don't need.
+                    // TODO: we could skip scanning row addresses we don't need.
                     let update_schema = batches[0].schema();
                     let read_columns = update_schema.field_names();
                     let mut updater = fragment
@@ -823,10 +837,10 @@ impl MergeInsertJob {
 
         let committed_ds = if !is_full_schema {
             if self.params.insert_not_matched {
-                return Err(Error::invalid_input(
-                    "The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data",
-                    location!(),
-                ));
+                return Err(Error::NotSupported {
+                    source: "The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data".into(),
+                    location: location!(),
+            });
             }
 
             if !matches!(
@@ -1237,7 +1251,9 @@ impl Merger {
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{types::UInt32Type, RecordBatchIterator, StringArray, UInt32Array};
+    use arrow_array::{
+        types::UInt32Type, Int64Array, RecordBatchIterator, StringArray, UInt32Array,
+    };
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use lance_datagen::{array, BatchCount, RowCount, Seed};
@@ -1654,135 +1670,210 @@ mod tests {
         assert_eq!(ds.count_rows(None).await.unwrap(), 2048);
     }
 
-    #[tokio::test]
-    async fn test_merge_insert_subcols() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+    mod subcols {
+        use super::*;
 
-        let data = lance_datagen::gen()
-            .with_seed(Seed::from(1))
-            .col("other", array::rand_utf8(4.into(), false))
-            .col("value", array::step::<UInt32Type>())
-            .col("key", array::rand_pseduo_uuid_hex());
-        let batch = data.into_batch_rows(RowCount::from(1024)).unwrap();
-        let schema = batch.schema();
+        struct Fixtures {
+            ds: Arc<Dataset>,
+            new_data: RecordBatch,
+        }
 
-        let reader = Box::new(RecordBatchIterator::new(
-            [Ok(batch.clone())],
-            schema.clone(),
-        ));
-        let write_params = WriteParams {
-            max_rows_per_file: 256,
-            ..Default::default()
-        };
-        let ds = Dataset::write(reader, test_uri, Some(write_params))
-            .await
-            .unwrap();
-        let ds = Arc::new(ds);
+        async fn setup() -> Fixtures {
+            let data = lance_datagen::gen()
+                .with_seed(Seed::from(1))
+                .col("other", array::rand_utf8(4.into(), false))
+                .col("value", array::step::<UInt32Type>())
+                .col("key", array::rand_pseduo_uuid_hex());
+            let batch = data.into_batch_rows(RowCount::from(1024)).unwrap();
+            let schema = batch.schema();
 
-        // New data with only a subset of columns
-        // TODO: how do I make sure there is overlap in rows?
-        let update_schema = Arc::new(schema.project(&[2, 1]).unwrap());
-        let update_batch = RecordBatch::try_new(
-            update_schema.clone(),
-            vec![
-                Arc::new(batch["key"].slice(256, 6)),
-                Arc::new(UInt32Array::from(vec![
-                    4000_u32, 5000, 6000, 7000, 8000, 9000,
-                ])),
-            ],
-        )
-        .unwrap();
-        let reader = Box::new(RecordBatchIterator::new(
-            [Ok(update_batch.clone())],
-            update_schema.clone(),
-        ));
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(batch.clone())],
+                schema.clone(),
+            ));
+            let write_params = WriteParams {
+                max_rows_per_file: 256,
+                max_rows_per_group: 32, // Non-standard group size to hit edge cases
+                ..Default::default()
+            };
+            let ds = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+            let ds = Arc::new(ds);
 
-        // Should reject when_not_matched_by_source_delete as not yet supported
-        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
-            .unwrap()
-            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::DoNothing)
-            .try_build()
-            .unwrap();
-        let res = require_send(job.execute_reader(reader)).await;
-        assert!(
-            matches!(
-                &res,
-                &Err(Error::NotSupported { ref source, .. })
-                    if source.to_string().contains("Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data"),
-            ),
-            "Expected NotSupported error, got: {:?}",
-            res
-        );
-
-        // Should reject when_not_matched_insert_all as invalid
-        let reader = Box::new(RecordBatchIterator::new(
-            [Ok(update_batch.clone())],
-            update_schema.clone(),
-        ));
-        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
-            .unwrap()
-            .when_not_matched(WhenNotMatched::InsertAll)
-            .when_matched(WhenMatched::UpdateAll)
-            .try_build()
-            .unwrap();
-        let res = job.execute_reader(reader).await;
-        assert!(matches!(
-            res,
-            Err(Error::InvalidInput { source, .. })
-                if source.to_string().contains("The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data")
-        ));
-
-        // TODO: should reject when data is not a subschema.
-
-        // Should accept when_matched_update_all
-        let reader = Box::new(RecordBatchIterator::new(
-            [Ok(update_batch.clone())],
-            update_schema.clone(),
-        ));
-        let fragments_before = ds
-            .get_fragments()
-            .iter()
-            .map(|f| f.metadata().clone())
-            .collect::<Vec<_>>();
-        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::DoNothing)
-            .try_build()
+            // New data with only a subset of columns
+            let update_schema = Arc::new(schema.project(&[2, 1]).unwrap());
+            // Full second file and part of third file.
+            let indices: Int64Array = (256..512).chain(600..612).chain([712, 715]).collect();
+            let keys = arrow::compute::take(batch["key"].as_ref(), &indices, None).unwrap();
+            let new_data = RecordBatch::try_new(
+                update_schema.clone(),
+                vec![
+                    keys,
+                    Arc::new((1000..(1000 + indices.len() as u32)).collect::<UInt32Array>()),
+                ],
+            )
             .unwrap();
 
-        let (ds, stats) = job.execute_reader(reader).await.unwrap();
+            Fixtures { ds, new_data }
+        }
 
-        // Should not rewrite the affected data files
-        let fragments_after = ds
-            .get_fragments()
-            .iter()
-            .map(|f| f.metadata().clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            fragments_before.iter().map(|f| f.id).collect::<Vec<_>>(),
-            fragments_after.iter().map(|f| f.id).collect::<Vec<_>>()
-        );
-        // Only the second fragment should be different.
-        assert_eq!(fragments_before[0], fragments_after[0]);
-        assert_ne!(fragments_before[1], fragments_after[1]);
-        assert_eq!(fragments_before[2], fragments_after[2]);
-        assert_eq!(fragments_before[3], fragments_after[3]);
+        #[tokio::test]
+        async fn test_delete_not_supported() {
+            let Fixtures { ds, new_data } = setup().await;
 
-        // Should add a new data file for updated columns
-        assert_eq!(fragments_after[1].files.len(), 2);
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(new_data.clone())],
+                new_data.schema(),
+            ));
 
-        // Updated columns should be only columns in new data files
-        // -2 field ids are tombstoned.
-        let data_files = fragments_after[1].files.clone();
-        assert_eq!(&data_files[0].fields, &[0, -2, -2]);
-        assert_eq!(&data_files[1].fields, &[1, 2]);
+            // Should reject when_not_matched_by_source_delete as not yet supported
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+            let res = require_send(job.execute_reader(reader)).await;
+            assert!(
+                matches!(
+                    &res,
+                    &Err(Error::NotSupported { ref source, .. })
+                        if source.to_string().contains("Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data"),
+                ),
+                "Expected NotSupported error, got: {:?}",
+                res
+            );
+        }
 
-        assert_eq!(stats.num_inserted_rows, 0);
-        assert_eq!(stats.num_updated_rows, 6);
-        assert_eq!(stats.num_deleted_rows, 0);
+        #[tokio::test]
+        async fn test_insert_not_supported() {
+            let Fixtures { ds, new_data } = setup().await;
+
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(new_data.clone())],
+                new_data.schema(),
+            ));
+
+            // Should reject when_not_matched_insert_all as not yet supporteed
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_matched(WhenMatched::UpdateAll)
+                .try_build()
+                .unwrap();
+            let res = job.execute_reader(reader).await;
+            assert!(matches!(
+                res,
+                Err(Error::NotSupported { source, .. })
+                    if source.to_string().contains("The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data")
+            ));
+        }
+
+        #[tokio::test]
+        async fn test_errors_on_bad_schema() {
+            let Fixtures { ds, new_data } = setup().await;
+
+            // Schema with different names, which should be rejected.
+            let bad_schema = Arc::new(Schema::new(vec![
+                Field::new("wrong_key", DataType::Utf8, false),
+                Field::new("wrong_value", DataType::UInt32, false),
+            ]));
+
+            // Should reject when data is not a subschema.
+            let bad_batch =
+                RecordBatch::try_new(bad_schema.clone(), new_data.columns().to_vec()).unwrap();
+            let reader = Box::new(RecordBatchIterator::new([Ok(bad_batch)], bad_schema));
+
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+            let res = job.execute_reader(reader).await;
+            assert!(
+                matches!(
+                    &res,
+                    &Err(Error::SchemaMismatch { ref difference, .. })
+                        if difference.to_string().contains("fields did not match")
+                ),
+                "Expected SchemaMismatch error, got: {:?}",
+                res
+            );
+        }
+
+        #[tokio::test]
+        async fn test_merge_insert_subcols() {
+            let Fixtures { ds, new_data } = setup().await;
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(new_data.clone())],
+                new_data.schema(),
+            ));
+            let fragments_before = ds
+                .get_fragments()
+                .iter()
+                .map(|f| f.metadata().clone())
+                .collect::<Vec<_>>();
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+            let (ds, stats) = job.execute_reader(reader).await.unwrap();
+
+            // Should not rewrite the affected data files
+            let fragments_after = ds
+                .get_fragments()
+                .iter()
+                .map(|f| f.metadata().clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                fragments_before.iter().map(|f| f.id).collect::<Vec<_>>(),
+                fragments_after.iter().map(|f| f.id).collect::<Vec<_>>()
+            );
+            // Only the second fragment should be different.
+            assert_eq!(fragments_before[0], fragments_after[0]);
+            assert_ne!(fragments_before[1], fragments_after[1]);
+            assert_ne!(fragments_before[2], fragments_after[2]);
+            assert_eq!(fragments_before[3], fragments_after[3]);
+
+            let has_added_files = |frag: &Fragment| {
+                assert_eq!(frag.files.len(), 2);
+                let data_files = &frag.files;
+                // Updated columns should be only columns in new data files
+                // -2 field ids are tombstoned.
+                assert_eq!(&data_files[0].fields, &[0, -2, -2]);
+                assert_eq!(&data_files[1].fields, &[1, 2]);
+            };
+            has_added_files(&fragments_after[1]);
+            has_added_files(&fragments_after[2]);
+
+            assert_eq!(stats.num_inserted_rows, 0);
+            assert_eq!(stats.num_updated_rows, new_data.num_rows() as u64);
+            assert_eq!(stats.num_deleted_rows, 0);
+
+            let data = ds
+                .scan()
+                .scan_in_order(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(data.num_rows(), 1024);
+            assert_eq!(data.num_columns(), 3);
+
+            let values = data
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            assert_eq!(values.value(0), 0);
+            assert_eq!(values.value(256), 1_000);
+            assert_eq!(values.value(512), 512);
+            assert_eq!(values.value(715), 1_000 + new_data.num_rows() as u32 - 1);
+        }
     }
 }
