@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cmp::Reverse;
+use std::cmp::{min, Reverse};
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes;
-use arrow_array::RecordBatch;
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::{Result, ROW_ID};
@@ -28,7 +27,7 @@ lazy_static! {
     static ref MIN_IO_SIZE: usize = std::env::var("MIN_IO_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1024 * 1024); // 1MB
+        .unwrap_or(256 * 1024); // 256KiB
 }
 
 // we might change the block size in the future
@@ -38,9 +37,10 @@ pub fn block_size(_length: usize) -> usize {
     *POSTING_BLOCK_SIZE
 }
 
+// the number of blocks to read in one IO operation
 #[inline]
-pub fn num_blocks_to_read(block_size: usize) -> usize {
-    *MIN_IO_SIZE / (block_size * 8) // the widest column is u64, so 8 bytes
+pub fn num_blocks_to_read(num_blocks: usize, block_size: usize) -> usize {
+    min(num_blocks, *MIN_IO_SIZE / (block_size * 8)) // the widest column is u64, so 8 bytes
 }
 
 #[derive(Clone)]
@@ -51,13 +51,6 @@ pub struct PostingIterator {
     doc: (u64, f32),
     mask: Arc<RowIdMask>,
     approximate_upper_bound: f32,
-    // cache the current block
-    block_id: usize,
-    blocks: Vec<RecordBatch>,
-
-    // stats
-    skiped_blocks: usize,
-    read_block_miss: usize,
 }
 
 impl PartialEq for PostingIterator {
@@ -101,10 +94,6 @@ impl PostingIterator {
             doc: first_block,
             mask,
             approximate_upper_bound,
-            block_id: 0,
-            blocks: Vec::new(),
-            skiped_blocks: 0,
-            read_block_miss: 0,
         }
     }
 
@@ -157,7 +146,6 @@ impl PostingIterator {
             && block_row_ids[current_block + 1] <= least_id
         {
             current_block += 1;
-            self.skiped_blocks += 1;
         }
         if current_block > start_block {
             self.index = current_block * block_size;
@@ -171,7 +159,7 @@ impl PostingIterator {
         }
 
         // read the current block all into memory and do linear search
-        let mut batch = self.read_block(current_block).await?;
+        let mut batch = self.list.read_block(current_block).await?;
         let mut row_ids = batch[ROW_ID]
             .as_primitive::<datatypes::UInt64Type>()
             .values();
@@ -194,7 +182,7 @@ impl PostingIterator {
 
                 current_block += 1;
                 block_offset += block_size;
-                batch = self.read_block(current_block).await?;
+                batch = self.list.read_block(current_block).await?;
                 row_ids = batch[ROW_ID]
                     .as_primitive::<datatypes::UInt64Type>()
                     .values();
@@ -209,21 +197,6 @@ impl PostingIterator {
                 return Ok(Some((row_id, self.index)));
             }
         }
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn read_block(&mut self, block_id: usize) -> Result<RecordBatch> {
-        if self.blocks.len() > 0
-            && self.block_id <= block_id
-            && block_id < self.block_id + self.blocks.len()
-        {
-            return Ok(self.blocks[block_id - self.block_id].clone());
-        }
-
-        self.read_block_miss += 1;
-        self.block_id = block_id;
-        self.blocks = self.list.read_blocks(block_id).await?;
-        Ok(self.blocks[0].clone())
     }
 }
 

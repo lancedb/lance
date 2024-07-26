@@ -84,7 +84,7 @@ impl IndexWriter for v2::writer::FileWriter {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write_batch(&batch).await?;
-        Ok(offset as u64)
+        Ok(offset)
     }
 
     async fn finish(&mut self) -> Result<()> {

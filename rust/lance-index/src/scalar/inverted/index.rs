@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of_val;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -366,6 +367,8 @@ impl std::fmt::Debug for InvertedListReader {
 impl DeepSizeOf for InvertedListReader {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.offsets.deep_size_of_children(context)
+            + self.lengths.deep_size_of_children(context)
+            + self.posting_cache.weighted_size() as usize
     }
 }
 
@@ -385,7 +388,7 @@ impl InvertedListReader {
             .ok_or_else(|| Error::io("lengths not found".to_string(), location!()))?;
         let lengths: Vec<usize> = serde_json::from_str(lengths)?;
 
-        const CACHE_SIZE: usize = 512 * 1024 * 1024; // 128 MiB
+        const CACHE_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
         let cache = Cache::builder()
             .max_capacity(CACHE_SIZE as u64)
             .weigher(|_, posting: &PostingListReader| posting.deep_size_of() as u32)
@@ -412,17 +415,42 @@ impl InvertedListReader {
 
                 let token_id = token_id as usize;
                 let offset = self.offsets[token_id];
-                let block_heads = self.reader.read_range(offset..offset + num_blocks).await?;
-                let row_ids = block_heads[ROW_ID].as_primitive::<UInt64Type>().clone();
-                let frequencies = block_heads[FREQUENCY_COL]
+                // read the first element of each block
+                // and cache first `num_blocks_to_cache` to reduce the number of reads,
+                // the `num_blocks_to_cache` is the max number of blocks to read,
+                // and the total bytes to read is still within MIN_IO_SIZE
+                let num_blocks_to_cache = max(
+                    0,
+                    num_blocks_to_read(num_blocks, block_size) - num_blocks.div_ceil(block_size),
+                );
+                let num_rows_to_cache = min(length, num_blocks_to_cache * block_size);
+                let batch = self
+                    .reader
+                    .read_range(offset..offset + num_blocks + num_rows_to_cache)
+                    .await?;
+                let head_batch = batch.slice(0, num_blocks);
+                let row_ids = head_batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+                let frequencies = head_batch[FREQUENCY_COL]
                     .as_primitive::<Float32Type>()
                     .clone();
+
+                let cached_blocks = (0..num_rows_to_cache)
+                    .step_by(block_size)
+                    .map(|offset| {
+                        let offset = offset + num_blocks;
+                        let length = min(batch.num_rows() - offset, block_size);
+                        batch.slice(offset, length)
+                    })
+                    .collect();
+
                 Result::Ok(PostingListReader {
                     reader: self.reader.clone(),
                     term_offset: offset,
                     length,
                     row_ids,
                     frequencies,
+                    block_id: 0,
+                    blocks: cached_blocks,
                 })
             })
             .await
@@ -501,12 +529,20 @@ pub struct PostingListReader {
     // first element of each block
     row_ids: UInt64Array,
     frequencies: Float32Array,
+    // blocks cache
+    block_id: usize,
+    blocks: Vec<RecordBatch>,
 }
 
 impl DeepSizeOf for PostingListReader {
     fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        self.row_ids.data_type().size() * self.row_ids.len()
-            + self.frequencies.data_type().size() * self.frequencies.len()
+        let block_size = block_size(self.len());
+        let num_blocks = self.len().div_ceil(block_size);
+        let num_cached_blocks = num_blocks_to_read(num_blocks, block_size);
+        let num_cached_rows = min(self.len(), num_cached_blocks * block_size);
+        size_of_val(self)
+            + self.row_ids.data_type().size() * (self.row_ids.len() + num_cached_rows)
+            + self.frequencies.data_type().size() * (self.frequencies.len() + num_cached_rows)
     }
 }
 
@@ -535,16 +571,27 @@ impl PostingListReader {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn read_blocks(&self, block_id: usize) -> Result<Vec<RecordBatch>> {
+    pub async fn read_block(&mut self, block_id: usize) -> Result<RecordBatch> {
+        if !self.blocks.is_empty()
+            && self.block_id <= block_id
+            && block_id < self.block_id + self.blocks.len()
+        {
+            return Ok(self.blocks[block_id - self.block_id].clone());
+        }
+
+        self.block_id = block_id;
+        self.blocks = self.read_blocks(block_id).await?;
+        Ok(self.blocks[0].clone())
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    async fn read_blocks(&self, block_id: usize) -> Result<Vec<RecordBatch>> {
         let block_size = block_size(self.length);
         let num_blocks = self.length.div_ceil(block_size);
-        let num_block_to_read = num_blocks_to_read(block_size);
+        let num_block_to_read = num_blocks_to_read(num_blocks, block_size);
         let start = self.term_offset + num_blocks + block_id * block_size;
         let end = start + min(self.length, num_block_to_read * block_size);
-        let batch = self
-            .reader
-            .read_range(start..end + self.block_size(block_id))
-            .await?;
+        let batch = self.reader.read_range(start..end).await?;
 
         let batches = (0..end - start)
             .step_by(block_size)
@@ -554,15 +601,6 @@ impl PostingListReader {
             })
             .collect();
         Ok(batches)
-    }
-
-    fn block_size(&self, block_id: usize) -> usize {
-        let block_offset = block_size(self.length) * block_id;
-        if block_id + 1 == self.row_ids.len() {
-            self.length - block_offset
-        } else {
-            block_size(self.length)
-        }
     }
 }
 
