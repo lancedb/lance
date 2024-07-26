@@ -3,7 +3,6 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -22,23 +21,26 @@ use super::index::{idf, PostingListReader, FREQUENCY_COL, K1};
 // One block consists of rows of a posting list (row id (u64) and frequency (f32)),
 // Increasing the block size can decrease the memory usage, but also decrease the probability of skipping blocks.
 lazy_static! {
-    pub static ref BLOCK_SIZE: usize = std::env::var("BLOCK_SIZE")
+    pub static ref POSTING_BLOCK_SIZE: usize = std::env::var("POSTING_BLOCK_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(256);
+    static ref MIN_IO_SIZE: usize = std::env::var("MIN_IO_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64 * 1024); // 64KB
 }
 
 // we might change the block size in the future
 // and it could be a function of the total number of documents
 #[inline]
 pub fn block_size(_length: usize) -> usize {
-    *BLOCK_SIZE
+    *POSTING_BLOCK_SIZE
 }
 
 #[inline]
 pub fn num_blocks_to_read(block_size: usize) -> usize {
-    const MIN_IO_SIZE: usize = 64 * 1024;
-    MIN_IO_SIZE / (block_size * (size_of::<u64>() + size_of::<f32>()))
+    *MIN_IO_SIZE / (block_size * 8) // the widest column is u64, so 8 bytes
 }
 
 #[derive(Clone)]
