@@ -239,8 +239,10 @@ fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
 // not exist).  We are given a path to a file and so we need to strip the last component
 // before creating the object store.  We then return the object store and the new relative path
 // to the file.
-async fn object_store_from_uri_or_path(uri_or_path: String) -> PyResult<(ObjectStore, Path)> {
-    if let Ok(mut url) = Url::parse(&uri_or_path) {
+pub async fn object_store_from_uri_or_path(
+    uri_or_path: impl AsRef<str>,
+) -> PyResult<(ObjectStore, Path)> {
+    if let Ok(mut url) = Url::parse(uri_or_path.as_ref()) {
         let path = object_store::path::Path::parse(url.path())
             .map_err(|e| PyIOError::new_err(format!("Invalid URL path `{}`: {}", url.path(), e)))?;
         let (parent_path, filename) = path_to_parent(&path)?;
@@ -250,8 +252,9 @@ async fn object_store_from_uri_or_path(uri_or_path: String) -> PyResult<(ObjectS
         let child_path = dir_path.child(filename);
         Ok((object_store, child_path))
     } else {
-        let path = Path::parse(&uri_or_path)
-            .map_err(|e| PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path, e)))?;
+        let path = Path::parse(uri_or_path.as_ref()).map_err(|e| {
+            PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path.as_ref(), e))
+        })?;
         let object_store = ObjectStore::local();
         Ok((object_store, path))
     }

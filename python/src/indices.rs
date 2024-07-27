@@ -4,7 +4,7 @@
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
-use lance::{index::vector::ivf::builder::write_vector_storage, io::ObjectStore};
+use lance::index::vector::ivf::builder::write_vector_storage;
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
     pq::{PQBuildParams, ProductQuantizer},
@@ -12,7 +12,7 @@ use lance_index::vector::{
 use lance_linalg::distance::DistanceType;
 use pyo3::{pyfunction, types::PyModule, wrap_pyfunction, PyObject, PyResult, Python};
 
-use crate::{dataset::Dataset, error::PythonErrorExt, RT};
+use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -160,7 +160,7 @@ async fn do_transform_vectors(
         .await
         .infer_error()?;
 
-    let (obj_store, path) = ObjectStore::from_uri(dst_uri).await.infer_error()?;
+    let (obj_store, path) = object_store_from_uri_or_path(dst_uri).await?;
     let writer = obj_store.create(&path).await.infer_error()?;
     write_vector_storage(
         transform_input,
