@@ -5,9 +5,11 @@ use std::sync::Arc;
 
 use arrow_array::builder::{ArrayBuilder, StringBuilder};
 use arrow_array::types::UInt8Type;
-use arrow_array::{Array, ArrayRef, DictionaryArray, StringArray, UInt8Array};
+use arrow_array::{make_array, Array, ArrayRef, DictionaryArray, StringArray, UInt8Array};
 use futures::{future::BoxFuture, FutureExt};
 
+use crate::buffer::LanceBuffer;
+use crate::data::{DataBlock, NullableDataBlock, VariableWidthBlock};
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
@@ -19,11 +21,9 @@ use crate::decoder::LogicalPageDecoder;
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
 use arrow_schema::DataType;
-use bytes::BytesMut;
 use lance_core::Result;
 use std::collections::HashMap;
 
-use crate::encodings::utils::new_primitive_array;
 use arrow_array::cast::AsArray;
 
 #[derive(Debug)]
@@ -80,9 +80,10 @@ impl PageScheduler for DictionaryPageScheduler {
             let items_decoder: Arc<dyn PrimitivePageDecoder> = Arc::from(items_page_decoder.await?);
 
             let mut primitive_wrapper = PrimitiveFieldDecoder::new_from_data(
-                items_decoder.clone(),
+                items_decoder,
                 DataType::Utf8,
                 copy_size,
+                false,
             );
 
             // Decode all items
@@ -95,7 +96,6 @@ impl PageScheduler for DictionaryPageScheduler {
             Ok(Box::new(DictionaryPageDecoder {
                 decoded_dict,
                 indices_decoder,
-                items_decoder,
             }) as Box<dyn PrimitivePageDecoder>)
         })
         .map(|join_handle| join_handle.unwrap())
@@ -106,25 +106,16 @@ impl PageScheduler for DictionaryPageScheduler {
 struct DictionaryPageDecoder {
     decoded_dict: Arc<dyn Array>,
     indices_decoder: Box<dyn PrimitivePageDecoder>,
-    items_decoder: Arc<dyn PrimitivePageDecoder>,
 }
 
 impl PrimitivePageDecoder for DictionaryPageDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         // Decode the indices
-        let indices_buffers = self
-            .indices_decoder
-            .decode(rows_to_skip, num_rows, all_null)?;
+        let indices_data = self.indices_decoder.decode(rows_to_skip, num_rows)?;
 
-        let indices_array =
-            new_primitive_array::<UInt8Type>(indices_buffers.clone(), num_rows, &DataType::UInt8);
+        let indices_array = make_array(indices_data.into_arrow(DataType::UInt8, false)?);
+        let indices_array = indices_array.as_primitive::<UInt8Type>();
 
-        let indices_array = indices_array.as_primitive::<UInt8Type>().clone();
         let dictionary = self.decoded_dict.clone();
 
         let adjusted_indices: UInt8Array = indices_array
@@ -142,31 +133,24 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
         let string_array = arrow_cast::cast(&dict_array, &DataType::Utf8).unwrap();
         let string_array = string_array.as_any().downcast_ref::<StringArray>().unwrap();
 
-        // This workflow is not ideal, since we go from DictionaryArray -> StringArray -> nulls, offsets, and bytes buffers (BytesMut)
-        // and later in primitive_array_from_buffers() we will go from nulls, offsets, and bytes buffers -> StringArray again.
-        // Creating the BytesMut is an unnecessary copy. But it is the best we can do in the current structure
-        let null_buffer = string_array
-            .nulls()
-            .map(|n| BytesMut::from(n.buffer().as_slice()))
-            .unwrap_or_else(BytesMut::new);
+        let null_buffer = string_array.nulls().map(|n| n.buffer().clone());
+        let offsets_buffer = string_array.offsets().inner().inner().clone();
+        let bytes_buffer = string_array.values().clone();
 
-        let offsets_buffer = BytesMut::from(string_array.offsets().inner().inner().as_slice());
-
-        // Empty buffer for nulls of bytes
-        let empty_buffer = BytesMut::new();
-
-        let bytes_buffer = BytesMut::from_iter(string_array.values().iter().copied());
-
-        Ok(vec![
-            null_buffer,
-            offsets_buffer,
-            empty_buffer,
-            bytes_buffer,
-        ])
-    }
-
-    fn num_buffers(&self) -> u32 {
-        self.items_decoder.num_buffers() + 2
+        let string_data = Box::new(VariableWidthBlock {
+            bits_per_offset: 32,
+            data: LanceBuffer::from(bytes_buffer),
+            offsets: LanceBuffer::from(offsets_buffer),
+            num_values: num_rows,
+        });
+        if let Some(nulls) = null_buffer {
+            Ok(Box::new(NullableDataBlock {
+                data: string_data,
+                nulls: LanceBuffer::from(nulls),
+            }))
+        } else {
+            Ok(string_data)
+        }
     }
 }
 
