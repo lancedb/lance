@@ -288,7 +288,7 @@ impl Dataset {
         Ok((object_store, base_path, commit_handler))
     }
 
-    /// Check out the specified version of this dataset
+    /// Check out a dataset version with a ref
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
         let ref_: refs::Ref = version.into();
         match ref_ {
@@ -320,7 +320,6 @@ impl Dataset {
         .await
     }
 
-    /// Check out the specified tagged version of this dataset
     async fn checkout_by_tag(&self, tag: &str) -> Result<Self> {
         check_valid_ref(tag)?;
 

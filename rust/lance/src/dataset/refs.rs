@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::ops::Range;
 
 use futures::future;
@@ -12,6 +15,7 @@ use std::sync::Arc;
 use crate::{Error, Result};
 use std::collections::HashMap;
 
+/// Lance Ref
 pub enum Ref {
     Version(u64),
     Tag(String),

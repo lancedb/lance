@@ -1092,11 +1092,11 @@ class LanceDataset(pa.dataset.Dataset):
         Unlike the :func:`dataset` constructor, this will re-use the
         current cache.
         This is a no-op if the dataset is already at the given version.
-        
+
         Parameters
         ----------
         version: int | str,
-            The version to checkout. A version number (`int`) or a tag
+            The version to check out. A version number (`int`) or a tag
             (`str`) can be provided.
 
         Returns
@@ -2546,6 +2546,7 @@ class Tags:
     """
     Dataset tag manager.
     """
+
     def __init__(self, dataset: _Dataset):
         self._ds = dataset
 
@@ -2563,7 +2564,7 @@ class Tags:
     def create(self, tag: str, version: int) -> None:
         """
         Create a tag for a given dataset version.
-        
+
         Parameters
         ----------
         tag: str,
