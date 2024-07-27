@@ -164,7 +164,7 @@ pub struct VariableWidthBlock {
     /// The offsets buffer (contains num_values + 1 offsets)
     pub offsets: LanceBuffer,
     /// The number of bits per offset
-    pub bits_per_offset: u32,
+    pub bits_per_offset: u8,
     /// The number of values represented by this block
     pub num_values: u64,
 }
