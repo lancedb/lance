@@ -57,7 +57,7 @@ use lance_core::{
         futures::Capacity,
         tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME},
     },
-    Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID,
+    Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
@@ -80,7 +80,10 @@ use crate::{
     index::DatasetIndexInternalExt,
     io::{
         commit::commit_transaction,
-        exec::{project, scalar_index::MapIndexExec, utils::ReplayExec, Planner, TakeExec},
+        exec::{
+            project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner,
+            TakeExec,
+        },
     },
     Dataset,
 };
@@ -405,8 +408,16 @@ impl MergeInsertJob {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(
 
+        let schema = source.schema();
+        let add_row_addr = match self.check_compatible_schema(&schema)? {
+            SchemaComparison::FullCompatible => false,
+            SchemaComparison::Subschema => true,
+        };
+
         // 1 - Input from user
         let input = Arc::new(OneShotExec::new(source));
+
+        // TODO: if subset, we should get row address as well.
 
         // 2 - Fork/Replay the input
         // Regrettably, this needs to have unbounded capacity, and so we need to fully read
@@ -415,7 +426,6 @@ impl MergeInsertJob {
 
         // 3 - Use the index to map input to row addresses
         // First, we need to project to the key column
-        let schema = shared_input.schema();
         let field = schema.field_with_name(&self.params.on[0])?;
         let index_mapper_input = Arc::new(project(
             shared_input.clone(),
@@ -425,18 +435,29 @@ impl MergeInsertJob {
 
         // Then we pass the key column into the index mapper
         let index_column = self.params.on[0].clone();
-        let index_mapper = Arc::new(MapIndexExec::new(
+        let mut index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new(
             // create index from original data and key column
             self.dataset.clone(),
             index_column.clone(),
             index_mapper_input,
         ));
 
-        // 4 - Take the mapped row addresses
+        // If requested, add row addresses to the output
+        if add_row_addr {
+            let pos = index_mapper.schema().fields().len(); // Add to end
+            index_mapper = Arc::new(AddRowAddrExec::try_new(
+                index_mapper,
+                self.dataset.clone(),
+                pos,
+            )?);
+        }
+
+        // 4 - Take the mapped row ids
         let mut target = Arc::new(TakeExec::try_new(
             self.dataset.clone(),
             index_mapper,
-            Arc::new(self.dataset.schema().clone()),
+            // Arc::new(self.dataset.schema().clone()),
+            Arc::new(self.dataset.schema().project_by_schema(schema.as_ref())?),
             num_cpus::get(),
         )?) as Arc<dyn ExecutionPlan>;
 
@@ -444,19 +465,33 @@ impl MergeInsertJob {
         //     index) puts the row id at the end.  We need to match these up so we reorder the row
         //     id to the end
         let schema = target.schema();
-        let fields = schema.fields();
-        let mut columns = fields[1..].to_vec();
-        columns.push(fields[0].clone());
+        let mut columns = schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() != ROW_ID && f.name() != ROW_ADDR)
+            .cloned()
+            .collect::<Vec<_>>();
+        columns.push(Arc::new(ROW_ID_FIELD.clone()));
+        if add_row_addr {
+            columns.push(Arc::new(ROW_ADDR_FIELD.clone()));
+        }
         target = Arc::new(project(target, &Schema::new(columns))?);
+
+        let mut column_names = schema.field_names().to_vec();
+        column_names.pop(); // no row_id
 
         // 5a - We also need to scan any new unindexed data and union it in
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
-            let unindexed_data = self
-                .dataset
-                .scan()
+            let mut builder = self.dataset.scan();
+            if add_row_addr {
+                builder.with_row_address();
+            }
+            let unindexed_data = builder
                 .with_row_id()
                 .with_fragments(unindexed_fragments)
+                .project(&column_names)
+                .unwrap()
                 .create_plan()
                 .await?;
             let unioned = UnionExec::new(vec![target, unindexed_data]);
@@ -474,7 +509,7 @@ impl MergeInsertJob {
             HashJoinExec::try_new(
                 shared_input,
                 target,
-                vec![(Arc::new(target_key), Arc::new(source_key))],
+                vec![(Arc::new(source_key), Arc::new(target_key))],
                 None,
                 &JoinType::Full,
                 None,
@@ -523,7 +558,6 @@ impl MergeInsertJob {
                     .iter()
                     .map(|s| s.as_str())
                     .chain([ROW_ID, ROW_ADDR])
-                    // .chain(join_cols.iter().cloned())
                     .collect::<Vec<_>>();
                 let projected = existing.select_columns(&columns)?;
                 // We aren't supporting inserts or deletes right now, so we can use inner join
@@ -1170,7 +1204,7 @@ impl Merger {
                 }
             }
 
-            merge_statistics.num_updated_rows = matched.num_rows() as u64;
+            merge_statistics.num_updated_rows += matched.num_rows() as u64;
 
             // If the filter eliminated all rows then its important we don't try and write
             // the batch at all.  Writing an empty batch currently panics
@@ -1206,13 +1240,13 @@ impl Merger {
                 Vec::from_iter(not_matched.columns().iter().cloned()),
             )?;
 
-            merge_statistics.num_inserted_rows = not_matched.num_rows() as u64;
+            merge_statistics.num_inserted_rows += not_matched.num_rows() as u64;
             batches.push(Ok(not_matched));
         }
         match self.params.delete_not_matched_by_source {
             WhenNotMatchedBySource::Delete => {
                 let unmatched = arrow::compute::filter(batch.column(row_id_col), &right_only)?;
-                merge_statistics.num_deleted_rows = unmatched.len() as u64;
+                merge_statistics.num_deleted_rows += unmatched.len() as u64;
                 let row_ids = unmatched.as_primitive::<UInt64Type>();
                 deleted_row_ids.extend(row_ids.values());
             }
@@ -1229,13 +1263,13 @@ impl Merger {
                             mask.as_boolean(),
                         )?;
                         let row_ids = row_ids.as_primitive::<UInt64Type>();
-                        merge_statistics.num_deleted_rows = row_ids.len() as u64;
+                        merge_statistics.num_deleted_rows += row_ids.len() as u64;
                         deleted_row_ids.extend(row_ids.values());
                     }
                     ColumnarValue::Scalar(scalar) => {
                         if let ScalarValue::Boolean(Some(true)) = scalar {
                             let row_ids = unmatched.column(row_id_col).as_primitive::<UInt64Type>();
-                            merge_statistics.num_deleted_rows = row_ids.len() as u64;
+                            merge_statistics.num_deleted_rows += row_ids.len() as u64;
                             deleted_row_ids.extend(row_ids.values());
                         }
                     }
@@ -1672,13 +1706,14 @@ mod tests {
 
     mod subcols {
         use super::*;
+        use rstest::rstest;
 
         struct Fixtures {
             ds: Arc<Dataset>,
             new_data: RecordBatch,
         }
 
-        async fn setup() -> Fixtures {
+        async fn setup(scalar_index: bool) -> Fixtures {
             let data = lance_datagen::gen()
                 .with_seed(Seed::from(1))
                 .col("other", array::rand_utf8(4.into(), false))
@@ -1696,9 +1731,17 @@ mod tests {
                 max_rows_per_group: 32, // Non-standard group size to hit edge cases
                 ..Default::default()
             };
-            let ds = Dataset::write(reader, "memory://", Some(write_params))
+            let mut ds = Dataset::write(reader, "memory://", Some(write_params))
                 .await
                 .unwrap();
+
+            if scalar_index {
+                let index_params = ScalarIndexParams::default();
+                ds.create_index(&["key"], IndexType::Scalar, None, &index_params, false)
+                    .await
+                    .unwrap();
+            }
+
             let ds = Arc::new(ds);
 
             // New data with only a subset of columns
@@ -1720,7 +1763,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_delete_not_supported() {
-            let Fixtures { ds, new_data } = setup().await;
+            let Fixtures { ds, new_data } = setup(false).await;
 
             let reader = Box::new(RecordBatchIterator::new(
                 [Ok(new_data.clone())],
@@ -1749,7 +1792,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_insert_not_supported() {
-            let Fixtures { ds, new_data } = setup().await;
+            let Fixtures { ds, new_data } = setup(false).await;
 
             let reader = Box::new(RecordBatchIterator::new(
                 [Ok(new_data.clone())],
@@ -1773,7 +1816,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_errors_on_bad_schema() {
-            let Fixtures { ds, new_data } = setup().await;
+            let Fixtures { ds, new_data } = setup(false).await;
 
             // Schema with different names, which should be rejected.
             let bad_schema = Arc::new(Schema::new(vec![
@@ -1804,9 +1847,10 @@ mod tests {
             );
         }
 
+        #[rstest]
         #[tokio::test]
-        async fn test_merge_insert_subcols() {
-            let Fixtures { ds, new_data } = setup().await;
+        async fn test_merge_insert_subcols(#[values(false, true)] scalar_index: bool) {
+            let Fixtures { ds, new_data } = setup(scalar_index).await;
             let reader = Box::new(RecordBatchIterator::new(
                 [Ok(new_data.clone())],
                 new_data.schema(),
