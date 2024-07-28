@@ -384,6 +384,10 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
         }
     }
 
+    if indices.is_empty() {
+        return (Arc::new(UInt64Array::from(Vec::<u64>::default())), 0);
+    }
+
     let last_offset = *indices.last().expect("Indices array is empty");
     // 8 exabytes in a single array seems unlikely but...just in case
     assert!(

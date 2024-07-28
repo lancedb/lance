@@ -1200,6 +1200,7 @@ mod tests {
 
     use std::{collections::HashMap, sync::Arc};
 
+    use arrow::array::StringBuilder;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
         ArrayRef, BooleanArray, ListArray,
@@ -1291,6 +1292,23 @@ mod tests {
         // When encoding a list of empty lists there are no items to encode
         // which is strange and we want to ensure we handle it
         let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append(true);
+        list_builder.append_null();
+        list_builder.append(true);
+        let list_array = Arc::new(list_builder.finish());
+
+        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
+        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
+            .await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+
+        // Scenario 2: All lists are empty (but now with strings)
+
+        // When encoding a list of empty lists there are no items to encode
+        // which is strange and we want to ensure we handle it
+        let items_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         list_builder.append(true);
         list_builder.append_null();
