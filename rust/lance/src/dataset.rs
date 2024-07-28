@@ -86,7 +86,7 @@ pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 /// Lance Dataset
 #[derive(Debug, Clone)]
 pub struct Dataset {
-    pub(crate) object_store: Arc<ObjectStore>,
+    pub object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
     /// Uri of the dataset.
     ///
