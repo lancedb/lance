@@ -477,8 +477,11 @@ impl MergeInsertJob {
         }
         target = Arc::new(project(target, &Schema::new(columns))?);
 
-        let mut column_names = schema.field_names().to_vec();
-        column_names.pop(); // no row_id
+        let column_names = schema
+            .field_names()
+            .into_iter()
+            .filter(|name| name.as_str() != ROW_ID && name.as_str() != ROW_ADDR)
+            .collect::<Vec<_>>();
 
         // 5a - We also need to scan any new unindexed data and union it in
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
@@ -1720,10 +1723,12 @@ mod tests {
                 .col("value", array::step::<UInt32Type>())
                 .col("key", array::rand_pseduo_uuid_hex());
             let batch = data.into_batch_rows(RowCount::from(1024)).unwrap();
+            let batch1 = batch.slice(0, 512);
+            let batch2 = batch.slice(512, 512);
             let schema = batch.schema();
 
             let reader = Box::new(RecordBatchIterator::new(
-                [Ok(batch.clone())],
+                [Ok(batch1.clone())],
                 schema.clone(),
             ));
             let write_params = WriteParams {
@@ -1731,7 +1736,7 @@ mod tests {
                 max_rows_per_group: 32, // Non-standard group size to hit edge cases
                 ..Default::default()
             };
-            let mut ds = Dataset::write(reader, "memory://", Some(write_params))
+            let mut ds = Dataset::write(reader, "memory://", Some(write_params.clone()))
                 .await
                 .unwrap();
 
@@ -1741,6 +1746,13 @@ mod tests {
                     .await
                     .unwrap();
             }
+
+            // Another two batches, not in the scalar index (if there is one)
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(batch2.clone())],
+                batch2.schema(),
+            ));
+            ds.append(reader, Some(write_params)).await.unwrap();
 
             let ds = Arc::new(ds);
 
