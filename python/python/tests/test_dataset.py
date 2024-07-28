@@ -1073,9 +1073,13 @@ def test_merge_insert_subcols(tmp_path: Path):
     assert fragments[1].fragment_id == original_fragments[1].fragment_id
 
     assert len(fragments[0].data_files()) == 2
-    assert fragments[0].data_files()[0] == original_fragments[0].data_files()[0]
+    assert str(fragments[0].data_files()[0]) == str(
+        original_fragments[0].data_files()[0]
+    )
     assert len(fragments[1].data_files()) == 1
-    assert fragments[1].data_files()[0] == original_fragments[1].data_files()[0]
+    assert str(fragments[1].data_files()[0]) == str(
+        original_fragments[1].data_files()[0]
+    )
 
 
 def test_flat_vector_search_with_delete(tmp_path: Path):
@@ -1258,7 +1262,10 @@ def test_merge_insert_incompatible_schema(tmp_path: Path):
 
     with pytest.raises(OSError):
         merge_dict = (
-            dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+            dataset.merge_insert("a")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(new_table)
         )
         check_merge_stats(merge_dict, (None, None, None))
 
