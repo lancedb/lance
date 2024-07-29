@@ -351,7 +351,6 @@ impl TokenSet {
 struct InvertedListReader {
     reader: Arc<dyn IndexReader>,
     offsets: Vec<usize>,
-    // lengths: Vec<usize>,
 
     // cache
     posting_cache: Cache<u32, PostingList>,
@@ -382,13 +381,6 @@ impl InvertedListReader {
             .ok_or_else(|| Error::io("offsets not found".to_string(), location!()))?;
         let offsets: Vec<usize> = serde_json::from_str(offsets)?;
 
-        // let lengths = reader
-        //     .schema()
-        //     .metadata
-        //     .get("lengths")
-        //     .ok_or_else(|| Error::io("lengths not found".to_string(), location!()))?;
-        // let lengths: Vec<usize> = serde_json::from_str(lengths)?;
-
         let cache = Cache::builder()
             .max_capacity(*CACHE_SIZE as u64)
             .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
@@ -396,7 +388,6 @@ impl InvertedListReader {
         Ok(Self {
             reader,
             offsets,
-            // lengths,
             posting_cache: cache,
         })
     }

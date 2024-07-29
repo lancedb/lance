@@ -5,7 +5,6 @@
 //!
 //!
 
-use core::panic;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -56,7 +55,9 @@ async fn main() {
         .unwrap();
 
         let batches = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-        let mut dataset = Dataset::write(batches, "fts.lance", None).await.unwrap();
+        let mut dataset = Dataset::write(batches, dataset_dir.as_ref(), None)
+            .await
+            .unwrap();
         let scalar_index_params = ScalarIndexParams {
             force_index_type: Some(ScalarIndexType::Inverted),
         };
@@ -72,7 +73,7 @@ async fn main() {
             .unwrap();
     }
 
-    let dataset = Dataset::open("fts.lance").await.unwrap();
+    let dataset = Dataset::open(dataset_dir.as_ref()).await.unwrap();
     let query = tokens[0];
     let query = FullTextSearchQuery::new(query.to_owned()).limit(Some(10));
     println!("query: {:?}", query);
@@ -99,18 +100,18 @@ async fn main() {
         .unwrap();
     println!("full_text_search: {:?}", start.elapsed());
 
-    // let batch = dataset
-    //     .scan()
-    //     .project(&["doc"])
-    //     .unwrap()
-    //     .with_row_id()
-    //     .try_into_batch()
-    //     .await
-    //     .unwrap();
-    // let flat_results = flat_full_text_search(&[&batch], "doc", query)
-    //     .unwrap()
-    //     .into_iter()
-    //     .collect::<HashSet<_>>();
-    // assert_gt!(index_results.len(), 0);
-    // assert_eq!(index_results, flat_results);
+    let batch = dataset
+        .scan()
+        .project(&["doc"])
+        .unwrap()
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let flat_results = flat_full_text_search(&[&batch], "doc", &query.query)
+        .unwrap()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    assert_gt!(index_results.len(), 0);
+    assert_eq!(index_results, flat_results);
 }
