@@ -70,12 +70,6 @@ pub struct TrainingRequest {
 
 #[async_trait]
 impl TrainingSource for TrainingRequest {
-    // async fn scan_chunks(self: Box<Self>, chunk_size: u32) -> Result<SendableRecordBatchStream> {
-    //     let scan = self.dataset.scan().with_row_id().project(&[&self.column])?;
-    //     let batches = scan.try_into_stream().await?;
-    //     Ok(chunk_concat_stream(batches, chunk_size as usize))
-    // }
-
     async fn scan_ordered_chunks(
         self: Box<Self>,
         chunk_size: u32,
