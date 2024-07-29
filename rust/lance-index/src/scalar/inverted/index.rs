@@ -135,7 +135,7 @@ impl InvertedIndex {
         let postings = stream::iter(token_ids.into_iter())
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
             .map(|(token_id, (inverted_list, mask))| async move {
-                let posting = inverted_list.posting_reader(token_id).await?;
+                let posting = inverted_list.posting_list(token_id).await?;
                 Result::Ok(PostingIterator::new(
                     token_id,
                     posting,
@@ -354,10 +354,10 @@ impl TokenSet {
 struct InvertedListReader {
     reader: Arc<dyn IndexReader>,
     offsets: Vec<usize>,
-    lengths: Vec<usize>,
+    // lengths: Vec<usize>,
 
     // cache
-    posting_cache: Cache<u32, PostingListReader>,
+    posting_cache: Cache<u32, PostingList>,
 }
 
 impl std::fmt::Debug for InvertedListReader {
@@ -371,7 +371,7 @@ impl std::fmt::Debug for InvertedListReader {
 impl DeepSizeOf for InvertedListReader {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.offsets.deep_size_of_children(context)
-            + self.lengths.deep_size_of_children(context)
+            // + self.lengths.deep_size_of_children(context)
             + self.posting_cache.weighted_size() as usize
     }
 }
@@ -385,80 +385,105 @@ impl InvertedListReader {
             .ok_or_else(|| Error::io("offsets not found".to_string(), location!()))?;
         let offsets: Vec<usize> = serde_json::from_str(offsets)?;
 
-        let lengths = reader
-            .schema()
-            .metadata
-            .get("lengths")
-            .ok_or_else(|| Error::io("lengths not found".to_string(), location!()))?;
-        let lengths: Vec<usize> = serde_json::from_str(lengths)?;
+        // let lengths = reader
+        //     .schema()
+        //     .metadata
+        //     .get("lengths")
+        //     .ok_or_else(|| Error::io("lengths not found".to_string(), location!()))?;
+        // let lengths: Vec<usize> = serde_json::from_str(lengths)?;
 
         let cache = Cache::builder()
             .max_capacity(*CACHE_SIZE as u64)
-            .weigher(|_, posting: &PostingListReader| posting.deep_size_of() as u32)
+            .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
             .build();
         Ok(Self {
             reader,
             offsets,
-            lengths,
+            // lengths,
             posting_cache: cache,
         })
     }
 
     pub(crate) fn posting_len(&self, token_id: u32) -> usize {
-        self.lengths[token_id as usize]
+        let token_id = token_id as usize;
+        let next_offset = self
+            .offsets
+            .get(token_id + 1)
+            .copied()
+            .unwrap_or(self.reader.num_rows());
+        next_offset - self.offsets[token_id]
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub(crate) async fn posting_reader(&self, token_id: u32) -> Result<PostingListReader> {
+    pub(crate) async fn posting_list(&self, token_id: u32) -> Result<PostingList> {
         self.posting_cache
             .try_get_with(token_id, async move {
                 let length = self.posting_len(token_id);
-                let block_size = block_size(length);
-                let num_blocks = length.div_ceil(block_size);
-
                 let token_id = token_id as usize;
                 let offset = self.offsets[token_id];
-                // read the first element of each block
-                // and cache first `num_blocks_to_cache` to reduce the number of reads,
-                // the `num_blocks_to_cache` is the max number of blocks to read,
-                // and the total bytes to read is still within MIN_IO_SIZE
-                let num_blocks_to_cache = max(
-                    0,
-                    num_blocks_to_read(num_blocks, block_size) - num_blocks.div_ceil(block_size),
-                );
-                let num_rows_to_cache = min(length, num_blocks_to_cache * block_size);
-                let batch = self
-                    .reader
-                    .read_range(offset..offset + num_blocks + num_rows_to_cache)
-                    .await?;
-                let head_batch = batch.slice(0, num_blocks);
-                let row_ids = head_batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-                let frequencies = head_batch[FREQUENCY_COL]
-                    .as_primitive::<Float32Type>()
-                    .clone();
-
-                let cached_blocks = (0..num_rows_to_cache)
-                    .step_by(block_size)
-                    .map(|offset| {
-                        let offset = offset + num_blocks;
-                        let length = min(batch.num_rows() - offset, block_size);
-                        batch.slice(offset, length).into()
-                    })
-                    .collect();
-
-                Result::Ok(PostingListReader {
-                    reader: self.reader.clone(),
-                    term_offset: offset,
-                    length,
-                    row_ids: row_ids.values().to_vec(),
-                    frequencies: frequencies.values().to_vec(),
-                    block_id: 0,
-                    blocks: cached_blocks,
-                })
+                let batch = self.reader.read_range(offset..offset + length).await?;
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
+                Result::Ok(PostingList::new(
+                    row_ids.values().to_vec(),
+                    frequencies.values().to_vec(),
+                ))
             })
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))
     }
+
+    // #[instrument(level = "debug", skip(self))]
+    // pub(crate) async fn posting_reader(&self, token_id: u32) -> Result<PostingListReader> {
+    //     self.posting_cache
+    //         .try_get_with(token_id, async move {
+    //             let length = self.posting_len(token_id);
+    //             let block_size = block_size(length);
+    //             let num_blocks = length.div_ceil(block_size);
+
+    //             let token_id = token_id as usize;
+    //             let offset = self.offsets[token_id];
+    //             // read the first element of each block
+    //             // and cache first `num_blocks_to_cache` to reduce the number of reads,
+    //             // the `num_blocks_to_cache` is the max number of blocks to read,
+    //             // and the total bytes to read is still within MIN_IO_SIZE
+    //             let num_blocks_to_cache = max(
+    //                 0,
+    //                 num_blocks_to_read(num_blocks, block_size) - num_blocks.div_ceil(block_size),
+    //             );
+    //             let num_rows_to_cache = min(length, num_blocks_to_cache * block_size);
+    //             let batch = self
+    //                 .reader
+    //                 .read_range(offset..offset + num_blocks + num_rows_to_cache)
+    //                 .await?;
+    //             let head_batch = batch.slice(0, num_blocks);
+    //             let row_ids = head_batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+    //             let frequencies = head_batch[FREQUENCY_COL]
+    //                 .as_primitive::<Float32Type>()
+    //                 .clone();
+
+    //             let cached_blocks = (0..num_rows_to_cache)
+    //                 .step_by(block_size)
+    //                 .map(|offset| {
+    //                     let offset = offset + num_blocks;
+    //                     let length = min(batch.num_rows() - offset, block_size);
+    //                     batch.slice(offset, length).into()
+    //                 })
+    //                 .collect();
+
+    //             Result::Ok(PostingListReader {
+    //                 reader: self.reader.clone(),
+    //                 term_offset: offset,
+    //                 length,
+    //                 row_ids: row_ids.values().to_vec(),
+    //                 frequencies: frequencies.values().to_vec(),
+    //                 block_id: 0,
+    //                 blocks: cached_blocks,
+    //             })
+    //         })
+    //         .await
+    //         .map_err(|e| Error::io(e.to_string(), location!()))
+    // }
 }
 
 fn block_head_indices(length: usize) -> Vec<usize> {
@@ -488,6 +513,14 @@ impl PostingList {
         self.len() == 0
     }
 
+    pub fn doc(&self, i: usize) -> (u64, f32) {
+        (self.row_ids[i], self.frequencies[i])
+    }
+
+    pub fn row_id(&self, i: usize) -> u64 {
+        self.row_ids[i]
+    }
+
     pub fn to_batch(&self) -> Result<RecordBatch> {
         let indices = (0..self.row_ids.len())
             .sorted_unstable_by_key(|&i| self.row_ids[i])
@@ -496,17 +529,17 @@ impl PostingList {
         let frequency_col =
             Float32Array::from_iter_values(indices.iter().map(|&i| self.frequencies[i]));
 
-        let block_head_indices = block_head_indices(self.len());
-        let block_head_row_ids = UInt64Array::from_iter_values(
-            block_head_indices
-                .iter()
-                .map(|&index| row_id_col.values()[index]),
-        );
-        let block_head_freqs = Float32Array::from_iter_values(
-            block_head_indices
-                .iter()
-                .map(|&index| frequency_col.values()[index]),
-        );
+        // let block_head_indices = block_head_indices(self.len());
+        // let block_head_row_ids = UInt64Array::from_iter_values(
+        //     block_head_indices
+        //         .iter()
+        //         .map(|&index| row_id_col.values()[index]),
+        // );
+        // let block_head_freqs = Float32Array::from_iter_values(
+        //     block_head_indices
+        //         .iter()
+        //         .map(|&index| frequency_col.values()[index]),
+        // );
 
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
@@ -516,8 +549,8 @@ impl PostingList {
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
-                concat(&[&block_head_row_ids, &row_id_col])?,
-                concat(&[&block_head_freqs, &frequency_col])?,
+                Arc::new(row_id_col) as ArrayRef,
+                Arc::new(frequency_col) as ArrayRef,
             ],
         )?;
         Ok(batch)
