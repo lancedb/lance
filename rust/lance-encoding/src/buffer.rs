@@ -104,7 +104,7 @@ impl LanceBuffer {
         }
     }
 
-    /// Clones the buffer but fails if the buffer is in borrowed mode
+    /// Clones the buffer but fails if the buffer is in owned mode
     pub fn try_clone(&self) -> Result<Self> {
         match self {
             LanceBuffer::Borrowed(buffer) => Ok(LanceBuffer::Borrowed(buffer.clone())),
