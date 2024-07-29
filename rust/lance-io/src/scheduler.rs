@@ -273,8 +273,6 @@ impl FileScheduler {
 
         let mut updated_requests = Vec::with_capacity(request.len());
 
-        let copy_request = request.clone();
-
         if !request.is_empty() {
             let mut curr_interval = request[0].clone();
 
@@ -290,23 +288,20 @@ impl FileScheduler {
             updated_requests.push(curr_interval);
         }
 
-        let copy_updated_requests = updated_requests.clone();
-
         let bytes_vec_fut =
             self.root
-                .submit_request(self.reader.clone(), updated_requests, priority);
+                .submit_request(self.reader.clone(), updated_requests.clone(), priority);
 
         let mut updated_index = 0;
-        let mut final_bytes = Vec::with_capacity(copy_request.len());
+        let mut final_bytes = Vec::with_capacity(request.len());
 
         async move {
             let bytes_vec = bytes_vec_fut.await?;
 
             let mut orig_index = 0;
-            while (updated_index < copy_updated_requests.len()) && (orig_index < copy_request.len())
-            {
-                let updated_range = &copy_updated_requests[updated_index];
-                let orig_range = &copy_request[orig_index];
+            while (updated_index < updated_requests.len()) && (orig_index < request.len()) {
+                let updated_range = &updated_requests[updated_index];
+                let orig_range = &request[orig_index];
                 let byte_offset = updated_range.start as usize;
 
                 if is_overlapping(updated_range, orig_range) {

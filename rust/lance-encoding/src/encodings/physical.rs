@@ -151,10 +151,11 @@ pub fn decoder_from_array_encoding(
             decoder_from_array_encoding(list.offsets.as_ref().unwrap(), buffers, data_type)
         }
         pb::array_encoding::ArrayEncoding::Binary(binary) => {
-            let indices_buffer_desc = binary.indices.as_ref().unwrap();
-            let (buffer_offset, _) = get_buffer(indices_buffer_desc, buffers);
+            let indices_encoding = binary.indices.as_ref().unwrap();
             let bytes_encoding = binary.bytes.as_ref().unwrap();
 
+            let indices_scheduler =
+                decoder_from_array_encoding(indices_encoding, buffers, data_type);
             let bytes_scheduler = decoder_from_array_encoding(bytes_encoding, buffers, data_type);
 
             let offset_type = match data_type {
@@ -163,9 +164,9 @@ pub fn decoder_from_array_encoding(
             };
 
             Box::new(BinaryPageScheduler::new(
+                indices_scheduler.into(),
                 bytes_scheduler.into(),
                 offset_type,
-                buffer_offset,
                 binary.null_adjustment,
             ))
         }
