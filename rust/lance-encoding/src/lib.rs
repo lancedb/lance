@@ -8,6 +8,8 @@ use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 
 use lance_core::Result;
 
+pub mod buffer;
+pub mod data;
 pub mod decoder;
 pub mod encoder;
 pub mod encodings;

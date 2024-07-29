@@ -129,3 +129,7 @@ harness = false
 [[bench]]
 name = "ivf_pq"
 harness = false
+
+[[bench]]
+name = "take"
+harness = false
