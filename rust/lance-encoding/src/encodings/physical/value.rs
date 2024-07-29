@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::ArrayRef;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 use snafu::{location, Location};
@@ -10,6 +10,8 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+use crate::buffer::LanceBuffer;
+use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encoder::BufferEncodingStrategy;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -179,58 +181,60 @@ impl ValuePageDecoder {
         !self.uncompressed_range_offsets.is_empty()
     }
 
-    fn decode_buffer(
-        &self,
-        buf: &Bytes,
-        bytes_to_skip: &mut u64,
-        bytes_to_take: &mut u64,
-        dest: &mut bytes::BytesMut,
-    ) {
-        let buf_len = buf.len() as u64;
-        if *bytes_to_skip > buf_len {
-            *bytes_to_skip -= buf_len;
-        } else {
-            let bytes_to_take_here = (buf_len - *bytes_to_skip).min(*bytes_to_take);
-            *bytes_to_take -= bytes_to_take_here;
-            let start = *bytes_to_skip as usize;
-            let end = start + bytes_to_take_here as usize;
-            dest.extend_from_slice(&buf.slice(start..end));
-            *bytes_to_skip = 0;
+    fn decode_buffers<'a>(
+        &'a self,
+        buffers: impl IntoIterator<Item = &'a Bytes>,
+        mut bytes_to_skip: u64,
+        mut bytes_to_take: u64,
+    ) -> LanceBuffer {
+        let mut dest: Option<Vec<u8>> = None;
+
+        for buf in buffers.into_iter() {
+            let buf_len = buf.len() as u64;
+            if bytes_to_skip > buf_len {
+                bytes_to_skip -= buf_len;
+            } else {
+                let bytes_to_take_here = (buf_len - bytes_to_skip).min(bytes_to_take);
+                bytes_to_take -= bytes_to_take_here;
+                let start = bytes_to_skip as usize;
+                let end = start + bytes_to_take_here as usize;
+                let slice = buf.slice(start..end);
+                match (&mut dest, bytes_to_take) {
+                    (None, 0) => {
+                        // The entire request is contained in one buffer so we can maybe zero-copy
+                        // if the slice is aligned properly
+                        return LanceBuffer::from_bytes(slice, self.bytes_per_value);
+                    }
+                    (None, _) => {
+                        dest.replace(Vec::with_capacity(bytes_to_take as usize));
+                    }
+                    _ => {}
+                }
+                dest.as_mut().unwrap().extend_from_slice(&slice);
+                bytes_to_skip = 0;
+            }
         }
+        LanceBuffer::from(dest.unwrap_or_default())
     }
 }
 
 impl PrimitivePageDecoder for ValuePageDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        _all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
-        let mut bytes_to_skip = rows_to_skip * self.bytes_per_value;
-        let mut bytes_to_take = num_rows * self.bytes_per_value;
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+        let bytes_to_skip = rows_to_skip * self.bytes_per_value;
+        let bytes_to_take = num_rows * self.bytes_per_value;
 
-        let mut dest_buffers = vec![BytesMut::with_capacity(bytes_to_take as usize)];
-
-        let dest = &mut dest_buffers[0];
-
-        debug_assert!(dest.capacity() as u64 >= bytes_to_take);
-
-        if self.is_compressed() {
+        let data_buffer = if self.is_compressed() {
             let decoding_data = self.get_uncompressed_bytes()?;
-            for buf in decoding_data.lock().unwrap().as_ref().unwrap() {
-                self.decode_buffer(buf, &mut bytes_to_skip, &mut bytes_to_take, dest);
-            }
+            let buffers = decoding_data.lock().unwrap();
+            self.decode_buffers(buffers.as_ref().unwrap(), bytes_to_skip, bytes_to_take)
         } else {
-            for buf in &self.data {
-                self.decode_buffer(buf, &mut bytes_to_skip, &mut bytes_to_take, dest);
-            }
-        }
-        Ok(dest_buffers)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        1
+            self.decode_buffers(&self.data, bytes_to_skip, bytes_to_take)
+        };
+        Ok(Box::new(FixedWidthDataBlock {
+            bits_per_value: self.bytes_per_value * 8,
+            data: data_buffer,
+            num_values: num_rows,
+        }))
     }
 }
 

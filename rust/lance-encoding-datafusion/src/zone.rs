@@ -604,7 +604,7 @@ mod tests {
 
         let decoder_middleware = DecoderMiddlewareChain::new()
             .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy));
+            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
 
@@ -618,7 +618,7 @@ mod tests {
 
         let decoder_middleware = DecoderMiddlewareChain::new()
             .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy));
+            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
         let result = count_lance_file(
             &fs,
@@ -638,7 +638,7 @@ mod tests {
 
         let decoder_middleware = DecoderMiddlewareChain::new()
             .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy));
+            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
         let result = count_lance_file(
             &fs,

@@ -4,14 +4,15 @@
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
+use lance::index::vector::ivf::builder::write_vector_storage;
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
-    pq::PQBuildParams,
+    pq::{PQBuildParams, ProductQuantizer},
 };
 use lance_linalg::distance::DistanceType;
 use pyo3::{pyfunction, types::PyModule, wrap_pyfunction, PyObject, PyResult, Python};
 
-use crate::{dataset::Dataset, error::PythonErrorExt, RT};
+use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -139,10 +140,78 @@ fn train_pq_model(
     codebook.to_pyarrow(py)
 }
 
+async fn do_transform_vectors(
+    dataset: &Dataset,
+    column: &str,
+    distance_type: DistanceType,
+    ivf_centroids: FixedSizeListArray,
+    pq_model: ProductQuantizer,
+    dst_uri: &str,
+) -> PyResult<()> {
+    let num_rows = dataset.ds.count_rows(None).await.infer_error()?;
+    let transform_input = dataset
+        .ds
+        .scan()
+        .project(&[column])
+        .infer_error()?
+        .with_row_id()
+        .batch_size(8192)
+        .try_into_stream()
+        .await
+        .infer_error()?;
+
+    let (obj_store, path) = object_store_from_uri_or_path(dst_uri).await?;
+    let writer = obj_store.create(&path).await.infer_error()?;
+    write_vector_storage(
+        transform_input,
+        num_rows as u64,
+        ivf_centroids,
+        pq_model,
+        distance_type,
+        column,
+        writer,
+    )
+    .await
+    .infer_error()?;
+    Ok(())
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn transform_vectors(
+    py: Python<'_>,
+    dataset: &Dataset,
+    column: &str,
+    dimension: usize,
+    num_subvectors: u32,
+    distance_type: &str,
+    ivf_centroids: PyArrowType<ArrayData>,
+    pq_codebook: PyArrowType<ArrayData>,
+    dst_uri: &str,
+) -> PyResult<()> {
+    let ivf_centroids = ivf_centroids.0;
+    let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
+    let codebook = pq_codebook.0;
+    let codebook = FixedSizeListArray::from(codebook);
+    let distance_type = DistanceType::try_from(distance_type).unwrap();
+    let pq = ProductQuantizer::new(
+        num_subvectors as usize,
+        /*num_bits=*/ 8,
+        dimension,
+        codebook,
+        distance_type,
+    );
+    RT.block_on(
+        Some(py),
+        do_transform_vectors(dataset, column, distance_type, ivf_centroids, pq, dst_uri),
+    )?
+}
+
 pub fn register_indices(py: Python, m: &PyModule) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
+    indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     m.add_submodule(indices)?;
     Ok(())
 }

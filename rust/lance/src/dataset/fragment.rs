@@ -24,9 +24,9 @@ use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_encoding::decoder::DecoderMiddlewareChain;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
-use lance_file::v2::reader::ReaderProjection;
+use lance_file::v2::reader::{CachedFileMetadata, ReaderProjection};
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::ScanScheduler;
+use lance_io::scheduler::{FileScheduler, ScanScheduler};
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
@@ -542,11 +542,13 @@ impl FileFragment {
             let store_scheduler = scan_scheduler
                 .unwrap_or_else(|| ScanScheduler::new(self.dataset.object_store.clone()));
             let file_scheduler = store_scheduler.open_file(&path).await?;
+            let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let reader = Arc::new(
-                v2::reader::FileReader::try_open(
+                v2::reader::FileReader::try_open_with_file_metadata(
                     file_scheduler,
                     None,
                     DecoderMiddlewareChain::default(),
+                    file_metadata,
                 )
                 .await?,
             );
@@ -945,6 +947,24 @@ impl FileFragment {
                 None => Ok(None),
             }
         }
+    }
+
+    /// Get the file metadata for this fragment, using the cache if available.
+    async fn get_file_metadata(
+        &self,
+        file_scheduler: &FileScheduler,
+    ) -> Result<Arc<CachedFileMetadata>> {
+        let cache = &self.dataset.session.file_metadata_cache;
+        let path = file_scheduler.reader().path();
+
+        let file_metadata = cache
+            .get_or_insert(path, |_path| async {
+                let file_metadata: CachedFileMetadata =
+                    v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
+                Ok(file_metadata)
+            })
+            .await?;
+        Ok(file_metadata)
     }
 
     /// Take rows based on internal local row offsets

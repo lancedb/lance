@@ -4,26 +4,31 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.file import LanceFileReader
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
+NUM_ROWS = 10000
+DIMENSION = 128
+NUM_SUBVECTORS = 8
+NUM_PARTITIONS = 100
 
-def gen_dataset(tmpdir, datatype=np.float32):
-    vectors = np.random.randn(10000, 128).astype(datatype)
+
+@pytest.fixture(params=[np.float16, np.float32, np.float64], ids=["f16", "f32", "f64"])
+def rand_dataset(tmpdir, request):
+    vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(request.param)
     vectors.shape = -1
-    vectors = pa.FixedSizeListArray.from_arrays(vectors, 128)
+    vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
     table = pa.Table.from_arrays([vectors], names=["vectors"])
     ds = lance.write_dataset(table, str(tmpdir / "dataset"))
 
     return ds
 
 
-def test_ivf_centroids(tmpdir):
-    ds = gen_dataset(tmpdir)
-
-    ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16)
+def test_ivf_centroids(tmpdir, rand_dataset):
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(sample_rate=16)
 
     assert ivf.distance_type == "l2"
-    assert len(ivf.centroids) == 100
+    assert len(ivf.centroids) == NUM_PARTITIONS
 
     ivf.save(str(tmpdir / "ivf"))
     reloaded = IvfModel.load(str(tmpdir / "ivf"))
@@ -32,33 +37,18 @@ def test_ivf_centroids(tmpdir):
 
 
 @pytest.mark.cuda
-def test_ivf_centroids_cuda(tmpdir):
-    ds = gen_dataset(tmpdir)
-    ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16, accelerator="cuda")
+def test_ivf_centroids_cuda(rand_dataset):
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+        sample_rate=16, accelerator="cuda"
+    )
 
     assert ivf.distance_type == "l2"
-    assert len(ivf.centroids) == 100
+    assert len(ivf.centroids) == NUM_PARTITIONS
 
 
-def test_ivf_centroids_column_type(tmpdir):
-    def check(column_type, typename):
-        ds = gen_dataset(tmpdir / typename, column_type)
-        ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16)
-        assert len(ivf.centroids) == 100
-        ivf.save(str(tmpdir / f"ivf_{typename}"))
-        reloaded = IvfModel.load(str(tmpdir / f"ivf_{typename}"))
-        assert ivf.centroids == reloaded.centroids
-
-    check(np.float16, "f16")
-    check(np.float32, "f32")
-    check(np.float64, "f64")
-
-
-def test_ivf_centroids_distance_type(tmpdir):
-    ds = gen_dataset(tmpdir)
-
+def test_ivf_centroids_distance_type(tmpdir, rand_dataset):
     def check(distance_type):
-        ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
             sample_rate=16, distance_type=distance_type
         )
         assert ivf.distance_type == distance_type
@@ -71,26 +61,25 @@ def test_ivf_centroids_distance_type(tmpdir):
     check("dot")
 
 
-def test_num_partitions(tmpdir):
-    ds = gen_dataset(tmpdir)
-
-    ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16, num_partitions=10)
+def test_num_partitions(rand_dataset):
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+        sample_rate=16, num_partitions=10
+    )
     assert ivf.num_partitions == 10
 
 
 @pytest.fixture
-def ds_with_ivf(tmpdir):
-    ds = gen_dataset(tmpdir)
-    ivf = IndicesBuilder(ds, "vectors").train_ivf(sample_rate=16)
-    return ds, ivf
+def rand_ivf(rand_dataset):
+    dtype = rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    centroids = np.random.rand(DIMENSION * 100).astype(dtype)
+    centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
+    return IvfModel(centroids, "l2")
 
 
-def test_gen_pq(tmpdir, ds_with_ivf):
-    ds, ivf = ds_with_ivf
-
-    pq = IndicesBuilder(ds, "vectors").train_pq(ivf, sample_rate=16)
-    assert pq.dimension == 128
-    assert pq.num_subvectors == 8
+def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
+    pq = IndicesBuilder(rand_dataset, "vectors").train_pq(rand_ivf, sample_rate=2)
+    assert pq.dimension == DIMENSION
+    assert pq.num_subvectors == NUM_SUBVECTORS
 
     pq.save(str(tmpdir / "pq"))
     reloaded = PqModel.load(str(tmpdir / "pq"))
@@ -99,12 +88,10 @@ def test_gen_pq(tmpdir, ds_with_ivf):
 
 
 @pytest.mark.cuda
-def test_assign_partitions(tmpdir):
-    ds = gen_dataset(tmpdir)
-    builder = IndicesBuilder(ds, "vectors")
+def test_assign_partitions(rand_dataset, rand_ivf):
+    builder = IndicesBuilder(rand_dataset, "vectors")
 
-    ivf = builder.train_ivf(sample_rate=16, num_partitions=20)
-    partitions_uri = builder.assign_ivf_partitions(ivf, accelerator="cuda")
+    partitions_uri = builder.assign_ivf_partitions(rand_ivf, accelerator="cuda")
 
     partitions = lance.dataset(partitions_uri)
     found_row_ids = set()
@@ -114,5 +101,33 @@ def test_assign_partitions(tmpdir):
             found_row_ids.add(row_id)
         part_ids = batch["partition"]
         for part_id in part_ids:
-            assert part_id.as_py() < 20
-    assert len(found_row_ids) == ds.count_rows()
+            assert part_id.as_py() < 100
+    assert len(found_row_ids) == rand_dataset.count_rows()
+
+
+@pytest.fixture
+def rand_pq(rand_dataset, rand_ivf):
+    dtype = rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    codebook = np.random.rand(DIMENSION * 256).astype(dtype)
+    codebook = pa.FixedSizeListArray.from_arrays(codebook, DIMENSION)
+    pq = PqModel(NUM_SUBVECTORS, codebook)
+    return pq
+
+
+def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
+    builder = IndicesBuilder(rand_dataset, "vectors")
+    builder.transform_vectors(rand_ivf, rand_pq, str(tmpdir / "transformed"))
+
+    reader = LanceFileReader(str(tmpdir / "transformed"))
+
+    assert reader.metadata().num_rows == 10000
+    data = next(reader.read_all(batch_size=10000).to_batches())
+
+    row_id = data.column("_rowid")
+    assert row_id.type == pa.uint64()
+
+    pq_code = data.column("__pq_code")
+    assert pq_code.type == pa.list_(pa.uint8(), 8)
+
+    part_id = data.column("__ivf_part_id")
+    assert part_id.type == pa.uint32()
