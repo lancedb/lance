@@ -11,7 +11,7 @@ NUM_ROWS = 10000
 DIMENSION = 128
 NUM_SUBVECTORS = 8
 NUM_FRAGMENTS = 3
-NUM_PARTITIONS = round(np.sqrt(NUM_FRAGMENTS*NUM_ROWS))
+NUM_PARTITIONS = round(np.sqrt(NUM_FRAGMENTS * NUM_ROWS))
 
 
 @pytest.fixture(params=[np.float16, np.float32, np.float64], ids=["f16", "f32", "f64"])
@@ -31,6 +31,7 @@ def rand_dataset(tmpdir, request):
     ds = lance.LanceDataset.commit(uri, operation)
 
     return ds
+
 
 def test_ivf_centroids(tmpdir, rand_dataset):
     ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(sample_rate=16)
