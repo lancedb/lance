@@ -8,7 +8,7 @@ use arrow::datatypes::{ArrowPrimitiveType, UInt16Type, UInt32Type, UInt64Type, U
 use arrow::util::bit_util::ceil;
 use arrow_array::{cast::AsArray, Array, ArrayRef, PrimitiveArray};
 use arrow_schema::DataType;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
 use log::trace;
 use num_traits::{AsPrimitive, PrimInt};
@@ -17,6 +17,8 @@ use snafu::{location, Location};
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 
+use crate::buffer::LanceBuffer;
+use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encoder::EncodedBufferMeta;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -310,14 +312,9 @@ struct BitpackedPageDecoder {
 }
 
 impl PrimitivePageDecoder for BitpackedPageDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        _all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         let num_bytes = self.uncompressed_bits_per_value / 8 * num_rows;
-        let mut dest_buffers = vec![BytesMut::with_capacity(num_bytes as usize)];
+        let mut dest = vec![0; num_bytes as usize];
 
         // current maximum supported bits per value = 64
         debug_assert!(self.bits_per_value <= 64);
@@ -325,8 +322,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
         let mut rows_to_skip = rows_to_skip;
         let mut rows_taken = 0;
         let byte_len = self.uncompressed_bits_per_value / 8;
-        let dst = &mut dest_buffers[0];
-        let mut dst_idx = dst.len(); // index for current byte being written to destination buffer
+        let mut dst_idx = 0; // index for current byte being written to destination buffer
 
         // create bit mask for source bits
         let mask = u64::MAX >> (64 - self.bits_per_value);
@@ -364,11 +360,8 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                 let mut dst_offset = 0;
 
                 while src_bits_written < self.bits_per_value {
-                    // add extra byte to buffer to hold next location
-                    dst.extend([0].repeat(dst_idx + 1 - dst.len()));
-
                     // write bits from current source byte into destination
-                    dst[dst_idx] += (curr_src >> src_offset) << dst_offset;
+                    dest[dst_idx] += (curr_src >> src_offset) << dst_offset;
                     let bits_written = (self.bits_per_value - src_bits_written)
                         .min(8 - src_offset)
                         .min(8 - dst_offset);
@@ -427,14 +420,11 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
             }
         }
 
-        // add pad any extra needed 0s onto end of buffer
-        dst.extend([0].repeat(dst_idx + 1 - dst.len()));
-
-        Ok(dest_buffers)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        1
+        Ok(Box::new(FixedWidthDataBlock {
+            data: LanceBuffer::from(dest),
+            bits_per_value: self.uncompressed_bits_per_value,
+            num_values: num_rows,
+        }))
     }
 }
 

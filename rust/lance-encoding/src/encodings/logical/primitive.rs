@@ -3,7 +3,7 @@
 
 use std::{fmt::Debug, ops::Range, sync::Arc};
 
-use arrow_array::{new_null_array, ArrayRef};
+use arrow_array::{make_array, ArrayRef};
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::deepcopy::deep_copy_array;
@@ -20,8 +20,6 @@ use crate::{
     encoder::{ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, FieldEncoder},
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
-
-use crate::encodings::utils::primitive_array_from_buffers;
 
 #[derive(Debug)]
 struct PrimitivePage {
@@ -43,10 +41,16 @@ pub struct PrimitiveFieldScheduler {
     data_type: DataType,
     page_schedulers: Vec<PrimitivePage>,
     num_rows: u64,
+    should_validate: bool,
 }
 
 impl PrimitiveFieldScheduler {
-    pub fn new(data_type: DataType, pages: Arc<[PageInfo]>, buffers: ColumnBuffers) -> Self {
+    pub fn new(
+        data_type: DataType,
+        pages: Arc<[PageInfo]>,
+        buffers: ColumnBuffers,
+        should_validate: bool,
+    ) -> Self {
         let page_schedulers = pages
             .iter()
             .map(|page| {
@@ -67,6 +71,7 @@ impl PrimitiveFieldScheduler {
             data_type,
             page_schedulers,
             num_rows,
+            should_validate,
         }
     }
 }
@@ -164,6 +169,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
             physical_decoder: None,
             rows_drained: 0,
             num_rows: num_rows_in_next,
+            should_validate: self.scheduler.should_validate,
         };
 
         let decoder = Box::new(logical_decoder);
@@ -201,6 +207,7 @@ pub struct PrimitiveFieldDecoder {
     data_type: DataType,
     unloaded_physical_decoder: Option<BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>>,
     physical_decoder: Option<Arc<dyn PrimitivePageDecoder>>,
+    should_validate: bool,
     num_rows: u64,
     rows_drained: u64,
 }
@@ -210,11 +217,13 @@ impl PrimitiveFieldDecoder {
         physical_decoder: Arc<dyn PrimitivePageDecoder>,
         data_type: DataType,
         num_rows: u64,
+        should_validate: bool,
     ) -> Self {
         Self {
             data_type,
             unloaded_physical_decoder: None,
             physical_decoder: Some(physical_decoder),
+            should_validate,
             num_rows,
             rows_drained: 0,
         }
@@ -234,27 +243,20 @@ impl Debug for PrimitiveFieldDecoder {
 struct PrimitiveFieldDecodeTask {
     rows_to_skip: u64,
     rows_to_take: u64,
+    should_validate: bool,
     physical_decoder: Arc<dyn PrimitivePageDecoder>,
     data_type: DataType,
 }
 
 impl DecodeArrayTask for PrimitiveFieldDecodeTask {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
-        let mut all_null = false;
+        let block = self
+            .physical_decoder
+            .decode(self.rows_to_skip, self.rows_to_take)?;
 
-        // The number of buffers needed is based on the data type.
-        // Most data types need two buffers but each layer of fixed-size-list, for
-        // example, adds another validity buffer.
-        let bufs =
-            self.physical_decoder
-                .decode(self.rows_to_skip, self.rows_to_take, &mut all_null)?;
-
-        if all_null {
-            return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));
-        }
-
-        // Convert the buffers into an Arrow array
-        primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)
+        Ok(make_array(
+            block.into_arrow(self.data_type, self.should_validate)?,
+        ))
     }
 }
 
@@ -279,6 +281,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         let task = Box::new(PrimitiveFieldDecodeTask {
             rows_to_skip,
             rows_to_take,
+            should_validate: self.should_validate,
             physical_decoder: self.physical_decoder.as_ref().unwrap().clone(),
             data_type: self.data_type.clone(),
         });

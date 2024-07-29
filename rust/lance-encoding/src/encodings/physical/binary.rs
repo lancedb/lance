@@ -8,10 +8,13 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, ScalarBuffer};
-use bytes::BytesMut;
 use futures::stream::StreamExt;
 use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt};
 
+use crate::buffer::LanceBuffer;
+use crate::data::{
+    DataBlock, DataBlockExt, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock,
+};
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
@@ -102,7 +105,7 @@ impl BinaryPageScheduler {
 impl BinaryPageScheduler {
     fn decode_indices(decoder: Arc<dyn PrimitivePageDecoder>, num_rows: u64) -> Result<ArrayRef> {
         let mut primitive_wrapper =
-            PrimitiveFieldDecoder::new_from_data(decoder, DataType::UInt64, num_rows);
+            PrimitiveFieldDecoder::new_from_data(decoder, DataType::UInt64, num_rows, false);
         let drained_task = primitive_wrapper.drain(num_rows)?;
         let indices_decode_task = drained_task.task;
         indices_decode_task.decode()
@@ -235,12 +238,7 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
     // We only need [8, 13] to decode in this case.
     // These need to be normalized in order to build the string later
     // So return [0, 5]
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         // Buffers[0] == validity buffer
         // Buffers[1] == offsets buffer
         // Buffers[2] == null buffer // TODO: Micro-optimization, can we get rid of this?  Doesn't hurt much though
@@ -255,7 +253,7 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
 
         let validity_buffer = if has_nulls {
             let num_validity_bits = arrow_buffer::bit_util::ceil(num_rows as usize, 8);
-            let mut validity_buffer = BytesMut::with_capacity(num_validity_bits);
+            let mut validity_buffer = Vec::with_capacity(num_validity_bits);
 
             if rows_to_skip == 0 {
                 validity_buffer.extend_from_slice(target_validity.inner().as_slice());
@@ -264,9 +262,9 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
                 let target_validity = BooleanBuffer::from_iter(target_validity.iter());
                 validity_buffer.extend_from_slice(target_validity.inner().as_slice());
             }
-            validity_buffer
+            Some(validity_buffer)
         } else {
-            BytesMut::new()
+            None
         };
 
         // STEP 2: offsets buffer
@@ -294,8 +292,6 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
                     .into_inner(),
                 _ => panic!("Unsupported offsets type"),
             };
-        // TODO: This forces a second copy, which is unfortunate, try and remove in the future
-        let offsets_buf = BytesMut::from(offsets_buffer.as_slice());
 
         let bytes_to_skip = self.decoded_indices.value(rows_to_skip as usize);
         let num_bytes = self
@@ -303,22 +299,24 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
             .value((rows_to_skip + num_rows) as usize)
             - bytes_to_skip;
 
-        let mut output_buffers = vec![validity_buffer, offsets_buf];
+        let bytes = self.bytes_decoder.decode(bytes_to_skip, num_bytes)?;
+        let bytes = bytes.try_into_layout::<FixedWidthDataBlock>()?;
+        debug_assert_eq!(bytes.bits_per_value, 8);
 
-        // Add decoded bytes into output_buffers[2..]
-        // Currently an empty null buffer is the first one
-        // The actual bytes are in the second buffer
-        // Including the indices this results in 4 buffers in total
-        output_buffers.extend(
-            self.bytes_decoder
-                .decode(bytes_to_skip, num_bytes, all_null)?,
-        );
-
-        Ok(output_buffers)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        self.bytes_decoder.num_buffers() + 2
+        let string_data = Box::new(VariableWidthBlock {
+            bits_per_offset: bytes_per_offset * 8,
+            data: bytes.data,
+            num_values: num_rows,
+            offsets: LanceBuffer::from(offsets_buffer),
+        });
+        if let Some(validity) = validity_buffer {
+            Ok(Box::new(NullableDataBlock {
+                data: string_data,
+                nulls: LanceBuffer::from(validity),
+            }))
+        } else {
+            Ok(string_data)
+        }
     }
 }
 

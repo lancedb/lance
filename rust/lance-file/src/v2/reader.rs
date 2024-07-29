@@ -6,6 +6,7 @@ use std::{collections::BTreeSet, io::Cursor, ops::Range, pin::Pin, sync::Arc};
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
+use deepsize::{Context, DeepSizeOf};
 use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_encoding::{
     decoder::{
@@ -42,7 +43,7 @@ use super::io::LanceEncodingsIo;
 // use these later we should make them lazily loaded and then cached once loaded.
 //
 // We store their position / length for debugging purposes
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub struct BufferDescriptor {
     pub position: u64,
     pub size: u64,
@@ -71,6 +72,19 @@ pub struct CachedFileMetadata {
     pub major_version: u16,
     pub minor_version: u16,
 }
+
+impl DeepSizeOf for CachedFileMetadata {
+    // TODO: include size for `column_metadatas` and `column_infos`.
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.file_schema.deep_size_of_children(context)
+            + self
+                .file_buffers
+                .iter()
+                .map(|file_buffer| file_buffer.deep_size_of_children(context))
+                .sum::<usize>()
+    }
+}
+
 /// Selecting columns from a lance file requires specifying both the
 /// index of the column and the data type of the column
 ///
@@ -311,7 +325,7 @@ impl FileReader {
     //
     // Also, if the number of columns is fairly small, it's faster to read them as a
     // single IOP, but we can fix this through coalescing.
-    async fn read_all_metadata(scheduler: &FileScheduler) -> Result<CachedFileMetadata> {
+    pub async fn read_all_metadata(scheduler: &FileScheduler) -> Result<CachedFileMetadata> {
         // 1. read the footer
         let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
         let footer = Self::decode_footer(&tail_bytes)?;
@@ -501,6 +515,22 @@ impl FileReader {
         decoder_strategy: DecoderMiddlewareChain,
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
+        Self::try_open_with_file_metadata(
+            scheduler,
+            base_projection,
+            decoder_strategy,
+            file_metadata,
+        )
+        .await
+    }
+
+    /// Same as `try_open` but with the file metadata already loaded.
+    pub async fn try_open_with_file_metadata(
+        scheduler: FileScheduler,
+        base_projection: Option<ReaderProjection>,
+        decoder_strategy: DecoderMiddlewareChain,
+        file_metadata: Arc<CachedFileMetadata>,
+    ) -> Result<Self> {
         if let Some(base_projection) = base_projection.as_ref() {
             Self::validate_projection(base_projection, &file_metadata)?;
         }
