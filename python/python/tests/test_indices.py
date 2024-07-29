@@ -132,7 +132,7 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     reader = LanceFileReader(uri)
 
-    assert reader.metadata().num_rows == 30000
+    assert reader.metadata().num_rows == (NUM_ROWS * NUM_FRAGMENTS)
     data = next(reader.read_all(batch_size=10000).to_batches())
 
     row_id = data.column("_rowid")
