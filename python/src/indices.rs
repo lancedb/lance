@@ -12,8 +12,8 @@ use lance_index::vector::{
 use lance_linalg::distance::DistanceType;
 use pyo3::{pyfunction, types::PyModule, wrap_pyfunction, PyObject, PyResult, Python};
 
-use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
 use crate::fragment::FileFragment;
+use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -208,7 +208,15 @@ pub fn transform_vectors(
     );
     RT.block_on(
         Some(py),
-        do_transform_vectors(dataset, column, distance_type, ivf_centroids, pq, dst_uri, fragments),
+        do_transform_vectors(
+            dataset,
+            column,
+            distance_type,
+            ivf_centroids,
+            pq,
+            dst_uri,
+            fragments,
+        ),
     )?
 }
 
