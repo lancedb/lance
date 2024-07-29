@@ -16,7 +16,7 @@ use object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use url::Url;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};
@@ -57,7 +57,7 @@ fn bench_random_take(c: &mut Criterion) {
                     let batch = dataset
                         .take_rows(&rows, ProjectionRequest::Schema(schema.clone()))
                         .await
-                        .expect(&format!("rows: {:?}", rows));
+                        .unwrap_or_else(|_| panic!("rows: {:?}", rows));
                     assert_eq!(batch.num_rows(), num_rows);
                 })
             });
