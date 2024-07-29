@@ -162,7 +162,7 @@ impl PostingIterator {
         std::mem::drop(_guard);
 
         // read the current block all into memory and do linear search
-        let span = tracing::span!(tracing::Level::DEBUG, "linear_search_block");
+        let span = tracing::span!(tracing::Level::DEBUG, "search_blocks");
         let _guard = span.enter();
 
         self.list.try_fetch_blocks(current_block).await?;
@@ -201,6 +201,7 @@ impl PostingIterator {
         Ok(None)
     }
 
+    #[instrument(level = "debug", skip_all)]
     fn go_through_block(
         &self,
         block: &Block,
@@ -273,19 +274,15 @@ impl Wand {
     fn score(&self, doc: u64, scorer: &impl Fn(u64, f32) -> f32) -> f32 {
         let mut score = 0.0;
         for posting in &self.postings {
-            if let Some((cur_doc, freq)) = posting.doc() {
-                if cur_doc > doc {
-                    // the posting list is sorted by its current doc id,
-                    // so we can break early once we find the current doc id is less than the doc id we are looking for
-                    break;
-                }
-                debug_assert!(cur_doc == doc);
-
-                score += posting.approximate_upper_bound() * scorer(doc, freq);
-            } else {
-                // the posting list is exhausted
+            let (cur_doc, freq) = posting.doc().unwrap();
+            if cur_doc > doc {
+                // the posting list is sorted by its current doc id,
+                // so we can break early once we find the current doc id is less than the doc id we are looking for
                 break;
             }
+            debug_assert!(cur_doc == doc);
+
+            score += posting.approximate_upper_bound() * scorer(doc, freq);
         }
         score
     }
@@ -331,9 +328,6 @@ impl Wand {
     fn find_pivot_term(&self) -> Option<&PostingIterator> {
         let mut acc = 0.0;
         for posting in self.postings.iter() {
-            if posting.doc().is_none() {
-                break;
-            }
             acc += posting.approximate_upper_bound();
             if acc >= self.threshold {
                 return Some(posting);
@@ -366,6 +360,13 @@ impl Wand {
         }
 
         self.postings.sort_unstable();
+        while let Some(last) = self.postings.last() {
+            if last.doc().is_none() {
+                self.postings.pop();
+            } else {
+                break;
+            }
+        }
 
         Ok(())
     }

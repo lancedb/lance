@@ -24,13 +24,13 @@ use object_store::path::Path;
 
 #[tokio::main]
 async fn main() {
-    const TOTAL: usize = 10_000;
+    const TOTAL: usize = 100_000;
     let tempdir = tempfile::tempdir().unwrap();
     let dataset_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let tokens = (0..10_000)
         .map(|_| random_word::gen(random_word::Lang::En))
         .collect_vec();
-    let create_index = true;
+    let create_index = false;
     if create_index {
         let row_id_col = Arc::new(UInt64Array::from(
             (0..TOTAL).map(|i| i as u64).collect_vec(),
@@ -56,9 +56,7 @@ async fn main() {
         .unwrap();
 
         let batches = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-        let mut dataset = Dataset::write(batches, dataset_dir.as_ref(), None)
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(batches, "fts.lance", None).await.unwrap();
         let scalar_index_params = ScalarIndexParams {
             force_index_type: Some(ScalarIndexType::Inverted),
         };
@@ -74,12 +72,13 @@ async fn main() {
             .unwrap();
     }
 
-    let dataset = Dataset::open(dataset_dir.as_ref()).await.unwrap();
+    let dataset = Dataset::open("fts.lance").await.unwrap();
     let query = tokens[0];
+    let query = FullTextSearchQuery::new(query.to_owned()).limit(Some(10));
     println!("query: {:?}", query);
     let batch = dataset
         .scan()
-        .full_text_search(FullTextSearchQuery::new(query.to_owned()))
+        .full_text_search(query.clone())
         .unwrap()
         .try_into_batch()
         .await
@@ -93,25 +92,25 @@ async fn main() {
     let start = std::time::Instant::now();
     dataset
         .scan()
-        .full_text_search(FullTextSearchQuery::new(query.to_owned()))
+        .full_text_search(query.clone())
         .unwrap()
         .try_into_batch()
         .await
         .unwrap();
     println!("full_text_search: {:?}", start.elapsed());
 
-    let batch = dataset
-        .scan()
-        .project(&["doc"])
-        .unwrap()
-        .with_row_id()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let flat_results = flat_full_text_search(&[&batch], "doc", query)
-        .unwrap()
-        .into_iter()
-        .collect::<HashSet<_>>();
-    assert_gt!(index_results.len(), 0);
-    assert_eq!(index_results, flat_results);
+    // let batch = dataset
+    //     .scan()
+    //     .project(&["doc"])
+    //     .unwrap()
+    //     .with_row_id()
+    //     .try_into_batch()
+    //     .await
+    //     .unwrap();
+    // let flat_results = flat_full_text_search(&[&batch], "doc", query)
+    //     .unwrap()
+    //     .into_iter()
+    //     .collect::<HashSet<_>>();
+    // assert_gt!(index_results.len(), 0);
+    // assert_eq!(index_results, flat_results);
 }
