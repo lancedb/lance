@@ -362,7 +362,7 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
-        // TODO: make this a proper function
+
         fn is_subschema(schema: &Schema, candidate: &Schema) -> bool {
             // Schema::contains() cares about order, but we don't.
             for field in candidate.fields() {
@@ -407,7 +407,6 @@ impl MergeInsertJob {
     ) -> Result<SendableRecordBatchStream> {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(
-
         let schema = source.schema();
         let add_row_addr = match self.check_compatible_schema(&schema)? {
             SchemaComparison::FullCompatible => false,
@@ -416,8 +415,6 @@ impl MergeInsertJob {
 
         // 1 - Input from user
         let input = Arc::new(OneShotExec::new(source));
-
-        // TODO: if subset, we should get row address as well.
 
         // 2 - Fork/Replay the input
         // Regrettably, this needs to have unbounded capacity, and so we need to fully read
@@ -456,14 +453,13 @@ impl MergeInsertJob {
         let mut target = Arc::new(TakeExec::try_new(
             self.dataset.clone(),
             index_mapper,
-            // Arc::new(self.dataset.schema().clone()),
             Arc::new(self.dataset.schema().project_by_schema(schema.as_ref())?),
             num_cpus::get(),
         )?) as Arc<dyn ExecutionPlan>;
 
-        // 5 - Take puts the row id at the beginning.  A full scan (used when there is no scalar
-        //     index) puts the row id at the end.  We need to match these up so we reorder the row
-        //     id to the end
+        // 5 - Take puts the row id and row addr at the beginning.  A full scan (used when there is
+        //     no scalar index) puts the row id and addr at the end.  We need to match these up so
+        //     we reorder those columns at the end.
         let schema = target.schema();
         let mut columns = schema
             .fields()
@@ -538,7 +534,6 @@ impl MergeInsertJob {
         let session_config = SessionConfig::default().with_target_partitions(1);
         let session_ctx = SessionContext::new_with_config(session_config);
         let schema = source.schema();
-
         let new_data = session_ctx.read_one_shot(source)?;
         let join_cols = self
             .params
@@ -1811,7 +1806,7 @@ mod tests {
                 new_data.schema(),
             ));
 
-            // Should reject when_not_matched_insert_all as not yet supporteed
+            // Should reject when_not_matched_insert_all as not yet supported
             let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
                 .unwrap()
                 .when_not_matched(WhenNotMatched::InsertAll)
