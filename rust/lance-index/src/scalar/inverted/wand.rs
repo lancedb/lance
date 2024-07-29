@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cmp::{min, Reverse};
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
@@ -13,37 +13,14 @@ use tracing::instrument;
 
 use super::builder::OrderedDoc;
 use super::index::{idf, K1};
-use super::{Block, PostingList};
+use super::PostingList;
 
 // WAND parameters
-// One block consists of rows of a posting list (row id (u64) and frequency (f32)),
-// Increasing the block size can decrease the memory usage, but also decrease the probability of skipping blocks.
 lazy_static! {
-    pub static ref POSTING_BLOCK_SIZE: usize = std::env::var("POSTING_BLOCK_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
-    static ref MIN_IO_SIZE: usize = std::env::var("MIN_IO_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1024 * 1024); // 1MiB
     static ref FACTOR: f32 = std::env::var("WAND_FACTOR")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.0);
-}
-
-// we might change the block size in the future
-// and it could be a function of the total number of documents
-#[inline]
-pub fn block_size(_length: usize) -> usize {
-    *POSTING_BLOCK_SIZE
-}
-
-// the number of blocks to read in one IO operation
-#[inline]
-pub fn num_blocks_to_read(num_blocks: usize, block_size: usize) -> usize {
-    min(num_blocks, *MIN_IO_SIZE / (block_size * 8)) // the widest column is u64, so 8 bytes
 }
 
 #[derive(Clone)]
@@ -120,25 +97,6 @@ impl PostingIterator {
                 return Some((row_id, self.index));
             }
             self.index += 1;
-        }
-        None
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    fn go_through_block(
-        &self,
-        block: &Block,
-        mut block_index: usize,
-    ) -> Option<(usize, (u64, f32))> {
-        let mut index = self.index;
-        while block_index < block.len() {
-            let doc = block.doc(block_index);
-            if self.mask.selected(doc.0) {
-                return Some((index, doc));
-            }
-
-            block_index += 1;
-            index += 1;
         }
         None
     }

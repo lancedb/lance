@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
-use std::mem::size_of_val;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
-use arrow::compute::concat;
 use arrow::datatypes::{self, Float32Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, Float32Array, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
@@ -432,63 +429,6 @@ impl InvertedListReader {
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))
     }
-
-    // #[instrument(level = "debug", skip(self))]
-    // pub(crate) async fn posting_reader(&self, token_id: u32) -> Result<PostingListReader> {
-    //     self.posting_cache
-    //         .try_get_with(token_id, async move {
-    //             let length = self.posting_len(token_id);
-    //             let block_size = block_size(length);
-    //             let num_blocks = length.div_ceil(block_size);
-
-    //             let token_id = token_id as usize;
-    //             let offset = self.offsets[token_id];
-    //             // read the first element of each block
-    //             // and cache first `num_blocks_to_cache` to reduce the number of reads,
-    //             // the `num_blocks_to_cache` is the max number of blocks to read,
-    //             // and the total bytes to read is still within MIN_IO_SIZE
-    //             let num_blocks_to_cache = max(
-    //                 0,
-    //                 num_blocks_to_read(num_blocks, block_size) - num_blocks.div_ceil(block_size),
-    //             );
-    //             let num_rows_to_cache = min(length, num_blocks_to_cache * block_size);
-    //             let batch = self
-    //                 .reader
-    //                 .read_range(offset..offset + num_blocks + num_rows_to_cache)
-    //                 .await?;
-    //             let head_batch = batch.slice(0, num_blocks);
-    //             let row_ids = head_batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-    //             let frequencies = head_batch[FREQUENCY_COL]
-    //                 .as_primitive::<Float32Type>()
-    //                 .clone();
-
-    //             let cached_blocks = (0..num_rows_to_cache)
-    //                 .step_by(block_size)
-    //                 .map(|offset| {
-    //                     let offset = offset + num_blocks;
-    //                     let length = min(batch.num_rows() - offset, block_size);
-    //                     batch.slice(offset, length).into()
-    //                 })
-    //                 .collect();
-
-    //             Result::Ok(PostingListReader {
-    //                 reader: self.reader.clone(),
-    //                 term_offset: offset,
-    //                 length,
-    //                 row_ids: row_ids.values().to_vec(),
-    //                 frequencies: frequencies.values().to_vec(),
-    //                 block_id: 0,
-    //                 blocks: cached_blocks,
-    //             })
-    //         })
-    //         .await
-    //         .map_err(|e| Error::io(e.to_string(), location!()))
-    // }
-}
-
-fn block_head_indices(length: usize) -> Vec<usize> {
-    let block_size = block_size(length);
-    (0..length).step_by(block_size).collect_vec()
 }
 
 #[derive(Debug, PartialEq, Clone, Default, DeepSizeOf)]
@@ -529,18 +469,6 @@ impl PostingList {
         let frequency_col =
             Float32Array::from_iter_values(indices.iter().map(|&i| self.frequencies[i]));
 
-        // let block_head_indices = block_head_indices(self.len());
-        // let block_head_row_ids = UInt64Array::from_iter_values(
-        //     block_head_indices
-        //         .iter()
-        //         .map(|&index| row_id_col.values()[index]),
-        // );
-        // let block_head_freqs = Float32Array::from_iter_values(
-        //     block_head_indices
-        //         .iter()
-        //         .map(|&index| frequency_col.values()[index]),
-        // );
-
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
             arrow_schema::Field::new(FREQUENCY_COL, DataType::Float32, false),
@@ -554,136 +482,6 @@ impl PostingList {
             ],
         )?;
         Ok(batch)
-    }
-}
-
-#[derive(Clone)]
-pub struct PostingListReader {
-    reader: Arc<dyn IndexReader>,
-    term_offset: usize,
-    length: usize,
-    // first element of each block
-    row_ids: Vec<u64>,
-    frequencies: Vec<f32>,
-    // blocks cache
-    block_id: usize,
-    blocks: Vec<Block>,
-}
-
-impl DeepSizeOf for PostingListReader {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        size_of_val(self)
-            + self.row_ids.deep_size_of()
-            + self.frequencies.deep_size_of()
-            + self.blocks.deep_size_of()
-    }
-}
-
-impl PostingListReader {
-    pub fn len(&self) -> usize {
-        self.length
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn num_blocks(&self) -> usize {
-        self.row_ids.len()
-    }
-
-    pub fn block_head_element(&self, block_id: usize) -> (u64, f32) {
-        (self.row_ids[block_id], self.frequencies[block_id])
-    }
-
-    pub fn block_row_ids(&self) -> &[u64] {
-        &self.row_ids
-    }
-
-    // read the block from cache,
-    // WARNING: this function doesn't check if the block is in the cache,
-    // must call try_fetch_blocks() before calling this function to ensure the block is in the cache,
-    // split these two functions to avoid mutable borrow checker
-    pub fn block(&self, block_id: usize) -> &Block {
-        &self.blocks[block_id - self.block_id]
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    pub async fn try_fetch_blocks(&mut self, block_id: usize) -> Result<()> {
-        if !self.blocks.is_empty()
-            && self.block_id <= block_id
-            && block_id < self.block_id + self.blocks.len()
-        {
-            return Ok(());
-        }
-
-        self.block_id = block_id;
-        self.blocks = self.read_blocks(block_id).await?;
-        Ok(())
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn read_blocks(&self, block_id: usize) -> Result<Vec<Block>> {
-        let block_size = block_size(self.length);
-        let num_blocks = self.length.div_ceil(block_size);
-        let num_block_to_read = num_blocks_to_read(num_blocks, block_size);
-        let start = self.term_offset + num_blocks + block_id * block_size;
-        let end = start + min(self.length, num_block_to_read * block_size);
-        let batch = self.reader.read_range(start..end).await?;
-
-        let blocks = (0..end - start)
-            .step_by(block_size)
-            .map(|offset| {
-                let length = min(self.length - offset, block_size);
-                batch.slice(offset, length).into()
-            })
-            .collect();
-        Ok(blocks)
-    }
-}
-
-#[derive(Debug, Clone, DeepSizeOf)]
-pub struct Block {
-    pub row_ids: Vec<u64>,
-    pub frequencies: Vec<f32>,
-}
-
-impl From<RecordBatch> for Block {
-    fn from(batch: RecordBatch) -> Self {
-        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
-        let frequencies = batch[FREQUENCY_COL]
-            .as_primitive::<Float32Type>()
-            .values()
-            .to_vec();
-        Self {
-            row_ids,
-            frequencies,
-        }
-    }
-}
-
-impl Block {
-    pub fn len(&self) -> usize {
-        self.row_ids.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline]
-    pub fn row_id(&self, i: usize) -> u64 {
-        self.row_ids[i]
-    }
-
-    #[inline]
-    pub fn frequency(&self, i: usize) -> f32 {
-        self.frequencies[i]
-    }
-
-    #[inline]
-    pub fn doc(&self, i: usize) -> (u64, f32) {
-        (self.row_id(i), self.frequency(i))
     }
 }
 

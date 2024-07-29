@@ -183,15 +183,10 @@ impl InvertedList {
                 Some(*offset - batch.num_rows())
             })
             .collect_vec();
-        // let lengths = self
-        //     .inverted_list
-        //     .iter()
-        //     .map(|list| list.len())
-        //     .collect_vec();
-        let metadata = HashMap::from_iter(vec![
-            ("offsets".to_owned(), serde_json::to_string(&offsets)?),
-            // ("lengths".to_owned(), serde_json::to_string(&lengths)?),
-        ]);
+        let metadata = HashMap::from_iter(vec![(
+            "offsets".to_owned(),
+            serde_json::to_string(&offsets)?,
+        )]);
 
         let batch =
             concat_batches(batches[0].schema_ref(), batches.iter())?.with_metadata(metadata)?;
