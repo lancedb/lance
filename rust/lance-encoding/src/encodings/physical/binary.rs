@@ -120,9 +120,6 @@ impl PageScheduler for BinaryPageScheduler {
         // if user wants row range a..b
         // Case 1: if a != 0, we need indices a-1..b to decode
         // Case 2: if a = 0, we need indices 0..b to decode
-        // To get the byte ranges we then multiply these by 8
-        // Then we add the buffer offset to map to the correct buffer in the page,
-        // since multiple encoding tasks may have been used to create the page
         let indices_ranges = ranges
             .iter()
             .map(|range| {
