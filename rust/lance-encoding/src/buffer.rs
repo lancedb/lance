@@ -21,16 +21,16 @@ impl LanceBuffer {
     /// Convert into a mutable buffer.  If this is a borrowed buffer, the data will be copied.
     pub fn into_owned(self) -> Vec<u8> {
         match self {
-            LanceBuffer::Borrowed(buffer) => buffer.to_vec(),
-            LanceBuffer::Owned(buffer) => buffer,
+            Self::Borrowed(buffer) => buffer.to_vec(),
+            Self::Owned(buffer) => buffer,
         }
     }
 
     /// Convert into an Arrow buffer.  Never copies data.
     pub fn into_buffer(self) -> Buffer {
         match self {
-            LanceBuffer::Borrowed(buffer) => buffer,
-            LanceBuffer::Owned(buffer) => Buffer::from_vec(buffer),
+            Self::Borrowed(buffer) => buffer,
+            Self::Owned(buffer) => Buffer::from_vec(buffer),
         }
     }
 
@@ -41,17 +41,17 @@ impl LanceBuffer {
     ///
     /// If the buffer is properly aligned this will be zero-copy.  If not, a copy
     /// will be made and an owned buffer returned.
-    pub fn from_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> LanceBuffer {
+    pub fn from_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> Self {
         if bytes.as_ptr().align_offset(bytes_per_value as usize) != 0 {
             // The original buffer is not aligned, cannot zero-copy
             let mut buf = Vec::with_capacity(bytes.len());
             buf.extend_from_slice(&bytes);
-            LanceBuffer::Owned(buf)
+            Self::Owned(buf)
         } else {
             // The original buffer is aligned, can zero-copy
             // SAFETY: the alignment is correct we can make this conversion
             unsafe {
-                LanceBuffer::Borrowed(Buffer::from_custom_allocation(
+                Self::Borrowed(Buffer::from_custom_allocation(
                     NonNull::new(bytes.as_ptr() as _).expect("should be a valid pointer"),
                     bytes.len(),
                     Arc::new(bytes),
@@ -64,8 +64,8 @@ impl LanceBuffer {
 impl AsRef<[u8]> for LanceBuffer {
     fn as_ref(&self) -> &[u8] {
         match self {
-            LanceBuffer::Borrowed(buffer) => buffer.as_slice(),
-            LanceBuffer::Owned(buffer) => buffer.as_slice(),
+            Self::Borrowed(buffer) => buffer.as_slice(),
+            Self::Owned(buffer) => buffer.as_slice(),
         }
     }
 }
@@ -80,12 +80,12 @@ impl Deref for LanceBuffer {
 
 impl From<Vec<u8>> for LanceBuffer {
     fn from(buffer: Vec<u8>) -> Self {
-        LanceBuffer::Owned(buffer)
+        Self::Owned(buffer)
     }
 }
 
 impl From<Buffer> for LanceBuffer {
     fn from(buffer: Buffer) -> Self {
-        LanceBuffer::Borrowed(buffer)
+        Self::Borrowed(buffer)
     }
 }
