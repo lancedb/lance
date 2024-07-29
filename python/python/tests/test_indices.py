@@ -10,7 +10,8 @@ from lance.indices import IndicesBuilder, IvfModel, PqModel
 NUM_ROWS = 10000
 DIMENSION = 128
 NUM_SUBVECTORS = 8
-NUM_PARTITIONS = 100
+NUM_FRAGMENTS = 3
+NUM_PARTITIONS = round(np.sqrt(NUM_FRAGMENTS*NUM_ROWS))
 
 
 @pytest.fixture(params=[np.float16, np.float32, np.float64], ids=["f16", "f32", "f64"])
@@ -18,11 +19,18 @@ def rand_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(request.param)
     vectors.shape = -1
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
-    table = pa.Table.from_arrays([vectors], names=["vectors"])
-    ds = lance.write_dataset(table, str(tmpdir / "dataset"))
+    uri = str(tmpdir / "dataset")
+
+    fragments = []
+    for i in range(NUM_FRAGMENTS):
+        table_append = pa.Table.from_arrays([vectors], names=["vectors"])
+        fragment = lance.fragment.LanceFragment.create(uri, table_append)
+        fragments.append(fragment)
+
+    operation = lance.LanceOperation.Overwrite(table_append.schema, fragments)
+    ds = lance.LanceDataset.commit(uri, operation)
 
     return ds
-
 
 def test_ivf_centroids(tmpdir, rand_dataset):
     ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(sample_rate=16)
@@ -115,12 +123,15 @@ def rand_pq(rand_dataset, rand_ivf):
 
 
 def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
+    fragments = list(rand_dataset.get_fragments())
+
     builder = IndicesBuilder(rand_dataset, "vectors")
-    builder.transform_vectors(rand_ivf, rand_pq, str(tmpdir / "transformed"))
+    uri = str(tmpdir / "transformed")
+    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=fragments)
 
-    reader = LanceFileReader(str(tmpdir / "transformed"))
+    reader = LanceFileReader(uri)
 
-    assert reader.metadata().num_rows == 10000
+    assert reader.metadata().num_rows == 30000
     data = next(reader.read_all(batch_size=10000).to_batches())
 
     row_id = data.column("_rowid")

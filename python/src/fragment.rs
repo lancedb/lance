@@ -34,7 +34,7 @@ use crate::{Scanner, RT};
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
 pub struct FileFragment {
-    fragment: LanceFragment,
+    pub fragment: LanceFragment,
 }
 
 impl FileFragment {
@@ -124,7 +124,7 @@ impl FileFragment {
         self.fragment.id()
     }
 
-    fn metadata(&self) -> FragmentMetadata {
+    pub fn metadata(&self) -> FragmentMetadata {
         FragmentMetadata::new(self.fragment.metadata().clone())
     }
 

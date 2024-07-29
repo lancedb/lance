@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import numpy as np
 import pyarrow as pa
 
+from lance import LanceFragment
 from lance.file import LanceFileReader, LanceFileWriter
 
 from .lance import indices
@@ -379,6 +380,7 @@ class IndicesBuilder:
         ivf: IvfModel,
         pq: PqModel,
         dest_uri: str,
+        fragments: list[LanceFragment],
         partition_ds_uri: Optional[str] = None,
     ):
         """
@@ -404,6 +406,7 @@ class IndicesBuilder:
         dimension = self.dataset.schema.field(self.column[0]).type.list_size
         num_subvectors = pq.num_subvectors
         distance_type = ivf.distance_type
+        fragments = [f._fragment for f in fragments]
         indices.transform_vectors(
             self.dataset._ds,
             self.column[0],
@@ -413,6 +416,7 @@ class IndicesBuilder:
             ivf.centroids,
             pq.codebook,
             dest_uri,
+            fragments,
         )
 
     def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
