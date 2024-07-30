@@ -57,7 +57,7 @@ fn bench_random_take(c: &mut Criterion) {
                     let batch = dataset
                         .take_rows(&rows, ProjectionRequest::Schema(schema.clone()))
                         .await
-                        .expect(&format!("rows: {:?}", rows));
+                        .unwrap_or_else(|_| panic!("rows: {:?}", rows));
                     assert_eq!(batch.num_rows(), num_rows);
                 })
             });
