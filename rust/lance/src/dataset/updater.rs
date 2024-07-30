@@ -5,6 +5,7 @@ use arrow_array::{RecordBatch, UInt32Array};
 use futures::StreamExt;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{datatypes::Schema, Error, Result};
+use lance_file::version::LanceFileVersion;
 use lance_table::format::Fragment;
 use lance_table::utils::stream::ReadBatchFutStream;
 use snafu::{location, Location};
@@ -125,14 +126,19 @@ impl Updater {
     ///
     /// Internal use only.
     async fn new_writer(&mut self, schema: Schema) -> Result<Box<dyn GenericWriter>> {
-        // Look at some file in the fragment to determine if it is a v2 file or not
-        let is_legacy = self.fragment.metadata.files[0].is_legacy_file();
+        let data_storage_version = LanceFileVersion::try_from(
+            self.dataset()
+                .manifest()
+                .data_storage_format
+                .version
+                .as_str(),
+        )?;
 
         open_writer(
             &self.fragment.dataset().object_store,
             &schema,
             &self.fragment.dataset().base,
-            is_legacy,
+            data_storage_version,
         )
         .await
     }

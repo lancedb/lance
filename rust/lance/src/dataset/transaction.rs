@@ -38,12 +38,12 @@
 use std::{collections::HashSet, sync::Arc};
 
 use lance_core::{datatypes::Schema, Error, Result};
-use lance_file::datatypes::Fields;
+use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_io::object_store::ObjectStore;
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
-        Fragment, Index, Manifest, RowIdMeta,
+        DataStorageFormat, Fragment, Index, Manifest, RowIdMeta,
     },
     io::{
         commit::CommitHandler,
@@ -357,6 +357,10 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<Index>)> {
+        println!(
+            "Building manifest with storage version: {:?}",
+            config.storage_format
+        );
         if config.use_move_stable_row_ids
             && current_manifest
                 .map(|m| !m.uses_move_stable_row_ids())
@@ -554,10 +558,22 @@ impl Transaction {
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
 
+        let data_storage_format = match (&config.storage_format, config.use_legacy_format) {
+            (Some(storage_format), _) => storage_format.clone(),
+            (None, Some(true)) => DataStorageFormat::new(LanceFileVersion::Legacy),
+            (None, Some(false)) => DataStorageFormat::new(LanceFileVersion::V2_0),
+            (None, None) => DataStorageFormat::default(),
+        };
+
         let mut manifest = if let Some(current_manifest) = current_manifest {
-            Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments))
+            let mut prev_manifest =
+                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
+            if matches!(self.operation, Operation::Overwrite { .. }) {
+                prev_manifest.data_storage_format = data_storage_format;
+            }
+            prev_manifest
         } else {
-            Manifest::new(schema, Arc::new(final_fragments))
+            Manifest::new(schema, Arc::new(final_fragments), data_storage_format)
         };
 
         manifest.tag.clone_from(&self.tag);

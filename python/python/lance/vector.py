@@ -272,7 +272,7 @@ def compute_partitions(
         dst_dataset_uri,
         schema=output_schema,
         max_rows_per_file=dataset.count_rows(),
-        use_legacy_format=True,
+        data_storage_version="legacy",
     )
     assert len(ds.get_fragments()) == 1
     files = ds.get_fragments()[0].data_files()

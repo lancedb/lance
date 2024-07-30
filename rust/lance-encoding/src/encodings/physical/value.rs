@@ -24,6 +24,8 @@ use lance_core::{Error, Result};
 
 use super::buffers::GeneralBufferCompressor;
 
+pub const COMPRESSION_META_KEY: &str = "lance:compression";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompressionScheme {
     None,
@@ -321,7 +323,6 @@ pub(crate) mod tests {
 
     use lance_arrow::DataTypeExt;
     use lance_datagen::{array::rand_with_distribution, ArrayGenerator};
-    use lance_testing::util::EnvVarGuard;
 
     use crate::{
         encoder::{ArrayEncoder, CoreBufferEncodingStrategy},
@@ -329,6 +330,7 @@ pub(crate) mod tests {
             check_round_trip_encoding_generated, check_round_trip_encoding_random,
             ArrayGeneratorProvider,
         },
+        version::LanceFileVersion,
     };
 
     const PRIMITIVE_TYPES: &[DataType] = &[
@@ -367,7 +369,6 @@ pub(crate) mod tests {
 
     #[test_log::test(test)]
     fn test_will_bitpack_allowed_types_when_possible() {
-        let _env_guard = EnvVarGuard::new("LANCE_USE_BITPACKING", "TRUE");
         let test_cases: Vec<(DataType, ArrayRef, u64)> = vec![
             (
                 DataType::UInt8,
@@ -423,6 +424,7 @@ pub(crate) mod tests {
             let mut buffed_index = 1;
             let encoder = ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
                 compression_scheme: CompressionScheme::None,
+                version: LanceFileVersion::V2_1,
             }))
             .unwrap();
             let result = encoder.encode(&arrs, &mut buffed_index).unwrap();
@@ -504,6 +506,7 @@ pub(crate) mod tests {
             let mut buffed_index = 1;
             let encoder = ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
                 compression_scheme: CompressionScheme::None,
+                version: LanceFileVersion::default_v2(),
             }))
             .unwrap();
             let result = encoder.encode(&arrs, &mut buffed_index).unwrap();
@@ -569,7 +572,6 @@ pub(crate) mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_bitpack_primitive() {
-        let _env_guard = EnvVarGuard::new("LANCE_USE_BITPACKING", "TRUE");
         let bitpacked_test_cases: &Vec<(DataType, Box<dyn ArrayGeneratorProvider>)> = &vec![
             // check less than one byte for multi-byte type
             (
@@ -721,7 +723,12 @@ pub(crate) mod tests {
 
         for (data_type, array_gen_provider) in bitpacked_test_cases {
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_generated(field, array_gen_provider.copy()).await;
+            check_round_trip_encoding_generated(
+                field,
+                array_gen_provider.copy(),
+                LanceFileVersion::V2_1,
+            )
+            .await;
         }
     }
 }

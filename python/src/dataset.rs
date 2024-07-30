@@ -41,6 +41,11 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
+use lance_file::version::LanceFileVersion;
+use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::FullTextSearchQuery;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
@@ -354,6 +359,11 @@ impl Dataset {
     #[getter(lance_schema)]
     fn lance_schema(self_: PyRef<'_, Self>) -> LanceSchema {
         LanceSchema(self_.ds.schema().clone())
+    }
+
+    #[getter(data_storage_version)]
+    fn data_storage_version(&self) -> PyResult<String> {
+        Ok(self.ds.manifest().data_storage_format.version.clone())
     }
 
     /// Get index statistics
@@ -1366,8 +1376,10 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(maybe_nbytes) = get_dict_opt::<usize>(options, "max_bytes_per_file")? {
             p.max_bytes_per_file = maybe_nbytes;
         }
-        if let Some(use_legacy_format) = get_dict_opt::<bool>(options, "use_legacy_format")? {
-            p.use_legacy_format = use_legacy_format;
+        if let Some(data_storage_version) = get_dict_opt::<String>(options, "data_storage_version")?
+        {
+            p.data_storage_version =
+                Some(LanceFileVersion::try_from(data_storage_version).infer_error()?);
         }
         if let Some(progress) = get_dict_opt::<PyObject>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));

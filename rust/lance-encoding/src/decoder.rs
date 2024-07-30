@@ -1011,7 +1011,7 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
+        debug_assert!(indices.windows(2).all(|w| w[0] <= w[1]));
         if indices.is_empty() {
             return;
         }

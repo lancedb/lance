@@ -149,6 +149,7 @@ class LanceFileWriter:
         schema: Optional[pa.Schema] = None,
         *,
         data_cache_bytes: Optional[int] = None,
+        version: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -166,9 +167,13 @@ class LanceFileWriter:
         data_cache_bytes: int
             How many bytes (per column) to cache before writing a page.  The
             default is an appropriate value based on the filesystem.
+        version: str
+            The version of the file format to write.  If not specified then
+            the latest stable version will be used.  Newer versions are more
+            efficient but may not be readable by older versions of the software.
         """
         self._writer = _LanceFileWriter(
-            path, schema, data_cache_bytes=data_cache_bytes, **kwargs
+            path, schema, data_cache_bytes=data_cache_bytes, version=version, **kwargs
         )
         self.closed = False
 

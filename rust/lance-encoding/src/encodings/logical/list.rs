@@ -23,17 +23,8 @@ use crate::{
         DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression,
         LogicalPageDecoder, NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{
-        ArrayEncoder, CoreBufferEncodingStrategy, EncodeTask, EncodedArray, EncodedColumn,
-        EncodedPage, FieldEncoder,
-    },
-    encodings::{
-        logical::r#struct::SimpleStructScheduler,
-        physical::{
-            basic::BasicEncoder,
-            value::{CompressionScheme, ValueEncoder},
-        },
-    },
+    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
+    encodings::logical::r#struct::SimpleStructScheduler,
     format::pb,
     EncodingsIo,
 };
@@ -840,19 +831,19 @@ struct ListOffsetsEncoder {
 }
 
 impl ListOffsetsEncoder {
-    fn new(cache_bytes: u64, keep_original_array: bool, column_index: u32) -> Self {
+    fn new(
+        cache_bytes: u64,
+        keep_original_array: bool,
+        column_index: u32,
+        inner_encoder: Arc<dyn ArrayEncoder>,
+    ) -> Self {
         Self {
             accumulation_queue: AccumulationQueue::new(
                 cache_bytes,
                 column_index,
                 keep_original_array,
             ),
-            inner_encoder: Arc::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
-                    compression_scheme: CompressionScheme::None,
-                }))
-                .unwrap(),
-            ))),
+            inner_encoder,
             column_index,
         }
     }
@@ -1103,6 +1094,7 @@ pub struct ListFieldEncoder {
 impl ListFieldEncoder {
     pub fn new(
         items_encoder: Box<dyn FieldEncoder>,
+        inner_offsets_encoder: Arc<dyn ArrayEncoder>,
         cache_bytes_per_columns: u64,
         keep_original_array: bool,
         column_index: u32,
@@ -1112,6 +1104,7 @@ impl ListFieldEncoder {
                 cache_bytes_per_columns,
                 keep_original_array,
                 column_index,
+                inner_offsets_encoder,
             ),
             items_encoder,
         }

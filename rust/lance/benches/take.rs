@@ -11,6 +11,7 @@ use lance::{
     arrow::FixedSizeListArrayExt,
     dataset::{builder::DatasetBuilder, ProjectionRequest},
 };
+use lance_file::version::LanceFileVersion;
 use lance_table::io::commit::RenameCommitHandler;
 use object_store::ObjectStore;
 #[cfg(target_os = "linux")]
@@ -44,7 +45,7 @@ fn bench_random_take(c: &mut Criterion) {
     for file_size in [1024 * 1024, 1024] {
         let dataset = rt.block_on(create_dataset(
             "memory://test.lance",
-            false,
+            LanceFileVersion::Legacy,
             num_batches,
             file_size,
         ));
@@ -67,7 +68,7 @@ fn bench_random_take(c: &mut Criterion) {
 
         let dataset = rt.block_on(create_dataset(
             "memory://test.lance",
-            true,
+            LanceFileVersion::Stable,
             num_batches,
             file_size,
         ));
@@ -88,11 +89,16 @@ fn bench_random_take(c: &mut Criterion) {
     }
 }
 
-async fn create_dataset(path: &str, use_v2: bool, num_batches: i32, file_size: i32) -> Dataset {
+async fn create_dataset(
+    path: &str,
+    data_storage_version: LanceFileVersion,
+    num_batches: i32,
+    file_size: i32,
+) -> Dataset {
     let store = create_file(
         std::path::Path::new(path),
         WriteMode::Create,
-        use_v2,
+        data_storage_version,
         num_batches,
         file_size,
     )
@@ -112,7 +118,7 @@ async fn create_dataset(path: &str, use_v2: bool, num_batches: i32, file_size: i
 async fn create_file(
     path: &std::path::Path,
     mode: WriteMode,
-    use_v2: bool,
+    data_storage_version: LanceFileVersion,
     num_batches: i32,
     file_size: i32,
 ) -> Arc<dyn ObjectStore> {
@@ -173,7 +179,7 @@ async fn create_file(
         max_rows_per_file: file_size as usize,
         max_rows_per_group: batch_size as usize,
         mode,
-        use_legacy_format: !use_v2,
+        data_storage_version: Some(data_storage_version.into()),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());

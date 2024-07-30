@@ -374,6 +374,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.lance_schema
 
+    @property
+    def data_storage_version(self) -> str:
+        """
+        The version of the data storage format this dataset is using
+        """
+        return self._ds.data_storage_version
+
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
@@ -2641,7 +2648,8 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    use_legacy_format: bool = True,
+    data_storage_version: str = "legacy",
+    use_legacy_format: Optional[bool] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2681,10 +2689,25 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    use_legacy_format : optional, bool, default True
-        Use the Lance v1 writer to write Lance v1 files.  The default is currently
-        True but will change as we roll out the v2 format.
+    data_storage_version: optional, str, default "legacy"
+        The version of the data storage format to use. Newer versions are more
+        efficient but require newer versions of lance to read.  The default is
+        "legacy" which will use the legacy v1 version.  See the user guide
+        for more details.
+    use_legacy_format : optional, bool, default None
+        Deprecated method for setting the data storage version. Use the
+        `data_storage_version` parameter instead.
     """
+    if use_legacy_format is not None:
+        warnings.warn(
+            "use_legacy_format is deprecated, use data_storage_version instead",
+            DeprecationWarning,
+        )
+        if use_legacy_format:
+            data_storage_version = "legacy"
+        else:
+            data_storage_version = "stable"
+
     if _check_for_hugging_face(data_obj):
         # Huggingface datasets
         from .dependencies import datasets
@@ -2705,7 +2728,7 @@ def write_dataset(
         "max_bytes_per_file": max_bytes_per_file,
         "progress": progress,
         "storage_options": storage_options,
-        "use_legacy_format": use_legacy_format,
+        "data_storage_version": data_storage_version,
     }
 
     if commit_lock:
