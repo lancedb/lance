@@ -13,6 +13,17 @@
 // Windows FS can't handle concurrent copy
 #[cfg(all(test, target_os = "linux", feature = "dynamodb_tests"))]
 mod test {
+    macro_rules! base_uri {
+        () => {
+            "base_uri"
+        };
+    }
+    macro_rules! version {
+        () => {
+            "version"
+        };
+    }
+
     use std::sync::Arc;
 
     use aws_credential_types::Credentials;
@@ -24,12 +35,12 @@ mod test {
         },
         Client,
     };
+    use futures::{future::join_all, TryStreamExt};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
 
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams},
-        io::{object_store::local::LocalFileSystem, object_store::ObjectStoreParams},
+        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         Dataset,
     };
     use lance_table::io::commit::{
@@ -40,20 +51,14 @@ mod test {
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
         ReadParams {
-            store_options: Some(ObjectStoreParams {
-                commit_handler: Some(handler),
-                ..Default::default()
-            }),
+            commit_handler: Some(handler),
             ..Default::default()
         }
     }
 
     fn write_params(handler: Arc<dyn CommitHandler>) -> WriteParams {
         WriteParams {
-            store_params: Some(ObjectStoreParams {
-                commit_handler: Some(handler),
-                ..Default::default()
-            }),
+            commit_handler: Some(handler),
             ..Default::default()
         }
     }
@@ -191,7 +196,7 @@ mod test {
             external_manifest_store: store,
         };
         let options = read_params(Arc::new(handler));
-        Dataset::open_with_params(ds_uri, &options).await.expect(
+        DatasetBuilder::from_uri(ds_uri).with_read_params(options).load().await.expect(
             "If this fails, it means the external store handler does not correctly handle the case when a dataset exist, but it has never used external store before."
         );
     }
@@ -214,10 +219,12 @@ mod test {
             .unwrap();
 
         // load the data and check the content
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
-        assert_eq!(ds.count_rows().await.unwrap(), 100);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 100);
     }
 
     #[tokio::test]
@@ -262,10 +269,12 @@ mod test {
         assert!(errors.is_empty(), "{:?}", errors);
 
         // load the data and check the content
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
     }
 
     #[tokio::test]
@@ -303,19 +312,19 @@ mod test {
             .copy(&manifest_path(&ds.base, 5), &latest_manifest_path(&ds.base))
             .await
             .unwrap();
+
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs
             .list(Some(&ds.base))
-            .await
-            .unwrap()
             .try_filter(|p| {
                 let p = p.clone();
                 async move { p.location.filename().unwrap().starts_with("6.manifest-") }
             })
-            .collect::<Vec<_>>()
-            .await;
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
         assert_eq!(version_six.len(), 1);
-        let version_six_staging_location = version_six.pop().unwrap().unwrap().location;
+        let version_six_staging_location = version_six.pop().unwrap().location;
         store
             .put_if_exists(ds.base.as_ref(), 6, version_six_staging_location.as_ref())
             .await
@@ -323,21 +332,31 @@ mod test {
 
         // Open without external store handler, should not see the out-of-sync commit
         let params = ReadParams::default();
-        let ds = Dataset::open_with_params(ds_uri, &params).await.unwrap();
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(params)
+            .load()
+            .await
+            .unwrap();
         assert_eq!(ds.version().version, 5);
-        assert_eq!(ds.count_rows().await.unwrap(), 50);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 50);
 
         // Open with external store handler, should sync the out-of-sync commit on open
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
         // Open without external store handler again, should see the newly sync'd commit
         let params = ReadParams::default();
-        let ds = Dataset::open_with_params(ds_uri, &params).await.unwrap();
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(params)
+            .load()
+            .await
+            .unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
     }
 }
