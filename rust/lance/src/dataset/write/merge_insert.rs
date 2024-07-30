@@ -43,7 +43,7 @@ use datafusion::{
 };
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::{chunker::chunk_stream, dataframe::DataFrameExt, exec::get_session_context};
+use lance_datafusion::{chunker::chunk_stream, dataframe::DataFrameExt, exec::new_session_context};
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
@@ -594,7 +594,7 @@ impl MergeInsertJob {
     ) -> Result<Vec<Fragment>> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = get_session_context(LanceExecutionOptions {
+        let session_ctx = new_session_context(LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
         });
@@ -795,6 +795,7 @@ impl MergeInsertJob {
                         break;
                     } else if tasks.is_empty() {
                         // If there are no tasks running, we can bypass the pool limits.
+                        // This lets us handle the case where we have a single large batch.
                         memory_size = 0;
                         break;
                     }
@@ -1300,7 +1301,7 @@ mod tests {
     use super::*;
 
     // Used to validate that futures returned are Send.
-    fn require_send<T: Send>(t: T) -> T {
+    fn assert_send<T: Send>(t: T) -> T {
         t
     }
 
@@ -1785,7 +1786,7 @@ mod tests {
                 .when_not_matched(WhenNotMatched::DoNothing)
                 .try_build()
                 .unwrap();
-            let res = require_send(job.execute_reader(reader)).await;
+            let res = assert_send(job.execute_reader(reader)).await;
             assert!(
                 matches!(
                     &res,

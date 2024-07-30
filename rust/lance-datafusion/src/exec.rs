@@ -195,7 +195,7 @@ impl LanceExecutionOptions {
     }
 }
 
-pub fn get_session_context(options: LanceExecutionOptions) -> SessionContext {
+pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
     let session_config = SessionConfig::new();
     let mut runtime_config = RuntimeConfig::new();
     if options.use_spilling() {
@@ -215,7 +215,10 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
-    let session_ctx = get_session_context(options);
+    let session_ctx = new_session_context(options);
+    // NOTE: we are only executing the first partition here. Therefore, if
+    // the plan has more than one partition, we will be missing data.
+    assert_eq!(plan.properties().partitioning.partition_count(), 1);
     Ok(plan.execute(0, session_ctx.task_ctx())?)
 }
 
