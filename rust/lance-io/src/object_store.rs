@@ -20,6 +20,7 @@ use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
 use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::limit::LimitStore;
 use object_store::{
     aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
     memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
@@ -45,6 +46,16 @@ use lance_core::{Error, Result};
 pub const DEFAULT_LOCAL_IO_PARALLELISM: u32 = 8;
 // Cloud disks often need many many threads to saturate the network
 pub const DEFAULT_CLOUD_IO_PARALLELISM: u32 = 64;
+/// Storage option key for the maximum number of concurrent requests.
+pub const CLOUD_IO_PARALLELISM_KEY: &str = "max_concurrent_requests";
+
+fn extract_io_parallelism(storage_options: &mut StorageOptions) -> Option<u32> {
+    storage_options
+        .0
+        .remove(CLOUD_IO_PARALLELISM_KEY)
+        .or_else(|| std::env::var(CLOUD_IO_PARALLELISM_KEY.to_uppercase()).ok())
+        .and_then(|val| val.parse::<u32>().ok())
+}
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -756,6 +767,9 @@ async fn configure_store(
 ) -> Result<ObjectStore> {
     let mut storage_options = StorageOptions(options.storage_options.clone().unwrap_or_default());
     let mut url = ensure_table_uri(url)?;
+
+    let io_parallelism = extract_io_parallelism(&mut storage_options);
+
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
     // block size where we don't see a latency penalty.
@@ -806,12 +820,15 @@ async fn configure_store(
                 .with_region(region);
             let store = builder.build()?;
 
+            let io_parallelism = io_parallelism.unwrap_or(DEFAULT_CLOUD_IO_PARALLELISM);
+            let store = LimitStore::new(store, io_parallelism as usize);
+
             Ok(ObjectStore {
                 inner: Arc::new(store),
                 scheme: String::from(url.scheme()),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts,
-                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                io_parallelism,
             })
         }
         "gs" => {
@@ -821,27 +838,31 @@ async fn configure_store(
                 builder = builder.with_config(key, value);
             }
             let store = builder.build()?;
-            let store = Arc::new(store);
+
+            let io_parallelism = io_parallelism.unwrap_or(DEFAULT_CLOUD_IO_PARALLELISM);
+            let store = LimitStore::new(store, io_parallelism as usize);
 
             Ok(ObjectStore {
-                inner: store,
+                inner: Arc::new(store),
                 scheme: String::from("gs"),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts: false,
-                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                io_parallelism,
             })
         }
         "az" => {
             storage_options.with_env_azure();
             let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
-            let store = Arc::new(store);
+
+            let io_parallelism = io_parallelism.unwrap_or(DEFAULT_CLOUD_IO_PARALLELISM);
+            let store = LimitStore::new(store, io_parallelism as usize);
 
             Ok(ObjectStore {
-                inner: store,
+                inner: Arc::new(store),
                 scheme: String::from("az"),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts: false,
-                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                io_parallelism,
             })
         }
         // we have a bypass logic to use `tokio::fs` directly to lower overhead
