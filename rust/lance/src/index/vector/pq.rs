@@ -158,7 +158,7 @@ impl Index for PQIndex {
                 .iter()
                 .map(|&row_id| RowAddress::new_from_id(row_id).fragment_id())
                 .collect::<Vec<_>>();
-            frag_ids.sort();
+            // the frag_ids are already sorted inside one pq page
             frag_ids.dedup();
             Ok(RoaringBitmap::from_sorted_iter(frag_ids).unwrap())
         } else {
