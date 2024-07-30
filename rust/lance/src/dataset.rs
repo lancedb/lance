@@ -1076,6 +1076,7 @@ impl Dataset {
         }
     }
 
+    /// Take rows by indices.
     #[instrument(skip_all, fields(num_rows=row_indices.len()))]
     pub async fn take(
         &self,
@@ -1092,7 +1093,7 @@ impl Dataset {
 
     /// Take Rows by the internal ROW ids.
     ///
-    /// In Lance, each row has a unique `u64` id, which is used to identify the row.
+    /// In Lance format, each row has a unique `u64` id, which is used to identify the row globally.
     ///
     /// ```rust
     /// # use std::sync::Arc;
@@ -1100,7 +1101,7 @@ impl Dataset {
     /// # use arrow_array::{RecordBatch, RecordBatchIterator, Int64Array};
     /// # use arrow_schema::{Schema, Field, DataType};
     /// # use lance::dataset::{WriteParams, Dataset, ProjectionRequest};
-    ///
+    /// #
     /// # let mut rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let test_dir = tempfile::tempdir().unwrap();
@@ -1114,7 +1115,7 @@ impl Dataset {
     /// #    vec![batch].into_iter().map(Ok), schema
     /// # );
     /// # let dataset = Dataset::write(reader, &uri, Some(write_params)).await.unwrap();
-    ///
+    /// #
     /// let schema = dataset.schema().clone();
     /// let row_ids = vec![0, 4, 7];
     /// let rows = dataset.take_rows(&row_ids, schema).await.unwrap();
