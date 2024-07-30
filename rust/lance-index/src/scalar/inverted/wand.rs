@@ -8,20 +8,11 @@ use std::sync::Arc;
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
-use lazy_static::lazy_static;
 use tracing::instrument;
 
 use super::builder::OrderedDoc;
 use super::index::{idf, K1};
 use super::PostingList;
-
-// WAND parameters
-lazy_static! {
-    static ref FACTOR: f32 = std::env::var("WAND_FACTOR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1.0);
-}
 
 #[derive(Clone)]
 pub struct PostingIterator {
@@ -103,7 +94,6 @@ impl PostingIterator {
 }
 
 pub struct Wand {
-    factor: f32,
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
     cur_doc: Option<u64>,
     postings: Vec<PostingIterator>,
@@ -113,7 +103,6 @@ pub struct Wand {
 impl Wand {
     pub(crate) fn new(postings: impl Iterator<Item = PostingIterator>) -> Self {
         Self {
-            factor: *FACTOR,
             threshold: 0.0,
             cur_doc: None,
             postings: postings.collect(),
@@ -124,21 +113,22 @@ impl Wand {
     // search the top-k documents that contain the query
     pub(crate) async fn search(
         &mut self,
-        k: usize,
+        limit: usize,
+        factor: f32,
         scorer: impl Fn(u64, f32) -> f32,
     ) -> Result<Vec<(u64, f32)>> {
-        if k == 0 {
+        if limit == 0 {
             return Ok(vec![]);
         }
 
         while let Some(doc) = self.next().await? {
             let score = self.score(doc, &scorer);
-            if self.candidates.len() < k {
+            if self.candidates.len() < limit {
                 self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
             } else if score > self.threshold {
                 self.candidates.pop();
                 self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
-                self.threshold = self.candidates.peek().unwrap().0.score.0 * self.factor;
+                self.threshold = self.candidates.peek().unwrap().0.score.0 * factor;
             }
         }
 

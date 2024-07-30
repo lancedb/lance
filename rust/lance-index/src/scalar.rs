@@ -122,6 +122,11 @@ pub struct FullTextSearchQuery {
     pub query: String,
     /// The maximum number of results to return
     pub limit: Option<i64>,
+    /// The wand factor to use for ranking
+    /// if None, use the default value of 1.0
+    /// Increasing this value will reduce the recall and improve the performance
+    /// 1.0 is the value that would give the best performance without recall loss
+    pub wand_factor: Option<f32>,
 }
 
 impl FullTextSearchQuery {
@@ -130,6 +135,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             columns: vec![],
+            wand_factor: None,
         }
     }
 
@@ -142,6 +148,11 @@ impl FullTextSearchQuery {
 
     pub fn limit(mut self, limit: Option<i64>) -> Self {
         self.limit = limit;
+        self
+    }
+
+    pub fn wand_factor(mut self, wand_factor: Option<f32>) -> Self {
+        self.wand_factor = wand_factor;
         self
     }
 }

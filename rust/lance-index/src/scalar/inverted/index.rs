@@ -107,15 +107,7 @@ impl InvertedIndex {
             .sorted_unstable()
             .dedup()
             .collect();
-        self.bm25_search(
-            token_ids,
-            query
-                .limit
-                .map(|limit| limit as usize)
-                .unwrap_or(usize::MAX),
-            prefilter,
-        )
-        .await
+        self.bm25_search(token_ids, query, prefilter).await
     }
 
     // search the documents that contain the query
@@ -125,9 +117,15 @@ impl InvertedIndex {
     async fn bm25_search(
         &self,
         token_ids: Vec<u32>,
-        limit: usize,
+        query: &FullTextSearchQuery,
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<Vec<(u64, f32)>> {
+        let limit = query
+            .limit
+            .map(|limit| limit as usize)
+            .unwrap_or(usize::MAX);
+        let wand_factor = query.wand_factor.unwrap_or(1.0);
+
         let mask = prefilter.mask();
 
         let postings = stream::iter(token_ids.into_iter())
@@ -146,7 +144,7 @@ impl InvertedIndex {
             .await?;
 
         let mut wand = Wand::new(postings.into_iter());
-        wand.search(limit, |doc, freq| {
+        wand.search(limit, wand_factor, |doc, freq| {
             let doc_norm =
                 K1 * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
             freq / (freq + doc_norm)
