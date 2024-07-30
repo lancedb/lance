@@ -838,6 +838,7 @@ mod tests {
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     use crate::index::vector::VectorIndexParams;
 
@@ -1532,7 +1533,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Delete first 1,000 rows so rowids != rowaddrs
+        // Delete first 1,000 rows so rowids != final rowaddrs
         dataset.delete("i < 1000").await.unwrap();
 
         dataset
@@ -1557,14 +1558,14 @@ mod tests {
             .await
             .unwrap();
 
-        async fn index_set(dataset: &Dataset) -> HashSet<String> {
+        async fn index_set(dataset: &Dataset) -> HashSet<Uuid> {
             dataset
                 .load_indices()
                 .await
                 .unwrap()
                 .iter()
                 // TODO: Should this be name or UUID?
-                .map(|index| index.name.clone())
+                .map(|index| index.uuid.clone())
                 .collect()
         }
         let indices = index_set(&dataset).await;
