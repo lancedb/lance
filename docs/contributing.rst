@@ -22,8 +22,10 @@ Development Environment
 Currently Lance is implemented in Rust and comes with a Python wrapper. So you'll want to make sure you setup both.
 
 1. Install Rust: https://www.rust-lang.org/tools/install
-2. Install Python 3.8+: https://www.python.org/downloads/
+2. Install Python 3.9+: https://www.python.org/downloads/
 3. Install protoctol buffers: https://grpc.io/docs/protoc-installation/ (make sure you have version 3.20 or higher)
+
+For more tips on setting up a Python development environment, see https://github.com/lancedb/lance/blob/main/python/DEVELOPMENT.md
 
 Sample Workflow
 ---------------
