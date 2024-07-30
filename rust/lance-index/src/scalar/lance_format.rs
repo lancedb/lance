@@ -11,6 +11,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
+use lance_core::{cache::FileMetadataCache, Error, Result};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2;
 use lance_file::{
@@ -18,12 +19,10 @@ use lance_file::{
     writer::{FileWriter, FileWriterOptions, ManifestProvider},
 };
 use lance_io::scheduler::ScanScheduler;
-use snafu::{location, Location};
-
-use lance_core::{cache::FileMetadataCache, Error, Result};
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
+use snafu::{location, Location};
 
 use super::{IndexReader, IndexStore, IndexWriter};
 
@@ -118,23 +117,8 @@ impl IndexReader for FileReader {
 
 #[async_trait]
 impl IndexReader for v2::reader::FileReader {
-    async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
-        let batch_size = u32::MAX as usize;
-        let offset = offset as usize;
-        let start = offset * batch_size;
-        let end = min(start + batch_size, self.num_rows() as usize);
-        let params = ReadBatchParams::Range(start..end);
-        let batches = self
-            .read_stream(
-                params,
-                batch_size as u32,
-                u32::MAX,
-                FilterExpression::no_filter(),
-            )?
-            .try_collect::<Vec<_>>()
-            .await?;
-        assert_eq!(batches.len(), 1);
-        Ok(batches[0].clone())
+    async fn read_record_batch(&self, _offset: u32) -> Result<RecordBatch> {
+        unimplemented!("v2 format removed the batch concept")
     }
 
     async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
@@ -152,7 +136,7 @@ impl IndexReader for v2::reader::FileReader {
     }
 
     async fn num_batches(&self) -> u32 {
-        self.num_rows().div_ceil(u32::MAX as u64) as u32
+        unimplemented!("v2 format removed the batch concept")
     }
 
     fn num_rows(&self) -> usize {
@@ -273,25 +257,17 @@ impl IndexStore for LanceIndexStore {
             self.object_store.copy(&path, &dest_path).await
         } else {
             let reader = self.open_index_file_v2(name).await?;
-            let num_batches = reader.num_batches().await;
-            if num_batches == 0 {
-                return Err(Error::Internal {
-                    message:
-                        "Cannot copy an empty index file because the schema cannot be determined"
-                            .into(),
-                    location: location!(),
-                });
-            }
-            let first_batch = reader.read_record_batch(0).await?;
-            let schema = first_batch.schema();
-            let mut writer = dest_store.new_index_file_v2(name, schema).await?;
-            writer.write_record_batch(first_batch).await?;
-            for batch_index in 1..num_batches {
-                writer
-                    .write_record_batch(reader.read_record_batch(batch_index).await?)
-                    .await?;
+            let mut writer = dest_store
+                .new_index_file_v2(name, Arc::new(reader.schema().into()))
+                .await?;
+
+            for offset in (0..reader.num_rows()).step_by(4096) {
+                let next_offset = min(offset + 4096, reader.num_rows());
+                let batch = reader.read_range(offset..next_offset).await?;
+                writer.write_record_batch(batch).await?;
             }
             writer.finish().await?;
+
             Ok(())
         }
     }

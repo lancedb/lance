@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::AsArray;
+use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, Float32Array, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
@@ -302,21 +303,20 @@ impl TokenSet {
     pub async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let mut tokens = HashMap::new();
         let mut next_id = 0;
-        for i in 0..reader.num_batches().await {
-            let batch = reader.read_record_batch(i).await?;
-            let token_col = batch[TOKEN_COL].as_string::<i32>();
-            let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
-            let frequency_col = batch[FREQUENCY_COL].as_primitive::<datatypes::UInt64Type>();
 
-            for ((token, &token_id), &frequency) in token_col
-                .iter()
-                .zip(token_id_col.values().iter())
-                .zip(frequency_col.values().iter())
-            {
-                let token = token.unwrap();
-                tokens.insert(token.to_owned(), (token_id, frequency));
-                next_id = next_id.max(token_id + 1);
-            }
+        let batch = reader.read_range(0..reader.num_rows()).await?;
+        let token_col = batch[TOKEN_COL].as_string::<i32>();
+        let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
+        let frequency_col = batch[FREQUENCY_COL].as_primitive::<datatypes::UInt64Type>();
+
+        for ((token, &token_id), &frequency) in token_col
+            .iter()
+            .zip(token_id_col.values().iter())
+            .zip(frequency_col.values().iter())
+        {
+            let token = token.unwrap();
+            tokens.insert(token.to_owned(), (token_id, frequency));
+            next_id = next_id.max(token_id + 1);
         }
 
         Ok(Self { tokens, next_id })
@@ -413,8 +413,8 @@ impl InvertedListReader {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
                 let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
                 Result::Ok(PostingList::new(
-                    row_ids.values().to_vec(),
-                    frequencies.values().to_vec(),
+                    row_ids.values().clone(),
+                    frequencies.values().clone(),
                 ))
             })
             .await
@@ -422,14 +422,21 @@ impl InvertedListReader {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Default, DeepSizeOf)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct PostingList {
-    pub row_ids: Vec<u64>,
-    pub frequencies: Vec<f32>,
+    pub row_ids: ScalarBuffer<u64>,
+    pub frequencies: ScalarBuffer<f32>,
+}
+
+impl DeepSizeOf for PostingList {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.row_ids.len() * std::mem::size_of::<u64>()
+            + self.frequencies.len() * std::mem::size_of::<f32>()
+    }
 }
 
 impl PostingList {
-    pub fn new(row_ids: Vec<u64>, frequencies: Vec<f32>) -> Self {
+    pub fn new(row_ids: ScalarBuffer<u64>, frequencies: ScalarBuffer<f32>) -> Self {
         Self {
             row_ids,
             frequencies,
@@ -450,6 +457,29 @@ impl PostingList {
 
     pub fn row_id(&self, i: usize) -> u64 {
         self.row_ids[i]
+    }
+}
+
+#[derive(Debug, Clone, Default, DeepSizeOf)]
+pub struct PostingListBuilder {
+    pub row_ids: Vec<u64>,
+    pub frequencies: Vec<f32>,
+}
+
+impl PostingListBuilder {
+    pub fn new(row_ids: Vec<u64>, frequencies: Vec<f32>) -> Self {
+        Self {
+            row_ids,
+            frequencies,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.row_ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn to_batch(&self) -> Result<RecordBatch> {
@@ -522,19 +552,17 @@ impl DocSet {
     pub async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let mut token_count = HashMap::new();
         let mut total_tokens = 0;
-        for i in 0..reader.num_batches().await {
-            let batch = reader.read_record_batch(i).await?;
-            let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-            let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
 
-            for (&row_id, &num_tokens) in row_id_col
-                .values()
-                .iter()
-                .zip(num_tokens_col.values().iter())
-            {
-                token_count.insert(row_id, num_tokens);
-                total_tokens += num_tokens as u64;
-            }
+        let batch = reader.read_range(0..reader.num_rows()).await?;
+        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
+        for (&row_id, &num_tokens) in row_id_col
+            .values()
+            .iter()
+            .zip(num_tokens_col.values().iter())
+        {
+            token_count.insert(row_id, num_tokens);
+            total_tokens += num_tokens as u64;
         }
 
         Ok(Self {
