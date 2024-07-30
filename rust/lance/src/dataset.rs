@@ -1201,7 +1201,7 @@ impl Dataset {
 
 /// # Schema Evolution
 ///
-/// Lance datasets supports evolving the schema. Several operations are
+/// Lance datasets support evolving the schema. Several operations are
 /// supported that mirror common SQL operations:
 ///
 /// - [Self::add_columns()]: Add new columns to the dataset, similar to `ALTER TABLE ADD COLUMN`.

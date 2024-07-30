@@ -277,7 +277,7 @@ Casting column data types
 In addition to changing column names, you can also change the data type of a
 column using the :py:meth:`lance.LanceDataset.alter_columns` method. This
 requires rewriting that column to new data files, but does not require rewriting
-the any other columns.
+the other columns.
 
 .. note::
 
@@ -285,7 +285,8 @@ the any other columns.
   changed.
 
 This method can be used to change the vector type of a column. For example, we
-can change a float32 embedding column into a float16 column to save disk space:
+can change a float32 embedding column into a float16 column to save disk space
+at the cost of lower precision:
 
 .. testcode::
 
@@ -374,7 +375,7 @@ dataset using the :py:meth:`lance.LanceDataset.merge` method. This allows fillin
 additional columns without having to rewrite the whole dataset.
 
 
-To use the ``merge`` method, provide a new table that includes the columns you
+To use the ``merge`` method, provide a new dataset that includes the columns you
 want to add, and a column name to use for joining the new data to the existing
 dataset.
 
@@ -414,8 +415,8 @@ Now if we want to add a column of labels we have generated, we can do so by merg
 Dropping columns
 ~~~~~~~~~~~~~~~~
 
-Finally, you can drop columns from a dataset using the :py:meth:`lance.LanceDataset.drop_columns`.
-This is a metadata-only operation and does not delete the data on disk. This makes
+Finally, you can drop columns from a dataset using the :py:meth:`lance.LanceDataset.drop_columns`
+method. This is a metadata-only operation and does not delete the data on disk. This makes
 it very quick.
 
 .. testcode::
