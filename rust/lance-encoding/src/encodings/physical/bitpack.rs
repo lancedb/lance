@@ -455,7 +455,9 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                 }
 
                 // if the type is signed, need to pad out the rest of the byte with 1s
+                let mut negative_padded_current_byte = false;
                 if self.signed && is_negative && dst_offset > 0 {
+                    negative_padded_current_byte = true;
                     while dst_offset < 8 {
                         dest[dst_idx] |= 1 << dst_offset;
                         dst_offset += 1;
@@ -489,7 +491,13 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
 
                     // pad remaining bytes with 1 for negative signed numbers
                     if self.signed && is_negative {
-                        dest.extend([0xFF].repeat(next_dst_idx - dest.len()))
+                        if !negative_padded_current_byte {
+                            dest[dst_idx] = 0xFF;
+                        }
+                        for i in dst_idx+1..next_dst_idx {
+                            dest[i] = 0xFF;
+                        }
+                        // dest.extend([0xFF].repeat(next_dst_idx - dest.len()))
                     }
 
                     dst_idx = next_dst_idx;
