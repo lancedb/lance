@@ -5,21 +5,18 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use crate::scalar::{IndexReader, IndexStore};
+use crate::vector::graph::OrderedFloat;
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
 use arrow::datatypes::{self, Float32Type, UInt64Type};
-use arrow_array::{OffsetSizeTrait, RecordBatch};
-use arrow_schema::DataType;
+use arrow_array::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use itertools::Itertools;
-use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result, ROW_ID};
-use snafu::{location, Location};
-
-use crate::scalar::{IndexReader, IndexStore};
-use crate::vector::graph::OrderedFloat;
+use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_core::{Result, ROW_ID};
 
 use super::index::*;
 
@@ -36,32 +33,13 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        match new_data.schema().field(0).data_type() {
-            DataType::Utf8 => {
-                update_index::<i32>(
-                    new_data,
-                    &mut self.tokens,
-                    &mut self.invert_list,
-                    &mut self.docs,
-                )
-                .await?;
-            }
-            DataType::LargeUtf8 => {
-                update_index::<i64>(
-                    new_data,
-                    &mut self.tokens,
-                    &mut self.invert_list,
-                    &mut self.docs,
-                )
-                .await?;
-            }
-            data_type => {
-                return Err(Error::invalid_input(
-                    format!("unsupported data type {} for inverted index", data_type),
-                    location!(),
-                ))
-            }
-        }
+        update_index(
+            new_data,
+            &mut self.tokens,
+            &mut self.invert_list,
+            &mut self.docs,
+        )
+        .await?;
 
         let token_set_batch = self.tokens.to_batch()?;
         let mut token_set_writer = dest_store
@@ -124,7 +102,7 @@ impl InvertedIndexBuilder {
     }
 }
 
-pub async fn update_index<Offset: OffsetSizeTrait>(
+pub async fn update_index(
     new_data: SendableRecordBatchStream,
     token_set: &mut TokenSet,
     invert_list: &mut InvertedList,
@@ -133,10 +111,10 @@ pub async fn update_index<Offset: OffsetSizeTrait>(
     let mut tokenizer = TOKENIZER.clone();
     let mut stream = new_data;
     while let Some(batch) = stream.try_next().await? {
-        let doc_col = batch.column(0).as_string::<Offset>();
+        let doc_iter = iter_str_array(batch.column(0));
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
 
-        for (doc, row_id) in doc_col.iter().zip(row_id_col.iter()) {
+        for (doc, row_id) in doc_iter.zip(row_id_col.iter()) {
             let doc = doc.unwrap();
             let row_id = row_id.unwrap();
             let mut token_stream = tokenizer.token_stream(doc);
@@ -284,6 +262,7 @@ mod tests {
     use arrow_array::{Array, ArrayRef, GenericStringArray, RecordBatch, UInt64Array};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
+    use lance_core::ROW_ID_FIELD;
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
@@ -308,7 +287,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
                 arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), false),
-                arrow_schema::Field::new(super::ROW_ID, arrow_schema::DataType::UInt64, false),
+                ROW_ID_FIELD.clone(),
             ])
             .into(),
             vec![
