@@ -122,7 +122,7 @@ mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = "0.11"
 num-traits = "0.2"
 num_cpus = "1.0"
-object_store = { version = "0.10.1" }
+object_store = { version = "0.10.2" }
 parquet = "52.0"
 pin-project = "1.0"
 path_abs = "0.5"
