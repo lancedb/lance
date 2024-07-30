@@ -400,6 +400,7 @@ class IndicesBuilder:
             path or a cloud storage path.
         fragments: list[LanceFragment]
             The list of data fragments to use when computing the transformed vectors.
+            Must be a non-empty list.
         partition_ds_uri: str
             The URI of a precomputed partitions dataset.  This allows the partition
             transform to be skipped, using the precomputed value instead.  This is
@@ -408,7 +409,11 @@ class IndicesBuilder:
         dimension = self.dataset.schema.field(self.column[0]).type.list_size
         num_subvectors = pq.num_subvectors
         distance_type = ivf.distance_type
-        fragments = [f._fragment for f in fragments]
+        if fragments:
+            fragments = [f._fragment for f in fragments]
+        else:
+            raise ValueError("fragments must be a non-empty list")
+
         indices.transform_vectors(
             self.dataset._ds,
             self.column[0],
