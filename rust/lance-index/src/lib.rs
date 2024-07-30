@@ -9,11 +9,6 @@
 //! API stability is not guaranteed.
 //! </section>
 
-#![cfg_attr(
-    all(feature = "nightly", target_arch = "x86_64"),
-    feature(stdarch_x86_avx512)
-)]
-
 use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;

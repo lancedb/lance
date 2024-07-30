@@ -693,7 +693,7 @@ impl FileFragment {
     /// * All field ids in the fragment are distinct
     /// * Within each data file, field ids are in increasing order
     /// * All fields in the schema have a corresponding field in one of the data
-    ///  files
+    ///   files
     /// * All data files exist and have the same length
     /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range

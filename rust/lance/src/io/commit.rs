@@ -45,7 +45,7 @@ use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
 
-#[cfg(all(target_feature = "dynamodb", test))]
+#[cfg(all(feature = "dynamodb", test))]
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
