@@ -464,7 +464,7 @@ mod test {
                     40,  // 40
                     125, // 125
                 ],
-                ProjectionRequest::from_schema(projection),
+                projection,
             )
             .await
             .unwrap();
@@ -543,9 +543,7 @@ mod test {
         // take the last row of first fragment
         // this triggers the contiguous branch
         let indices = &[(1 << 32) - 1];
-        let fut = require_send(
-            ds.take_rows(indices, ProjectionRequest::from_schema(ds.schema().clone())),
-        );
+        let fut = require_send(ds.take_rows(indices, ds.schema()));
         let err = fut.await.unwrap_err();
         assert!(
             err.to_string().contains("Invalid read params"),
@@ -555,10 +553,7 @@ mod test {
 
         // this triggers the sorted branch, but not contiguous
         let indices = &[(1 << 32) - 3, (1 << 32) - 1];
-        let err = ds
-            .take_rows(indices, ProjectionRequest::from_schema(ds.schema().clone()))
-            .await
-            .unwrap_err();
+        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
         assert!(
             err.to_string()
                 .contains("Invalid read params Indices(4294967293,4294967295)"),
@@ -568,10 +563,7 @@ mod test {
 
         // this triggers the catch all branch
         let indices = &[(1 << 32) - 1, (1 << 32) - 3];
-        let err = ds
-            .take_rows(indices, ProjectionRequest::from_schema(ds.schema().clone()))
-            .await
-            .unwrap_err();
+        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
         assert!(
             err.to_string()
                 .contains("Invalid read params Indices(4294967293,4294967295)"),
@@ -597,7 +589,6 @@ mod test {
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
         let projection = Schema::try_from(data.schema().as_ref()).unwrap();
-        let projection = ProjectionRequest::from_schema(projection);
         let indices = &[
             5_u64 << 32,        // 200
             (4_u64 << 32) + 39, // 199
@@ -710,13 +701,7 @@ mod test {
         dataset.delete("i in (1, 2, 3, 7)").await.unwrap();
 
         let indices = &[0, 4, 6, 5];
-        let result = dataset
-            .take_rows(
-                indices,
-                ProjectionRequest::from_schema(dataset.schema().clone()),
-            )
-            .await
-            .unwrap();
+        let result = dataset.take_rows(indices, dataset.schema()).await.unwrap();
         assert_eq!(
             RecordBatch::try_new(
                 data.schema(),

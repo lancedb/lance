@@ -233,6 +233,11 @@ impl ProjectionRequest {
         Self::Schema(Arc::new(schema))
     }
 
+    /// Provide a list of projection with SQL transform.
+    ///
+    /// # Parameters
+    /// - `columns`: A list of tuples where the first element is resulted column name and the second
+    ///              element is the SQL expression.
     pub fn from_sql(
         columns: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
@@ -249,6 +254,24 @@ impl ProjectionRequest {
             Self::Schema(schema) => Ok(ProjectionPlan::new_empty(schema)),
             Self::Sql(columns) => ProjectionPlan::try_new(dataset_schema, &columns),
         }
+    }
+}
+
+impl From<Arc<Schema>> for ProjectionRequest {
+    fn from(schema: Arc<Schema>) -> Self {
+        Self::Schema(schema)
+    }
+}
+
+impl From<Schema> for ProjectionRequest {
+    fn from(schema: Schema) -> Self {
+        Self::from(Arc::new(schema))
+    }
+}
+
+impl From<&Schema> for ProjectionRequest {
+    fn from(schema: &Schema) -> Self {
+        Self::from(schema.clone())
     }
 }
 
@@ -1057,26 +1080,59 @@ impl Dataset {
     pub async fn take(
         &self,
         row_indices: &[u64],
-        projection: ProjectionRequest,
+        projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
         take::take(
             self,
             row_indices,
-            &projection.into_projection_plan(self.schema())?,
+            &projection.into().into_projection_plan(self.schema())?,
         )
         .await
     }
 
-    /// Take rows by the internal ROW ids.
+    /// Take Rows by the internal ROW ids.
+    ///
+    /// In Lance, each row has a unique `u64` id, which is used to identify the row.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use tokio::runtime::Runtime;
+    /// # use arrow_array::{RecordBatch, RecordBatchIterator, Int64Array};
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// # use lance::dataset::{WriteParams, Dataset, ProjectionRequest};
+    ///
+    /// # let mut rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let test_dir = tempfile::tempdir().unwrap();
+    /// # let uri = test_dir.path().to_str().unwrap().to_string();
+    /// #
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    /// # let write_params = WriteParams::default();
+    /// # let array = Arc::new(Int64Array::from_iter(0..128));
+    /// # let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    /// # let reader = RecordBatchIterator::new(
+    /// #    vec![batch].into_iter().map(Ok), schema
+    /// # );
+    /// # let dataset = Dataset::write(reader, &uri, Some(write_params)).await.unwrap();
+    ///
+    /// let schema = dataset.schema().clone();
+    /// let row_ids = vec![0, 4, 7];
+    /// let rows = dataset.take_rows(&row_ids, schema).await.unwrap();
+    ///
+    /// // We can have more fine-grained control over the projection, i.e., SQL projection.
+    /// let projection = ProjectionRequest::from_sql([("identity", "id * 2")]);
+    /// let rows = dataset.take_rows(&row_ids, projection).await.unwrap();
+    /// # });
+    /// ```
     pub async fn take_rows(
         &self,
         row_ids: &[u64],
-        projection: ProjectionRequest,
+        projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
         take::take_rows(
             self,
             row_ids,
-            &projection.into_projection_plan(self.schema())?,
+            &projection.into().into_projection_plan(self.schema())?,
         )
         .await
     }
@@ -1098,8 +1154,7 @@ impl Dataset {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
         let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
-        self.take(&ids, ProjectionRequest::from_schema(projection.clone()))
-            .await
+        self.take(&ids, projection).await
     }
 
     /// Delete rows based on a predicate.
@@ -1347,12 +1402,7 @@ impl DatasetTakeRows for Dataset {
     }
 
     async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
-        Self::take_rows(
-            self,
-            row_ids,
-            ProjectionRequest::from_schema(projection.clone()),
-        )
-        .await
+        Self::take_rows(self, row_ids, projection).await
     }
 }
 
