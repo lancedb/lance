@@ -398,6 +398,8 @@ class IndicesBuilder:
         dest_uri: str
             The URI to save the transformed vectors to.  The URI can be a local file
             path or a cloud storage path.
+        fragments: list[LanceFragment]
+            The list of data fragments to use when computing the transformed vectors.
         partition_ds_uri: str
             The URI of a precomputed partitions dataset.  This allows the partition
             transform to be skipped, using the precomputed value instead.  This is
