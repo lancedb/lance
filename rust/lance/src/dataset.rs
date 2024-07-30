@@ -15,7 +15,7 @@ use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
@@ -41,6 +41,7 @@ mod hash_joiner;
 pub mod index;
 pub mod optimize;
 pub mod progress;
+pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
@@ -53,6 +54,7 @@ mod write;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
+use self::refs::{check_valid_ref, tag_path, TagContents, Tags};
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
@@ -86,7 +88,7 @@ pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 /// Lance Dataset
 #[derive(Debug, Clone)]
 pub struct Dataset {
-    pub(crate) object_store: Arc<ObjectStore>,
+    pub object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
     /// Uri of the dataset.
     ///
@@ -96,6 +98,7 @@ pub struct Dataset {
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) session: Arc<Session>,
+    pub tags: Tags,
 }
 
 /// Dataset Version
@@ -156,6 +159,8 @@ pub struct ReadParams {
     /// If a custom object store is provided (via store_params.object_store) then this
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
+
+    pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl ReadParams {
@@ -177,6 +182,15 @@ impl ReadParams {
         self
     }
 
+    /// Provide an object store registry for custom object stores
+    pub fn with_object_store_registry(
+        &mut self,
+        object_store_registry: Arc<ObjectStoreRegistry>,
+    ) -> &mut Self {
+        self.object_store_registry = object_store_registry;
+        self
+    }
+
     /// Use the explicit locking to resolve the latest version
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
@@ -191,6 +205,7 @@ impl Default for ReadParams {
             session: None,
             store_options: None,
             commit_handler: None,
+            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -250,9 +265,12 @@ impl Dataset {
         uri: &str,
         commit_handler: &Option<Arc<dyn CommitHandler>>,
         store_options: &Option<ObjectStoreParams>,
+        object_store_registry: Arc<ObjectStoreRegistry>,
     ) -> Result<(ObjectStore, Path, Arc<dyn CommitHandler>)> {
         let (mut object_store, base_path) = match store_options.as_ref() {
-            Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
+            Some(store_options) => {
+                ObjectStore::from_uri_and_params(object_store_registry, uri, store_options).await?
+            }
             None => ObjectStore::from_uri(uri).await?,
         };
 
@@ -285,8 +303,16 @@ impl Dataset {
         Ok((object_store, base_path, commit_handler))
     }
 
-    /// Check out the specified version of this dataset
-    pub async fn checkout_version(&self, version: u64) -> Result<Self> {
+    /// Check out a dataset version with a ref
+    pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
+        let ref_: refs::Ref = version.into();
+        match ref_ {
+            refs::Ref::Version(version) => self.checkout_by_version_number(version).await,
+            refs::Ref::Tag(tag) => self.checkout_by_tag(tag.as_str()).await,
+        }
+    }
+
+    async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
         let manifest_file = self
             .commit_handler
@@ -307,6 +333,22 @@ impl Dataset {
             self.commit_handler.clone(),
         )
         .await
+    }
+
+    async fn checkout_by_tag(&self, tag: &str) -> Result<Self> {
+        check_valid_ref(tag)?;
+
+        let tag_file = tag_path(&self.base, tag);
+
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+
+        self.checkout_by_version_number(tag_contents.version).await
     }
 
     async fn load_manifest(
@@ -383,6 +425,11 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
     ) -> Result<Self> {
+        let tags = Tags::new(
+            object_store.clone(),
+            commit_handler.clone(),
+            base_path.clone(),
+        );
         Ok(Self {
             object_store,
             base: base_path,
@@ -390,6 +437,7 @@ impl Dataset {
             manifest: Arc::new(manifest),
             commit_handler,
             session,
+            tags,
         })
     }
 
@@ -400,8 +448,13 @@ impl Dataset {
         params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut params = params.unwrap_or_default();
-        let (object_store, base, commit_handler) =
-            Self::params_from_uri(uri, &params.commit_handler, &params.store_params).await?;
+        let (object_store, base, commit_handler) = Self::params_from_uri(
+            uri,
+            &params.commit_handler,
+            &params.store_params,
+            params.object_store_registry.clone(),
+        )
+        .await?;
 
         // Read expected manifest path for the dataset
         let dataset_exists = match commit_handler
@@ -446,6 +499,7 @@ impl Dataset {
                     .with_read_params(ReadParams {
                         store_options: params.store_params.clone(),
                         commit_handler: params.commit_handler.clone(),
+                        object_store_registry: params.object_store_registry.clone(),
                         ..Default::default()
                     })
                     .load()
@@ -532,6 +586,8 @@ impl Dataset {
             .await?
         };
 
+        let tags = Tags::new(object_store.clone(), commit_handler.clone(), base.clone());
+
         Ok(Self {
             object_store,
             base,
@@ -539,6 +595,7 @@ impl Dataset {
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
             commit_handler,
+            tags,
         })
     }
 
@@ -718,9 +775,16 @@ impl Dataset {
         &self,
         older_than: Duration,
         delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<Result<RemovalStats>> {
         let before = utc_now() - older_than;
-        cleanup::cleanup_old_versions(self, before, delete_unverified).boxed()
+        cleanup::cleanup_old_versions(
+            self,
+            before,
+            delete_unverified,
+            error_if_tagged_old_versions,
+        )
+        .boxed()
     }
 
     /// Commit changes to the dataset
@@ -757,6 +821,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
+        object_store_registry: Arc<ObjectStoreRegistry>,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
             || match operation {
@@ -769,8 +834,13 @@ impl Dataset {
             Ok,
         )?;
 
-        let (object_store, base, commit_handler) =
-            Self::params_from_uri(base_uri, &commit_handler, &store_params).await?;
+        let (object_store, base, commit_handler) = Self::params_from_uri(
+            base_uri,
+            &commit_handler,
+            &store_params,
+            object_store_registry.clone(),
+        )
+        .await?;
 
         // Test if the dataset exists
         let dataset_exists = match commit_handler
@@ -795,6 +865,7 @@ impl Dataset {
                 DatasetBuilder::from_uri(base_uri)
                     .with_read_params(ReadParams {
                         store_options: store_params.clone(),
+                        object_store_registry: object_store_registry.clone(),
                         ..Default::default()
                     })
                     .load()
@@ -827,13 +898,17 @@ impl Dataset {
             .await?
         };
 
+        let object_store = Arc::new(object_store);
+        let tags = Tags::new(object_store.clone(), commit_handler.clone(), base.clone());
+
         Ok(Self {
-            object_store: Arc::new(object_store),
+            object_store,
             base,
             uri: base_uri.to_string(),
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
             commit_handler,
+            tags,
         })
     }
 
@@ -1259,7 +1334,7 @@ impl Dataset {
     /// This is a metadata-only operation and does not remove the data from the
     /// underlying storage. In order to remove the data, you must subsequently
     /// call `compact_files` to rewrite the data without the removed columns and
-    /// then call `cleanup_files` to remove the old files.
+    /// then call `cleanup_old_versions` to remove the old files.
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
         schema_evolution::drop_columns(self, columns).await
     }
@@ -2845,6 +2920,84 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(dataset.count_fragments(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_tag(#[values(false, true)] use_legacy_format: bool) {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                use_legacy_format,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.version, 1);
+
+        // delete some rows
+        dataset.delete("i > 50").await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
+
+        let bad_tag_creation = dataset.tags.create("tag1", 3).await;
+        assert_eq!(
+            bad_tag_creation.err().unwrap().to_string(),
+            "Version not found error: version 3 does not exist"
+        );
+
+        let bad_tag_deletion = dataset.tags.delete("tag1").await;
+        assert_eq!(
+            bad_tag_deletion.err().unwrap().to_string(),
+            "Ref not found error: tag tag1 does not exist"
+        );
+
+        dataset.tags.create("tag1", 1).await.unwrap();
+
+        assert_eq!(dataset.tags.list().await.unwrap().len(), 1);
+
+        let another_bad_tag_creation = dataset.tags.create("tag1", 1).await;
+        assert_eq!(
+            another_bad_tag_creation.err().unwrap().to_string(),
+            "Ref conflict error: tag tag1 already exists"
+        );
+
+        dataset.tags.delete("tag1").await.unwrap();
+
+        assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
+
+        dataset.tags.create("tag1", 1).await.unwrap();
+        dataset.tags.create("tag2", 1).await.unwrap();
+        dataset.tags.create("v1.0.0-rc1", 1).await.unwrap();
+
+        assert_eq!(dataset.tags.list().await.unwrap().len(), 3);
+
+        let bad_checkout = dataset.checkout_version("tag3").await;
+        assert_eq!(
+            bad_checkout.err().unwrap().to_string(),
+            "Ref not found error: tag tag3 does not exist"
+        );
+
+        dataset = dataset.checkout_version("tag1").await.unwrap();
+        assert_eq!(dataset.manifest.version, 1);
     }
 
     #[rstest]

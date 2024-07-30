@@ -137,6 +137,12 @@ class IvfModel:
         return cls(centroids, distance_type)
 
 
+# Some transforms hardcode their output column names
+PARTITION_COLUMN = "__ivf_part_id"
+RESIDUAL_COLUMN = "__residual_vector"
+PQ_COLUMN = "__pq_code"
+
+
 class IndicesBuilder:
     """
     A class with helper functions for building indices on a dataset.
@@ -197,9 +203,6 @@ class IndicesBuilder:
         Parameters
         ----------
 
-        column: str
-            The vector column to partition, must be a fixed size list of floats
-            or 1-dimensional fixed-shape tensor column.
         num_partitions: int
             The number of partitions to train.  Large values are more expensive to
             train and can lead to longer search times.  Smaller values could lead to
@@ -369,6 +372,47 @@ class IndicesBuilder:
         )
         return compute_partitions(
             self.dataset, self.column[0], kmeans, dst_dataset_uri=output_uri
+        )
+
+    def transform_vectors(
+        self,
+        ivf: IvfModel,
+        pq: PqModel,
+        dest_uri: str,
+        partition_ds_uri: Optional[str] = None,
+    ):
+        """
+        Apply transformations to the vectors in the dataset and create an unsorted
+        storage file.  The unsorted storage file is a lance file that will at least
+        have a row id column.  Normally it will have other columns containing the
+        transform outputs (such as partition id and PQ code)
+
+        Parameters
+        ----------
+        ivf: IvfModel
+            The IVF model to use for the transformations (e.g. partition assignment)
+        pq: PqModel
+            The PQ model to use for the transformations (e.g. quantization)
+        dest_uri: str
+            The URI to save the transformed vectors to.  The URI can be a local file
+            path or a cloud storage path.
+        partition_ds_uri: str
+            The URI of a precomputed partitions dataset.  This allows the partition
+            transform to be skipped, using the precomputed value instead.  This is
+            optional.
+        """
+        dimension = self.dataset.schema.field(self.column[0]).type.list_size
+        num_subvectors = pq.num_subvectors
+        distance_type = ivf.distance_type
+        indices.transform_vectors(
+            self.dataset._ds,
+            self.column[0],
+            dimension,
+            num_subvectors,
+            distance_type,
+            ivf.centroids,
+            pq.codebook,
+            dest_uri,
         )
 
     def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):

@@ -7,12 +7,13 @@ use arrow_array::{cast::AsArray, Array, BinaryArray};
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType;
 use arrow_select::concat::concat;
-use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 
 use lance_core::Result;
 
 use crate::{
+    buffer::LanceBuffer,
+    data::{DataBlock, DataBlockExt, NullableDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
@@ -63,30 +64,22 @@ struct FsstPageDecoder {
 }
 
 impl PrimitivePageDecoder for FsstPageDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
-        let buffers = self
-            .inner_decoder
-            .decode(rows_to_skip, num_rows, all_null)?;
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+        let compressed_data = self.inner_decoder.decode(rows_to_skip, num_rows)?;
+        let compressed_data = compressed_data.as_any_box();
+        let (string_data, nulls) = match compressed_data.downcast::<NullableDataBlock>() {
+            Ok(nullable) => {
+                let data = nullable.data.try_into_layout::<VariableWidthBlock>()?;
+                Result::Ok((data, Some(nullable.nulls)))
+            }
+            Err(data) => {
+                let data = data.downcast::<VariableWidthBlock>().unwrap();
+                Ok((data, None))
+            }
+        }?;
 
-        let mut buffers_iter = buffers.into_iter();
-
-        // Buffer order expected from inner binary decoder
-        let validity = buffers_iter.next().unwrap();
-        let offsets = buffers_iter.next().unwrap();
-        let dummy = buffers_iter.next().unwrap();
-        let bytes = buffers_iter.next().unwrap();
-
-        // Reinterpret offsets as i32
-        let offsets = ScalarBuffer::<i32>::new(
-            Buffer::from_bytes(offsets.freeze().into()),
-            0,
-            num_rows as usize + 1,
-        );
+        let offsets = ScalarBuffer::<i32>::from(string_data.offsets.into_buffer());
+        let bytes = string_data.data.into_buffer();
 
         let mut decompressed_offsets = vec![0_i32; offsets.len()];
         let mut decompressed_bytes = vec![0_u8; bytes.len() * 8];
@@ -105,23 +98,28 @@ impl PrimitivePageDecoder for FsstPageDecoder {
         // TODO: Change PrimitivePageDecoder to use Vec instead of BytesMut
         // since there is no way to get BytesMut from Vec but these copies should be avoidable
         // This is not the first time this has happened
-        let mut offsets_as_bytes_mut = BytesMut::with_capacity(decompressed_offsets.len());
+        let mut offsets_as_bytes_mut = Vec::with_capacity(decompressed_offsets.len());
         let decompressed_offsets = ScalarBuffer::<i32>::from(decompressed_offsets);
         offsets_as_bytes_mut.extend_from_slice(decompressed_offsets.inner().as_slice());
 
-        let mut bytes_as_bytes_mut = BytesMut::with_capacity(decompressed_bytes.len());
+        let mut bytes_as_bytes_mut = Vec::with_capacity(decompressed_bytes.len());
         bytes_as_bytes_mut.extend_from_slice(&decompressed_bytes);
 
-        Ok(vec![
-            validity,
-            offsets_as_bytes_mut,
-            dummy,
-            bytes_as_bytes_mut,
-        ])
-    }
+        let new_string_data = Box::new(VariableWidthBlock {
+            bits_per_offset: 32,
+            data: LanceBuffer::from(bytes_as_bytes_mut),
+            num_values: num_rows,
+            offsets: LanceBuffer::from(offsets_as_bytes_mut),
+        });
 
-    fn num_buffers(&self) -> u32 {
-        self.inner_decoder.num_buffers()
+        if let Some(nulls) = nulls {
+            Ok(Box::new(NullableDataBlock {
+                data: new_string_data,
+                nulls,
+            }))
+        } else {
+            Ok(new_string_data)
+        }
     }
 }
 

@@ -1130,8 +1130,8 @@ impl BtreeTrainingSource for BTreeUpdater {
         let new_input = Arc::new(OneShotExec::new(self.new_data));
         let old_input = Self::into_old_input(self.index);
         debug_assert_eq!(
-            old_input.schema().all_fields().len(),
-            new_input.schema().all_fields().len()
+            old_input.schema().flattened_fields().len(),
+            new_input.schema().flattened_fields().len()
         );
         let sort_expr = PhysicalSortExpr {
             expr: Arc::new(Column::new("values", 0)),

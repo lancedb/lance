@@ -3,10 +3,11 @@
 from pathlib import Path
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
-from lance.indices import IndicesBuilder
+from lance.indices import IndicesBuilder, IvfModel, PqModel
 
 N_DIMS = 512
 
@@ -126,4 +127,33 @@ def test_partition_assignment(test_large_dataset, benchmark, num_partitions):
     ivf = builder.train_ivf(num_partitions=num_partitions)
     benchmark.pedantic(
         builder.assign_ivf_partitions, args=[ivf, None, "cuda"], iterations=1, rounds=1
+    )
+
+
+def rand_ivf(rand_dataset):
+    dtype = rand_dataset.schema.field("vector").type.value_type.to_pandas_dtype()
+    centroids = np.random.rand(N_DIMS * 35000).astype(dtype)
+    centroids = pa.FixedSizeListArray.from_arrays(centroids, N_DIMS)
+    return IvfModel(centroids, "l2")
+
+
+def rand_pq(rand_dataset, rand_ivf):
+    dtype = rand_dataset.schema.field("vector").type.value_type.to_pandas_dtype()
+    codebook = np.random.rand(N_DIMS * 256).astype(dtype)
+    codebook = pa.FixedSizeListArray.from_arrays(codebook, N_DIMS)
+    pq = PqModel(512 // 16, codebook)
+    return pq
+
+
+@pytest.mark.benchmark(group="transform_vectors")
+def test_transform_vectors(test_dataset, tmpdir_factory, benchmark):
+    ivf = rand_ivf(test_dataset)
+    pq = rand_pq(test_dataset, ivf)
+    builder = IndicesBuilder(test_dataset)
+    dst_uri = str(tmpdir_factory.mktemp("transformed") / "output.lance")
+    benchmark.pedantic(
+        builder.transform_vectors,
+        args=["vector", ivf, pq, dst_uri],
+        iterations=1,
+        rounds=1,
     )

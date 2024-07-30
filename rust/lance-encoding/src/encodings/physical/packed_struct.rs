@@ -8,6 +8,8 @@ use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::DataTypeExt;
 
 use crate::{
+    buffer::LanceBuffer,
+    data::{DataBlock, FixedWidthDataBlock, StructDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb::{self},
@@ -106,12 +108,7 @@ struct PackedStructPageDecoder {
 }
 
 impl PrimitivePageDecoder for PackedStructPageDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        _all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         // Decoding workflow:
         // rows 0-2: {x: [1, 2, 3], y: [4, 5, 6], z: [7, 8, 9]}
         // rows 3-5: {x: [10, 11, 12], y: [13, 14, 15], z: [16, 17, 18]}
@@ -128,13 +125,13 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
 
         let bytes_to_skip = (rows_to_skip as usize) * self.total_bytes_per_row;
 
-        let mut struct_bytes = Vec::new();
+        let mut children = Vec::with_capacity(self.fields.len());
 
         let mut start_index = 0;
 
         for field in &self.fields {
             let bytes_per_field = field.data_type().byte_width();
-            let mut field_bytes = BytesMut::default();
+            let mut field_bytes = Vec::with_capacity(bytes_per_field * num_rows as usize);
 
             let mut byte_index = start_index;
 
@@ -145,14 +142,13 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
             }
 
             start_index += bytes_per_field;
-            struct_bytes.push(field_bytes);
+            children.push(Box::new(FixedWidthDataBlock {
+                data: LanceBuffer::from(field_bytes),
+                bits_per_value: bytes_per_field as u64 * 8,
+                num_values: num_rows,
+            }) as Box<dyn DataBlock>);
         }
-
-        Ok(struct_bytes)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        self.fields.len() as u32
+        Ok(Box::new(StructDataBlock { children }))
     }
 }
 

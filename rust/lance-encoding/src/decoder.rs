@@ -218,7 +218,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
@@ -231,6 +231,7 @@ use tokio::sync::mpsc::{self, unbounded_channel};
 use lance_core::{Error, Result};
 use tracing::instrument;
 
+use crate::data::DataBlock;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
 use crate::encodings::logical::primitive::PrimitiveFieldScheduler;
@@ -323,7 +324,7 @@ impl Default for DecoderMiddlewareChain {
         Self {
             chain: Default::default(),
         }
-        .add_strategy(Arc::new(CoreFieldDecoderStrategy))
+        .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()))
     }
 }
 
@@ -565,7 +566,9 @@ pub trait FieldDecoderStrategy: Send + Sync + std::fmt::Debug {
 
 /// The core decoder strategy handles all the various Arrow types
 #[derive(Debug, Default)]
-pub struct CoreFieldDecoderStrategy;
+pub struct CoreFieldDecoderStrategy {
+    pub validate_data: bool,
+}
 
 impl CoreFieldDecoderStrategy {
     /// This is just a sanity check to ensure there is no "wrapped encodings"
@@ -608,6 +611,7 @@ impl CoreFieldDecoderStrategy {
     }
 
     fn create_primitive_scheduler(
+        &self,
         data_type: &DataType,
         path: &VecDeque<u32>,
         column: &ColumnInfo,
@@ -623,6 +627,7 @@ impl CoreFieldDecoderStrategy {
             data_type.clone(),
             column.page_infos.clone(),
             column_buffers,
+            self.validate_data,
         )))
     }
 
@@ -659,7 +664,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
             let primitive_col = column_infos.next().unwrap();
-            let scheduler = Self::create_primitive_scheduler(
+            let scheduler = self.create_primitive_scheduler(
                 &data_type,
                 chain.current_path(),
                 primitive_col,
@@ -673,7 +678,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 // depending on the child data type.
                 if Self::is_primitive(inner.data_type()) {
                     let primitive_col = column_infos.next().unwrap();
-                    let scheduler = Self::create_primitive_scheduler(
+                    let scheduler = self.create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
                         primitive_col,
@@ -732,6 +737,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     DataType::UInt64,
                     Arc::from(inner_infos.into_boxed_slice()),
                     offsets_column_buffers,
+                    self.validate_data,
                 )) as Arc<dyn FieldScheduler>;
                 let offset_type = if matches!(data_type, DataType::List(_)) {
                     DataType::Int32
@@ -754,7 +760,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
 
                 if Self::check_packed_struct(column_info) {
                     // use packed struct encoding
-                    let scheduler = Self::create_primitive_scheduler(
+                    let scheduler = self.create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
                         column_info,
@@ -1217,13 +1223,7 @@ pub trait PrimitivePageDecoder: Send + Sync {
     /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
     /// * `num_rows` - how many rows to decode
     /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>>;
-    fn num_buffers(&self) -> u32;
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>>;
 }
 
 /// A scheduler for single-column encodings of primitive data

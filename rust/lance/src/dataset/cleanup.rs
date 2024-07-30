@@ -35,7 +35,7 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_table::{
     format::{Index, Manifest},
     io::{
@@ -45,12 +45,14 @@ use lance_table::{
 };
 use object_store::path::Path;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future,
     sync::{Mutex, MutexGuard},
 };
 
 use crate::{utils::temporal::utc_now, Dataset};
+
+use super::refs::TagContents;
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -81,6 +83,8 @@ struct CleanupTask<'a> {
     before: DateTime<Utc>,
     /// If true, delete unverified data files even if they are recent
     delete_unverified: bool,
+    /// If true, return an Error if a tagged version is old
+    error_if_old_versions_tagged: bool,
 }
 
 /// Information about the dataset that we learn by inspecting all of the manifests
@@ -93,6 +97,8 @@ struct CleanupInspection {
     /// referenced by at least one manifest file (potentially an old one) and
     /// so we know that they are not part of an ongoing operation.
     verified_files: ReferencedFiles,
+    /// Track tagged old versions in case we want to raise a `CleanupError`.
+    tagged_old_versions: HashSet<u64>,
 }
 
 /// If a file cannot be verified then it will only be deleted if it is at least
@@ -100,29 +106,54 @@ struct CleanupInspection {
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 
 impl<'a> CleanupTask<'a> {
-    fn new(dataset: &'a Dataset, before: DateTime<Utc>, delete_unverified: bool) -> Self {
+    fn new(
+        dataset: &'a Dataset,
+        before: DateTime<Utc>,
+        delete_unverified: bool,
+        error_if_old_versions_tagged: bool,
+    ) -> Self {
         Self {
             dataset,
             before,
             delete_unverified,
+            error_if_old_versions_tagged,
         }
     }
 
     async fn run(self) -> Result<RemovalStats> {
         // First we process all manifest files in parallel to figure
         // out which files are referenced by valid manifests
-        let inspection = self.process_manifests().await?;
+
+        // get protected manifests first, and include those in process_manifests
+        // pass on option to process manifests around whether to return error
+        // or clean around the manifest
+
+        let tags = self.dataset.tags.list().await?;
+        let tagged_versions: HashSet<u64> = tags.values().map(|v| v.version).collect();
+
+        let inspection = self.process_manifests(&tagged_versions).await?;
+
+        if self.error_if_old_versions_tagged && !inspection.tagged_old_versions.is_empty() {
+            return Err(tagged_old_versions_cleanup_error(
+                &tags,
+                &inspection.tagged_old_versions,
+            ));
+        }
+
         self.delete_unreferenced_files(inspection).await
     }
 
-    async fn process_manifests(&'a self) -> Result<CleanupInspection> {
+    async fn process_manifests(
+        &'a self,
+        tagged_versions: &HashSet<u64>,
+    ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
             .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
             .await?
             .try_for_each_concurrent(num_cpus::get(), |path| {
-                self.process_manifest_file(path, &inspection)
+                self.process_manifest_file(path, &inspection, tagged_versions)
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -132,6 +163,7 @@ impl<'a> CleanupTask<'a> {
         &self,
         path: Path,
         inspection: &Mutex<CleanupInspection>,
+        tagged_versions: &HashSet<u64>,
     ) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
@@ -141,14 +173,21 @@ impl<'a> CleanupTask<'a> {
 
         let manifest = read_manifest(&self.dataset.object_store, &path).await?;
         let dataset_version = self.dataset.version().version;
-        // Don't delete the latest version, even if it is old.  Also don't delete manifests
-        // if their version is newer than the dataset version.  These are either in-progress
-        // or newly added since we started.
+
+        // Don't delete the latest version, even if it is old. Don't delete tagged versions,
+        // regardless of age. Don't delete manifests if their version is newer than the dataset
+        // version.  These are either in-progress or newly added since we started.
         let is_latest = dataset_version <= manifest.version;
-        let in_working_set = is_latest || manifest.timestamp() >= self.before;
+        let is_tagged = tagged_versions.contains(&manifest.version);
+        let in_working_set = is_latest || manifest.timestamp() >= self.before || is_tagged;
         let indexes = read_manifest_indexes(&self.dataset.object_store, &path, &manifest).await?;
 
         let mut inspection = inspection.lock().unwrap();
+
+        // Track tagged old versions in case we want to return a `CleanupError` later.
+        if is_tagged {
+            inspection.tagged_old_versions.insert(manifest.version);
+        }
 
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
         if !in_working_set {
@@ -388,9 +427,39 @@ pub async fn cleanup_old_versions(
     dataset: &Dataset,
     before: DateTime<Utc>,
     delete_unverified: Option<bool>,
+    error_if_tagged_old_versions: Option<bool>,
 ) -> Result<RemovalStats> {
-    let cleanup = CleanupTask::new(dataset, before, delete_unverified.unwrap_or(false));
+    let cleanup = CleanupTask::new(
+        dataset,
+        before,
+        delete_unverified.unwrap_or(false),
+        error_if_tagged_old_versions.unwrap_or(true),
+    );
     cleanup.run().await
+}
+
+fn tagged_old_versions_cleanup_error(
+    tags: &HashMap<String, TagContents>,
+    tagged_old_versions: &HashSet<u64>,
+) -> Error {
+    let unreferenced_tags: HashMap<String, u64> = tags
+        .iter()
+        .filter_map(|(k, &v)| {
+            if tagged_old_versions.contains(&v.version) {
+                Some((k.clone(), v.version))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Error::Cleanup {
+        message: format!(
+            "{} tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup: {:?}",
+            unreferenced_tags.len(),
+            unreferenced_tags
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -398,12 +467,12 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::RecordBatchReader;
-    use lance_core::{
-        utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
-        Error,
-    };
+    use datafusion::common::assert_contains;
+    use lance_core::utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::{DatasetIndexExt, IndexType};
-    use lance_io::object_store::{ObjectStore, ObjectStoreParams, WrappingObjectStore};
+    use lance_io::object_store::{
+        ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use snafu::{location, Location};
@@ -619,16 +688,17 @@ mod tests {
 
         async fn run_cleanup(&self, before: DateTime<Utc>) -> Result<RemovalStats> {
             let db = self.open().await?;
-            cleanup_old_versions(&db, before, None).await
+            cleanup_old_versions(&db, before, None, None).await
         }
 
         async fn run_cleanup_with_override(
             &self,
             before: DateTime<Utc>,
             delete_unverified: Option<bool>,
+            error_if_tagged_old_versions: Option<bool>,
         ) -> Result<RemovalStats> {
             let db = self.open().await?;
-            cleanup_old_versions(&db, before, delete_unverified).await
+            cleanup_old_versions(&db, before, delete_unverified, error_if_tagged_old_versions).await
         }
 
         async fn open(&self) -> Result<Box<Dataset>> {
@@ -643,8 +713,10 @@ mod tests {
         }
 
         async fn count_files(&self) -> Result<FileCounts> {
+            let registry = Arc::new(ObjectStoreRegistry::default());
             let (os, path) =
-                ObjectStore::from_uri_and_params(&self.dataset_path, &self.os_params()).await?;
+                ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
+                    .await?;
             let mut file_stream = os.read_dir_all(&path, None).await?;
             let mut file_count = FileCounts {
                 num_data_files: 0,
@@ -757,6 +829,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_error_when_tagged_old_versions() {
+        // We should not clean up old versions that are tagged.
+        // This tests when `error_if_tagged_old_version=true`.
+        // When `true`, no files should be cleaned and a `Error::CleanupError`
+        // should be returned.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+
+        let mut dataset = *(fixture.open().await.unwrap());
+
+        dataset.tags.create("old-tag", 1).await.unwrap();
+        dataset.tags.create("another-old-tag", 2).await.unwrap();
+
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
+
+        let mut cleanup_error = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert_contains!(cleanup_error.to_string(), "Cleanup error: 2 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
+
+        dataset.tags.delete("old-tag").await.unwrap();
+
+        cleanup_error = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert_contains!(cleanup_error.to_string(), "Cleanup error: 1 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
+
+        dataset.tags.delete("another-old-tag").await.unwrap();
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_around_tagged_old_versions() {
+        // We should not clean up old versions that are tagged.
+        // This tests when `error_if_tagged_old_version=false`.
+        // When `false`, old versions should be cleaned up except
+        // latest and those that are tagged.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+
+        let mut dataset = *(fixture.open().await.unwrap());
+
+        dataset.tags.create("old-tag", 1).await.unwrap();
+        dataset.tags.create("another-old-tag", 2).await.unwrap();
+        dataset.tags.create("tag-latest", 3).await.unwrap();
+
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
+
+        let mut removed = fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(8).unwrap(),
+                None,
+                Some(false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 0);
+
+        dataset.tags.delete("old-tag").await.unwrap();
+
+        removed = fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(8).unwrap(),
+                None,
+                Some(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 1);
+
+        dataset.tags.delete("another-old-tag").await.unwrap();
+
+        removed = fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(8).unwrap(),
+                None,
+                Some(false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 1);
+    }
+
+    #[tokio::test]
     async fn cleanup_recent_verified_files() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -815,7 +990,7 @@ mod tests {
 
             let before = utc_now();
             let removed = fixture
-                .run_cleanup_with_override(before, override_opt)
+                .run_cleanup_with_override(before, override_opt, None)
                 .await
                 .unwrap();
 
