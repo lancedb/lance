@@ -35,7 +35,6 @@ lazy_static::lazy_static! {
         .worker_threads(1)
         // keep the thread alive "forever"
         .thread_keep_alive(Duration::from_secs(u64::MAX))
-        .enable_all()
         .build()
         .unwrap();
 }

@@ -53,10 +53,7 @@ use futures::{
 use lance_core::{
     datatypes::SchemaCompareOptions,
     error::{box_error, InvalidInputSnafu},
-    utils::{
-        futures::Capacity,
-        tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME},
-    },
+    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -608,7 +605,6 @@ impl MergeInsertJob {
         // Can update the fragments in parallel.
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
-        let handle = CPU_RUNTIME.handle();
         let task_limit = get_num_compute_intensive_cpus();
         let mut reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
@@ -816,7 +812,7 @@ impl MergeInsertJob {
                 updated_fragments.clone(),
                 memory_size,
             );
-            tasks.spawn_on(fut, handle);
+            tasks.spawn(fut);
         }
 
         while let Some(res) = tasks.join_next().await {
