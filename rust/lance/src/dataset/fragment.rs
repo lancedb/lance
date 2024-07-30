@@ -1035,11 +1035,22 @@ impl FileFragment {
         schemas: Option<(Schema, Schema)>,
     ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
+
+        let mut with_row_addr = false;
         if let Some(columns) = columns {
-            schema = schema.project(columns)?;
+            let mut projection = Vec::new();
+            for column in columns {
+                if column.as_ref() == ROW_ADDR {
+                    with_row_addr = true;
+                } else {
+                    projection.push(column.as_ref());
+                }
+            }
+            schema = schema.project(&projection)?;
         }
         // If there is no projection, we at least need to read the row addresses
-        let with_row_addr = schema.fields.is_empty();
+        with_row_addr |= schema.fields.is_empty();
+
         let reader = self.open(&schema, false, with_row_addr, None);
         let deletion_vector = read_deletion_file(
             &self.dataset.base,

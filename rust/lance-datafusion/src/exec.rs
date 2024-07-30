@@ -11,7 +11,7 @@ use datafusion::{
     dataframe::DataFrame,
     datasource::streaming::StreamingTable,
     execution::{
-        context::{SessionConfig, SessionContext, SessionState},
+        context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerConfig,
         memory_pool::FairSpillPool,
         runtime_env::{RuntimeConfig, RuntimeEnv},
@@ -195,13 +195,7 @@ impl LanceExecutionOptions {
     }
 }
 
-/// Executes a plan using default session & runtime configuration
-///
-/// Only executes a single partition.  Panics if the plan has more than one partition.
-pub fn execute_plan(
-    plan: Arc<dyn ExecutionPlan>,
-    options: LanceExecutionOptions,
-) -> Result<SendableRecordBatchStream> {
+pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
     let session_config = SessionConfig::new();
     let mut runtime_config = RuntimeConfig::new();
     if options.use_spilling() {
@@ -210,12 +204,22 @@ pub fn execute_plan(
             options.mem_pool_size() as usize
         )));
     }
-    let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
-    let session_state = SessionState::new_with_config_rt(session_config, runtime_env);
+    let runtime_env = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
+    SessionContext::new_with_config_rt(session_config, runtime_env)
+}
+
+/// Executes a plan using default session & runtime configuration
+///
+/// Only executes a single partition.  Panics if the plan has more than one partition.
+pub fn execute_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+) -> Result<SendableRecordBatchStream> {
+    let session_ctx = new_session_context(options);
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
-    Ok(plan.execute(0, session_state.task_ctx())?)
+    Ok(plan.execute(0, session_ctx.task_ctx())?)
 }
 
 pub trait SessionContextExt {
