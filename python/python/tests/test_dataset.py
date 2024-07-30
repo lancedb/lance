@@ -250,6 +250,40 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_tag(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    assert len(ds.tags.list()) == 0
+
+    with pytest.raises(ValueError):
+        ds.tags.create("tag1", 3)
+
+    with pytest.raises(ValueError):
+        ds.tags.delete("tag1")
+
+    ds.tags.create("tag1", 1)
+    assert len(ds.tags.list()) == 1
+
+    with pytest.raises(ValueError):
+        ds.tags.create("tag1", 1)
+
+    ds.tags.delete("tag1")
+
+    ds.tags.create("tag1", 1)
+    ds.tags.create("tag2", 1)
+
+    assert len(ds.tags.list()) == 2
+
+    with pytest.raises(OSError):
+        ds.checkout_version("tag3")
+
+    assert ds.checkout_version("tag1").version == 1
+
+
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
     base_dir = tmp_path / "test"
@@ -590,6 +624,68 @@ def test_cleanup_old_versions(tmp_path):
 
     # Now this call will actually delete the old version
     stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 1
+
+
+def test_cleanup_error_when_tagged_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
+
+    with pytest.raises(OSError):
+        dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert len(dataset.versions()) == 3
+
+    dataset.tags.delete("old-tag")
+    with pytest.raises(OSError):
+        dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert len(dataset.versions()) == 3
+
+    dataset.tags.delete("another-old-tag")
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 2
+    assert len(dataset.versions()) == 1
+
+
+def test_cleanup_around_tagged_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
+    dataset.tags.create("tag-latest", 3)
+
+    stats = dataset.cleanup_old_versions(
+        older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
+    )
+    assert stats.bytes_removed == 0
+    assert stats.old_versions == 0
+
+    dataset.tags.delete("old-tag")
+    stats = dataset.cleanup_old_versions(
+        older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
+    )
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 1
+
+    dataset.tags.delete("another-old-tag")
+    stats = dataset.cleanup_old_versions(
+        older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
+    )
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1
 
