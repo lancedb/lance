@@ -164,7 +164,7 @@ impl InvertedList {
             .metadata
             .get("offsets")
             .ok_or(Error::Index {
-                message: format!("offsets not found"),
+                message: "offsets not found".to_string(),
                 location: location!(),
             })?;
         let offsets: Vec<usize> = serde_json::from_str(offsets)?;
