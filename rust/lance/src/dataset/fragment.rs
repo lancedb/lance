@@ -24,9 +24,9 @@ use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_encoding::decoder::DecoderMiddlewareChain;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
-use lance_file::v2::reader::ReaderProjection;
+use lance_file::v2::reader::{CachedFileMetadata, ReaderProjection};
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::ScanScheduler;
+use lance_io::scheduler::{FileScheduler, ScanScheduler};
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
@@ -542,11 +542,13 @@ impl FileFragment {
             let store_scheduler = scan_scheduler
                 .unwrap_or_else(|| ScanScheduler::new(self.dataset.object_store.clone()));
             let file_scheduler = store_scheduler.open_file(&path).await?;
+            let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let reader = Arc::new(
-                v2::reader::FileReader::try_open(
+                v2::reader::FileReader::try_open_with_file_metadata(
                     file_scheduler,
                     None,
                     DecoderMiddlewareChain::default(),
+                    file_metadata,
                 )
                 .await?,
             );
@@ -691,7 +693,7 @@ impl FileFragment {
     /// * All field ids in the fragment are distinct
     /// * Within each data file, field ids are in increasing order
     /// * All fields in the schema have a corresponding field in one of the data
-    ///  files
+    ///   files
     /// * All data files exist and have the same length
     /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
@@ -947,6 +949,24 @@ impl FileFragment {
         }
     }
 
+    /// Get the file metadata for this fragment, using the cache if available.
+    async fn get_file_metadata(
+        &self,
+        file_scheduler: &FileScheduler,
+    ) -> Result<Arc<CachedFileMetadata>> {
+        let cache = &self.dataset.session.file_metadata_cache;
+        let path = file_scheduler.reader().path();
+
+        let file_metadata = cache
+            .get_or_insert(path, |_path| async {
+                let file_metadata: CachedFileMetadata =
+                    v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
+                Ok(file_metadata)
+            })
+            .await?;
+        Ok(file_metadata)
+    }
+
     /// Take rows based on internal local row offsets
     ///
     /// If the row offsets are out-of-bounds, this will return an error. But if the
@@ -1015,11 +1035,22 @@ impl FileFragment {
         schemas: Option<(Schema, Schema)>,
     ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
+
+        let mut with_row_addr = false;
         if let Some(columns) = columns {
-            schema = schema.project(columns)?;
+            let mut projection = Vec::new();
+            for column in columns {
+                if column.as_ref() == ROW_ADDR {
+                    with_row_addr = true;
+                } else {
+                    projection.push(column.as_ref());
+                }
+            }
+            schema = schema.project(&projection)?;
         }
         // If there is no projection, we at least need to read the row addresses
-        let with_row_addr = schema.fields.is_empty();
+        with_row_addr |= schema.fields.is_empty();
+
         let reader = self.open(&schema, false, with_row_addr, None);
         let deletion_vector = read_deletion_file(
             &self.dataset.base,
@@ -1678,6 +1709,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
+    use lance_io::object_store::ObjectStoreRegistry;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
@@ -2048,7 +2080,8 @@ mod tests {
             fragments,
         };
 
-        let new_dataset = Dataset::commit(test_uri, op, None, None, None)
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let new_dataset = Dataset::commit(test_uri, op, None, None, None, registry)
             .await
             .unwrap();
 
@@ -2141,7 +2174,8 @@ mod tests {
                 schema: full_schema.clone(),
             };
 
-            let dataset = Dataset::commit(test_uri, op, None, None, None)
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let dataset = Dataset::commit(test_uri, op, None, None, None, registry)
                 .await
                 .unwrap();
 
@@ -2351,6 +2385,7 @@ mod tests {
 
         // Rearrange schema so it's `s` then `i`.
         let schema = updater.schema().unwrap().clone().project(&["s", "i"])?;
+        let registry = Arc::new(ObjectStoreRegistry::default());
 
         let dataset = Dataset::commit(
             test_uri,
@@ -2361,6 +2396,7 @@ mod tests {
             Some(dataset.manifest.version),
             None,
             None,
+            registry,
         )
         .await?;
 

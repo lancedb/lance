@@ -8,19 +8,21 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, ScalarBuffer};
-use bytes::BytesMut;
-use futures::stream::StreamExt;
-use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt};
+use futures::{future::BoxFuture, FutureExt};
 
+use crate::decoder::LogicalPageDecoder;
+use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
+
+use crate::buffer::LanceBuffer;
+use crate::data::{
+    DataBlock, DataBlockExt, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock,
+};
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
     EncodingsIo,
 };
-
-use crate::decoder::LogicalPageDecoder;
-use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
 use arrow_array::{PrimitiveArray, UInt64Array, UInt8Array};
 use arrow_schema::DataType;
@@ -97,12 +99,10 @@ impl BinaryPageScheduler {
             null_adjustment,
         }
     }
-}
 
-impl BinaryPageScheduler {
     fn decode_indices(decoder: Arc<dyn PrimitivePageDecoder>, num_rows: u64) -> Result<ArrayRef> {
         let mut primitive_wrapper =
-            PrimitiveFieldDecoder::new_from_data(decoder, DataType::UInt64, num_rows);
+            PrimitiveFieldDecoder::new_from_data(decoder, DataType::UInt64, num_rows, false);
         let drained_task = primitive_wrapper.drain(num_rows)?;
         let indices_decode_task = drained_task.task;
         indices_decode_task.decode()
@@ -124,22 +124,21 @@ impl PageScheduler for BinaryPageScheduler {
             .iter()
             .map(|range| {
                 if range.start != 0 {
-                    (range.start - 1)..(range.end)
+                    (range.start - 1)..range.end
                 } else {
-                    0..(range.end)
+                    0..range.end
                 }
             })
             .collect::<Vec<std::ops::Range<u64>>>();
 
-        let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+        // We schedule all the indices for decoding together
+        // This is more efficient compared to scheduling them one by one (reduces speed significantly for random access)
+        let indices_page_decoder =
+            self.indices_scheduler
+                .schedule_ranges(&indices_ranges, scheduler, top_level_row);
 
-        let mut futures_ordered = indices_ranges
-            .iter()
-            .map(|range| {
-                self.indices_scheduler
-                    .schedule_ranges(&[range.clone()], scheduler, top_level_row)
-            })
-            .collect::<FuturesOrdered<_>>();
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+        let indices_num_rows = indices_ranges.iter().map(|r| r.end - r.start).sum::<u64>();
 
         let ranges = ranges.to_vec();
         let copy_scheduler = scheduler.clone();
@@ -159,38 +158,43 @@ impl PageScheduler for BinaryPageScheduler {
             // Cumulative sum: 0, 4 | 8 | 13
             // These are the normalized offsets stored in decoded_indices
             // Rest of the workflow is continued later in BinaryPageDecoder
+            let indices_decoder = Arc::from(indices_page_decoder.await?);
+            let indices = Self::decode_indices(indices_decoder, indices_num_rows)?;
+            let decoded_indices = indices.as_primitive::<UInt64Type>();
 
             let mut indices_builder = IndicesNormalizer::new(num_rows, null_adjustment);
             let mut bytes_ranges = Vec::new();
-            let mut curr_range_idx = 0;
-            while let Some(indices_page_decoder) = futures_ordered.next().await {
-                let decoder = Arc::from(indices_page_decoder?);
+            let mut curr_offset_index = 0;
 
-                // Build and run decode task for offsets
-                let curr_indices_range = indices_ranges[curr_range_idx].clone();
-                let curr_row_range = ranges[curr_range_idx].clone();
-                let indices_num_rows = curr_indices_range.end - curr_indices_range.start;
+            for curr_row_range in ranges.iter() {
+                let row_start = curr_row_range.start;
+                let curr_range_len = (curr_row_range.end - row_start) as usize;
 
-                let indices = Self::decode_indices(decoder, indices_num_rows)?;
-                let indices = indices.as_primitive::<UInt64Type>();
+                let curr_indices;
 
-                let first = if curr_row_range.start == 0 {
+                if row_start == 0 {
+                    curr_indices = decoded_indices.slice(0, curr_range_len);
+                    curr_offset_index = curr_range_len;
+                } else {
+                    curr_indices = decoded_indices.slice(curr_offset_index, curr_range_len + 1);
+                    curr_offset_index += curr_range_len + 1;
+                }
+
+                let first = if row_start == 0 {
                     0
                 } else {
                     indices_builder
-                        .normalize(*indices.values().first().unwrap())
+                        .normalize(*curr_indices.values().first().unwrap())
                         .1
                 };
                 let last = indices_builder
-                    .normalize(*indices.values().last().unwrap())
+                    .normalize(*curr_indices.values().last().unwrap())
                     .1;
                 if first != last {
                     bytes_ranges.push(first..last);
                 }
 
-                indices_builder.extend(indices, curr_row_range.start == 0);
-
-                curr_range_idx += 1;
+                indices_builder.extend(&curr_indices, row_start == 0);
             }
 
             let (indices, validity) = indices_builder.into_parts();
@@ -235,12 +239,7 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
     // We only need [8, 13] to decode in this case.
     // These need to be normalized in order to build the string later
     // So return [0, 5]
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         // Buffers[0] == validity buffer
         // Buffers[1] == offsets buffer
         // Buffers[2] == null buffer // TODO: Micro-optimization, can we get rid of this?  Doesn't hurt much though
@@ -255,7 +254,7 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
 
         let validity_buffer = if has_nulls {
             let num_validity_bits = arrow_buffer::bit_util::ceil(num_rows as usize, 8);
-            let mut validity_buffer = BytesMut::with_capacity(num_validity_bits);
+            let mut validity_buffer = Vec::with_capacity(num_validity_bits);
 
             if rows_to_skip == 0 {
                 validity_buffer.extend_from_slice(target_validity.inner().as_slice());
@@ -264,9 +263,9 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
                 let target_validity = BooleanBuffer::from_iter(target_validity.iter());
                 validity_buffer.extend_from_slice(target_validity.inner().as_slice());
             }
-            validity_buffer
+            Some(validity_buffer)
         } else {
-            BytesMut::new()
+            None
         };
 
         // STEP 2: offsets buffer
@@ -294,8 +293,6 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
                     .into_inner(),
                 _ => panic!("Unsupported offsets type"),
             };
-        // TODO: This forces a second copy, which is unfortunate, try and remove in the future
-        let offsets_buf = BytesMut::from(offsets_buffer.as_slice());
 
         let bytes_to_skip = self.decoded_indices.value(rows_to_skip as usize);
         let num_bytes = self
@@ -303,22 +300,24 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
             .value((rows_to_skip + num_rows) as usize)
             - bytes_to_skip;
 
-        let mut output_buffers = vec![validity_buffer, offsets_buf];
+        let bytes = self.bytes_decoder.decode(bytes_to_skip, num_bytes)?;
+        let bytes = bytes.try_into_layout::<FixedWidthDataBlock>()?;
+        debug_assert_eq!(bytes.bits_per_value, 8);
 
-        // Add decoded bytes into output_buffers[2..]
-        // Currently an empty null buffer is the first one
-        // The actual bytes are in the second buffer
-        // Including the indices this results in 4 buffers in total
-        output_buffers.extend(
-            self.bytes_decoder
-                .decode(bytes_to_skip, num_bytes, all_null)?,
-        );
-
-        Ok(output_buffers)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        self.bytes_decoder.num_buffers() + 2
+        let string_data = Box::new(VariableWidthBlock {
+            bits_per_offset: bytes_per_offset * 8,
+            data: bytes.data,
+            num_values: num_rows,
+            offsets: LanceBuffer::from(offsets_buffer),
+        });
+        if let Some(validity) = validity_buffer {
+            Ok(Box::new(NullableDataBlock {
+                data: string_data,
+                nulls: LanceBuffer::from(validity),
+            }))
+        } else {
+            Ok(string_data)
+        }
     }
 }
 
@@ -386,6 +385,10 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
         }
     }
 
+    if indices.is_empty() {
+        return (Arc::new(UInt64Array::from(Vec::<u64>::default())), 0);
+    }
+
     let last_offset = *indices.last().expect("Indices array is empty");
     // 8 exabytes in a single array seems unlikely but...just in case
     assert!(
@@ -409,7 +412,6 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
         }
         indices_offset += array.len();
     }
-
     (Arc::new(UInt64Array::from(indices)), null_adjustment)
 }
 
@@ -494,7 +496,7 @@ pub mod tests {
     use super::get_indices_from_string_arrays;
 
     #[test_log::test(tokio::test)]
-    async fn test_utf8() {
+    async fn test_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
         check_round_trip_encoding_random(field, HashMap::new()).await;
     }
@@ -568,14 +570,14 @@ pub mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_simple_utf8() {
-        let string_array = StringArray::from(vec![Some("abc"), Some("de"), None, Some("fgh")]);
+    async fn test_simple_utf8_binary() {
+        let string_array = StringArray::from(vec![Some("abc"), None, Some("pqr"), None, Some("m")]);
 
         let test_cases = TestCases::default()
             .with_range(0..2)
             .with_range(0..3)
             .with_range(1..3)
-            .with_indices(vec![1, 3]);
+            .with_indices(vec![0, 1, 3, 4]);
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,

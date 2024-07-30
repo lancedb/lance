@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_buffer::BooleanBuffer;
-use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 
 use crate::{
+    data::{AllNullDataBlock, DataBlock, DataBlockExt, FixedWidthDataBlock, NullableDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
@@ -32,16 +32,6 @@ enum DataNullStatus {
     None(Box<dyn PrimitivePageDecoder>),
     // Validity and values
     Some(DataDecoders),
-}
-
-impl DataNullStatus {
-    fn values_decoder(&self) -> Option<&dyn PrimitivePageDecoder> {
-        match self {
-            Self::All => None,
-            Self::Some(decoders) => Some(decoders.values.as_ref()),
-            Self::None(values) => Some(values.as_ref()),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -169,46 +159,22 @@ struct BasicPageDecoder {
 }
 
 impl PrimitivePageDecoder for BasicPageDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
-        let dest_buffers = match &self.mode {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+        match &self.mode {
             DataNullStatus::Some(decoders) => {
-                let mut buffers = decoders.validity.decode(rows_to_skip, num_rows, all_null)?; // buffer 0
-                let mut values_bytesmut =
-                    decoders.values.decode(rows_to_skip, num_rows, all_null)?; // buffer 1 onwards
-
-                buffers.append(&mut values_bytesmut);
-                buffers
+                let validity = decoders.validity.decode(rows_to_skip, num_rows)?;
+                let validity = validity.try_into_layout::<FixedWidthDataBlock>()?;
+                let values = decoders.values.decode(rows_to_skip, num_rows)?;
+                Ok(Box::new(NullableDataBlock {
+                    data: values,
+                    nulls: validity.data,
+                }))
             }
-            // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
-            // other pages needed the buffer, in which case we need to fill our section
-            DataNullStatus::All => {
-                let buffers = vec![BytesMut::default()];
-                *all_null = true;
-                buffers
-            }
-            DataNullStatus::None(values) => {
-                let mut dest_buffers = vec![BytesMut::default()];
-
-                let mut values_bytesmut = values.decode(rows_to_skip, num_rows, all_null)?;
-                dest_buffers.append(&mut values_bytesmut);
-                dest_buffers
-            }
-        };
-
-        Ok(dest_buffers)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        1 + self
-            .mode
-            .values_decoder()
-            .map(|val| val.num_buffers())
-            .unwrap_or(0)
+            DataNullStatus::All => Ok(Box::new(AllNullDataBlock {
+                num_values: num_rows,
+            })),
+            DataNullStatus::None(values) => values.decode(rows_to_skip, num_rows),
+        }
     }
 }
 

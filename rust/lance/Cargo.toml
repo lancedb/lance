@@ -101,6 +101,7 @@ tracing-chrome = "0.7.1"
 rstest = "0.19.0"
 random_word = { version = "0.4.3", features = ["en"] }
 
+
 [features]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
@@ -128,4 +129,8 @@ harness = false
 
 [[bench]]
 name = "ivf_pq"
+harness = false
+
+[[bench]]
+name = "take"
 harness = false

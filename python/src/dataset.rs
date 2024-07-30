@@ -27,6 +27,7 @@ use chrono::Duration;
 use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::transaction::validate_operation;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -56,7 +57,7 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PySet, PyString};
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
@@ -899,17 +900,18 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    fn checkout_version(&self, version: u64) -> PyResult<Self> {
-        let ds = RT
-            .block_on(None, self.ds.checkout_version(version))?
-            .map_err(|err| match err {
-                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
-                _ => PyIOError::new_err(err.to_string()),
-            })?;
-        Ok(Self {
-            ds: Arc::new(ds),
-            uri: self.uri.clone(),
-        })
+    fn checkout_version(&self, py: Python, version: PyObject) -> PyResult<Self> {
+        if let Ok(i) = version.downcast::<PyInt>(py) {
+            let ref_: u64 = i.extract()?;
+            self._checkout_version(ref_)
+        } else if let Ok(v) = version.downcast::<PyString>(py) {
+            let ref_: &str = v.extract()?;
+            self._checkout_version(ref_)
+        } else {
+            Err(PyIOError::new_err(
+                "version must be an integer or a string.",
+            ))
+        }
     }
 
     /// Restore the current version
@@ -926,18 +928,65 @@ impl Dataset {
         &self,
         older_than_micros: i64,
         delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
     ) -> PyResult<CleanupStats> {
         let older_than = Duration::microseconds(older_than_micros);
         let cleanup_stats = RT
             .block_on(
                 None,
-                self.ds.cleanup_old_versions(older_than, delete_unverified),
+                self.ds.cleanup_old_versions(
+                    older_than,
+                    delete_unverified,
+                    error_if_tagged_old_versions,
+                ),
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
             old_versions: cleanup_stats.old_versions,
         })
+    }
+
+    fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        let tags = self_
+            .list_tags()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Python::with_gil(|py| {
+            let pytags = PyDict::new(py);
+            for (k, v) in tags.iter() {
+                let dict = PyDict::new(py);
+                dict.set_item("version", v.version).unwrap();
+                dict.set_item("manifest_size", v.manifest_size).unwrap();
+                dict.to_object(py);
+                pytags.set_item(k, dict).unwrap();
+            }
+            Ok(pytags.to_object(py))
+        })
+    }
+
+    fn create_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.tags.create(tag.as_str(), version))?
+            .map_err(|err| match err {
+                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::RefConflict { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::VersionNotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn delete_tag(&mut self, tag: String) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.tags.delete(tag.as_str()))?
+            .map_err(|err| match err {
+                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     #[pyo3(signature = (**kwargs))]
@@ -1094,12 +1143,14 @@ impl Dataset {
                 };
                 let manifest = dataset.as_ref().map(|ds| ds.manifest());
                 validate_operation(manifest, &operation.0)?;
+                let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
                 LanceDataset::commit(
                     dataset_uri,
                     operation.0,
                     read_version,
                     object_store_params,
                     commit_handler,
+                    object_store_registry,
                 )
                 .await
             })?
@@ -1190,8 +1241,26 @@ impl Dataset {
 }
 
 impl Dataset {
+    fn _checkout_version(&self, version: impl Into<Ref> + std::marker::Send) -> PyResult<Self> {
+        let ds = RT
+            .block_on(None, self.ds.checkout_version(version))?
+            .map_err(|err| match err {
+                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri: self.uri.clone(),
+        })
+    }
+
     fn list_versions(&self) -> ::lance::error::Result<Vec<Version>> {
         RT.runtime.block_on(self.ds.versions())
+    }
+
+    fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
+        RT.runtime.block_on(self.ds.tags.list())
     }
 }
 

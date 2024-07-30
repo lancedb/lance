@@ -4,13 +4,15 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow_buffer::BooleanBufferBuilder;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
+    buffer::LanceBuffer,
+    data::{DataBlock, FixedWidthDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     EncodingsIo,
 };
@@ -93,17 +95,8 @@ struct BitmapDecoder {
 }
 
 impl PrimitivePageDecoder for BitmapDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        _all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
-        let num_bytes = arrow_buffer::bit_util::ceil(num_rows as usize, 8);
-        let mut dest_buffers = vec![BytesMut::with_capacity(num_bytes)];
-
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         let mut rows_to_skip = rows_to_skip;
-
         let mut dest_builder = BooleanBufferBuilder::new(num_rows as usize);
 
         let mut rows_remaining = num_rows;
@@ -121,28 +114,11 @@ impl PrimitivePageDecoder for BitmapDecoder {
         }
 
         let bool_buffer = dest_builder.finish().into_inner();
-        unsafe { dest_buffers[0].set_len(bool_buffer.len()) }
-        // TODO: This requires an extra copy.  First we copy the data from the read buffer(s)
-        // into dest_builder (one copy is inevitable).  Then we copy the data from dest_builder
-        // into dest_buffers.  This second copy could be avoided (e.g. BooleanBufferBuilder
-        // has a new_from_buffer but that requires MutableBuffer and we can't easily get there
-        // from BytesMut [or can we?])
-        //
-        // Worst case, we vendor our own copy of BooleanBufferBuilder based on BytesMut.  We could
-        // also use MutableBuffer ourselves instead of BytesMut but arrow-rs claims MutableBuffer may
-        // be deprecated in the future (though that discussion seems to have died)
-
-        // TODO: Will this work at the boundaries?  If we have to skip 3 bits for example then the first
-        // bytes of bool_buffer.as_slice will be 000XXXXX and if we copy it on top of YYY00000 then the YYY
-        // will be clobbered.
-        //
-        // It's a moot point at the moment since we don't support page bridging
-        dest_buffers[0].copy_from_slice(bool_buffer.as_slice());
-        Ok(dest_buffers)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        1
+        Ok(Box::new(FixedWidthDataBlock {
+            data: LanceBuffer::from(bool_buffer),
+            bits_per_value: 1,
+            num_values: num_rows,
+        }))
     }
 }
 
@@ -184,7 +160,7 @@ mod tests {
             ],
         };
 
-        let result = decoder.decode(5, 1, &mut false);
+        let result = decoder.decode(5, 1);
         assert!(result.is_ok());
     }
 }
