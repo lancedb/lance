@@ -494,10 +494,9 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                         if !negative_padded_current_byte {
                             dest[dst_idx] = 0xFF;
                         }
-                        for i in dst_idx+1..next_dst_idx {
-                            dest[i] = 0xFF;
+                        for i in dest.iter_mut().take(next_dst_idx).skip(dst_idx + 1) {
+                            *i = 0xFF;
                         }
-                        // dest.extend([0xFF].repeat(next_dst_idx - dest.len()))
                     }
 
                     dst_idx = next_dst_idx;
