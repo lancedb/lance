@@ -667,7 +667,7 @@ pub(crate) mod tests {
                 DataType::Int64,
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int64Type, Uniform<i64>>::new(
-                        Uniform::new(-1 * (5 << 42), 6 << 42),
+                        Uniform::new(-(5 << 42), 6 << 42),
                     ),
                 ),
             ),
@@ -675,7 +675,7 @@ pub(crate) mod tests {
                 DataType::Int32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-1 * (5 << 7), 6 << 7),
+                        Uniform::new(-(5 << 7), 6 << 7),
                     ),
                 ),
             ),
