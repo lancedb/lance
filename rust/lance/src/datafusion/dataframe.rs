@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     dataframe::DataFrame,
@@ -19,7 +19,8 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{streaming::PartitionStream, ExecutionPlan, SendableRecordBatchStream},
 };
-use lance_core::ROW_ID;
+use lance_arrow::SchemaExt;
+use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 
 use crate::Dataset;
 
@@ -27,27 +28,27 @@ pub struct LanceTableProvider {
     dataset: Arc<Dataset>,
     full_schema: Arc<Schema>,
     row_id_idx: Option<usize>,
+    row_addr_idx: Option<usize>,
 }
 
 impl LanceTableProvider {
-    fn new(dataset: Arc<Dataset>, with_row_id: bool) -> Self {
-        let full_schema = if with_row_id {
-            let mut full_schema = dataset.schema().clone();
-            full_schema
-                .extend(&[Field::new(ROW_ID, DataType::UInt64, false)])
-                .unwrap();
-            full_schema
-        } else {
-            dataset.schema().clone()
-        };
+    fn new(dataset: Arc<Dataset>, with_row_id: bool, with_row_addr: bool) -> Self {
+        let mut full_schema = Schema::from(dataset.schema());
+        let mut row_id_idx = None;
+        let mut row_addr_idx = None;
+        if with_row_id {
+            full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
+            row_id_idx = Some(full_schema.fields.len() - 1);
+        }
+        if with_row_addr {
+            full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
+            row_addr_idx = Some(full_schema.fields.len() - 1);
+        }
         Self {
             dataset,
-            full_schema: Arc::new(Schema::from(&full_schema)),
-            row_id_idx: if with_row_id {
-                Some(full_schema.fields.len() - 1)
-            } else {
-                None
-            },
+            full_schema: Arc::new(full_schema),
+            row_id_idx,
+            row_addr_idx,
         }
     }
 }
@@ -79,6 +80,8 @@ impl TableProvider for LanceTableProvider {
             for field_idx in projection {
                 if Some(*field_idx) == self.row_id_idx {
                     scan.with_row_id();
+                } else if Some(*field_idx) == self.row_addr_idx {
+                    scan.with_row_address();
                 } else {
                     columns.push(self.full_schema.field(*field_idx).name());
                 }
@@ -126,6 +129,7 @@ pub trait SessionContextExt {
         &self,
         dataset: Arc<Dataset>,
         with_row_id: bool,
+        with_row_addr: bool,
     ) -> datafusion::common::Result<DataFrame>;
     /// Creates a DataFrame for reading a stream of data
     ///
@@ -169,8 +173,13 @@ impl SessionContextExt for SessionContext {
         &self,
         dataset: Arc<Dataset>,
         with_row_id: bool,
+        with_row_addr: bool,
     ) -> datafusion::common::Result<DataFrame> {
-        self.read_table(Arc::new(LanceTableProvider::new(dataset, with_row_id)))
+        self.read_table(Arc::new(LanceTableProvider::new(
+            dataset,
+            with_row_id,
+            with_row_addr,
+        )))
     }
 
     fn read_one_shot(
