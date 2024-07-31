@@ -13,7 +13,7 @@ use crate::vector::graph::OrderedFloat;
 use super::{idf, OrderedDoc, PostingList, K1};
 
 #[derive(Clone)]
-pub(crate) struct PostingIterator<'a> {
+pub struct PostingIterator<'a> {
     token_id: u32,
     list: &'a PostingList,
     index: usize,
@@ -97,7 +97,7 @@ impl<'a> PostingIterator<'a> {
     }
 }
 
-pub(crate) struct Wand<'a> {
+pub struct Wand<'a> {
     factor: f32,
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
     cur_doc: Option<u64>,

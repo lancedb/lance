@@ -16,7 +16,9 @@ use object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 use url::Url;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};
