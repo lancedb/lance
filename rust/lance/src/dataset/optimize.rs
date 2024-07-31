@@ -107,7 +107,7 @@ use super::{write_fragments_internal, WriteMode, WriteParams};
 
 mod remapping;
 
-pub use remapping::{IndexRemapper, IndexRemapperOptions, RemappedIndex};
+pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Options to be passed to [compact_files].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1547,7 +1547,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Delete first 1,000 rows so rowids != final rowaddrs
+        // Delete first 1,100 rows so rowids != final rowaddrs
+        // First 1,000 rows deletes first file. Next 100 deletes part of second
+        // file, so we will trigger the with deletions code path.
         dataset.delete("i < 1100").await.unwrap();
 
         dataset

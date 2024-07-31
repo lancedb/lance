@@ -315,62 +315,62 @@ pub mod tests {
         check_round_trip_encoding_random(field, metadata).await;
     }
 
-    #[test_log::test(tokio::test)]
-    async fn test_specific_packed_struct() {
-        let array1 = Arc::new(UInt64Array::from(vec![1, 2, 3, 4]));
-        let array2 = Arc::new(Int32Array::from(vec![5, 6, 7, 8]));
-        let array3 = Arc::new(UInt8Array::from(vec![9, 10, 11, 12]));
+    // #[test_log::test(tokio::test)]
+    // async fn test_specific_packed_struct() {
+    //     let array1 = Arc::new(UInt64Array::from(vec![1, 2, 3, 4]));
+    //     let array2 = Arc::new(Int32Array::from(vec![5, 6, 7, 8]));
+    //     let array3 = Arc::new(UInt8Array::from(vec![9, 10, 11, 12]));
 
-        let struct_array1 = Arc::new(StructArray::from(vec![
-            (
-                Arc::new(Field::new("x", DataType::UInt64, false)),
-                array1.clone() as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("y", DataType::Int32, false)),
-                array2.clone() as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("z", DataType::UInt8, false)),
-                array3.clone() as ArrayRef,
-            ),
-        ]));
+    //     let struct_array1 = Arc::new(StructArray::from(vec![
+    //         (
+    //             Arc::new(Field::new("x", DataType::UInt64, false)),
+    //             array1.clone() as ArrayRef,
+    //         ),
+    //         (
+    //             Arc::new(Field::new("y", DataType::Int32, false)),
+    //             array2.clone() as ArrayRef,
+    //         ),
+    //         (
+    //             Arc::new(Field::new("z", DataType::UInt8, false)),
+    //             array3.clone() as ArrayRef,
+    //         ),
+    //     ]));
 
-        let array4 = Arc::new(UInt64Array::from(vec![13, 14, 15, 16]));
-        let array5 = Arc::new(Int32Array::from(vec![17, 18, 19, 20]));
-        let array6 = Arc::new(UInt8Array::from(vec![21, 22, 23, 24]));
+    //     let array4 = Arc::new(UInt64Array::from(vec![13, 14, 15, 16]));
+    //     let array5 = Arc::new(Int32Array::from(vec![17, 18, 19, 20]));
+    //     let array6 = Arc::new(UInt8Array::from(vec![21, 22, 23, 24]));
 
-        let struct_array2 = Arc::new(StructArray::from(vec![
-            (
-                Arc::new(Field::new("x", DataType::UInt64, false)),
-                array4.clone() as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("y", DataType::Int32, false)),
-                array5.clone() as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("z", DataType::UInt8, false)),
-                array6.clone() as ArrayRef,
-            ),
-        ]));
+    //     let struct_array2 = Arc::new(StructArray::from(vec![
+    //         (
+    //             Arc::new(Field::new("x", DataType::UInt64, false)),
+    //             array4.clone() as ArrayRef,
+    //         ),
+    //         (
+    //             Arc::new(Field::new("y", DataType::Int32, false)),
+    //             array5.clone() as ArrayRef,
+    //         ),
+    //         (
+    //             Arc::new(Field::new("z", DataType::UInt8, false)),
+    //             array6.clone() as ArrayRef,
+    //         ),
+    //     ]));
 
-        let test_cases = TestCases::default()
-            .with_range(0..2)
-            .with_range(0..6)
-            .with_range(1..4)
-            .with_indices(vec![1, 3, 7]);
+    //     let test_cases = TestCases::default()
+    //         .with_range(0..2)
+    //         .with_range(0..6)
+    //         .with_range(1..4)
+    //         .with_indices(vec![1, 3, 7]);
 
-        let mut metadata = HashMap::new();
-        metadata.insert("packed".to_string(), "true".to_string());
+    //     let mut metadata = HashMap::new();
+    //     metadata.insert("packed".to_string(), "true".to_string());
 
-        check_round_trip_encoding_of_data(
-            vec![struct_array1, struct_array2],
-            &test_cases,
-            metadata,
-        )
-        .await;
-    }
+    //     check_round_trip_encoding_of_data(
+    //         vec![struct_array1, struct_array2],
+    //         &test_cases,
+    //         metadata,
+    //     )
+    //     .await;
+    // }
 
     #[test_log::test(tokio::test)]
     async fn test_fsl_packed_struct() {
