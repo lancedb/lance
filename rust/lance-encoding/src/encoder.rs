@@ -268,8 +268,8 @@ impl CoreArrayEncodingStrategy {
                 )))))
             }
             DataType::Dictionary(key_type, value_type) => {
-                let key_encoder = Self::array_encoder_from_type(&key_type, data_size, false)?;
-                let value_encoder = Self::array_encoder_from_type(&value_type, data_size, false)?;
+                let key_encoder = Self::array_encoder_from_type(key_type, data_size, false)?;
+                let value_encoder = Self::array_encoder_from_type(value_type, data_size, false)?;
 
                 Ok(Box::new(AlreadyDictionaryEncoder::new(
                     key_encoder,
@@ -500,37 +500,37 @@ pub struct CoreFieldEncodingStrategy {
 
 impl CoreFieldEncodingStrategy {
     fn is_primitive_type(data_type: &DataType) -> bool {
-        match data_type {
+        matches!(
+            data_type,
             DataType::Boolean
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::Duration(_)
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Int8
-            | DataType::Interval(_)
-            | DataType::Null
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Timestamp(_, _)
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::UInt8
-            | DataType::FixedSizeBinary(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::Utf8
-            | DataType::LargeUtf8 => true,
-            _ => false,
-        }
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::Duration(_)
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Int8
+                | DataType::Interval(_)
+                | DataType::Null
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::UInt8
+                | DataType::FixedSizeBinary(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::Utf8
+                | DataType::LargeUtf8,
+        )
     }
 }
 

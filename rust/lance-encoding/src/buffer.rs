@@ -76,16 +76,16 @@ impl LanceBuffer {
     /// This is often called before cloning the buffer
     pub fn into_borrowed(self) -> Self {
         match self {
-            LanceBuffer::Borrowed(_) => self,
-            LanceBuffer::Owned(buffer) => LanceBuffer::Borrowed(Buffer::from_vec(buffer)),
+            Self::Borrowed(_) => self,
+            Self::Owned(buffer) => Self::Borrowed(Buffer::from_vec(buffer)),
         }
     }
 
     /// Creates an owned copy of the buffer, will always involve a full copy of the bytes
     pub fn to_owned(&self) -> Self {
         match self {
-            LanceBuffer::Borrowed(buffer) => LanceBuffer::Owned(buffer.to_vec()),
-            LanceBuffer::Owned(buffer) => LanceBuffer::Owned(buffer.clone()),
+            Self::Borrowed(buffer) => Self::Owned(buffer.to_vec()),
+            Self::Owned(buffer) => Self::Owned(buffer.clone()),
         }
     }
 
@@ -94,12 +94,12 @@ impl LanceBuffer {
     /// This is a zero-copy operation
     pub fn borrow_and_clone(&mut self) -> Self {
         match self {
-            LanceBuffer::Borrowed(buffer) => LanceBuffer::Borrowed(buffer.clone()),
-            LanceBuffer::Owned(buffer) => {
+            Self::Borrowed(buffer) => Self::Borrowed(buffer.clone()),
+            Self::Owned(buffer) => {
                 let buf_data = std::mem::take(buffer);
                 let buffer = Buffer::from_vec(buf_data);
-                *self = LanceBuffer::Borrowed(buffer.clone());
-                LanceBuffer::Borrowed(buffer)
+                *self = Self::Borrowed(buffer.clone());
+                Self::Borrowed(buffer)
             }
         }
     }
@@ -107,8 +107,8 @@ impl LanceBuffer {
     /// Clones the buffer but fails if the buffer is in owned mode
     pub fn try_clone(&self) -> Result<Self> {
         match self {
-            LanceBuffer::Borrowed(buffer) => Ok(LanceBuffer::Borrowed(buffer.clone())),
-            LanceBuffer::Owned(_) => Err(Error::Internal {
+            Self::Borrowed(buffer) => Ok(Self::Borrowed(buffer.clone())),
+            Self::Owned(_) => Err(Error::Internal {
                 message: "try_clone called on an owned buffer".to_string(),
                 location: location!(),
             }),

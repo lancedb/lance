@@ -693,12 +693,12 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 }
             }
             DataType::Dictionary(_key_type, value_type) => {
-                if Self::is_primitive(&value_type) {
+                if Self::is_primitive(value_type) {
                     let primitive_col = column_infos.next().unwrap();
                     let scheduler = self.create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
-                        &primitive_col,
+                        primitive_col,
                         buffers,
                     )?;
                     Ok((chain, Ok(scheduler)))
