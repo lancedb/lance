@@ -7,11 +7,12 @@ import pytest
 from lance.file import LanceFileReader
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
-NUM_ROWS = 10000
+NUM_ROWS_PER_FRAGMENT = 10000
 DIMENSION = 128
 NUM_SUBVECTORS = 8
 NUM_FRAGMENTS = 3
-NUM_PARTITIONS = round(np.sqrt(NUM_FRAGMENTS * NUM_ROWS))
+NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
+NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
 
 
 @pytest.fixture(params=[np.float16, np.float32, np.float64], ids=["f16", "f32", "f64"])
@@ -19,16 +20,10 @@ def rand_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(request.param)
     vectors.shape = -1
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
+    table = pa.Table.from_arrays([vectors], names=["vectors"])
     uri = str(tmpdir / "dataset")
 
-    fragments = []
-    for i in range(NUM_FRAGMENTS):
-        table_append = pa.Table.from_arrays([vectors], names=["vectors"])
-        fragment = lance.fragment.LanceFragment.create(uri, table_append)
-        fragments.append(fragment)
-
-    operation = lance.LanceOperation.Overwrite(table_append.schema, fragments)
-    ds = lance.LanceDataset.commit(uri, operation)
+    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
 
     return ds
 
@@ -132,7 +127,7 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     reader = LanceFileReader(uri)
 
-    assert reader.metadata().num_rows == (NUM_ROWS * NUM_FRAGMENTS)
+    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
     row_id = data.column("_rowid")
@@ -143,3 +138,9 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     part_id = data.column("__ivf_part_id")
     assert part_id.type == pa.uint32()
+
+    # test when fragments = None
+    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
+    reader = LanceFileReader(uri)
+
+    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)

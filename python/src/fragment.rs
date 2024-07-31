@@ -34,7 +34,7 @@ use crate::{Scanner, RT};
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
 pub struct FileFragment {
-    pub fragment: LanceFragment,
+    fragment: LanceFragment,
 }
 
 impl FileFragment {

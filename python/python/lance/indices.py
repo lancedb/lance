@@ -380,7 +380,7 @@ class IndicesBuilder:
         ivf: IvfModel,
         pq: PqModel,
         dest_uri: str,
-        fragments: list[LanceFragment],
+        fragments: Optional[list[LanceFragment]],
         partition_ds_uri: Optional[str] = None,
     ):
         """
@@ -400,7 +400,7 @@ class IndicesBuilder:
             path or a cloud storage path.
         fragments: list[LanceFragment]
             The list of data fragments to use when computing the transformed vectors.
-            Must be a non-empty list.
+            This is an optional parameter (the default uses all fragments).
         partition_ds_uri: str
             The URI of a precomputed partitions dataset.  This allows the partition
             transform to be skipped, using the precomputed value instead.  This is
@@ -409,10 +409,12 @@ class IndicesBuilder:
         dimension = self.dataset.schema.field(self.column[0]).type.list_size
         num_subvectors = pq.num_subvectors
         distance_type = ivf.distance_type
-        if fragments:
-            fragments = [f._fragment for f in fragments]
+        if fragments is None:
+            fragments = [f._fragment for f in self.dataset.get_fragments()]
+        elif len(fragments) == 0:
+            raise ValueError("fragments must be a non-empty list or None")
         else:
-            raise ValueError("fragments must be a non-empty list")
+            fragments = [f._fragment for f in fragments]
 
         indices.transform_vectors(
             self.dataset._ds,
