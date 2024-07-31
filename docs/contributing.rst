@@ -24,8 +24,9 @@ Currently Lance is implemented in Rust and comes with a Python wrapper. So you'l
 1. Install Rust: https://www.rust-lang.org/tools/install
 2. Install Python 3.9+: https://www.python.org/downloads/
 3. Install protoctol buffers: https://grpc.io/docs/protoc-installation/ (make sure you have version 3.20 or higher)
-
-For more tips on setting up a Python development environment, see https://github.com/lancedb/lance/blob/main/python/DEVELOPMENT.md
+4. Install commit hooks:
+    a. Install pre-commit: https://pre-commit.com/#install
+    b. Run `pre-commit install` in the root of the repo
 
 Sample Workflow
 ---------------
@@ -38,24 +39,20 @@ Sample Workflow
 7. Merge!
 8. Go back to step 2
 
-Linting
--------
-We use black isort and ruff for python and cargo fmt and clippy for rust.
+Python Development
+------------------
 
-To run the python linters:
+See: https://github.com/lancedb/lance/blob/main/python/DEVELOPMENT.md
 
-.. code-block::
+Rust Development
+----------------
 
-    isort python
-    black python
-    ruff check python
-
-To run the rust linters:
+To format and lint Rust code:
 
 .. code-block::
 
     cargo fmt --all
-    cargo clippy --all-features --tests
+    cargo clippy --all-features --tests --benches
 
 Repo Structure
 --------------
@@ -105,12 +102,6 @@ To make a dev install:
 .. code-block::
 
     maturin develop
-
-To run the Python unit tests:
-
-.. code-block::
-
-    pytest python/tests
 
 Documentation
 ~~~~~~~~~~~~~
