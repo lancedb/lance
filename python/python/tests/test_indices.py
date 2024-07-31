@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import os
+
 import lance
 import numpy as np
 import pyarrow as pa
 import pytest
 from lance.file import LanceFileReader
 from lance.indices import IndicesBuilder, IvfModel, PqModel
-import os
 
 NUM_ROWS_PER_FRAGMENT = 10000
 DIMENSION = 128
@@ -16,14 +17,7 @@ NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
 
 
-@pytest.fixture(params=[np.float16, 
-                        # np.float32, 
-                        # np.float64
-                        ], 
-                        ids=["f16", 
-                            #  "f32", 
-                            #  "f64"
-                             ])
+@pytest.fixture(params=[np.float16, np.float32, np.float64], ids=["f16", "f32", "f64"])
 def rand_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(request.param)
     vectors.shape = -1
@@ -133,10 +127,7 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     uri = str(tmpdir / "transformed")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=fragments)
 
-    builder.shuffle_transformed_vectors(["transformed"], str(tmpdir), rand_ivf)
-
     reader = LanceFileReader(uri)
-
     assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
@@ -148,6 +139,14 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     part_id = data.column("__ivf_part_id")
     assert part_id.type == pa.uint32()
+
+    # test shuffle for transformed vectors
+    filenames = builder.shuffle_transformed_vectors(
+        ["transformed"], str(tmpdir), rand_ivf
+    )
+    for fname in filenames:
+        full_path = str(tmpdir / fname)
+        assert os.path.getsize(full_path) > 0
 
     # test when fragments = None
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)

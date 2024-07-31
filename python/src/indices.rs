@@ -11,7 +11,11 @@ use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
 };
 use lance_linalg::distance::DistanceType;
-use pyo3::{pyfunction, types::{PyModule}, wrap_pyfunction, PyObject, PyResult, Python};
+use pyo3::{
+    pyfunction,
+    types::{PyList, PyModule},
+    wrap_pyfunction, PyObject, PyResult, Python,
+};
 
 use crate::fragment::FileFragment;
 use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
@@ -222,13 +226,14 @@ pub fn transform_vectors(
 }
 
 async fn do_shuffle_transform_vectors(
-    transformed_uris: Vec<String>, 
-    dest_uri: &str, 
-    ivf_centroids: FixedSizeListArray
-) -> PyResult<()> {
-
-    shuffle_vectors(transformed_uris, dest_uri, ivf_centroids).await.infer_error()?;
-    Ok(())
+    transformed_uris: Vec<String>,
+    dest_uri: &str,
+    ivf_centroids: FixedSizeListArray,
+) -> PyResult<Vec<String>> {
+    let partition_files = shuffle_vectors(transformed_uris, dest_uri, ivf_centroids)
+        .await
+        .infer_error()?;
+    Ok(partition_files)
 }
 
 #[pyfunction]
@@ -238,19 +243,22 @@ pub fn shuffle_transformed_vectors(
     transformed_uris: Vec<String>,
     dest_uri: &str,
     ivf_centroids: PyArrowType<ArrayData>,
-) -> PyResult<()> {
-
+) -> PyResult<PyObject> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
 
-    RT.block_on(
-        Some(py),
-        do_shuffle_transform_vectors(
-            transformed_uris,
-            dest_uri,
-            ivf_centroids
-        ),
-    )?
+    let result = RT.block_on(
+        None,
+        do_shuffle_transform_vectors(transformed_uris, dest_uri, ivf_centroids),
+    )?;
+
+    match result {
+        Ok(partition_files) => {
+            let py_list = PyList::new(py, partition_files);
+            Ok(py_list.into())
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+    }
 }
 
 pub fn register_indices(py: Python, m: &PyModule) -> PyResult<()> {

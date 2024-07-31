@@ -427,16 +427,16 @@ class IndicesBuilder:
             dest_uri,
             fragments,
         )
-    
+
     def shuffle_transformed_vectors(
         self,
         transformed_uris: list[str],
         dest_uri: str,
         ivf: IvfModel,
-    ):
+    ) -> list[str]:
         """
-        Take the transformed, unsorted vectors file as input, and create a sorted
-        storage file. Sorting is done based on the partition id. So this function
+        Take the transformed, unsorted vector files as input, and create sorted
+        storage files. Sorting is done based on the partition id. This function
         only makes sense if the storage file contains a partition_id column.
 
         Parameters
@@ -445,10 +445,16 @@ class IndicesBuilder:
             The uri of the unsorted storage file.
         dest_uri: str
             The uri to save the sorted storage file to.
+
+        Returns
+        -------
+        list[str]
+            The list of paths of sorted transformed vector files.
         """
-        print(transformed_uris, dest_uri)
-        if type(transformed_uris) == list:
-            indices.shuffle_transformed_vectors(transformed_uris, dest_uri, ivf.centroids)
+        if type(transformed_uris) is list:
+            return indices.shuffle_transformed_vectors(
+                transformed_uris, dest_uri, ivf.centroids
+            )
         else:
             raise ValueError("transformed_uris must be a list of strings")
 

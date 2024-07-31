@@ -171,9 +171,6 @@ impl FileReader {
                 // We have not read the metadata bytes yet.
                 read_struct(object_reader, metadata_pos).await?
             } else {
-                println!("Tail bytes: {:?}", tail_bytes.len());
-                println!("File size: {}", file_size);
-                println!("Metadata pos: {}", metadata_pos);
                 let offset = tail_bytes.len() - (file_size - metadata_pos);
                 read_struct_from_buf(&tail_bytes.slice(offset..))?
             };
