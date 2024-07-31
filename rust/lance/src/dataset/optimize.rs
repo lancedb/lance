@@ -84,10 +84,12 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLock};
+use std::usize;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_index::DatasetIndexExt;
+use lance_table::io::deletion::read_deletion_file;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 
@@ -638,8 +640,6 @@ async fn rewrite_files(
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         let data_no_row_ids = make_rowid_capture_stream(row_ids.clone(), data)?;
         (Some(row_ids), data_no_row_ids)
-    } else if fragments.iter().any(|f| f.deletion_file.is_some()) {
-        todo!("Handle case where we are materializing deletions");
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         (None, data)
@@ -712,6 +712,20 @@ async fn rechunk_stable_row_ids(
             .position(|frag| frag.id as u32 == *frag_id)
             .expect("Fragment not found")
     });
+
+    // Need to remove deleted rows
+    futures::stream::iter(old_sequences.iter_mut().zip(old_fragments.iter()))
+        .map(Ok)
+        .try_for_each(|((_, seq), frag)| async move {
+            let deletions = read_deletion_file(&dataset.base, frag, dataset.object_store()).await?;
+            if let Some(deletions) = deletions {
+                let mut new_seq = seq.as_ref().clone();
+                new_seq.mask(deletions.into_iter().map(|x| x as usize))?;
+                *seq = Arc::new(new_seq);
+            }
+            Ok::<(), crate::Error>(())
+        })
+        .await?;
 
     let new_sequences = lance_table::rowids::rechunk_sequences(
         old_sequences
@@ -1534,7 +1548,7 @@ mod tests {
         .unwrap();
 
         // Delete first 1,000 rows so rowids != final rowaddrs
-        dataset.delete("i < 1000").await.unwrap();
+        dataset.delete("i < 1100").await.unwrap();
 
         dataset
             .create_index(
@@ -1564,8 +1578,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                // TODO: Should this be name or UUID?
-                .map(|index| index.uuid.clone())
+                .map(|index| index.uuid)
                 .collect()
         }
         let indices = index_set(&dataset).await;
@@ -1595,9 +1608,11 @@ mod tests {
         let before_vec_result = vector_query(&dataset).await;
         let before_scalar_result = scalar_query(&dataset).await;
 
-        let _metrics = compact_files(&mut dataset, Default::default(), None)
-            .await
-            .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_800,
+            ..Default::default()
+        };
+        let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
 
         // The indices should be unchanged after compaction, since we are using
         // move-stable row ids.
