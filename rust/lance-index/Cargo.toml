@@ -73,6 +73,12 @@ rustc_version.workspace = true
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
 
+[features]
+default = []
+# This feature is turned on automatically by the build script but listed here
+# so that clippy & other tools know about it
+nightly = []
+
 [[bench]]
 name = "find_partitions"
 harness = false

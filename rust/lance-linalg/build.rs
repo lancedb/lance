@@ -10,6 +10,10 @@ fn main() -> Result<(), String> {
             e => Err(e),
         })
         .unwrap();
+
+    // Tell clippy about our custom cfg flags
+    println!("cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512\"))");
+
     if rust_toolchain.starts_with("nightly") {
         // enable the 'nightly' feature flag
         println!("cargo:rustc-cfg=feature=\"nightly\"");
@@ -50,7 +54,7 @@ fn main() -> Result<(), String> {
         } else {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
-            println!("cargo:rustc-cfg=kernel_suppport=\"avx512\"");
+            println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
         };
         // Build a version with AVX
         // While GCC doesn't have support for _Float16 until GCC 12, clang
