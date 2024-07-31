@@ -5,12 +5,13 @@ use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use lance::index::vector::ivf::builder::write_vector_storage;
+use lance_index::vector::ivf::shuffler::shuffle_vectors;
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
     pq::{PQBuildParams, ProductQuantizer},
 };
 use lance_linalg::distance::DistanceType;
-use pyo3::{pyfunction, types::PyModule, wrap_pyfunction, PyObject, PyResult, Python};
+use pyo3::{pyfunction, types::{PyModule}, wrap_pyfunction, PyObject, PyResult, Python};
 
 use crate::fragment::FileFragment;
 use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
@@ -220,11 +221,44 @@ pub fn transform_vectors(
     )?
 }
 
+async fn do_shuffle_transform_vectors(
+    transformed_uris: Vec<String>, 
+    dest_uri: &str, 
+    ivf_centroids: FixedSizeListArray
+) -> PyResult<()> {
+
+    shuffle_vectors(transformed_uris, dest_uri, ivf_centroids).await.infer_error()?;
+    Ok(())
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn shuffle_transformed_vectors(
+    py: Python<'_>,
+    transformed_uris: Vec<String>,
+    dest_uri: &str,
+    ivf_centroids: PyArrowType<ArrayData>,
+) -> PyResult<()> {
+
+    let ivf_centroids = ivf_centroids.0;
+    let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
+
+    RT.block_on(
+        Some(py),
+        do_shuffle_transform_vectors(
+            transformed_uris,
+            dest_uri,
+            ivf_centroids
+        ),
+    )?
+}
+
 pub fn register_indices(py: Python, m: &PyModule) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
+    indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     m.add_submodule(indices)?;
     Ok(())
 }

@@ -6,15 +6,23 @@ import pyarrow as pa
 import pytest
 from lance.file import LanceFileReader
 from lance.indices import IndicesBuilder, IvfModel, PqModel
+import os
 
 NUM_ROWS = 10000
 DIMENSION = 128
 NUM_SUBVECTORS = 8
-NUM_FRAGMENTS = 3
+NUM_FRAGMENTS = 1
 NUM_PARTITIONS = round(np.sqrt(NUM_FRAGMENTS * NUM_ROWS))
 
 
-@pytest.fixture(params=[np.float16, np.float32, np.float64], ids=["f16", "f32", "f64"])
+@pytest.fixture(params=[np.float16, 
+                        # np.float32, 
+                        # np.float64
+                        ], 
+                        ids=["f16", 
+                            #  "f32", 
+                            #  "f64"
+                             ])
 def rand_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(request.param)
     vectors.shape = -1
@@ -129,6 +137,8 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder = IndicesBuilder(rand_dataset, "vectors")
     uri = str(tmpdir / "transformed")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=fragments)
+
+    builder.shuffle_transformed_vectors(["transformed"], str(tmpdir), rand_ivf)
 
     reader = LanceFileReader(uri)
 

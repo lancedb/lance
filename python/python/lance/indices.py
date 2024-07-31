@@ -425,6 +425,30 @@ class IndicesBuilder:
             dest_uri,
             fragments,
         )
+    
+    def shuffle_transformed_vectors(
+        self,
+        transformed_uris: list[str],
+        dest_uri: str,
+        ivf: IvfModel,
+    ):
+        """
+        Take the transformed, unsorted vectors file as input, and create a sorted
+        storage file. Sorting is done based on the partition id. So this function
+        only makes sense if the storage file contains a partition_id column.
+
+        Parameters
+        ----------
+        transformed_uri: list[str]
+            The uri of the unsorted storage file.
+        dest_uri: str
+            The uri to save the sorted storage file to.
+        """
+        print(transformed_uris, dest_uri)
+        if type(transformed_uris) == list:
+            indices.shuffle_transformed_vectors(transformed_uris, dest_uri, ivf.centroids)
+        else:
+            raise ValueError("transformed_uris must be a list of strings")
 
     def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
         if num_partitions is None:

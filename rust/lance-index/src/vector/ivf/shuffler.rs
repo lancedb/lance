@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::compute::sort_to_indices;
+use arrow_array::FixedSizeListArray;
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use futures::stream::repeat_with;
@@ -170,7 +171,7 @@ pub async fn shuffle_dataset(
         shuffler
     };
 
-    // step 2: stream in the shuffle data in chunks and write sorted chuncks out
+    // step 2: stream in the shuffle data in chunks and write sorted chunks out
     let start = std::time::Instant::now();
     let partition_files = shuffler
         .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
@@ -183,6 +184,24 @@ pub async fn shuffle_dataset(
     info!("merged partitioned shuffles in {:?}", start.elapsed());
 
     Ok(stream)
+}
+
+pub async fn shuffle_vectors(transformed_uris: Vec<String>, dest_uri: &str, ivf_centroids: FixedSizeListArray) -> Result<()> {
+    let num_partitions = ivf_centroids.len() as u32;
+    let shuffle_partition_batches = 1024 * 10;
+    let shuffle_partition_concurrency = 2;
+    let mut shuffler = IvfShuffler::try_new(num_partitions, Some(dest_uri.into()))?;
+
+    unsafe {
+        shuffler.set_unsorted_buffers(&transformed_uris);
+    }
+    println!("Set unsorted buffers");
+        
+    let partition_files = shuffler
+                .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
+                .await?;
+
+    Ok(())
 }
 
 pub struct IvfShuffler {
@@ -283,7 +302,9 @@ impl IvfShuffler {
         let mut total_batches = vec![];
         for buffer in &self.unsorted_buffers {
             let object_store = ObjectStore::local();
+            println!("Getting path");
             let path = self.output_dir.child(buffer.as_str());
+            println!("Path as string: {:?}", Path::parse(path.clone()));
             let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
             total_batches.push(reader.num_batches());
         }
@@ -464,6 +485,7 @@ impl IvfShuffler {
                 let object_store = ObjectStore::local();
                 let output_file = format!("sorted_{}.lance", i);
                 let path = self.output_dir.child(output_file.clone());
+                println!("Output file: {}", path.to_string());
                 let writer = object_store.create(&path).await?;
 
                 info!(
