@@ -269,12 +269,6 @@ impl From<Schema> for ProjectionRequest {
     }
 }
 
-impl From<&Schema> for ProjectionRequest {
-    fn from(schema: &Schema) -> Self {
-        Self::from(schema.clone())
-    }
-}
-
 impl Dataset {
     /// Open an existing dataset.
     ///
@@ -1043,7 +1037,7 @@ impl Dataset {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
         let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
-        self.take(&ids, projection).await
+        self.take(&ids, projection.clone()).await
     }
 
     /// Delete rows based on a predicate.
@@ -1423,7 +1417,7 @@ impl DatasetTakeRows for Dataset {
     }
 
     async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
-        Self::take_rows(self, row_ids, projection).await
+        Self::take_rows(self, row_ids, projection.clone()).await
     }
 }
 
