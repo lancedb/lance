@@ -602,6 +602,7 @@ def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
+    time.sleep(0.1)
     moment = datetime.now()
     lance.write_dataset(table, base_dir, mode="overwrite")
 
@@ -633,6 +634,7 @@ def test_cleanup_error_when_tagged_old_versions(tmp_path):
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
     lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.1)
     moment = datetime.now()
     lance.write_dataset(table, base_dir, mode="overwrite")
 
@@ -661,6 +663,7 @@ def test_cleanup_around_tagged_old_versions(tmp_path):
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
     lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.1)
     moment = datetime.now()
     lance.write_dataset(table, base_dir, mode="overwrite")
 
