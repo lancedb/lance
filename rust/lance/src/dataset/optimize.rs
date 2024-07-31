@@ -84,7 +84,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLock};
-use std::usize;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
