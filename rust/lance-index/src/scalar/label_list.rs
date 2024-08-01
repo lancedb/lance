@@ -20,8 +20,7 @@ use crate::{Index, IndexType};
 
 use super::{bitmap::train_bitmap_index, SargableQuery};
 use super::{
-    bitmap::BitmapIndex, btree::BtreeTrainingSource, AnyQuery, IndexStore, LabelListQuery,
-    ScalarIndex,
+    bitmap::BitmapIndex, btree::TrainingSource, AnyQuery, IndexStore, LabelListQuery, ScalarIndex,
 };
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
@@ -262,11 +261,11 @@ fn unnest_batch(
 }
 
 struct UnnestTrainingSource {
-    source: Box<dyn BtreeTrainingSource>,
+    source: Box<dyn TrainingSource>,
 }
 
 #[async_trait]
-impl BtreeTrainingSource for UnnestTrainingSource {
+impl TrainingSource for UnnestTrainingSource {
     async fn scan_ordered_chunks(
         self: Box<Self>,
         chunk_size: u32,
@@ -287,7 +286,7 @@ impl BtreeTrainingSource for UnnestTrainingSource {
 
 /// Trains a new label list index
 pub async fn train_label_list_index(
-    data_source: Box<dyn BtreeTrainingSource + Send>,
+    data_source: Box<dyn TrainingSource + Send>,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
     let unnest_source = Box::new(UnnestTrainingSource {

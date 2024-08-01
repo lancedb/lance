@@ -15,7 +15,7 @@ use arrow_array::{
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
-use arrow_select::take::take;
+use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
 pub mod deepcopy;
@@ -283,6 +283,14 @@ impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
 
 pub fn as_fixed_size_binary_array(arr: &dyn Array) -> &FixedSizeBinaryArray {
     arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap()
+}
+
+pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> + '_> {
+    match arr.data_type() {
+        DataType::Utf8 => Box::new(arr.as_string::<i32>().iter()),
+        DataType::LargeUtf8 => Box::new(arr.as_string::<i64>().iter()),
+        _ => panic!("Expecting Utf8 or LargeUtf8, found {:?}", arr.data_type()),
+    }
 }
 
 /// Extends Arrow's [RecordBatch].
@@ -606,6 +614,33 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
     struct_arr
         .column_by_name(components[0])
         .and_then(|arr| get_sub_array(arr, &components[1..]))
+}
+
+/// Interleave multiple RecordBatches into a single RecordBatch.
+///
+/// Behaves like [`arrow::compute::interleave`], but for RecordBatches.
+pub fn interleave_batches(
+    batches: &[RecordBatch],
+    indices: &[(usize, usize)],
+) -> Result<RecordBatch> {
+    let first_batch = batches.first().ok_or_else(|| {
+        ArrowError::InvalidArgumentError("Cannot interleave zero RecordBatches".to_string())
+    })?;
+    let schema = first_batch.schema().clone();
+    let num_columns = first_batch.num_columns();
+    let mut columns = Vec::with_capacity(num_columns);
+    let mut chunks = Vec::with_capacity(batches.len());
+
+    for i in 0..num_columns {
+        for batch in batches {
+            chunks.push(batch.column(i).as_ref());
+        }
+        let new_column = interleave(&chunks, indices)?;
+        columns.push(new_column);
+        chunks.clear();
+    }
+
+    RecordBatch::try_new(schema, columns)
 }
 
 #[cfg(test)]

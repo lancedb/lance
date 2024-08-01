@@ -179,9 +179,11 @@ impl ScanScheduler {
         let reader = self.object_store.open(path).await?;
         let mut file_counter = self.file_counter.lock().unwrap();
         let file_index = *file_counter;
+        let block_size = self.object_store.block_size() as u64;
         *file_counter += 1;
         Ok(FileScheduler {
             reader: reader.into(),
+            block_size,
             root: self.clone(),
             file_index,
         })
@@ -243,7 +245,17 @@ impl ScanScheduler {
 pub struct FileScheduler {
     reader: Arc<dyn Reader>,
     root: Arc<ScanScheduler>,
+    block_size: u64,
     file_index: u32,
+}
+
+fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
+    // Note that range1.end <= range2.start is possible (e.g. when decoding string arrays)
+    range2.start <= (range1.end + block_size)
+}
+
+fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
+    range1.start < range2.end && range2.start < range1.end
 }
 
 impl FileScheduler {
@@ -258,8 +270,56 @@ impl FileScheduler {
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.file_index as u128) << 64) + priority as u128;
-        self.root
-            .submit_request(self.reader.clone(), request, priority)
+
+        let mut updated_requests = Vec::with_capacity(request.len());
+
+        if !request.is_empty() {
+            let mut curr_interval = request[0].clone();
+
+            for req in request.iter().skip(1) {
+                if is_close_together(&curr_interval, req, self.block_size) {
+                    curr_interval.end = curr_interval.end.max(req.end);
+                } else {
+                    updated_requests.push(curr_interval);
+                    curr_interval = req.clone();
+                }
+            }
+
+            updated_requests.push(curr_interval);
+        }
+
+        let bytes_vec_fut =
+            self.root
+                .submit_request(self.reader.clone(), updated_requests.clone(), priority);
+
+        let mut updated_index = 0;
+        let mut final_bytes = Vec::with_capacity(request.len());
+
+        async move {
+            let bytes_vec = bytes_vec_fut.await?;
+
+            let mut orig_index = 0;
+            while (updated_index < updated_requests.len()) && (orig_index < request.len()) {
+                let updated_range = &updated_requests[updated_index];
+                let orig_range = &request[orig_index];
+                let byte_offset = updated_range.start as usize;
+
+                if is_overlapping(updated_range, orig_range) {
+                    // Rescale the ranges since they correspond to the entire set of bytes, while
+                    // But we need to slice into a subset of the bytes in a particular index of bytes_vec
+                    let start = orig_range.start as usize - byte_offset;
+                    let end = orig_range.end as usize - byte_offset;
+
+                    let sliced_range = bytes_vec[updated_index].slice(start..end);
+                    final_bytes.push(sliced_range);
+                    orig_index += 1;
+                } else {
+                    updated_index += 1;
+                }
+            }
+
+            Ok(final_bytes)
+        }
     }
 
     /// Submit a single IOP to the reader

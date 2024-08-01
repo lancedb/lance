@@ -46,6 +46,9 @@ The key features of Lance include:
 
 * **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB and more on the way.
 
+> [!TIP]
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](docs/contributing.rst) for more information.
+
 ## Quick Start
 
 **Installation**

@@ -478,6 +478,7 @@ impl RowIdTreeMap {
     ///
     /// The serialization format is:
     /// * u32: num_entries
+    ///
     /// for each entry:
     ///   * u32: fragment_id
     ///   * u32: bitmap size

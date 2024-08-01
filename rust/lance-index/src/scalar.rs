@@ -46,10 +46,14 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
+    /// Read the range of rows from the file
+    async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch>;
     /// Return the number of batches in the file
     async fn num_batches(&self) -> u32;
     /// Return the number of rows in the file
     fn num_rows(&self) -> usize;
+    /// Return the metadata of the file
+    fn schema(&self) -> &lance_core::datatypes::Schema;
 }
 
 /// Trait abstracting I/O away from index logic
@@ -64,14 +68,21 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
         -> Result<Box<dyn IndexWriter>>;
+    async fn new_index_file_v2(
+        &self,
+        name: &str,
+        schema: Arc<Schema>,
+    ) -> Result<Box<dyn IndexWriter>>;
 
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
+    async fn open_index_file_v2(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
 
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
+    async fn copy_index_file_v2(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
 }
 
 /// Different scalar indices may support different kinds of queries
@@ -111,6 +122,11 @@ pub struct FullTextSearchQuery {
     pub query: String,
     /// The maximum number of results to return
     pub limit: Option<i64>,
+    /// The wand factor to use for ranking
+    /// if None, use the default value of 1.0
+    /// Increasing this value will reduce the recall and improve the performance
+    /// 1.0 is the value that would give the best performance without recall loss
+    pub wand_factor: Option<f32>,
 }
 
 impl FullTextSearchQuery {
@@ -119,6 +135,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             columns: vec![],
+            wand_factor: None,
         }
     }
 
@@ -131,6 +148,11 @@ impl FullTextSearchQuery {
 
     pub fn limit(mut self, limit: Option<i64>) -> Self {
         self.limit = limit;
+        self
+    }
+
+    pub fn wand_factor(mut self, wand_factor: Option<f32>) -> Self {
+        self.wand_factor = wand_factor;
         self
     }
 }

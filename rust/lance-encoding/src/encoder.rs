@@ -9,13 +9,15 @@ use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
-use lance_core::Result;
+use lance_core::{Error, Result};
+use snafu::{location, Location};
 
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::physical::bitpack::{num_compressed_bits, BitpackingBufferEncoder};
 use crate::encodings::physical::buffers::{
     BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder,
 };
+use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
@@ -265,6 +267,15 @@ impl CoreArrayEncodingStrategy {
                     *dimension as u32,
                 )))))
             }
+            DataType::Dictionary(key_type, value_type) => {
+                let key_encoder = Self::array_encoder_from_type(key_type, data_size, false)?;
+                let value_encoder = Self::array_encoder_from_type(value_type, data_size, false)?;
+
+                Ok(Box::new(AlreadyDictionaryEncoder::new(
+                    key_encoder,
+                    value_encoder,
+                )))
+            }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
                     let dict_indices_encoder =
@@ -487,6 +498,42 @@ pub struct CoreFieldEncodingStrategy {
     array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
 }
 
+impl CoreFieldEncodingStrategy {
+    fn is_primitive_type(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::Duration(_)
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Int8
+                | DataType::Interval(_)
+                | DataType::Null
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::UInt8
+                | DataType::FixedSizeBinary(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::Utf8
+                | DataType::LargeUtf8,
+        )
+    }
+}
+
 impl Default for CoreFieldEncodingStrategy {
     fn default() -> Self {
         Self {
@@ -505,94 +552,88 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
         keep_original_array: bool,
         _config: &HashMap<String, String>,
     ) -> Result<Box<dyn FieldEncoder>> {
-        match field.data_type() {
-            DataType::Boolean
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::Duration(_)
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Int8
-            | DataType::Interval(_)
-            | DataType::Null
-            | DataType::RunEndEncoded(_, _)
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Timestamp(_, _)
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::UInt8
-            | DataType::FixedSizeBinary(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::Utf8
-            | DataType::LargeUtf8 => Ok(Box::new(PrimitiveFieldEncoder::try_new(
+        let data_type = field.data_type();
+        if Self::is_primitive_type(&data_type) {
+            Ok(Box::new(PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_column,
                 keep_original_array,
                 self.array_encoding_strategy.clone(),
                 column_index.next_column_index(field.id),
-            )?)),
-            DataType::List(child) => {
-                let list_idx = column_index.next_column_index(field.id);
-                let inner_encoding = encoding_strategy_root.create_field_encoder(
-                    encoding_strategy_root,
-                    &field.children[0],
-                    column_index,
-                    cache_bytes_per_column,
-                    keep_original_array,
-                    child.metadata(),
-                )?;
-                Ok(Box::new(ListFieldEncoder::new(
-                    inner_encoding,
-                    cache_bytes_per_column,
-                    keep_original_array,
-                    list_idx,
-                )))
-            }
-            DataType::Struct(_) => {
-                let field_metadata = &field.metadata;
-                if field_metadata
-                    .get("packed")
-                    .map(|v| v == "true")
-                    .unwrap_or(false)
-                {
-                    Ok(Box::new(PrimitiveFieldEncoder::try_new(
+            )?))
+        } else {
+            match data_type {
+                DataType::List(child) => {
+                    let list_idx = column_index.next_column_index(field.id);
+                    let inner_encoding = encoding_strategy_root.create_field_encoder(
+                        encoding_strategy_root,
+                        &field.children[0],
+                        column_index,
                         cache_bytes_per_column,
                         keep_original_array,
-                        self.array_encoding_strategy.clone(),
-                        column_index.next_column_index(field.id),
-                    )?))
-                } else {
-                    let header_idx = column_index.next_column_index(field.id);
-                    let children_encoders = field
-                        .children
-                        .iter()
-                        .map(|field| {
-                            self.create_field_encoder(
-                                encoding_strategy_root,
-                                field,
-                                column_index,
-                                cache_bytes_per_column,
-                                keep_original_array,
-                                &field.metadata,
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(Box::new(StructFieldEncoder::new(
-                        children_encoders,
-                        header_idx,
+                        child.metadata(),
+                    )?;
+                    Ok(Box::new(ListFieldEncoder::new(
+                        inner_encoding,
+                        cache_bytes_per_column,
+                        keep_original_array,
+                        list_idx,
                     )))
                 }
+                DataType::Struct(_) => {
+                    let field_metadata = &field.metadata;
+                    if field_metadata
+                        .get("packed")
+                        .map(|v| v == "true")
+                        .unwrap_or(false)
+                    {
+                        Ok(Box::new(PrimitiveFieldEncoder::try_new(
+                            cache_bytes_per_column,
+                            keep_original_array,
+                            self.array_encoding_strategy.clone(),
+                            column_index.next_column_index(field.id),
+                        )?))
+                    } else {
+                        let header_idx = column_index.next_column_index(field.id);
+                        let children_encoders = field
+                            .children
+                            .iter()
+                            .map(|field| {
+                                self.create_field_encoder(
+                                    encoding_strategy_root,
+                                    field,
+                                    column_index,
+                                    cache_bytes_per_column,
+                                    keep_original_array,
+                                    &field.metadata,
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(Box::new(StructFieldEncoder::new(
+                            children_encoders,
+                            header_idx,
+                        )))
+                    }
+                }
+                DataType::Dictionary(_, value_type) => {
+                    // A dictionary of primitive is, itself, primitive
+                    if Self::is_primitive_type(&value_type) {
+                        Ok(Box::new(PrimitiveFieldEncoder::try_new(
+                            cache_bytes_per_column,
+                            keep_original_array,
+                            self.array_encoding_strategy.clone(),
+                            column_index.next_column_index(field.id),
+                        )?))
+                    } else {
+                        // A dictionary of logical is, itself, logical and we don't support that today
+                        // It could be possible (e.g. store indices in one column and values in remaining columns)
+                        // but would be a significant amount of work
+                        //
+                        // An easier fallback implementation would be to decode-on-write and encode-on-read
+                        Err(Error::NotSupported { source: format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into(), location: location!() })
+                    }
+                }
+                _ => todo!("Implement encoding for field {}", field),
             }
-            _ => todo!("Implement encoding for field {}", field),
         }
     }
 }

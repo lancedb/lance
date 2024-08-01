@@ -120,6 +120,9 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --check
         shell: bash
+      - name: Start DynamoDB local for tests
+        run: |
+          docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
       - name: Run tests
         run: |
           cargo test --all-features -- --test-threads 1
