@@ -12,6 +12,7 @@ use lance_index::vector::{
 use lance_linalg::distance::DistanceType;
 use pyo3::{pyfunction, types::PyModule, wrap_pyfunction, PyObject, PyResult, Python};
 
+use crate::fragment::FileFragment;
 use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
 
 async fn do_train_ivf_model(
@@ -147,11 +148,14 @@ async fn do_transform_vectors(
     ivf_centroids: FixedSizeListArray,
     pq_model: ProductQuantizer,
     dst_uri: &str,
+    fragments: Vec<FileFragment>,
 ) -> PyResult<()> {
     let num_rows = dataset.ds.count_rows(None).await.infer_error()?;
+    let fragments = fragments.iter().map(|item| item.metadata().inner).collect();
     let transform_input = dataset
         .ds
         .scan()
+        .with_fragments(fragments)
         .project(&[column])
         .infer_error()?
         .with_row_id()
@@ -188,6 +192,7 @@ pub fn transform_vectors(
     ivf_centroids: PyArrowType<ArrayData>,
     pq_codebook: PyArrowType<ArrayData>,
     dst_uri: &str,
+    fragments: Vec<FileFragment>,
 ) -> PyResult<()> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
@@ -203,7 +208,15 @@ pub fn transform_vectors(
     );
     RT.block_on(
         Some(py),
-        do_transform_vectors(dataset, column, distance_type, ivf_centroids, pq, dst_uri),
+        do_transform_vectors(
+            dataset,
+            column,
+            distance_type,
+            ivf_centroids,
+            pq,
+            dst_uri,
+            fragments,
+        ),
     )?
 }
 
