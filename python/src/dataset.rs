@@ -38,19 +38,16 @@ use lance::dataset::{
 };
 use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
-use lance::index::{
-    scalar::{ScalarIndexParams, ScalarIndexType},
-    vector::VectorIndexParams,
-    DatasetIndexInternalExt,
-};
+use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
-use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::FullTextSearchQuery;
-use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
-    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
+    optimize::OptimizeOptions,
+    scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
+    vector::{
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+        sq::builder::SQBuildParams,
+    },
     DatasetIndexExt, IndexParams, IndexType,
 };
 use lance_io::object_store::ObjectStoreParams;
