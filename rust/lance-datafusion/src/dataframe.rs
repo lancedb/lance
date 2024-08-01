@@ -116,8 +116,8 @@ impl BatchStreamGrouper {
     }
 
     /// Get the output schema of the stream.
-    pub fn schema(&self) -> Arc<Schema> {
-        self.input.schema()
+    pub fn schema(&self) -> &Arc<Schema> {
+        &self.schema
     }
 
     /// Given a record batch, find the distinct ranges of partition values.

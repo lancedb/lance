@@ -24,13 +24,23 @@ use crate::buffer::LanceBuffer;
 /// A DataBlock can be converted into an Arrow ArrayData (and then Array) for a given array type.
 /// For example, a FixedWidthDataBlock can be converted into any primitive type or a fixed size
 /// list of a primitive type.
-pub trait DataBlock: Any {
+pub trait DataBlock: Any + std::fmt::Debug + Send + Sync {
     /// Get a reference to the Any trait object
     fn as_any(&self) -> &dyn Any;
     /// Convert self into a Box<dyn Any>
     fn as_any_box(self: Box<Self>) -> Box<dyn Any>;
     /// Convert self into an Arrow ArrayData
     fn into_arrow(self: Box<Self>, data_type: DataType, validate: bool) -> Result<ArrayData>;
+    /// Converts the data buffers into borrowed mode and clones the block
+    ///
+    /// This is a zero-copy operation but requires a mutable reference to self and, afterwards,
+    /// all buffers will be in Borrowed mode.
+    fn borrow_and_clone(&mut self) -> Box<dyn DataBlock>;
+    /// Try and clone the block
+    ///
+    /// This will fail if any buffers are in owned mode.  You can call borrow_and_clone() to
+    /// ensure that all buffers are in borrowed mode before calling this method.
+    fn try_clone(&self) -> Result<Box<dyn DataBlock>>;
 }
 
 /// Extension trait for DataBlock
@@ -51,6 +61,7 @@ impl DataBlockExt for Box<dyn DataBlock> {
 }
 
 /// A data block with no buffers where everything is null
+#[derive(Debug)]
 pub struct AllNullDataBlock {
     /// The number of values represented by this block
     pub num_values: u64,
@@ -68,9 +79,22 @@ impl DataBlock for AllNullDataBlock {
     fn into_arrow(self: Box<Self>, data_type: DataType, _validate: bool) -> Result<ArrayData> {
         Ok(ArrayData::new_null(&data_type, self.num_values as usize))
     }
+
+    fn borrow_and_clone(&mut self) -> Box<dyn DataBlock> {
+        Box::new(Self {
+            num_values: self.num_values,
+        })
+    }
+
+    fn try_clone(&self) -> Result<Box<dyn DataBlock>> {
+        Ok(Box::new(Self {
+            num_values: self.num_values,
+        }))
+    }
 }
 
 /// Wraps a data block and adds nullability information to it
+#[derive(Debug)]
 pub struct NullableDataBlock {
     /// The underlying data
     pub data: Box<dyn DataBlock>,
@@ -97,9 +121,24 @@ impl DataBlock for NullableDataBlock {
             Ok(unsafe { data.build_unchecked() })
         }
     }
+
+    fn borrow_and_clone(&mut self) -> Box<dyn DataBlock> {
+        Box::new(Self {
+            data: self.data.borrow_and_clone(),
+            nulls: self.nulls.borrow_and_clone(),
+        })
+    }
+
+    fn try_clone(&self) -> Result<Box<dyn DataBlock>> {
+        Ok(Box::new(Self {
+            data: self.data.try_clone()?,
+            nulls: self.nulls.try_clone()?,
+        }))
+    }
 }
 
 /// A data block for a single buffer of data where each element has a fixed number of bits
+#[derive(Debug)]
 pub struct FixedWidthDataBlock {
     /// The data buffer
     pub data: LanceBuffer,
@@ -155,9 +194,26 @@ impl DataBlock for FixedWidthDataBlock {
         let root_num_values = self.num_values;
         self.do_into_arrow(data_type, root_num_values, validate)
     }
+
+    fn borrow_and_clone(&mut self) -> Box<dyn DataBlock> {
+        Box::new(Self {
+            data: self.data.borrow_and_clone(),
+            bits_per_value: self.bits_per_value,
+            num_values: self.num_values,
+        })
+    }
+
+    fn try_clone(&self) -> Result<Box<dyn DataBlock>> {
+        Ok(Box::new(Self {
+            data: self.data.try_clone()?,
+            bits_per_value: self.bits_per_value,
+            num_values: self.num_values,
+        }))
+    }
 }
 
 /// A data block for variable-width data (e.g. strings, packed rows, etc.)
+#[derive(Debug)]
 pub struct VariableWidthBlock {
     /// The data buffer
     pub data: LanceBuffer,
@@ -192,9 +248,28 @@ impl DataBlock for VariableWidthBlock {
             Ok(unsafe { builder.build_unchecked() })
         }
     }
+
+    fn borrow_and_clone(&mut self) -> Box<dyn DataBlock> {
+        Box::new(Self {
+            data: self.data.borrow_and_clone(),
+            offsets: self.offsets.borrow_and_clone(),
+            bits_per_offset: self.bits_per_offset,
+            num_values: self.num_values,
+        })
+    }
+
+    fn try_clone(&self) -> Result<Box<dyn DataBlock>> {
+        Ok(Box::new(Self {
+            data: self.data.try_clone()?,
+            offsets: self.offsets.try_clone()?,
+            bits_per_offset: self.bits_per_offset,
+            num_values: self.num_values,
+        }))
+    }
 }
 
 /// A data block representing a struct
+#[derive(Debug)]
 pub struct StructDataBlock {
     /// The child arrays
     pub children: Vec<Box<dyn DataBlock>>,
@@ -230,5 +305,84 @@ impl DataBlock for StructDataBlock {
                 location: location!(),
             })
         }
+    }
+
+    fn borrow_and_clone(&mut self) -> Box<dyn DataBlock> {
+        Box::new(Self {
+            children: self
+                .children
+                .iter_mut()
+                .map(|c| c.borrow_and_clone())
+                .collect(),
+        })
+    }
+
+    fn try_clone(&self) -> Result<Box<dyn DataBlock>> {
+        Ok(Box::new(Self {
+            children: self
+                .children
+                .iter()
+                .map(|c| c.try_clone())
+                .collect::<Result<_>>()?,
+        }))
+    }
+}
+
+/// A data block for dictionary encoded data
+#[derive(Debug)]
+pub struct DictionaryDataBlock {
+    /// The indices buffer
+    pub indices: Box<dyn DataBlock>,
+    /// The dictionary itself
+    pub dictionary: Box<dyn DataBlock>,
+}
+
+impl DataBlock for DictionaryDataBlock {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_box(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+
+    fn into_arrow(self: Box<Self>, data_type: DataType, validate: bool) -> Result<ArrayData> {
+        let (key_type, value_type) = if let DataType::Dictionary(key_type, value_type) = &data_type
+        {
+            (key_type.as_ref().clone(), value_type.as_ref().clone())
+        } else {
+            return Err(Error::Internal {
+                message: format!("Expected Dictionary, got {:?}", data_type),
+                location: location!(),
+            });
+        };
+
+        let indices = self.indices.into_arrow(key_type, validate)?;
+        let dictionary = self.dictionary.into_arrow(value_type, validate)?;
+
+        let builder = indices
+            .into_builder()
+            .add_child_data(dictionary)
+            .data_type(data_type);
+
+        if validate {
+            Ok(builder.build()?)
+        } else {
+            Ok(unsafe { builder.build_unchecked() })
+        }
+    }
+
+    fn borrow_and_clone(&mut self) -> Box<dyn DataBlock> {
+        Box::new(Self {
+            indices: self.indices.borrow_and_clone(),
+            dictionary: self.dictionary.borrow_and_clone(),
+        })
+    }
+
+    fn try_clone(&self) -> Result<Box<dyn DataBlock>> {
+        Ok(Box::new(Self {
+            indices: self.indices.try_clone()?,
+            dictionary: self.dictionary.try_clone()?,
+        }))
     }
 }

@@ -706,7 +706,7 @@ mod tests {
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
-    use lance_linalg::distance::MetricType;
+    use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
@@ -1023,5 +1023,47 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_index_too_small_for_pq() {
+        let test_dir = tempdir().unwrap();
+        let dimensions = 1536;
+
+        let field = Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![field]));
+        let float_arr = generate_random_array(100 * dimensions as usize);
+
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![record_batch.clone()].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 96, DistanceType::L2, 1);
+        let result = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await;
+
+        assert!(matches!(result, Err(Error::Index { .. })));
+        if let Error::Index { message, .. } = result.unwrap_err() {
+            assert_eq!(
+                message,
+                "Not enough rows to train PQ. Requires 256 rows but only 100 available",
+            )
+        }
     }
 }

@@ -250,6 +250,40 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_tag(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    assert len(ds.tags.list()) == 0
+
+    with pytest.raises(ValueError):
+        ds.tags.create("tag1", 3)
+
+    with pytest.raises(ValueError):
+        ds.tags.delete("tag1")
+
+    ds.tags.create("tag1", 1)
+    assert len(ds.tags.list()) == 1
+
+    with pytest.raises(ValueError):
+        ds.tags.create("tag1", 1)
+
+    ds.tags.delete("tag1")
+
+    ds.tags.create("tag1", 1)
+    ds.tags.create("tag2", 1)
+
+    assert len(ds.tags.list()) == 2
+
+    with pytest.raises(OSError):
+        ds.checkout_version("tag3")
+
+    assert ds.checkout_version("tag1").version == 1
+
+
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
     base_dir = tmp_path / "test"
@@ -568,6 +602,7 @@ def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
+    time.sleep(0.1)
     moment = datetime.now()
     lance.write_dataset(table, base_dir, mode="overwrite")
 
@@ -590,6 +625,70 @@ def test_cleanup_old_versions(tmp_path):
 
     # Now this call will actually delete the old version
     stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 1
+
+
+def test_cleanup_error_when_tagged_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.1)
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
+
+    with pytest.raises(OSError):
+        dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert len(dataset.versions()) == 3
+
+    dataset.tags.delete("old-tag")
+    with pytest.raises(OSError):
+        dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert len(dataset.versions()) == 3
+
+    dataset.tags.delete("another-old-tag")
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 2
+    assert len(dataset.versions()) == 1
+
+
+def test_cleanup_around_tagged_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.1)
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
+    dataset.tags.create("tag-latest", 3)
+
+    stats = dataset.cleanup_old_versions(
+        older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
+    )
+    assert stats.bytes_removed == 0
+    assert stats.old_versions == 0
+
+    dataset.tags.delete("old-tag")
+    stats = dataset.cleanup_old_versions(
+        older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
+    )
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 1
+
+    dataset.tags.delete("another-old-tag")
+    stats = dataset.cleanup_old_versions(
+        older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
+    )
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1
 
@@ -1036,6 +1135,52 @@ def test_merge_insert(tmp_path: Path):
         check_merge_stats(merge_dict, (None, None, None))
 
 
+def test_merge_insert_subcols(tmp_path: Path):
+    initial_data = pa.table(
+        {
+            "a": range(10),
+            "b": range(10),
+            "c": range(10, 20),
+        }
+    )
+    # Split across two fragments
+    dataset = lance.write_dataset(
+        initial_data, tmp_path / "dataset", max_rows_per_file=5
+    )
+    original_fragments = dataset.get_fragments()
+
+    new_values = pa.table(
+        {
+            "a": range(3, 5),
+            "b": range(20, 22),
+        }
+    )
+    (dataset.merge_insert("a").when_matched_update_all().execute(new_values))
+
+    expected = pa.table(
+        {
+            "a": range(10),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 9],
+            "c": range(10, 20),
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
+
+    # First fragment has new file
+    fragments = dataset.get_fragments()
+    assert fragments[0].fragment_id == original_fragments[0].fragment_id
+    assert fragments[1].fragment_id == original_fragments[1].fragment_id
+
+    assert len(fragments[0].data_files()) == 2
+    assert str(fragments[0].data_files()[0]) == str(
+        original_fragments[0].data_files()[0]
+    )
+    assert len(fragments[1].data_files()) == 1
+    assert str(fragments[1].data_files()[0]) == str(
+        original_fragments[1].data_files()[0]
+    )
+
+
 def test_flat_vector_search_with_delete(tmp_path: Path):
     table = pa.Table.from_pydict(
         {
@@ -1216,7 +1361,10 @@ def test_merge_insert_incompatible_schema(tmp_path: Path):
 
     with pytest.raises(OSError):
         merge_dict = (
-            dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+            dataset.merge_insert("a")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(new_table)
         )
         check_merge_stats(merge_dict, (None, None, None))
 

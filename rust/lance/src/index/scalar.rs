@@ -10,12 +10,11 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
-use lance_index::scalar::bitmap::train_inverted_index;
-use lance_index::scalar::inverted::{InvertedIndex, INVERT_LIST_FILE};
+use lance_index::scalar::inverted::{train_inverted_index, InvertedIndex, INVERT_LIST_FILE};
 use lance_index::{
     scalar::{
         bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
-        btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+        btree::{train_btree_index, BTreeIndex, TrainingSource},
         flat::FlatIndexMetadata,
         label_list::{train_label_list_index, LabelListIndex},
         lance_format::LanceIndexStore,
@@ -64,13 +63,13 @@ impl IndexParams for ScalarIndexParams {
     }
 }
 
-struct TrainingRequest {
+pub struct TrainingRequest {
     dataset: Arc<Dataset>,
     column: String,
 }
 
 #[async_trait]
-impl BtreeTrainingSource for TrainingRequest {
+impl TrainingSource for TrainingRequest {
     async fn scan_ordered_chunks(
         self: Box<Self>,
         chunk_size: u32,

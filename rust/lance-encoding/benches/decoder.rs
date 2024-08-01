@@ -267,5 +267,5 @@ criterion_group!(
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_decode, bench_decode_fsl);
+    targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct);
 criterion_main!(benches);
