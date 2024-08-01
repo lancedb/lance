@@ -13,7 +13,7 @@ use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::{FileWriter, ManifestProvider};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::manifest::ManifestDescribing;
@@ -107,6 +107,8 @@ pub struct WriteParams {
     /// This makes compaction more efficient, since with stable row ids no
     /// secondary indices need to be updated to point to new row ids.
     pub enable_move_stable_row_ids: bool,
+
+    pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl Default for WriteParams {
@@ -123,6 +125,7 @@ impl Default for WriteParams {
             commit_handler: None,
             use_legacy_format: true,
             enable_move_stable_row_ids: false,
+            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -150,6 +153,7 @@ pub async fn write_fragments(
             }
             Err(Error::DatasetNotFound { .. }) => {
                 let (object_store, base) = ObjectStore::from_uri_and_params(
+                    params.object_store_registry.clone(),
                     dataset_uri,
                     &params.store_params.clone().unwrap_or_default(),
                 )
@@ -160,6 +164,7 @@ pub async fn write_fragments(
         }
     } else {
         let (object_store, base) = ObjectStore::from_uri_and_params(
+            params.object_store_registry.clone(),
             dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )

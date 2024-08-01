@@ -12,13 +12,17 @@ integtest:
 	pytest --run-integration $(PYTEST_ARGS) python/tests
 .PHONY: integtest
 
+doctest:
+	pytest --doctest-modules $(PYTEST_ARGS) python/lance
+.PHONY: doctest
+
 format: format-python
 	cargo fmt
 .PHONY: format
 
 format-python:
 	ruff format python
-	ruff --fix python
+	ruff check --fix python
 .PHONY: format-python
 
 lint: lint-python lint-rust
@@ -26,7 +30,7 @@ lint: lint-python lint-rust
 
 lint-python:
 	ruff format --check python
-	ruff python
+	ruff check python
 .PHONY: lint-python
 
 lint-rust:

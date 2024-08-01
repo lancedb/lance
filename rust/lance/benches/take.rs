@@ -17,6 +17,7 @@ use object_store::ObjectStore;
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 use url::Url;
 

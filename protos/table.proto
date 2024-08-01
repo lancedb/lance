@@ -200,6 +200,11 @@ message DataFile {
   string path = 1;
   // The ids of the fields/columns in this file.
   //
+  // -1 is used for "unassigned" while in memory. It is not meant to be written
+  // to disk. -2 is used for "tombstoned", meaningful a field that is no longer
+  // in use. This is often because the original field id was reassigned to a
+  // different data file.
+  //
   // In Lance v1 IDs are assigned based on position in the file, offset by the max
   // existing field id in the table (if any already). So when a fragment is first
   // created with one file of N columns, the field ids will be 1, 2, ..., N. If a

@@ -45,7 +45,7 @@ use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
 
-#[cfg(all(target_feature = "dynamodb", test))]
+#[cfg(all(feature = "dynamodb", test))]
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
@@ -206,7 +206,7 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     for fragment in manifest.fragments.iter() {
         for file in fragment.files.iter() {
             for field_id in file.fields.iter() {
-                if !seen_fields.insert(*field_id) {
+                if *field_id >= 0 && !seen_fields.insert(*field_id) {
                     fields_with_duplicate_ids.insert(*field_id);
                 }
             }

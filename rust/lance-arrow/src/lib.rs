@@ -15,7 +15,7 @@ use arrow_array::{
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
-use arrow_select::take::take;
+use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
 pub mod deepcopy;
@@ -614,6 +614,33 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
     struct_arr
         .column_by_name(components[0])
         .and_then(|arr| get_sub_array(arr, &components[1..]))
+}
+
+/// Interleave multiple RecordBatches into a single RecordBatch.
+///
+/// Behaves like [`arrow::compute::interleave`], but for RecordBatches.
+pub fn interleave_batches(
+    batches: &[RecordBatch],
+    indices: &[(usize, usize)],
+) -> Result<RecordBatch> {
+    let first_batch = batches.first().ok_or_else(|| {
+        ArrowError::InvalidArgumentError("Cannot interleave zero RecordBatches".to_string())
+    })?;
+    let schema = first_batch.schema().clone();
+    let num_columns = first_batch.num_columns();
+    let mut columns = Vec::with_capacity(num_columns);
+    let mut chunks = Vec::with_capacity(batches.len());
+
+    for i in 0..num_columns {
+        for batch in batches {
+            chunks.push(batch.column(i).as_ref());
+        }
+        let new_column = interleave(&chunks, indices)?;
+        columns.push(new_column);
+        chunks.clear();
+    }
+
+    RecordBatch::try_new(schema, columns)
 }
 
 #[cfg(test)]

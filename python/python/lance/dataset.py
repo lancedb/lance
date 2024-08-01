@@ -210,6 +210,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._uri
 
+    @property
+    def tags(self) -> Tags:
+        return Tags(self._ds)
+
     def list_indices(self) -> List[Dict[str, Any]]:
         if getattr(self, "_list_indices_res", None) is None:
             self._list_indices_res = self._ds.load_indices()
@@ -712,10 +716,14 @@ class LanceDataset(pa.dataset.Dataset):
         list columns can be casted between their size variants. For example,
         string to large string, binary to large binary, and list to large list.
 
+        Columns that are renamed can keep any indices that are on them. However, if
+        the column is casted to a different type, it's indices will be dropped.
+
         Parameters
         ----------
         alterations : Iterable[Dict[str, Any]]
             A sequence of dictionaries, each with the following keys:
+
             - "path": str
                 The column path to alter. For a top-level column, this is the name.
                 For a nested column, this is the dot-separated path, e.g. "a.b.c".
@@ -899,16 +907,16 @@ class LanceDataset(pa.dataset.Dataset):
     def drop_columns(self, columns: List[str]):
         """Drop one or more columns from the dataset
 
+        This is a metadata-only operation and does not remove the data from the
+        underlying storage. In order to remove the data, you must subsequently
+        call ``compact_files`` to rewrite the data without the removed columns and
+        then call ``cleanup_old_versions`` to remove the old files.
+
         Parameters
         ----------
         columns : list of str
             The names of the columns to drop. These can be nested column references
             (e.g. "a.b.c") or top-level column names (e.g. "a").
-
-        This is a metadata-only operation and does not remove the data from the
-        underlying storage. In order to remove the data, you must subsequently
-        call ``compact_files`` to rewrite the data without the removed columns and
-        then call ``cleanup_files`` to remove the old files.
 
         Examples
         --------
@@ -1081,13 +1089,23 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
-    def checkout_version(self, version) -> "LanceDataset":
+    def checkout_version(self, version: int | str) -> "LanceDataset":
         """
         Load the given version of the dataset.
 
         Unlike the :func:`dataset` constructor, this will re-use the
         current cache.
         This is a no-op if the dataset is already at the given version.
+
+        Parameters
+        ----------
+        version: int | str,
+            The version to check out. A version number (`int`) or a tag
+            (`str`) can be provided.
+
+        Returns
+        -------
+        LanceDataset
         """
         ds = copy.copy(self)
         if version != ds.version:
@@ -1107,6 +1125,7 @@ class LanceDataset(pa.dataset.Dataset):
         older_than: Optional[timedelta] = None,
         *,
         delete_unverified: bool = False,
+        error_if_tagged_old_versions: bool = True,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -1135,11 +1154,19 @@ class LanceDataset(pa.dataset.Dataset):
             This should only be set to True if you can guarantee that no other process
             is currently working on this dataset.  Otherwise the dataset could be put
             into a corrupted state.
+
+        error_if_tagged_old_versions: bool, default True
+            Some versions may have tags associated with them. Tagged versions will
+            not be cleaned up, regardless of how old they are. If this argument
+            is set to `True` (the default), an exception will be raised if any
+            tagged versions match the parameters. Otherwise, tagged versions will
+            be ignored without any error and only untagged versions will be
+            cleaned up.
         """
         if older_than is None:
             older_than = timedelta(days=14)
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than), delete_unverified
+            td_to_micros(older_than), delete_unverified, error_if_tagged_old_versions
         )
 
     def create_scalar_index(
@@ -2517,6 +2544,52 @@ class DatasetOptimizer:
         if the new data exhibits new patterns, concepts, or trends)
         """
         self._dataset._ds.optimize_indices(**kwargs)
+
+
+class Tags:
+    """
+    Dataset tag manager.
+    """
+
+    def __init__(self, dataset: _Dataset):
+        self._ds = dataset
+
+    def list(self) -> dict[str, int]:
+        """
+        List all dataset tags.
+
+        Returns
+        -------
+        dict[str, int]
+            A dictionary mapping tag names to version numbers.
+        """
+        return self._ds.tags()
+
+    def create(self, tag: str, version: int) -> None:
+        """
+        Create a tag for a given dataset version.
+
+        Parameters
+        ----------
+        tag: str,
+            The name of the tag to create. This name must be unique among all tag
+            names for the dataset.
+        version: int,
+            The dataset version to tag.
+        """
+        self._ds.create_tag(tag, version)
+
+    def delete(self, tag: str) -> None:
+        """
+        Delete tag from the dataset.
+
+        Parameters
+        ----------
+        tag: str,
+            The name of the tag to delete.
+
+        """
+        self._ds.delete_tag(tag)
 
 
 class DatasetStats(TypedDict):
