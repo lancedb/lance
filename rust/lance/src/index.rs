@@ -103,7 +103,7 @@ pub(crate) async fn remap_index(
         .await?;
 
     match generic.index_type() {
-        IndexType::Scalar => {
+        IndexType::Scalar | IndexType::Bitmap | IndexType::LabelList => {
             let new_store = LanceIndexStore::from_dataset(dataset, &new_id.to_string());
 
             let scalar_index = dataset

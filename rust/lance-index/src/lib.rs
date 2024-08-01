@@ -67,7 +67,12 @@ pub trait Index: Send + Sync + DeepSizeOf {
 #[derive(Debug, PartialEq, Eq, Copy, Hash, Clone, DeepSizeOf)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
-    Scalar = 0,
+    Scalar = 0, // BTree
+
+    Bitmap = 1, // Bitmap
+
+    LabelList = 2, // LabelList
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100,
@@ -77,6 +82,8 @@ impl std::fmt::Display for IndexType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Scalar => write!(f, "Scalar"),
+            Self::Bitmap => write!(f, "Bitmap"),
+            Self::LabelList => write!(f, "LabelList"),
             Self::Vector => write!(f, "Vector"),
         }
     }

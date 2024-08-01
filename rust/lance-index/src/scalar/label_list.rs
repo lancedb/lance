@@ -61,7 +61,7 @@ impl Index for LabelListIndex {
     }
 
     fn index_type(&self) -> IndexType {
-        IndexType::Scalar
+        IndexType::LabelList
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
