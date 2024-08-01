@@ -761,6 +761,18 @@ pub async fn encode_batch(
     })
 }
 
+pub fn bits_per_value(encoding: &pb::ArrayEncoding) -> Option<u64> {
+    match encoding.array_encoding.as_ref().unwrap() {
+        pb::array_encoding::ArrayEncoding::Flat(flat) => Some(flat.bits_per_value),
+        pb::array_encoding::ArrayEncoding::Bitpacked(bitpacked) => Some(bitpacked.compressed_bits_per_value),
+        pb::array_encoding::ArrayEncoding::FrameOfReference(frame_of_reference) => {
+            bits_per_value(frame_of_reference.inner.as_ref().unwrap())
+        }
+        // TODO handle for other encodings?
+        _ => None
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use arrow_array::{ArrayRef, StringArray};

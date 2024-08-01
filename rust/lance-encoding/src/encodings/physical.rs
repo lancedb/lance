@@ -5,6 +5,7 @@ use arrow_schema::DataType;
 use fsst::FsstPageScheduler;
 use packed_struct::PackedStructPageScheduler;
 
+use crate::encoder::bits_per_value;
 use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PageScheduler, format::pb};
 
@@ -225,9 +226,12 @@ pub fn decoder_from_array_encoding(
             ))
         }
         
-        pb::array_encoding::ArrayEncoding::FrameOfReference(_frame_of_reference) => {
+        pb::array_encoding::ArrayEncoding::FrameOfReference(frame_of_reference) => {
+            // TODO maybe don't want to unwrap here ....
+            let mut inner_scheduler = decoder_from_array_encoding(frame_of_reference.inner.as_ref().unwrap(), buffers, data_type);
             // TODO pass some arguments to this thing
-            Box::new(FrameOfReferencePageScheduler{})
+            // TODO should not be u64 on next line
+            Box::new(FrameOfReferencePageScheduler::new(frame_of_reference.frame_of_reference as u64, inner_scheduler))
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column
         // (that has no data).  We never actually decode that column and so this branch is never actually encountered.
