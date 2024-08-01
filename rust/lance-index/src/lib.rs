@@ -67,13 +67,15 @@ pub trait Index: Send + Sync + DeepSizeOf {
 #[derive(Debug, PartialEq, Eq, Copy, Hash, Clone, DeepSizeOf)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
-    Scalar = 0, // BTree
+    Scalar = 0, // Legacy scalar index, alias to BTree
 
-    Bitmap = 1, // Bitmap
+    BTree = 1, // BTree
 
-    LabelList = 2, // LabelList
+    Bitmap = 2, // Bitmap
 
-    Inverted = 3, // Inverted
+    LabelList = 3, // LabelList
+
+    Inverted = 4, // Inverted
 
     // 100+ and up for vector index.
     /// Flat vector index.
@@ -83,12 +85,25 @@ pub enum IndexType {
 impl std::fmt::Display for IndexType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::Scalar => write!(f, "Scalar"),
+            Self::Scalar | Self::BTree => write!(f, "BTree"),
             Self::Bitmap => write!(f, "Bitmap"),
             Self::LabelList => write!(f, "LabelList"),
             Self::Inverted => write!(f, "Inverted"),
             Self::Vector => write!(f, "Vector"),
         }
+    }
+}
+
+impl IndexType {
+    pub fn is_scalar(&self) -> bool {
+        matches!(
+            self,
+            Self::Scalar | Self::BTree | Self::Bitmap | Self::LabelList | Self::Inverted
+        )
+    }
+
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Self::Vector)
     }
 }
 

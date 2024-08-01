@@ -103,7 +103,7 @@ pub(crate) async fn remap_index(
         .await?;
 
     match generic.index_type() {
-        IndexType::Scalar | IndexType::Bitmap | IndexType::LabelList | IndexType::Inverted => {
+        it if it.is_scalar() => {
             let new_store = LanceIndexStore::from_dataset(dataset, &new_id.to_string());
 
             let scalar_index = dataset
@@ -111,7 +111,7 @@ pub(crate) async fn remap_index(
                 .await?;
             scalar_index.remap(row_id_map, &new_store).await?;
         }
-        IndexType::Vector => {
+        it if it.is_vector() => {
             remap_vector_index(
                 Arc::new(dataset.clone()),
                 &field.name,
@@ -121,6 +121,12 @@ pub(crate) async fn remap_index(
                 row_id_map,
             )
             .await?;
+        }
+        _ => {
+            return Err(Error::Index {
+                message: format!("Index type {} is not supported", generic.index_type()),
+                location: location!(),
+            });
         }
     }
 
