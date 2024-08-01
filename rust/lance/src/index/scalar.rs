@@ -10,17 +10,14 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
-use lance_index::scalar::inverted::{train_inverted_index, InvertedIndex, INVERT_LIST_FILE};
-use lance_index::{
-    scalar::{
-        bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
-        btree::{train_btree_index, BTreeIndex, TrainingSource},
-        flat::FlatIndexMetadata,
-        label_list::{train_label_list_index, LabelListIndex},
-        lance_format::LanceIndexStore,
-        ScalarIndex,
-    },
-    IndexType,
+use lance_index::scalar::{
+    bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
+    btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+    flat::FlatIndexMetadata,
+    inverted::{InvertedIndex, INVERT_LIST_FILE},
+    label_list::{train_label_list_index, LabelListIndex},
+    lance_format::LanceIndexStore,
+    ScalarIndex, ScalarIndexParams, ScalarIndexType,
 };
 use snafu::{location, Location};
 use tracing::instrument;
@@ -31,8 +28,6 @@ use crate::{
     dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
     Dataset,
 };
-
-use super::IndexParams;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
@@ -69,7 +64,7 @@ impl IndexParams for ScalarIndexParams {
     }
 }
 
-pub struct TrainingRequest {
+struct TrainingRequest {
     dataset: Arc<Dataset>,
     column: String,
 }

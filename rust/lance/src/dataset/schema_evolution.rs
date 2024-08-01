@@ -1016,11 +1016,11 @@ mod test {
         use arrow_array::{Float16Array, Float32Array, Int64Array, ListArray};
         use half::f16;
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::{DatasetIndexExt, IndexType};
+        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
         use lance_linalg::distance::MetricType;
         use lance_testing::datagen::generate_random_array;
 
-        use crate::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
+        use crate::index::vector::VectorIndexParams;
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, false),
             ArrowField::new("f", DataType::Float32, false),

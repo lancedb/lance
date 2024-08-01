@@ -1662,12 +1662,11 @@ pub mod test_dataset {
 
     use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::ArrowError;
-    use lance_index::IndexType;
+    use lance_index::{scalar::ScalarIndexParams, IndexType};
     use tempfile::{tempdir, TempDir};
 
     use crate::arrow::*;
     use crate::dataset::WriteParams;
-    use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
 
     // Creates a dataset with 5 batches where each batch has 80 rows
@@ -1818,7 +1817,7 @@ mod test {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::IndexType;
+    use lance_index::{scalar::ScalarIndexParams, IndexType};
     use lance_io::object_store::ObjectStoreParams;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
@@ -1830,7 +1829,6 @@ mod test {
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
-    use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::IoTrackingStore;
 

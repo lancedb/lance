@@ -25,7 +25,10 @@ use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
-use lance_index::{pb, vector::VectorIndex, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use lance_index::{
+    pb, scalar::ScalarIndexParams, vector::VectorIndex, DatasetIndexExt, Index, IndexType,
+    INDEX_FILE_NAME,
+};
 use lance_io::scheduler::ScanScheduler;
 use lance_io::traits::Reader;
 use lance_io::utils::{
@@ -35,7 +38,6 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
-use scalar::ScalarIndexParams;
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -212,9 +214,14 @@ impl DatasetIndexExt for Dataset {
         let index_id = Uuid::new_v4();
         match (index_type, params.index_name()) {
             (
-                IndexType::Scalar | IndexType::Bitmap | IndexType::LabelList | IndexType::Inverted,
+                IndexType::Bitmap | IndexType::BTree | IndexType::Inverted | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
+                let params = ScalarIndexParams::new(index_type.try_into()?);
+                build_scalar_index(self, column, &index_id.to_string(), &params).await?;
+            }
+            (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
+                // Guess the index type
                 let params = params
                     .as_any()
                     .downcast_ref::<ScalarIndexParams>()
