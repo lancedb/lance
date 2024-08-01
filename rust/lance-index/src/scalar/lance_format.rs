@@ -16,13 +16,12 @@ use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2;
 use lance_file::{
     reader::FileReader,
-    writer::{FileWriter, FileWriterOptions, ManifestProvider},
+    writer::{FileWriter, ManifestProvider},
 };
 use lance_io::scheduler::ScanScheduler;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
-use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
+use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
-use snafu::{location, Location};
 
 use super::{IndexReader, IndexStore, IndexWriter};
 
@@ -161,23 +160,6 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<Box<dyn IndexWriter>> {
         let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
-        let writer = FileWriter::<ManifestDescribing>::try_new(
-            &self.object_store,
-            &path,
-            schema,
-            &FileWriterOptions::default(),
-        )
-        .await?;
-        Ok(Box::new(writer))
-    }
-
-    async fn new_index_file_v2(
-        &self,
-        name: &str,
-        schema: Arc<Schema>,
-    ) -> Result<Box<dyn IndexWriter>> {
-        let path = self.index_dir.child(name);
-        let schema = schema.as_ref().try_into()?;
         let writer = self.object_store.create(&path).await?;
         let writer = v2::writer::FileWriter::try_new(
             writer,
@@ -189,25 +171,31 @@ impl IndexStore for LanceIndexStore {
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        let file_reader = FileReader::try_new_self_described(
-            &self.object_store,
-            &path,
-            self.metadata_cache.as_ref(),
-        )
-        .await?;
-        Ok(Arc::new(file_reader))
-    }
-
-    async fn open_index_file_v2(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        let path = self.index_dir.child(name);
         let file_scheduler = self.scheduler.open_file(&path).await?;
-        let file_reader = v2::reader::FileReader::try_open(
+        match v2::reader::FileReader::try_open(
             file_scheduler,
             None,
             DecoderMiddlewareChain::default(),
         )
-        .await?;
-        Ok(Arc::new(file_reader))
+        .await
+        {
+            Ok(reader) => Ok(Arc::new(reader)),
+            Err(e) => {
+                // If the error is a version conflict we can try to read the file with v1 reader
+                if let Error::VersionConflict { .. } = e {
+                    let path = self.index_dir.child(name);
+                    let file_reader = FileReader::try_new_self_described(
+                        &self.object_store,
+                        &path,
+                        self.metadata_cache.as_ref(),
+                    )
+                    .await?;
+                    Ok(Arc::new(file_reader))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
@@ -222,43 +210,8 @@ impl IndexStore for LanceIndexStore {
             self.object_store.copy(&path, &dest_path).await
         } else {
             let reader = self.open_index_file(name).await?;
-            let num_batches = reader.num_batches().await;
-            if num_batches == 0 {
-                return Err(Error::Internal {
-                    message:
-                        "Cannot copy an empty index file because the schema cannot be determined"
-                            .into(),
-                    location: location!(),
-                });
-            }
-            let first_batch = reader.read_record_batch(0).await?;
-            let schema = first_batch.schema();
-            let mut writer = dest_store.new_index_file(name, schema).await?;
-            writer.write_record_batch(first_batch).await?;
-            for batch_index in 1..num_batches {
-                writer
-                    .write_record_batch(reader.read_record_batch(batch_index).await?)
-                    .await?;
-            }
-            writer.finish().await?;
-            Ok(())
-        }
-    }
-
-    async fn copy_index_file_v2(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
-        let path = self.index_dir.child(name);
-
-        let other_store = dest_store.as_any().downcast_ref::<Self>();
-        if let Some(dest_lance_store) = other_store {
-            // If both this store and the destination are lance stores we can use object_store's copy
-            // This does blindly assume that both stores are using the same underlying object_store
-            // but there is no easy way to verify this and it happens to always be true at the moment
-            let dest_path = dest_lance_store.index_dir.child(name);
-            self.object_store.copy(&path, &dest_path).await
-        } else {
-            let reader = self.open_index_file_v2(name).await?;
             let mut writer = dest_store
-                .new_index_file_v2(name, Arc::new(reader.schema().into()))
+                .new_index_file(name, Arc::new(reader.schema().into()))
                 .await?;
 
             for offset in (0..reader.num_rows()).step_by(4096) {

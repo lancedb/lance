@@ -94,6 +94,13 @@ pub enum Error {
     Cleanup { message: String },
     #[snafu(display("Version not found error: {message}"))]
     VersionNotFound { message: String },
+    #[snafu(display("Version conflict error: {message}"))]
+    VersionConflict {
+        message: String,
+        major_version: u16,
+        minor_version: u16,
+        location: Location,
+    },
 }
 
 impl Error {
@@ -117,10 +124,26 @@ impl Error {
             location,
         }
     }
+
     pub fn io(message: impl Into<String>, location: Location) -> Self {
         let message: String = message.into();
         Self::IO {
             source: message.into(),
+            location,
+        }
+    }
+
+    pub fn versino_conflict(
+        message: impl Into<String>,
+        major_version: u16,
+        minor_version: u16,
+        location: Location,
+    ) -> Self {
+        let message: String = message.into();
+        Self::VersionConflict {
+            message,
+            major_version,
+            minor_version,
             location,
         }
     }

@@ -190,11 +190,13 @@ impl FileReader {
         let minor_version = cursor.read_u16::<LittleEndian>()?;
 
         if major_version != MAJOR_VERSION as u16 || minor_version != MINOR_VERSION_NEXT {
-            return Err(Error::io(
+            return Err(Error::versino_conflict(
                 format!(
                     "Attempt to use the lance v0.2 reader to read a file with version {}.{}",
                     major_version, minor_version
                 ),
+                major_version,
+                minor_version,
                 location!(),
             ));
         }

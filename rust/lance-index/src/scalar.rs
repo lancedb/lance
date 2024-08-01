@@ -68,21 +68,14 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
         -> Result<Box<dyn IndexWriter>>;
-    async fn new_index_file_v2(
-        &self,
-        name: &str,
-        schema: Arc<Schema>,
-    ) -> Result<Box<dyn IndexWriter>>;
 
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
-    async fn open_index_file_v2(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
 
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
-    async fn copy_index_file_v2(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
 }
 
 /// Different scalar indices may support different kinds of queries
