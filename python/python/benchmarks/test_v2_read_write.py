@@ -374,47 +374,30 @@ def benchmark_sift_vector_encodings(
 
 
 if __name__ == "__main__":
-    # if os.path.exists("benchmark_tpch_encodings_plain_non_numeric.csv"):
-    #     os.remove("benchmark_tpch_encodings_plain_non_numeric.csv")
+    # Should contain all table files
+    tpch_dir_path = "/tmp/TPCH_SF1/"
+    dataset_name = "tpch_sf1"
 
-    # benchmark_tpch_lineitem("/home/ubuntu/test/TPCH_SF1/")
-    # benchmark_tpch_encodings(
-    #     "/home/ubuntu/test/TPCH_SF1/",
-    #     dataset_name="tpch_sf1",
-    #     encoding_type="plain_numeric",
-    # )
-    # benchmark_tpch_encodings(
-    #     "/home/ubuntu/test/TPCH_SF1/",
-    #     dataset_name="tpch_sf1",
-    #     encoding_type="plain_non_numeric",
-    # )
-    # benchmark_tpch_encodings(
-    #     "/home/ubuntu/test/TPCH_SF1/",
-    #     dataset_name="tpch_sf1",
-    #     encoding_type="plain_timestamp",
-    # )
-
+    benchmark_tpch_lineitem(tpch_dir_path)
     benchmark_tpch_encodings(
-        "/home/ubuntu/test/TPCH_SF10/",
-        dataset_name="tpch_sf10",
+        tpch_dir_path,
+        dataset_name=dataset_name,
         encoding_type="plain_numeric",
-        num_trials=5,
     )
     benchmark_tpch_encodings(
-        "/home/ubuntu/test/TPCH_SF10/",
-        dataset_name="tpch_sf10",
+        tpch_dir_path,
+        dataset_name=dataset_name,
         encoding_type="plain_non_numeric",
-        num_trials=5,
     )
     benchmark_tpch_encodings(
-        "/home/ubuntu/test/TPCH_SF10/",
-        dataset_name="tpch_sf10",
+        tpch_dir_path,
+        dataset_name=dataset_name,
         encoding_type="plain_timestamp",
+    )
+
+    benchmark_sift_vector_encodings(
+        "/home/ubuntu/test/",
+        dataset_name="sift1m",
+        encoding_type="plain_fixed_size_list",
         num_trials=5,
     )
-    # benchmark_sift_vector_encodings(
-    #     "/home/ubuntu/test/",
-    #     dataset_name="sift1m",
-    #     encoding_type="plain_fixed_size_list",
-    #     num_trials=5,
-    # )
