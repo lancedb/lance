@@ -514,7 +514,6 @@ impl Dataset {
         };
 
         let mut storage_version = params.storage_version_or_default();
-        println!("Initial storage version: {}", storage_version);
 
         // append + input schema different from existing schema = error
         if matches!(params.mode, WriteMode::Append) {
@@ -530,7 +529,6 @@ impl Dataset {
                 // If appending, always use existing storage version
                 storage_version =
                     LanceFileVersion::try_from(m.data_storage_format.version.as_str())?;
-                println!("Reverted to append version: {}", storage_version);
             }
         }
 
@@ -572,7 +570,6 @@ impl Dataset {
             None,
         );
 
-        println!("Writing manifest with storage version: {}", storage_version);
         let manifest_config = ManifestWriteConfig {
             use_move_stable_row_ids: params.enable_move_stable_row_ids,
             storage_format: Some(DataStorageFormat::new(storage_version)),

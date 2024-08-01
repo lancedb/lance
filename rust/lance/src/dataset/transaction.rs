@@ -357,10 +357,6 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<Index>)> {
-        println!(
-            "Building manifest with storage version: {:?}",
-            config.storage_format
-        );
         if config.use_move_stable_row_ids
             && current_manifest
                 .map(|m| !m.uses_move_stable_row_ids())

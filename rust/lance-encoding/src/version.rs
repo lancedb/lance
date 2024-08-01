@@ -13,10 +13,13 @@ pub const V2_FORMAT_2_1: &str = "2.1";
 pub enum LanceFileVersion {
     // Note that Stable must come AFTER the stable version and Next must come AFTER the next version
     // this way comparisons like x >= V2_0 will work the same if x is Stable or V2_0
+    /// The legacy (0.1) format
     Legacy,
     V2_0,
+    /// The latest stable release
     Stable,
     V2_1,
+    /// The latest unstable release
     Next,
 }
 
@@ -74,6 +77,8 @@ impl TryFrom<&str> for LanceFileVersion {
             V2_FORMAT_2_1 => Ok(Self::V2_1),
             "stable" => Ok(Self::Stable),
             "legacy" => Ok(Self::Legacy),
+            // Version 0.3 is an alias of 2.0
+            "0.3" => Ok(Self::V2_0),
             _ => Err(Error::InvalidInput {
                 source: format!("Unknown Lance storage version: {}", value).into(),
                 location: location!(),

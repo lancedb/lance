@@ -1,5 +1,5 @@
-Lance Format
-============
+Lance Formats
+=============
 
 The Lance project includes both a table format and a file format.  Lance typically refers
 to tables as "datasets".  A Lance dataset is designed to efficiently handle secondary indices,
@@ -75,6 +75,56 @@ A ``Footer`` describes the overall layout of the file.  The entire file layout i
    :linenos:
    :start-at: // ## File Layout
    :end-at: // File Layout-End
+
+File Version
+------------
+
+The Lance file format has gone through a number of changes including a breaking change
+from version 1 to version 2.  There are a number of APIs that allow the file version to
+be specified.  Using a newer version of the file format will lead to better compression
+and/or performance.  However, older software versions may not be able to read newer files.
+
+In addition, the latest version of the file format (next) is unstable and should not be
+used for production use cases.  Breaking changes could be made to unstable encodings and
+that would mean that files written with these encodings are no longer readable by any 
+newer versions of Lance.  The ``next`` version should only be used for experimentation
+and benchmarking upcoming features.
+
+The following values are supported:
+
+.. list-table: File Versions
+    :widths: 20 20 20 40
+    :header-rows: 1
+  
+    * - Version
+      - Minimal Lance Version
+      - Maximum Lance Version
+      - Description
+    * - 0.1
+      - Any
+      - Any
+      - This is the initial Lance format.
+    * - 2.0
+      - 0.15.0
+      - Any
+      - Rework of the Lance file format that removed row groups and introduced null
+        support for lists, fixed size lists, and primtives
+    * - 2.1 (unstable)
+      - None
+      - Any
+      - Adds FSST string compression and bit packing
+    * - legacy
+      - N/A
+      - N/A
+      - Alias for 0.1
+    * - stable
+      - N/A
+      - N/A
+      - Alias for the latest stable version (currently 2.0)
+    * - next
+      - N/A
+      - N/A
+      - Alias for the latest unstable version (currently 2.1)
 
 File Encodings
 --------------
