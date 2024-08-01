@@ -144,14 +144,15 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     reader = LanceFileReader(uri)
 
 
+
 def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder = IndicesBuilder(rand_dataset, "vectors")
-    uri = str(tmpdir / "transformed")
+    uri = str(tmpdir / "transformed_shuffle")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
 
     # test shuffle for transformed vectors
     filenames = builder.shuffle_transformed_vectors(
-        ["transformed"], str(tmpdir), rand_ivf
+        ["transformed_shuffle"], str(tmpdir), rand_ivf
     )
 
     for fname in filenames:
