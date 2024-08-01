@@ -46,6 +46,7 @@ where
     T::Native: PrimInt + AsPrimitive<u64>,
 {
     let max = arrow::compute::bit_or(arr);
+
     let num_bits =
         max.map(|max| arr.data_type().byte_width() as u64 * 8 - max.leading_zeros() as u64);
 
