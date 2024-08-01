@@ -16,6 +16,7 @@ from unittest import mock
 
 import lance
 import lance.fragment
+import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import polars as pl
@@ -1974,3 +1975,14 @@ def test_v2_dataset(tmp_path: Path):
 
     fragment = list(dataset.get_fragments())[0]
     assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+
+
+def test_late_materialization_batch_size(tmp_path: Path):
+    table = pa.table({"filter": np.arange(32 * 32), "values": np.arange(32 * 32)})
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=False, max_rows_per_file=10000
+    )
+    for batch in dataset.to_batches(
+        columns=["values"], filter="filter % 2 == 0", batch_size=32
+    ):
+        assert batch.num_rows == 32

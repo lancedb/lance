@@ -58,6 +58,7 @@ def create_table(num_rows, offset) -> pa.Table:
             "vector": vectors,
             "filterable": filterable,
             "category": categories,
+            "category_no_index": categories,
             "genres": genres,
         }
     )
@@ -77,9 +78,11 @@ def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
         rows_remaining -= next_batch_length
         table = create_table(next_batch_length, offset)
         if offset == 0:
-            dataset = lance.write_dataset(table, tmp_path)
+            dataset = lance.write_dataset(table, tmp_path, use_legacy_format=False)
         else:
-            dataset = lance.write_dataset(table, tmp_path, mode="append")
+            dataset = lance.write_dataset(
+                table, tmp_path, mode="append", use_legacy_format=False
+            )
         offset += next_batch_length
 
     dataset.create_index(
@@ -479,3 +482,26 @@ def test_label_list_index_prefilter(test_dataset, benchmark, filter: str):
             prefilter=True,
             filter=filter,
         )
+
+
+@pytest.mark.benchmark(group="late_materialization")
+@pytest.mark.parametrize(
+    "use_index",
+    (False, True),
+    ids=["no_index", "with_index"],
+)
+def test_late_materialization(test_dataset, benchmark, use_index):
+    column = "category" if use_index else "category_no_index"
+    print(
+        test_dataset.scanner(
+            columns=["vector"],
+            filter=f"{column} = 0",
+            batch_size=32,
+        ).explain_plan(True)
+    )
+    benchmark(
+        test_dataset.to_table,
+        columns=["vector"],
+        filter=f"{column} = 0",
+        batch_size=32,
+    )
