@@ -159,7 +159,7 @@ impl ExecutionPlan for FtsExec {
                             })?;
 
                     pre_filter.wait_for_ready().await?;
-                    let results = index.full_text_search(&query, pre_filter);
+                    let results = index.full_text_search(&query, pre_filter).await?;
 
                     let mut row_ids = Vec::new();
                     let mut scores = Vec::new();
