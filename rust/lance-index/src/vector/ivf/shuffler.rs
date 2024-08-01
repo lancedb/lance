@@ -190,18 +190,18 @@ pub async fn shuffle_dataset(
 }
 
 pub async fn shuffle_vectors(
-    transformed_uris: Vec<String>,
-    dest_uri: &str,
+    filenames: Vec<String>,
+    dir_path: &str,
     ivf_centroids: FixedSizeListArray,
 ) -> Result<Vec<String>> {
     let num_partitions = ivf_centroids.len() as u32;
     let shuffle_partition_batches = 1024 * 10;
     let shuffle_partition_concurrency = 2;
     let mut shuffler =
-        IvfShuffler::try_new(num_partitions, Some(dest_uri.into()), "v2".to_string())?;
+        IvfShuffler::try_new(num_partitions, Some(dir_path.into()), "v2".to_string())?;
 
     unsafe {
-        shuffler.set_unsorted_buffers(&transformed_uris);
+        shuffler.set_unsorted_buffers(&filenames);
     }
 
     let partition_files = shuffler

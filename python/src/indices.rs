@@ -226,11 +226,11 @@ pub fn transform_vectors(
 }
 
 async fn do_shuffle_transform_vectors(
-    transformed_uris: Vec<String>,
-    dest_uri: &str,
+    filenames: Vec<String>,
+    dir_path: &str,
     ivf_centroids: FixedSizeListArray,
 ) -> PyResult<Vec<String>> {
-    let partition_files = shuffle_vectors(transformed_uris, dest_uri, ivf_centroids)
+    let partition_files = shuffle_vectors(filenames, dir_path, ivf_centroids)
         .await
         .infer_error()?;
     Ok(partition_files)
@@ -240,8 +240,8 @@ async fn do_shuffle_transform_vectors(
 #[allow(clippy::too_many_arguments)]
 pub fn shuffle_transformed_vectors(
     py: Python<'_>,
-    transformed_uris: Vec<String>,
-    dest_uri: &str,
+    filenames: Vec<String>,
+    dir_path: &str,
     ivf_centroids: PyArrowType<ArrayData>,
 ) -> PyResult<PyObject> {
     let ivf_centroids = ivf_centroids.0;
@@ -249,7 +249,7 @@ pub fn shuffle_transformed_vectors(
 
     let result = RT.block_on(
         None,
-        do_shuffle_transform_vectors(transformed_uris, dest_uri, ivf_centroids),
+        do_shuffle_transform_vectors(filenames, dir_path, ivf_centroids),
     )?;
 
     match result {

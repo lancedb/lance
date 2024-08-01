@@ -430,8 +430,8 @@ class IndicesBuilder:
 
     def shuffle_transformed_vectors(
         self,
-        transformed_uris: list[str],
-        dest_uri: str,
+        filenames: list[str],
+        dir_path: str,
         ivf: IvfModel,
     ) -> list[str]:
         """
@@ -441,22 +441,22 @@ class IndicesBuilder:
 
         Parameters
         ----------
-        transformed_uri: list[str]
-            The uri of the unsorted storage file.
+        filenames: list[str]
+            The filenames of the unsorted storage files.
         dest_uri: str
-            The uri to save the sorted storage file to.
+            Path of the directory where all the files are located.
 
         Returns
         -------
         list[str]
             The list of paths of sorted transformed vector files.
         """
-        if type(transformed_uris) is list:
+        if isinstance(filenames, list):
             return indices.shuffle_transformed_vectors(
-                transformed_uris, dest_uri, ivf.centroids
+                filenames, dir_path, ivf.centroids
             )
         else:
-            raise ValueError("transformed_uris must be a list of strings")
+            raise ValueError("filenames must be a list of strings")
 
     def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
         if num_partitions is None:
