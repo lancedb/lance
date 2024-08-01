@@ -235,3 +235,14 @@ def test_bitmap_index(tmp_path: Path):
     indices = dataset.list_indices()
     assert len(indices) == 1
     assert indices[0]["type"] == "Bitmap"
+
+
+def test_label_list_index(tmp_path: Path):
+    tags = pa.array(["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7"])
+    tag_list = pa.ListArray.from_arrays([0, 2, 4], tags)
+    tbl = pa.Table.from_arrays([tag_list], names=["tags"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("tags", index_type="LABEL_LIST")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "LabelList"
