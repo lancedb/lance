@@ -5,6 +5,7 @@ import os
 import random
 import string
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import lance
 import numpy as np
@@ -222,3 +223,15 @@ def test_full_text_search(dataset):
     results = results.column(0)
     for row in results:
         assert query in row.as_py()
+
+
+def test_bitmap_index(tmp_path: Path):
+    """Test create bitmap index"""
+    tbl = pa.Table.from_arrays(
+        [pa.array([["a", "b", "c"][i % 3] for i in range(100)])], names=["a"]
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("a", index_type="BITMAP")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "Bitmap"

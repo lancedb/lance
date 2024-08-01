@@ -814,7 +814,7 @@ impl Index for BTreeIndex {
     }
 
     fn index_type(&self) -> IndexType {
-        IndexType::Bitmap
+        IndexType::Scalar
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {

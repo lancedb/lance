@@ -36,6 +36,7 @@ use super::IndexParams;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
+#[derive(Debug)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
