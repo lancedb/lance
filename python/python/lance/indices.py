@@ -444,7 +444,8 @@ class IndicesBuilder:
         filenames: list[str]
             The filenames of the unsorted files.
         dir_path: str
-            Directory where all the files are located, and where output files will be placed.
+            Directory where all the files are located, and where output files
+            will be placed.
 
         Returns
         -------
