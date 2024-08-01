@@ -215,6 +215,12 @@ message PackedStruct {
   Buffer buffer = 2;
 }
 
+message FrameOfReference {
+  int64 frame_of_reference = 1;
+  bool negative = 2;
+  ArrayEncoding inner = 3;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -228,6 +234,7 @@ message ArrayEncoding {
         Fsst fsst = 8;
         PackedStruct packed_struct = 9;
         Bitpacked bitpacked = 10;
+	FrameOfReference frame_of_reference = 11;
     }
 }
 

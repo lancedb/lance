@@ -11,6 +11,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::Result;
 
+use crate::encodings::logical::frame_of_reference::FrameOfReferenceEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::physical::bitpack::{num_compressed_bits, BitpackingBufferEncoder};
 use crate::encodings::physical::buffers::{
@@ -307,6 +308,17 @@ impl CoreArrayEncodingStrategy {
 
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
             }
+
+            DataType::UInt64 => {
+                Ok(Box::new(FrameOfReferenceEncoder::new(Box::new(
+                    ValueEncoder::try_new(
+                        Arc::new(CoreBufferEncodingStrategy {
+                            compression_scheme: get_compression_scheme(),
+                        })
+                    )?
+                ))))
+            }
+
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
                     compression_scheme: get_compression_scheme(),

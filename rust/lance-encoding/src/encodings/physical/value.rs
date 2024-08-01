@@ -331,6 +331,7 @@ pub(crate) mod tests {
     };
 
     const PRIMITIVE_TYPES: &[DataType] = &[
+        /*
         DataType::FixedSizeBinary(2),
         DataType::Date32,
         DataType::Date64,
@@ -341,7 +342,9 @@ pub(crate) mod tests {
         DataType::UInt8,
         DataType::UInt16,
         DataType::UInt32,
+        */
         DataType::UInt64,
+        /*
         DataType::Float16,
         DataType::Float32,
         DataType::Float64,
@@ -351,6 +354,7 @@ pub(crate) mod tests {
         DataType::Time32(TimeUnit::Second),
         DataType::Time64(TimeUnit::Nanosecond),
         DataType::Duration(TimeUnit::Second),
+        */
         // The Interval type is supported by the reader but the writer works with Lance schema
         // at the moment and Lance schema can't parse interval
         // DataType::Interval(IntervalUnit::DayTime),

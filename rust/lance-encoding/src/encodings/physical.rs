@@ -15,6 +15,8 @@ use self::{
     value::ValuePageScheduler,
 };
 
+use super::logical::frame_of_reference::FrameOfReferencePageScheduler;
+
 pub mod basic;
 pub mod binary;
 pub mod bitmap;
@@ -221,6 +223,11 @@ pub fn decoder_from_array_encoding(
                 data_type.clone(),
                 buffer_offset,
             ))
+        }
+        
+        pb::array_encoding::ArrayEncoding::FrameOfReference(_frame_of_reference) => {
+            // TODO pass some arguments to this thing
+            Box::new(FrameOfReferencePageScheduler{})
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column
         // (that has no data).  We never actually decode that column and so this branch is never actually encountered.
