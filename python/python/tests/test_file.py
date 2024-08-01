@@ -88,12 +88,18 @@ def check_round_trip(tmp_path, table):
 
 
 def test_different_types(tmp_path):
+    dict_values = pa.array(["foo", "bar", "baz"], pa.string())
+    dict_indices = pa.array([2, 1, 0], pa.uint8())
+
     check_round_trip(
         tmp_path,
         pa.table(
             {
                 "large_string": pa.array(["foo", "bar", "baz"], pa.large_string()),
                 "large_binary": pa.array([b"foo", b"bar", b"baz"], pa.large_binary()),
+                "dict_string": pa.DictionaryArray.from_arrays(
+                    dict_indices, dict_values
+                ),
             }
         ),
     )
@@ -189,3 +195,53 @@ def test_list_field_name(tmp_path):
 
     assert round_tripped == table
     assert round_tripped.schema.field("list_str").type == weird_string_type
+
+
+def test_dictionary(tmp_path):
+    # Basic round trip
+    dictionary = pa.array(["foo", "bar", "baz"], pa.string())
+    indices = pa.array([0, 1, 2, 0, 1, 2], pa.int32())
+    dict_arr = pa.DictionaryArray.from_arrays(indices, dictionary)
+
+    def round_trip(arr):
+        table = pa.table({"dict": arr})
+
+        path = tmp_path / "foo.lance"
+        with LanceFileWriter(str(path)) as writer:
+            writer.write_batch(table)
+
+        reader = LanceFileReader(str(path))
+        table2 = reader.read_all().to_table()
+        return table2.column("dict").chunk(0)
+
+    round_tripped = round_trip(dict_arr)
+
+    assert round_tripped == dict_arr
+    assert round_tripped.type == dict_arr.type
+
+    # Dictionary that doesn't use all values
+    dictionary = pa.array(["foo", "bar", "baz"], pa.string())
+    indices = pa.array([0, 0, 1, 1], pa.int32())
+    dict_arr = pa.DictionaryArray.from_arrays(indices, dictionary)
+
+    round_tripped = round_trip(dict_arr)
+
+    assert round_tripped.dictionary == dictionary
+
+    # different indices types
+    dictionary = pa.array(["foo", "bar", "baz"], pa.string())
+    for data_type in [
+        pa.uint8(),
+        pa.uint16(),
+        pa.uint32(),
+        pa.uint64(),
+        pa.int8(),
+        pa.int16(),
+        pa.int32(),
+        pa.int64(),
+    ]:
+        indices = pa.array([0, 1, 2, 0, 1, 2], data_type)
+        dict_arr = pa.DictionaryArray.from_arrays(indices, dictionary)
+        round_tripped = round_trip(dict_arr)
+        assert round_tripped == dict_arr
+        assert round_tripped.type == dict_arr.type
