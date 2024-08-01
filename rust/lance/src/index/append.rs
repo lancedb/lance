@@ -79,7 +79,7 @@ pub async fn merge_indices<'a>(
     });
 
     let (new_uuid, indices_merged) = match indices[0].index_type() {
-        IndexType::Scalar | IndexType::Bitmap | IndexType::LabelList => {
+        IndexType::Scalar | IndexType::Bitmap | IndexType::LabelList | IndexType::Inverted => {
             let index = dataset
                 .open_scalar_index(&column.name, &old_indices[0].uuid.to_string())
                 .await?;

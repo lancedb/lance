@@ -73,6 +73,8 @@ pub enum IndexType {
 
     LabelList = 2, // LabelList
 
+    Inverted = 3, // Inverted
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100,
@@ -84,6 +86,7 @@ impl std::fmt::Display for IndexType {
             Self::Scalar => write!(f, "Scalar"),
             Self::Bitmap => write!(f, "Bitmap"),
             Self::LabelList => write!(f, "LabelList"),
+            Self::Inverted => write!(f, "Inverted"),
             Self::Vector => write!(f, "Vector"),
         }
     }

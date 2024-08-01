@@ -63,15 +63,6 @@ impl Session {
         extension: Arc<dyn IndexExtension>,
     ) -> Result<()> {
         match extension.index_type() {
-            IndexType::Scalar | IndexType::Bitmap | IndexType::LabelList => {
-                return Err(Error::invalid_input(
-                    format!(
-                        "scalar index extension is not support yet: {}",
-                        extension.index_type()
-                    ),
-                    location!(),
-                ));
-            }
             IndexType::Vector => {
                 if self
                     .index_extensions
@@ -92,6 +83,15 @@ impl Session {
                         location!(),
                     ));
                 }
+            }
+            _ => {
+                return Err(Error::invalid_input(
+                    format!(
+                        "scalar index extension is not support yet: {}",
+                        extension.index_type()
+                    ),
+                    location!(),
+                ));
             }
         }
 

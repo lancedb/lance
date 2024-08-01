@@ -55,7 +55,12 @@ impl IndexParams for ScalarIndexParams {
     }
 
     fn index_type(&self) -> IndexType {
-        IndexType::Scalar
+        match self.force_index_type {
+            Some(ScalarIndexType::BTree) | None => IndexType::Scalar,
+            Some(ScalarIndexType::Bitmap) => IndexType::Bitmap,
+            Some(ScalarIndexType::LabelList) => IndexType::LabelList,
+            Some(ScalarIndexType::Inverted) => IndexType::Inverted,
+        }
     }
 
     fn index_name(&self) -> &str {
@@ -94,7 +99,7 @@ impl TrainingSource for TrainingRequest {
 
 /// Build a Scalar Index
 #[instrument(level = "debug", skip_all)]
-pub async fn build_scalar_index(
+pub(super) async fn build_scalar_index(
     dataset: &Dataset,
     column: &str,
     uuid: &str,
