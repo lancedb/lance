@@ -2693,6 +2693,25 @@ def write_dataset(
             if schema is None:
                 schema = data_obj.features.arrow_schema
             data_obj = data_obj.data.to_batches()
+        elif isinstance(data_obj, datasets.DatasetDict):
+            raise ValueError(
+                "DatasetDict is not yet supported. For now please "
+                "iterate through the DatasetDict and pass in single "
+                "Dataset instances (e.g., from dataset_dict.data) to "
+                "`write_dataset`. "
+            )
+        elif isinstance(data_obj, datasets.IterableDataset):
+            if schema is None:
+                schema = data_obj.features.arrow_schema
+            # this is hacky because 1) `max_rows_per_group` is
+            # a write parameter, not a read parameter, and 2) we
+            # are getting rid of row groups anyways. However,
+            # this is a required parameter and it's a reasonable
+            # default. If manual batch size is needed, the user
+            # can manually iterate through the IterableDataset
+            # and pass in the batches (see test_huggingface.py for
+            # unit test example).
+            data_obj = data_obj.iter(batch_size=max_rows_per_group)
 
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
@@ -2739,6 +2758,9 @@ def _coerce_reader(
         return data_obj.to_reader()
     elif isinstance(data_obj, pa.RecordBatchReader):
         return data_obj
+    elif isinstance(data_obj, dict):
+        # dict of columns
+        return pa.Table.from_pydict(data_obj, schema=schema)
     elif (
         type(data_obj).__module__.startswith("polars")
         and data_obj.__class__.__name__ == "DataFrame"
@@ -2838,7 +2860,10 @@ def _casting_recordbatch_iter(
     uses float32 for vectors.
     """
     for batch in input_iter:
-        if not isinstance(batch, pa.RecordBatch):
+        if isinstance(batch, dict):
+            # if it's a dict, it's a dict of columns
+            batch = pa.RecordBatch.from_pydict(batch, schema)
+        elif not isinstance(batch, pa.RecordBatch):
             raise TypeError(f"Expected RecordBatch, got {type(batch)}")
         if batch.schema != schema:
             try:
