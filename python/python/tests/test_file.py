@@ -72,6 +72,7 @@ def test_version(tmp_path):
     assert metadata.major_version == 0
     assert metadata.minor_version == 3
 
+    path = tmp_path / "foo2.lance"
     with LanceFileWriter(str(path), schema, version="2.1") as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))
     reader = LanceFileReader(str(path))
