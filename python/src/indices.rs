@@ -225,7 +225,7 @@ pub fn transform_vectors(
     )?
 }
 
-async fn do_shuffle_transform_vectors(
+async fn do_shuffle_transformed_vectors(
     filenames: Vec<String>,
     dir_path: &str,
     ivf_centroids: FixedSizeListArray,
@@ -249,7 +249,7 @@ pub fn shuffle_transformed_vectors(
 
     let result = RT.block_on(
         None,
-        do_shuffle_transform_vectors(filenames, dir_path, ivf_centroids),
+        do_shuffle_transformed_vectors(filenames, dir_path, ivf_centroids),
     )?;
 
     match result {
