@@ -12,9 +12,9 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::scalar::{
     bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
-    btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+    btree::{train_btree_index, BTreeIndex, TrainingSource},
     flat::FlatIndexMetadata,
-    inverted::{InvertedIndex, INVERT_LIST_FILE},
+    inverted::{train_inverted_index, InvertedIndex, INVERT_LIST_FILE},
     label_list::{train_label_list_index, LabelListIndex},
     lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
@@ -30,39 +30,6 @@ use crate::{
 };
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
-
-#[derive(Debug)]
-pub enum ScalarIndexType {
-    BTree,
-    Bitmap,
-    LabelList,
-    Inverted,
-}
-
-#[derive(Default)]
-pub struct ScalarIndexParams {
-    /// If set then always use the given index type and skip auto-detection
-    pub force_index_type: Option<ScalarIndexType>,
-}
-
-impl IndexParams for ScalarIndexParams {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn index_type(&self) -> IndexType {
-        match self.force_index_type {
-            Some(ScalarIndexType::BTree) | None => IndexType::Scalar,
-            Some(ScalarIndexType::Bitmap) => IndexType::Bitmap,
-            Some(ScalarIndexType::LabelList) => IndexType::LabelList,
-            Some(ScalarIndexType::Inverted) => IndexType::Inverted,
-        }
-    }
-
-    fn index_name(&self) -> &str {
-        LANCE_SCALAR_INDEX
-    }
-}
 
 struct TrainingRequest {
     dataset: Arc<Dataset>,
