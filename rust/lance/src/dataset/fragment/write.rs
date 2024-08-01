@@ -81,6 +81,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            params.object_store_registry.clone(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )
@@ -151,6 +152,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            params.object_store_registry.clone(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )

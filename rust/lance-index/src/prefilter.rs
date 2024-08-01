@@ -37,6 +37,8 @@ pub trait PreFilter: Send + Sync {
     fn is_empty(&self) -> bool;
 
     /// Get the row id mask for this prefilter
+    ///
+    /// This method must be called after `wait_for_ready`
     fn mask(&self) -> Arc<RowIdMask>;
 
     /// Check whether a slice of row ids should be included in a query.

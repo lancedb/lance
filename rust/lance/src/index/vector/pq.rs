@@ -408,6 +408,19 @@ pub async fn build_pq_model(
     } else {
         training_data
     };
+
+    let num_codes = 2_usize.pow(params.num_bits as u32);
+    if training_data.len() < num_codes {
+        return Err(Error::Index {
+            message: format!(
+                "Not enough rows to train PQ. Requires {:?} rows but only {:?} available",
+                num_codes,
+                training_data.len()
+            ),
+            location: location!(),
+        });
+    }
+
     info!("Start train PQ: params={:#?}", params);
     let pq = params.build(&training_data, MetricType::L2).await?;
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());

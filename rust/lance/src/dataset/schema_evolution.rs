@@ -482,7 +482,7 @@ pub(super) async fn alter_columns(
 /// This is a metadata-only operation and does not remove the data from the
 /// underlying storage. In order to remove the data, you must subsequently
 /// call `compact_files` to rewrite the data without the removed columns and
-/// then call `cleanup_files` to remove the old files.
+/// then call `cleanup_old_versions` to remove the old files.
 pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<()> {
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {

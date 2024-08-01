@@ -5,7 +5,6 @@
 //!
 //!
 
-use core::panic;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -24,7 +23,7 @@ use object_store::path::Path;
 
 #[tokio::main]
 async fn main() {
-    const TOTAL: usize = 10_000_000;
+    const TOTAL: usize = 100_000;
     let tempdir = tempfile::tempdir().unwrap();
     let dataset_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let tokens = (0..10_000)
@@ -37,7 +36,7 @@ async fn main() {
         ));
         let docs = (0..TOTAL)
             .map(|_| {
-                let num_words = rand::random::<usize>() % 300 + 1;
+                let num_words = rand::random::<usize>() % 100 + 1;
                 let doc = (0..num_words)
                     .map(|_| tokens[rand::random::<usize>() % tokens.len()])
                     .collect::<Vec<_>>();
@@ -76,10 +75,11 @@ async fn main() {
 
     let dataset = Dataset::open(dataset_dir.as_ref()).await.unwrap();
     let query = tokens[0];
+    let query = FullTextSearchQuery::new(query.to_owned()).limit(Some(10));
     println!("query: {:?}", query);
     let batch = dataset
         .scan()
-        .full_text_search(FullTextSearchQuery::new(query.to_owned()))
+        .full_text_search(query.clone())
         .unwrap()
         .try_into_batch()
         .await
@@ -93,7 +93,7 @@ async fn main() {
     let start = std::time::Instant::now();
     dataset
         .scan()
-        .full_text_search(FullTextSearchQuery::new(query.to_owned()))
+        .full_text_search(query.clone())
         .unwrap()
         .try_into_batch()
         .await
@@ -108,7 +108,7 @@ async fn main() {
         .try_into_batch()
         .await
         .unwrap();
-    let flat_results = flat_full_text_search(&[&batch], "doc", query)
+    let flat_results = flat_full_text_search(&[&batch], "doc", &query.query)
         .unwrap()
         .into_iter()
         .collect::<HashSet<_>>();

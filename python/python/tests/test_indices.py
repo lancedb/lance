@@ -10,8 +10,12 @@ from lance.file import LanceFileReader
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
 NUM_ROWS_PER_FRAGMENT = 10000
+NUM_ROWS_PER_FRAGMENT = 10000
 DIMENSION = 128
 NUM_SUBVECTORS = 8
+NUM_FRAGMENTS = 3
+NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
+NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
 NUM_FRAGMENTS = 3
 NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
@@ -23,6 +27,9 @@ def rand_dataset(tmpdir, request):
     vectors.shape = -1
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
     table = pa.Table.from_arrays([vectors], names=["vectors"])
+    uri = str(tmpdir / "dataset")
+
+    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
     uri = str(tmpdir / "dataset")
 
     ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
@@ -123,7 +130,11 @@ def rand_pq(rand_dataset, rand_ivf):
 def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     fragments = list(rand_dataset.get_fragments())
 
+    fragments = list(rand_dataset.get_fragments())
+
     builder = IndicesBuilder(rand_dataset, "vectors")
+    uri = str(tmpdir / "transformed")
+    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=fragments)
     uri = str(tmpdir / "transformed")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=fragments)
 
