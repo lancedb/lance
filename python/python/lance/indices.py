@@ -457,7 +457,7 @@ class IndicesBuilder:
             )
         else:
             raise ValueError("filenames must be a list of strings")
-    
+
     def load_shuffled_vectors(self, filenames: list[str], dir_path: str):
         """
         Takes filenames of the sorted, transformed vector files as input. Loads
@@ -472,9 +472,7 @@ class IndicesBuilder:
         """
 
         if isinstance(filenames, list):
-            return indices.load_shuffled_vectors(
-                filenames, dir_path
-            )
+            return indices.load_shuffled_vectors(filenames, dir_path)
         else:
             raise ValueError("filenames must be a list of strings")
 

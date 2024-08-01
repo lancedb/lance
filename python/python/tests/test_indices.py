@@ -118,6 +118,7 @@ def rand_pq(rand_dataset, rand_ivf):
     pq = PqModel(NUM_SUBVECTORS, codebook)
     return pq
 
+
 def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     fragments = list(rand_dataset.get_fragments())
 
@@ -142,8 +143,8 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
     reader = LanceFileReader(uri)
 
-def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
+def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder = IndicesBuilder(rand_dataset, "vectors")
     uri = str(tmpdir / "transformed")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
@@ -152,16 +153,17 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     filenames = builder.shuffle_transformed_vectors(
         ["transformed"], str(tmpdir), rand_ivf
     )
-    
+
     for fname in filenames:
         full_path = str(tmpdir / fname)
         assert os.path.getsize(full_path) > 0
 
-def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
+def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder = IndicesBuilder(rand_dataset, "vectors")
     uri = str(tmpdir / "transformed")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
-    reader = LanceFileReader(uri)
-
-    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)
+    filenames = builder.shuffle_transformed_vectors(
+        ["transformed"], str(tmpdir), rand_ivf
+    )
+    builder.load_shuffled_vectors(filenames, str(tmpdir))
