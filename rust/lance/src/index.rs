@@ -205,7 +205,10 @@ impl DatasetIndexExt for Dataset {
 
         let index_id = Uuid::new_v4();
         match (index_type, params.index_name()) {
-            (IndexType::Scalar | IndexType::Bitmap | IndexType::LabelList, LANCE_SCALAR_INDEX) => {
+            (
+                IndexType::Scalar | IndexType::Bitmap | IndexType::LabelList | IndexType::Inverted,
+                LANCE_SCALAR_INDEX,
+            ) => {
                 let params = params
                     .as_any()
                     .downcast_ref::<ScalarIndexParams>()

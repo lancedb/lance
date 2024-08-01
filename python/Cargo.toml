@@ -58,6 +58,7 @@ url = "2.5.0"
 [features]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+build_info = []
 
 [build-dependencies]
 prost-build = "0.11"
