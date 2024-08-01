@@ -88,4 +88,7 @@ workers.
     for batch in ds:
         print(batch)
 
-
+.. warning::
+    For multiprocessing you should probably not use fork as lance is
+    multi-threaded internally and fork and multi-thread do not work well.
+    Refer to `this discussion <https://discuss.python.org/t/concerns-regarding-deprecation-of-fork-with-alive-threads/33555>`_.

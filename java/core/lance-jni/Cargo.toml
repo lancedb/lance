@@ -8,7 +8,6 @@ license.workspace = true
 description = "JNI bindings for Lance Columnar format"
 keywords.workspace = true
 categories.workspace = true
-publish = false
 
 [lib]
 crate-type = ["cdylib"]

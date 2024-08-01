@@ -19,6 +19,7 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{
     reader::{BufferDescriptor, CachedFileMetadata, FileReader},
     writer::{FileWriter, FileWriterOptions},
@@ -171,23 +172,23 @@ pub struct LanceFileWriter {
 impl LanceFileWriter {
     async fn open(
         uri_or_path: String,
-        schema: PyArrowType<ArrowSchema>,
+        schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
         let object_writer = object_store.create(&path).await.infer_error()?;
-        let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
-        let inner = FileWriter::try_new(
-            object_writer,
-            path.to_string(),
-            lance_schema,
-            FileWriterOptions {
-                data_cache_bytes,
-                keep_original_array,
-            },
-        )
-        .infer_error()?;
+        let options = FileWriterOptions {
+            data_cache_bytes,
+            keep_original_array,
+            ..Default::default()
+        };
+        let inner = if let Some(schema) = schema {
+            let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
+            FileWriter::try_new(object_writer, lance_schema, options).infer_error()
+        } else {
+            Ok(FileWriter::new_lazy(object_writer, options))
+        }?;
         Ok(Self {
             inner: Box::new(inner),
         })
@@ -199,7 +200,7 @@ impl LanceFileWriter {
     #[new]
     pub fn new(
         path: String,
-        schema: PyArrowType<ArrowSchema>,
+        schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
@@ -238,8 +239,10 @@ fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
 // not exist).  We are given a path to a file and so we need to strip the last component
 // before creating the object store.  We then return the object store and the new relative path
 // to the file.
-async fn object_store_from_uri_or_path(uri_or_path: String) -> PyResult<(ObjectStore, Path)> {
-    if let Ok(mut url) = Url::parse(&uri_or_path) {
+pub async fn object_store_from_uri_or_path(
+    uri_or_path: impl AsRef<str>,
+) -> PyResult<(ObjectStore, Path)> {
+    if let Ok(mut url) = Url::parse(uri_or_path.as_ref()) {
         let path = object_store::path::Path::parse(url.path())
             .map_err(|e| PyIOError::new_err(format!("Invalid URL path `{}`: {}", url.path(), e)))?;
         let (parent_path, filename) = path_to_parent(&path)?;
@@ -249,8 +252,9 @@ async fn object_store_from_uri_or_path(uri_or_path: String) -> PyResult<(ObjectS
         let child_path = dir_path.child(filename);
         Ok((object_store, child_path))
     } else {
-        let path = Path::parse(&uri_or_path)
-            .map_err(|e| PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path, e)))?;
+        let path = Path::parse(uri_or_path.as_ref()).map_err(|e| {
+            PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path.as_ref(), e))
+        })?;
         let object_store = ObjectStore::local();
         Ok((object_store, path))
     }
@@ -264,12 +268,11 @@ pub struct LanceFileReader {
 impl LanceFileReader {
     async fn open(uri_or_path: String) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
-        let io_parallelism = std::env::var("IO_THREADS")
-            .map(|val| val.parse::<u32>().unwrap_or(8))
-            .unwrap_or(8);
-        let scheduler = ScanScheduler::new(Arc::new(object_store), io_parallelism);
+        let scheduler = ScanScheduler::new(Arc::new(object_store));
         let file = scheduler.open_file(&path).await.infer_error()?;
-        let inner = FileReader::try_open(file, None).await.infer_error()?;
+        let inner = FileReader::try_open(file, None, DecoderMiddlewareChain::default())
+            .await
+            .infer_error()?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -305,7 +308,12 @@ impl LanceFileReader {
         let inner = self.inner.clone();
         let _guard = RT.runtime.enter();
         let stream = inner
-            .read_stream(params, batch_size, batch_readahead)
+            .read_stream(
+                params,
+                batch_size,
+                batch_readahead,
+                FilterExpression::no_filter(),
+            )
             .infer_error()?;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
     }

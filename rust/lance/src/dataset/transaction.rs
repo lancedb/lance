@@ -43,20 +43,22 @@ use lance_io::object_store::ObjectStore;
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
-        Fragment, Index, Manifest,
+        Fragment, Index, Manifest, RowIdMeta,
     },
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
     },
+    rowids::{write_row_ids, RowIdSequence},
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use super::{feature_flags::apply_feature_flags, ManifestWriteConfig};
+use super::ManifestWriteConfig;
 use crate::utils::temporal::timestamp_to_nanos;
+use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 
 /// A change to a dataset that can be retried
 ///
@@ -230,10 +232,10 @@ impl Transaction {
     /// Returns true if the transaction cannot be committed if the other
     /// transaction is committed first.
     pub fn conflicts_with(&self, other: &Self) -> bool {
-        // TODO: this assume IsolationLevel is Serializable, but we could also
-        // support Snapshot Isolation, which is more permissive. In particular,
-        // it would allow a Delete transaction to succeed after a concurrent
-        // Append, even if the Append added rows that would be deleted.
+        // This assumes IsolationLevel is Snapshot Isolation, which is more
+        // permissive than Serializable. In particular, it allows a Delete
+        // transaction to succeed after a concurrent Append, even if the Append
+        // added rows that would be deleted.
         match &self.operation {
             Operation::Append { .. } => match &other.operation {
                 // Append is compatible with anything that doesn't change the schema
@@ -293,6 +295,7 @@ impl Transaction {
                     self.operation.modifies_same_ids(&other.operation)
                 }
                 Operation::Project { .. } => false,
+                Operation::Append { .. } => false,
                 _ => true,
             },
             // Merge changes the schema, but preserves row ids, so the only operations
@@ -354,6 +357,17 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<Index>)> {
+        if config.use_move_stable_row_ids
+            && current_manifest
+                .map(|m| !m.uses_move_stable_row_ids())
+                .unwrap_or_default()
+        {
+            return Err(Error::NotSupported {
+                source: "Cannot enable stable row ids on existing dataset".into(),
+                location: location!(),
+            });
+        }
+
         // Get the schema and the final fragment list
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
@@ -382,6 +396,25 @@ impl Transaction {
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
 
+        let mut next_row_id = {
+            // Only use row ids if the feature flag is set already or
+            match (current_manifest, config.use_move_stable_row_ids) {
+                (Some(manifest), _)
+                    if manifest.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0 =>
+                {
+                    Some(manifest.next_row_id)
+                }
+                (None, true) => Some(0),
+                (_, false) => None,
+                (Some(_), true) => {
+                    return Err(Error::NotSupported {
+                        source: "Cannot enable stable row ids on existing dataset".into(),
+                        location: location!(),
+                    });
+                }
+            }
+        };
+
         let maybe_existing_fragments =
             current_manifest
                 .map(|m| m.fragments.as_ref())
@@ -396,10 +429,13 @@ impl Transaction {
         match &self.operation {
             Operation::Append { ref fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
-                final_fragments.extend(Self::fragments_with_ids(
-                    fragments.clone(),
-                    &mut fragment_id,
-                ));
+                let mut new_fragments =
+                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
+                        .collect::<Vec<_>>();
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+                final_fragments.extend(new_fragments);
             }
             Operation::Delete {
                 ref updated_fragments,
@@ -432,16 +468,22 @@ impl Transaction {
                         Some(f.clone())
                     }
                 }));
-                final_fragments.extend(Self::fragments_with_ids(
-                    new_fragments.clone(),
-                    &mut fragment_id,
-                ));
+                let mut new_fragments =
+                    Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
+                        .collect::<Vec<_>>();
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+                final_fragments.extend(new_fragments);
             }
             Operation::Overwrite { ref fragments, .. } => {
-                final_fragments.extend(Self::fragments_with_ids(
-                    fragments.clone(),
-                    &mut fragment_id,
-                ));
+                let mut new_fragments =
+                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
+                        .collect::<Vec<_>>();
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+                final_fragments.extend(new_fragments);
                 final_indices = Vec::new();
             }
             Operation::Rewrite {
@@ -521,7 +563,7 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest);
+            apply_feature_flags(&mut manifest, config.use_move_stable_row_ids)?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -532,6 +574,10 @@ impl Transaction {
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
+
+        if let Some(next_row_id) = next_row_id {
+            manifest.next_row_id = next_row_id;
+        }
 
         Ok((manifest, final_indices))
     }
@@ -663,16 +709,35 @@ impl Transaction {
         }
         Ok(())
     }
+
+    fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
+        for fragment in fragments {
+            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
+                message: "Fragment does not have physical rows".into(),
+                location: location!(),
+            })? as u64;
+            let row_ids = *next_row_id..(*next_row_id + physical_rows);
+            let sequence = RowIdSequence::from(row_ids);
+            // TODO: write to a separate file if large. Possibly share a file with other fragments.
+            let serialized = write_row_ids(&sequence);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+            *next_row_id += physical_rows;
+        }
+        Ok(())
+    }
 }
 
-impl TryFrom<&pb::Transaction> for Transaction {
+impl TryFrom<pb::Transaction> for Transaction {
     type Error = Error;
 
-    fn try_from(message: &pb::Transaction) -> Result<Self> {
-        let operation = match &message.operation {
+    fn try_from(message: pb::Transaction) -> Result<Self> {
+        let operation = match message.operation {
             Some(pb::transaction::Operation::Append(pb::transaction::Append { fragments })) => {
                 Operation::Append {
-                    fragments: fragments.iter().map(Fragment::from).collect(),
+                    fragments: fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
                 }
             }
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
@@ -680,7 +745,10 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 deleted_fragment_ids,
                 predicate,
             })) => Operation::Delete {
-                updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
+                updated_fragments: updated_fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
                 deleted_fragment_ids: deleted_fragment_ids.clone(),
                 predicate: predicate.clone(),
             },
@@ -689,14 +757,15 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Overwrite {
-                fragments: fragments.iter().map(Fragment::from).collect(),
+                fragments: fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
                 schema: Schema::from(&Fields(schema.clone())),
             },
             Some(pb::transaction::Operation::ReserveFragments(
                 pb::transaction::ReserveFragments { num_fragments },
-            )) => Operation::ReserveFragments {
-                num_fragments: *num_fragments,
-            },
+            )) => Operation::ReserveFragments { num_fragments },
             Some(pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 old_fragments,
                 new_fragments,
@@ -705,13 +774,19 @@ impl TryFrom<&pb::Transaction> for Transaction {
             })) => {
                 let groups = if !groups.is_empty() {
                     groups
-                        .iter()
+                        .into_iter()
                         .map(RewriteGroup::try_from)
                         .collect::<Result<_>>()?
                 } else {
                     vec![RewriteGroup {
-                        old_fragments: old_fragments.iter().map(Fragment::from).collect(),
-                        new_fragments: new_fragments.iter().map(Fragment::from).collect(),
+                        old_fragments: old_fragments
+                            .into_iter()
+                            .map(Fragment::try_from)
+                            .collect::<Result<Vec<_>>>()?,
+                        new_fragments: new_fragments
+                            .into_iter()
+                            .map(Fragment::try_from)
+                            .collect::<Result<Vec<_>>>()?,
                     }]
                 };
                 let rewritten_indices = rewritten_indices
@@ -729,11 +804,11 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 removed_indices,
             })) => Operation::CreateIndex {
                 new_indices: new_indices
-                    .iter()
+                    .into_iter()
                     .map(Index::try_from)
                     .collect::<Result<_>>()?,
                 removed_indices: removed_indices
-                    .iter()
+                    .into_iter()
                     .map(Index::try_from)
                     .collect::<Result<_>>()?,
             },
@@ -742,11 +817,14 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Merge {
-                fragments: fragments.iter().map(Fragment::from).collect(),
+                fragments: fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
                 schema: Schema::from(&Fields(schema.clone())),
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
-                Operation::Restore { version: *version }
+                Operation::Restore { version }
             }
             Some(pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids,
@@ -754,8 +832,14 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 new_fragments,
             })) => Operation::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
-                updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
-                new_fragments: new_fragments.iter().map(Fragment::from).collect(),
+                updated_fragments: updated_fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
+                new_fragments: new_fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -791,29 +875,41 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 .old_id
                 .as_ref()
                 .map(Uuid::try_from)
-                .ok_or_else(|| Error::IO {
-                    message: "required field (old_id) missing from message".to_string(),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::io(
+                        "required field (old_id) missing from message".to_string(),
+                        location!(),
+                    )
                 })??,
             new_id: message
                 .new_id
                 .as_ref()
                 .map(Uuid::try_from)
-                .ok_or_else(|| Error::IO {
-                    message: "required field (new_id) missing from message".to_string(),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::io(
+                        "required field (new_id) missing from message".to_string(),
+                        location!(),
+                    )
                 })??,
         })
     }
 }
 
-impl TryFrom<&pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
+impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     type Error = Error;
 
-    fn try_from(message: &pb::transaction::rewrite::RewriteGroup) -> Result<Self> {
+    fn try_from(message: pb::transaction::rewrite::RewriteGroup) -> Result<Self> {
         Ok(Self {
-            old_fragments: message.old_fragments.iter().map(Fragment::from).collect(),
-            new_fragments: message.new_fragments.iter().map(Fragment::from).collect(),
+            old_fragments: message
+                .old_fragments
+                .into_iter()
+                .map(Fragment::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            new_fragments: message
+                .new_fragments
+                .into_iter()
+                .map(Fragment::try_from)
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 }
@@ -1079,7 +1175,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, false, true, true, false, false, true],
+                [false, false, false, true, true, false, false, true],
             ),
             (
                 Operation::Delete {
@@ -1088,7 +1184,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, true, true, true, true, false, true],
+                [false, false, true, true, true, true, false, true],
             ),
             (
                 Operation::Overwrite {
@@ -1144,12 +1240,12 @@ mod tests {
             ),
             (
                 Operation::Update {
-                    // Delete that affects same fragments as other transactions
+                    // Update that affects same fragments as other transactions
                     updated_fragments: vec![fragment0.clone()],
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2.clone()],
                 },
-                [true, false, true, true, true, true, false, true],
+                [false, false, true, true, true, true, false, true],
             ),
         ];
 

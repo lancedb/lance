@@ -22,10 +22,8 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
-use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
-use object_store::path::Path;
 use pyo3::prelude::*;
 use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
 
@@ -99,7 +97,7 @@ impl FileFragment {
     fn create(
         dataset_uri: &str,
         fragment_id: Option<usize>,
-        reader: &PyAny,
+        reader: &Bound<PyAny>,
         kwargs: Option<&PyDict>,
     ) -> PyResult<FragmentMetadata> {
         let params = if let Some(kw_params) = kwargs {
@@ -430,36 +428,11 @@ impl FragmentMetadata {
     }
 }
 
-#[pyfunction(name = "_cleanup_partial_writes")]
-pub fn cleanup_partial_writes(base_uri: &str, files: Vec<(String, String)>) -> PyResult<()> {
-    let (store, _) = RT
-        .runtime
-        .block_on(ObjectStore::from_uri(base_uri))
-        .map_err(|err| PyIOError::new_err(format!("Failed to create object store: {}", err)))?;
-
-    let files: Vec<(Path, String)> = files
-        .into_iter()
-        .map(|(path, multipart_id)| (Path::from(path.as_str()), multipart_id))
-        .collect();
-
-    #[allow(clippy::map_identity)]
-    async fn inner(store: ObjectStore, files: Vec<(Path, String)>) -> Result<(), ::lance::Error> {
-        let files_iter = files
-            .iter()
-            .map(|(path, multipart_id)| (path, multipart_id));
-        lance::dataset::cleanup::cleanup_partial_writes(&store, files_iter).await
-    }
-
-    RT.runtime
-        .block_on(inner(store, files))
-        .map_err(|err| PyIOError::new_err(format!("Failed to cleanup files: {}", err)))
-}
-
 #[pyfunction(name = "_write_fragments")]
 #[pyo3(signature = (dataset_uri, reader, **kwargs))]
 pub fn write_fragments(
     dataset_uri: &str,
-    reader: &PyAny,
+    reader: &Bound<PyAny>,
     kwargs: Option<&PyDict>,
 ) -> PyResult<Vec<FragmentMetadata>> {
     let batches = convert_reader(reader)?;
@@ -481,7 +454,7 @@ pub fn write_fragments(
         .collect()
 }
 
-fn convert_reader(reader: &PyAny) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
+fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let reader = RT.block_on(
@@ -492,6 +465,8 @@ fn convert_reader(reader: &PyAny) -> PyResult<Box<dyn RecordBatchReader + Send +
         )??;
         Ok(Box::new(reader))
     } else {
-        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?))
+        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow_bound(
+            reader,
+        )?))
     }
 }

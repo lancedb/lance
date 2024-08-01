@@ -52,10 +52,7 @@ impl HashJoiner {
         .await
         .unwrap()?;
         if batches.is_empty() {
-            return Err(Error::IO {
-                message: "HashJoiner: No data".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io("HashJoiner: No data".to_string(), location!()));
         };
 
         let map = DashMap::new();
@@ -97,10 +94,7 @@ impl HashJoiner {
                     match task_result {
                         Ok(Ok(_)) => Ok(()),
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::IO {
-                            message: format!("HashJoiner: {}", err),
-                            location: location!(),
-                        }),
+                        Err(err) => Err(Error::io(format!("HashJoiner: {}", err), location!())),
                     }
                 }
             })
@@ -180,10 +174,10 @@ impl HashJoiner {
                     let task_result = task::spawn_blocking(move || {
                         let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
                         interleave(array_refs.as_ref(), indices.as_ref())
-                            .map_err(|err| Error::IO {
-                                message: format!("HashJoiner: {}", err),
-                                location: location!(),
-                            })
+                            .map_err(|err| Error::io(
+                                format!("HashJoiner: {}", err),
+                                location!(),
+                            ))
                     })
                     .await;
                     match task_result {
@@ -198,10 +192,10 @@ impl HashJoiner {
                             Ok(array)
                         },
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::IO {
-                            message: format!("HashJoiner: {}", err),
-                            location: location!(),
-                        }),
+                        Err(err) => Err(Error::io(
+                            format!("HashJoiner: {}", err),
+                            location!(),
+                        )),
                     }
                 }
             })

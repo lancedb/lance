@@ -7,10 +7,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::{iter::repeat_with, ops::Range};
 
-use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::types::ArrowPrimitiveType;
+use arrow_array::{
+    Float32Array, Int32Array, PrimitiveArray, RecordBatch, RecordBatchIterator, RecordBatchReader,
+};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::{fixed_size_list_type, ArrowFloatType, FixedSizeListArrayExt};
 use num_traits::{real::Real, FromPrimitive};
+use rand::distributions::uniform::SampleUniform;
 use rand::{
     distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::SliceRandom, Rng, SeedableRng,
 };
@@ -52,8 +56,8 @@ impl IncrementingInt32 {
         self
     }
 
-    pub fn named(mut self, name: String) -> Self {
-        self.name = Some(name);
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
         self
     }
 }
@@ -146,7 +150,7 @@ impl BatchGenerator {
         self
     }
 
-    pub fn batch(&mut self, num_rows: i32) -> impl RecordBatchReader {
+    fn gen_batch(&mut self, num_rows: u32) -> RecordBatch {
         let mut fields = Vec::with_capacity(self.generators.len());
         let mut arrays = Vec::with_capacity(self.generators.len());
         for (field_index, gen) in self.generators.iter_mut().enumerate() {
@@ -157,8 +161,21 @@ impl BatchGenerator {
             arrays.push(arr);
         }
         let schema = Arc::new(ArrowSchema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
-        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone())
+        RecordBatch::try_new(schema.clone(), arrays).unwrap()
+    }
+
+    pub fn batch(&mut self, num_rows: i32) -> impl RecordBatchReader {
+        let batch = self.gen_batch(num_rows as u32);
+        let schema = batch.schema();
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema)
+    }
+
+    pub fn batches(&mut self, num_batches: u32, rows_per_batch: u32) -> impl RecordBatchReader {
+        let batches = (0..num_batches)
+            .map(|_| self.gen_batch(rows_per_batch))
+            .collect::<Vec<_>>();
+        let schema = batches[0].schema();
+        RecordBatchIterator::new(batches.into_iter().map(Ok), schema)
     }
 }
 
@@ -205,12 +222,18 @@ pub fn generate_random_array(n: usize) -> Float32Array {
     Float32Array::from_iter_values(repeat_with(|| rng.gen::<f32>()).take(n))
 }
 
-/// Create a random float32 array where each element is uniformly distributed a
+/// Create a random primitive array where each element is uniformly distributed a
 /// given range.
-pub fn generate_random_array_with_range(n: usize, range: Range<f32>) -> Float32Array {
+pub fn generate_random_array_with_range<T: ArrowPrimitiveType>(
+    n: usize,
+    range: Range<T::Native>,
+) -> PrimitiveArray<T>
+where
+    T::Native: SampleUniform,
+{
     let mut rng = StdRng::from_seed([13; 32]);
     let distribution = Uniform::new(range.start, range.end);
-    Float32Array::from_iter_values(repeat_with(|| distribution.sample(&mut rng)).take(n))
+    PrimitiveArray::<T>::from_iter_values(repeat_with(|| distribution.sample(&mut rng)).take(n))
 }
 
 /// Create a random float32 array where each element is uniformly

@@ -27,16 +27,16 @@ public class Utils {
 
   /** Convert Arrow Schema to FFI Arrow Schema. */
   public static ArrowSchema toFfi(Schema schema, BufferAllocator allocator) {
-    var arrowSchema = ArrowSchema.allocateNew(allocator);
+    ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
     Data.exportSchema(allocator, schema, null, arrowSchema);
     return arrowSchema;
   }
 
   /** Convert optional array to optional list for JNI processing. */
   public static Optional<List<String>> convert(Optional<String[]> optionalArray) {
-    if (optionalArray.isEmpty()) {
-      return Optional.empty();
+    if (optionalArray.isPresent()) {
+      return Optional.of(Arrays.asList(optionalArray.get()));
     }
-    return Optional.of(Arrays.asList(optionalArray.get()));
+    return Optional.empty();
   }
 }

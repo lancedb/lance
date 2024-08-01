@@ -13,20 +13,18 @@ use arrow_array::{
     cast::AsArray,
     types::{Int32Type, Int64Type},
     ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
-    RecordBatch, StructArray, UInt32Array, UInt64Array,
+    RecordBatch, StructArray, UInt32Array,
 };
-use arrow_array::{make_array, BooleanArray};
-use arrow_buffer::{ArrowNativeType, NullBuffer};
+use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, FieldRef, Schema as ArrowSchema};
 use arrow_select::concat::{self, concat_batches};
-use arrow_select::filter::filter_record_batch;
 use async_recursion::async_recursion;
+use deepsize::DeepSizeOf;
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::cache::FileMetadataCache;
 use lance_core::datatypes::{Field, Schema};
-use lance_core::utils::deletion::DeletionVector;
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_core::{Error, Result};
 use lance_io::encodings::dictionary::DictionaryDecoder;
 use lance_io::encodings::AsyncIndex;
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
@@ -43,15 +41,10 @@ use tracing::instrument;
 use crate::format::metadata::Metadata;
 use crate::page_table::{PageInfo, PageTable};
 
-/// Compute row id from `fragment_id` and the `offset` of the row in the fragment.
-fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
-    (fragment_id << 32) + offset as u64
-}
-
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
-#[derive(Clone)]
+#[derive(Clone, DeepSizeOf)]
 pub struct FileReader {
     pub object_reader: Arc<dyn Reader>,
     metadata: Arc<Metadata>,
@@ -62,27 +55,16 @@ pub struct FileReader {
     /// For simple file access, this can just be zero.
     fragment_id: u64,
 
-    /// If set true, returns the row ID from the dataset alongside with the
-    /// actual data.
-    with_row_id: bool,
-
-    /// If true, instead of removing deleted rows, the _rowid column value may be
-    /// marked as null. This is used as a performance optimization to
-    /// avoid copying data.
-    make_deletions_null: bool,
-
     /// Page table for statistics
     stats_page_table: Arc<Option<PageTable>>,
 }
 
 impl std::fmt::Debug for FileReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "FileReader(fragment={}, path={})",
-            self.fragment_id,
-            self.object_reader.path()
-        )
+        f.debug_struct("FileReader")
+            .field("fragment", &self.fragment_id)
+            .field("path", &self.object_reader.path())
+            .finish()
     }
 }
 
@@ -167,8 +149,6 @@ impl FileReader {
             schema,
             page_table,
             fragment_id: fragment_id as u64,
-            with_row_id: false,
-            make_deletions_null: false,
             stats_page_table,
         })
     }
@@ -229,7 +209,7 @@ impl FileReader {
     }
 
     /// Load some metadata about the fragment from the cache, if there is one.
-    async fn load_from_cache<T: Send + Sync + 'static, F, Fut>(
+    async fn load_from_cache<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
         cache: Option<&FileMetadataCache>,
         path: &Path,
         loader: F,
@@ -250,28 +230,6 @@ impl FileReader {
         // If just reading a lance data file we assume the schema is the schema of the data file
         let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_with_fragment_id(object_store, path, schema, 0, 0, max_field_id, None).await
-    }
-
-    /// Instruct the FileReader to return meta row id column.
-    ///
-    /// The row id column will have the name `_rowid` and will be of type `UInt64`.
-    ///
-    /// The row id is a 64-bit integer that is unique within the dataset. The
-    /// most significant 32 bits are the fragment id, and the least significant
-    /// 32 bits are the row offset within the fragment.
-    pub fn with_row_id(&mut self, v: bool) -> &mut Self {
-        self.with_row_id = v;
-        self
-    }
-
-    /// Instruct the FileReader that instead of removing deleted rows, it may
-    /// simply mark the _rowid value as null. Some rows may still be removed,
-    /// for example if the entire batch is deleted. This is a performance
-    /// optimization where the null bitmap of the _rowid column serves as a
-    /// selection vector.
-    pub fn with_make_deletions_null(&mut self, val: bool) -> &mut Self {
-        self.make_deletions_null = val;
-        self
     }
 
     /// Requested projection of the data in this file, excluding the row id column.
@@ -306,17 +264,8 @@ impl FileReader {
         batch_id: i32,
         params: impl Into<ReadBatchParams>,
         projection: &Schema,
-        deletion_vector: Option<&DeletionVector>,
     ) -> Result<RecordBatch> {
-        read_batch(
-            self,
-            &params.into(),
-            projection,
-            batch_id,
-            self.with_row_id,
-            deletion_vector,
-        )
-        .await
+        read_batch(self, &params.into(), projection, batch_id).await
     }
 
     /// Read a range of records into one batch.
@@ -328,20 +277,19 @@ impl FileReader {
         &self,
         range: Range<usize>,
         projection: &Schema,
-        deletion_vector: Option<&DeletionVector>,
     ) -> Result<RecordBatch> {
         if range.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
         }
         let range_in_batches = self.metadata.range_to_batches(range)?;
-        let batches = stream::iter(range_in_batches)
-            .map(|(batch_id, range)| async move {
-                self.read_batch(batch_id, range, projection, deletion_vector)
-                    .await
-            })
-            .buffered(num_cpus::get())
-            .try_collect::<Vec<_>>()
-            .await?;
+        let batches =
+            stream::iter(range_in_batches)
+                .map(|(batch_id, range)| async move {
+                    self.read_batch(batch_id, range, projection).await
+                })
+                .buffered(num_cpus::get())
+                .try_collect::<Vec<_>>()
+                .await?;
         if batches.len() == 1 {
             return Ok(batches[0].clone());
         }
@@ -353,12 +301,7 @@ impl FileReader {
     ///
     /// The indices must be sorted.
     #[instrument(level = "debug", skip_all)]
-    pub async fn take(
-        &self,
-        indices: &[u32],
-        projection: &Schema,
-        deletion_vector: Option<&DeletionVector>,
-    ) -> Result<RecordBatch> {
+    pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let num_batches = self.num_batches();
         let num_rows = self.len() as u32;
         let indices_in_batches = self.metadata.group_indices_to_batches(indices);
@@ -375,24 +318,15 @@ impl FileReader {
                         location: location!(),
                     })
                 } else {
-                    self.read_batch(
-                        batch.batch_id,
-                        batch.offsets.as_slice(),
-                        projection,
-                        deletion_vector,
-                    )
-                    .await
+                    self.read_batch(batch.batch_id, batch.offsets.as_slice(), projection)
+                        .await
                 }
             })
             .buffered(num_cpus::get() * 4)
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut schema = ArrowSchema::from(projection);
-        if self.with_row_id {
-            schema = schema.try_with_column(ROW_ID_FIELD.clone())?;
-        }
-        let schema = Arc::new(schema);
+        let schema = Arc::new(ArrowSchema::from(projection));
 
         Ok(tokio::task::spawn_blocking(move || concat_batches(&schema, &batches)).await??)
     }
@@ -476,7 +410,7 @@ pub fn batches_stream(
         }))
         .map(move |(batch_id, (reader, projection))| async move {
             reader
-                .read_batch(batch_id, ReadBatchParams::RangeFull, &projection, None)
+                .read_batch(batch_id, ReadBatchParams::RangeFull, &projection)
                 .await
         })
         .buffered(2)
@@ -493,10 +427,8 @@ pub async fn read_batch(
     params: &ReadBatchParams,
     schema: &Schema,
     batch_id: i32,
-    with_row_id: bool,
-    deletion_vector: Option<&DeletionVector>,
 ) -> Result<RecordBatch> {
-    let batch = if !schema.fields.is_empty() {
+    if !schema.fields.is_empty() {
         // We box this because otherwise we get a higher-order lifetime error.
         let arrs = stream::iter(&schema.fields)
             .map(|f| async { read_array(reader, f, batch_id, &reader.page_table, params).await })
@@ -504,136 +436,10 @@ pub async fn read_batch(
             .try_collect::<Vec<_>>()
             .boxed();
         let arrs = arrs.await?;
-        Some(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
+        Ok(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
     } else {
-        // If the schema is empty, we are just fetching row ids.
-        assert!(with_row_id);
-        None
-    };
-
-    let should_fetch_row_id =
-        with_row_id || !matches!(deletion_vector, None | Some(DeletionVector::NoDeletions));
-
-    let num_rows = if let Some(batch) = &batch {
-        batch.num_rows()
-    } else {
-        let total_rows = reader.num_rows_in_batch(batch_id);
-        match params {
-            ReadBatchParams::Indices(indices) => indices.len(),
-            ReadBatchParams::Range(r) => r.len(),
-            ReadBatchParams::RangeFull => total_rows,
-            ReadBatchParams::RangeTo(r) => r.end,
-            ReadBatchParams::RangeFrom(r) => total_rows - r.start,
-        }
-    };
-
-    let row_ids = if should_fetch_row_id {
-        let ids_in_batch: Vec<i32> = match params {
-            ReadBatchParams::Indices(indices) => {
-                indices.values().iter().map(|v| *v as i32).collect()
-            }
-            ReadBatchParams::Range(r) => r.clone().map(|v| v as i32).collect(),
-            ReadBatchParams::RangeFull => (0..num_rows as i32).collect(),
-            ReadBatchParams::RangeTo(r) => (0..r.end).map(|v| v as i32).collect(),
-            ReadBatchParams::RangeFrom(r) => {
-                (r.start..r.start + num_rows).map(|v| v as i32).collect()
-            }
-        };
-        let batch_offset = reader
-            .metadata
-            .get_offset(batch_id)
-            .ok_or_else(|| Error::IO {
-                message: format!("batch {batch_id} does not exist"),
-                location: location!(),
-            })?;
-        let row_ids: Vec<u64> = ids_in_batch
-            .iter()
-            .map(|o| compute_row_id(reader.fragment_id, *o + batch_offset))
-            .collect();
-
-        Some(row_ids)
-    } else {
-        None
-    };
-
-    // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
-    // so I'm going to just leave deletion filter at this layer for now.
-    // We should push this down futurther when we get to statistics-based predicate pushdown
-
-    // This function is meant to be IO bound, but we are doing CPU-bound work here
-    // We should try to move this to later.
-    let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
-    let _enter = span.enter();
-    let deletion_mask =
-        deletion_vector.and_then(|v| v.build_predicate(row_ids.as_ref().unwrap().iter()));
-
-    let batch = match batch {
-        Some(batch) => {
-            if with_row_id {
-                let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
-                batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
-            } else {
-                batch
-            }
-        }
-        None if with_row_id => {
-            let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
-            RecordBatch::try_new(
-                Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()])),
-                vec![row_id_arr as ArrayRef],
-            )?
-        }
-        _ => unreachable!(),
-    };
-
-    match (deletion_mask, reader.make_deletions_null) {
-        (None, _) => Ok(batch),
-        (Some(mask), false) => Ok(filter_record_batch(&batch, &mask)?),
-        (Some(mask), true) => Ok(apply_deletions_as_nulls(batch, &mask)?),
+        Err(Error::invalid_input("no fields requested", location!()))
     }
-}
-
-/// Apply a mask to the batch, where rows are "deleted" by the _rowid column null.
-/// This is used as a performance optimization to avoid copying data.
-fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<RecordBatch> {
-    // Transform mask into null buffer. Null means deleted, though note that
-    // null buffers are actually validity buffers, so True means not null
-    // and thus not deleted.
-    let mask_buffer = NullBuffer::new(mask.values().clone());
-
-    match mask_buffer.null_count() {
-        // All rows are deleted
-        n if n == mask_buffer.len() => return Ok(RecordBatch::new_empty(batch.schema())),
-        // No rows are deleted
-        0 => return Ok(batch),
-        _ => {}
-    }
-
-    // For each column convert to data
-    let new_columns = batch
-        .schema()
-        .fields()
-        .iter()
-        .zip(batch.columns())
-        .map(|(field, col)| {
-            if field.name() == ROW_ID {
-                let col_data = col.to_data();
-                // If it already has a validity bitmap, then AND it with the mask.
-                // Otherwise, use the boolean buffer as the mask.
-                let null_buffer = NullBuffer::union(col_data.nulls(), Some(&mask_buffer));
-
-                Ok(col_data
-                    .into_builder()
-                    .null_bit_buffer(null_buffer.map(|b| b.buffer().clone()))
-                    .build()
-                    .map(make_array)?)
-            } else {
-                Ok(col.clone())
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(RecordBatch::try_new(batch.schema(), new_columns)?)
 }
 
 #[async_recursion]
@@ -678,12 +484,14 @@ fn get_page_info<'a>(
     field: &'a Field,
     batch_id: i32,
 ) -> Result<&'a PageInfo> {
-    page_table.get(field.id, batch_id).ok_or_else(|| Error::IO {
-        message: format!(
-            "No page info found for field: {}, field_id={} batch={}",
-            field.name, field.id, batch_id
-        ),
-        location: location!(),
+    page_table.get(field.id, batch_id).ok_or_else(|| {
+        Error::io(
+            format!(
+                "No page info found for field: {}, field_id={} batch={}",
+                field.name, field.id, batch_id
+            ),
+            location!(),
+        )
     })
 }
 
@@ -721,13 +529,13 @@ fn read_null_array(
             } else {
                 let idx_max = *indices.values().iter().max().unwrap() as u64;
                 if idx_max >= page_info.length.try_into().unwrap() {
-                    return Err(Error::IO {
-                        message: format!(
+                    return Err(Error::io(
+                        format!(
                             "NullArray Reader: request([{}]) out of range: [0..{}]",
                             idx_max, page_info.length
                         ),
-                        location: location!(),
-                    });
+                        location!(),
+                    ));
                 }
                 indices.len()
             }
@@ -741,13 +549,16 @@ fn read_null_array(
                 _ => unreachable!(),
             };
             if idx_end > page_info.length {
-                return Err(Error::IO {
-                    message: format!(
+                return Err(Error::io(
+                    format!(
                         "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
-                        idx_start, idx_end, page_info.length
+                        // and wrap it in here.
+                        idx_start,
+                        idx_end,
+                        page_info.length
                     ),
-                    location: location!(),
-                });
+                    location!(),
+                ));
             }
             idx_end - idx_start
         }
@@ -942,7 +753,6 @@ mod tests {
 
     use super::*;
 
-    use arrow_array::Int32Array;
     use arrow_array::{
         builder::{Int32Builder, LargeListBuilder, ListBuilder, StringBuilder},
         cast::{as_string_array, as_struct_array},
@@ -950,73 +760,8 @@ mod tests {
         Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, StringArray,
         UInt8Array,
     };
+    use arrow_array::{BooleanArray, Int32Array};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
-    use roaring::RoaringBitmap;
-
-    #[tokio::test]
-    async fn read_with_row_id() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int64, true),
-            ArrowField::new("f", DataType::Float32, false),
-        ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
-
-        // Write 10 batches.
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
-            &store,
-            &path,
-            schema.clone(),
-            &Default::default(),
-        )
-        .await
-        .unwrap();
-        for batch_id in 0..10 {
-            let value_range = batch_id * 10..batch_id * 10 + 10;
-            let columns: Vec<ArrayRef> = vec![
-                Arc::new(Int64Array::from_iter(
-                    value_range.clone().collect::<Vec<_>>(),
-                )),
-                Arc::new(Float32Array::from_iter(
-                    value_range.map(|n| n as f32).collect::<Vec<_>>(),
-                )),
-            ];
-            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
-            file_writer.write(&[batch]).await.unwrap();
-        }
-        file_writer.finish().await.unwrap();
-
-        let fragment = 123_u64;
-        let mut reader = FileReader::try_new_with_fragment_id(
-            &store,
-            &path,
-            schema,
-            fragment as u32,
-            0,
-            2,
-            None,
-        )
-        .await
-        .unwrap();
-        reader.with_row_id(true);
-
-        for b in 0..10 {
-            let batch = reader
-                .read_batch(b, .., reader.schema(), None)
-                .await
-                .unwrap();
-            let row_ids_col = &batch[ROW_ID];
-            // Do the same computation as `compute_row_id`.
-            let start_pos = (fragment << 32) + 10 * b as u64;
-
-            assert_eq!(
-                &UInt64Array::from_iter_values(start_pos..start_pos + 10),
-                row_ids_col.as_primitive(),
-            );
-        }
-    }
 
     #[tokio::test]
     async fn test_take() {
@@ -1073,7 +818,7 @@ mod tests {
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
         let batch = reader
-            .take(&[1, 15, 20, 25, 30, 48, 90], reader.schema(), None)
+            .take(&[1, 15, 20, 25, 30, 48, 90], reader.schema())
             .await
             .unwrap();
         let dict_keys = UInt8Array::from_iter_values([1, 1, 6, 4, 2, 6, 6]);
@@ -1094,133 +839,6 @@ mod tests {
             )
             .unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn read_with_delete() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int64, true),
-            ArrowField::new("f", DataType::Float32, false),
-        ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-
-        let (store, path) = ObjectStore::from_uri("memory:///foo").await.unwrap();
-
-        // Write 10 batches.
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
-            &store,
-            &path,
-            schema.clone(),
-            &Default::default(),
-        )
-        .await
-        .unwrap();
-        for batch_id in 0..10 {
-            let value_range = batch_id * 10..batch_id * 10 + 10;
-            let columns: Vec<ArrayRef> = vec![
-                Arc::new(Int64Array::from_iter(value_range.clone())),
-                Arc::new(Float32Array::from_iter(value_range.map(|n| n as f32))),
-            ];
-            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
-            file_writer.write(&[batch]).await.unwrap();
-        }
-        file_writer.finish().await.unwrap();
-
-        let fragment = 123;
-
-        // delete even rows
-        let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter((0..100).filter(|x| x % 2 == 0)));
-
-        let mut reader = FileReader::try_new_with_fragment_id(
-            &store,
-            &path,
-            schema,
-            fragment as u32,
-            0,
-            2,
-            None,
-        )
-        .await
-        .unwrap();
-        reader.with_row_id(true);
-
-        for b in 0..10 {
-            let batch = reader
-                .read_batch(b, .., reader.schema(), Some(&dv))
-                .await
-                .unwrap();
-            let row_ids_col = &batch[ROW_ID];
-            // Do the same computation as `compute_row_id`.
-            let start_pos = (fragment << 32) + 10 * b as u64;
-
-            assert_eq!(
-                &UInt64Array::from_iter_values((start_pos..start_pos + 10).filter(|i| i % 2 == 1)),
-                row_ids_col.as_primitive(),
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn read_with_delete_without_row_id() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int64, true),
-            ArrowField::new("f", DataType::Float32, false),
-        ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-
-        let (store, path) = ObjectStore::from_uri("memory:///foo").await.unwrap();
-
-        // Write 10 batches.
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
-            &store,
-            &path,
-            schema.clone(),
-            &Default::default(),
-        )
-        .await
-        .unwrap();
-        for batch_id in 0..10 {
-            let value_range = batch_id * 10..batch_id * 10 + 10;
-            let columns: Vec<ArrayRef> = vec![
-                Arc::new(Int64Array::from_iter(value_range.clone())),
-                Arc::new(Float32Array::from_iter(value_range.map(|n| n as f32))),
-            ];
-            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
-            file_writer.write(&[batch]).await.unwrap();
-        }
-        file_writer.finish().await.unwrap();
-
-        let fragment = 123;
-
-        // delete even rows
-        let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter((0..100).filter(|x| x % 2 == 0)));
-
-        let mut reader = FileReader::try_new_with_fragment_id(
-            &store,
-            &path,
-            schema,
-            fragment as u32,
-            0,
-            2,
-            None,
-        )
-        .await
-        .unwrap();
-        reader.with_row_id(false);
-
-        for b in 0..10 {
-            let batch = reader
-                .read_batch(b, .., reader.schema(), Some(&dv))
-                .await
-                .unwrap();
-            // if we didn't request rowid we should not get it back
-            assert!(!batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .any(|name| name == ROW_ID))
-        }
     }
 
     async fn test_write_null_string_in_struct(field_nullable: bool) {
@@ -1258,10 +876,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual_batch = reader
-            .read_batch(0, .., reader.schema(), None)
-            .await
-            .unwrap();
+        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
 
         if field_nullable {
             assert_eq!(
@@ -1312,10 +927,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual_batch = reader
-            .read_batch(0, .., reader.schema(), None)
-            .await
-            .unwrap();
+        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
         let expected = concat_batches(&arrow_schema, batches_ref).unwrap();
         assert_eq!(expected, actual_batch);
     }
@@ -1363,10 +975,7 @@ mod tests {
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
         let params = ReadBatchParams::Range(1..2);
-        let slice_of_batch = reader
-            .read_batch(0, params, reader.schema(), None)
-            .await
-            .unwrap();
+        let slice_of_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
         assert_eq!(expected_batch, slice_of_batch);
     }
 
@@ -1590,7 +1199,7 @@ mod tests {
         let reader = FileReader::try_new(&store, &path, schema.clone())
             .await
             .unwrap();
-        let actual = reader.take(&[1, 3, 5, 9], &schema, None).await.unwrap();
+        let actual = reader.take(&[1, 3, 5, 9], &schema).await.unwrap();
 
         let value_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(value_builder);
@@ -1668,10 +1277,7 @@ mod tests {
         assert!(file_size_bytes < 1_000);
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual_batch = reader
-            .read_batch(0, .., reader.schema(), None)
-            .await
-            .unwrap();
+        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(batch, actual_batch);
     }
 
@@ -1698,10 +1304,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual_batch = reader
-            .read_range(7..25, reader.schema(), None)
-            .await
-            .unwrap();
+        let actual_batch = reader.read_range(7..25, reader.schema()).await.unwrap();
 
         assert_eq!(
             actual_batch.column_by_name("i").unwrap().as_ref(),
@@ -1785,10 +1388,7 @@ mod tests {
         let reader = FileReader::try_new(&store, &path, schema.clone())
             .await
             .unwrap();
-        let actual = reader
-            .take(&[2, 4, 5, 8, 4555], &schema, None)
-            .await
-            .unwrap();
+        let actual = reader.take(&[2, 4, 5, 8, 4555], &schema).await.unwrap();
 
         assert_eq!(
             actual.column_by_name("b").unwrap().as_ref(),
@@ -1843,7 +1443,7 @@ mod tests {
         .await
         .unwrap();
         let actual = reader
-            .read_batch(0, ReadBatchParams::RangeFull, &partial_schema, None)
+            .read_batch(0, ReadBatchParams::RangeFull, &partial_schema)
             .await
             .unwrap();
 

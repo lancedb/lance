@@ -22,12 +22,14 @@ dataset.drop_columns(["a", "z"])
 dataset.add_columns({"b": "x * 4", "c": "x * 5"})
 
 # This is the bug: b and c will show data from z and a.
-assert dataset.to_table() == pa.table({
-    "x": range(4),
-    "y": [0, 2, 4, 6],
-    "b": [0, 3, 6, 9],
-    "c": [0, -1, -2, -3],
-})
+assert dataset.to_table() == pa.table(
+    {
+        "x": range(4),
+        "y": [0, 2, 4, 6],
+        "b": [0, 3, 6, 9],
+        "c": [0, -1, -2, -3],
+    }
+)
 
-fragment_sizes = { len(frag.data_files()) for frag in dataset.get_fragments() }
+fragment_sizes = {len(frag.data_files()) for frag in dataset.get_fragments()}
 assert fragment_sizes == {4, 2}

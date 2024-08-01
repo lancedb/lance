@@ -2,6 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance secondary index library
+//!
+//! <section class="warning">
+//! This is internal crate used by <a href="https://github.com/lancedb/lance">the lance project</a>.
+//! <br/>
+//! API stability is not guaranteed.
+//! </section>
 
 #![cfg_attr(
     all(feature = "nightly", target_arch = "x86_64"),
@@ -11,11 +17,13 @@
 use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use lance_core::Result;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 pub mod optimize;
+pub mod prefilter;
 pub mod scalar;
 pub mod traits;
 pub mod vector;
@@ -37,12 +45,15 @@ pub mod pb {
 /// Generic methods common across all types of secondary indices
 ///
 #[async_trait]
-pub trait Index: Send + Sync {
+pub trait Index: Send + Sync + DeepSizeOf {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any;
 
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index>;
+
+    /// Cast to [vector::VectorIndex]
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn vector::VectorIndex>>;
 
     /// Retrieve index statistics as a JSON Value
     fn statistics(&self) -> Result<serde_json::Value>;
@@ -58,7 +69,7 @@ pub trait Index: Send + Sync {
 }
 
 /// Index Type
-#[derive(Debug, PartialEq, Eq, Copy, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Hash, Clone, DeepSizeOf)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
     Scalar = 0,

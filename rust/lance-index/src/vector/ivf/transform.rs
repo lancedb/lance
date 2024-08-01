@@ -30,14 +30,14 @@ use super::PART_ID_COLUMN;
 /// this transform is a Noop.
 ///
 #[derive(Debug)]
-pub struct IvfTransformer {
+pub struct PartitionTransformer {
     centroids: FixedSizeListArray,
     distance_type: DistanceType,
     input_column: String,
     output_column: String,
 }
 
-impl IvfTransformer {
+impl PartitionTransformer {
     pub fn new(
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
@@ -60,7 +60,7 @@ impl IvfTransformer {
             .into()
     }
 }
-impl Transformer for IvfTransformer {
+impl Transformer for PartitionTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {
             // If the partition ID column is already present, we don't need to compute it again.

@@ -20,7 +20,6 @@ import time
 from subprocess import check_output
 
 import lance
-import pyarrow as pa
 
 
 def main():

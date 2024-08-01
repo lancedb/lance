@@ -33,7 +33,7 @@ use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
 
-use crate::vector::ivf::Ivf;
+use crate::vector::ivf::IvfTransformer;
 use crate::vector::transform::{KeepFiniteVectors, Transformer};
 use crate::vector::PART_ID_COLUMN;
 
@@ -42,7 +42,7 @@ const UNSORTED_BUFFER: &str = "unsorted.lance";
 fn get_temp_dir() -> Result<Path> {
     let dir = TempDir::new()?;
     let tmp_dir_path = Path::from_filesystem_path(dir.path()).map_err(|e| Error::IO {
-        message: format!("failed to get buffer path in shuffler: {}", e),
+        source: Box::new(e),
         location: location!(),
     })?;
     Ok(tmp_dir_path)
@@ -70,7 +70,7 @@ fn get_temp_dir() -> Result<Path> {
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
-    ivf: Arc<Ivf>,
+    ivf: Arc<IvfTransformer>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
     shuffle_partition_batches: usize,
@@ -79,6 +79,7 @@ pub async fn shuffle_dataset(
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
     // step 1: either use precomputed shuffle files or write shuffle data to a file
     let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
+        info!("Precomputed shuffle files provided, skip calculation of IVF partition.");
         let mut shuffler = IvfShuffler::try_new(num_partitions, Some(path))?;
         unsafe {
             shuffler.set_unsorted_buffers(&buffers);
@@ -86,6 +87,11 @@ pub async fn shuffle_dataset(
 
         shuffler
     } else {
+        info!(
+            "Calculating IVF partitions for vectors (num_partitions={}, precomputed_partitions={})",
+            num_partitions,
+            precomputed_partitions.is_some()
+        );
         let mut shuffler = IvfShuffler::try_new(num_partitions, None)?;
 
         let column = column.to_owned();
@@ -149,20 +155,17 @@ pub async fn shuffle_dataset(
             .buffer_unordered(num_cpus::get())
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
-                Ok(Err(err)) => Err(Error::IO {
-                    message: err.to_string(),
-                    location: location!(),
-                }),
-                Err(err) => Err(Error::IO {
-                    message: err.to_string(),
-                    location: location!(),
-                }),
+                Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),
+                Err(err) => Err(Error::io(err.to_string(), location!())),
             })
             .boxed();
 
         let start = std::time::Instant::now();
         shuffler.write_unsorted_stream(stream).await?;
-        info!("wrote unstored stream in {:?}", start.elapsed());
+        info!(
+            "wrote partition assignment to unsorted tmp file in {:?}",
+            start.elapsed()
+        );
 
         shuffler
     };
@@ -172,9 +175,9 @@ pub async fn shuffle_dataset(
     let partition_files = shuffler
         .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
         .await?;
-    info!("counted partition sizes in {:?}", start.elapsed());
+    info!("created sorted chunks in {:?}", start.elapsed());
 
-    // step 3: load the sorted chuncks, consumers are expect to be responsible for merging the streams
+    // step 3: load the sorted chunks, consumers are expect to be responsible for merging the streams
     let start = std::time::Instant::now();
     let stream = shuffler.load_partitioned_shuffles(partition_files).await?;
     info!("merged partitioned shuffles in {:?}", start.elapsed());
@@ -235,29 +238,22 @@ impl IvfShuffler {
         let schema = match data.as_mut().peek().await {
             Some(Ok(batch)) => batch.schema(),
             Some(Err(err)) => {
-                return Err(Error::IO {
-                    message: err.to_string(),
-                    location: location!(),
-                })
+                return Err(Error::io(err.to_string(), location!()));
             }
             None => {
-                return Err(Error::IO {
-                    message: "empty stream".to_string(),
-                    location: location!(),
-                })
+                return Err(Error::io("empty stream".to_string(), location!()));
             }
         };
 
         // validate the schema,
         // we need to have row ID and partition ID column
-        schema.column_with_name(ROW_ID).ok_or(Error::IO {
-            message: "row ID column not found".to_owned(),
-            location: location!(),
-        })?;
-        schema.column_with_name(PART_ID_COLUMN).ok_or(Error::IO {
-            message: "partition ID column not found".to_owned(),
-            location: location!(),
-        })?;
+        schema
+            .column_with_name(ROW_ID)
+            .ok_or(Error::io("row ID column not found".to_owned(), location!()))?;
+        schema.column_with_name(PART_ID_COLUMN).ok_or(Error::io(
+            "partition ID column not found".to_owned(),
+            location!(),
+        ))?;
 
         let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
@@ -265,7 +261,12 @@ impl IvfShuffler {
             &Default::default(),
         )?;
 
+        let mut batches_processed = 0;
         while let Some(batch) = data.next().await {
+            if batches_processed % 1000 == 0 {
+                info!("Partition assignment progress {}/?", batches_processed);
+            }
+            batches_processed += 1;
             file_writer.write(&[batch?]).await?;
         }
 
@@ -308,7 +309,7 @@ impl IvfShuffler {
                 .expect("part id should exist");
 
             let mut stream = stream::iter(start..end)
-                .map(|i| reader.read_batch(i as i32, .., &lance_schema, None))
+                .map(|i| reader.read_batch(i as i32, .., &lance_schema))
                 .buffer_unordered(16);
 
             while let Some(batch) = stream.next().await {
@@ -327,6 +328,7 @@ impl IvfShuffler {
         &self,
         inputs: &[ShuffleInput],
         partition_size: Vec<u64>,
+        num_batches_to_sort: usize,
     ) -> Result<Vec<Vec<RecordBatch>>> {
         let mut partitioned_batches = Vec::with_capacity(partition_size.len());
         for _ in 0..partition_size.len() {
@@ -334,6 +336,8 @@ impl IvfShuffler {
         }
 
         info!("Shuffling into memory");
+
+        let mut num_processed = 0;
 
         for &ShuffleInput {
             file_idx,
@@ -345,19 +349,16 @@ impl IvfShuffler {
             let file_name = &self.unsorted_buffers[file_idx];
             let path = self.output_dir.child(file_name.as_str());
             let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
-            let total_batch = reader.num_batches();
 
             let mut stream = stream::iter(start..end)
-                .map(|i| {
-                    reader.read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema(), None)
-                })
-                .buffered(16)
-                .enumerate();
+                .map(|i| reader.read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema()))
+                .buffered(16);
 
-            while let Some((idx, batch)) = stream.next().await {
-                if idx % 100 == 0 {
-                    info!("Shuffle Progress {}/{}", idx, total_batch);
+            while let Some(batch) = stream.next().await {
+                if num_processed % 100 == 0 {
+                    info!("Shuffle Progress {}/{}", num_processed, num_batches_to_sort);
                 }
+                num_processed += 1;
 
                 let batch = batch?;
 
@@ -401,12 +402,17 @@ impl IvfShuffler {
         let num_batches = self.total_batches().await?;
         let total_batches = num_batches.iter().sum();
 
+        info!(
+            "Sorting unsorted data into sorted chunks (batches_per_chunk={} concurrent_jobs={})",
+            batches_per_partition, concurrent_jobs
+        );
         stream::iter((0..total_batches).step_by(batches_per_partition))
             .zip(stream::repeat(num_batches))
             .map(|(i, num_batches)| async move {
                 // first, calculate which files and ranges needs to be processed
                 let start = i;
                 let end = std::cmp::min(i + batches_per_partition, total_batches);
+                let num_batches_to_sort = end - start;
                 let mut input = vec![];
 
                 let mut cumulative_size = 0;
@@ -445,16 +451,14 @@ impl IvfShuffler {
                 let size_counts = self.count_partition_size(&input).await?;
 
                 // third, shuffle the data into each partition
-                let shuffled = self.shuffle_to_partitions(&input, size_counts).await?;
-                let schema =
-                    shuffled
-                        .iter()
-                        .find(|batches| !batches.is_empty())
-                        .ok_or(Error::IO {
-                            message: "empty input to shuffle".to_owned(),
-                            location: location!(),
-                        })?[0]
-                        .schema();
+                let shuffled = self
+                    .shuffle_to_partitions(&input, size_counts, num_batches_to_sort)
+                    .await?;
+                let schema = shuffled
+                    .iter()
+                    .find(|batches| !batches.is_empty())
+                    .ok_or(Error::io("empty input to shuffle".to_owned(), location!()))?[0]
+                    .schema();
 
                 // finally, write the shuffled data to disk
                 let object_store = ObjectStore::local();
@@ -462,13 +466,21 @@ impl IvfShuffler {
                 let path = self.output_dir.child(output_file.clone());
                 let writer = object_store.create(&path).await?;
 
+                info!(
+                    "Chunk loaded into memory and sorted, writing to disk at {}",
+                    path
+                );
                 let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
                     writer,
                     Schema::try_from(schema.as_ref())?,
                     &Default::default(),
                 )?;
 
-                for batches in shuffled {
+                for batches_and_idx in shuffled.into_iter().enumerate() {
+                    let (idx, batches) = batches_and_idx;
+                    if idx % 1000 == 0 {
+                        info!("Writing partition {}/{}", idx, self.num_partitions);
+                    }
                     file_writer.write(&batches).await?;
                 }
 
@@ -498,7 +510,7 @@ impl IvfShuffler {
                 .zip(stream::repeat(reader))
                 .map(|(i, reader)| async move {
                     reader
-                        .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema(), None)
+                        .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema())
                         .await
                 })
                 .buffered(4);

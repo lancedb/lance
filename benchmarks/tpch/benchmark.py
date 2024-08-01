@@ -1,7 +1,5 @@
 # Benchmark performance Lance vs Parquet w/ Tpch Q1 and Q6
 import lance
-import pandas as pd
-import pyarrow as pa
 import duckdb
 
 import sys
@@ -46,10 +44,10 @@ WHERE
 num_args = len(sys.argv)
 assert num_args == 2
 
-query = ''
-if sys.argv[1] == 'q1':
+query = ""
+if sys.argv[1] == "q1":
     query = Q1
-elif sys.argv[1] == 'q6':
+elif sys.argv[1] == "q6":
     query = Q6
 else:
     sys.exit("We only support Q1 and Q6 for now")
@@ -62,17 +60,18 @@ lineitem = lance.dataset("./dataset/lineitem.lance")
 res1 = duckdb.sql(query).df()
 end1 = time.time()
 
-print("Lance Latency: ",str(round(end1 - start1, 3)) + 's')
+print("Lance Latency: ", str(round(end1 - start1, 3)) + "s")
 print(res1)
 
 ##### Parquet #####
 lineitem = None
 start2 = time.time()
 # read from parquet and create a view instead of table from it
-duckdb.sql("CREATE VIEW lineitem AS SELECT * FROM read_parquet('./dataset/lineitem_sf1.parquet');")
+duckdb.sql(
+    "CREATE VIEW lineitem AS SELECT * FROM read_parquet('./dataset/lineitem_sf1.parquet');"
+)
 res2 = duckdb.sql(query).df()
 end2 = time.time()
 
-print("Parquet Latency: ",str(round(end2 - start2, 3)) + 's')
+print("Parquet Latency: ", str(round(end2 - start2, 3)) + "s")
 print(res2)
-

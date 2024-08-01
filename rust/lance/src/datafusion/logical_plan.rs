@@ -63,7 +63,7 @@ impl TableProvider for Dataset {
         if let Some(limit) = limit {
             scanner.limit(Some(limit as i64), None)?;
         }
-        let plan: Arc<dyn ExecutionPlan> = scanner.scan(false, false, projections.into());
+        let plan: Arc<dyn ExecutionPlan> = scanner.scan(false, false, false, projections.into());
 
         Ok(plan)
     }

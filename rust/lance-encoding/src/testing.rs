@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_array::{Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -12,11 +12,18 @@ use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::Result;
-use lance_datagen::{array, gen, RowCount, Seed};
+use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 
 use crate::{
-    decoder::{BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, PageInfo},
-    encoder::{BatchEncoder, EncodedPage, FieldEncoder},
+    decoder::{
+        BatchDecodeStream, ColumnInfo, CoreFieldDecoderStrategy, DecodeBatchScheduler,
+        DecoderMessage, DecoderMiddlewareChain, FilterExpression, PageInfo,
+    },
+    encoder::{
+        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodedBuffer, EncodedPage, FieldEncoder,
+        FieldEncodingStrategy,
+    },
+    encodings::logical::r#struct::SimpleStructDecoder,
     EncodingsIo,
 };
 
@@ -25,21 +32,15 @@ pub(crate) struct SimulatedScheduler {
 }
 
 impl SimulatedScheduler {
-    pub fn new(data: Vec<EncodedPage>) -> Self {
-        let mut bytes = BytesMut::new();
-        for page in data.into_iter() {
-            for buf in page.array.buffers {
-                for part in buf.parts.into_iter() {
-                    bytes.extend_from_slice(&part)
-                }
-            }
-        }
-        Self {
-            data: bytes.freeze(),
-        }
+    pub fn new(data: Bytes) -> Self {
+        Self { data }
     }
 
     fn satisfy_request(&self, req: Range<u64>) -> Bytes {
+        if req.is_empty() {
+            // Some filesystems (e.g. S3 will return an error if an empty request is made and so we need to avoid those)
+            panic!("Empty request")
+        }
         self.data.slice(req.start as usize..req.end as usize)
     }
 }
@@ -58,57 +59,117 @@ impl EncodingsIo for SimulatedScheduler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn test_decode(
     num_rows: u64,
+    batch_size: u32,
     schema: &Schema,
-    column_infos: &[ColumnInfo],
+    column_indices: &[u32],
+    column_infos: &[Arc<ColumnInfo>],
     expected: Option<Arc<dyn Array>>,
+    io: &Arc<dyn EncodingsIo>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
-        UnboundedSender<DecoderMessage>,
-    ) -> BoxFuture<'static, Result<()>>,
+        UnboundedSender<Result<DecoderMessage>>,
+    ) -> (SimpleStructDecoder, BoxFuture<'static, ()>),
 ) {
-    let decode_scheduler = DecodeBatchScheduler::new(schema, column_infos, &Vec::new());
+    let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
+    let decode_and_validate =
+        DecoderMiddlewareChain::new().add_strategy(Arc::new(CoreFieldDecoderStrategy {
+            validate_data: true,
+        }));
+    let decode_scheduler = DecodeBatchScheduler::try_new(
+        &lance_schema,
+        column_indices,
+        column_infos,
+        &Vec::new(),
+        num_rows,
+        &decode_and_validate,
+        io,
+    )
+    .unwrap();
 
     let (tx, rx) = mpsc::unbounded_channel();
 
-    schedule_fn(decode_scheduler, tx).await.unwrap();
+    let (decoder, scheduler_fut) = schedule_fn(decode_scheduler, tx);
 
-    const BATCH_SIZE: u32 = 100;
-    let mut decode_stream = BatchDecodeStream::new(rx, BATCH_SIZE, num_rows).into_stream();
+    scheduler_fut.await;
+
+    let mut decode_stream = BatchDecodeStream::new(rx, batch_size, num_rows, decoder).into_stream();
 
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
         let batch = batch.task.await.unwrap();
         if let Some(expected) = expected.as_ref() {
             let actual = batch.column(0);
-            let expected_size = (BATCH_SIZE as usize).min(expected.len() - offset);
+            let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
             assert_eq!(&expected, actual);
         }
-        offset += BATCH_SIZE as usize;
+        offset += batch_size as usize;
+    }
+}
+
+pub trait ArrayGeneratorProvider {
+    fn provide(&self) -> Box<dyn ArrayGenerator>;
+    fn copy(&self) -> Box<dyn ArrayGeneratorProvider>;
+}
+struct RandomArrayGeneratorProvider {
+    field: Field,
+}
+
+impl ArrayGeneratorProvider for RandomArrayGeneratorProvider {
+    fn provide(&self) -> Box<dyn ArrayGenerator> {
+        array::rand_type(self.field.data_type())
+    }
+
+    fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
+        Box::new(Self {
+            field: self.field.clone(),
+        })
     }
 }
 
 /// Given a field this will test the round trip encoding and decoding of random data
-pub async fn check_round_trip_encoding_random(field: Field) {
+pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<String, String>) {
+    let field = field.with_metadata(metadata);
+    let array_generator_provider = RandomArrayGeneratorProvider {
+        field: field.clone(),
+    };
+    check_round_trip_encoding_generated(field, Box::new(array_generator_provider)).await;
+}
+
+pub async fn check_round_trip_encoding_generated(
+    field: Field,
+    array_generator_provider: Box<dyn ArrayGeneratorProvider>,
+) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
+        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_config = HashMap::new();
         let encoder_factory = || {
-            let mut col_idx = 0;
-            let mut field_id_to_col_index = Vec::new();
-            BatchEncoder::get_encoder_for_field(
-                &lance_field,
-                page_size,
-                /*keep_original_array=*/ true,
-                &mut col_idx,
-                &mut field_id_to_col_index,
-            )
-            .unwrap()
+            let mut column_index_seq = ColumnIndexSequence::default();
+            encoding_strategy
+                .create_field_encoder(
+                    &encoding_strategy,
+                    &lance_field,
+                    &mut column_index_seq,
+                    page_size,
+                    true,
+                    &encoding_config,
+                )
+                .unwrap()
         };
-        check_round_trip_field_encoding_random(encoder_factory, field.clone()).await
+
+        // let array_generator_provider = RandomArrayGeneratorProvider{field: field.clone()};
+        check_round_trip_field_encoding_random(
+            encoder_factory,
+            field.clone(),
+            array_generator_provider.copy(),
+        )
+        .await
     }
 }
 
@@ -119,11 +180,23 @@ fn supports_nulls(data_type: &DataType) -> bool {
 }
 
 // The default will just test the full read
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TestCases {
     ranges: Vec<Range<u64>>,
     indices: Vec<Vec<u64>>,
+    batch_size: u32,
     skip_validation: bool,
+}
+
+impl Default for TestCases {
+    fn default() -> Self {
+        Self {
+            batch_size: 100,
+            ranges: Vec::new(),
+            indices: Vec::new(),
+            skip_validation: false,
+        }
+    }
 }
 
 impl TestCases {
@@ -134,6 +207,11 @@ impl TestCases {
 
     pub fn with_indices(mut self, indices: Vec<u64>) -> Self {
         self.indices.push(indices);
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: u32) -> Self {
+        self.batch_size = batch_size;
         self
     }
 
@@ -149,22 +227,73 @@ impl TestCases {
 /// In other words, these are multiple chunks of one long array and not multiple columns
 /// in a record batch.  To feed a "record batch" you should first convert the record batch
 /// to a struct array.
-pub async fn check_round_trip_encoding_of_data(data: Vec<Arc<dyn Array>>, test_cases: &TestCases) {
+pub async fn check_round_trip_encoding_of_data(
+    data: Vec<Arc<dyn Array>>,
+    test_cases: &TestCases,
+    metadata: HashMap<String, String>,
+) {
     let example_data = data.first().expect("Data must have at least one array");
-    let field = Field::new("", example_data.data_type().clone(), true);
+    let mut field = Field::new("", example_data.data_type().clone(), true);
+    field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
-        let mut col_idx = 0;
-        let mut field_id_to_col_index = Vec::new();
-        let encoder = BatchEncoder::get_encoder_for_field(
-            &lance_field,
-            page_size,
-            /*keep_original=*/ true,
-            &mut col_idx,
-            &mut field_id_to_col_index,
-        )
-        .unwrap();
+        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_config = HashMap::new();
+        let mut column_index_seq = ColumnIndexSequence::default();
+        let encoder = encoding_strategy
+            .create_field_encoder(
+                &encoding_strategy,
+                &lance_field,
+                &mut column_index_seq,
+                page_size,
+                true,
+                &encoding_config,
+            )
+            .unwrap();
         check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases).await
+    }
+}
+
+struct SimulatedWriter {
+    page_infos: Vec<Vec<PageInfo>>,
+    encoded_data: BytesMut,
+}
+
+impl SimulatedWriter {
+    fn new(num_columns: u32) -> Self {
+        let mut page_infos = Vec::with_capacity(num_columns as usize);
+        page_infos.resize_with(num_columns as usize, Default::default);
+        Self {
+            page_infos,
+            encoded_data: BytesMut::new(),
+        }
+    }
+
+    fn write_buffer(&mut self, buffer: EncodedBuffer) -> (u64, u64) {
+        let offset = self.encoded_data.len() as u64;
+        for part in buffer.parts.iter() {
+            self.encoded_data.extend_from_slice(part);
+        }
+        let size = self.encoded_data.len() as u64 - offset;
+        (offset, size)
+    }
+
+    fn write_page(&mut self, encoded_page: EncodedPage) {
+        trace!("Encoded page {:?}", encoded_page);
+        let (page_buffers, page_encoding) = encoded_page.array.into_parts();
+        let buffer_offsets_and_sizes = page_buffers
+            .into_iter()
+            .map(|b| self.write_buffer(b))
+            .collect::<Vec<_>>();
+
+        let page_info = PageInfo {
+            num_rows: encoded_page.num_rows,
+            encoding: page_encoding,
+            buffer_offsets_and_sizes: Arc::from(buffer_offsets_and_sizes.clone()),
+        };
+
+        let col_idx = encoded_page.column_idx as usize;
+        self.page_infos[col_idx].push(page_info);
     }
 }
 
@@ -175,54 +304,46 @@ async fn check_round_trip_encoding_inner(
     data: Vec<Arc<dyn Array>>,
     test_cases: &TestCases,
 ) {
-    let mut all_encoded_pages = Vec::new();
-    let mut page_infos: Vec<Vec<Arc<PageInfo>>> = vec![Vec::new(); encoder.num_columns() as usize];
-    let mut buffer_offset = 0;
-
-    let mut simulate_write = |mut encoded_page: EncodedPage| {
-        trace!("Encoded page {:?}", encoded_page);
-        encoded_page.array.buffers.sort_by_key(|b| b.index);
-        let buffer_offsets = encoded_page
-            .array
-            .buffers
-            .iter()
-            .map(|buf| {
-                let offset = buffer_offset;
-                buffer_offset += buf.parts.iter().map(|part| part.len() as u64).sum::<u64>();
-                offset
-            })
-            .collect::<Vec<_>>();
-
-        let page_info = PageInfo {
-            num_rows: encoded_page.num_rows,
-            encoding: encoded_page.array.encoding.clone(),
-            buffer_offsets: Arc::new(buffer_offsets.clone()),
-        };
-
-        let col_idx = encoded_page.column_idx as usize;
-        all_encoded_pages.push(encoded_page);
-        page_infos[col_idx].push(Arc::new(page_info));
-    };
+    let mut writer = SimulatedWriter::new(encoder.num_columns());
 
     for arr in &data {
         for encode_task in encoder.maybe_encode(arr.clone()).unwrap() {
             let encoded_page = encode_task.await.unwrap();
-            simulate_write(encoded_page);
+            writer.write_page(encoded_page);
         }
     }
 
     for encode_task in encoder.flush().unwrap() {
         let encoded_page = encode_task.await.unwrap();
-        simulate_write(encoded_page);
+        writer.write_page(encoded_page);
     }
 
-    let scheduler = Arc::new(SimulatedScheduler::new(all_encoded_pages)) as Arc<dyn EncodingsIo>;
+    let encoded_columns = encoder.finish().await.unwrap();
+    let mut column_infos = Vec::new();
+    for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
+        for page in encoded_column.final_pages {
+            writer.write_page(page);
+        }
 
-    let column_infos = page_infos
-        .into_iter()
-        .enumerate()
-        .map(|(col_idx, page_infos)| ColumnInfo::new(col_idx as u32, page_infos, Vec::new()))
-        .collect::<Vec<_>>();
+        let col_buffer_off_and_size = encoded_column
+            .column_buffers
+            .into_iter()
+            .map(|b| writer.write_buffer(b))
+            .collect::<Vec<_>>();
+
+        let column_info = ColumnInfo::new(
+            col_idx as u32,
+            Arc::from(std::mem::take(&mut writer.page_infos[col_idx])),
+            col_buffer_off_and_size,
+            encoded_column.encoding,
+        );
+
+        column_infos.push(Arc::new(column_info));
+    }
+
+    let scheduler =
+        Arc::new(SimulatedScheduler::new(writer.encoded_data.freeze())) as Arc<dyn EncodingsIo>;
+
     let schema = Schema::new(vec![field.clone()]);
 
     let num_rows = data.iter().map(|arr| arr.len() as u64).sum::<u64>();
@@ -232,21 +353,31 @@ async fn check_round_trip_encoding_inner(
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };
 
-    // We always try a full decode, regardless of the test cases provided
     debug!("Testing full decode");
     let scheduler_copy = scheduler.clone();
     test_decode(
         num_rows,
+        test_cases.batch_size,
         &schema,
+        &[0],
         &column_infos,
         concat_data.clone(),
+        &scheduler_copy.clone(),
         |mut decode_scheduler, tx| {
-            async move {
-                decode_scheduler
-                    .schedule_range(0..num_rows, tx, scheduler_copy)
-                    .await
-            }
-            .boxed()
+            #[allow(clippy::single_range_in_vec_init)]
+            let root_decoder = decode_scheduler.new_root_decoder_ranges(&[0..num_rows]);
+            (
+                root_decoder,
+                async move {
+                    decode_scheduler.schedule_range(
+                        0..num_rows,
+                        &FilterExpression::no_filter(),
+                        tx,
+                        scheduler_copy,
+                    )
+                }
+                .boxed(),
+            )
         },
     )
     .await;
@@ -262,11 +393,27 @@ async fn check_round_trip_encoding_inner(
         let range = range.clone();
         test_decode(
             num_rows,
+            test_cases.batch_size,
             &schema,
+            &[0],
             &column_infos,
             expected,
+            &scheduler.clone(),
             |mut decode_scheduler, tx| {
-                async move { decode_scheduler.schedule_range(range, tx, scheduler).await }.boxed()
+                #[allow(clippy::single_range_in_vec_init)]
+                let root_decoder = decode_scheduler.new_root_decoder_ranges(&[0..num_rows]);
+                (
+                    root_decoder,
+                    async move {
+                        decode_scheduler.schedule_range(
+                            range,
+                            &FilterExpression::no_filter(),
+                            tx,
+                            scheduler,
+                        )
+                    }
+                    .boxed(),
+                )
             },
         )
         .await;
@@ -293,16 +440,26 @@ async fn check_round_trip_encoding_inner(
         let indices = indices.clone();
         test_decode(
             num_rows,
+            test_cases.batch_size,
             &schema,
+            &[0],
             &column_infos,
             expected,
+            &scheduler.clone(),
             |mut decode_scheduler, tx| {
-                async move {
-                    decode_scheduler
-                        .schedule_take(&indices, tx, scheduler)
-                        .await
-                }
-                .boxed()
+                let root_decoder = decode_scheduler.new_root_decoder_indices(&indices);
+                (
+                    root_decoder,
+                    async move {
+                        decode_scheduler.schedule_take(
+                            &indices,
+                            &FilterExpression::no_filter(),
+                            tx,
+                            scheduler,
+                        )
+                    }
+                    .boxed(),
+                )
             },
         )
         .await;
@@ -316,6 +473,7 @@ const NUM_RANDOM_ROWS: u32 = 10000;
 async fn check_round_trip_field_encoding_random(
     encoder_factory: impl Fn() -> Box<dyn FieldEncoder>,
     field: Field,
+    array_generator_provider: Box<dyn ArrayGeneratorProvider>,
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
         for use_slicing in [false, true] {
@@ -350,7 +508,7 @@ async fn check_round_trip_field_encoding_random(
                 // example, a list array sliced into smaller arrays will have arrays whose
                 // starting offset is not 0.
                 if use_slicing {
-                    let mut generator = gen().anon_col(array::rand_type(field.data_type()));
+                    let mut generator = gen().anon_col(array_generator_provider.provide());
                     if let Some(null_rate) = null_rate {
                         generator.with_random_nulls(null_rate);
                     }
@@ -368,7 +526,7 @@ async fn check_round_trip_field_encoding_random(
                     for i in 0..num_ingest_batches {
                         let mut generator = gen()
                             .with_seed(Seed::from(i as u64))
-                            .anon_col(array::rand_type(field.data_type()));
+                            .anon_col(array_generator_provider.provide());
                         if let Some(null_rate) = null_rate {
                             generator.with_random_nulls(null_rate);
                         }

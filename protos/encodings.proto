@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package lance.encodings;
  
+import "google/protobuf/empty.proto";
+
 // This file contains a specification for encodings that can be used
 // to store and load Arrow data into a Lance file.
 //
@@ -154,6 +156,10 @@ message FixedSizeList {
   ArrayEncoding items = 2;
 }
 
+message Compression {
+  string scheme = 1;
+}
+
 // Fixed width items placed contiguously in a buffer
 message Flat {
   // the number of bits per value, must be greater than 0, does
@@ -161,6 +167,21 @@ message Flat {
   uint64 bits_per_value = 1;
   // the buffer of values
   Buffer buffer = 2;
+  // The Compression message can specify the compression scheme (e.g. zstd) and any
+  // other information that is needed for decompression.
+  Compression compression = 3;
+}
+
+// Items are bitpacked in a buffer
+message Bitpacked {
+  // the number of bits used for a value in the buffer
+  uint64 compressed_bits_per_value = 1;
+
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 2;
+
+  // The items in the list
+  Buffer buffer = 3;
 }
 
 // An array encoding for shredded structs that will never be null
@@ -170,6 +191,30 @@ message Flat {
 // TODO: Struct validity bitmaps will be placed here.
 message SimpleStruct {}
 
+// An array encoding for binary fields
+message Binary {
+  ArrayEncoding indices = 1;
+  ArrayEncoding bytes = 2;
+  uint64 null_adjustment = 3;
+}
+
+message Fsst {
+  ArrayEncoding binary = 1;
+  bytes symbol_table = 2;
+}
+
+// An array encoding for dictionary-encoded fields
+message Dictionary {
+  ArrayEncoding indices = 1;
+  ArrayEncoding items = 2;
+  uint32 num_dictionary_items = 3;
+}
+
+message PackedStruct {
+  repeated ArrayEncoding inner = 1;
+  Buffer buffer = 2;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -178,5 +223,27 @@ message ArrayEncoding {
         FixedSizeList fixed_size_list = 3;
         List list = 4;
         SimpleStruct struct = 5;
+        Binary binary = 6;
+        Dictionary dictionary = 7;
+        Fsst fsst = 8;
+        PackedStruct packed_struct = 9;
+        Bitpacked bitpacked = 10;
     }
+}
+
+// Wraps a column with a zone map index that can be used
+// to apply pushdown filters
+message ZoneIndex {
+  uint32 rows_per_zone = 1;
+  Buffer zone_map_buffer = 2;
+  ColumnEncoding inner = 3;
+}
+
+// Encodings that describe a column of values
+message ColumnEncoding {
+  oneof column_encoding {
+    // No special encoding, just column values
+    google.protobuf.Empty values = 1;
+    ZoneIndex zone_index = 2;
+  }
 }

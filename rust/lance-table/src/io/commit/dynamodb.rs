@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::RequestId;
 use aws_sdk_dynamodb::operation::{
     get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
     query::builders::QueryFluentBuilder,
@@ -20,9 +21,11 @@ use snafu::{location, Location};
 use tokio::sync::RwLock;
 
 use crate::io::commit::external_manifest::ExternalManifestStore;
-use lance_core::error::{IOSnafu, NotFoundSnafu};
+use lance_core::error::box_error;
+use lance_core::error::NotFoundSnafu;
 use lance_core::{Error, Result};
 
+#[derive(Debug)]
 struct WrappedSdkError<E>(SdkError<E>);
 
 impl<E> From<WrappedSdkError<E>> for Error
@@ -30,15 +33,38 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(e: WrappedSdkError<E>) -> Self {
-        let error_type = format!("{}", e.0);
         Self::IO {
-            message: format!(
-                "dynamodb error: {}, source: {:?}",
-                error_type,
-                e.0.into_source()
-            ),
+            source: box_error(e),
             location: location!(),
         }
+    }
+}
+
+impl<E> std::fmt::Display for WrappedSdkError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let request_id = self.0.request_id().unwrap_or("unknown");
+        let service_err = &self.0.raw_response();
+        write!(f, "WrappedSdkError: request_id: {}", request_id)?;
+        if let Some(err) = service_err {
+            write!(f, ", service_error: {:?}", err)
+        } else {
+            write!(f, ", no service error")
+        }
+    }
+}
+
+impl<E> std::error::Error for WrappedSdkError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    // Implement the necessary methods for the Error trait here.
+    // For example, you can delegate to the inner SdkError:
+
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
     }
 }
 
@@ -131,11 +157,17 @@ impl DynamoDBExternalManifestStore {
             .send()
             .await
             .wrap_err()?;
-        let table = describe_result.table.context(IOSnafu {
-            message: format!("dynamodb table: {table_name} does not exist"),
+        let table = describe_result.table.ok_or_else(|| {
+            Error::io(
+                format!("dynamodb table: {table_name} does not exist"),
+                location!(),
+            )
         })?;
-        let mut schema = table.key_schema.context(IOSnafu {
-            message: format!("dynamodb table: {table_name} does not have a key schema"),
+        let mut schema = table.key_schema.ok_or_else(|| {
+            Error::io(
+                format!("dynamodb table: {table_name} does not have a key schema"),
+                location!(),
+            )
         })?;
 
         let mut has_hask_key = false;
@@ -143,16 +175,13 @@ impl DynamoDBExternalManifestStore {
 
         // there should be two keys, HASH(base_uri) and RANGE(version)
         for _ in 0..2 {
-            let key = schema.pop().context(IOSnafu {
-                message: format!("dynamodb table: {table_name} must have HASH and RANGE keys"),
+            let key = schema.pop().ok_or_else(|| {
+                Error::io(
+                    format!("dynamodb table: {table_name} must have HASH and RANGE keys"),
+                    location!(),
+                )
             })?;
-            let key_type = key.key_type.context(IOSnafu {
-                message: format!("dynamodb table: {table_name} key types must be defined"),
-            })?;
-            let name = key.attribute_name.context(IOSnafu {
-                message: format!("dynamodb table: {table_name} key must have an attribute name"),
-            })?;
-            match (key_type, name.as_str()) {
+            match (key.key_type, key.attribute_name.as_str()) {
                 (KeyType::Hash, base_uri!()) => {
                     has_hask_key = true;
                 }
@@ -160,12 +189,13 @@ impl DynamoDBExternalManifestStore {
                     has_range_key = true;
                 }
                 _ => {
-                    return Err(Error::IO {
-                        message: format!(
-                            "dynamodb table: {table_name} unknown key type encountered name:{name}",
+                    return Err(Error::io(
+                        format!(
+                            "dynamodb table: {} unknown key type encountered name:{}",
+                            table_name, key.attribute_name
                         ),
-                        location: location!(),
-                    });
+                        location!(),
+                    ));
                 }
             }
         }
@@ -173,10 +203,10 @@ impl DynamoDBExternalManifestStore {
         // Both keys must be present
         if !(has_hask_key && has_range_key) {
             return Err(
-                Error::IO {
-                    message: format!("dynamodb table: {} must have HASH and RANGE keys, named `{}` and `{}` respectively", table_name, base_uri!(), version!()),
-                    location: location!(),
-                }
+                Error::io(
+                    format!("dynamodb table: {} must have HASH and RANGE keys, named `{}` and `{}` respectively", table_name, base_uri!(), version!()),
+                    location!(),
+                )
             );
         }
 
@@ -226,16 +256,16 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             ),
         })?;
 
-        let path = item.get(path!()).context(IOSnafu {
-            message: format!("key {} is not present", path!()),
-        })?;
+        let path = item
+            .get(path!())
+            .ok_or_else(|| Error::io(format!("key {} is not present", path!()), location!()))?;
 
         match path {
             AttributeValue::S(path) => Ok(path.clone()),
-            _ => Err(Error::IO {
-                message: format!("key {} is not a string", path!()),
-                location: location!(),
-            }),
+            _ => Err(Error::io(
+                format!("key {} is not a string", path!()),
+                location!(),
+            )),
         }
     }
 
@@ -260,44 +290,46 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                     return Ok(None);
                 }
                 if items.len() > 1 {
-                    return Err(Error::IO {
-                        message: format!(
+                    return Err(Error::io(
+                        format!(
                             "dynamodb table: {} return unexpect number of items",
                             self.table_name
                         ),
-                        location: location!(),
-                    });
+                        location!(),
+                    ));
                 }
 
                 let item = items.pop().expect("length checked");
                 let version_attibute = item
                 .get(version!())
-                .context(
-                    IOSnafu {
-                        message: format!("dynamodb error: found entries for {} but the returned data does not contain {} column", base_uri, version!())
-                    }
+                .ok_or_else(||
+                    Error::io(
+                        format!("dynamodb error: found entries for {} but the returned data does not contain {} column", base_uri, version!()),
+                        location!(),
+                    )
                 )?;
 
                 let path_attribute = item
                 .get(path!())
-                .context(
-                    IOSnafu {
-                        message: format!("dynamodb error: found entries for {} but the returned data does not contain {} column", base_uri, path!())
-                    }
+                .ok_or_else(||
+                    Error::io(
+                        format!("dynamodb error: found entries for {} but the returned data does not contain {} column", base_uri, path!()),
+                        location!(),
+                    )
                 )?;
 
                 match (version_attibute, path_attribute) {
                     (AttributeValue::N(version), AttributeValue::S(path)) => Ok(Some((
-                        version.parse().map_err(|e| Error::IO {
-                            message: format!("dynamodb error: could not parse the version number returned {}, error: {}", version, e),
-                            location: location!(),
-                        })?,
+                        version.parse().map_err(|e| Error::io(
+                            format!("dynamodb error: could not parse the version number returned {}, error: {}", version, e),
+                            location!(),
+                        ))?,
                         path.clone(),
                     ))),
-                    _ => Err(Error::IO {
-                        message: format!("dynamodb error: found entries for {base_uri} but the returned data is not number type"),
-                        location: location!(),
-                    })
+                    _ => Err(Error::io(
+                        format!("dynamodb error: found entries for {base_uri} but the returned data is not number type"),
+                        location!(),
+                    ))
                 }
             }
             _ => Ok(None),

@@ -20,6 +20,7 @@ lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-datagen = { workspace = true }
+lance-encoding = { workspace = true }
 lance-file = { workspace = true }
 lance-io = { workspace = true }
 lance-linalg = { workspace = true }
@@ -40,6 +41,7 @@ chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
 dashmap = "5"
+deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 itertools.workspace = true
@@ -67,6 +69,7 @@ log = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 moka.workspace = true
+tantivy.workspace = true
 tfrecord = { version = "0.15.0", optional = true, features = ["async"] }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tempfile.workspace = true
@@ -96,6 +99,7 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger = "0.10.0"
 tracing-chrome = "0.7.1"
 rstest = "0.19.0"
+random_word = { version = "0.4.3", features = ["en"] }
 
 [features]
 fp16kernels = ["lance-linalg/fp16kernels"]
@@ -124,4 +128,8 @@ harness = false
 
 [[bench]]
 name = "ivf_pq"
+harness = false
+
+[[bench]]
+name = "take"
 harness = false

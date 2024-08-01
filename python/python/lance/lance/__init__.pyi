@@ -37,9 +37,9 @@ class LanceFileWriter:
     def __init__(
         self,
         path: str,
-        schema: pa.Schema,
-        data_cache_bytes: int,
-        keep_original_array: bool,
+        schema: Optional[pa.Schema],
+        data_cache_bytes: Optional[int],
+        keep_original_array: Optional[bool],
     ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...
     def finish(self) -> int: ...
@@ -76,3 +76,6 @@ class LanceFileMetadata:
     num_global_buffer_bytes: int
     global_buffers: List[LanceBufferDescriptor]
     columns: List[LanceColumnMetadata]
+
+class _Session:
+    def size_bytes(self) -> int: ...

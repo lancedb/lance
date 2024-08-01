@@ -267,7 +267,11 @@ class KMeans:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
-        return self.dist_func(data, self.centroids, y2=y2)
+
+        if self.metric in ["l2", "cosine"]:
+            return self.dist_func(data, self.centroids, y2=y2)
+        else:
+            return self.dist_func(data, self.centroids)
 
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]

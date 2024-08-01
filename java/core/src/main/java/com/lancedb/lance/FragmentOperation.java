@@ -18,7 +18,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.util.Preconditions;
 
 /** Fragment related operations. */
 public abstract class FragmentOperation {
@@ -42,6 +42,9 @@ public abstract class FragmentOperation {
 
     @Override
     public Dataset commit(BufferAllocator allocator, String path, Optional<Long> readVersion) {
+      Preconditions.checkNotNull(allocator);
+      Preconditions.checkNotNull(path);
+      Preconditions.checkNotNull(readVersion);
       return Dataset.commitAppend(path, readVersion,
           fragments.stream().map(FragmentMetadata::getJsonMetadata).collect(Collectors.toList()));
     }

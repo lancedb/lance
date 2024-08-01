@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RowAddress(u64);
 
 impl RowAddress {

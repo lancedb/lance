@@ -17,6 +17,8 @@ pub trait SchemaExt {
     ) -> std::result::Result<Schema, ArrowError>;
 
     fn field_names(&self) -> Vec<&String>;
+
+    fn without_column(&self, column_name: &str) -> Schema;
 }
 
 impl SchemaExt for Schema {
@@ -48,6 +50,20 @@ impl SchemaExt for Schema {
         let mut fields: Vec<FieldRef> = self.fields().iter().cloned().collect();
         fields.insert(index, FieldRef::new(field));
         Ok(Self::new_with_metadata(fields, self.metadata.clone()))
+    }
+
+    /// Project the schema to remove the given column.
+    ///
+    /// This only works on top-level fields right now. If a field does not exist,
+    /// the schema will be returned as is.
+    fn without_column(&self, column_name: &str) -> Schema {
+        let fields: Vec<FieldRef> = self
+            .fields()
+            .iter()
+            .filter(|f| f.name() != column_name)
+            .cloned()
+            .collect();
+        Self::new_with_metadata(fields, self.metadata.clone())
     }
 
     fn field_names(&self) -> Vec<&String> {

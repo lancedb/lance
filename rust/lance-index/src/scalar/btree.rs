@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
@@ -23,12 +23,13 @@ use datafusion_physical_expr::{
     expressions::{Column, MaxAccumulator, MinAccumulator},
     PhysicalSortExpr,
 };
+use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
     stream::{self},
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
-use lance_core::{Error, Result};
+use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
@@ -40,7 +41,8 @@ use snafu::{location, Location};
 use crate::{Index, IndexType};
 
 use super::{
-    flat::FlatIndexMetadata, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,
+    flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, SargableQuery,
+    ScalarIndex,
 };
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
@@ -48,7 +50,14 @@ const BTREE_PAGES_NAME: &str = "page_data.lance";
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
-struct OrderableScalarValue(ScalarValue);
+pub struct OrderableScalarValue(pub ScalarValue);
+
+impl DeepSizeOf for OrderableScalarValue {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // deepsize and size both factor in the size of the ScalarValue
+        self.0.size() - std::mem::size_of::<ScalarValue>()
+    }
+}
 
 impl Display for OrderableScalarValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -151,6 +160,20 @@ impl Ord for OrderableScalarValue {
                 }
             }
             (Float64(_), _) => panic!("Attempt to compare f64 with non-f64"),
+            (Float16(v1), Float16(v2)) => match (v1, v2) {
+                (Some(f1), Some(f2)) => f1.total_cmp(f2),
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            (Float16(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Float16(_), _) => panic!("Attempt to compare f16 with non-f16"),
             (Int8(v1), Int8(v2)) => v1.cmp(v2),
             (Int8(v1), Null) => {
                 if v1.is_none() {
@@ -223,33 +246,33 @@ impl Ord for OrderableScalarValue {
                 }
             }
             (UInt64(_), _) => panic!("Attempt to compare Int16 with non-UInt64"),
-            (Utf8(v1), Utf8(v2)) => v1.cmp(v2),
-            (Utf8(v1), Null) => {
+            (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Utf8(v2) | Utf8View(v2) | LargeUtf8(v2)) => {
+                v1.cmp(v2)
+            }
+            (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Null) => {
                 if v1.is_none() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
             }
-            (Utf8(_), _) => panic!("Attempt to compare Utf8 with non-Utf8"),
-            (LargeUtf8(v1), LargeUtf8(v2)) => v1.cmp(v2),
-            (LargeUtf8(v1), Null) => {
+            (Utf8(_) | Utf8View(_) | LargeUtf8(_), _) => {
+                panic!("Attempt to compare Utf8 with non-Utf8")
+            }
+            (
+                Binary(v1) | LargeBinary(v1) | BinaryView(v1),
+                Binary(v2) | LargeBinary(v2) | BinaryView(v2),
+            ) => v1.cmp(v2),
+            (Binary(v1) | LargeBinary(v1) | BinaryView(v1), Null) => {
                 if v1.is_none() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
             }
-            (LargeUtf8(_), _) => panic!("Attempt to compare LargeUtf8 with non-LargeUtf8"),
-            (Binary(v1), Binary(v2)) => v1.cmp(v2),
-            (Binary(v1), Null) => {
-                if v1.is_none() {
-                    Ordering::Equal
-                } else {
-                    Ordering::Greater
-                }
+            (Binary(_) | LargeBinary(_) | BinaryView(_), _) => {
+                panic!("Attempt to compare Binary with non-Binary")
             }
-            (Binary(_), _) => panic!("Attempt to compare Binary with non-Binary"),
             (FixedSizeBinary(_, v1), FixedSizeBinary(_, v2)) => v1.cmp(v2),
             (FixedSizeBinary(_, v1), Null) => {
                 if v1.is_none() {
@@ -261,15 +284,6 @@ impl Ord for OrderableScalarValue {
             (FixedSizeBinary(_, _), _) => {
                 panic!("Attempt to compare FixedSizeBinary with non-FixedSizeBinary")
             }
-            (LargeBinary(v1), LargeBinary(v2)) => v1.cmp(v2),
-            (LargeBinary(v1), Null) => {
-                if v1.is_none() {
-                    Ordering::Equal
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (LargeBinary(_), _) => panic!("Attempt to compare LargeBinary with non-LargeBinary"),
             (FixedSizeList(left), FixedSizeList(right)) => {
                 if left.eq(right) {
                     todo!()
@@ -301,6 +315,17 @@ impl Ord for OrderableScalarValue {
                 panic!("Attempt to compare List with non-List")
             }
             (LargeList(_), _) => todo!(),
+            (Map(_), Map(_)) => todo!(),
+            (Map(left), Null) => {
+                if left.is_null(0) {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Map(_), _) => {
+                panic!("Attempt to compare Map with non-Map")
+            }
             (Date32(v1), Date32(v2)) => v1.cmp(v2),
             (Date32(v1), Null) => {
                 if v1.is_none() {
@@ -502,7 +527,7 @@ impl Ord for OrderableScalarValue {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 struct PageRecord {
     max: OrderableScalarValue,
     page_number: u32,
@@ -520,7 +545,7 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
 }
 
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
     /// Pages where the value may be null
@@ -640,7 +665,7 @@ impl BTreeLookup {
 ///
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
 /// for faster lookup
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, DeepSizeOf)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
     store: Arc<dyn IndexStore>,
@@ -664,10 +689,10 @@ impl BTreeIndex {
 
     async fn search_page(
         &self,
-        query: &ScalarQuery,
+        query: &SargableQuery,
         page_number: u32,
         index_reader: Arc<dyn IndexReader>,
-    ) -> Result<UInt64Array> {
+    ) -> Result<RowIdTreeMap> {
         let serialized_page = index_reader.read_record_batch(page_number).await?;
         let subindex = self.sub_index.load_subindex(serialized_page).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
@@ -781,6 +806,13 @@ impl Index for BTreeIndex {
         self
     }
 
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Err(Error::NotSupported {
+            source: "BTreeIndex is not vector index".into(),
+            location: location!(),
+        })
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::Scalar
     }
@@ -820,18 +852,23 @@ impl Index for BTreeIndex {
 
 #[async_trait]
 impl ScalarIndex for BTreeIndex {
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let pages = match query {
-            ScalarQuery::Equals(val) => self
+            SargableQuery::Equals(val) => self
                 .page_lookup
                 .pages_eq(&OrderableScalarValue(val.clone())),
-            ScalarQuery::Range(start, end) => self
+            SargableQuery::Range(start, end) => self
                 .page_lookup
                 .pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref())),
-            ScalarQuery::IsIn(values) => self
+            SargableQuery::IsIn(values) => self
                 .page_lookup
                 .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
-            ScalarQuery::IsNull() => self.page_lookup.pages_null(),
+            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
+                "full text search is not supported for BTree index, build a inverted index for it",
+                location!(),
+            )),
+            SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let page_tasks = pages
@@ -841,19 +878,10 @@ impl ScalarIndex for BTreeIndex {
                     .boxed()
             })
             .collect::<Vec<_>>();
-        let row_id_lists = stream::iter(page_tasks)
+        stream::iter(page_tasks)
             .buffered(num_cpus::get())
-            .try_collect::<Vec<UInt64Array>>()
-            .await?;
-        let total_size = row_id_lists
-            .iter()
-            .map(|row_id_list| row_id_list.len())
-            .sum();
-        let mut all_row_ids = Vec::with_capacity(total_size);
-        for row_id_list in row_id_lists {
-            all_row_ids.extend(row_id_list.values());
-        }
-        Ok(UInt64Array::from_iter_values(all_row_ids))
+            .try_collect::<RowIdTreeMap>()
+            .await
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
@@ -953,7 +981,7 @@ fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
 
 /// A trait that must be implemented by anything that wishes to act as a btree subindex
 #[async_trait]
-pub trait BTreeSubIndex: Debug + Send + Sync {
+pub trait BTreeSubIndex: Debug + Send + Sync + DeepSizeOf {
     /// Trains the subindex on a single batch of data and serializes it to Arrow
     async fn train(&self, batch: RecordBatch) -> Result<RecordBatch>;
 
@@ -1102,8 +1130,8 @@ impl BtreeTrainingSource for BTreeUpdater {
         let new_input = Arc::new(OneShotExec::new(self.new_data));
         let old_input = Self::into_old_input(self.index);
         debug_assert_eq!(
-            old_input.schema().all_fields().len(),
-            new_input.schema().all_fields().len()
+            old_input.schema().flattened_fields().len(),
+            new_input.schema().flattened_fields().len()
         );
         let sort_expr = PhysicalSortExpr {
             expr: Arc::new(Column::new("values", 0)),
@@ -1153,5 +1181,33 @@ impl Stream for IndexReaderStream {
         let reader_copy = this.reader.clone();
         let read_task = async move { reader_copy.read_record_batch(page_number).await }.boxed();
         std::task::Poll::Ready(Some(read_task))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::Int32Type;
+    use arrow_array::FixedSizeListArray;
+    use datafusion_common::ScalarValue;
+    use deepsize::DeepSizeOf;
+
+    use super::OrderableScalarValue;
+
+    #[test]
+    fn test_scalar_value_size() {
+        let size_of_i32 = OrderableScalarValue(ScalarValue::Int32(Some(0))).deep_size_of();
+        let size_of_many_i32 = OrderableScalarValue(ScalarValue::FixedSizeList(Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![Some(vec![Some(0); 128])],
+                128,
+            ),
+        )))
+        .deep_size_of();
+
+        // deep_size_of should account for the rust type overhead
+        assert!(size_of_i32 > 4);
+        assert!(size_of_many_i32 > 128 * 4);
     }
 }

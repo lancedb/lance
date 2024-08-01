@@ -15,6 +15,7 @@
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.Dataset;
+import com.lancedb.lance.LockManager;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -24,6 +25,7 @@ import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.ScanTask;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -37,6 +39,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
 
   private long nativeScannerHandle;
 
+  private final LockManager lockManager = new LockManager();
+
   private LanceScanner() {}
 
   /**
@@ -49,6 +53,9 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    */
   public static LanceScanner create(Dataset dataset, ScanOptions options,
       BufferAllocator allocator) {
+    Preconditions.checkNotNull(dataset);
+    Preconditions.checkNotNull(options);
+    Preconditions.checkNotNull(allocator);
     LanceScanner scanner = createScanner(dataset, options.getFragmentIds(), options.getColumns(),
         options.getSubstraitFilter(), options.getFilter(), options.getBatchSize());
     scanner.allocator = allocator;
@@ -67,9 +74,11 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    */
   @Override
   public void close() throws Exception {
-    if (nativeScannerHandle != 0) {
-      releaseNativeScanner(nativeScannerHandle);
-      nativeScannerHandle = 0;
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      if (nativeScannerHandle != 0) {
+        releaseNativeScanner(nativeScannerHandle);
+        nativeScannerHandle = 0;
+      }
     }
   }
 
@@ -83,12 +92,15 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
 
   @Override
   public ArrowReader scanBatches() {
-    try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
-      openStream(s.memoryAddress());
-      return Data.importArrayStream(allocator, s);
-    } catch (IOException e) {
-      // TODO: handle IO exception?
-      throw new RuntimeException(e);
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
+      try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
+        openStream(s.memoryAddress());
+        return Data.importArrayStream(allocator, s);
+      } catch (IOException e) {
+        // TODO: handle IO exception?
+        throw new RuntimeException(e);
+      }
     }
   }
 
@@ -102,9 +114,12 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
 
   @Override
   public Schema schema() {
-    try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
-      importFfiSchema(ffiArrowSchema.memoryAddress());
-      return Data.importSchema(allocator, ffiArrowSchema, null);
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
+      try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+        importFfiSchema(ffiArrowSchema.memoryAddress());
+        return Data.importSchema(allocator, ffiArrowSchema, null);
+      }
     }
   }
 
@@ -115,5 +130,12 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    *
    * @return num of rows.
    */
-  public native long countRows();
+  public long countRows() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
+      return nativeCountRows();
+    }
+  }
+
+  private native long nativeCountRows();
 }

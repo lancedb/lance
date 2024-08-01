@@ -6,6 +6,7 @@ members = [
     "rust/lance-core",
     "rust/lance-datagen",
     "rust/lance-encoding",
+    "rust/lance-encoding-datafusion",
     "rust/lance-file",
     "rust/lance-index",
     "rust/lance-io",
@@ -13,13 +14,14 @@ members = [
     "rust/lance-table",
     "rust/lance-test-macros",
     "rust/lance-testing",
+    "rust/lance-encoding/compression-algo/fsst",
 ]
 exclude = ["python"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
 [workspace.package]
-version = "0.11.0"
+version = "0.15.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -39,44 +41,46 @@ categories = [
     "development-tools",
     "science",
 ]
-rust-version = "1.75"
+rust-version = "1.78"
 
 [workspace.dependencies]
-lance = { version = "=0.11.0", path = "./rust/lance" }
-lance-arrow = { version = "=0.11.0", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.11.0", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.11.0", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.11.0", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.11.0", path = "./rust/lance-encoding" }
-lance-file = { version = "=0.11.0", path = "./rust/lance-file" }
-lance-index = { version = "=0.11.0", path = "./rust/lance-index" }
-lance-io = { version = "=0.11.0", path = "./rust/lance-io" }
-lance-linalg = { version = "=0.11.0", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.11.0", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.11.0", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.11.0", path = "./rust/lance-testing" }
+lance = { version = "=0.15.1", path = "./rust/lance" }
+lance-arrow = { version = "=0.15.1", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.15.1", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.15.1", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.15.1", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.15.1", path = "./rust/lance-encoding" }
+lance-encoding-datafusion = { version = "=0.15.1", path = "./rust/lance-encoding-datafusion" }
+lance-file = { version = "=0.15.1", path = "./rust/lance-file" }
+lance-index = { version = "=0.15.1", path = "./rust/lance-index" }
+lance-io = { version = "=0.15.1", path = "./rust/lance-io" }
+lance-linalg = { version = "=0.15.1", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.15.1", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.15.1", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.15.1", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "51.0.0", optional = false, features = ["prettyprint"] }
-arrow-arith = "51.0"
-arrow-array = "51.0"
-arrow-buffer = "51.0"
-arrow-cast = "51.0"
-arrow-data = "51.0"
-arrow-ipc = { version = "51.0", features = ["zstd"] }
-arrow-ord = "51.0"
-arrow-row = "51.0"
-arrow-schema = "51.0"
-arrow-select = "51.0"
+arrow = { version = "52.2", optional = false, features = ["prettyprint"] }
+arrow-arith = "52.2"
+arrow-array = "52.2"
+arrow-buffer = "52.2"
+arrow-cast = "52.2"
+arrow-data = "52.2"
+arrow-ipc = { version = "52.2", features = ["zstd"] }
+arrow-ord = "52.2"
+arrow-row = "52.2"
+arrow-schema = "52.2"
+arrow-select = "52.2"
 async-recursion = "1.0"
 async-trait = "0.1"
-aws-config = "0.56"
-aws-credential-types = "0.56"
-aws-sdk-dynamodb = "0.34"
+aws-config = "1.2.0"
+aws-credential-types = "1.2.0"
+aws-sdk-dynamodb = "1.38.0"
 half = { "version" = "2.4.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
+bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
@@ -84,22 +88,32 @@ chrono = { version = "0.4.25", default-features = false, features = [
     "std",
     "now",
 ] }
-criterion = { version = "0.5", features = ["async", "async_tokio"] }
-datafusion = { version = "37.1", default-features = false, features = [
+criterion = { version = "0.5", features = [
+    "async",
+    "async_tokio",
+    "html_reports",
+] }
+crossbeam-queue = "0.3"
+datafusion = { version = "40.0", default-features = false, features = [
     "array_expressions",
     "regex_expressions",
+    "unicode_expressions",
 ] }
-datafusion-common = "37.1"
-datafusion-functions = { version = "37.1", features = ["regex_expressions"] }
-datafusion-sql = "37.1"
-datafusion-expr = "37.1"
-datafusion-execution = "37.1"
-datafusion-physical-expr = { version = "37.1", features = [
+datafusion-common = "40.0"
+datafusion-functions = { version = "40.0", features = ["regex_expressions"] }
+datafusion-sql = "40.0"
+datafusion-expr = "40.0"
+datafusion-execution = "40.0"
+datafusion-optimizer = "40.0"
+datafusion-physical-expr = { version = "40.0", features = [
     "regex_expressions",
 ] }
+deepsize = "0.2.0"
 either = "1.0"
+fsst = { version = "=0.15.1", path = "./rust/lance-encoding/compression-algo/fsst" }
 futures = "0.3"
 http = "0.2.9"
+hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.12"
 lazy_static = "1"
 log = "0.4"
@@ -108,8 +122,8 @@ mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = "0.11"
 num-traits = "0.2"
 num_cpus = "1.0"
-object_store = { version = "0.9.0" }
-parquet = "49.0"
+object_store = { version = "0.10.1" }
+parquet = "52.0"
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
@@ -118,13 +132,15 @@ prost = "0.12.2"
 prost-build = "0.12.2"
 prost-types = "0.12.2"
 rand = { version = "0.8.3", features = ["small_rng"] }
+rangemap = { version = "1.0" }
 rayon = "1.10"
 roaring = "0.10.1"
 rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 shellexpand = "3.0"
-snafu = "0.7.4"
+snafu = "0.7.5"
+tantivy = "0.22.0"
 tempfile = "3"
 test-log = { version = "0.2.15" }
 tokio = { version = "1.23", features = [
@@ -139,6 +155,7 @@ tracing = "0.1"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 pretty_assertions = "1.4.0"
+zstd = "0.13.1"
 
 [profile.bench]
 opt-level = 3

@@ -68,11 +68,9 @@
 //!
 //! ```
 //!
-use std::sync::Arc;
 
 use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
-use lance_core::ROW_ID_FIELD;
 pub use lance_core::{datatypes, error};
 pub use lance_core::{Error, Result};
 
@@ -98,10 +96,4 @@ pub async fn open_dataset<T: AsRef<str>>(table_uri: T) -> Result<Dataset> {
 
 lazy_static::lazy_static! {
     pub static ref DIST_FIELD : arrow_schema::Field = arrow_schema::Field::new(DIST_COL, DataType::Float32, true);
-    /// Row ID field. This is nullable because its validity bitmap is sometimes used
-    /// as a selection vector.
-    pub static ref RESULT_SCHEMA: Arc<arrow_schema::Schema> = Arc::new(arrow_schema::Schema::new(vec![
-        DIST_FIELD.clone(),
-        ROW_ID_FIELD.clone(),
-    ]));
 }

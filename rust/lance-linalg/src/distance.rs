@@ -6,7 +6,8 @@
 //! This module provides distance metrics for vectors.
 //!
 //! - `bf16, f16, f32, f64` types are supported.
-//! - SIMD is used when available, on `x86_64` and `aarch64` architectures.
+//! - SIMD is used when available, on `x86_64`, `aarch64` and `loongarch64`
+//!   architectures.
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ pub mod l2;
 pub mod norm_l2;
 
 pub use cosine::*;
+use deepsize::DeepSizeOf;
 pub use dot::*;
 pub use l2::*;
 pub use norm_l2::*;
@@ -27,7 +29,7 @@ pub use norm_l2::*;
 use crate::Result;
 
 /// Distance metrics type.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, DeepSizeOf)]
 pub enum DistanceType {
     L2,
     Cosine,

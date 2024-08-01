@@ -6,12 +6,13 @@ use std::ops::Range;
 
 use crate::datatypes::{Fields, FieldsWithMeta};
 use crate::format::pb;
+use deepsize::DeepSizeOf;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::traits::ProtoStruct;
 use snafu::{location, Location};
 /// Data File Metadata
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, DeepSizeOf, PartialEq)]
 pub struct Metadata {
     /// Offset of each record batch.
     pub batch_offsets: Vec<i32>,
@@ -52,9 +53,10 @@ impl From<&Metadata> for pb::Metadata {
     }
 }
 
-impl From<pb::Metadata> for Metadata {
-    fn from(m: pb::Metadata) -> Self {
-        Self {
+impl TryFrom<pb::Metadata> for Metadata {
+    type Error = Error;
+    fn try_from(m: pb::Metadata) -> Result<Self> {
+        Ok(Self {
             batch_offsets: m.batch_offsets.clone(),
             page_table_position: m.page_table_position as usize,
             manifest_position: Some(m.manifest_position as usize),
@@ -70,7 +72,7 @@ impl From<pb::Metadata> for Metadata {
             } else {
                 None
             },
-        }
+        })
     }
 }
 
@@ -166,14 +168,14 @@ impl Metadata {
     // TODO: pub(crate)
     pub fn range_to_batches(&self, range: Range<usize>) -> Result<Vec<(i32, Range<usize>)>> {
         if range.end > *(self.batch_offsets.last().unwrap()) as usize {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "Range {:?} is out of bounds {}",
                     range,
                     self.batch_offsets.last().unwrap()
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         let offsets = self.batch_offsets.as_slice();
         let mut batch_id = offsets
@@ -196,7 +198,7 @@ impl Metadata {
 }
 
 /// Metadata about the statistics
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, DeepSizeOf)]
 pub struct StatisticsMetadata {
     /// Schema of the page-level statistics.
     ///

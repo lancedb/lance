@@ -13,40 +13,41 @@ use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_struct_array, AsArray},
     types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
+    Array, FixedSizeListArray, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
+use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
-use lance_core::{datatypes::Field, Error, Result, ROW_ID_FIELD};
+use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
 use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::vector::{
-    graph::VectorStorage,
-    quantizer::{Quantization, QuantizationMetadata, Quantizer},
-};
+use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::quantizer::QuantizationType;
+use lance_index::vector::v3::shuffler::IvfShuffler;
+use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
-        graph::NEIGHBORS_FIELD,
-        hnsw::{builder::HnswBuildParams, VECTOR_ID_FIELD},
+        hnsw::{builder::HnswBuildParams, HNSWIndex, HNSW},
         ivf::{
-            builder::load_precomputed_partitions,
-            shuffler::shuffle_dataset,
-            storage::{IvfData, IVF_PARTITION_KEY},
-            IvfBuildParams,
+            builder::load_precomputed_partitions, shuffler::shuffle_dataset,
+            storage::IVF_PARTITION_KEY, IvfBuildParams,
         },
         pq::{PQBuildParams, ProductQuantizer},
-        sq::{builder::SQBuildParams, ScalarQuantizer},
-        Query, DIST_COL,
+        quantizer::{Quantization, QuantizationMetadata, Quantizer},
+        sq::ScalarQuantizer,
+        Query, VectorIndex, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -57,15 +58,12 @@ use lance_io::{
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
+use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_linalg::{
     distance::Normalize,
     kernels::{normalize_arrow, normalize_fsl},
 };
-use lance_linalg::{
-    distance::{DistanceType, Dot, MetricType, L2},
-    MatrixView,
-};
-use log::{debug, info};
+use log::info;
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
@@ -75,15 +73,12 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
-use self::io::write_hnsw_quantization_index_partitions;
-
+use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
-    hnsw::HNSWIndex,
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
-    VectorIndex,
 };
-use crate::{dataset::builder::DatasetBuilder, index::vector::sq::build_sq_model};
+use crate::dataset::builder::DatasetBuilder;
 use crate::{
     dataset::Dataset,
     index::{
@@ -95,20 +90,23 @@ use crate::{
     session::Session,
 };
 
-mod builder;
+pub mod builder;
 mod io;
+pub mod v2;
 
 /// IVF Index.
 pub struct IVFIndex {
     uuid: String,
 
     /// Ivf model
-    ivf: Ivf,
+    ivf: IvfModel,
 
     reader: Arc<dyn Reader>,
 
     /// Index in each partition.
     sub_index: Arc<dyn VectorIndex>,
+
+    partition_locks: PartitionLoadLock,
 
     metric_type: MetricType,
 
@@ -118,12 +116,21 @@ pub struct IVFIndex {
     session: Weak<Session>,
 }
 
+impl DeepSizeOf for IVFIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.uuid.deep_size_of_children(context)
+            + self.reader.deep_size_of_children(context)
+            + self.sub_index.deep_size_of_children(context)
+        // Skipping session since it is a weak ref
+    }
+}
+
 impl IVFIndex {
     /// Create a new IVF index.
     pub(crate) fn try_new(
         session: Arc<Session>,
         uuid: &str,
-        ivf: Ivf,
+        ivf: IvfModel,
         reader: Arc<dyn Reader>,
         sub_index: Arc<dyn VectorIndex>,
         metric_type: MetricType,
@@ -134,6 +141,8 @@ impl IVFIndex {
                 location: location!(),
             });
         }
+
+        let num_partitions = ivf.num_partitions();
         Ok(Self {
             uuid: uuid.to_owned(),
             session: Arc::downgrade(&session),
@@ -141,6 +150,7 @@ impl IVFIndex {
             reader,
             sub_index,
             metric_type,
+            partition_locks: PartitionLoadLock::new(num_partitions),
         })
     }
 
@@ -165,28 +175,40 @@ impl IVFIndex {
         let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
             part_idx
         } else {
-            if partition_id >= self.ivf.lengths.len() {
-                return Err(Error::Index {
-                    message: format!(
-                        "partition id {} is out of range of {} partitions",
-                        partition_id,
-                        self.ivf.lengths.len()
-                    ),
-                    location: location!(),
-                });
-            }
+            let mtx = self.partition_locks.get_partition_mutex(partition_id);
+            let _guard = mtx.lock().await;
+            // check the cache again, as the partition may have been loaded by another
+            // thread that held the lock on loading the partition
+            if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
+                part_idx
+            } else {
+                if partition_id >= self.ivf.num_partitions() {
+                    return Err(Error::Index {
+                        message: format!(
+                            "partition id {} is out of range of {} partitions",
+                            partition_id,
+                            self.ivf.num_partitions()
+                        ),
+                        location: location!(),
+                    });
+                }
 
-            let offset = self.ivf.offsets[partition_id];
-            let length = self.ivf.lengths[partition_id] as usize;
-            let idx = self
-                .sub_index
-                .load_partition(self.reader.clone(), offset, length, partition_id)
-                .await?;
-            let idx: Arc<dyn VectorIndex> = idx.into();
-            if write_cache {
-                session.index_cache.insert_vector(&cache_key, idx.clone());
+                let range = self.ivf.row_range(partition_id);
+                let idx = self
+                    .sub_index
+                    .load_partition(
+                        self.reader.clone(),
+                        range.start,
+                        range.end - range.start,
+                        partition_id,
+                    )
+                    .await?;
+                let idx: Arc<dyn VectorIndex> = idx.into();
+                if write_cache {
+                    session.index_cache.insert_vector(&cache_key, idx.clone());
+                }
+                idx
             }
-            idx
         };
         Ok(part_index)
     }
@@ -196,7 +218,7 @@ impl IVFIndex {
     /// Internal API with no stability guarantees.
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         if self.sub_index.use_residual() {
-            let partition_centroids = self.ivf.centroids.value(partition_id);
+            let partition_centroids = self.ivf.centroids.as_ref().unwrap().value(partition_id);
             let residual_key = sub(&query.key, &partition_centroids)?;
             let mut part_query = query.clone();
             part_query.key = residual_key;
@@ -204,34 +226,6 @@ impl IVFIndex {
         } else {
             Ok(query.clone())
         }
-    }
-
-    async fn search_in_partition(
-        &self,
-        partition_id: usize,
-        query: &Query,
-        pre_filter: Arc<PreFilter>,
-    ) -> Result<RecordBatch> {
-        let part_index = self.load_partition(partition_id, true).await?;
-
-        let query = self.preprocess_query(partition_id, query)?;
-        let batch = part_index.search(&query, pre_filter).await?;
-        Ok(batch)
-    }
-
-    /// find the IVF partitions ids given the query vector.
-    ///
-    /// Internal API with no stability guarantees.
-    ///
-    /// Assumes the query vector is normalized if the metric type is cosine.
-    pub fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
-        let mt = if self.metric_type == MetricType::Cosine {
-            MetricType::L2
-        } else {
-            self.metric_type
-        };
-
-        self.ivf.find_partitions(&query.key, query.nprobes, mt)
     }
 }
 
@@ -245,18 +239,31 @@ impl std::fmt::Debug for IVFIndex {
 ///
 /// Returns (new_uuid, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
-    dataset: &Dataset,
+    dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
-    // Senity check the indices
+    // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::Index {
             message: "optimizing vector index: no existing index found".to_string(),
             location: location!(),
         });
+    }
+
+    // try cast to v1 IVFIndex,
+    // fallback to v2 IVFIndex if it's not v1 IVFIndex
+    if !existing_indices[0].as_any().is::<IVFIndex>() {
+        return optimize_vector_indices_v2(
+            &dataset,
+            unindexed,
+            vector_column,
+            existing_indices,
+            options,
+        )
+        .await;
     }
 
     let new_uuid = Uuid::new_v4();
@@ -271,7 +278,7 @@ pub(crate) async fn optimize_vector_indices(
         .as_any()
         .downcast_ref::<IVFIndex>()
         .ok_or(Error::Index {
-            message: "optimizing vector index: first index is not IVF".to_string(),
+            message: "optimizing vector index: the first index isn't IVF".to_string(),
             location: location!(),
         })?;
 
@@ -298,7 +305,7 @@ pub(crate) async fn optimize_vector_indices(
             .child(INDEX_AUXILIARY_FILE_NAME);
         let aux_writer = object_store.create(&aux_file).await?;
         optimize_ivf_hnsw_indices(
-            dataset,
+            Arc::new(dataset),
             first_idx,
             hnsw_sq,
             vector_column,
@@ -319,6 +326,98 @@ pub(crate) async fn optimize_vector_indices(
     Ok((new_uuid, merged))
 }
 
+pub(crate) async fn optimize_vector_indices_v2(
+    dataset: &Dataset,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    vector_column: &str,
+    existing_indices: &[Arc<dyn Index>],
+    options: &OptimizeOptions,
+) -> Result<(Uuid, usize)> {
+    // Sanity check the indices
+    if existing_indices.is_empty() {
+        return Err(Error::Index {
+            message: "optimizing vector index: no existing index found".to_string(),
+            location: location!(),
+        });
+    }
+    let existing_indices = existing_indices
+        .iter()
+        .cloned()
+        .map(|idx| idx.as_vector_index())
+        .collect::<Result<Vec<_>>>()?;
+
+    let new_uuid = Uuid::new_v4();
+    let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+    let ivf_model = existing_indices[0].ivf_model();
+    let quantizer = existing_indices[0].quantizer();
+    let distance_type = existing_indices[0].metric_type();
+    let num_partitions = ivf_model.num_partitions();
+    let index_type = existing_indices[0].sub_index_type();
+
+    let temp_dir = tempfile::tempdir()?;
+    let temp_dir = temp_dir.path().to_str().unwrap().into();
+    let shuffler = Box::new(IvfShuffler::new(temp_dir, num_partitions));
+    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+        0
+    } else {
+        existing_indices.len() - options.num_indices_to_merge
+    };
+    let indices_to_merge = existing_indices[start_pos..].to_vec();
+    let merged_num = indices_to_merge.len();
+    match index_type {
+        (SubIndexType::Flat, QuantizationType::Flat) => {
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
+
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                None,
+                None,
+                // TODO: get the HNSW parameters from the existing indices
+                HnswBuildParams::default(),
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
+
+        (sub_index_type, quantizer_type) => {
+            return Err(Error::Index {
+                message: format!(
+                    "optimizing vector index: unsupported index type IVF_{}_{}",
+                    sub_index_type, quantizer_type
+                ),
+                location: location!(),
+            });
+        }
+    }
+
+    Ok((new_uuid, merged_num))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn optimize_ivf_pq_indices(
     first_idx: &IVFIndex,
@@ -334,8 +433,8 @@ async fn optimize_ivf_pq_indices(
     let dim = first_idx.ivf.dimension();
 
     // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
-    let ivf = lance_index::vector::ivf::Ivf::with_pq(
-        first_idx.ivf.centroids.clone(),
+    let ivf = lance_index::vector::ivf::IvfTransformer::with_pq(
+        first_idx.ivf.centroids.clone().unwrap(),
         metric_type,
         vector_column,
         pq_index.pq.clone(),
@@ -343,10 +442,10 @@ async fn optimize_ivf_pq_indices(
     );
 
     // Shuffled un-indexed data with partition.
-    let shuffled = if let Some(stream) = unindexed {
-        Some(
+    let shuffled = match unindexed {
+        Some(unindexed) => Some(
             shuffle_dataset(
-                stream,
+                unindexed,
                 vector_column,
                 ivf.into(),
                 None,
@@ -356,12 +455,11 @@ async fn optimize_ivf_pq_indices(
                 None,
             )
             .await?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
 
-    let mut ivf_mut = Ivf::new(first_idx.ivf.centroids.clone());
+    let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap());
 
     let start_pos = if options.num_indices_to_merge > existing_indices.len() {
         0
@@ -402,7 +500,7 @@ async fn optimize_ivf_pq_indices(
 
 #[allow(clippy::too_many_arguments)]
 async fn optimize_ivf_hnsw_indices<Q: Quantization>(
-    dataset: &Dataset,
+    dataset: Arc<dyn DatasetTakeRows>,
     first_idx: &IVFIndex,
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
@@ -414,8 +512,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 ) -> Result<usize> {
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
-    let ivf = lance_index::vector::ivf::new_ivf_with_quantizer(
-        first_idx.ivf.centroids.clone(),
+    let ivf = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+        first_idx.ivf.centroids.clone().unwrap(),
         distance_type,
         vector_column,
         quantizer.clone(),
@@ -423,10 +521,10 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     )?;
 
     // Shuffled un-indexed data with partition.
-    let shuffled = if let Some(stream) = unindexed {
-        Some(
+    let unindexed_data = match unindexed {
+        Some(unindexed) => Some(
             shuffle_dataset(
-                stream,
+                unindexed,
                 vector_column,
                 Arc::new(ivf),
                 None,
@@ -436,12 +534,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
                 None,
             )
             .await?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
 
-    let mut ivf_mut = Ivf::new(first_idx.ivf.centroids.clone());
+    let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap());
 
     let start_pos = if options.num_indices_to_merge > existing_indices.len() {
         0
@@ -460,8 +557,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         .collect::<Result<Vec<_>>>()?;
 
     // Prepare the HNSW writer
-    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
-    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
@@ -500,17 +596,9 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Write the metadata of quantizer
     let quantization_metadata = match &quantizer {
+        Quantizer::Flat(_) => None,
         Quantizer::Product(pq) => {
-            let mat = MatrixView::<Float32Type>::new(
-                Arc::new(
-                    pq.codebook_as_fsl()
-                        .values()
-                        .as_primitive::<Float32Type>()
-                        .clone(),
-                ),
-                pq.dimension(),
-            );
-            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
             aux_writer
                 .object_writer
@@ -543,7 +631,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         Some(&mut aux_writer),
         &mut ivf_mut,
         quantizer,
-        shuffled,
+        unindexed_data,
         Some(&indices_to_merge),
     )
     .await?;
@@ -552,12 +640,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     let hnsw_metadata_json = json!(hnsw_metadata);
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
-    // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::with_centroids(Arc::new(ivf_mut.centroids.clone()));
-    for length in ivf_mut.lengths {
-        ivf_data.add_partition(length);
-    }
-    ivf_data.write(&mut writer).await?;
+    ivf_mut.write(&mut writer).await?;
     writer.finish().await?;
 
     // Write the aux file
@@ -631,19 +714,22 @@ impl Index for IVFIndex {
         self
     }
 
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+        Ok(self)
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::Vector
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        let partitions_statistics = self
-            .ivf
-            .lengths
-            .iter()
-            .map(|&len| IvfIndexPartitionStatistics { size: len })
+        let partitions_statistics = (0..self.ivf.num_partitions())
+            .map(|part_id| IvfIndexPartitionStatistics {
+                size: self.ivf.partition_size(part_id) as u32,
+            })
             .collect::<Vec<_>>();
 
-        let centroid_vecs = centroids_to_vectors(&self.ivf.centroids)?;
+        let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
 
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type: "IVF".to_string(),
@@ -671,7 +757,7 @@ impl Index for IVFIndex {
 #[async_trait]
 impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
         if self.metric_type == MetricType::Cosine {
             let key = normalize_arrow(&query.key)?;
@@ -688,12 +774,14 @@ impl VectorIndex for IVFIndex {
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
-        let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| Error::IO {
-            message: format!(
-                "_distance column does not exist in batch: {}",
-                batch.schema()
-            ),
-            location: location!(),
+        let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| {
+            Error::io(
+                format!(
+                    "_distance column does not exist in batch: {}",
+                    batch.schema()
+                ),
+                location!(),
+            )
         })?;
 
         // TODO: Use a heap sort to get the top-k.
@@ -702,6 +790,34 @@ impl VectorIndex for IVFIndex {
         let struct_arr = StructArray::from(batch);
         let taken_distances = take(&struct_arr, &selection, None)?;
         Ok(as_struct_array(&taken_distances).into())
+    }
+
+    /// find the IVF partitions ids given the query vector.
+    ///
+    /// Internal API with no stability guarantees.
+    ///
+    /// Assumes the query vector is normalized if the metric type is cosine.
+    fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+        let mt = if self.metric_type == MetricType::Cosine {
+            MetricType::L2
+        } else {
+            self.metric_type
+        };
+
+        self.ivf.find_partitions(&query.key, query.nprobes, mt)
+    }
+
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        let part_index = self.load_partition(partition_id, true).await?;
+
+        let query = self.preprocess_query(partition_id, query)?;
+        let batch = part_index.search(&query, pre_filter).await?;
+        Ok(batch)
     }
 
     fn is_loadable(&self) -> bool {
@@ -728,7 +844,7 @@ impl VectorIndex for IVFIndex {
         })
     }
 
-    fn storage(&self) -> &dyn VectorStorage {
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
@@ -743,6 +859,19 @@ impl VectorIndex for IVFIndex {
             message: "Remapping IVF in this way not supported".to_string(),
             location: location!(),
         })
+    }
+
+    fn ivf_model(&self) -> IvfModel {
+        self.ivf.clone()
+    }
+
+    fn quantizer(&self) -> Quantizer {
+        unimplemented!("only for v2 IVFIndex")
+    }
+
+    /// the index type of this vector index.
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+        unimplemented!("only for v2 IVFIndex")
     }
 
     fn metric_type(&self) -> MetricType {
@@ -771,10 +900,10 @@ pub struct IvfPQIndexMetadata {
     pub(crate) metric_type: MetricType,
 
     /// IVF model
-    pub(crate) ivf: Ivf,
+    pub(crate) ivf: IvfModel,
 
     /// Product Quantizer
-    pub(crate) pq: Arc<dyn ProductQuantizer>,
+    pub(crate) pq: ProductQuantizer,
 
     /// Transforms to be applied before search.
     transforms: Vec<pb::Transform>,
@@ -802,9 +931,9 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 )?)),
             },
             pb::VectorIndexStage {
-                stage: Some(pb::vector_index_stage::Stage::Pq(
-                    idx.pq.as_ref().try_into()?,
-                )),
+                stage: Some(pb::vector_index_stage::Stage::Pq(pb::Pq::try_from(
+                    &idx.pq,
+                )?)),
             },
         ]);
 
@@ -827,123 +956,16 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
         })
     }
 }
-/// Ivf Model
-#[derive(Debug, Clone)]
-pub(crate) struct Ivf {
-    /// Centroids of each partition.
-    ///
-    /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
-    /// memory allocator.
-    pub(crate) centroids: FixedSizeListArray,
-
-    /// Offset of each partition in the file.
-    offsets: Vec<usize>,
-
-    /// Number of vectors in each partition.
-    lengths: Vec<u32>,
-}
-
-impl Ivf {
-    pub(super) fn new(centroids: FixedSizeListArray) -> Self {
-        Self {
-            centroids,
-            offsets: vec![],
-            lengths: vec![],
-        }
-    }
-
-    /// Ivf model dimension.
-    pub(super) fn dimension(&self) -> usize {
-        self.centroids.value_length() as usize
-    }
-
-    /// Number of IVF partitions.
-    fn num_partitions(&self) -> usize {
-        self.centroids.len()
-    }
-
-    /// Use the query vector to find `nprobes` closest partitions.
-    fn find_partitions(
-        &self,
-        query: &dyn Array,
-        nprobes: usize,
-        metric_type: MetricType,
-    ) -> Result<UInt32Array> {
-        let internal =
-            lance_index::vector::ivf::new_ivf(self.centroids.clone(), metric_type, vec![]);
-        internal.find_partitions(query, nprobes)
-    }
-
-    /// Add the offset and length of one partition.
-    pub(super) fn add_partition(&mut self, offset: usize, len: u32) {
-        self.offsets.push(offset);
-        self.lengths.push(len);
-    }
-}
-
-/// Convert IvfModel to protobuf.
-impl TryFrom<&Ivf> for pb::Ivf {
-    type Error = Error;
-
-    fn try_from(ivf: &Ivf) -> Result<Self> {
-        if ivf.offsets.len() != ivf.centroids.len() {
-            return Err(Error::IO {
-                message: "Ivf model has not been populated".to_string(),
-                location: location!(),
-            });
-        }
-        Ok(Self {
-            centroids: vec![],
-            offsets: ivf.offsets.iter().map(|o| *o as u64).collect(),
-            lengths: ivf.lengths.clone(),
-            centroids_tensor: Some((&ivf.centroids).try_into()?),
-        })
-    }
-}
-
-/// Convert IvfModel to protobuf.
-impl TryFrom<&pb::Ivf> for Ivf {
-    type Error = Error;
-
-    fn try_from(proto: &pb::Ivf) -> Result<Self> {
-        let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
-            debug!("Ivf: loading IVF centroids from index format v2");
-            FixedSizeListArray::try_from(tensor)?
-        } else {
-            debug!("Ivf: loading IVF centroids from index format v1");
-            // For backward-compatibility
-            let f32_centroids = Float32Array::from(proto.centroids.clone());
-            let dimension = f32_centroids.len() / proto.lengths.len();
-            FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?
-        };
-
-        let mut ivf = Self {
-            centroids,
-            offsets: proto.offsets.iter().map(|o| *o as usize).collect(),
-            lengths: proto.lengths.clone(),
-        };
-
-        if ivf.offsets.is_empty() && !ivf.lengths.is_empty() {
-            let mut offset = 0;
-            for len in &ivf.lengths {
-                ivf.offsets.push(offset);
-                offset += *len as usize;
-            }
-        }
-
-        Ok(ivf)
-    }
-}
 
 fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     let Some(field) = dataset.schema().field(column) else {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "Building index: column {} does not exist in dataset: {:?}",
                 column, dataset
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
         if !elem_type.data_type().is_floating() {
@@ -1022,13 +1044,13 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
 ///
 /// Visibility: pub(super) for testing
 #[instrument(level = "debug", skip_all, name = "build_ivf_model")]
-pub(super) async fn build_ivf_model(
+pub async fn build_ivf_model(
     dataset: &Dataset,
     column: &str,
     dim: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
-) -> Result<Ivf> {
+) -> Result<IvfModel> {
     if let Some(centroids) = params.centroids.as_ref() {
         info!("Pre-computed IVF centroids is provided, skip IVF training");
         if centroids.values().len() != params.num_partitions * dim {
@@ -1041,7 +1063,7 @@ pub(super) async fn build_ivf_model(
                 location: location!(),
             });
         }
-        return Ok(Ivf::new(centroids.as_ref().clone()));
+        return Ok(IvfModel::new(centroids.as_ref().clone()));
     }
     let sample_size_hint = params.num_partitions * params.sample_rate;
 
@@ -1081,7 +1103,7 @@ async fn build_ivf_model_and_pq(
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
-) -> Result<(Ivf, Arc<dyn ProductQuantizer>)> {
+) -> Result<(IvfModel, ProductQuantizer)> {
     sanity_check_params(ivf_params, pq_params)?;
 
     info!(
@@ -1115,40 +1137,6 @@ async fn build_ivf_model_and_pq(
     Ok((ivf_model, pq))
 }
 
-async fn build_ivf_model_and_sq(
-    dataset: &Dataset,
-    column: &str,
-    metric_type: MetricType,
-    ivf_params: &IvfBuildParams,
-    sq_params: &SQBuildParams,
-) -> Result<(Ivf, ScalarQuantizer)> {
-    sanity_check_ivf_params(ivf_params)?;
-
-    info!(
-        "Building vector index: IVF{},SQ{}, metric={}",
-        ivf_params.num_partitions, sq_params.num_bits, metric_type,
-    );
-
-    let field = sanity_check(dataset, column)?;
-    let dim = if let DataType::FixedSizeList(_, d) = field.data_type() {
-        d as usize
-    } else {
-        return Err(Error::Index {
-            message: format!(
-                "VectorIndex requires the column data type to be fixed size list of floats, got {}",
-                field.data_type()
-            ),
-            location: location!(),
-        });
-    };
-
-    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
-
-    let sq = build_sq_model(dataset, column, metric_type, sq_params).await?;
-
-    Ok((ivf_model, sq))
-}
-
 async fn scan_index_field_stream(
     dataset: &Dataset,
     column: &str,
@@ -1166,7 +1154,11 @@ async fn load_precomputed_partitions_if_available(
     match &ivf_params.precomputed_partitons_file {
         Some(file) => {
             info!("Loading precomputed partitions from file: {}", file);
-            let ds = DatasetBuilder::from_uri(file).load().await?;
+            let mut builder = DatasetBuilder::from_uri(file);
+            if let Some(storage_options) = &ivf_params.storage_options {
+                builder = builder.with_storage_options(storage_options.clone());
+            }
+            let ds = builder.load().await?;
             let stream = ds.scan().try_into_stream().await?;
             Ok(Some(
                 load_precomputed_partitions(stream, ds.count_rows(None).await?).await?,
@@ -1243,41 +1235,6 @@ pub async fn build_ivf_hnsw_pq_index(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn build_ivf_hnsw_sq_index(
-    dataset: &Dataset,
-    column: &str,
-    index_name: &str,
-    uuid: &str,
-    metric_type: MetricType,
-    ivf_params: &IvfBuildParams,
-    hnsw_params: &HnswBuildParams,
-    sq_params: &SQBuildParams,
-) -> Result<()> {
-    let (ivf_model, sq) =
-        build_ivf_model_and_sq(dataset, column, metric_type, ivf_params, sq_params).await?;
-    let stream = scan_index_field_stream(dataset, column).await?;
-    let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
-
-    write_ivf_hnsw_file(
-        dataset,
-        column,
-        index_name,
-        uuid,
-        &[],
-        ivf_model,
-        Quantizer::Scalar(sq),
-        metric_type,
-        hnsw_params,
-        stream,
-        precomputed_partitions,
-        ivf_params.shuffle_partition_batches,
-        ivf_params.shuffle_partition_concurrency,
-        ivf_params.precomputed_shuffle_buffers.clone(),
-    )
-    .await
-}
-
 struct RemapPageTask {
     offset: usize,
     length: u32,
@@ -1310,7 +1267,7 @@ impl RemapPageTask {
         Ok(self)
     }
 
-    async fn write(self, writer: &mut ObjectWriter, ivf: &mut Ivf) -> Result<()> {
+    async fn write(self, writer: &mut ObjectWriter, ivf: &mut IvfModel) -> Result<()> {
         let page = self.page.as_ref().expect("Load was not called");
         let page: &PQIndex = page
             .as_any()
@@ -1360,7 +1317,7 @@ pub(crate) async fn remap_index_file(
         .map(|task| task.load_and_remap(reader.clone(), index, mapping))
         .buffered(num_cpus::get());
 
-    let mut ivf = Ivf {
+    let mut ivf = IvfModel {
         centroids: index.ivf.centroids.clone(),
         offsets: Vec::with_capacity(index.ivf.offsets.len()),
         lengths: Vec::with_capacity(index.ivf.lengths.len()),
@@ -1408,8 +1365,8 @@ async fn write_ivf_pq_file(
     index_name: &str,
     uuid: &str,
     transformers: &[Box<dyn Transformer>],
-    mut ivf: Ivf,
-    pq: Arc<dyn ProductQuantizer>,
+    mut ivf: IvfModel,
+    pq: ProductQuantizer,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<HashMap<u64, u32>>,
@@ -1449,7 +1406,7 @@ async fn write_ivf_pq_file(
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),
         column: column.to_string(),
-        dimension: pq.dimension() as u32,
+        dimension: pq.dimension as u32,
         dataset_version: dataset.version().version,
         metric_type,
         ivf,
@@ -1474,7 +1431,7 @@ async fn write_ivf_hnsw_file(
     _index_name: &str,
     uuid: &str,
     _transformers: &[Box<dyn Transformer>],
-    mut ivf: Ivf,
+    mut ivf: IvfModel,
     quantizer: Quantizer,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
@@ -1488,8 +1445,7 @@ async fn write_ivf_hnsw_file(
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let writer = object_store.create(&path).await?;
 
-    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
-    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
@@ -1532,17 +1488,9 @@ async fn write_ivf_hnsw_file(
 
     // For PQ, we need to store the codebook
     let quantization_metadata = match &quantizer {
+        Quantizer::Flat(_) => None,
         Quantizer::Product(pq) => {
-            let mat = MatrixView::<Float32Type>::new(
-                Arc::new(
-                    pq.codebook_as_fsl()
-                        .values()
-                        .as_primitive::<Float32Type>()
-                        .clone(),
-                ),
-                pq.dimension(),
-            );
-            let codebook_tensor = pb::Tensor::from(&mat);
+            let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
             aux_writer
                 .object_writer
@@ -1569,7 +1517,7 @@ async fn write_ivf_hnsw_file(
     let num_partitions = ivf.num_partitions() as u32;
 
     let (hnsw_metadata, aux_ivf) = builder::build_hnsw_partitions(
-        dataset,
+        Arc::new(dataset.clone()),
         &mut writer,
         Some(&mut aux_writer),
         stream,
@@ -1591,12 +1539,7 @@ async fn write_ivf_hnsw_file(
     let hnsw_metadata_json = json!(hnsw_metadata);
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
-    // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::with_centroids(Arc::new(ivf.centroids.clone()));
-    for length in ivf.lengths {
-        ivf_data.add_partition(length);
-    }
-    ivf_data.write(&mut writer).await?;
+    ivf.write(&mut writer).await?;
     writer.finish().await?;
 
     // Write the aux file
@@ -1610,7 +1553,7 @@ async fn do_train_ivf_model<T: ArrowFloatType + 'static>(
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
-) -> Result<Ivf>
+) -> Result<IvfModel>
 where
     T::Native: Dot + L2 + Normalize,
 {
@@ -1627,7 +1570,7 @@ where
         params.sample_rate,
     )
     .await?;
-    Ok(Ivf::new(FixedSizeListArray::try_new_from_values(
+    Ok(IvfModel::new(FixedSizeListArray::try_new_from_values(
         centroids,
         dimension as i32,
     )?))
@@ -1636,25 +1579,31 @@ where
 /// Train IVF partitions using kmeans.
 async fn train_ivf_model(
     data: &FixedSizeListArray,
-    metric_type: MetricType,
+    distance_type: DistanceType,
     params: &IvfBuildParams,
-) -> Result<Ivf> {
+) -> Result<IvfModel> {
     assert!(
-        metric_type != MetricType::Cosine,
+        distance_type != DistanceType::Cosine,
         "Cosine metric should be done by normalized L2 distance",
     );
     let values = data.values();
     let dim = data.value_length() as usize;
-    match values.data_type() {
-        DataType::Float16 => {
-            do_train_ivf_model::<Float16Type>(values.as_primitive(), dim, metric_type, params).await
+    match (values.data_type(), distance_type) {
+        (DataType::Float16, _) => {
+            do_train_ivf_model::<Float16Type>(values.as_primitive(), dim, distance_type, params)
+                .await
         }
-        DataType::Float32 => {
-            do_train_ivf_model::<Float32Type>(values.as_primitive(), dim, metric_type, params).await
+        (DataType::Float32, _) => {
+            do_train_ivf_model::<Float32Type>(values.as_primitive(), dim, distance_type, params)
+                .await
         }
-        DataType::Float64 => {
-            do_train_ivf_model::<Float64Type>(values.as_primitive(), dim, metric_type, params).await
+        (DataType::Float64, _) => {
+            do_train_ivf_model::<Float64Type>(values.as_primitive(), dim, distance_type, params)
+                .await
         }
+        // (DataType::UInt8, DistanceType::Hamming) => {
+        //     do_train_ivf_model::<UInt8Type>(values.as_primitive(), dim, distance_type, params).await
+        // }
         _ => Err(Error::Index {
             message: "Unsupported data type".to_string(),
             location: location!(),
@@ -1671,12 +1620,14 @@ mod tests {
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
-    use arrow_array::{RecordBatchIterator, RecordBatchReader, UInt64Array};
+    use arrow_array::{Float32Array, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::Field;
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
+    use lance_linalg::MatrixView;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
@@ -1684,6 +1635,7 @@ mod tests {
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
 
+    use crate::index::prefilter::DatasetPreFilter;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
     const DIM: usize = 32;
@@ -1853,7 +1805,7 @@ mod tests {
         async fn check_index<F: Fn(u64) -> Option<u64>>(
             &mut self,
             index: &IVFIndex,
-            prefilter: Arc<PreFilter>,
+            prefilter: Arc<dyn PreFilter>,
             ids_to_test: &[u64],
             row_id_map: F,
         ) {
@@ -1900,7 +1852,7 @@ mod tests {
         test_uri: &str,
         range: Range<f32>,
     ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range(1000 * DIM, range);
+        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
@@ -2063,7 +2015,7 @@ mod tests {
             fragment_bitmap: None,
         };
 
-        let prefilter = Arc::new(PreFilter::new(dataset.clone(), &[index_meta], None));
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);
@@ -2200,13 +2152,14 @@ mod tests {
         let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::L2, &ivf_params)
             .await
             .unwrap();
-        assert_eq!(2, ivf_model.centroids.len());
-        assert_eq!(32, ivf_model.centroids.value_length());
+        assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
+        assert_eq!(32, ivf_model.centroids.as_ref().unwrap().value_length());
         assert_eq!(2, ivf_model.num_partitions());
 
         // All centroids values should be in the range [1000, 1100]
         ivf_model
             .centroids
+            .unwrap()
             .values()
             .as_primitive::<Float32Type>()
             .values()
@@ -2227,13 +2180,14 @@ mod tests {
         let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::Cosine, &ivf_params)
             .await
             .unwrap();
-        assert_eq!(2, ivf_model.centroids.len());
-        assert_eq!(32, ivf_model.centroids.value_length());
+        assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
+        assert_eq!(32, ivf_model.centroids.as_ref().unwrap().value_length());
         assert_eq!(2, ivf_model.num_partitions());
 
         // All centroids values should be in the range [1000, 1100]
         ivf_model
             .centroids
+            .unwrap()
             .values()
             .as_primitive::<Float32Type>()
             .values()
@@ -2507,25 +2461,6 @@ mod tests {
             .await
             .unwrap();
 
-        let indexes = dataset
-            .object_store()
-            .read_dir(dataset.indices_dir())
-            .await
-            .unwrap();
-        assert_eq!(indexes.len(), 1);
-
-        let uuid = &indexes[0];
-        let index_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_FILE_NAME);
-        let aux_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_AUXILIARY_FILE_NAME);
-        assert!(dataset.object_store().exists(&index_path).await.unwrap());
-        assert!(dataset.object_store().exists(&aux_path).await.unwrap());
-
         let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
         let query = vector_array.value(0);
         let query = query.as_primitive::<Float32Type>();
@@ -2565,101 +2500,6 @@ mod tests {
 
         let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
         let gt = ground_truth(&mat, query.values(), k, DistanceType::L2);
-
-        let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
-        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
-
-        let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
-        assert!(
-            recall >= 0.9,
-            "recall: {}\n results: {:?}\n\ngt: {:?}",
-            recall,
-            results,
-            gt,
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_ivf_hnsw_sq() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let nlist = 4;
-        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
-
-        let ivf_params = IvfBuildParams::new(nlist);
-        let sq_params = SQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
-        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::Cosine,
-            ivf_params,
-            hnsw_params,
-            sq_params,
-        );
-
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
-
-        let indexes = dataset
-            .object_store()
-            .read_dir(dataset.indices_dir())
-            .await
-            .unwrap();
-        assert_eq!(indexes.len(), 1);
-
-        let uuid = &indexes[0];
-        let index_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_FILE_NAME);
-        let aux_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_AUXILIARY_FILE_NAME);
-        assert!(dataset.object_store().exists(&index_path).await.unwrap());
-        assert!(dataset.object_store().exists(&aux_path).await.unwrap());
-
-        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
-        let query = vector_array.value(0);
-        let query = query.as_primitive::<Float32Type>();
-        let k = 100;
-        let results = dataset
-            .scan()
-            .with_row_id()
-            .nearest("vector", query, k)
-            .unwrap()
-            .nprobs(nlist)
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(1, results.len());
-        assert_eq!(k, results[0].num_rows());
-
-        let row_ids = results[0]
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .iter()
-            .map(|v| v.unwrap() as u32)
-            .collect::<Vec<_>>();
-        let dists = results[0]
-            .column_by_name("_distance")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-
-        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, DistanceType::Cosine);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
@@ -2689,7 +2529,7 @@ mod tests {
         let ivf_params =
             IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
 
-        let distance_type = MetricType::L2;
+        let distance_type = DistanceType::L2;
         let sq_params = SQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
@@ -2703,25 +2543,6 @@ mod tests {
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
-
-        let indexes = dataset
-            .object_store()
-            .read_dir(dataset.indices_dir())
-            .await
-            .unwrap();
-        assert_eq!(indexes.len(), 1);
-
-        let uuid = &indexes[0];
-        let index_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_FILE_NAME);
-        let aux_path = dataset
-            .indices_dir()
-            .child(uuid.as_str())
-            .child(INDEX_AUXILIARY_FILE_NAME);
-        assert!(dataset.object_store().exists(&index_path).await.unwrap());
-        assert!(dataset.object_store().exists(&aux_path).await.unwrap());
 
         let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
         let query = vector_array.value(0);
@@ -2761,7 +2582,7 @@ mod tests {
             .to_vec();
 
         let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, DistanceType::L2);
+        let gt = ground_truth(&mat, query.values(), k, distance_type);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
@@ -2812,6 +2633,8 @@ mod tests {
         assert!(ivf_idx
             .ivf
             .centroids
+            .as_ref()
+            .unwrap()
             .values()
             .as_primitive::<Float32Type>()
             .values()
@@ -2827,7 +2650,7 @@ mod tests {
         // PQ code is on residual space
         pq_idx
             .pq
-            .codebook_as_fsl()
+            .codebook
             .values()
             .as_primitive::<Float32Type>()
             .values()

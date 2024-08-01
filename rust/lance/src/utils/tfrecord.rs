@@ -9,6 +9,7 @@
 use arrow::buffer::OffsetBuffer;
 use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::{ArrayRef, FixedSizeListArray, ListArray};
+use arrow_buffer::ArrowNativeType;
 use arrow_buffer::ScalarBuffer;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -62,10 +63,7 @@ pub async fn infer_tfrecord_schema(
     let mut records = RecordStream::<Example, _>::from_reader(data, Default::default());
     let mut i = 0;
     while let Some(record) = records.next().await {
-        let record = record.map_err(|err| Error::IO {
-            message: err.to_string(),
-            location: location!(),
-        })?;
+        let record = record.map_err(|err| Error::io(err.to_string(), location!()))?;
 
         if let Some(features) = record.features {
             for (name, feature) in features.feature {
@@ -200,24 +198,24 @@ impl FeatureMeta {
                 FeatureType::Binary => FeatureType::Binary,
                 FeatureType::Tensor { .. } => Self::extract_tensor(data.value[0].as_slice())?,
                 _ => {
-                    return Err(Error::IO {
-                        message: format!(
+                    return Err(Error::io(
+                        format!(
                             "Data type mismatch: expected {:?}, got {:?}",
                             self.feature_type,
                             feature.kind.as_ref().unwrap()
                         ),
-                        location: location!(),
-                    })
+                        location!(),
+                    ))
                 }
             },
             Kind::FloatList(_) => FeatureType::Float,
             Kind::Int64List(_) => FeatureType::Integer,
         };
         if self.feature_type != feature_type {
-            return Err(Error::IO {
-                message: format!("inconsistent feature type for field {:?}", feature_type),
-                location: location!(),
-            });
+            return Err(Error::io(
+                format!("inconsistent feature type for field {:?}", feature_type),
+                location!(),
+            ));
         }
         if feature_is_repeated(feature) {
             self.repeated = true;
@@ -254,10 +252,10 @@ fn tensor_dtype_to_arrow(tensor_dtype: &TensorDataType) -> Result<DataType> {
         TensorDataType::DtFloat => DataType::Float32,
         TensorDataType::DtDouble => DataType::Float64,
         _ => {
-            return Err(Error::IO {
-                message: format!("unsupported tensor data type {:?}", tensor_dtype),
-                location: location!(),
-            });
+            return Err(Error::io(
+                format!("unsupported tensor data type {:?}", tensor_dtype),
+                location!(),
+            ));
         }
     })
 }
@@ -533,10 +531,10 @@ fn convert_leaf(
         TypeInfo {
             fsl_size: Some(_), ..
         } => convert_fixedshape_tensor(&features, type_info)?,
-        _ => Err(Error::IO {
-            message: format!("unsupported type {:?}", type_info.leaf_type),
-            location: location!(),
-        })?,
+        _ => Err(Error::io(
+            format!("unsupported type {:?}", type_info.leaf_type),
+            location!(),
+        ))?,
     };
 
     Ok((values, offsets))
@@ -716,10 +714,10 @@ fn convert_fixedshape_tensor(
             }
             Arc::new(values.finish())
         }
-        _ => Err(Error::IO {
-            message: format!("unsupported type {:?}", type_info.leaf_type),
-            location: location!(),
-        })?,
+        _ => Err(Error::io(
+            format!("unsupported type {:?}", type_info.leaf_type),
+            location!(),
+        ))?,
     };
 
     Ok((values, offsets))
@@ -729,26 +727,26 @@ fn validate_tensor(tensor: &TensorProto, type_info: &TypeInfo) -> Result<()> {
     let tensor_shape = tensor.tensor_shape.as_ref().unwrap();
     let length = tensor_shape.dim.iter().map(|d| d.size as i32).product();
     if type_info.fsl_size != Some(length) {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "tensor length mismatch: expected {}, got {}",
                 type_info.fsl_size.unwrap(),
                 length
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
 
     let data_type = tensor_dtype_to_arrow(&tensor.dtype())?;
     if data_type != type_info.leaf_type {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "tensor type mismatch: expected {:?}, got {:?}",
                 type_info.leaf_type,
                 tensor.dtype()
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
 
     Ok(())
@@ -767,13 +765,13 @@ fn append_primitive_from_slice<T>(
     // TensorProto to tell us the original endianness, so it's possible there
     // could be a mismatch here.
     let (prefix, middle, suffix) = unsafe { slice.align_to::<T::Native>() };
-    for val in prefix.chunks_exact(T::get_byte_width()) {
+    for val in prefix.chunks_exact(T::Native::get_byte_width()) {
         builder.append_value(parse_val(val));
     }
 
     builder.append_slice(middle);
 
-    for val in suffix.chunks_exact(T::get_byte_width()) {
+    for val in suffix.chunks_exact(T::Native::get_byte_width()) {
         builder.append_value(parse_val(val));
     }
 }

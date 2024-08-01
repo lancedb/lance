@@ -7,8 +7,12 @@ use std::fmt::Formatter;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+#[cfg(target_arch = "loongarch64")]
+use std::arch::loongarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "loongarch64")]
+use std::mem::transmute;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
 use super::{FloatSimd, SIMD};
@@ -24,6 +28,12 @@ pub struct f32x8(std::arch::x86_64::__m256);
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 pub struct f32x8(float32x4x2_t);
+
+/// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
+#[allow(non_camel_case_types)]
+#[cfg(target_arch = "loongarch64")]
+#[derive(Clone, Copy)]
+pub struct f32x8(v8f32);
 
 impl std::fmt::Debug for f32x8 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -63,6 +73,24 @@ impl f32x8 {
             ];
             Self::load_unaligned(values.as_ptr())
         }
+
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            // loongarch64 does not have relevant SIMD instructions.
+            let ptr = slice.as_ptr();
+
+            let values = [
+                *ptr.add(indices[0] as usize),
+                *ptr.add(indices[1] as usize),
+                *ptr.add(indices[2] as usize),
+                *ptr.add(indices[3] as usize),
+                *ptr.add(indices[4] as usize),
+                *ptr.add(indices[5] as usize),
+                *ptr.add(indices[6] as usize),
+                *ptr.add(indices[7] as usize),
+            ];
+            Self::load_unaligned(values.as_ptr())
+        }
     }
 }
 
@@ -88,6 +116,10 @@ impl SIMD<f32, 8> for f32x8 {
         unsafe {
             Self(float32x4x2_t(vdupq_n_f32(val), vdupq_n_f32(val)))
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(transmute(lasx_xvreplgr2vr_w(transmute(val))))
+        }
     }
 
     fn zeros() -> Self {
@@ -96,7 +128,13 @@ impl SIMD<f32, 8> for f32x8 {
             Self(_mm256_setzero_ps())
         }
         #[cfg(target_arch = "aarch64")]
-        Self::splat(0.0)
+        {
+            Self::splat(0.0)
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            Self::splat(0.0)
+        }
     }
 
     #[inline]
@@ -106,7 +144,13 @@ impl SIMD<f32, 8> for f32x8 {
             Self(_mm256_load_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
-        Self::load_unaligned(ptr)
+        {
+            Self::load_unaligned(ptr)
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            Self(transmute(lasx_xvld::<0>(transmute(ptr))))
+        }
     }
 
     #[inline]
@@ -116,7 +160,13 @@ impl SIMD<f32, 8> for f32x8 {
             Self(_mm256_loadu_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
-        Self(vld1q_f32_x2(ptr))
+        {
+            Self(vld1q_f32_x2(ptr))
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            Self(transmute(lasx_xvld::<0>(transmute(ptr))))
+        }
     }
 
     unsafe fn store(&self, ptr: *mut f32) {
@@ -128,6 +178,10 @@ impl SIMD<f32, 8> for f32x8 {
         unsafe {
             vst1q_f32_x2(ptr, self.0);
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            lasx_xvst::<0>(transmute(self.0), transmute(ptr));
+        }
     }
 
     unsafe fn store_unaligned(&self, ptr: *mut f32) {
@@ -138,6 +192,10 @@ impl SIMD<f32, 8> for f32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             vst1q_f32_x2(ptr, self.0);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            lasx_xvst::<0>(transmute(self.0), transmute(ptr));
         }
     }
 
@@ -163,6 +221,10 @@ impl SIMD<f32, 8> for f32x8 {
             let sum = vaddq_f32(self.0 .0, self.0 .1);
             vaddvq_f32(sum)
         }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            self.as_array().iter().sum()
+        }
     }
 
     fn reduce_min(&self) -> f32 {
@@ -177,15 +239,25 @@ impl SIMD<f32, 8> for f32x8 {
                 min = _mm256_min_ps(min, shift);
                 shift = _mm256_permute_ps(min, 14);
                 min = _mm256_min_ps(min, shift);
-                let mut results: [f32; 8] = [0f32; 8];
-                _mm256_storeu_ps(results.as_mut_ptr(), min);
-                results[0]
+                shift = _mm256_permute_ps(min, 1);
+                min = _mm256_min_ps(min, shift);
+                _mm256_cvtss_f32(min)
             }
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let m = vminq_f32(self.0 .0, self.0 .1);
             vminvq_f32(m)
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            let m1 = lasx_xvpermi_d::<14>(transmute(self.0));
+            let m2 = lasx_xvfmin_s(transmute(m1), self.0);
+            let m1 = lasx_xvpermi_w::<14>(transmute(m2), transmute(m2));
+            let m2 = lasx_xvfmin_s(transmute(m1), transmute(m2));
+            let m1 = lasx_xvpermi_w::<1>(transmute(m2), transmute(m2));
+            let m2 = lasx_xvfmin_s(transmute(m1), transmute(m2));
+            transmute(lasx_xvpickve2gr_w::<0>(transmute(m2)))
         }
     }
 
@@ -200,6 +272,10 @@ impl SIMD<f32, 8> for f32x8 {
                 vminq_f32(self.0 .0, rhs.0 .0),
                 vminq_f32(self.0 .1, rhs.0 .1),
             ))
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvfmin_s(self.0, rhs.0))
         }
     }
 
@@ -235,6 +311,14 @@ impl SIMD<f32, 8> for f32x8 {
                 }
             }
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            for i in 0..8 {
+                if self.as_array().get_unchecked(i) == &val {
+                    return Some(i as i32);
+                }
+            }
+        }
         None
     }
 }
@@ -249,6 +333,10 @@ impl FloatSimd<f32, 8> for f32x8 {
         unsafe {
             self.0 .0 = vfmaq_f32(self.0 .0, a.0 .0, b.0 .0);
             self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            self.0 = lasx_xvfmadd_s(a.0, b.0, self.0);
         }
     }
 }
@@ -269,6 +357,10 @@ impl Add for f32x8 {
                 vaddq_f32(self.0 .1, rhs.0 .1),
             ))
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvfadd_s(self.0, rhs.0))
+        }
     }
 }
 
@@ -283,6 +375,10 @@ impl AddAssign for f32x8 {
         unsafe {
             self.0 .0 = vaddq_f32(self.0 .0, rhs.0 .0);
             self.0 .1 = vaddq_f32(self.0 .1, rhs.0 .1);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            self.0 = lasx_xvfadd_s(self.0, rhs.0);
         }
     }
 }
@@ -303,6 +399,10 @@ impl Sub for f32x8 {
                 vsubq_f32(self.0 .1, rhs.0 .1),
             ))
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvfsub_s(self.0, rhs.0))
+        }
     }
 }
 
@@ -317,6 +417,10 @@ impl SubAssign for f32x8 {
         unsafe {
             self.0 .0 = vsubq_f32(self.0 .0, rhs.0 .0);
             self.0 .1 = vsubq_f32(self.0 .1, rhs.0 .1);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            self.0 = lasx_xvfsub_s(self.0, rhs.0);
         }
     }
 }
@@ -337,6 +441,10 @@ impl Mul for f32x8 {
                 vmulq_f32(self.0 .1, rhs.0 .1),
             ))
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvfmul_s(self.0, rhs.0))
+        }
     }
 }
 
@@ -355,6 +463,12 @@ pub struct f32x16(__m512);
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 pub struct f32x16(float32x4x4_t);
+
+/// 16 of 32-bit `f32` values. Use 256-bit SIMD
+#[allow(non_camel_case_types)]
+#[cfg(target_arch = "loongarch64")]
+#[derive(Clone, Copy)]
+pub struct f32x16(v8f32, v8f32);
 
 impl std::fmt::Debug for f32x16 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -399,6 +513,13 @@ impl SIMD<f32, 16> for f32x16 {
                 vdupq_n_f32(val),
             ))
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(
+                transmute(lasx_xvreplgr2vr_w(transmute(val))),
+                transmute(lasx_xvreplgr2vr_w(transmute(val))),
+            )
+        }
     }
 
     #[inline]
@@ -412,7 +533,13 @@ impl SIMD<f32, 16> for f32x16 {
             Self(_mm256_setzero_ps(), _mm256_setzero_ps())
         }
         #[cfg(target_arch = "aarch64")]
-        Self::splat(0.0)
+        {
+            Self::splat(0.0)
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            Self::splat(0.0)
+        }
     }
 
     #[inline]
@@ -426,7 +553,16 @@ impl SIMD<f32, 16> for f32x16 {
             Self(_mm512_load_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
-        Self::load_unaligned(ptr)
+        {
+            Self::load_unaligned(ptr)
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            Self(
+                transmute(lasx_xvld::<0>(transmute(ptr))),
+                transmute(lasx_xvld::<32>(transmute(ptr))),
+            )
+        }
     }
 
     #[inline]
@@ -440,7 +576,16 @@ impl SIMD<f32, 16> for f32x16 {
             Self(_mm512_loadu_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
-        Self(vld1q_f32_x4(ptr))
+        {
+            Self(vld1q_f32_x4(ptr))
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            Self(
+                transmute(lasx_xvld::<0>(transmute(ptr))),
+                transmute(lasx_xvld::<32>(transmute(ptr))),
+            )
+        }
     }
 
     #[inline]
@@ -457,6 +602,11 @@ impl SIMD<f32, 16> for f32x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             vst1q_f32_x4(ptr, self.0);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            lasx_xvst::<0>(transmute(self.0), transmute(ptr));
+            lasx_xvst::<32>(transmute(self.1), transmute(ptr));
         }
     }
 
@@ -475,6 +625,11 @@ impl SIMD<f32, 16> for f32x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             vst1q_f32_x4(ptr, self.0);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            lasx_xvst::<0>(transmute(self.0), transmute(ptr));
+            lasx_xvst::<32>(transmute(self.1), transmute(ptr));
         }
     }
 
@@ -505,6 +660,10 @@ impl SIMD<f32, 16> for f32x16 {
             sum1 = vaddq_f32(sum1, sum2);
             vaddvq_f32(sum1)
         }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            self.as_array().iter().sum()
+        }
     }
 
     #[inline]
@@ -520,9 +679,9 @@ impl SIMD<f32, 16> for f32x16 {
             m1 = _mm256_min_ps(m1, m2);
             m2 = _mm256_permute_ps(m1, 14);
             m1 = _mm256_min_ps(m1, m2);
-            let mut results: [f32; 8] = [0f32; 8];
-            _mm256_storeu_ps(results.as_mut_ptr(), m1);
-            results[0]
+            m2 = _mm256_permute_ps(m1, 1);
+            m1 = _mm256_min_ps(m1, m2);
+            _mm256_cvtss_f32(m1)
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -531,6 +690,17 @@ impl SIMD<f32, 16> for f32x16 {
             let m2 = vminq_f32(self.0 .2, self.0 .3);
             let m = vminq_f32(m1, m2);
             vminvq_f32(m)
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            let m1 = lasx_xvfmin_s(self.0, self.1);
+            let m2 = lasx_xvpermi_d::<14>(transmute(m1));
+            let m1 = lasx_xvfmin_s(transmute(m1), transmute(m2));
+            let m2 = lasx_xvpermi_w::<14>(transmute(m1), transmute(m1));
+            let m1 = lasx_xvfmin_s(transmute(m1), transmute(m2));
+            let m2 = lasx_xvpermi_w::<1>(transmute(m1), transmute(m1));
+            let m1 = lasx_xvfmin_s(transmute(m1), transmute(m2));
+            transmute(lasx_xvpickve2gr_w::<0>(transmute(m1)))
         }
     }
 
@@ -552,6 +722,10 @@ impl SIMD<f32, 16> for f32x16 {
                 vminq_f32(self.0 .2, rhs.0 .2),
                 vminq_f32(self.0 .3, rhs.0 .3),
             ))
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvfmin_s(self.0, rhs.0), lasx_xvfmin_s(self.1, rhs.1))
         }
     }
 
@@ -596,6 +770,15 @@ impl SIMD<f32, 16> for f32x16 {
             }
             None
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            for i in 0..16 {
+                if self.as_array().get_unchecked(i) == &val {
+                    return Some(i as i32);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -617,6 +800,11 @@ impl FloatSimd<f32, 16> for f32x16 {
             self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
             self.0 .2 = vfmaq_f32(self.0 .2, a.0 .2, b.0 .2);
             self.0 .3 = vfmaq_f32(self.0 .3, a.0 .3, b.0 .3);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            self.0 = lasx_xvfmadd_s(a.0, b.0, self.0);
+            self.1 = lasx_xvfmadd_s(a.1, b.1, self.1);
         }
     }
 }
@@ -643,6 +831,10 @@ impl Add for f32x16 {
                 vaddq_f32(self.0 .3, rhs.0 .3),
             ))
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvfadd_s(self.0, rhs.0), lasx_xvfadd_s(self.1, rhs.1))
+        }
     }
 }
 
@@ -664,6 +856,11 @@ impl AddAssign for f32x16 {
             self.0 .1 = vaddq_f32(self.0 .1, rhs.0 .1);
             self.0 .2 = vaddq_f32(self.0 .2, rhs.0 .2);
             self.0 .3 = vaddq_f32(self.0 .3, rhs.0 .3);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            self.0 = lasx_xvfadd_s(self.0, rhs.0);
+            self.1 = lasx_xvfadd_s(self.1, rhs.1);
         }
     }
 }
@@ -690,6 +887,10 @@ impl Mul for f32x16 {
                 vmulq_f32(self.0 .3, rhs.0 .3),
             ))
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvfmul_s(self.0, rhs.0), lasx_xvfmul_s(self.1, rhs.1))
+        }
     }
 }
 
@@ -715,6 +916,10 @@ impl Sub for f32x16 {
                 vsubq_f32(self.0 .3, rhs.0 .3),
             ))
         }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvfsub_s(self.0, rhs.0), lasx_xvfsub_s(self.1, rhs.1))
+        }
     }
 }
 
@@ -736,6 +941,11 @@ impl SubAssign for f32x16 {
             self.0 .1 = vsubq_f32(self.0 .1, rhs.0 .1);
             self.0 .2 = vsubq_f32(self.0 .2, rhs.0 .2);
             self.0 .3 = vsubq_f32(self.0 .3, rhs.0 .3);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            self.0 = lasx_xvfsub_s(self.0, rhs.0);
+            self.1 = lasx_xvfsub_s(self.1, rhs.1);
         }
     }
 }
@@ -782,8 +992,10 @@ mod tests {
     fn test_f32x8_cmp_ops() {
         let a = [1.0_f32, 2.0, 5.0, 6.0, 7.0, 3.0, 2.0, 1.0];
         let b = [2.0_f32, 1.0, 4.0, 5.0, 9.0, 5.0, 6.0, 2.0];
+        let c = [2.0_f32, 1.0, 4.0, 5.0, 7.0, 3.0, 2.0, 1.0];
         let simd_a: f32x8 = (&a).into();
         let simd_b: f32x8 = (&b).into();
+        let simd_c: f32x8 = (&c).into();
 
         let min_simd = simd_a.min(&simd_b);
         assert_eq!(
@@ -791,6 +1003,8 @@ mod tests {
             [1.0, 1.0, 4.0, 5.0, 7.0, 3.0, 2.0, 1.0]
         );
         let min_val = min_simd.reduce_min();
+        assert_eq!(min_val, 1.0);
+        let min_val = simd_c.reduce_min();
         assert_eq!(min_val, 1.0);
 
         assert_eq!(Some(2), simd_a.find(5.0));
@@ -836,8 +1050,12 @@ mod tests {
         let b = [
             2.0_f32, 1.0, 4.0, 5.0, 9.0, 5.0, 6.0, 2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 2.0, 1.0,
         ];
+        let c = [
+            1.0_f32, 1.0, 4.0, 5.0, 7.0, 3.0, 2.0, 1.0, -0.5, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, -1.0,
+        ];
         let simd_a: f32x16 = (&a).into();
         let simd_b: f32x16 = (&b).into();
+        let simd_c: f32x16 = (&c).into();
 
         let min_simd = simd_a.min(&simd_b);
         assert_eq!(
@@ -846,6 +1064,8 @@ mod tests {
         );
         let min_val = min_simd.reduce_min();
         assert_eq!(min_val, -0.5);
+        let min_val = simd_c.reduce_min();
+        assert_eq!(min_val, -1.0);
 
         assert_eq!(Some(2), simd_a.find(5.0));
         assert_eq!(Some(1), simd_a.find(2.0));

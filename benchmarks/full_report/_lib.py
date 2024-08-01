@@ -6,9 +6,6 @@ from pathlib import Path
 from typing import List
 
 import gzip
-import lance
-import numpy as np
-import pyarrow as pa
 import requests
 
 
@@ -33,15 +30,15 @@ def cosine(X, Y):
 def knn(
     query: np.ndarray,
     data: np.ndarray,
-    metric: Literal['L2', 'cosine'],
+    metric: Literal["L2", "cosine"],
     k: int,
 ) -> np.ndarray:
-    if metric == 'L2':
+    if metric == "L2":
         dist = l2
-    elif metric == 'cosine':
+    elif metric == "cosine":
         dist = cosine
     else:
-        raise ValueError('Invalid metric')
+        raise ValueError("Invalid metric")
     return np.argpartition(dist(query, data), k, axis=1)[:, 0:k]
 
 
@@ -51,10 +48,12 @@ def write_lance(
 ):
     dims = data.shape[1]
 
-    schema = pa.schema([
-        pa.field("vec", pa.list_(pa.float32(), dims)),
-        pa.field("id", pa.uint32(), False),
-    ])
+    schema = pa.schema(
+        [
+            pa.field("vec", pa.list_(pa.float32(), dims)),
+            pa.field("id", pa.uint32(), False),
+        ]
+    )
 
     fsl = pa.FixedSizeListArray.from_arrays(
         pa.array(data.reshape(-1).astype(np.float32), type=pa.float32()),
@@ -64,6 +63,7 @@ def write_lance(
     t = pa.Table.from_pydict({"vec": fsl, "id": ids}, schema)
 
     lance.write_dataset(t, path)
+
 
 # NYT
 
@@ -112,7 +112,8 @@ def _get_nyt_vectors(
     tfidf = TfidfTransformer().fit_transform(freq)
     print("computing dense projection")
     dense_projection = random_projection.GaussianRandomProjection(
-        n_components=output_dims, random_state=42,
+        n_components=output_dims,
+        random_state=42,
     ).fit_transform(tfidf)
     dense_projection = dense_projection.astype(np.float32)
     np.save(_CACHE_PATH, dense_projection)

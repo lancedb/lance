@@ -15,10 +15,11 @@
 package com.lancedb.lance;
 
 import java.io.Serializable;
+import org.apache.arrow.util.Preconditions;
 import org.json.JSONObject;
 
 /**
- * Metadata of a Fragment in the dataset. 
+ * Metadata of a Fragment in the dataset.
  * Matching to lance Fragment.
  * */
 public class FragmentMetadata implements Serializable {
@@ -38,7 +39,7 @@ public class FragmentMetadata implements Serializable {
   public int getId() {
     return id;
   }
-  
+
   public long getPhysicalRows() {
     return physicalRows;
   }
@@ -54,6 +55,7 @@ public class FragmentMetadata implements Serializable {
    * @return created fragment metadata
    */
   public static FragmentMetadata fromJson(String jsonMetadata) {
+    Preconditions.checkNotNull(jsonMetadata);
     JSONObject metadata = new JSONObject(jsonMetadata);
     if (!metadata.has(ID_KEY) || !metadata.has(PHYSICAL_ROWS_KEY)) {
       throw new IllegalArgumentException(

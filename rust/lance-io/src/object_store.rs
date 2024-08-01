@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
 use chrono::{DateTime, Utc};
+use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
@@ -26,16 +28,23 @@ use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredenti
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
 use snafu::{location, Location};
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::RwLock;
 use url::Url;
 
 use super::local::LocalObjectReader;
-mod gcs_wrapper;
 mod tracing;
-use self::gcs_wrapper::PatchedGoogleCloudStorage;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
+
+// Local disks tend to do fine with a few threads
+// Note: the number of threads here also impacts the number of files
+// we need to read in some situations.  So keeping this at 8 keeps the
+// RAM on our scanner down.
+pub const DEFAULT_LOCAL_IO_PARALLELISM: u32 = 8;
+// Cloud disks often need many many threads to saturate the network
+pub const DEFAULT_CLOUD_IO_PARALLELISM: u32 = 64;
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -83,8 +92,19 @@ pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
-    base_path: Path,
     block_size: usize,
+    pub use_constant_size_upload_parts: bool,
+    io_parallelism: u32,
+}
+
+impl DeepSizeOf for ObjectStore {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // We aren't counting `inner` here which is problematic but an ObjectStore
+        // shouldn't be too big.  The only exception might be the write cache but, if
+        // the writer cache has data, it means we're using it somewhere else that isn't
+        // a cache and so that doesn't really count.
+        self.scheme.deep_size_of_children(context) + self.block_size.deep_size_of_children(context)
+    }
 }
 
 impl std::fmt::Display for ObjectStore {
@@ -298,6 +318,11 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
+    /// Use constant size upload parts for multipart uploads. Only necessary
+    /// for Cloudflare R2, which doesn't support variable size parts. When this
+    /// is false, max upload size is 2.5TB. When this is true, the max size is
+    /// 50GB.
+    pub use_constant_size_upload_parts: bool,
 }
 
 impl Default for ObjectStoreParams {
@@ -309,6 +334,7 @@ impl Default for ObjectStoreParams {
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
+            use_constant_size_upload_parts: false,
         }
     }
 }
@@ -343,15 +369,14 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Self, Path)> {
-        let (object_store, base_path) = match Url::parse(uri) {
+        let (object_store, path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
                 Self::from_path(uri)
             }
             Ok(url) => {
                 let store = Self::new_from_url(url.clone(), params.clone()).await?;
-                let path = Path::from(url.path());
-                Ok((store, path))
+                Ok((store, Path::from(url.path())))
             }
             Err(_) => Self::from_path(uri),
         }?;
@@ -365,11 +390,11 @@ impl ObjectStore {
                     .unwrap_or(object_store.inner),
                 ..object_store
             },
-            base_path,
+            path,
         ))
     }
 
-    pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
+    pub fn from_path_with_scheme(str_path: &str, scheme: &str) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
 
         let mut expanded_path = path_abs::PathAbs::new(expanded)
@@ -385,12 +410,17 @@ impl ObjectStore {
         Ok((
             Self {
                 inner: Arc::new(LocalFileSystem::new()).traced(),
-                scheme: String::from("file"),
-                base_path: Path::from_absolute_path(expanded_path.as_path())?,
+                scheme: String::from(scheme),
                 block_size: 4 * 1024, // 4KB block size
+                use_constant_size_upload_parts: false,
+                io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             },
             Path::from_absolute_path(expanded_path.as_path())?,
         ))
+    }
+
+    pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
+        Self::from_path_with_scheme(str_path, "file")
     }
 
     async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
@@ -402,8 +432,9 @@ impl ObjectStore {
         Self {
             inner: Arc::new(LocalFileSystem::new()).traced(),
             scheme: String::from("file"),
-            base_path: Path::from("/"),
             block_size: 4 * 1024, // 4KB block size
+            use_constant_size_upload_parts: false,
+            io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
         }
     }
 
@@ -412,8 +443,9 @@ impl ObjectStore {
         Self {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            base_path: Path::from("/"),
             block_size: 64 * 1024,
+            use_constant_size_upload_parts: false,
+            io_parallelism: get_num_compute_intensive_cpus() as u32,
         }
     }
 
@@ -430,8 +462,24 @@ impl ObjectStore {
         self.block_size = new_size;
     }
 
-    pub fn base_path(&self) -> &Path {
-        &self.base_path
+    pub fn set_io_parallelism(&mut self, io_parallelism: u32) {
+        self.io_parallelism = io_parallelism;
+    }
+
+    pub fn io_parallelism(&self) -> Result<u32> {
+        std::env::var("LANCE_IO_THREADS")
+            .map(|val| {
+                val.parse::<u32>().map_err(|parse_err| {
+                    Error::invalid_input(
+                        format!(
+                            "The LANCE_IO_THREADS variable is not set to an integer: {}",
+                            parse_err
+                        ),
+                        location!(),
+                    )
+                })
+            })
+            .unwrap_or(Ok(self.io_parallelism))
     }
 
     /// Open a file for path.
@@ -440,11 +488,29 @@ impl ObjectStore {
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size).await,
+            "file" => LocalObjectReader::open(path, self.block_size, None).await,
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
+                None,
+            )?)),
+        }
+    }
+
+    /// Open a reader for a file with known size.
+    ///
+    /// This size may either have been retrieved from a list operation or
+    /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
+    /// call.
+    pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+        match self.scheme.as_str() {
+            "file" => LocalObjectReader::open(path, self.block_size, Some(known_size)).await,
+            _ => Ok(Box::new(CloudObjectReader::new(
+                self.inner.clone(),
+                path.clone(),
+                self.block_size,
+                Some(known_size),
             )?)),
         }
     }
@@ -465,11 +531,10 @@ impl ObjectStore {
 
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
-        ObjectWriter::new(self.inner.as_ref(), path).await
+        ObjectWriter::new(self, path).await
     }
 
     /// A helper function to create a file and write content to it.
-    ///
     pub async fn put(&self, path: &Path, content: &[u8]) -> Result<()> {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
@@ -690,6 +755,12 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             )
             .await?;
 
+            // Cloudflare does not support varying part sizes.
+            let use_constant_size_upload_parts = storage_options
+                .get(&AmazonS3ConfigKey::Endpoint)
+                .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
+                .unwrap_or(false);
+
             // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
             url.set_scheme("s3").map_err(|()| Error::Internal {
                 message: "could not set scheme".into(),
@@ -712,11 +783,11 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             Ok(ObjectStore {
                 inner: Arc::new(store),
                 scheme: String::from(url.scheme()),
-                base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                use_constant_size_upload_parts,
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             })
         }
-
         "gs" => {
             storage_options.with_env_gcs();
             let mut builder = GoogleCloudStorageBuilder::new().with_url(url.as_ref());
@@ -724,41 +795,50 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 builder = builder.with_config(key, value);
             }
             let store = builder.build()?;
-            // Temporary fix for having larger object sizes. Replace when
-            // object_store 0.10.0 is available.
-            let store = PatchedGoogleCloudStorage(Arc::new(store));
             let store = Arc::new(store);
+
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("gs"),
-                base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                use_constant_size_upload_parts: false,
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             })
         }
         "az" => {
             storage_options.with_env_azure();
-
             let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
             let store = Arc::new(store);
 
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("az"),
-                base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                use_constant_size_upload_parts: false,
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             })
         }
+        // we have a bypass logic to use `tokio::fs` directly to lower overhead
+        // however this makes testing harder as we can't use the same code path
+        // "file-object-store" forces local file system dataset to use the same
+        // code path as cloud object stores
         "file" => Ok(ObjectStore::from_path(url.path())?.0),
+        "file-object-store" => {
+            Ok(ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0)
+        }
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            base_path: Path::from(url.path()),
             block_size: 64 * 1024,
+            use_constant_size_upload_parts: false,
+            io_parallelism: get_num_compute_intensive_cpus() as u32,
         }),
-        s => Err(Error::IO {
-            message: format!("Unsupported URI scheme: {}", s),
-            location: location!(),
-        }),
+        unknown_scheme => {
+            let err = lance_core::Error::from(object_store::Error::NotSupported {
+                source: format!("Unsupported URI scheme: {}", unknown_scheme).into(),
+            });
+            Err(err)
+        }
     }
 }
 
@@ -768,6 +848,8 @@ impl ObjectStore {
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        use_constant_size_upload_parts: bool,
+        io_parallelism: u32,
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
@@ -780,8 +862,9 @@ impl ObjectStore {
         Self {
             inner: store,
             scheme: scheme.into(),
-            base_path: location.path().into(),
             block_size,
+            use_constant_size_upload_parts,
+            io_parallelism,
         }
     }
 }
@@ -871,6 +954,7 @@ lazy_static::lazy_static! {
         "gs",
         "az",
         "file",
+        "file-object-store",
         "memory"
       ]);
 }
@@ -922,6 +1006,26 @@ mod tests {
                 .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
         }
+    }
+
+    #[tokio::test]
+    async fn test_cloud_paths() {
+        let uri = "s3://bucket/foo.lance";
+        let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
+        assert_eq!(store.scheme, "s3");
+        assert_eq!(path.to_string(), "foo.lance");
+
+        let (store, path) = ObjectStore::from_uri("s3+ddb://bucket/foo.lance")
+            .await
+            .unwrap();
+        assert_eq!(store.scheme, "s3");
+        assert_eq!(path.to_string(), "foo.lance");
+
+        let (store, path) = ObjectStore::from_uri("gs://bucket/foo.lance")
+            .await
+            .unwrap();
+        assert_eq!(store.scheme, "gs");
+        assert_eq!(path.to_string(), "foo.lance");
     }
 
     #[tokio::test]

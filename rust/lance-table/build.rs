@@ -10,7 +10,11 @@ fn main() -> Result<()> {
     prost_build.extern_path(".lance.file", "::lance_file::format::pb");
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
     prost_build.compile_protos(
-        &["./protos/table.proto", "./protos/transaction.proto"],
+        &[
+            "./protos/table.proto",
+            "./protos/transaction.proto",
+            "./protos/rowids.proto",
+        ],
         &["./protos"],
     )?;
 

@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use arrow_array::{cast::AsArray, ArrayRef};
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
+    data::{DataBlock, DataBlockExt, FixedWidthDataBlock},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
     EncodingsIo,
@@ -18,12 +21,12 @@ use crate::{
 /// This scheduler is, itself, primitive
 #[derive(Debug)]
 pub struct FixedListScheduler {
-    items_scheduler: Box<dyn PhysicalPageScheduler>,
+    items_scheduler: Box<dyn PageScheduler>,
     dimension: u32,
 }
 
 impl FixedListScheduler {
-    pub fn new(items_scheduler: Box<dyn PhysicalPageScheduler>, dimension: u32) -> Self {
+    pub fn new(items_scheduler: Box<dyn PageScheduler>, dimension: u32) -> Self {
         Self {
             items_scheduler,
             dimension,
@@ -31,16 +34,16 @@ impl FixedListScheduler {
     }
 }
 
-impl PhysicalPageScheduler for FixedListScheduler {
+impl PageScheduler for FixedListScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
-        scheduler: &dyn EncodingsIo,
+        ranges: &[std::ops::Range<u64>],
+        scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let expanded_ranges = ranges
             .iter()
-            .map(|range| (range.start * self.dimension)..(range.end * self.dimension))
+            .map(|range| (range.start * self.dimension as u64)..(range.end * self.dimension as u64))
             .collect::<Vec<_>>();
         trace!(
             "Expanding {} fsl ranges across {}..{} to item ranges across {}..{}",
@@ -58,41 +61,27 @@ impl PhysicalPageScheduler for FixedListScheduler {
             let items_decoder = inner_page_decoder.await?;
             Ok(Box::new(FixedListDecoder {
                 items_decoder,
-                dimension,
-            }) as Box<dyn PhysicalPageDecoder>)
+                dimension: dimension as u64,
+            }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
 }
 
 pub struct FixedListDecoder {
-    items_decoder: Box<dyn PhysicalPageDecoder>,
-    dimension: u32,
+    items_decoder: Box<dyn PrimitivePageDecoder>,
+    dimension: u64,
 }
 
-impl PhysicalPageDecoder for FixedListDecoder {
-    fn update_capacity(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        all_null: &mut bool,
-    ) {
+impl PrimitivePageDecoder for FixedListDecoder {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         let rows_to_skip = rows_to_skip * self.dimension;
-        let num_rows = num_rows * self.dimension;
-        self.items_decoder
-            .update_capacity(rows_to_skip, num_rows, buffers, all_null);
-    }
-
-    fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [bytes::BytesMut]) {
-        let rows_to_skip = rows_to_skip * self.dimension;
-        let num_rows = num_rows * self.dimension;
-        self.items_decoder
-            .decode_into(rows_to_skip, num_rows, dest_buffers);
-    }
-
-    fn num_buffers(&self) -> u32 {
-        self.items_decoder.num_buffers()
+        let num_child_rows = num_rows * self.dimension;
+        let child_data = self.items_decoder.decode(rows_to_skip, num_child_rows)?;
+        let mut child_data = child_data.try_into_layout::<FixedWidthDataBlock>()?;
+        child_data.num_values = num_rows;
+        child_data.bits_per_value *= self.dimension;
+        Ok(child_data)
     }
 }
 
@@ -134,7 +123,7 @@ impl ArrayEncoder for FslEncoder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_schema::{DataType, Field};
 
@@ -148,7 +137,7 @@ mod tests {
             let inner_field = Field::new("item", data_type.clone(), true);
             let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
             let field = Field::new("", data_type, false);
-            check_round_trip_encoding_random(field).await;
+            check_round_trip_encoding_random(field, HashMap::new()).await;
         }
     }
 }

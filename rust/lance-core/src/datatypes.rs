@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, TimeUnit};
+use deepsize::DeepSizeOf;
 use lance_arrow::bfloat16::{
     is_bfloat16_field, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME,
 };
@@ -24,7 +25,7 @@ pub use schema::Schema;
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct LogicalType(String);
 
 impl fmt::Display for LogicalType {
@@ -322,6 +323,15 @@ pub struct Dictionary {
     pub length: usize,
 
     pub values: Option<ArrayRef>,
+}
+
+impl DeepSizeOf for Dictionary {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.values
+            .as_ref()
+            .map(|v| v.get_array_memory_size())
+            .unwrap_or(0)
+    }
 }
 
 impl PartialEq for Dictionary {

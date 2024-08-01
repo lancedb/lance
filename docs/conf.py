@@ -1,7 +1,6 @@
 # Configuration file for the Sphinx documentation builder.
 
 import shutil
-import subprocess
 
 
 def run_apidoc(_):

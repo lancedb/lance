@@ -20,6 +20,7 @@ import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
 /** Fragment operations. */
@@ -31,6 +32,11 @@ public class Fragment {
   /** Create a fragment from the given data in vector schema root. */
   public static FragmentMetadata create(String datasetUri, BufferAllocator allocator,
       VectorSchemaRoot root, Optional<Integer> fragmentId, WriteParams params) {
+    Preconditions.checkNotNull(datasetUri);
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(root);
+    Preconditions.checkNotNull(fragmentId);
+    Preconditions.checkNotNull(params);
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
          ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
@@ -43,6 +49,10 @@ public class Fragment {
   /** Create a fragment from the given data. */
   public static FragmentMetadata create(String datasetUri, ArrowArrayStream stream,
       Optional<Integer> fragmentId, WriteParams params) {
+    Preconditions.checkNotNull(datasetUri);
+    Preconditions.checkNotNull(stream);
+    Preconditions.checkNotNull(fragmentId);
+    Preconditions.checkNotNull(params);
     return FragmentMetadata.fromJson(createWithFfiStream(datasetUri,
         stream.memoryAddress(), fragmentId,
         params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),

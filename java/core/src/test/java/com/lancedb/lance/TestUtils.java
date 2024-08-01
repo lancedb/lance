@@ -67,7 +67,7 @@ public class TestUtils {
         schema, new WriteParams.Builder().build());
       assertEquals(0, dataset.countRows());
       assertEquals(schema, dataset.getSchema());
-      var fragments = dataset.getFragments();
+      List<DatasetFragment> fragments = dataset.getFragments();
       assertEquals(0, fragments.size());
       assertEquals(1, dataset.version());
       assertEquals(1, dataset.latestVersion());
@@ -98,7 +98,7 @@ public class TestUtils {
 
     public Dataset write(long version, int rowCount) {
       FragmentMetadata metadata = createNewFragment(rowCount, rowCount);
-      FragmentOperation.Append appendOp = new FragmentOperation.Append(List.of(metadata));
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata));
       return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
     }
     
@@ -139,7 +139,7 @@ public class TestUtils {
                    allocator);
            ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
         Data.exportArrayStream(allocator, reader, arrowStream);
-        try (Dataset dataset = Dataset.write(
+        try (Dataset dataset = Dataset.create(
             allocator,
             arrowStream,
             datasetPath,
@@ -174,7 +174,7 @@ public class TestUtils {
     private void validateFragments(Dataset dataset) {
       assertNotNull(schema);
       assertNotNull(dataset);
-      var fragments = dataset.getFragments();
+      List<DatasetFragment> fragments = dataset.getFragments();
       assertEquals(1, fragments.size());
       assertEquals(0, fragments.get(0).getId());
       assertEquals(9, fragments.get(0).countRows());

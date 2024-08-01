@@ -9,7 +9,8 @@ use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 
 use crate::{
-    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
+    data::{AllNullDataBlock, DataBlock, DataBlockExt, FixedWidthDataBlock, NullableDataBlock},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
     EncodingsIo,
@@ -20,39 +21,29 @@ use lance_core::Result;
 use super::buffers::BitmapBufferEncoder;
 
 struct DataDecoders {
-    validity: Box<dyn PhysicalPageDecoder>,
-    values: Box<dyn PhysicalPageDecoder>,
+    validity: Box<dyn PrimitivePageDecoder>,
+    values: Box<dyn PrimitivePageDecoder>,
 }
 
 enum DataNullStatus {
     // Neither validity nor values
     All,
     // Values only
-    None(Box<dyn PhysicalPageDecoder>),
+    None(Box<dyn PrimitivePageDecoder>),
     // Validity and values
     Some(DataDecoders),
 }
 
-impl DataNullStatus {
-    fn values_decoder(&self) -> Option<&dyn PhysicalPageDecoder> {
-        match self {
-            Self::All => None,
-            Self::Some(decoders) => Some(decoders.values.as_ref()),
-            Self::None(values) => Some(values.as_ref()),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct DataSchedulers {
-    validity: Box<dyn PhysicalPageScheduler>,
-    values: Box<dyn PhysicalPageScheduler>,
+    validity: Box<dyn PageScheduler>,
+    values: Box<dyn PageScheduler>,
 }
 
 #[derive(Debug)]
 enum SchedulerNullStatus {
     // Values only
-    None(Box<dyn PhysicalPageScheduler>),
+    None(Box<dyn PageScheduler>),
     // Validity and values
     Some(DataSchedulers),
     // Neither validity nor values
@@ -60,7 +51,7 @@ enum SchedulerNullStatus {
 }
 
 impl SchedulerNullStatus {
-    fn values_scheduler(&self) -> Option<&dyn PhysicalPageScheduler> {
+    fn values_scheduler(&self) -> Option<&dyn PageScheduler> {
         match self {
             Self::All => None,
             Self::None(values) => Some(values.as_ref()),
@@ -88,8 +79,8 @@ pub struct BasicPageScheduler {
 impl BasicPageScheduler {
     /// Creates a new instance that expects a validity bitmap
     pub fn new_nullable(
-        validity_decoder: Box<dyn PhysicalPageScheduler>,
-        values_decoder: Box<dyn PhysicalPageScheduler>,
+        validity_decoder: Box<dyn PageScheduler>,
+        values_decoder: Box<dyn PageScheduler>,
     ) -> Self {
         Self {
             mode: SchedulerNullStatus::Some(DataSchedulers {
@@ -100,7 +91,7 @@ impl BasicPageScheduler {
     }
 
     /// Create a new instance that does not need a validity bitmap because no item is null
-    pub fn new_non_nullable(values_decoder: Box<dyn PhysicalPageScheduler>) -> Self {
+    pub fn new_non_nullable(values_decoder: Box<dyn PageScheduler>) -> Self {
         Self {
             mode: SchedulerNullStatus::None(values_decoder),
         }
@@ -118,13 +109,13 @@ impl BasicPageScheduler {
     }
 }
 
-impl PhysicalPageScheduler for BasicPageScheduler {
+impl PageScheduler for BasicPageScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
-        scheduler: &dyn EncodingsIo,
+        ranges: &[std::ops::Range<u64>],
+        scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let validity_future = match &self.mode {
             SchedulerNullStatus::None(_) | SchedulerNullStatus::All => None,
             SchedulerNullStatus::Some(schedulers) => Some(schedulers.validity.schedule_ranges(
@@ -157,7 +148,7 @@ impl PhysicalPageScheduler for BasicPageScheduler {
                 }
                 _ => unreachable!(),
             };
-            Ok(Box::new(BasicPageDecoder { mode }) as Box<dyn PhysicalPageDecoder>)
+            Ok(Box::new(BasicPageDecoder { mode }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
@@ -167,53 +158,23 @@ struct BasicPageDecoder {
     mode: DataNullStatus,
 }
 
-impl PhysicalPageDecoder for BasicPageDecoder {
-    fn update_capacity(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        all_null: &mut bool,
-    ) {
-        // No need to look at the validity decoder to know the dest buffer size since it is boolean
-        buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
-        // The validity buffer is only required if we have some nulls
-        buffers[0].1 = matches!(self.mode, DataNullStatus::Some(_));
-        if let Some(values) = self.mode.values_decoder() {
-            values.update_capacity(rows_to_skip, num_rows, &mut buffers[1..], all_null);
-        } else {
-            *all_null = true;
-        }
-    }
-
-    fn decode_into(&self, rows_to_skip: u32, num_rows: u32, dest_buffers: &mut [bytes::BytesMut]) {
+impl PrimitivePageDecoder for BasicPageDecoder {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         match &self.mode {
             DataNullStatus::Some(decoders) => {
-                decoders
-                    .validity
-                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[..1]);
-                decoders
-                    .values
-                    .decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..]);
+                let validity = decoders.validity.decode(rows_to_skip, num_rows)?;
+                let validity = validity.try_into_layout::<FixedWidthDataBlock>()?;
+                let values = decoders.values.decode(rows_to_skip, num_rows)?;
+                Ok(Box::new(NullableDataBlock {
+                    data: values,
+                    nulls: validity.data,
+                }))
             }
-            // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
-            // other pages needed the buffer, in which case we need to fill our section
-            DataNullStatus::All => {
-                dest_buffers[0].fill(0);
-            }
-            DataNullStatus::None(values) => {
-                dest_buffers[0].fill(1);
-                values.decode_into(rows_to_skip, num_rows, &mut dest_buffers[1..]);
-            }
+            DataNullStatus::All => Ok(Box::new(AllNullDataBlock {
+                num_values: num_rows,
+            })),
+            DataNullStatus::None(values) => values.decode(rows_to_skip, num_rows),
         }
-    }
-
-    fn num_buffers(&self) -> u32 {
-        1 + self
-            .mode
-            .values_decoder()
-            .map(|val| val.num_buffers())
-            .unwrap_or(0)
     }
 }
 
@@ -258,7 +219,7 @@ impl ArrayEncoder for BasicEncoder {
 
             let validity_buffer_index = *buffer_index;
             *buffer_index += 1;
-            let validity = BitmapBufferEncoder::default().encode(&validity_as_arrays)?;
+            let (validity, _) = BitmapBufferEncoder::default().encode(&validity_as_arrays)?;
             let validity_encoding = Box::new(pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
                     bits_per_value: 1,
@@ -266,6 +227,7 @@ impl ArrayEncoder for BasicEncoder {
                         buffer_index: validity_buffer_index,
                         buffer_type: pb::buffer::BufferType::Page as i32,
                     }),
+                    compression: None,
                 })),
             });
 

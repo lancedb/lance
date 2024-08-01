@@ -12,13 +12,21 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_file::reader::FileReader;
+use lance_file::v2;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
-use lance_index::scalar::expression::IndexInformationProvider;
+use lance_index::scalar::expression::{
+    IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
+};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
+use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
-use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use lance_index::INDEX_METADATA_SCHEMA_KEY;
+use lance_index::{pb, vector::VectorIndex, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use lance_io::scheduler::ScanScheduler;
 use lance_io::traits::Reader;
 use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
@@ -27,14 +35,16 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
+use scalar::ScalarIndexParams;
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
+use vector::ivf::v2::IVFIndex;
 
 pub(crate) mod append;
 pub(crate) mod cache;
-pub(crate) mod prefilter;
+pub mod prefilter;
 pub mod scalar;
 pub mod vector;
 
@@ -48,7 +58,7 @@ use crate::{dataset::Dataset, Error, Result};
 
 use self::append::merge_indices;
 use self::scalar::{build_scalar_index, LANCE_SCALAR_INDEX};
-use self::vector::{build_vector_index, VectorIndex, VectorIndexParams, LANCE_VECTOR_INDEX};
+use self::vector::{build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX};
 
 /// Builds index.
 #[async_trait]
@@ -119,12 +129,14 @@ pub(crate) async fn remap_index(
 
 #[derive(Debug)]
 pub struct ScalarIndexInfo {
-    indexed_columns: HashMap<String, DataType>,
+    indexed_columns: HashMap<String, (DataType, Box<dyn ScalarQueryParser>)>,
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
-    fn get_index(&self, col: &str) -> Option<&DataType> {
-        self.indexed_columns.get(col)
+    fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+        self.indexed_columns
+            .get(col)
+            .map(|(ty, parser)| (ty, parser.as_ref()))
     }
 }
 
@@ -194,7 +206,14 @@ impl DatasetIndexExt for Dataset {
         let index_id = Uuid::new_v4();
         match (index_type, params.index_name()) {
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
-                build_scalar_index(self, column, &index_id.to_string()).await?;
+                let params = params
+                    .as_any()
+                    .downcast_ref::<ScalarIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Scalar index type must take a ScalarIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+                build_scalar_index(self, column, &index_id.to_string(), params).await?;
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
@@ -492,12 +511,12 @@ impl DatasetIndexInternalExt for Dataset {
         }
     }
 
-    async fn open_scalar_index(&self, _column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>> {
+    async fn open_scalar_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>> {
         if let Some(index) = self.session.index_cache.get_scalar(uuid) {
             return Ok(index);
         }
 
-        let index = crate::index::scalar::open_scalar_index(self, uuid).await?;
+        let index = crate::index::scalar::open_scalar_index(self, column, uuid).await?;
         self.session.index_cache.insert_scalar(uuid, index.clone());
         Ok(index)
     }
@@ -517,7 +536,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         // the index file is in lance format since version (0,2)
         // TODO: we need to change the legacy IVF_PQ to be in lance format
-        match (major_version, minor_version) {
+        let index = match (major_version, minor_version) {
             (0, 1) | (0, 0) => {
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
@@ -554,12 +573,82 @@ impl DatasetIndexInternalExt for Dataset {
                 .await
             }
 
+            (0, 3) => {
+                let scheduler = ScanScheduler::new(self.object_store.clone());
+                let file = scheduler.open_file(&index_file).await?;
+                let reader =
+                    v2::reader::FileReader::try_open(file, None, Default::default()).await?;
+                let index_metadata = reader
+                    .schema()
+                    .metadata
+                    .get(INDEX_METADATA_SCHEMA_KEY)
+                    .ok_or(Error::Index {
+                        message: "Index Metadata not found".to_owned(),
+                        location: location!(),
+                    })?;
+                let index_metadata: lance_index::IndexMetadata =
+                    serde_json::from_str(index_metadata)?;
+                let field = self.schema().field(column).ok_or_else(|| Error::Index {
+                    message: format!("Column {} does not exist in the schema", column),
+                    location: location!(),
+                })?;
+
+                let value_type = if let DataType::FixedSizeList(df, _) = field.data_type() {
+                    Result::Ok(df.data_type().to_owned())
+                } else {
+                    return Err(Error::Index {
+                        message: format!("Column {} is not a vector column", column),
+                        location: location!(),
+                    });
+                }?;
+                match index_metadata.index_type.as_str() {
+                    "FLAT" => match value_type {
+                        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                            let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
+                                self.object_store.clone(),
+                                self.indices_dir(),
+                                uuid.to_owned(),
+                                Arc::downgrade(&self.session),
+                            )
+                            .await?;
+                            Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                        }
+                        _ => Err(Error::Index {
+                            message: format!(
+                                "the field type {} is not supported for FLAT index",
+                                field.data_type()
+                            ),
+                            location: location!(),
+                        }),
+                    },
+
+                    "HNSW" => {
+                        let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    _ => Err(Error::Index {
+                        message: format!("Unsupported index type: {}", index_metadata.index_type),
+                        location: location!(),
+                    }),
+                }
+            }
+
             _ => Err(Error::Index {
                 message: "unsupported index version (maybe need to upgrade your lance version)"
                     .to_owned(),
                 location: location!(),
             }),
-        }
+        };
+        let index = index?;
+        self.session.index_cache.insert_vector(uuid, index.clone());
+        Ok(index)
     }
 
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
@@ -571,8 +660,16 @@ impl DatasetIndexInternalExt for Dataset {
         .map(|idx| {
             let field = idx.fields[0];
             let field = schema.field_by_id(field).ok_or_else(|| Error::Internal { message: format!("Index referenced a field with id {field} which did not exist in the schema"), location: location!() });
-            field.map(|field| (field.name.clone(), field.data_type()))
-        }).collect::<Result<Vec<_>>>()?;
+            field.map(|field| {
+                let query_parser = if let DataType::List(_) = field.data_type() {
+                    Box::<LabelListQueryParser>::default() as Box<dyn ScalarQueryParser>
+                } else {
+                    Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
+                };
+                (field.name.clone(), (field.data_type(), query_parser))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
         let index_info_map = HashMap::from_iter(indexed_fields);
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,

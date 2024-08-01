@@ -10,9 +10,11 @@ use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
+use prost::Message;
 use prost_types::Timestamp;
 
 use super::Fragment;
+use crate::feature_flags::FLAG_MOVE_STABLE_ROW_IDS;
 use crate::format::pb;
 use lance_core::cache::FileMetadataCache;
 use lance_core::datatypes::Schema;
@@ -68,6 +70,9 @@ pub struct Manifest {
     /// Precomputed logic offset of each fragment
     /// accelerating the fragment search using offset ranges.
     fragment_offsets: Vec<usize>,
+
+    /// The max row id used so far.
+    pub next_row_id: u64,
 }
 
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
@@ -100,6 +105,7 @@ impl Manifest {
             max_fragment_id: 0,
             transaction_file: None,
             fragment_offsets,
+            next_row_id: 0,
         }
     }
 
@@ -124,6 +130,7 @@ impl Manifest {
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             fragment_offsets,
+            next_row_id: previous.next_row_id,
         }
     }
 
@@ -193,13 +200,13 @@ impl Manifest {
     /// Note this does not support recycling of fragment ids.
     pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {
         if since.version >= self.version {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "fragments_since: given version {} is newer than manifest version {}",
                     since.version, self.version
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         let start = since.max_fragment_id();
         Ok(self
@@ -245,6 +252,18 @@ impl Manifest {
         }
 
         fragments
+    }
+
+    /// Whether the dataset uses move-stable row ids.
+    pub fn uses_move_stable_row_ids(&self) -> bool {
+        self.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0
+    }
+
+    /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
+    /// and can be used to create a dataset
+    pub fn serialized(&self) -> Vec<u8> {
+        let pb_manifest: pb::Manifest = self.into();
+        pb_manifest.encode_to_vec()
     }
 }
 
@@ -328,8 +347,10 @@ impl ProtoStruct for Manifest {
     type Proto = pb::Manifest;
 }
 
-impl From<pb::Manifest> for Manifest {
-    fn from(p: pb::Manifest) -> Self {
+impl TryFrom<pb::Manifest> for Manifest {
+    type Error = Error;
+
+    fn try_from(p: pb::Manifest) -> Result<Self> {
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -342,13 +363,28 @@ impl From<pb::Manifest> for Manifest {
             }
             _ => None,
         };
-        let fragments = Arc::new(p.fragments.iter().map(Fragment::from).collect::<Vec<_>>());
+        let fragments = Arc::new(
+            p.fragments
+                .into_iter()
+                .map(Fragment::try_from)
+                .collect::<Result<Vec<_>>>()?,
+        );
         let fragment_offsets = compute_fragment_offsets(fragments.as_slice());
         let fields_with_meta = FieldsWithMeta {
             fields: Fields(p.fields),
             metadata: p.metadata,
         };
-        Self {
+
+        if FLAG_MOVE_STABLE_ROW_IDS & p.reader_feature_flags != 0
+            && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
+        {
+            return Err(Error::Internal {
+                message: "All fragments must have row ids".into(),
+                location: location!(),
+            });
+        }
+
+        Ok(Self {
             schema: Schema::from(fields_with_meta),
             version: p.version,
             writer_version,
@@ -366,7 +402,8 @@ impl From<pb::Manifest> for Manifest {
                 Some(p.transaction_file)
             },
             fragment_offsets,
-        }
+            next_row_id: p.next_row_id,
+        })
     }
 }
 
@@ -403,6 +440,7 @@ impl From<&Manifest> for pb::Manifest {
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
+            next_row_id: m.next_row_id,
         }
     }
 }
@@ -563,6 +601,7 @@ mod tests {
                 id: 0,
                 files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
                 deletion_file: None,
+                row_id_meta: None,
                 physical_rows: None,
             },
             Fragment {
@@ -572,6 +611,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path3", vec![2]),
                 ],
                 deletion_file: None,
+                row_id_meta: None,
                 physical_rows: None,
             },
         ];

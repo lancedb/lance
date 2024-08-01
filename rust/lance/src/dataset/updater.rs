@@ -132,7 +132,7 @@ impl Updater {
             &self.fragment.dataset().object_store,
             &schema,
             &self.fragment.dataset().base,
-            !is_legacy,
+            is_legacy,
         )
         .await
     }
@@ -140,21 +140,21 @@ impl Updater {
     /// Update one batch.
     pub async fn update(&mut self, batch: RecordBatch) -> Result<()> {
         let Some(last) = self.last_input.as_ref() else {
-            return Err(Error::IO {
-                message: "Fragment Updater: no input data is available before update".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                "Fragment Updater: no input data is available before update".to_string(),
+                location!(),
+            ));
         };
 
         if last.num_rows() != batch.num_rows() {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "Fragment Updater: new batch has different size with the source batch: {} != {}",
                     last.num_rows(),
                     batch.num_rows()
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         };
 
         // Add back in deleted rows
@@ -319,9 +319,11 @@ impl DeletionRestorer {
         let deleted_batch_offsets = self.deleted_batch_offsets_in_range(batch.num_rows() as u32);
         let batch = add_blanks(batch, &deleted_batch_offsets)?;
 
-        // validation just in case
         if let Some(batch_size) = self.batch_size {
-            if batch.num_rows() != batch_size as usize {
+            // validation just in case, when the input has a fixed batch size then the
+            // output should have the same fixed batch size (except the last batch)
+            let is_last = self.is_exhausted();
+            if batch.num_rows() != batch_size as usize && !is_last {
                 return Err(Error::Internal {
                     message: format!(
                         "Fragment Updater: batch size mismatch: {} != {}",

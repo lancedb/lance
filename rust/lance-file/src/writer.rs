@@ -176,9 +176,11 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
             let arrs = batches
                 .iter()
                 .map(|batch| {
-                    batch.column_by_name(&field.name).ok_or_else(|| Error::IO {
-                        message: format!("FileWriter::write: Field '{}' not found", field.name),
-                        location: location!(),
+                    batch.column_by_name(&field.name).ok_or_else(|| {
+                        Error::io(
+                            format!("FileWriter::write: Field '{}' not found", field.name),
+                            location!(),
+                        )
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -242,11 +244,6 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     /// Total bytes written so far
     pub async fn tell(&mut self) -> Result<usize> {
         self.object_writer.tell().await
-    }
-
-    /// Returns the in-flight multipart ID.
-    pub fn multipart_id(&self) -> &str {
-        &self.object_writer.multipart_id
     }
 
     /// Return the id of the next batch to be written.
@@ -606,17 +603,21 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         for field_id in 0..max_field_id + 1 {
             if let Some(field) = schema.mut_field_by_id(field_id) {
                 if field.data_type().is_dictionary() {
-                    let dict_info = field.dictionary.as_mut().ok_or_else(|| Error::IO {
-                        message: format!("Lance field {} misses dictionary info", field.name),
-                        location: location!(),
+                    let dict_info = field.dictionary.as_mut().ok_or_else(|| {
+                        Error::io(
+                            format!("Lance field {} misses dictionary info", field.name),
+                            // and wrap it in here.
+                            location!(),
+                        )
                     })?;
 
-                    let value_arr = dict_info.values.as_ref().ok_or_else(|| Error::IO {
-                        message: format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array",
-                        field.name
-                    ),
-                        location: location!(),
+                    let value_arr = dict_info.values.as_ref().ok_or_else(|| {
+                        Error::io(
+                            format!(
+                        "Lance field {} is dictionary type, but misses the dictionary value array", 
+                        field.name),
+                            location!(),
+                        )
                     })?;
 
                     let data_type = value_arr.data_type();
@@ -630,13 +631,13 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                             encoder.encode(&[value_arr]).await?
                         }
                         _ => {
-                            return Err(Error::IO {
-                                message: format!(
+                            return Err(Error::io(
+                                format!(
                                     "Does not support {} as dictionary value type",
                                     value_arr.data_type()
                                 ),
-                                location: location!(),
-                            });
+                                location!(),
+                            ));
                         }
                     };
                     dict_info.offset = pos;
@@ -916,10 +917,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual = reader
-            .read_batch(0, .., reader.schema(), None)
-            .await
-            .unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(actual, batch);
     }
 
@@ -953,10 +951,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual = reader
-            .read_batch(0, .., reader.schema(), None)
-            .await
-            .unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(actual, batch);
     }
 
@@ -998,10 +993,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual = reader
-            .read_batch(0, .., reader.schema(), None)
-            .await
-            .unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(actual, batch);
     }
 
@@ -1209,7 +1201,7 @@ mod tests {
         for i in 0..reader.num_batches() {
             batches.push(
                 reader
-                    .read_batch(i as i32, .., reader.schema(), None)
+                    .read_batch(i as i32, .., reader.schema())
                     .await
                     .unwrap(),
             );

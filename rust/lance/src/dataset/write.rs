@@ -7,7 +7,7 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{datatypes::Schema, Error, Result};
-use lance_datafusion::chunker::chunk_stream;
+use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2;
@@ -50,10 +50,10 @@ impl TryFrom<&str> for WriteMode {
             "create" => Ok(Self::Create),
             "append" => Ok(Self::Append),
             "overwrite" => Ok(Self::Overwrite),
-            _ => Err(Error::IO {
-                message: format!("Invalid write mode: {}", value),
-                location: location!(),
-            }),
+            _ => Err(Error::io(
+                format!("Invalid write mode: {}", value),
+                location!(),
+            )),
         }
     }
 }
@@ -96,11 +96,17 @@ pub struct WriteParams {
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
 
-    /// If set to true then the Lance v2 writer will be used instead of the Lance v1 writer
+    /// If set to true then the Lance v1 writer will be used instead of the Lance v2 writer
     ///
-    /// Unless you are intentionally testing the v2 writer, you should leave this as false
+    /// Unless you are intentionally testing the v2 writer, you should leave this as true
     /// as the v2 writer is still experimental and not fully implemented.
-    pub use_experimental_writer: bool,
+    pub use_legacy_format: bool,
+
+    /// Experimental: if set to true, the writer will use move-stable row ids.
+    /// These row ids are stable after compaction operations, but not after updates.
+    /// This makes compaction more efficient, since with stable row ids no
+    /// secondary indices need to be updated to point to new row ids.
+    pub enable_move_stable_row_ids: bool,
 }
 
 impl Default for WriteParams {
@@ -115,7 +121,8 @@ impl Default for WriteParams {
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
-            use_experimental_writer: false,
+            use_legacy_format: true,
+            enable_move_stable_row_ids: false,
         }
     }
 }
@@ -138,7 +145,7 @@ pub async fn write_fragments(
         {
             Ok(dataset) => {
                 let store = dataset.object_store().clone();
-                let base = dataset.uri().clone();
+                let base = dataset.base.clone();
                 (Some(dataset), store, base)
             }
             Err(Error::DatasetNotFound { .. }) => {
@@ -208,22 +215,18 @@ pub async fn write_fragments_internal(
         schema
     };
 
-    // TODO: When writing v2 we could consider skipping this chunking step.  However, leaving in
-    // for now as it doesn't hurt anything
-    let mut buffered_reader = if params.use_experimental_writer {
-        data.and_then(|batch| std::future::ready(Ok(vec![batch])))
-            .map_err(Error::from)
-            .boxed()
-    } else {
+    let mut buffered_reader = if params.use_legacy_format {
         chunk_stream(data, params.max_rows_per_group)
+    } else {
+        // In v2 we don't care about group size but we do want to break
+        // the stream on file boundaries
+        break_stream(data, params.max_rows_per_file)
+            .map_ok(|batch| vec![batch])
+            .boxed()
     };
 
-    let writer_generator = WriterGenerator::new(
-        object_store,
-        base_dir,
-        schema,
-        params.use_experimental_writer,
-    );
+    let writer_generator =
+        WriterGenerator::new(object_store, base_dir, schema, params.use_legacy_format);
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
@@ -232,10 +235,7 @@ pub async fn write_fragments_internal(
 
         if writer.is_none() {
             let (new_writer, new_fragment) = writer_generator.new_writer().await?;
-            // rustc has a hard time analyzing the lifetime of the &str returned
-            // by multipart_id(), so we convert it to an owned value here.
-            let multipart_id = new_writer.multipart_id().to_string();
-            params.progress.begin(&new_fragment, &multipart_id).await?;
+            params.progress.begin(&new_fragment).await?;
             writer = Some(new_writer);
             fragments.push(new_fragment);
         }
@@ -271,10 +271,6 @@ pub async fn write_fragments_internal(
 
 #[async_trait::async_trait]
 pub trait GenericWriter: Send {
-    /// Get a unique id associated with the fragment being written
-    ///
-    /// This is used for progress reporting
-    fn multipart_id(&self) -> &str;
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
     /// Get the current position in the file
@@ -288,9 +284,6 @@ pub trait GenericWriter: Send {
 
 #[async_trait::async_trait]
 impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String) {
-    fn multipart_id(&self) -> &str {
-        self.0.multipart_id()
-    }
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.0.write(batches).await
     }
@@ -305,39 +298,43 @@ impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String
     }
 }
 
+struct V2WriterAdapter {
+    writer: v2::writer::FileWriter,
+    path: String,
+}
+
 #[async_trait::async_trait]
-impl GenericWriter for v2::writer::FileWriter {
-    fn multipart_id(&self) -> &str {
-        self.multipart_id()
-    }
+impl GenericWriter for V2WriterAdapter {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         for batch in batches {
-            self.write_batch(batch).await?;
+            self.writer.write_batch(batch).await?;
         }
         Ok(())
     }
     async fn tell(&mut self) -> Result<u64> {
-        Ok(self.tell().await?)
+        Ok(self.writer.tell().await?)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
         let field_ids = self
+            .writer
             .field_id_to_column_indices()
             .iter()
             .map(|(field_id, _)| *field_id)
             .collect::<Vec<_>>();
         let column_indices = self
+            .writer
             .field_id_to_column_indices()
             .iter()
             .map(|(_, column_index)| *column_index)
             .collect::<Vec<_>>();
         let data_file = DataFile::new(
-            self.path(),
+            std::mem::take(&mut self.path),
             field_ids,
             column_indices,
             MAJOR_VERSION as u32,
             MINOR_VERSION_NEXT as u32,
         );
-        let num_rows = self.finish().await? as u32;
+        let num_rows = self.writer.finish().await? as u32;
         Ok((num_rows, data_file))
     }
 }
@@ -346,21 +343,13 @@ pub async fn open_writer(
     object_store: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
-    use_v2: bool,
+    use_legacy_format: bool,
 ) -> Result<Box<dyn GenericWriter>> {
     let filename = format!("{}.lance", Uuid::new_v4());
 
     let full_path = base_dir.child(DATA_DIR).child(filename.as_str());
 
-    let writer = if use_v2 {
-        let writer = object_store.create(&full_path).await?;
-        Box::new(v2::writer::FileWriter::try_new(
-            writer,
-            filename,
-            schema.clone(),
-            FileWriterOptions::default(),
-        )?) as Box<dyn GenericWriter>
-    } else {
+    let writer = if use_legacy_format {
         Box::new((
             FileWriter::<ManifestDescribing>::try_new(
                 object_store,
@@ -371,6 +360,15 @@ pub async fn open_writer(
             .await?,
             filename,
         ))
+    } else {
+        let writer = object_store.create(&full_path).await?;
+        let file_writer =
+            v2::writer::FileWriter::try_new(writer, schema.clone(), FileWriterOptions::default())?;
+        let writer_adapter = V2WriterAdapter {
+            writer: file_writer,
+            path: filename,
+        };
+        Box::new(writer_adapter) as Box<dyn GenericWriter>
     };
     Ok(writer)
 }
@@ -380,7 +378,7 @@ struct WriterGenerator {
     object_store: Arc<ObjectStore>,
     base_dir: Path,
     schema: Schema,
-    use_v2: bool,
+    use_legacy_format: bool,
 }
 
 impl WriterGenerator {
@@ -388,13 +386,13 @@ impl WriterGenerator {
         object_store: Arc<ObjectStore>,
         base_dir: &Path,
         schema: &Schema,
-        use_v2: bool,
+        use_legacy_format: bool,
     ) -> Self {
         Self {
             object_store,
             base_dir: base_dir.clone(),
             schema: schema.clone(),
-            use_v2,
+            use_legacy_format,
         }
     }
 
@@ -406,7 +404,7 @@ impl WriterGenerator {
             &self.object_store,
             &self.schema,
             &self.base_dir,
-            self.use_v2,
+            self.use_legacy_format,
         )
         .await?;
 
@@ -567,7 +565,7 @@ mod tests {
         .unwrap();
 
         let write_params = WriteParams {
-            use_experimental_writer: true,
+            use_legacy_format: false,
             // This parameter should be ignored
             max_rows_per_group: 1,
             ..Default::default()
@@ -634,7 +632,7 @@ mod tests {
         .unwrap();
 
         let write_params = WriteParams {
-            use_experimental_writer: false,
+            use_legacy_format: true,
             ..Default::default()
         };
         let data_stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -677,7 +675,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reader.num_batches(), 1);
-        let batch = reader.read_batch(0, .., &schema, None).await.unwrap();
+        let batch = reader.read_batch(0, .., &schema).await.unwrap();
         assert_eq!(batch, data);
     }
 }

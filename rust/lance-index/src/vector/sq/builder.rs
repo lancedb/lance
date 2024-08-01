@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow::{
-    array::AsArray,
-    datatypes::{Float16Type, Float32Type, Float64Type},
-};
-use arrow_array::Array;
-
-use arrow_schema::DataType;
-use lance_core::{Error, Result};
-use lance_linalg::distance::MetricType;
-use snafu::{location, Location};
-
-use super::ScalarQuantizer;
+use crate::vector::quantizer::QuantizerBuildParams;
 
 #[derive(Debug, Clone)]
 pub struct SQBuildParams {
@@ -32,36 +21,8 @@ impl Default for SQBuildParams {
     }
 }
 
-impl SQBuildParams {
-    pub fn build(&self, data: &dyn Array, _: MetricType) -> Result<ScalarQuantizer> {
-        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "SQ builder: input is not a FixedSizeList: {}",
-                data.data_type()
-            ),
-            location: location!(),
-        })?;
-
-        let mut quantizer = ScalarQuantizer::new(self.num_bits, fsl.value_length() as usize);
-
-        match fsl.value_type() {
-            DataType::Float16 => {
-                quantizer.update_bounds::<Float16Type>(fsl)?;
-            }
-            DataType::Float32 => {
-                quantizer.update_bounds::<Float32Type>(fsl)?;
-            }
-            DataType::Float64 => {
-                quantizer.update_bounds::<Float64Type>(fsl)?;
-            }
-            _ => {
-                return Err(Error::Index {
-                    message: format!("SQ builder: unsupported data type: {}", fsl.value_type()),
-                    location: location!(),
-                })
-            }
-        }
-
-        Ok(quantizer)
+impl QuantizerBuildParams for SQBuildParams {
+    fn sample_size(&self) -> usize {
+        self.sample_rate * 2usize.pow(self.num_bits as u32)
     }
 }

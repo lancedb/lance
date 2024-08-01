@@ -3,9 +3,11 @@
 from pathlib import Path
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance.indices import IndicesBuilder, IvfModel, PqModel
 
 N_DIMS = 512
 
@@ -95,3 +97,63 @@ def test_optimize_index(
         lance.write_dataset(small_table, test_large_dataset.uri, mode="append")
 
     benchmark(test_large_dataset.optimize.optimize_indices)
+
+
+@pytest.mark.benchmark(group="optimize_index")
+@pytest.mark.parametrize("num_partitions", [100, 300])
+def test_train_ivf(test_large_dataset, benchmark, num_partitions):
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    benchmark.pedantic(
+        builder.train_ivf,
+        kwargs={"num_partitions": num_partitions},
+        iterations=1,
+        rounds=1,
+    )
+
+
+# Pre-computing partition assigment only makes sense on CUDA and so this benchmark runs
+# only on CUDA.
+@pytest.mark.benchmark(group="assign_partitions")
+@pytest.mark.parametrize("num_partitions", [100, 300])
+def test_partition_assignment(test_large_dataset, benchmark, num_partitions):
+    from lance.dependencies import torch
+
+    try:
+        if not torch.cuda.is_available():
+            return
+    except:  # noqa: E722
+        return
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    ivf = builder.train_ivf(num_partitions=num_partitions)
+    benchmark.pedantic(
+        builder.assign_ivf_partitions, args=[ivf, None, "cuda"], iterations=1, rounds=1
+    )
+
+
+def rand_ivf(rand_dataset):
+    dtype = rand_dataset.schema.field("vector").type.value_type.to_pandas_dtype()
+    centroids = np.random.rand(N_DIMS * 35000).astype(dtype)
+    centroids = pa.FixedSizeListArray.from_arrays(centroids, N_DIMS)
+    return IvfModel(centroids, "l2")
+
+
+def rand_pq(rand_dataset, rand_ivf):
+    dtype = rand_dataset.schema.field("vector").type.value_type.to_pandas_dtype()
+    codebook = np.random.rand(N_DIMS * 256).astype(dtype)
+    codebook = pa.FixedSizeListArray.from_arrays(codebook, N_DIMS)
+    pq = PqModel(512 // 16, codebook)
+    return pq
+
+
+@pytest.mark.benchmark(group="transform_vectors")
+def test_transform_vectors(test_dataset, tmpdir_factory, benchmark):
+    ivf = rand_ivf(test_dataset)
+    pq = rand_pq(test_dataset, ivf)
+    builder = IndicesBuilder(test_dataset)
+    dst_uri = str(tmpdir_factory.mktemp("transformed") / "output.lance")
+    benchmark.pedantic(
+        builder.transform_vectors,
+        args=["vector", ivf, pq, dst_uri],
+        iterations=1,
+        rounds=1,
+    )

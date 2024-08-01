@@ -16,10 +16,12 @@ use std::os::windows::fs::FileExt;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use object_store::path::Path;
 use snafu::{location, Location};
 use tokio::io::AsyncSeekExt;
+use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::traits::{Reader, Writer};
@@ -55,31 +57,39 @@ pub struct LocalObjectReader {
     /// Fie path.
     path: Path,
 
+    /// Known size of the file. This is either passed in on construction or
+    /// cached on the first metadata call.
+    size: OnceCell<usize>,
+
     /// Block size, in bytes.
     block_size: usize,
+}
+
+impl DeepSizeOf for LocalObjectReader {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // Skipping `file` as it should just be a file handle
+        self.path.as_ref().deep_size_of_children(context)
+    }
 }
 
 impl LocalObjectReader {
     pub async fn open_local_path(
         path: impl AsRef<std::path::Path>,
         block_size: usize,
+        known_size: Option<usize>,
     ) -> Result<Box<dyn Reader>> {
         let path = path.as_ref().to_owned();
         let object_store_path = Path::from_filesystem_path(&path)?;
-        tokio::task::spawn_blocking(move || {
-            let local_file = File::open(&path)?;
-            Ok(Box::new(Self {
-                file: Arc::new(local_file),
-                path: object_store_path,
-                block_size,
-            }) as Box<dyn Reader>)
-        })
-        .await?
+        Self::open(&object_store_path, block_size, known_size).await
     }
 
     /// Open a local object reader, with default prefetch size.
     #[instrument(level = "debug")]
-    pub async fn open(path: &Path, block_size: usize) -> Result<Box<dyn Reader>> {
+    pub async fn open(
+        path: &Path,
+        block_size: usize,
+        known_size: Option<usize>,
+    ) -> Result<Box<dyn Reader>> {
         let path = path.clone();
         let local_path = to_local_path(&path);
         tokio::task::spawn_blocking(move || {
@@ -88,14 +98,13 @@ impl LocalObjectReader {
                     uri: path.to_string(),
                     location: location!(),
                 },
-                _ => Error::IO {
-                    message: e.to_string(),
-                    location: location!(),
-                },
+                _ => e.into(),
             })?;
+            let size = OnceCell::new_with(known_size);
             Ok(Box::new(Self {
                 file: Arc::new(file),
                 block_size,
+                size,
                 path: path.clone(),
             }) as Box<dyn Reader>)
         })
@@ -114,13 +123,26 @@ impl Reader for LocalObjectReader {
     }
 
     /// Returns the file size.
-    async fn size(&self) -> Result<usize> {
-        Ok(self.file.metadata()?.len() as usize)
+    async fn size(&self) -> object_store::Result<usize> {
+        let file = self.file.clone();
+        self.size
+            .get_or_try_init(|| async move {
+                let metadata = tokio::task::spawn_blocking(move || {
+                    file.metadata().map_err(|err| object_store::Error::Generic {
+                        store: "LocalFileSystem",
+                        source: err.into(),
+                    })
+                })
+                .await??;
+                Ok(metadata.len() as usize)
+            })
+            .await
+            .cloned()
     }
 
     /// Reads a range of data.
     #[instrument(level = "debug", skip(self))]
-    async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
+    async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {
             let mut buf = BytesMut::with_capacity(range.len());
@@ -135,6 +157,10 @@ impl Reader for LocalObjectReader {
             Ok(buf.freeze())
         })
         .await?
+        .map_err(|err: std::io::Error| object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: err.into(),
+        })
     }
 }
 

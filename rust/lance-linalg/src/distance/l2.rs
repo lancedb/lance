@@ -19,7 +19,7 @@ use lance_arrow::{ArrowFloatType, FloatArray};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
-use num_traits::{AsPrimitive, Float, Num};
+use num_traits::{AsPrimitive, Num};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -64,7 +64,7 @@ pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
 #[inline]
 pub fn l2_scalar<
     T: AsPrimitive<Output>,
-    Output: Float + Sum + AddAssign + 'static,
+    Output: Num + Copy + Sum + AddAssign + 'static,
     const LANES: usize,
 >(
     from: &[T],
@@ -98,6 +98,13 @@ pub fn l2_scalar<
     s + sums.iter().copied().sum()
 }
 
+impl L2 for u8 {
+    #[inline]
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
+        l2_distance_uint_scalar(x, y)
+    }
+}
+
 impl L2 for bf16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
@@ -119,6 +126,10 @@ mod kernel {
         pub fn l2_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn l2_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn l2_f16_lsx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn l2_f16_lasx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
@@ -142,6 +153,14 @@ impl L2 for f16 {
             SimdSupport::Avx2 => unsafe {
                 kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                kernel::l2_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                kernel::l2_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
             _ => l2_scalar::<Self, f32, 16>(x, y),
         }
     }
@@ -150,7 +169,9 @@ impl L2 for f16 {
 impl L2 for f32 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        l2_scalar::<Self, Self, 32>(x, y)
+        // 16 = 512 (avx512) / 8 bits / 4 (sizeof(f32))
+        // See https://github.com/lancedb/lance/pull/2450.
+        l2_scalar::<Self, Self, 16>(x, y)
     }
 
     fn l2_batch<'a>(

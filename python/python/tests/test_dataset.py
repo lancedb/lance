@@ -304,6 +304,20 @@ def test_take_with_columns(tmp_path: Path):
     assert table2 == pa.Table.from_pylist([{"b": 2}])
 
 
+def test_take_with_projection(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    table2 = dataset.take([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+
+    assert table2 == pa.Table.from_pylist([{"a2": 2, "bup": "X"}])
+
+    table3 = dataset._take_rows([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+    assert table3 == table2
+
+
 def test_filter(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -915,6 +929,14 @@ def test_delete_data(tmp_path: Path):
     assert dataset.count_rows() == 0
 
 
+def check_merge_stats(merge_dict, expected):
+    assert (
+        merge_dict["num_inserted_rows"],
+        merge_dict["num_updated_rows"],
+        merge_dict["num_deleted_rows"],
+    ) == expected
+
+
 def test_merge_insert(tmp_path: Path):
     nrows = 1000
     table = pa.Table.from_pydict(
@@ -939,59 +961,79 @@ def test_merge_insert(tmp_path: Path):
 
     is_new = pc.field("b") == 2
 
-    dataset.merge_insert("a").when_not_matched_insert_all().execute(new_table)
+    merge_dict = (
+        dataset.merge_insert("a").when_not_matched_insert_all().execute(new_table)
+    )
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
+    check_merge_stats(merge_dict, (300, 0, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+    merge_dict = dataset.merge_insert("a").when_matched_update_all().execute(new_table)
     table = dataset.to_table()
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 700
+    check_merge_stats(merge_dict, (0, 700, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert(
-        "a"
-    ).when_not_matched_insert_all().when_matched_update_all().execute(new_table)
+    merge_dict = (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .when_matched_update_all()
+        .execute(new_table)
+    )
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 1000
+    check_merge_stats(merge_dict, (300, 700, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert("a").when_not_matched_insert_all().when_matched_update_all(
-        "target.c == source.c"
-    ).execute(new_table)
+    merge_dict = (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .when_matched_update_all("target.c == source.c")
+        .execute(new_table)
+    )
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 650
+    check_merge_stats(merge_dict, (300, 350, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert("a").when_not_matched_by_source_delete().execute(new_table)
+    merge_dict = (
+        dataset.merge_insert("a").when_not_matched_by_source_delete().execute(new_table)
+    )
     table = dataset.to_table()
     assert table.num_rows == 700
     assert table.filter(is_new).num_rows == 0
+    check_merge_stats(merge_dict, (0, 0, 300))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
-    dataset.merge_insert("a").when_not_matched_by_source_delete(
-        "a < 100"
-    ).when_not_matched_insert_all().execute(new_table)
+    merge_dict = (
+        dataset.merge_insert("a")
+        .when_not_matched_by_source_delete("a < 100")
+        .when_not_matched_insert_all()
+        .execute(new_table)
+    )
 
     table = dataset.to_table()
     assert table.num_rows == 1200
     assert table.filter(is_new).num_rows == 300
+    check_merge_stats(merge_dict, (300, 0, 100))
 
     # If the user doesn't specify anything then the merge_insert is
     # a no-op and the operation fails
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
     with pytest.raises(ValueError):
-        dataset.merge_insert("a").execute(new_table)
+        merge_dict = dataset.merge_insert("a").execute(new_table)
+        check_merge_stats(merge_dict, (None, None, None))
 
 
 def test_flat_vector_search_with_delete(tmp_path: Path):
@@ -1031,9 +1073,11 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
         }
     )
 
-    dataset.merge_insert("id").when_matched_update_all(
-        "target.txNumber < source.txNumber"
-    ).execute(new_table)
+    merge_dict = (
+        dataset.merge_insert("id")
+        .when_matched_update_all("target.txNumber < source.txNumber")
+        .execute(new_table)
+    )
 
     table = dataset.to_table()
 
@@ -1049,6 +1093,7 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
     )
 
     assert table.sort_by("id") == expected
+    check_merge_stats(merge_dict, (0, 2, 0))
 
     # No matches
 
@@ -1060,9 +1105,13 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
         }
     )
 
-    dataset.merge_insert("id").when_matched_update_all(
-        "target.txNumber < source.txNumber"
-    ).execute(new_table)
+    merge_dict = (
+        dataset.merge_insert("id")
+        .when_matched_update_all("target.txNumber < source.txNumber")
+        .execute(new_table)
+    )
+
+    check_merge_stats(merge_dict, (0, 0, 0))
 
 
 def test_merge_insert_source_is_dataset(tmp_path: Path):
@@ -1085,22 +1134,28 @@ def test_merge_insert_source_is_dataset(tmp_path: Path):
 
     is_new = pc.field("b") == 2
 
-    dataset.merge_insert("a").when_not_matched_insert_all().execute(new_dataset)
+    merge_dict = (
+        dataset.merge_insert("a").when_not_matched_insert_all().execute(new_dataset)
+    )
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
+    check_merge_stats(merge_dict, (300, 0, 0))
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
 
     reader = new_dataset.to_batches()
 
-    dataset.merge_insert("a").when_not_matched_insert_all().execute(
-        reader, schema=new_dataset.schema
+    merge_dict = (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .execute(reader, schema=new_dataset.schema)
     )
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
+    check_merge_stats(merge_dict, (300, 0, 0))
 
 
 def test_merge_insert_multiple_keys(tmp_path: Path):
@@ -1132,10 +1187,13 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
 
     is_new = pc.field("b") == 2
 
-    dataset.merge_insert(["a", "c"]).when_matched_update_all().execute(new_table)
+    merge_dict = (
+        dataset.merge_insert(["a", "c"]).when_matched_update_all().execute(new_table)
+    )
     table = dataset.to_table()
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 350
+    check_merge_stats(merge_dict, (0, 350, 0))
 
 
 def test_merge_insert_incompatible_schema(tmp_path: Path):
@@ -1157,7 +1215,10 @@ def test_merge_insert_incompatible_schema(tmp_path: Path):
     )
 
     with pytest.raises(OSError):
-        dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+        merge_dict = (
+            dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+        )
+        check_merge_stats(merge_dict, (None, None, None))
 
 
 def test_merge_insert_vector_column(tmp_path: Path):
@@ -1179,10 +1240,12 @@ def test_merge_insert_vector_column(tmp_path: Path):
         table, tmp_path / "dataset", mode="create", max_rows_per_file=100
     )
 
-    dataset.merge_insert(
-        ["key"]
-    ).when_not_matched_insert_all().when_matched_update_all().execute(new_table)
-
+    merge_dict = (
+        dataset.merge_insert(["key"])
+        .when_not_matched_insert_all()
+        .when_matched_update_all()
+        .execute(new_table)
+    )
     expected = pa.Table.from_pydict(
         {
             "vec": pa.array(
@@ -1193,6 +1256,7 @@ def test_merge_insert_vector_column(tmp_path: Path):
     )
 
     assert dataset.to_table().sort_by("key") == expected
+    check_merge_stats(merge_dict, (1, 1, 0))
 
 
 def test_update_dataset(tmp_path: Path):
@@ -1287,6 +1351,26 @@ def test_update_dataset_all_types(tmp_path: Path):
         }
     )
     assert dataset.to_table() == expected
+
+
+def test_update_with_binary_field(tmp_path: Path):
+    # Create a lance dataset with binary fields
+    table = pa.Table.from_pydict(
+        {
+            "a": [f"str-{i}" for i in range(100)],
+            "b": [b"bin-{i}" for i in range(100)],
+            "c": list(range(100)),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Update binary field
+    dataset.update({"b": "X'616263'"}, where="c < 2")
+
+    ds = lance.dataset(tmp_path)
+    assert ds.scanner(filter="c < 2").to_table().column(
+        "b"
+    ).combine_chunks() == pa.array([b"abc", b"abc"])
 
 
 def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):
@@ -1678,9 +1762,61 @@ def test_migrate_manifest(tmp_path: Path):
 
 def test_v2_dataset(tmp_path: Path):
     table = pa.table({"a": range(100), "b": range(100)})
-    dataset = lance.write_dataset(table, tmp_path, use_experimental_writer=True)
+    dataset = lance.write_dataset(table, tmp_path, use_legacy_format=False)
     batches = list(dataset.to_batches())
     assert len(batches) == 1
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
     assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+
+    # Append will write v2 if dataset was originally created with v2
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=True, mode="append"
+    )
+
+    assert len(dataset.get_fragments()) == 2
+
+    fragment = list(dataset.get_fragments())[1]
+    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=True, mode="overwrite"
+    )
+    fragment = list(dataset.get_fragments())[0]
+    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+
+    # Append will write v1 if dataset was originally created with v1
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=False, mode="append"
+    )
+
+    fragment = list(dataset.get_fragments())[1]
+    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+
+    # Writing an empty table with v2 will put dataset in "v2 mode"
+    dataset = lance.write_dataset(
+        [], tmp_path, schema=table.schema, use_legacy_format=False, mode="overwrite"
+    )
+
+    assert len(dataset.get_fragments()) == 0
+
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=True, mode="append"
+    )
+
+    fragment = list(dataset.get_fragments())[0]
+    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+
+    # Writing an empty table with v1 will put dataset in "v1 mode"
+    dataset = lance.write_dataset(
+        [], tmp_path, schema=table.schema, use_legacy_format=True, mode="overwrite"
+    )
+
+    assert len(dataset.get_fragments()) == 0
+
+    dataset = lance.write_dataset(
+        table, tmp_path, use_legacy_format=False, mode="append"
+    )
+
+    fragment = list(dataset.get_fragments())[0]
+    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)

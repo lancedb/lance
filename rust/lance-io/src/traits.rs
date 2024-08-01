@@ -5,6 +5,7 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use deepsize::DeepSizeOf;
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -79,17 +80,17 @@ impl<W: Writer + ?Sized> WriteExt for W {
 }
 
 #[async_trait]
-pub trait Reader: std::fmt::Debug + Send + Sync {
+pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn path(&self) -> &Path;
 
     /// Suggest optimal I/O size per storage device.
     fn block_size(&self) -> usize;
 
     /// Object/File Size.
-    async fn size(&self) -> Result<usize>;
+    async fn size(&self) -> object_store::Result<usize>;
 
     /// Read a range of bytes from the object.
     ///
     /// TODO: change to read_at()?
-    async fn get_range(&self, range: Range<usize>) -> Result<Bytes>;
+    async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes>;
 }

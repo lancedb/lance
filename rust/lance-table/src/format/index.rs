@@ -3,6 +3,7 @@
 
 //! Metadata for index
 
+use deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
@@ -31,10 +32,24 @@ pub struct Index {
     pub fragment_bitmap: Option<RoaringBitmap>,
 }
 
-impl TryFrom<&pb::IndexMetadata> for Index {
+impl DeepSizeOf for Index {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.uuid.as_bytes().deep_size_of_children(context)
+            + self.fields.deep_size_of_children(context)
+            + self.name.deep_size_of_children(context)
+            + self.dataset_version.deep_size_of_children(context)
+            + self
+                .fragment_bitmap
+                .as_ref()
+                .map(|fragment_bitmap| fragment_bitmap.serialized_size())
+                .unwrap_or(0)
+    }
+}
+
+impl TryFrom<pb::IndexMetadata> for Index {
     type Error = Error;
 
-    fn try_from(proto: &pb::IndexMetadata) -> Result<Self> {
+    fn try_from(proto: pb::IndexMetadata) -> Result<Self> {
         let fragment_bitmap = if proto.fragment_bitmap.is_empty() {
             None
         } else {
@@ -44,16 +59,14 @@ impl TryFrom<&pb::IndexMetadata> for Index {
         };
 
         Ok(Self {
-            uuid: proto
-                .uuid
-                .as_ref()
-                .map(Uuid::try_from)
-                .ok_or_else(|| Error::IO {
-                    message: "uuid field does not exist in Index metadata".to_string(),
-                    location: location!(),
-                })??,
-            name: proto.name.clone(),
-            fields: proto.fields.clone(),
+            uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
+                Error::io(
+                    "uuid field does not exist in Index metadata".to_string(),
+                    location!(),
+                )
+            })??,
+            name: proto.name,
+            fields: proto.fields,
             dataset_version: proto.dataset_version,
             fragment_bitmap,
         })

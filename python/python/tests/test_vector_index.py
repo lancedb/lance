@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance import LanceFragment
 
 torch = pytest.importorskip("torch")
 from lance.util import validate_vector_index  # noqa: E402
@@ -137,7 +138,6 @@ def test_index_with_nans(tmp_path):
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
-        accelerator=torch.device("cpu"),
     )
     validate_vector_index(dataset, "vector")
 
@@ -447,6 +447,22 @@ def test_optimize_index(dataset, tmp_path):
     assert len(list(indices_dir.iterdir())) == 2
 
 
+def test_create_index_dot(dataset, tmp_path):
+    dataset_uri = tmp_path / "dataset.lance"
+    assert not dataset.has_index
+    ds = lance.write_dataset(dataset.to_table(), dataset_uri)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="dot",
+        num_partitions=4,
+        num_sub_vectors=2,
+    )
+
+    assert ds.has_index
+    assert "dot" == ds.stats.index_stats("vector_idx")["indices"][0]["metric_type"]
+
+
 def create_uniform_table(min, max, nvec, offset, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     # rowid = np.arange(offset, offset + nvec)
@@ -491,8 +507,8 @@ def test_optimize_index_recall(tmp_path: Path):
         for query in sample_queries:
             results = dataset.to_table(nearest=query).column("vector")
             assert has_target(query["q"], results)
-            plan = dataset.scanner(nearest=query).explain_plan()
-            assert ("KNNFlat" in plan) == has_knn_combined
+            plan = dataset.scanner(nearest=query).explain_plan(verbose=True)
+            assert ("KNNVectorDistance" in plan) == has_knn_combined
         for query in sample_delete_queries:
             results = dataset.to_table(nearest=query).column("vector")
             assert delete_has_happened != has_target(query["q"], results)
@@ -589,7 +605,7 @@ def test_index_cache_size(tmp_path):
 
     indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=1)
     # query using the same vector, we should get a very high hit rate
-    query_index(indexed_dataset, 100, q=rng.standard_normal(16))
+    query_index(indexed_dataset, 200, q=rng.standard_normal(16))
     assert indexed_dataset._ds.index_cache_hit_rate() > 0.99
 
     last_hit_rate = indexed_dataset._ds.index_cache_hit_rate()
@@ -729,3 +745,56 @@ def test_index_cast_centroids(tmp_path):
         accelerator=torch.device("cpu"),
         ivf_centroids=centroids,
     )
+
+
+def test_fragment_scan_disallowed_on_ann(dataset):
+    q = np.random.randn(128)
+    with pytest.raises(
+        ValueError, match="This operation is not supported for fragment scan"
+    ):
+        scanner = dataset.scanner(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": q,
+            },
+            fragments=[LanceFragment(dataset, 0)],
+        )
+        scanner.explain_plan(True)
+
+
+def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
+    q = np.random.randn(128)
+    scanner = dataset.scanner(
+        prefilter=True,
+        filter="id>0",
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": q,
+        },
+        fragments=[LanceFragment(dataset, 0)],
+    )
+    scanner.explain_plan(True)
+
+
+def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+    dataset.create_scalar_index("id", index_type="BTREE")
+
+    q = np.random.randn(128)
+    with pytest.raises(
+        ValueError, match="This operation is not supported for fragment scan"
+    ):
+        scanner = dataset.scanner(
+            prefilter=True,
+            filter="id=1234",
+            columns=["id"],
+            nearest={"column": "vector", "q": q, "use_index": True},
+            fragments=[LanceFragment(dataset, 0)],
+        )
+        scanner.explain_plan(True)

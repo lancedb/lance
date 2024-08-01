@@ -34,7 +34,7 @@ impl LanceSchema {
         Ok(format!("{:?}", self.0))
     }
 
-    pub fn __richcmp__(&self, other: LanceSchema, op: CompareOp) -> PyResult<bool> {
+    pub fn __richcmp__(&self, other: Self, op: CompareOp) -> PyResult<bool> {
         match op {
             CompareOp::Eq => Ok(self.0 == other.0),
             CompareOp::Ne => Ok(self.0 != other.0),

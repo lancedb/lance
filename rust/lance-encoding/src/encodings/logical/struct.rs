@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{
+    collections::{BinaryHeap, VecDeque},
+    ops::Range,
+    sync::Arc,
+};
 
 use arrow_array::{cast::AsArray, ArrayRef, StructArray};
 use arrow_schema::{DataType, Fields};
@@ -11,13 +15,138 @@ use snafu::{location, Location};
 
 use crate::{
     decoder::{
-        DecodeArrayTask, DecoderReady, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask,
-        SchedulerContext,
+        DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
+        NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{EncodeTask, EncodedArray, EncodedPage, FieldEncoder},
+    encoder::{EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
     format::pb,
 };
 use lance_core::{Error, Result};
+
+#[derive(Debug)]
+struct SchedulingJobWithStatus<'a> {
+    col_idx: u32,
+    col_name: &'a str,
+    job: Box<dyn SchedulingJob + 'a>,
+    rows_scheduled: u64,
+    rows_remaining: u64,
+}
+
+impl<'a> PartialEq for SchedulingJobWithStatus<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.col_idx == other.col_idx
+    }
+}
+
+impl<'a> Eq for SchedulingJobWithStatus<'a> {}
+
+impl<'a> PartialOrd for SchedulingJobWithStatus<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<'a> Ord for SchedulingJobWithStatus<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Note this is reversed to make it min-heap
+        other.rows_scheduled.cmp(&self.rows_scheduled)
+    }
+}
+
+/// Scheduling job for struct data
+///
+/// The order in which we schedule the children is important.  We want to schedule the child
+/// with the least amount of data first.
+///
+/// This allows us to decode entire rows as quickly as possible
+#[derive(Debug)]
+struct SimpleStructSchedulerJob<'a> {
+    scheduler: &'a SimpleStructScheduler,
+    /// A min-heap whose key is the # of rows currently scheduled
+    children: BinaryHeap<SchedulingJobWithStatus<'a>>,
+    rows_scheduled: u64,
+    num_rows: u64,
+    initialized: bool,
+}
+
+impl<'a> SimpleStructSchedulerJob<'a> {
+    fn new(
+        scheduler: &'a SimpleStructScheduler,
+        children: Vec<Box<dyn SchedulingJob + 'a>>,
+        num_rows: u64,
+    ) -> Self {
+        let children = children
+            .into_iter()
+            .enumerate()
+            .map(|(idx, job)| SchedulingJobWithStatus {
+                col_idx: idx as u32,
+                col_name: scheduler.child_fields[idx].name(),
+                job,
+                rows_scheduled: 0,
+                rows_remaining: num_rows,
+            })
+            .collect::<BinaryHeap<_>>();
+        Self {
+            scheduler,
+            children,
+            rows_scheduled: 0,
+            num_rows,
+            initialized: false,
+        }
+    }
+}
+
+impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
+    fn schedule_next(
+        &mut self,
+        mut context: &mut SchedulerContext,
+        top_level_row: u64,
+    ) -> Result<ScheduledScanLine> {
+        let mut decoders = Vec::new();
+        if !self.initialized {
+            // Send info to the decoder thread so it knows a struct is here.  In the future we will also
+            // send validity info here.
+            let struct_decoder = Box::new(SimpleStructDecoder::new(
+                self.scheduler.child_fields.clone(),
+                self.num_rows,
+            ));
+            let struct_decoder = context.locate_decoder(struct_decoder);
+            decoders.push(struct_decoder);
+            self.initialized = true;
+        }
+        let old_rows_scheduled = self.rows_scheduled;
+        // Schedule as many children as we need to until we have scheduled at least one
+        // complete row
+        while old_rows_scheduled == self.rows_scheduled {
+            let mut next_child = self.children.pop().unwrap();
+            trace!("Scheduling more rows for child {}", next_child.col_idx);
+            let scoped = context.push(next_child.col_name, next_child.col_idx);
+            let child_scan = next_child
+                .job
+                .schedule_next(scoped.context, top_level_row)?;
+            trace!(
+                "Scheduled {} rows for child {}",
+                child_scan.rows_scheduled,
+                next_child.col_idx
+            );
+            next_child.rows_scheduled += child_scan.rows_scheduled;
+            next_child.rows_remaining -= child_scan.rows_scheduled;
+            decoders.extend(child_scan.decoders);
+            self.children.push(next_child);
+            self.rows_scheduled = self.children.peek().unwrap().rows_scheduled;
+            context = scoped.pop();
+        }
+        let struct_rows_scheduled = self.rows_scheduled - old_rows_scheduled;
+        Ok(ScheduledScanLine {
+            decoders,
+            rows_scheduled: struct_rows_scheduled,
+        })
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+}
 
 /// A scheduler for structs
 ///
@@ -25,349 +154,51 @@ use lance_core::{Error, Result};
 /// go through and schedule each column one after the other.  This would mean our decode can't start
 /// until nearly all the data has arrived (since we need data from each column)
 ///
-/// Instead, we schedule in row-major fashion, described in detail below.
+/// Instead, we schedule in row-major fashion
 ///
 /// Note: this scheduler is the starting point for all decoding.  This is because we treat the top-level
 /// record batch as a non-nullable struct.
 #[derive(Debug)]
 pub struct SimpleStructScheduler {
-    children: Vec<Vec<Box<dyn LogicalPageScheduler>>>,
+    children: Vec<Arc<dyn FieldScheduler>>,
     child_fields: Fields,
-    num_rows: u32,
-    // True if this is the top-level decoder (and we should send scan line messages)
-    is_root: bool,
+    num_rows: u64,
 }
 
 impl SimpleStructScheduler {
-    fn new_with_params(
-        children: Vec<Vec<Box<dyn LogicalPageScheduler>>>,
-        child_fields: Fields,
-        is_root: bool,
-    ) -> Self {
+    pub fn new(children: Vec<Arc<dyn FieldScheduler>>, child_fields: Fields) -> Self {
         debug_assert!(!children.is_empty());
-        let num_rows = children[0].iter().map(|page| page.num_rows()).sum();
-        // Ensure that all the children have the same number of rows
+        let num_rows = children[0].num_rows();
+        debug_assert!(children.iter().all(|child| child.num_rows() == num_rows));
         Self {
             children,
             child_fields,
             num_rows,
-            is_root,
-        }
-    }
-
-    pub fn new(children: Vec<Vec<Box<dyn LogicalPageScheduler>>>, child_fields: Fields) -> Self {
-        Self::new_with_params(children, child_fields, false)
-    }
-
-    pub fn new_root(
-        children: Vec<Vec<Box<dyn LogicalPageScheduler>>>,
-        child_fields: Fields,
-    ) -> Self {
-        Self::new_with_params(children, child_fields, true)
-    }
-}
-
-// As we schedule a range we keep one of these per column so that we know
-// how far into the column we have already scheduled.
-#[derive(Debug, Clone, Copy)]
-struct RangeFieldWalkStatus {
-    rows_to_skip: u32,
-    rows_to_take: u32,
-    page_offset: u32,
-    rows_queued: u32,
-}
-
-impl RangeFieldWalkStatus {
-    fn new_from_range(range: Range<u32>) -> Self {
-        Self {
-            rows_to_skip: range.start,
-            rows_to_take: range.end - range.start,
-            page_offset: 0,
-            rows_queued: 0,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-struct TakeFieldWalkStatus<'a> {
-    indices: &'a [u32],
-    indices_index: usize,
-    page_offset: u32,
-    rows_queued: u32,
-    rows_passed: u32,
-}
-
-impl<'a> TakeFieldWalkStatus<'a> {
-    fn new_from_indices(indices: &'a [u32]) -> Self {
-        Self {
-            indices,
-            indices_index: 0,
-            page_offset: 0,
-            rows_queued: 0,
-            rows_passed: 0,
-        }
+impl FieldScheduler for SimpleStructScheduler {
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[Range<u64>],
+        filter: &FilterExpression,
+    ) -> Result<Box<dyn SchedulingJob + 'a>> {
+        let child_schedulers = self
+            .children
+            .iter()
+            .map(|child| child.schedule_ranges(ranges, filter))
+            .collect::<Result<Vec<_>>>()?;
+        let num_rows = child_schedulers[0].num_rows();
+        Ok(Box::new(SimpleStructSchedulerJob::new(
+            self,
+            child_schedulers,
+            num_rows,
+        )))
     }
 
-    // If the next page has `rows_in_page` rows then return the indices that would be included
-    // in that page (the returned indices are relative to the start of the page)
-    fn advance_page(&mut self, rows_in_page: u32) -> Vec<u32> {
-        let mut indices = Vec::new();
-        while self.indices_index < self.indices.len()
-            && (self.indices[self.indices_index] - self.rows_passed) < rows_in_page
-        {
-            indices.push(self.indices[self.indices_index] - self.rows_passed);
-            self.indices_index += 1;
-        }
-        self.rows_passed += rows_in_page;
-        self.page_offset += 1;
-        indices
-    }
-}
-
-impl LogicalPageScheduler for SimpleStructScheduler {
-    fn schedule_ranges(
-        &self,
-        ranges: &[Range<u32>],
-        mut context: &mut SchedulerContext,
-        top_level_row: u64,
-    ) -> Result<()> {
-        for range in ranges.iter().cloned() {
-            let mut rows_to_read = range.end - range.start;
-            trace!(
-                "Scheduling struct decode of range {:?} ({} rows)",
-                range,
-                rows_to_read
-            );
-
-            // Before we do anything, send a struct decoder to the decode thread so it can start decoding the pages
-            // we are about to send.
-            //
-            // This will need to get a tiny bit more complicated once structs have their own nullability and that nullability
-            // information starts to span multiple pages.
-            context.emit(Box::new(SimpleStructDecoder::new(
-                self.child_fields.clone(),
-                rows_to_read,
-            )));
-
-            let mut field_status =
-                vec![RangeFieldWalkStatus::new_from_range(range); self.children.len()];
-
-            // NOTE: The order in which we are scheduling tasks here is very important.  We want to schedule the I/O so that
-            // we can deliver completed rows as quickly as possible to the decoder.  This means we want to schedule in row-major
-            // order from start to the end.  E.g. if we schedule one column at a time then the decoder is going to have to wait
-            // until almost all the I/O is finished before it can return a single batch.
-            //
-            // Luckily, we can do this using a simple greedy algorithm.  We iterate through each column independently.  For each
-            // pass through the metadata we look for any column that doesn't have any "queued rows".  Once we find it we schedule
-            // the next page for that column and increase its queued rows.  After each pass we should have some data queued for
-            // each column.  We take the column with the least amount of queued data and decrement that amount from the queued
-            // rows total of all columns.
-
-            // As we schedule, we create decoders.  These decoders are immediately sent to the decode thread
-            // to allow decoding to start.
-
-            // TODO: Instead of advancing one page at a time on each column we could make this algorithm aware of the
-            // batch size.  Then we would advance a column until it has enough rows to fill the next batch.  This would
-            // mainly be useful in cases like "take from fixed-size-list<struct<...>>" since the take from fsl becomes a
-            // schedule_ranges against the struct with many tiny ranges and then we end up converting each range into a single
-            // batch of I/O with the current algorithm.
-            //
-            // The downside of the current algorithm is that many tiny I/O batches means less opportunity for in-batch coalescing.
-            // Then again, if our outer batch coalescing is super good then maybe we don't bother
-
-            let mut current_top_level_row = top_level_row;
-
-            while rows_to_read > 0 {
-                let mut min_rows_added = u32::MAX;
-                for (col_idx, field_scheduler) in self.children.iter().enumerate() {
-                    let status = &mut field_status[col_idx];
-                    if status.rows_queued == 0 {
-                        trace!("Need additional rows for column {}", col_idx);
-                        let mut next_page = &field_scheduler[status.page_offset as usize];
-
-                        while status.rows_to_skip >= next_page.num_rows() {
-                            status.rows_to_skip -= next_page.num_rows();
-                            status.page_offset += 1;
-                            trace!("Skipping entire page of {} rows", next_page.num_rows());
-                            next_page = &field_scheduler[status.page_offset as usize];
-                        }
-
-                        let page_range_start = status.rows_to_skip;
-                        let page_rows_remaining = next_page.num_rows() - page_range_start;
-                        let rows_to_take = status.rows_to_take.min(page_rows_remaining);
-                        let page_range = page_range_start..(page_range_start + rows_to_take);
-
-                        trace!(
-                            "Taking {} rows from column {} starting at page offset {}",
-                            rows_to_take,
-                            col_idx,
-                            page_range_start,
-                        );
-                        let scope = context.push(self.child_fields[col_idx].name(), col_idx as u32);
-                        next_page.schedule_ranges(
-                            &[page_range],
-                            scope.context,
-                            current_top_level_row,
-                        )?;
-                        context = scope.pop();
-
-                        status.rows_queued += rows_to_take;
-                        status.rows_to_take -= rows_to_take;
-                        status.page_offset += 1;
-                        status.rows_to_skip = 0;
-
-                        min_rows_added = min_rows_added.min(rows_to_take);
-                    } else {
-                        trace!(
-                            "Using {} queued rows for column {}",
-                            col_idx,
-                            status.rows_queued
-                        );
-                        min_rows_added = min_rows_added.min(status.rows_queued);
-                    }
-                }
-                if min_rows_added == 0 {
-                    panic!("Error in scheduling logic, panic to avoid infinite loop");
-                }
-                rows_to_read -= min_rows_added;
-                current_top_level_row += min_rows_added as u64;
-                if self.is_root {
-                    trace!(
-                        "Scheduler scan complete ({} rows now scheduled)",
-                        current_top_level_row - top_level_row
-                    );
-                    context
-                        .sink
-                        .send(crate::decoder::DecoderMessage::ScanLine(
-                            current_top_level_row - top_level_row,
-                        ))
-                        .unwrap();
-                }
-                for field_status in &mut field_status {
-                    field_status.rows_queued -= min_rows_added;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn num_rows(&self) -> u32 {
+    fn num_rows(&self) -> u64 {
         self.num_rows
-    }
-
-    fn schedule_take(
-        &self,
-        indices: &[u32],
-        mut context: &mut SchedulerContext,
-        top_level_row: u64,
-    ) -> Result<()> {
-        trace!(
-            "Scheduling struct decode of {} indices with top_level_row={}",
-            indices.len(),
-            top_level_row
-        );
-
-        // Before we do anything, send a struct decoder to the decode thread so it can start decoding the pages
-        // we are about to send.
-        //
-        // This will need to get a tiny bit more complicated once structs have their own nullability and that nullability
-        // information starts to span multiple pages.
-        context.emit(Box::new(SimpleStructDecoder::new(
-            self.child_fields.clone(),
-            indices.len() as u32,
-        )));
-
-        // Create a cursor into indices for each column
-        let mut field_status =
-            vec![TakeFieldWalkStatus::new_from_indices(indices); self.children.len()];
-        let mut rows_to_read = indices.len() as u32;
-
-        // NOTE: See schedule_range for a description of the scheduling algorithm
-        let mut current_top_level_row = top_level_row;
-        while rows_to_read > 0 {
-            trace!("Beginning scheduler scan of columns");
-            let mut min_rows_added = u32::MAX;
-            for (col_idx, field_scheduler) in self.children.iter().enumerate() {
-                let status = &mut field_status[col_idx];
-                if status.rows_queued == 0 {
-                    trace!("Need additional rows for column {}", col_idx);
-                    let mut indices_in_page = Vec::new();
-                    let mut next_page = None;
-                    // Loop through the pages in this column until we find one with overlapping indices
-                    while indices_in_page.is_empty() {
-                        let next_candidate_page = &field_scheduler[status.page_offset as usize];
-                        indices_in_page = status.advance_page(next_candidate_page.num_rows());
-                        trace!(
-                            "{}",
-                            if indices_in_page.is_empty() {
-                                format!(
-                                    "Skipping entire page of {} rows for column {}",
-                                    next_candidate_page.num_rows(),
-                                    col_idx,
-                                )
-                            } else {
-                                format!(
-                                    "Found page for column {} with {} rows that had {} overlapping indices",
-                                    col_idx,
-                                    next_candidate_page.num_rows(),
-                                    indices_in_page.len()
-                                )
-                            }
-                        );
-                        next_page = Some(next_candidate_page);
-                    }
-
-                    // We should be guaranteed to get at least one page
-                    let next_page = next_page.unwrap();
-
-                    let scope = context.push(self.child_fields[col_idx].name(), col_idx as u32);
-                    next_page.schedule_take(
-                        &indices_in_page,
-                        scope.context,
-                        current_top_level_row,
-                    )?;
-                    context = scope.pop();
-
-                    let rows_scheduled = indices_in_page.len() as u32;
-                    status.rows_queued += rows_scheduled;
-
-                    min_rows_added = min_rows_added.min(rows_scheduled);
-                } else {
-                    // TODO: Unit tests are not covering this path right now
-                    trace!(
-                        "Using {} already queued rows for column {}",
-                        status.rows_queued,
-                        col_idx
-                    );
-                    min_rows_added = min_rows_added.min(status.rows_queued);
-                }
-            }
-            if min_rows_added == 0 {
-                panic!("Error in scheduling logic, panic to avoid infinite loop");
-            }
-            trace!(
-                "One scheduling pass complete, {} rows added",
-                min_rows_added
-            );
-            rows_to_read -= min_rows_added;
-            current_top_level_row += min_rows_added as u64;
-            if self.is_root {
-                trace!(
-                    "Scheduler scan complete ({} rows now scheduled)",
-                    current_top_level_row - top_level_row
-                );
-                context
-                    .sink
-                    .send(crate::decoder::DecoderMessage::ScanLine(
-                        current_top_level_row - top_level_row,
-                    ))
-                    .unwrap();
-            }
-            for field_status in &mut field_status {
-                field_status.rows_queued -= min_rows_added;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -386,10 +217,10 @@ struct ChildState {
     scheduled: VecDeque<Box<dyn LogicalPageDecoder>>,
     // Rows that should still be coming over the channel source but haven't yet been
     // put into the awaited queue
-    rows_unawaited: u32,
+    rows_unawaited: u64,
     // Rows that have been pulled out of the channel source, awaited, and are ready to
     // be drained
-    rows_available: u32,
+    rows_available: u64,
     // The field index in the struct (used for debugging / logging)
     field_index: u32,
 }
@@ -397,7 +228,7 @@ struct ChildState {
 struct CompositeDecodeTask {
     // One per child
     tasks: Vec<Box<dyn DecodeArrayTask>>,
-    num_rows: u32,
+    num_rows: u64,
     has_more: bool,
 }
 
@@ -420,7 +251,7 @@ impl CompositeDecodeTask {
 }
 
 impl ChildState {
-    fn new(num_rows: u32, field_index: u32) -> Self {
+    fn new(num_rows: u64, field_index: u32) -> Self {
         Self {
             scheduled: VecDeque::new(),
             rows_unawaited: num_rows,
@@ -430,7 +261,7 @@ impl ChildState {
     }
 
     // Wait for the next set of rows to arrive.
-    async fn wait(&mut self, num_rows: u32) -> Result<()> {
+    async fn wait(&mut self, num_rows: u64) -> Result<()> {
         trace!(
             "Struct child {} waiting for {} rows and {} are available already",
             self.field_index,
@@ -476,10 +307,10 @@ impl ChildState {
         }
     }
 
-    fn drain(&mut self, num_rows: u32) -> Result<CompositeDecodeTask> {
+    fn drain(&mut self, num_rows: u64) -> Result<CompositeDecodeTask> {
         trace!("Struct draining {} rows", num_rows);
         debug_assert!(self.rows_available >= num_rows);
-        debug_assert!(num_rows > 0);
+
         self.rows_available -= num_rows;
         let mut remaining = num_rows;
         let mut composite = CompositeDecodeTask {
@@ -505,14 +336,14 @@ impl ChildState {
 }
 
 #[derive(Debug)]
-struct SimpleStructDecoder {
+pub struct SimpleStructDecoder {
     children: Vec<ChildState>,
     child_fields: Fields,
     data_type: DataType,
 }
 
 impl SimpleStructDecoder {
-    fn new(child_fields: Fields, num_rows: u32) -> Self {
+    pub fn new(child_fields: Fields, num_rows: u64) -> Self {
         let data_type = DataType::Struct(child_fields.clone());
         Self {
             children: child_fields
@@ -543,7 +374,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
         Ok(())
     }
 
-    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
+    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
         async move {
             for child in self.children.iter_mut() {
                 child.wait(num_rows).await?;
@@ -553,7 +384,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
         .boxed()
     }
 
-    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         let child_tasks = self
             .children
             .iter_mut()
@@ -574,7 +405,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
     }
 
     // Rows are available only if they are available in every child column
-    fn avail(&self) -> u32 {
+    fn avail(&self) -> u64 {
         self.children
             .iter()
             .map(|c| c.rows_available)
@@ -583,7 +414,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
     }
 
     // Rows are unawaited if they are unawaited in any child column
-    fn unawaited(&self) -> u32 {
+    fn unawaited(&self) -> u64 {
         self.children
             .iter()
             .map(|c| c.rows_unawaited)
@@ -619,7 +450,7 @@ impl DecodeArrayTask for SimpleStructDecodeTask {
 pub struct StructFieldEncoder {
     children: Vec<Box<dyn FieldEncoder>>,
     column_index: u32,
-    num_rows_seen: u32,
+    num_rows_seen: u64,
 }
 
 impl StructFieldEncoder {
@@ -635,7 +466,7 @@ impl StructFieldEncoder {
 
 impl FieldEncoder for StructFieldEncoder {
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
-        self.num_rows_seen += array.len() as u32;
+        self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
         let child_tasks = self
             .children
@@ -682,12 +513,25 @@ impl FieldEncoder for StructFieldEncoder {
             .sum::<u32>()
             + 1
     }
+
+    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        async move {
+            let mut columns = Vec::new();
+            // Add a column for the struct header
+            columns.push(EncodedColumn::default());
+            for child in self.children.iter_mut() {
+                columns.extend(child.finish().await?);
+            }
+            Ok(columns)
+        }
+        .boxed()
+    }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
@@ -706,7 +550,7 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
         let field = Field::new("", data_type, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -720,7 +564,7 @@ mod tests {
             Field::new("outer_int", DataType::Int32, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -742,7 +586,7 @@ mod tests {
             Field::new("outer_binary", DataType::Binary, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -771,6 +615,7 @@ mod tests {
             .step_by(437)
             .map(|offset| struct_array.slice(offset, 437.min(10000 - offset)))
             .collect::<Vec<_>>();
-        check_round_trip_encoding_of_data(struct_arrays, &TestCases::default()).await;
+        check_round_trip_encoding_of_data(struct_arrays, &TestCases::default(), HashMap::new())
+            .await;
     }
 }

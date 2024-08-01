@@ -6,14 +6,18 @@ use std::{ops::Range, sync::Arc};
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 
+use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use num_traits::*;
 use snafu::{location, Location};
 
+use super::quantizer::Quantizer;
+
 pub mod builder;
 pub mod storage;
+pub mod transform;
 
 /// Scalar Quantization, optimized for [Apache Arrow] buffer memory layout.
 ///
@@ -30,6 +34,12 @@ pub struct ScalarQuantizer {
     pub dim: usize,
 
     pub bounds: Range<f64>,
+}
+
+impl DeepSizeOf for ScalarQuantizer {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        0
+    }
 }
 
 impl ScalarQuantizer {
@@ -118,6 +128,19 @@ impl ScalarQuantizer {
     /// Whether to use residual as input or not.
     pub fn use_residual(&self) -> bool {
         false
+    }
+}
+
+impl TryFrom<Quantizer> for ScalarQuantizer {
+    type Error = Error;
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::Scalar(sq) => Ok(sq),
+            _ => Err(Error::Index {
+                message: "Expect to be a ScalarQuantizer".to_string(),
+                location: location!(),
+            }),
+        }
     }
 }
 

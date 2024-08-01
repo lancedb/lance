@@ -4,10 +4,12 @@
 use std::ops::Range;
 
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 
 use lance_core::Result;
 
+pub mod buffer;
+pub mod data;
 pub mod decoder;
 pub mod encoder;
 pub mod encodings;
@@ -42,6 +44,20 @@ pub trait EncodingsIo: Send + Sync {
         range: Vec<Range<u64>>,
         priority: u64,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>>;
+
+    /// Submit an I/O request with a single range
+    ///
+    /// This is just a utitliy function that wraps [`EncodingsIo::submit_request`] for the common
+    /// case of a single range request.
+    fn submit_single(
+        &self,
+        range: std::ops::Range<u64>,
+        priority: u64,
+    ) -> BoxFuture<'static, lance_core::Result<bytes::Bytes>> {
+        self.submit_request(vec![range], priority)
+            .map_ok(|mut v| v.pop().unwrap())
+            .boxed()
+    }
 }
 
 /// An implementation of EncodingsIo that serves data from an in-memory buffer

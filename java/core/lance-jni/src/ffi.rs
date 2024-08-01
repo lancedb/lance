@@ -14,11 +14,10 @@
 
 use core::slice;
 
+use crate::error::Result;
 use jni::objects::{JByteBuffer, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{objects::JObject, JNIEnv};
-
-use crate::error::{Error, Result};
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
@@ -28,10 +27,18 @@ pub trait JNIEnvExt {
     /// Get strings from Java List<String> object.
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>>;
 
-    /// Get strings from Java String[] object.
-    /// Note that get Option<Vec<String>> from Java Optional<String[]> just doesn't work.
+    /// Converts a Java `String[]` array to a Rust `Vec<String>`.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it dereferences a raw pointer `jobjectArray`.
+    /// The caller must ensure that the `jobjectArray` is a valid Java string array
+    /// and that the JNI environment `self` is correctly initialized and valid.
+    /// The function assumes that the `jobjectArray` is not null and that its elements
+    /// are valid Java strings. If these conditions are not met, the function may
+    /// exhibit undefined behavior.
     #[allow(dead_code)]
-    fn get_strings_array(&mut self, obj: jobjectArray) -> Result<Vec<String>>;
+    unsafe fn get_strings_array(&mut self, obj: jobjectArray) -> Result<Vec<String>>;
 
     /// Get Option<String> from Java Optional<String>.
     fn get_string_opt(&mut self, obj: &JObject) -> Result<Option<String>>;
@@ -85,7 +92,7 @@ impl JNIEnvExt for JNIEnv<'_> {
         Ok(results)
     }
 
-    fn get_strings_array(&mut self, obj: jobjectArray) -> Result<Vec<String>> {
+    unsafe fn get_strings_array(&mut self, obj: jobjectArray) -> Result<Vec<String>> {
         let jobject_array = unsafe { JObjectArray::from_raw(obj) };
         let array_len = self.get_array_length(&jobject_array)?;
         let mut res: Vec<String> = Vec::new();
@@ -171,12 +178,12 @@ impl JNIEnvExt for JNIEnv<'_> {
         if obj.is_null() {
             return Ok(None);
         }
-        let is_empty = self.call_method(obj, "isEmpty", "()Z", &[])?;
-        if is_empty.z()? {
+        let is_present = self.call_method(obj, "isPresent", "()Z", &[])?;
+        if is_present.z()? {
+            f(self, obj).map(Some)
+        } else {
             // TODO(lu): put get java object into here cuz can only get java Object
             Ok(None)
-        } else {
-            f(self, obj).map(Some)
         }
     }
 }
