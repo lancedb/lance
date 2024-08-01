@@ -13,6 +13,7 @@ use async_recursion::async_recursion;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -1618,9 +1619,10 @@ impl Scanner {
         projection: &Schema,
         batch_readahead: usize,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let coalesced = Arc::new(CoalesceBatchesExec::new(input, self.get_batch_size()));
         Ok(Arc::new(TakeExec::try_new(
             self.dataset.clone(),
-            input,
+            coalesced,
             Arc::new(projection.clone()),
             batch_readahead,
         )?))
