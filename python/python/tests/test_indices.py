@@ -16,6 +16,7 @@ NUM_FRAGMENTS = 3
 NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
 
+
 @pytest.fixture(params=[np.float16, np.float32, np.float64], ids=["f16", "f32", "f64"])
 def rand_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(request.param)
@@ -25,10 +26,6 @@ def rand_dataset(tmpdir, request):
     uri = str(tmpdir / "dataset")
 
     ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
-    uri = str(tmpdir / "dataset")
-
-    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
-
     return ds
 
 
@@ -148,17 +145,17 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)
 
-def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
+def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder = IndicesBuilder(rand_dataset, "vectors")
-    uri = str(tmpdir / "transformed")
+    uri = str(tmpdir / "transformed_shuffle")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
 
     # test shuffle for transformed vectors
     filenames = builder.shuffle_transformed_vectors(
-        ["transformed"], str(tmpdir), rand_ivf
+        ["transformed_shuffle"], str(tmpdir), rand_ivf
     )
-    
+
     for fname in filenames:
         full_path = str(tmpdir / fname)
         assert os.path.getsize(full_path) > 0

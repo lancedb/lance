@@ -197,8 +197,7 @@ pub async fn shuffle_vectors(
     let num_partitions = ivf_centroids.len() as u32;
     let shuffle_partition_batches = 1024 * 10;
     let shuffle_partition_concurrency = 2;
-    let mut shuffler =
-        IvfShuffler::try_new(num_partitions, Some(dir_path.into()), false)?;
+    let mut shuffler = IvfShuffler::try_new(num_partitions, Some(dir_path.into()), false)?;
 
     unsafe {
         shuffler.set_unsorted_buffers(&filenames);
@@ -233,11 +232,7 @@ struct ShuffleInput {
 }
 
 impl IvfShuffler {
-    pub fn try_new(
-        num_partitions: u32,
-        output_dir: Option<Path>,
-        is_legacy: bool,
-    ) -> Result<Self> {
+    pub fn try_new(num_partitions: u32, output_dir: Option<Path>, is_legacy: bool) -> Result<Self> {
         let output_dir = match output_dir {
             Some(output_dir) => output_dir,
             None => get_temp_dir()?,
@@ -321,15 +316,12 @@ impl IvfShuffler {
             println!("Path as string: {:?}", Path::parse(path.clone()));
 
             if self.is_legacy {
-                let reader =
-                    FileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
                 total_batches.push(reader.num_batches());
-            }
-            else {
+            } else {
                 let scheduler = ScanScheduler::new(object_store.into());
                 let file = scheduler.open_file(&path).await?;
-                let reader =
-                    Lancev2FileReader::try_open(file, None, Default::default()).await?;
+                let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let num_batches = reader.metadata().num_rows / 1024;
                 total_batches.push(num_batches as usize);
             }
@@ -352,8 +344,7 @@ impl IvfShuffler {
             let path = self.output_dir.child(file_name.as_str());
 
             if self.is_legacy {
-                let reader =
-                    FileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
                 let lance_schema = reader
                     .schema()
                     .project(&[PART_ID_COLUMN])
@@ -373,11 +364,9 @@ impl IvfShuffler {
                         partition_sizes[*part_id as usize] += 1;
                     });
                 }
-            }
-            else {
+            } else {
                 let file = scheduler.open_file(&path).await?;
-                let reader =
-                    Lancev2FileReader::try_open(file, None, Default::default()).await?;
+                let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader
                     .read_stream(
                         lance_io::ReadBatchParams::Range(start..end),
@@ -456,8 +445,7 @@ impl IvfShuffler {
             let path = self.output_dir.child(file_name.as_str());
 
             if self.is_legacy {
-                let reader =
-                    FileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
 
                 let mut stream = stream::iter(start..end)
                     .map(|i| {
@@ -480,12 +468,10 @@ impl IvfShuffler {
 
                     Self::process_batch_in_shuffle(batch, &mut partitioned_batches).await?;
                 }
-            }
-            else {
+            } else {
                 let scheduler = ScanScheduler::new(Arc::new(object_store));
                 let file = scheduler.open_file(&path).await?;
-                let reader =
-                    Lancev2FileReader::try_open(file, None, Default::default()).await?;
+                let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader
                     .read_stream(
                         lance_io::ReadBatchParams::Range(start..end),
