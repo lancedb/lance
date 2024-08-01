@@ -437,19 +437,19 @@ class IndicesBuilder:
         """
         Take the transformed, unsorted vector files as input, and create sorted
         storage files. Sorting is done based on the partition id. This function
-        only makes sense if the storage file contains a partition_id column.
+        only makes sense if the transformed vector file contains a partition_id column.
 
         Parameters
         ----------
         filenames: list[str]
-            The filenames of the unsorted storage files.
-        dest_uri: str
-            Path of the directory where all the files are located.
+            The filenames of the unsorted files.
+        dir_path: str
+            Directory where all the files are located, and where output files will be placed.
 
         Returns
         -------
         list[str]
-            The list of paths of sorted transformed vector files.
+            The file paths of the sorted transformed vector files.
         """
         if isinstance(filenames, list):
             return indices.shuffle_transformed_vectors(
