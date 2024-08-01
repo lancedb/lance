@@ -196,7 +196,7 @@ impl TestDatasetGenerator {
             let sub_frag = FragmentCreateBuilder::new(uri)
                 .schema(&file_schema)
                 .write_params(&WriteParams {
-                    data_storage_version: Some(self.data_storage_version.into()),
+                    data_storage_version: Some(self.data_storage_version),
                     ..Default::default()
                 })
                 .write(reader, None)

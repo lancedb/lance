@@ -9,11 +9,12 @@ pub const V2_FORMAT_2_0: &str = "2.0";
 pub const V2_FORMAT_2_1: &str = "2.1";
 
 /// Lance file version
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Ord, PartialOrd)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Ord, PartialOrd)]
 pub enum LanceFileVersion {
     // Note that Stable must come AFTER the stable version and Next must come AFTER the next version
     // this way comparisons like x >= V2_0 will work the same if x is Stable or V2_0
     /// The legacy (0.1) format
+    #[default]
     Legacy,
     V2_0,
     /// The latest stable release
@@ -23,29 +24,20 @@ pub enum LanceFileVersion {
     Next,
 }
 
-impl Default for LanceFileVersion {
-    fn default() -> Self {
-        // Changing this is impactful beyond lance_file, this is the default used for new datasets in Lance
-        LanceFileVersion::Legacy
-    }
-}
-
 impl LanceFileVersion {
     /// Convert Stable or Next to the actual version
-    pub fn resolve(&self) -> LanceFileVersion {
+    pub fn resolve(&self) -> Self {
         match self {
-            LanceFileVersion::Legacy => LanceFileVersion::Legacy,
-            LanceFileVersion::V2_0 => LanceFileVersion::V2_0,
-            LanceFileVersion::V2_1 => LanceFileVersion::V2_1,
-            LanceFileVersion::Stable => LanceFileVersion::V2_0,
-            LanceFileVersion::Next => LanceFileVersion::V2_1,
+            Self::Stable => Self::V2_0,
+            Self::Next => Self::V2_1,
+            _ => *self,
         }
     }
 
     /// Returns the default version if Legacy is not an option
     pub fn default_v2() -> Self {
         // This will go away soon, but there are a few spots where the Legacy default doesn't make sense
-        LanceFileVersion::V2_0
+        Self::V2_0
     }
 }
 

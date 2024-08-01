@@ -562,7 +562,7 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(LanceFileVersion::Legacy.into()),
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
@@ -648,7 +648,7 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -754,7 +754,7 @@ mod test {
             Some(WriteParams {
                 max_rows_per_file: 50,
                 max_rows_per_group: 25,
-                data_storage_version: Some(LanceFileVersion::Legacy.into()),
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
@@ -944,7 +944,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1071,7 +1071,7 @@ mod test {
             RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1274,7 +1274,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1339,7 +1339,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )

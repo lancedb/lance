@@ -1132,7 +1132,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1167,7 +1167,7 @@ mod tests {
         // Just one file
         let write_params = WriteParams {
             max_rows_per_file: 10_000,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1185,7 +1185,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 3_000,
             max_rows_per_group: 1_000,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             mode: WriteMode::Overwrite,
             ..Default::default()
         };
@@ -1253,7 +1253,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 1200))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 400,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         Dataset::write(reader, test_uri, Some(write_params))
@@ -1264,7 +1264,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(1200, 2000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -1282,7 +1282,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(3200, 600))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 300,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -1402,7 +1402,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 5_000,
             max_rows_per_group: 1_000,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1490,7 +1490,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 1000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1546,7 +1546,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))

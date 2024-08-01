@@ -179,7 +179,7 @@ async fn create_file(
         max_rows_per_file: file_size as usize,
         max_rows_per_group: batch_size as usize,
         mode,
-        data_storage_version: Some(data_storage_version.into()),
+        data_storage_version: Some(data_storage_version),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());

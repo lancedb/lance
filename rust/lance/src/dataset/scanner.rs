@@ -1736,7 +1736,7 @@ pub mod test_dataset {
             let params = WriteParams {
                 max_rows_per_group: 10,
                 max_rows_per_file: 200,
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 enable_move_stable_row_ids: stable_row_ids,
                 ..Default::default()
             };
@@ -2501,7 +2501,7 @@ mod test {
 
         let params = WriteParams {
             mode: WriteMode::Append,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
 
@@ -2584,7 +2584,7 @@ mod test {
             data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -2666,7 +2666,7 @@ mod test {
             data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -2729,7 +2729,7 @@ mod test {
         .unwrap()];
 
         let write_params = WriteParams {
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
             enable_move_stable_row_ids: stable_row_ids,
             ..Default::default()
@@ -2798,7 +2798,7 @@ mod test {
         .unwrap()];
 
         let write_params = WriteParams {
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2854,7 +2854,7 @@ mod test {
         .unwrap()];
 
         let write_params = WriteParams {
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2923,7 +2923,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(LanceFileVersion::Legacy.into()),
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         Dataset::write(batches, test_uri, Some(write_params))
@@ -3022,7 +3022,7 @@ mod test {
                 reader,
                 test_uri,
                 Some(WriteParams {
-                    data_storage_version: Some(data_storage_version.into()),
+                    data_storage_version: Some(data_storage_version),
                     enable_move_stable_row_ids: stable_row_ids,
                     ..Default::default()
                 }),
@@ -3123,7 +3123,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     mode: WriteMode::Append,
-                    data_storage_version: Some(data_storage_version.into()),
+                    data_storage_version: Some(data_storage_version),
                     ..Default::default()
                 }),
             )
@@ -3185,7 +3185,7 @@ mod test {
             data_gen.batch(32),
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3220,7 +3220,7 @@ mod test {
             data_gen.batch(32),
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3268,7 +3268,7 @@ mod test {
             data_gen.batch(32),
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3375,7 +3375,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     max_rows_per_file: 500,
-                    data_storage_version: Some(data_storage_version.into()),
+                    data_storage_version: Some(data_storage_version),
                     enable_move_stable_row_ids: use_stable_row_ids,
                     ..Default::default()
                 }),
@@ -3427,7 +3427,7 @@ mod test {
                 .append(
                     RecordBatchIterator::new(vec![Ok(append_data)], data.schema()),
                     Some(WriteParams {
-                        data_storage_version: Some(data_storage_version.into()),
+                        data_storage_version: Some(data_storage_version),
                         ..Default::default()
                     }),
                 )
@@ -3865,7 +3865,7 @@ mod test {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3990,7 +3990,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         Dataset::write(batches, test_uri, Some(write_params))

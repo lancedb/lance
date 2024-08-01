@@ -444,7 +444,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             enable_move_stable_row_ids,
             ..Default::default()
         };
@@ -498,7 +498,7 @@ mod test {
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             enable_move_stable_row_ids,
             ..Default::default()
         };
@@ -594,7 +594,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -666,7 +666,7 @@ mod test {
         let data = test_batch(1..5);
         let write_params = WriteParams {
             max_rows_per_group: 2,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -710,7 +710,7 @@ mod test {
         let data = test_batch(0..8);
         let write_params = WriteParams {
             max_rows_per_group: 2,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             enable_move_stable_row_ids: true,
             ..Default::default()
         };

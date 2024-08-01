@@ -135,7 +135,7 @@ impl Default for WriteParams {
 
 impl WriteParams {
     pub fn storage_version_or_default(&self) -> LanceFileVersion {
-        self.data_storage_version.clone().unwrap_or_default()
+        self.data_storage_version.unwrap_or_default()
     }
 }
 
@@ -385,7 +385,7 @@ pub async fn open_writer(
             writer,
             schema.clone(),
             FileWriterOptions {
-                format_version: Some(storage_version.into()),
+                format_version: Some(storage_version),
                 ..Default::default()
             },
         )?;
@@ -590,7 +590,7 @@ mod tests {
         .unwrap();
 
         let write_params = WriteParams {
-            data_storage_version: Some(LanceFileVersion::Stable.into()),
+            data_storage_version: Some(LanceFileVersion::Stable),
             // This parameter should be ignored
             max_rows_per_group: 1,
             ..Default::default()
@@ -657,7 +657,7 @@ mod tests {
         .unwrap();
 
         let write_params = WriteParams {
-            data_storage_version: Some(LanceFileVersion::Legacy.into()),
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let data_stream = Box::pin(RecordBatchStreamAdapter::new(

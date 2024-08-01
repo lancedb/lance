@@ -1560,7 +1560,7 @@ mod tests {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
             mode,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..WriteParams::default()
         };
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1651,7 +1651,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1667,7 +1667,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         // We should be able to append even if the metadata doesn't exactly match.
@@ -1739,7 +1739,7 @@ mod tests {
         // check schema of reader and original is same
         assert_eq!(schema.as_ref(), reader.schema().as_ref());
         let write_params = Some(WriteParams {
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         });
         let result = Dataset::write(reader, test_uri, write_params)
@@ -1827,7 +1827,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 100,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let dataset = Dataset::write(batches, test_uri, Some(write_params))
@@ -1882,7 +1882,7 @@ mod tests {
             batches,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         );
@@ -1968,7 +1968,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -2000,7 +2000,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2082,7 +2082,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2179,7 +2179,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2285,7 +2285,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2383,7 +2383,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2439,7 +2439,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -2467,7 +2467,7 @@ mod tests {
         // Append should inherit index
         let write_params = WriteParams {
             mode: WriteMode::Append,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
@@ -2503,7 +2503,7 @@ mod tests {
         // Overwrite should invalidate index
         let write_params = WriteParams {
             mode: WriteMode::Overwrite,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()];
@@ -2536,7 +2536,7 @@ mod tests {
             data.into_reader_rows(RowCount::from(16 * 1024), BatchCount::from(4)),
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 enable_move_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
@@ -2591,7 +2591,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -2647,7 +2647,7 @@ mod tests {
 
         let write_params = WriteParams {
             mode: WriteMode::Append,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             enable_move_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
@@ -2758,7 +2758,7 @@ mod tests {
 
         let write_params = WriteParams {
             mode: WriteMode::Append,
-            data_storage_version: Some(data_storage_version.into()),
+            data_storage_version: Some(data_storage_version),
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
             enable_move_stable_row_ids: use_stable_row_id,
@@ -2987,7 +2987,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3049,7 +3049,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3145,7 +3145,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3219,7 +3219,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 enable_move_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
@@ -3330,7 +3330,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3540,7 +3540,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let write_params = WriteParams {
             mode: WriteMode::Append,
-            data_storage_version: Some(LanceFileVersion::Legacy.into()),
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let dataset = Dataset::write(batches, test_uri, Some(write_params))
@@ -3639,7 +3639,7 @@ mod tests {
             .append(
                 data,
                 Some(WriteParams {
-                    data_storage_version: Some(data_storage_version.into()),
+                    data_storage_version: Some(data_storage_version),
                     ..Default::default()
                 }),
             )
@@ -3757,7 +3757,7 @@ mod tests {
             RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
             test_uri,
             Some(WriteParams {
-                data_storage_version: Some(data_storage_version.into()),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )

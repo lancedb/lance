@@ -272,7 +272,7 @@ fn get_compression_scheme(field_meta: Option<&HashMap<String, String>>) -> Compr
     field_meta
         .map(|metadata| {
             if let Some(compression_scheme) = metadata.get(COMPRESSION_META_KEY) {
-                parse_compression_scheme(&compression_scheme).unwrap_or(CompressionScheme::None)
+                parse_compression_scheme(compression_scheme).unwrap_or(CompressionScheme::None)
             } else {
                 CompressionScheme::None
             }
