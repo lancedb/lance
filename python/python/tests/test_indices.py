@@ -143,6 +143,7 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
     reader = LanceFileReader(uri)
 
+    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)
 
 
 def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
@@ -158,7 +159,6 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     for fname in filenames:
         full_path = str(tmpdir / fname)
         assert os.path.getsize(full_path) > 0
-
 
 def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder = IndicesBuilder(rand_dataset, "vectors")
