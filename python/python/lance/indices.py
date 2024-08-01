@@ -457,6 +457,26 @@ class IndicesBuilder:
             )
         else:
             raise ValueError("filenames must be a list of strings")
+    
+    def load_shuffled_vectors(self, filenames: list[str], dir_path: str):
+        """
+        Takes filenames of the sorted, transformed vector files as input. Loads
+        these sorted files and commits the index into the dataset.
+
+        Parameters
+        ----------
+        filenames: list[str]
+            The filenames of the sorted storage files.
+        dir_path: str
+            Path of the directory where all the files are located.
+        """
+
+        if isinstance(filenames, list):
+            return indices.load_shuffled_vectors(
+                filenames, dir_path
+            )
+        else:
+            raise ValueError("filenames must be a list of strings")
 
     def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
         if num_partitions is None:

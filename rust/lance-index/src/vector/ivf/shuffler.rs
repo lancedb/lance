@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::compute::sort_to_indices;
-use arrow::csv::writer;
 use arrow_array::FixedSizeListArray;
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
@@ -212,16 +211,15 @@ pub async fn shuffle_vectors(
     Ok(partition_files)
 }
 
+// pub async fn load_ivf_pq(
+//     filenames: Vec<String>,
+//     dir_path: &str,
+// ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
+//     let stream = load_partitioned_shuffles(Path::parse(dir_path)?, filenames).await?;
 
-pub async fn load_ivf_pq(
-    filenames: Vec<String>,
-    dir_path: &str,
-) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
-    let stream = load_partitioned_shuffles(Path::parse(dir_path)?, filenames).await?;
-
-    write_pq_partitions(writer, ivf, stream, None);
-    Ok(stream)
-}
+//     write_pq_partitions(writer, ivf, stream, None);
+//     Ok(stream)
+// }
 
 pub async fn load_partitioned_shuffles(
     output_dir: Path,

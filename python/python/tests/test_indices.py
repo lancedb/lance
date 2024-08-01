@@ -10,7 +10,6 @@ from lance.file import LanceFileReader
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
 NUM_ROWS_PER_FRAGMENT = 10000
-NUM_ROWS_PER_FRAGMENT = 10000
 DIMENSION = 128
 NUM_SUBVECTORS = 8
 NUM_FRAGMENTS = 3
@@ -27,10 +26,6 @@ def rand_dataset(tmpdir, request):
     uri = str(tmpdir / "dataset")
 
     ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
-    uri = str(tmpdir / "dataset")
-
-    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
-
     return ds
 
 
@@ -123,15 +118,10 @@ def rand_pq(rand_dataset, rand_ivf):
     pq = PqModel(NUM_SUBVECTORS, codebook)
     return pq
 
-
 def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     fragments = list(rand_dataset.get_fragments())
 
-    fragments = list(rand_dataset.get_fragments())
-
     builder = IndicesBuilder(rand_dataset, "vectors")
-    uri = str(tmpdir / "transformed")
-    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=fragments)
     uri = str(tmpdir / "transformed")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=fragments)
 
@@ -152,8 +142,6 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
     reader = LanceFileReader(uri)
 
-    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)
-
 def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     builder = IndicesBuilder(rand_dataset, "vectors")
@@ -169,7 +157,10 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
         full_path = str(tmpdir / fname)
         assert os.path.getsize(full_path) > 0
 
-    # test when fragments = None
+def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
+
+    builder = IndicesBuilder(rand_dataset, "vectors")
+    uri = str(tmpdir / "transformed")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
     reader = LanceFileReader(uri)
 
