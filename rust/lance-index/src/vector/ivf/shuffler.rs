@@ -85,7 +85,7 @@ pub async fn shuffle_dataset(
     // step 1: either use precomputed shuffle files or write shuffle data to a file
     let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
         info!("Precomputed shuffle files provided, skip calculation of IVF partition.");
-        let mut shuffler = IvfShuffler::try_new(num_partitions, Some(path), true)?;
+        let mut shuffler = IvfShuffler::try_new(num_partitions, Some(path), true, None)?;
         unsafe {
             shuffler.set_unsorted_buffers(&buffers);
         }
@@ -97,7 +97,7 @@ pub async fn shuffle_dataset(
             num_partitions,
             precomputed_partitions.is_some()
         );
-        let mut shuffler = IvfShuffler::try_new(num_partitions, None, true)?;
+        let mut shuffler = IvfShuffler::try_new(num_partitions, None, true, None)?;
 
         let column = column.to_owned();
         let precomputed_partitions = precomputed_partitions.map(Arc::new);
@@ -191,17 +191,23 @@ pub async fn shuffle_dataset(
 }
 
 pub async fn shuffle_vectors(
-    filenames: Vec<String>,
+    unsorted_filenames: Vec<String>,
     dir_path: &str,
     ivf_centroids: FixedSizeListArray,
+    shuffle_output_root_filename: &str,
 ) -> Result<Vec<String>> {
     let num_partitions = ivf_centroids.len() as u32;
-    let shuffle_partition_batches = 1024 * 10;
+    let shuffle_partition_batches = SHUFFLE_BATCH_SIZE * 10;
     let shuffle_partition_concurrency = 2;
-    let mut shuffler = IvfShuffler::try_new(num_partitions, Some(dir_path.into()), false)?;
+    let mut shuffler = IvfShuffler::try_new(
+        num_partitions,
+        Some(dir_path.into()),
+        false,
+        Some(shuffle_output_root_filename.to_string()),
+    )?;
 
     unsafe {
-        shuffler.set_unsorted_buffers(&filenames);
+        shuffler.set_unsorted_buffers(&unsorted_filenames);
     }
 
     let partition_files = shuffler
@@ -231,6 +237,7 @@ pub async fn load_partitioned_shuffles(
     for file in files {
         let object_store = ObjectStore::local();
         let path = output_dir.child(file);
+        println!("path: {:?}", path);
         let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
         let reader = Arc::new(reader);
 
@@ -257,6 +264,8 @@ pub struct IvfShuffler {
 
     // whether the lance file is v1 (legacy) or v2
     is_legacy: bool,
+
+    shuffle_output_root_filename: String,
 }
 
 /// Represents a range of batches in a file that should be shuffled
@@ -270,10 +279,20 @@ struct ShuffleInput {
 }
 
 impl IvfShuffler {
-    pub fn try_new(num_partitions: u32, output_dir: Option<Path>, is_legacy: bool) -> Result<Self> {
+    pub fn try_new(
+        num_partitions: u32,
+        output_dir: Option<Path>,
+        is_legacy: bool,
+        shuffle_output_root_filename: Option<String>,
+    ) -> Result<Self> {
         let output_dir = match output_dir {
             Some(output_dir) => output_dir,
             None => get_temp_dir()?,
+        };
+
+        let shuffle_output_root_filename = match shuffle_output_root_filename {
+            Some(shuffle_output_root_filename) => shuffle_output_root_filename,
+            None => "sorted".to_string(),
         };
 
         Ok(Self {
@@ -281,6 +300,7 @@ impl IvfShuffler {
             output_dir,
             unsorted_buffers: vec![],
             is_legacy,
+            shuffle_output_root_filename,
         })
     }
 
@@ -514,7 +534,7 @@ impl IvfShuffler {
                 let mut stream = reader
                     .read_stream(
                         lance_io::ReadBatchParams::Range(start..end),
-                        1024,
+                        SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
                     )
@@ -548,7 +568,7 @@ impl IvfShuffler {
     ) -> Result<Vec<String>> {
         let num_batches = self.total_batches().await?;
         let total_batches = num_batches.iter().sum();
-
+        println!("total_batches: {}", total_batches);
         info!(
             "Sorting unsorted data into sorted chunks (batches_per_chunk={} concurrent_jobs={})",
             batches_per_partition, concurrent_jobs
@@ -609,7 +629,7 @@ impl IvfShuffler {
 
                 // finally, write the shuffled data to disk
                 let object_store = ObjectStore::local();
-                let output_file = format!("sorted_{}.lance", i);
+                let output_file = format!("{}_{}.lance", self.shuffle_output_root_filename, i);
                 let path = self.output_dir.child(output_file.clone());
                 let writer = object_store.create(&path).await?;
 
@@ -699,13 +719,15 @@ mod test {
                     )
                     .unwrap());
                 }
-                let row_ids = Arc::new(UInt64Array::from_iter(idx * 1024..(idx + 1) * 1024));
+                let start_idx = idx * (SHUFFLE_BATCH_SIZE as u64);
+                let end_idx = (idx + 1) * (SHUFFLE_BATCH_SIZE as u64);
+                let row_ids = Arc::new(UInt64Array::from_iter(start_idx..end_idx));
 
                 let part_id = Arc::new(UInt32Array::from_iter(
-                    (idx * 1024..(idx + 1) * 1024).map(|_| idx as u32),
+                    (start_idx..end_idx).map(|_| idx as u32),
                 ));
 
-                let values = Arc::new(UInt8Array::from_iter((0..32 * 1024).map(|_| idx as u8)));
+                let values = Arc::new(UInt8Array::from_iter((0..32 * SHUFFLE_BATCH_SIZE).map(|_| idx as u8)));
                 let pq_codes = Arc::new(
                     FixedSizeListArray::try_new_from_values(values as Arc<dyn Array>, 32).unwrap(),
                 );
@@ -718,7 +740,7 @@ mod test {
 
         let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
 
-        let shuffler = IvfShuffler::try_new(100, None, true).unwrap();
+        let shuffler = IvfShuffler::try_new(100, None, true, None).unwrap();
 
         (stream, shuffler)
     }
@@ -761,8 +783,7 @@ mod test {
 
         assert_eq!(partition_files.len(), 1);
 
-        let mut result_stream = 
-            load_partitioned_shuffles(shuffler.output_dir, partition_files)
+        let mut result_stream = load_partitioned_shuffles(shuffler.output_dir, partition_files)
             .await
             .unwrap();
 
@@ -770,7 +791,7 @@ mod test {
         let mut stream = result_stream.pop().unwrap();
 
         while let Some(item) = stream.next().await {
-            check_batch(item.unwrap(), num_batches, 1024);
+            check_batch(item.unwrap(), num_batches, SHUFFLE_BATCH_SIZE);
             num_batches += 1;
         }
 
@@ -786,8 +807,7 @@ mod test {
 
         assert_eq!(partition_files.len(), 1);
 
-        let mut result_stream = 
-            load_partitioned_shuffles(shuffler.output_dir, partition_files)
+        let mut result_stream = load_partitioned_shuffles(shuffler.output_dir, partition_files)
             .await
             .unwrap();
 
@@ -795,7 +815,7 @@ mod test {
         let mut stream = result_stream.pop().unwrap();
 
         while let Some(item) = stream.next().await {
-            check_batch(item.unwrap(), num_batches, 1024);
+            check_batch(item.unwrap(), num_batches, SHUFFLE_BATCH_SIZE);
             num_batches += 1;
         }
 
@@ -811,8 +831,7 @@ mod test {
 
         assert_eq!(partition_files.len(), 100);
 
-        let mut result_stream = 
-            load_partitioned_shuffles(shuffler.output_dir, partition_files)
+        let mut result_stream = load_partitioned_shuffles(shuffler.output_dir, partition_files)
             .await
             .unwrap();
 
@@ -821,7 +840,7 @@ mod test {
 
         while let Some(mut stream) = result_stream.pop() {
             while let Some(item) = stream.next().await {
-                check_batch(item.unwrap(), num_batches, 1024);
+                check_batch(item.unwrap(), num_batches, SHUFFLE_BATCH_SIZE);
                 num_batches += 1
             }
         }
@@ -841,8 +860,7 @@ mod test {
 
         assert_eq!(partition_files.len(), 1);
 
-        let mut result_stream = 
-            load_partitioned_shuffles(shuffler.output_dir, partition_files)
+        let mut result_stream = load_partitioned_shuffles(shuffler.output_dir, partition_files)
             .await
             .unwrap();
 
@@ -870,8 +888,7 @@ mod test {
         let partition_files = shuffler.write_partitioned_shuffles(1, 32).await.unwrap();
         assert_eq!(partition_files.len(), 200);
 
-        let mut result_stream = 
-            load_partitioned_shuffles(shuffler.output_dir, partition_files)
+        let mut result_stream = load_partitioned_shuffles(shuffler.output_dir, partition_files)
             .await
             .unwrap();
 
@@ -880,7 +897,7 @@ mod test {
 
         while let Some(mut stream) = result_stream.pop() {
             while let Some(item) = stream.next().await {
-                check_batch(item.unwrap(), num_batches % 100, 1024);
+                check_batch(item.unwrap(), num_batches % 100, SHUFFLE_BATCH_SIZE);
                 num_batches += 1
             }
         }

@@ -430,9 +430,10 @@ class IndicesBuilder:
 
     def shuffle_transformed_vectors(
         self,
-        filenames: list[str],
+        unsorted_filenames: list[str],
         dir_path: str,
         ivf: IvfModel,
+        shuffle_output_root_filename: Optional[str],
     ) -> list[str]:
         """
         Take the transformed, unsorted vector files as input, and create sorted
@@ -441,20 +442,26 @@ class IndicesBuilder:
 
         Parameters
         ----------
-        filenames: list[str]
+        unsorted_filenames: list[str]
             The filenames of the unsorted files.
         dir_path: str
             Directory where all the files are located, and where output files
             will be placed.
+        ivf: IvfModel
+            The IVF model used for the transformations (e.g. partition assignment)
+        shuffle_output_root_filename: Optional[str]
+            The root filename for the sorted output files. If not provided, the root
+            filename used will be `"sorted"`.
 
         Returns
         -------
         list[str]
-            The file paths of the sorted transformed vector files.
+            The file paths of the sorted transformed vector files. These will be of the
+            form `shuffle_output_root_filename_i.lance`.
         """
-        if isinstance(filenames, list):
+        if isinstance(unsorted_filenames, list):
             return indices.shuffle_transformed_vectors(
-                filenames, dir_path, ivf.centroids
+                unsorted_filenames, dir_path, ivf.centroids, shuffle_output_root_filename
             )
         else:
             raise ValueError("filenames must be a list of strings")
@@ -470,6 +477,8 @@ class IndicesBuilder:
             The filenames of the sorted storage files.
         dir_path: str
             Path of the directory where all the files are located.
+        ivf: IvfModel
+            The IVF model used for the transformations (e.g. partition assignment)
         """
 
         if isinstance(filenames, list):

@@ -153,6 +153,7 @@ pub async fn write_pq_partitions(
     let mut new_streams = vec![];
 
     if let Some(streams) = streams {
+        println!("length of streams: {}", streams.len());
         for stream in streams {
             let mut stream = Box::pin(stream.peekable());
 

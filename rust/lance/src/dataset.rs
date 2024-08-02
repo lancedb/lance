@@ -1100,7 +1100,7 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
-    pub(crate) fn indices_dir(&self) -> Path {
+    pub fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
     }
 

@@ -227,11 +227,12 @@ pub fn transform_vectors(
 }
 
 async fn do_shuffle_transformed_vectors(
-    filenames: Vec<String>,
+    unsorted_filenames: Vec<String>,
     dir_path: &str,
     ivf_centroids: FixedSizeListArray,
+    shuffle_output_root_filename: &str,
 ) -> PyResult<Vec<String>> {
-    let partition_files = shuffle_vectors(filenames, dir_path, ivf_centroids)
+    let partition_files = shuffle_vectors(unsorted_filenames, dir_path, ivf_centroids, shuffle_output_root_filename)
         .await
         .infer_error()?;
     Ok(partition_files)
@@ -241,16 +242,17 @@ async fn do_shuffle_transformed_vectors(
 #[allow(clippy::too_many_arguments)]
 pub fn shuffle_transformed_vectors(
     py: Python<'_>,
-    filenames: Vec<String>,
+    unsorted_filenames: Vec<String>,
     dir_path: &str,
     ivf_centroids: PyArrowType<ArrayData>,
+    shuffle_output_root_filename: &str,
 ) -> PyResult<PyObject> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
 
     let result = RT.block_on(
         None,
-        do_shuffle_transformed_vectors(filenames, dir_path, ivf_centroids),
+        do_shuffle_transformed_vectors(unsorted_filenames, dir_path, ivf_centroids, shuffle_output_root_filename),
     )?;
 
     match result {
@@ -268,15 +270,16 @@ async fn do_load_shuffled_vectors(
     dataset: &Dataset,
     mut ivf_model: IvfModel,
 ) -> PyResult<()> {
-    // let obj_store = dataset.ds.object_store();
-    // let path = dataset.ds.indices_dir().child("shuffled_vectors.idx");
     let (obj_store, path) = object_store_from_uri_or_path(dir_path).await?;
-    let stream = load_partitioned_shuffles(path.clone(), filenames).await.infer_error()?;
+    let streams = load_partitioned_shuffles(path.clone(), filenames).await.infer_error()?;
+
+    let obj_store = dataset.ds.object_store();
+    let path = dataset.ds.indices_dir().child("shuffled_vectors.idx");
     let mut writer = obj_store.create(&path).await.infer_error()?;
     println!("Path to write: {:?}", path);
     // let output_file = format!("sorted_{}.lance", i);
     // let path = self.output_dir.child(output_file.clone());
-    write_pq_partitions(&mut writer, &mut ivf_model, Some(stream), None);
+    write_pq_partitions(&mut writer, &mut ivf_model, Some(streams), None);
 
     Ok(())
 }

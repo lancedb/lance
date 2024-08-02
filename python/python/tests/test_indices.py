@@ -11,7 +11,7 @@ import pytest
 from lance.file import LanceFileReader
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
-NUM_ROWS_PER_FRAGMENT = 1000
+NUM_ROWS_PER_FRAGMENT = 10000
 DIMENSION = 128
 NUM_SUBVECTORS = 8
 NUM_FRAGMENTS = 3
@@ -164,7 +164,7 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     # test shuffle for transformed vectors
     filenames = builder.shuffle_transformed_vectors(
-        ["transformed_shuffle"], str(tmpdir), rand_ivf
+        ["transformed_shuffle"], str(tmpdir), rand_ivf, "sorted"
     )
     print(filenames)
 
@@ -173,23 +173,28 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
         assert os.path.getsize(full_path) > 0
 
 def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
-    fragments1 = list(rand_dataset.get_fragments())[:1]
-    fragments2 = list(rand_dataset.get_fragments())[1:]
+    fragments = list(rand_dataset.get_fragments())
+    print("{} fragments".format(len(fragments)))
+
+    fragments1 = fragments[:1]
+    print(fragments1)
+    fragments2 = fragments[1:]
+    print(fragments2)
 
     builder = IndicesBuilder(rand_dataset, "vectors")
 
     uri_1 = str(tmpdir / "transformed1")
-    builder.transform_vectors(rand_ivf, rand_pq, uri_1, fragments=None)
-    filenames = builder.shuffle_transformed_vectors(
-        ["transformed1"], str(tmpdir), rand_ivf
+    builder.transform_vectors(rand_ivf, rand_pq, uri_1, fragments=fragments1)
+    filenames1 = builder.shuffle_transformed_vectors(
+        ["transformed1"], str(tmpdir), rand_ivf, "frags1_sorted"
     )
-    print(filenames)
 
     uri_2 = str(tmpdir / "transformed2")
-    builder.transform_vectors(rand_ivf, rand_pq, uri_2, fragments=fragments1)
-    filenames = builder.shuffle_transformed_vectors(
-        ["transformed2"], str(tmpdir), rand_ivf
+    builder.transform_vectors(rand_ivf, rand_pq, uri_2, fragments=fragments2)
+    filenames2 = builder.shuffle_transformed_vectors(
+        ["transformed2"], str(tmpdir), rand_ivf, "frags2_sorted"
     )
-    print(filenames)
 
-    # builder.load_shuffled_vectors(filenames, str(tmpdir), rand_ivf)
+    sorted_filenames = filenames1 + filenames2
+    print(sorted_filenames)
+    builder.load_shuffled_vectors(sorted_filenames, str(tmpdir), rand_ivf)
