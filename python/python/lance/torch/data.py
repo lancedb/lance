@@ -242,7 +242,10 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.sampler: Sampler = sampler
 
         # Dataset with huggingface metadata
-        if (hf_meta := dataset.schema.metadata.get(b"huggingface")) is not None:
+        if (
+            dataset.schema.metadata is not None
+            and (hf_meta := dataset.schema.metadata.get(b"huggingface")) is not None
+        ):
             from ..hf import HuggingFaceConverter
 
             hf_ds_info = json.loads(hf_meta)
