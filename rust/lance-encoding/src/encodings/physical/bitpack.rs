@@ -103,6 +103,7 @@ where
     return min_leading_bits
         .map(|leading_bits| arr.data_type().byte_width() as u64 * 8 - leading_bits)
         .map(|bits| bits + if add_signed_bit { 1 } else { 0 })
+        .map(|bits| bits.max(1)) // cannot bitpack into < 1 bit
         .map(|bits| BitpackParams {
             num_bits: bits,
             signed: add_signed_bit,
@@ -219,6 +220,7 @@ fn pack_bits(
 ) {
     let bit_len = byte_len as u64 * 8;
 
+    println!("num bits = {:?}", num_bits);
     let mask = u64::MAX >> (64 - num_bits);
 
     let mut src_idx = 0;
