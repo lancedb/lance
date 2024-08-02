@@ -313,7 +313,6 @@ impl IvfShuffler {
         for buffer in &self.unsorted_buffers {
             let object_store = ObjectStore::local();
             let path = self.output_dir.child(buffer.as_str());
-            println!("Path as string: {:?}", Path::parse(path.clone()));
 
             if self.is_legacy {
                 let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
@@ -369,7 +368,7 @@ impl IvfShuffler {
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader
                     .read_stream(
-                        lance_io::ReadBatchParams::Range(start..end),
+                        lance_io::ReadBatchParams::Range((start * 1024)..(end * 1024)),
                         1024,
                         16,
                         FilterExpression::no_filter(),
@@ -474,7 +473,7 @@ impl IvfShuffler {
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader
                     .read_stream(
-                        lance_io::ReadBatchParams::Range(start..end),
+                        lance_io::ReadBatchParams::Range((start * 1024)..(end * 1024)),
                         1024,
                         16,
                         FilterExpression::no_filter(),
