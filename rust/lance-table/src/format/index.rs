@@ -94,11 +94,3 @@ impl From<&Index> for pb::IndexMetadata {
         }
     }
 }
-//
-// impl From<&Vec<Index>> for pb::IndexSection {
-//     fn from(indices: &Vec<Index>) -> Self {
-//         Self {
-//             indices: indices.iter().map(pb::IndexMetadata::from).collect(),
-//         }
-//     }
-// }

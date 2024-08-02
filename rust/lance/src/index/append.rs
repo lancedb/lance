@@ -6,7 +6,6 @@ use std::sync::Arc;
 use lance_core::{Error, Result};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::IndexType;
 use lance_table::format::Index as IndexMetadata;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
@@ -79,7 +78,7 @@ pub async fn merge_indices<'a>(
     });
 
     let (new_uuid, indices_merged) = match indices[0].index_type() {
-        IndexType::Scalar => {
+        it if it.is_scalar() => {
             let index = dataset
                 .open_scalar_index(&column.name, &old_indices[0].uuid.to_string())
                 .await?;
@@ -102,7 +101,7 @@ pub async fn merge_indices<'a>(
 
             Ok((new_uuid, 1))
         }
-        IndexType::Vector => {
+        it if it.is_vector() => {
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
@@ -123,6 +122,13 @@ pub async fn merge_indices<'a>(
             )
             .await
         }
+        _ => Err(Error::Index {
+            message: format!(
+                "Append index: invalid index type: {:?}",
+                indices[0].index_type()
+            ),
+            location: location!(),
+        }),
     }?;
 
     Ok(Some((
@@ -144,7 +150,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-        DatasetIndexExt,
+        DatasetIndexExt, IndexType,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;

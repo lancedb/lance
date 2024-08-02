@@ -25,7 +25,12 @@ use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
-use lance_index::{pb, vector::VectorIndex, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use lance_index::{
+    pb,
+    scalar::{ScalarIndexParams, LANCE_SCALAR_INDEX},
+    vector::VectorIndex,
+    DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME,
+};
 use lance_io::scheduler::ScanScheduler;
 use lance_io::traits::Reader;
 use lance_io::utils::{
@@ -35,7 +40,6 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
-use scalar::ScalarIndexParams;
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -57,7 +61,7 @@ use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
 
 use self::append::merge_indices;
-use self::scalar::{build_scalar_index, LANCE_SCALAR_INDEX};
+use self::scalar::build_scalar_index;
 use self::vector::{build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX};
 
 /// Builds index.
@@ -103,7 +107,7 @@ pub(crate) async fn remap_index(
         .await?;
 
     match generic.index_type() {
-        IndexType::Scalar => {
+        it if it.is_scalar() => {
             let new_store = LanceIndexStore::from_dataset(dataset, &new_id.to_string());
 
             let scalar_index = dataset
@@ -111,7 +115,7 @@ pub(crate) async fn remap_index(
                 .await?;
             scalar_index.remap(row_id_map, &new_store).await?;
         }
-        IndexType::Vector => {
+        it if it.is_vector() => {
             remap_vector_index(
                 Arc::new(dataset.clone()),
                 &field.name,
@@ -121,6 +125,12 @@ pub(crate) async fn remap_index(
                 row_id_map,
             )
             .await?;
+        }
+        _ => {
+            return Err(Error::Index {
+                message: format!("Index type {} is not supported", generic.index_type()),
+                location: location!(),
+            });
         }
     }
 
@@ -205,7 +215,15 @@ impl DatasetIndexExt for Dataset {
 
         let index_id = Uuid::new_v4();
         match (index_type, params.index_name()) {
+            (
+                IndexType::Bitmap | IndexType::BTree | IndexType::Inverted | IndexType::LabelList,
+                LANCE_SCALAR_INDEX,
+            ) => {
+                let params = ScalarIndexParams::new(index_type.try_into()?);
+                build_scalar_index(self, column, &index_id.to_string(), &params).await?;
+            }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
+                // Guess the index type
                 let params = params
                     .as_any()
                     .downcast_ref::<ScalarIndexParams>()
@@ -700,7 +718,7 @@ mod tests {
 
     use super::*;
 
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
     use lance_index::vector::{
@@ -1065,5 +1083,37 @@ mod tests {
                 "Not enough rows to train PQ. Requires 256 rows but only 100 available",
             )
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_bitmap_index() {
+        let test_dir = tempdir().unwrap();
+        let field = Field::new("tag", DataType::Utf8, false);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let array = StringArray::from_iter_values((0..128).map(|i| ["a", "b", "c"][i % 3]));
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![record_batch.clone()].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset
+            .create_index(
+                &["tag"],
+                IndexType::Bitmap,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let index = dataset
+            .open_generic_index("tag", &indices[0].uuid.to_string())
+            .await
+            .unwrap();
+        assert_eq!(index.index_type(), IndexType::Bitmap);
     }
 }
