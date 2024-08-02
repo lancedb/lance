@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import os
+
 import lance
 import numpy as np
 import pyarrow as pa
@@ -24,7 +26,6 @@ def rand_dataset(tmpdir, request):
     uri = str(tmpdir / "dataset")
 
     ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
-
     return ds
 
 
@@ -126,7 +127,6 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=fragments)
 
     reader = LanceFileReader(uri)
-
     assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
@@ -147,3 +147,18 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     reader = LanceFileReader(uri)
 
     assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)
+
+
+def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
+    builder = IndicesBuilder(rand_dataset, "vectors")
+    uri = str(tmpdir / "transformed_shuffle")
+    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
+
+    # test shuffle for transformed vectors
+    filenames = builder.shuffle_transformed_vectors(
+        ["transformed_shuffle"], str(tmpdir), rand_ivf
+    )
+
+    for fname in filenames:
+        full_path = str(tmpdir / fname)
+        assert os.path.getsize(full_path) > 0

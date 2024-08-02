@@ -428,6 +428,37 @@ class IndicesBuilder:
             fragments,
         )
 
+    def shuffle_transformed_vectors(
+        self,
+        filenames: list[str],
+        dir_path: str,
+        ivf: IvfModel,
+    ) -> list[str]:
+        """
+        Take the transformed, unsorted vector files as input, and create sorted
+        storage files. Sorting is done based on the partition id. This function
+        only makes sense if the transformed vector file contains a partition_id column.
+
+        Parameters
+        ----------
+        filenames: list[str]
+            The filenames of the unsorted files.
+        dir_path: str
+            Directory where all the files are located, and where output files
+            will be placed.
+
+        Returns
+        -------
+        list[str]
+            The file paths of the sorted transformed vector files.
+        """
+        if isinstance(filenames, list):
+            return indices.shuffle_transformed_vectors(
+                filenames, dir_path, ivf.centroids
+            )
+        else:
+            raise ValueError("filenames must be a list of strings")
+
     def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
         if num_partitions is None:
             return round(math.sqrt(num_rows))
