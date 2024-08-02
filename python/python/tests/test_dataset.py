@@ -283,6 +283,12 @@ def test_tag(tmp_path: Path):
 
     assert ds.checkout_version("tag1").version == 1
 
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 1
+
+    with pytest.raises(ValueError):
+        lance.dataset(base_dir, "missing-tag")
+
 
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
