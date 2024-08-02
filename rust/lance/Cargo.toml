@@ -19,7 +19,6 @@ no-default-features = true
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
-lance-datagen = { workspace = true }
 lance-encoding = { workspace = true }
 lance-file = { workspace = true }
 lance-io = { workspace = true }
@@ -87,6 +86,7 @@ prost-build.workspace = true
 
 [dev-dependencies]
 lance-test-macros = { workspace = true }
+lance-datagen = { workspace = true }
 pretty_assertions = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
