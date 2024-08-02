@@ -42,6 +42,7 @@ use crate::vector::transform::{KeepFiniteVectors, Transformer};
 use crate::vector::PART_ID_COLUMN;
 
 const UNSORTED_BUFFER: &str = "unsorted.lance";
+const SHUFFLE_BATCH_SIZE: usize = 1024;
 
 fn get_temp_dir() -> Result<Path> {
     let dir = TempDir::new()?;
@@ -195,7 +196,7 @@ pub async fn shuffle_vectors(
     ivf_centroids: FixedSizeListArray,
 ) -> Result<Vec<String>> {
     let num_partitions = ivf_centroids.len() as u32;
-    let shuffle_partition_batches = 1024 * 10;
+    let shuffle_partition_batches = SHUFFLE_BATCH_SIZE * 10;
     let shuffle_partition_concurrency = 2;
     let mut shuffler = IvfShuffler::try_new(num_partitions, Some(dir_path.into()), false)?;
 
@@ -321,7 +322,7 @@ impl IvfShuffler {
                 let scheduler = ScanScheduler::new(object_store.into());
                 let file = scheduler.open_file(&path).await?;
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
-                let num_batches = reader.metadata().num_rows / 1024;
+                let num_batches = reader.metadata().num_rows / (SHUFFLE_BATCH_SIZE as u64);
                 total_batches.push(num_batches as usize);
             }
         }
@@ -368,8 +369,10 @@ impl IvfShuffler {
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader
                     .read_stream(
-                        lance_io::ReadBatchParams::Range((start * 1024)..(end * 1024)),
-                        1024,
+                        lance_io::ReadBatchParams::Range(
+                            (start * SHUFFLE_BATCH_SIZE)..(end * SHUFFLE_BATCH_SIZE),
+                        ),
+                        SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
                     )
@@ -473,8 +476,10 @@ impl IvfShuffler {
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader
                     .read_stream(
-                        lance_io::ReadBatchParams::Range((start * 1024)..(end * 1024)),
-                        1024,
+                        lance_io::ReadBatchParams::Range(
+                            (start * SHUFFLE_BATCH_SIZE)..(end * SHUFFLE_BATCH_SIZE),
+                        ),
+                        SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
                     )
@@ -686,13 +691,17 @@ mod test {
                     )
                     .unwrap());
                 }
-                let row_ids = Arc::new(UInt64Array::from_iter(idx * 1024..(idx + 1) * 1024));
+                let start_idx = idx * (SHUFFLE_BATCH_SIZE as u64);
+                let end_idx = (idx + 1) * (SHUFFLE_BATCH_SIZE as u64);
+                let row_ids = Arc::new(UInt64Array::from_iter(start_idx..end_idx));
 
                 let part_id = Arc::new(UInt32Array::from_iter(
-                    (idx * 1024..(idx + 1) * 1024).map(|_| idx as u32),
+                    (start_idx..end_idx).map(|_| idx as u32),
                 ));
 
-                let values = Arc::new(UInt8Array::from_iter((0..32 * 1024).map(|_| idx as u8)));
+                let values = Arc::new(UInt8Array::from_iter(
+                    (0..32 * SHUFFLE_BATCH_SIZE).map(|_| idx as u8),
+                ));
                 let pq_codes = Arc::new(
                     FixedSizeListArray::try_new_from_values(values as Arc<dyn Array>, 32).unwrap(),
                 );
@@ -757,7 +766,7 @@ mod test {
         let mut stream = result_stream.pop().unwrap();
 
         while let Some(item) = stream.next().await {
-            check_batch(item.unwrap(), num_batches, 1024);
+            check_batch(item.unwrap(), num_batches, SHUFFLE_BATCH_SIZE);
             num_batches += 1;
         }
 
@@ -782,7 +791,7 @@ mod test {
         let mut stream = result_stream.pop().unwrap();
 
         while let Some(item) = stream.next().await {
-            check_batch(item.unwrap(), num_batches, 1024);
+            check_batch(item.unwrap(), num_batches, SHUFFLE_BATCH_SIZE);
             num_batches += 1;
         }
 
@@ -808,7 +817,7 @@ mod test {
 
         while let Some(mut stream) = result_stream.pop() {
             while let Some(item) = stream.next().await {
-                check_batch(item.unwrap(), num_batches, 1024);
+                check_batch(item.unwrap(), num_batches, SHUFFLE_BATCH_SIZE);
                 num_batches += 1
             }
         }
@@ -867,7 +876,7 @@ mod test {
 
         while let Some(mut stream) = result_stream.pop() {
             while let Some(item) = stream.next().await {
-                check_batch(item.unwrap(), num_batches % 100, 1024);
+                check_batch(item.unwrap(), num_batches % 100, SHUFFLE_BATCH_SIZE);
                 num_batches += 1
             }
         }
