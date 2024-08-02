@@ -69,7 +69,6 @@ random_word = { version = "0.4.3", features = ["en"] }
 
 [build-dependencies]
 prost-build.workspace = true
-rustc_version.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true

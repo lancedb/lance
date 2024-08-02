@@ -9,61 +9,26 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
-use lance_index::scalar::inverted::{train_inverted_index, InvertedIndex, INVERT_LIST_FILE};
-use lance_index::{
-    scalar::{
-        bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
-        btree::{train_btree_index, BTreeIndex, TrainingSource},
-        flat::FlatIndexMetadata,
-        label_list::{train_label_list_index, LabelListIndex},
-        lance_format::LanceIndexStore,
-        ScalarIndex,
-    },
-    IndexType,
+use lance_index::scalar::{
+    bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
+    btree::{train_btree_index, BTreeIndex, TrainingSource},
+    flat::FlatIndexMetadata,
+    inverted::{train_inverted_index, InvertedIndex, INVERT_LIST_FILE},
+    label_list::{train_label_list_index, LabelListIndex},
+    lance_format::LanceIndexStore,
+    ScalarIndex, ScalarIndexParams, ScalarIndexType,
 };
 use snafu::{location, Location};
 use tracing::instrument;
-
-use lance_core::{Error, Result};
 
 use crate::{
     dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
     Dataset,
 };
 
-use super::IndexParams;
-
-pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
-
-pub enum ScalarIndexType {
-    BTree,
-    Bitmap,
-    LabelList,
-    Inverted,
-}
-
-#[derive(Default)]
-pub struct ScalarIndexParams {
-    /// If set then always use the given index type and skip auto-detection
-    pub force_index_type: Option<ScalarIndexType>,
-}
-
-impl IndexParams for ScalarIndexParams {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn index_type(&self) -> IndexType {
-        IndexType::Scalar
-    }
-
-    fn index_name(&self) -> &str {
-        LANCE_SCALAR_INDEX
-    }
-}
-
-pub struct TrainingRequest {
+struct TrainingRequest {
     dataset: Arc<Dataset>,
     column: String,
 }
@@ -94,7 +59,7 @@ impl TrainingSource for TrainingRequest {
 
 /// Build a Scalar Index
 #[instrument(level = "debug", skip_all)]
-pub async fn build_scalar_index(
+pub(super) async fn build_scalar_index(
     dataset: &Dataset,
     column: &str,
     uuid: &str,

@@ -101,10 +101,7 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 mod test {
     use std::ops::Range;
 
-    use crate::{
-        dataset::{builder::DatasetBuilder, UpdateBuilder, WriteMode, WriteParams},
-        index::scalar::ScalarIndexParams,
-    };
+    use crate::dataset::{builder::DatasetBuilder, UpdateBuilder, WriteMode, WriteParams};
 
     use super::*;
 
@@ -112,7 +109,7 @@ mod test {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
     use lance_core::{utils::address::RowAddress, ROW_ADDR, ROW_ID};
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
 
     fn sequence_batch(values: Range<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -175,7 +172,7 @@ mod test {
         let result = Dataset::write(reader, tmp_path, Some(write_params)).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(),
-                Error::NotSupported { source, .. } 
+                Error::NotSupported { source, .. }
                     if source.to_string().contains("Cannot enable stable row ids on existing dataset")));
     }
 

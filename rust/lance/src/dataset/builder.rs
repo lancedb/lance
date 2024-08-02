@@ -16,6 +16,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use url::Url;
 
+use super::refs::{Ref, Tags};
 use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::{
     error::{Error, Result},
@@ -35,7 +36,7 @@ pub struct DatasetBuilder {
     session: Option<Arc<Session>>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     options: ObjectStoreParams,
-    version: Option<u64>,
+    version: Option<Ref>,
     table_uri: String,
     object_store_registry: Arc<ObjectStoreRegistry>,
 }
@@ -80,9 +81,15 @@ impl DatasetBuilder {
         self
     }
 
-    /// Sets `version` to the builder
+    /// Sets `version` for the builder using a version number
     pub fn with_version(mut self, version: u64) -> Self {
-        self.version = Some(version);
+        self.version = Some(Ref::from(version));
+        self
+    }
+
+    /// Sets `version` for the builder using a tag
+    pub fn with_tag(mut self, tag: &str) -> Self {
+        self.version = Some(Ref::from(tag));
         self
     }
 
@@ -250,12 +257,27 @@ impl DatasetBuilder {
             )),
         };
 
-        let version = self.version;
+        let mut version: Option<u64> = None;
+        let cloned_ref = self.version.clone();
         let table_uri = self.table_uri.clone();
 
         let manifest = self.manifest.take();
 
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+
+        if let Some(r) = cloned_ref {
+            version = match r {
+                Ref::Version(v) => Some(v),
+                Ref::Tag(t) => {
+                    let tags = Tags::new(
+                        Arc::new(object_store.clone()),
+                        commit_handler.clone(),
+                        base_path.clone(),
+                    );
+                    Some(tags.get_version(t.as_str()).await?)
+                }
+            }
+        }
 
         let manifest = if manifest.is_some() {
             let mut manifest = manifest.unwrap();

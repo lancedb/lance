@@ -14,7 +14,6 @@ rust-version.workspace = true
 [dependencies]
 lance-arrow.workspace = true
 lance-core.workspace = true
-lance-datagen.workspace = true
 arrow.workspace = true
 arrow-arith.workspace = true
 arrow-array.workspace = true
@@ -29,17 +28,17 @@ log.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true
 prost.workspace = true
+hyperloglogplus.workspace = true
 prost-types.workspace = true
+rand.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zstd.workspace = true
-rand = "0.8.4"
-rand_xoshiro = "0.6.0"
-hyperloglogplus.workspace = true
 
 [dev-dependencies]
 lance-testing.workspace = true
+lance-datagen.workspace = true
 rand.workspace = true
 tempfile.workspace = true
 test-log.workspace = true

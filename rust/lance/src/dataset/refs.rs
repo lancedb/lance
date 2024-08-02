@@ -16,6 +16,7 @@ use crate::{Error, Result};
 use std::collections::HashMap;
 
 /// Lance Ref
+#[derive(Debug, Clone)]
 pub enum Ref {
     Version(u64),
     Tag(String),
@@ -85,6 +86,22 @@ impl Tags {
             .await?;
 
         Ok(tags)
+    }
+
+    pub async fn get_version(&self, tag: &str) -> Result<u64> {
+        check_valid_ref(tag)?;
+
+        let tag_file = tag_path(&self.base, tag);
+
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+
+        Ok(tag_contents.version)
     }
 
     pub async fn create(&mut self, tag: &str, version: u64) -> Result<()> {

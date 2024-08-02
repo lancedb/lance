@@ -42,6 +42,7 @@ use crate::vector::transform::{KeepFiniteVectors, Transformer};
 use crate::vector::PART_ID_COLUMN;
 
 const UNSORTED_BUFFER: &str = "unsorted.lance";
+const SHUFFLE_BATCH_SIZE: usize = 1024;
 
 fn get_temp_dir() -> Result<Path> {
     let dir = TempDir::new()?;
@@ -350,7 +351,6 @@ impl IvfShuffler {
         for buffer in &self.unsorted_buffers {
             let object_store = ObjectStore::local();
             let path = self.output_dir.child(buffer.as_str());
-            println!("Path as string: {:?}", Path::parse(path.clone()));
 
             if self.is_legacy {
                 let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
@@ -359,7 +359,7 @@ impl IvfShuffler {
                 let scheduler = ScanScheduler::new(object_store.into());
                 let file = scheduler.open_file(&path).await?;
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
-                let num_batches = reader.metadata().num_rows / 1024;
+                let num_batches = reader.metadata().num_rows / (SHUFFLE_BATCH_SIZE as u64);
                 total_batches.push(num_batches as usize);
             }
         }
@@ -406,8 +406,10 @@ impl IvfShuffler {
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader
                     .read_stream(
-                        lance_io::ReadBatchParams::Range(start..end),
-                        1024,
+                        lance_io::ReadBatchParams::Range(
+                            (start * SHUFFLE_BATCH_SIZE)..(end * SHUFFLE_BATCH_SIZE),
+                        ),
+                        SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
                     )

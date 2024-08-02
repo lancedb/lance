@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import os
 
+import os
+
 import lance
 import numpy as np
 import pyarrow as pa
@@ -144,6 +146,9 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     part_id = data.column("__ivf_part_id")
     assert part_id.type == pa.uint32()
+
+    # We need to close the file to be able to overwrite it on Windows.
+    del reader
 
     # test when fragments = None
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)

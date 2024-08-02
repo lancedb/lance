@@ -54,7 +54,7 @@ mod write;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
-use self::refs::{check_valid_ref, tag_path, TagContents, Tags};
+use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
@@ -353,19 +353,8 @@ impl Dataset {
     }
 
     async fn checkout_by_tag(&self, tag: &str) -> Result<Self> {
-        check_valid_ref(tag)?;
-
-        let tag_file = tag_path(&self.base, tag);
-
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
-
-        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-
-        self.checkout_by_version_number(tag_contents.version).await
+        let version = self.tags.get_version(tag).await?;
+        self.checkout_by_version_number(version).await
     }
 
     async fn load_manifest(
@@ -1506,7 +1495,6 @@ mod tests {
     use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::WriteMode::Overwrite;
-    use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::TestDatasetGenerator;
 
@@ -1524,7 +1512,7 @@ mod tests {
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, RowCount};
-    use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::WriterVersion;
@@ -3063,6 +3051,13 @@ mod tests {
 
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 1);
+
+        let first_ver = DatasetBuilder::from_uri(test_uri)
+            .with_tag("tag1")
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(first_ver.version().version, 1);
     }
 
     #[rstest]

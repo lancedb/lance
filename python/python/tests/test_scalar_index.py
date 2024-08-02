@@ -5,6 +5,7 @@ import os
 import random
 import string
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import lance
 import numpy as np
@@ -60,7 +61,7 @@ def data_table(indexed_dataset: lance.LanceDataset):
 def test_load_indices(indexed_dataset: lance.LanceDataset):
     indices = indexed_dataset.list_indices()
     vec_idx = next(idx for idx in indices if idx["type"] == "Vector")
-    scalar_idx = next(idx for idx in indices if idx["type"] == "Scalar")
+    scalar_idx = next(idx for idx in indices if idx["type"] == "BTree")
     assert vec_idx is not None
     assert scalar_idx is not None
 
@@ -222,3 +223,26 @@ def test_full_text_search(dataset):
     results = results.column(0)
     for row in results:
         assert query in row.as_py()
+
+
+def test_bitmap_index(tmp_path: Path):
+    """Test create bitmap index"""
+    tbl = pa.Table.from_arrays(
+        [pa.array([["a", "b", "c"][i % 3] for i in range(100)])], names=["a"]
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("a", index_type="BITMAP")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "Bitmap"
+
+
+def test_label_list_index(tmp_path: Path):
+    tags = pa.array(["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7"])
+    tag_list = pa.ListArray.from_arrays([0, 2, 4], tags)
+    tbl = pa.Table.from_arrays([tag_list], names=["tags"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("tags", index_type="LABEL_LIST")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "LabelList"
