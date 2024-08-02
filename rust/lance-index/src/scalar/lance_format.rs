@@ -389,7 +389,7 @@ mod tests {
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = tempdir().unwrap();
-        let updated_index_store = test_store(&updated_index_dir);
+        let updated_index_store = legacy_test_store(&updated_index_dir);
         index
             .update(
                 lance_datafusion::utils::reader_to_stream(Box::new(data)),
