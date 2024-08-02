@@ -141,7 +141,7 @@ async fn merge_streams(
 /// These existing partitions must have the same centroids and PQ codebook.
 ///
 /// TODO: migrate this function to `lance-index` crate.
-pub(super) async fn write_pq_partitions(
+pub async fn write_pq_partitions(
     writer: &mut dyn Writer,
     ivf: &mut IvfModel,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,

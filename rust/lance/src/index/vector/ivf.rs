@@ -91,7 +91,7 @@ use crate::{
 };
 
 pub mod builder;
-mod io;
+pub mod io;
 pub mod v2;
 
 /// IVF Index.

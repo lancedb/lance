@@ -459,7 +459,7 @@ class IndicesBuilder:
         else:
             raise ValueError("filenames must be a list of strings")
 
-    def load_shuffled_vectors(self, filenames: list[str], dir_path: str):
+    def load_shuffled_vectors(self, filenames: list[str], dir_path: str, ivf: IvfModel):
         """
         Takes filenames of the sorted, transformed vector files as input. Loads
         these sorted files and commits the index into the dataset.
@@ -473,7 +473,9 @@ class IndicesBuilder:
         """
 
         if isinstance(filenames, list):
-            return indices.load_shuffled_vectors(filenames, dir_path)
+            return indices.load_shuffled_vectors(
+                filenames, dir_path, self.dataset._ds, ivf.centroids
+            )
         else:
             raise ValueError("filenames must be a list of strings")
 

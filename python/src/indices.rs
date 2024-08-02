@@ -5,7 +5,8 @@ use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use lance::index::vector::ivf::builder::write_vector_storage;
-use lance_index::vector::ivf::shuffler::shuffle_vectors;
+use lance::index::vector::ivf::io::write_pq_partitions;
+use lance_index::vector::ivf::shuffler::{shuffle_vectors, load_partitioned_shuffles};
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
     pq::{PQBuildParams, ProductQuantizer},
@@ -14,7 +15,7 @@ use lance_linalg::distance::DistanceType;
 use pyo3::{
     pyfunction,
     types::{PyList, PyModule},
-    wrap_pyfunction, PyObject, PyResult, Python,
+    wrap_pyfunction, PyObject, PyResult, Python
 };
 
 use crate::fragment::FileFragment;
@@ -261,12 +262,56 @@ pub fn shuffle_transformed_vectors(
     }
 }
 
+async fn do_load_shuffled_vectors(
+    filenames: Vec<String>,
+    dir_path: &str,
+    dataset: &Dataset,
+    mut ivf_model: IvfModel,
+) -> PyResult<()> {
+    // let obj_store = dataset.ds.object_store();
+    // let path = dataset.ds.indices_dir().child("shuffled_vectors.idx");
+    let (obj_store, path) = object_store_from_uri_or_path(dir_path).await?;
+    let stream = load_partitioned_shuffles(path.clone(), filenames).await.infer_error()?;
+    let mut writer = obj_store.create(&path).await.infer_error()?;
+    println!("Path to write: {:?}", path);
+    // let output_file = format!("sorted_{}.lance", i);
+    // let path = self.output_dir.child(output_file.clone());
+    write_pq_partitions(&mut writer, &mut ivf_model, Some(stream), None);
+
+    Ok(())
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn load_shuffled_vectors(
+    py: Python<'_>,
+    filenames: Vec<String>,
+    dir_path: &str,
+    dataset: &Dataset,
+    ivf_centroids: PyArrowType<ArrayData>,
+) -> PyResult<()> {
+    let ivf_centroids = ivf_centroids.0;
+    let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
+
+    let ivf_model = IvfModel {
+        centroids: Some(ivf_centroids),
+        offsets: vec![],
+        lengths: vec![],
+    };
+
+    RT.block_on(
+        None,
+        do_load_shuffled_vectors(filenames, dir_path, dataset, ivf_model),
+    )?
+}
+
 pub fn register_indices(py: Python, m: &PyModule) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
+    indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
     m.add_submodule(indices)?;
     Ok(())
 }
