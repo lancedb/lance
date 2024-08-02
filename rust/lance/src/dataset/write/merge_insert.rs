@@ -1286,13 +1286,10 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use lance_datagen::{array, BatchCount, RowCount, Seed};
-    use lance_index::IndexType;
+    use lance_index::{scalar::ScalarIndexParams, IndexType};
     use tempfile::tempdir;
 
-    use crate::{
-        dataset::{WriteMode, WriteParams},
-        index::scalar::ScalarIndexParams,
-    };
+    use crate::dataset::{WriteMode, WriteParams};
 
     use super::*;
 

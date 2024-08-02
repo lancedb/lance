@@ -13,11 +13,10 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
 use arrow_array::{LargeStringArray, RecordBatch, RecordBatchIterator, UInt64Array};
 use itertools::Itertools;
-use lance::index::scalar::{ScalarIndexParams, ScalarIndexType};
 use lance::Dataset;
 use lance_core::ROW_ID;
 use lance_index::scalar::inverted::flat_full_text_search;
-use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType};
 use lance_index::DatasetIndexExt;
 use object_store::path::Path;
 

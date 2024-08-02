@@ -124,7 +124,7 @@ impl FileFragment {
         self.fragment.id()
     }
 
-    fn metadata(&self) -> FragmentMetadata {
+    pub fn metadata(&self) -> FragmentMetadata {
         FragmentMetadata::new(self.fragment.metadata().clone())
     }
 

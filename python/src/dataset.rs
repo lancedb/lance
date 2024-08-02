@@ -38,16 +38,16 @@ use lance::dataset::{
 };
 use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
-use lance::index::scalar::ScalarIndexType;
-use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
+use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
-use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::FullTextSearchQuery;
-use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
-    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
+    optimize::OptimizeOptions,
+    scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
+    vector::{
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+        sq::builder::SQBuildParams,
+    },
     DatasetIndexExt, IndexParams, IndexType,
 };
 use lance_io::object_store::ObjectStoreParams;
@@ -365,13 +365,15 @@ impl Dataset {
         PyBytes::new(py, &manifest_bytes).into()
     }
 
-    /// Load index metadata
+    /// Load index metadata.
+    ///
+    /// This call will open the index and return its concrete index type.
     fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let index_metadata = RT
             .block_on(Some(self_.py()), self_.ds.load_indices())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         let py = self_.py();
-        Ok(index_metadata
+        index_metadata
             .iter()
             .map(|idx| {
                 let dict = PyDict::new(py);
@@ -387,7 +389,14 @@ impl Dataset {
                 let idx_type = if is_vector {
                     IndexType::Vector
                 } else {
-                    IndexType::Scalar
+                    let ds = self_.ds.clone();
+                    RT.block_on(Some(self_.py()), async {
+                        let scalar_idx = ds
+                            .open_scalar_index(&idx_schema.fields[0].name, &idx.uuid.to_string())
+                            .await?;
+                        Ok::<_, lance::Error>(scalar_idx.index_type())
+                    })?
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?
                 };
 
                 let field_names = idx_schema
@@ -412,9 +421,9 @@ impl Dataset {
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
                 dict.set_item("fragment_ids", fragment_set).unwrap();
-                dict.to_object(py)
+                Ok(dict.to_object(py))
             })
-            .collect::<Vec<_>>())
+            .collect::<PyResult<Vec<_>>>()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1020,7 +1029,10 @@ impl Dataset {
     ) -> PyResult<()> {
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
-            "BTREE" | "BITMAP" | "LABEL_LIST" | "INVERTED" => IndexType::Scalar,
+            "BTREE" => IndexType::Scalar,
+            "BITMAP" => IndexType::Bitmap,
+            "LABEL_LIST" => IndexType::LabelList,
+            "INVERTED" => IndexType::Inverted,
             "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -1029,7 +1041,7 @@ impl Dataset {
             }
         };
 
-        // Only VectorParams are supported.
+        log::info!("Creating index: type={}", index_type);
         let params: Box<dyn IndexParams> = if index_type == "BTREE" {
             Box::<ScalarIndexParams>::default()
         } else if index_type == "BITMAP" {

@@ -1506,7 +1506,6 @@ mod tests {
     use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::WriteMode::Overwrite;
-    use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::TestDatasetGenerator;
 
@@ -1524,7 +1523,7 @@ mod tests {
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, RowCount};
-    use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::WriterVersion;

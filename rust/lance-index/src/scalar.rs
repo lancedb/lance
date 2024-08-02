@@ -18,9 +18,10 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::Result;
+use lance_core::{Error, Result};
+use snafu::{location, Location};
 
-use crate::Index;
+use crate::{Index, IndexParams, IndexType};
 
 pub mod bitmap;
 pub mod btree;
@@ -29,6 +30,66 @@ pub mod flat;
 pub mod inverted;
 pub mod label_list;
 pub mod lance_format;
+
+pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
+
+#[derive(Debug)]
+pub enum ScalarIndexType {
+    BTree,
+    Bitmap,
+    LabelList,
+    Inverted,
+}
+
+impl TryFrom<IndexType> for ScalarIndexType {
+    type Error = Error;
+
+    fn try_from(value: IndexType) -> Result<Self> {
+        match value {
+            IndexType::BTree | IndexType::Scalar => Ok(Self::BTree),
+            IndexType::Bitmap => Ok(Self::Bitmap),
+            IndexType::LabelList => Ok(Self::LabelList),
+            IndexType::Inverted => Ok(Self::Inverted),
+            _ => Err(Error::InvalidInput {
+                source: format!("Index type {:?} is not a scalar index", value).into(),
+                location: location!(),
+            }),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ScalarIndexParams {
+    /// If set then always use the given index type and skip auto-detection
+    pub force_index_type: Option<ScalarIndexType>,
+}
+
+impl ScalarIndexParams {
+    pub fn new(index_type: ScalarIndexType) -> Self {
+        Self {
+            force_index_type: Some(index_type),
+        }
+    }
+}
+
+impl IndexParams for ScalarIndexParams {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn index_type(&self) -> IndexType {
+        match self.force_index_type {
+            Some(ScalarIndexType::BTree) | None => IndexType::BTree,
+            Some(ScalarIndexType::Bitmap) => IndexType::Bitmap,
+            Some(ScalarIndexType::LabelList) => IndexType::LabelList,
+            Some(ScalarIndexType::Inverted) => IndexType::Inverted,
+        }
+    }
+
+    fn index_name(&self) -> &str {
+        LANCE_SCALAR_INDEX
+    }
+}
 
 /// Trait for storing an index (or parts of an index) into storage
 #[async_trait]

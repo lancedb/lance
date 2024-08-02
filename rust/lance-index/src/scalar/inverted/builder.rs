@@ -101,10 +101,7 @@ pub async fn update_index(
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
 
         for (doc, row_id) in doc_iter.zip(row_id_col.values().iter()) {
-            let doc = match doc {
-                Some(doc) => doc,
-                None => continue,
-            };
+            let Some(doc) = doc else { continue };
             let row_id = *row_id;
             let mut token_stream = tokenizer.token_stream(doc);
             let mut row_token_cnt = HashMap::new();
