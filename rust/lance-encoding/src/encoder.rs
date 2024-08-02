@@ -128,12 +128,20 @@ pub trait BufferEncoder: std::fmt::Debug + Send + Sync {
     fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)>;
 }
 
+#[derive(Debug)]
 pub struct EncodedBufferMeta {
     pub bits_per_value: u64,
 
-    pub bitpacked_bits_per_value: Option<u64>,
+    pub bitpacking: Option<BitpackingBufferMeta>,
 
     pub compression_scheme: Option<CompressionScheme>,
+}
+
+#[derive(Debug)]
+pub struct BitpackingBufferMeta {
+    pub bits_per_value: u64,
+
+    pub signed: bool,
 }
 
 /// Encodes data from Arrow format into some kind of on-disk format
@@ -419,7 +427,10 @@ impl CoreBufferEncodingStrategy {
             return None;
         }
 
-        Some(BitpackingBufferEncoder::new(num_bits))
+        Some(BitpackingBufferEncoder::new(
+            num_bits,
+            !data_type.is_unsigned_integer(),
+        ))
     }
 }
 

@@ -28,7 +28,7 @@ impl BufferEncoder for FlatBufferEncoder {
             EncodedBuffer { parts },
             EncodedBufferMeta {
                 bits_per_value: (data_type.byte_width() * 8) as u64,
-                bitpacked_bits_per_value: None,
+                bitpacking: None,
                 compression_scheme: None,
             },
         ))
@@ -111,7 +111,7 @@ impl BufferEncoder for CompressedBufferEncoder {
             EncodedBuffer { parts },
             EncodedBufferMeta {
                 bits_per_value: (data_type.byte_width() * 8) as u64,
-                bitpacked_bits_per_value: None,
+                bitpacking: None,
                 compression_scheme: Some(CompressionScheme::Zstd),
             },
         ))
@@ -149,7 +149,7 @@ impl BufferEncoder for BitmapBufferEncoder {
             buffer,
             EncodedBufferMeta {
                 bits_per_value: 1,
-                bitpacked_bits_per_value: None,
+                bitpacking: None,
                 compression_scheme: None,
             },
         ))
