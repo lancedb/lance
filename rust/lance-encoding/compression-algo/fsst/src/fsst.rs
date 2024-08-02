@@ -1279,14 +1279,14 @@ pub fn decompress(
 #[cfg(test)]
 mod tests {
     use crate::fsst::*;
-    use arrow::array::StringArray;
+    use arrow_array::StringArray;
 
     const TEST_PARAGRAPH: &str = "ACT I. Scene I.
     Elsinore. A platform before the Castle.
-    
+
     Enter two Sentinels-[first,] Francisco, [who paces up and down
     at his post; then] Bernardo, [who approaches him].
-    
+
         Ber. Who's there.?
         Fran. Nay, answer me. Stand and unfold yourself.
         Ber. Long live the King!
@@ -1301,7 +1301,7 @@ mod tests {
         Ber. Well, good night.
         If you do meet Horatio and Marcellus,
         The rivals of my watch, bid them make haste.
-        Enter Horatio and Marcellus.  
+        Enter Horatio and Marcellus.
 
         Fran. I think I hear them. Stand, ho! Who is there?
         Hor. Friends to this ground.
@@ -1321,7 +1321,7 @@ mod tests {
         Mar. Horatio says 'tis but our fantasy,
             And will not let belief take hold of him
             Touching this dreaded sight, twice seen of us.
-            Therefore I have entreated him along,  
+            Therefore I have entreated him along,
             With us to watch the minutes of this night,
             That, if again this apparition come,
             He may approve our eyes and speak to it.
@@ -1341,7 +1341,7 @@ mod tests {
                                 Enter Ghost.
 
         Mar. Peace! break thee off! Look where it comes again!
-        Ber. In the same figure, like the King that's dead.  
+        Ber. In the same figure, like the King that's dead.
         Mar. Thou art a scholar; speak to it, Horatio.
         Ber. Looks it not like the King? Mark it, Horatio.
         Hor. Most like. It harrows me with fear and wonder.
@@ -1361,7 +1361,7 @@ mod tests {
             What think you on't?
         Hor. Before my God, I might not this believe
             Without the sensible and true avouch
-            Of mine own eyes.  
+            Of mine own eyes.
         Mar. Is it not like the King?
         Hor. As thou art to thyself.
             Such was the very armour he had on
@@ -1381,30 +1381,30 @@ mod tests {
             And foreign mart for implements of war;
             Why such impress of shipwrights, whose sore task
             Does not divide the Sunday from the week.
-            What might be toward, that this sweaty haste  
+            What might be toward, that this sweaty haste
             Doth make the night joint-labourer with the day?
             Who is't that can inform me?";
 
     const TEST_PARAGRAPH2: &str = "Towards the end of November, during a thaw, at nine o’clock one morning, a train on the Warsaw and Petersburg railway was approaching the latter city at full speed.
-The morning was so damp and misty that it was only with great difficulty that the day succeeded in breaking; 
-and it was impossible to distinguish anything more than a few yards away from the carriage windows. 
-Some of the passengers by this particular train were returning from abroad; but the third-class carriages were the best filled, chiefly with insignificant persons of various occupations and degrees, 
-picked up at the different stations nearer town. 
+The morning was so damp and misty that it was only with great difficulty that the day succeeded in breaking;
+and it was impossible to distinguish anything more than a few yards away from the carriage windows.
+Some of the passengers by this particular train were returning from abroad; but the third-class carriages were the best filled, chiefly with insignificant persons of various occupations and degrees,
+picked up at the different stations nearer town.
 All of them seemed weary, and most of them had sleepy eyes and a shivering expression, while their complexions generally appeared to have taken on the colour of the fog outside.
-When day dawned, two passengers in one of the third-class carriages found themselves opposite each other. Both were young fellows, both were rather poorly dressed, both had remarkable faces, 
-and both were evidently anxious to start a conversation. 
+When day dawned, two passengers in one of the third-class carriages found themselves opposite each other. Both were young fellows, both were rather poorly dressed, both had remarkable faces,
+and both were evidently anxious to start a conversation.
 If they had but known why, at this particular moment, they were both remarkable persons, they would undoubtedly have wondered at the strange chance which had set them down opposite to one another in a third-class carriage of the Warsaw Railway Company.
-One of them was a young fellow of about twenty-seven, not tall, with black curling hair, and small, grey, fiery eyes. His nose was broad and flat, and he had high cheek bones; his thin lips were constantly compressed into an impudent, 
-ironical—it might almost be called a malicious—smile; 
-but his forehead was high and well formed, and atoned for a good deal of the ugliness of the lower part of his face. 
-A special feature of this physiognomy was its death-like pallor, which gave to the whole man an indescribably emaciated appearance in spite of his hard look, 
-and at the same time a sort of passionate and suffering expression which did not harmonize with his impudent, 
-sarcastic smile and keen, self-satisfied bearing. 
-He wore a large fur—or rather astrachan—overcoat, which had kept him warm all night, while his neighbour had been obliged to bear the full severity of a Russian November night entirely unprepared. 
+One of them was a young fellow of about twenty-seven, not tall, with black curling hair, and small, grey, fiery eyes. His nose was broad and flat, and he had high cheek bones; his thin lips were constantly compressed into an impudent,
+ironical—it might almost be called a malicious—smile;
+but his forehead was high and well formed, and atoned for a good deal of the ugliness of the lower part of his face.
+A special feature of this physiognomy was its death-like pallor, which gave to the whole man an indescribably emaciated appearance in spite of his hard look,
+and at the same time a sort of passionate and suffering expression which did not harmonize with his impudent,
+sarcastic smile and keen, self-satisfied bearing.
+He wore a large fur—or rather astrachan—overcoat, which had kept him warm all night, while his neighbour had been obliged to bear the full severity of a Russian November night entirely unprepared.
 His wide sleeveless mantle with a large cape to it—the sort of cloak one sees upon travellers during the winter months in Switzerland or North Italy—was by no means adapted to the long cold journey through Russia, from Eydkuhnen to St. Petersburg.
-The wearer of this cloak was a young fellow, also of about twenty-six or twenty-seven years of age, slightly above the middle height, very fair, with a thin, pointed and very light coloured beard; 
-his eyes were large and blue, and had an intent look about them, yet that heavy expression which some people affirm to be a peculiarity as well as evidence, of an epileptic subject. 
-His face was decidedly a pleasant one for all that; refined, but quite colourless, except for the circumstance that at this moment it was blue with cold. 
+The wearer of this cloak was a young fellow, also of about twenty-six or twenty-seven years of age, slightly above the middle height, very fair, with a thin, pointed and very light coloured beard;
+his eyes were large and blue, and had an intent look about them, yet that heavy expression which some people affirm to be a peculiarity as well as evidence, of an epileptic subject.
+His face was decidedly a pleasant one for all that; refined, but quite colourless, except for the circumstance that at this moment it was blue with cold.
 He held a bundle made up of an old faded silk handkerchief that apparently contained all his travelling wardrobe, and wore thick shoes and gaiters, his whole appearance being very un-Russian.
 His black-haired neighbour inspected these peculiarities, having nothing better to do, and at length remarked, with that rude enjoyment of the discomforts of others which the common classes so often show:
 “Cold?”
@@ -1412,43 +1412,43 @@ His black-haired neighbour inspected these peculiarities, having nothing better 
 “What, been abroad, I suppose?”
 “Yes, straight from Switzerland.”
 “Wheugh! my goodness!” The black-haired young fellow whistled, and then laughed.
-The conversation proceeded. The readiness of the fair-haired young man in the cloak to answer all his opposite neighbour’s questions was surprising. 
-He seemed to have no suspicion of any impertinence or inappropriateness in the fact of such questions being put to him. 
-Replying to them, he made known to the inquirer that he certainly had been long absent from Russia, more than four years; that he had been sent abroad for his health; 
+The conversation proceeded. The readiness of the fair-haired young man in the cloak to answer all his opposite neighbour’s questions was surprising.
+He seemed to have no suspicion of any impertinence or inappropriateness in the fact of such questions being put to him.
+Replying to them, he made known to the inquirer that he certainly had been long absent from Russia, more than four years; that he had been sent abroad for his health;
 that he had suffered from some strange nervous malady—a kind of epilepsy, with convulsive spasms. His interlocutor burst out laughing several times at his answers; and more than ever, when to the question, “whether he had been cured?” the patient replied:
 “No, they did not cure me.”
 “Hey! that’s it! You stumped up your money for nothing, and we believe in those fellows, here!” remarked the black-haired individual, sarcastically.";
 
     const TEST_PARAGRAPH3: &str = "When the widow hurried away to Pavlofsk, she went straight to Daria Alexeyevna’s house, and telling all she knew, threw her into a state of great alarm.
-Both ladies decided to communicate at once with Lebedeff, who, as the friend and landlord of the prince, was also much agitated. 
+Both ladies decided to communicate at once with Lebedeff, who, as the friend and landlord of the prince, was also much agitated.
 Vera Lebedeff told all she knew, and by Lebedeff’s advice it was decided that all three should go to Petersburg as quickly as possible, in order to avert “what might so easily happen.”
 This is how it came about that at eleven o’clock next morning Rogojin’s flat was opened by the police in the presence of Lebedeff, the two ladies, and Rogojin’s own brother, who lived in the wing.
-The evidence of the porter went further than anything else towards the success of Lebedeff in gaining the assistance of the police. 
-He declared that he had seen Rogojin return to the house last night, accompanied by a friend, and that both had gone upstairs very secretly and cautiously. 
+The evidence of the porter went further than anything else towards the success of Lebedeff in gaining the assistance of the police.
+He declared that he had seen Rogojin return to the house last night, accompanied by a friend, and that both had gone upstairs very secretly and cautiously.
 After this there was no hesitation about breaking open the door, since it could not be got open in any other way.
 Rogojin suffered from brain fever for two months. When he recovered from the attack he was at once brought up on trial for murder.
-He gave full, satisfactory, and direct evidence on every point; and the prince’s name was, thanks to this, not brought into the proceedings. 
-Rogojin was very quiet during the progress of the trial. He did not contradict his clever and eloquent counsel, who argued that the brain fever, 
+He gave full, satisfactory, and direct evidence on every point; and the prince’s name was, thanks to this, not brought into the proceedings.
+Rogojin was very quiet during the progress of the trial. He did not contradict his clever and eloquent counsel, who argued that the brain fever,
 or inflammation of the brain, was the cause of the crime; clearly proving that this malady had existed long before the murder was perpetrated, and had been brought on by the sufferings of the accused.
-But Rogojin added no words of his own in confirmation of this view, and as before, he recounted with marvellous exactness the details of his crime. 
-He was convicted, but with extenuating circumstances, and condemned to hard labour in Siberia for fifteen years. He heard his sentence grimly, silently, and thoughtfully. His colossal fortune, 
+But Rogojin added no words of his own in confirmation of this view, and as before, he recounted with marvellous exactness the details of his crime.
+He was convicted, but with extenuating circumstances, and condemned to hard labour in Siberia for fifteen years. He heard his sentence grimly, silently, and thoughtfully. His colossal fortune,
 with the exception of the comparatively small portion wasted in the first wanton period of his inheritance, went to his brother, to the great satisfaction of the latter.
 The old lady, Rogojin’s mother, is still alive, and remembers her favourite son Parfen sometimes, but not clearly. God spared her the knowledge of this dreadful calamity which had overtaken her house.
 Lebedeff, Keller, Gania, Ptitsin, and many other friends of ours continue to live as before. There is scarcely any change in them, so that there is no need to tell of their subsequent doings.
-Hippolyte died in great agitation, and rather sooner than he expected, about a fortnight after Nastasia Philipovna’s death. Colia was much affected by these events, 
+Hippolyte died in great agitation, and rather sooner than he expected, about a fortnight after Nastasia Philipovna’s death. Colia was much affected by these events,
 and drew nearer to his mother in heart and sympathy. Nina Alexandrovna is anxious, because he is “thoughtful beyond his years,” but he will, we think, make a useful and active man.
-The prince’s further fate was more or less decided by Colia, who selected, out of all the persons he had met during the last six or seven months, Evgenie Pavlovitch, as friend and confidant. 
-To him he made over all that he knew as to the events above recorded, and as to the present condition of the prince. He was not far wrong in his choice. 
+The prince’s further fate was more or less decided by Colia, who selected, out of all the persons he had met during the last six or seven months, Evgenie Pavlovitch, as friend and confidant.
+To him he made over all that he knew as to the events above recorded, and as to the present condition of the prince. He was not far wrong in his choice.
 Evgenie Pavlovitch took the deepest interest in the fate of the unfortunate “idiot,” and, thanks to his influence, the prince found himself once more with Dr. Schneider, in Switzerland.
 Evgenie Pavlovitch, who went abroad at this time, intending to live a long while on the continent, being, as he often said, quite superfluous in Russia, visits his sick friend at Schneider’s every few months.
 But Dr. Schneider frowns ever more and more and shakes his head; he hints that the brain is fatally injured; he does not as yet declare that his patient is incurable, but he allows himself to express the gravest fears.
-Evgenie takes this much to heart, and he has a heart, as is proved by the fact that he receives and even answers letters from Colia. But besides this, 
-another trait in his character has become apparent, and as it is a good trait we will make haste to reveal it. 
-After each visit to Schneider’s establishment, Evgenie Pavlovitch writes another letter, besides that to Colia, giving the most minute particulars concerning the invalid’s condition. 
+Evgenie takes this much to heart, and he has a heart, as is proved by the fact that he receives and even answers letters from Colia. But besides this,
+another trait in his character has become apparent, and as it is a good trait we will make haste to reveal it.
+After each visit to Schneider’s establishment, Evgenie Pavlovitch writes another letter, besides that to Colia, giving the most minute particulars concerning the invalid’s condition.
 In these letters is to be detected, and in each one more than the last, a growing feeling of friendship and sympathy.
-The individual who corresponds thus with Evgenie Pavlovitch, and who engages so much of his attention and respect, is Vera Lebedeff. 
-We have never been able to discover clearly how such relations sprang up. 
-Of course the root of them was in the events which we have already recorded, and which so filled Vera with grief on the prince’s account that she fell seriously ill. 
+The individual who corresponds thus with Evgenie Pavlovitch, and who engages so much of his attention and respect, is Vera Lebedeff.
+We have never been able to discover clearly how such relations sprang up.
+Of course the root of them was in the events which we have already recorded, and which so filled Vera with grief on the prince’s account that she fell seriously ill.
 But exactly how the acquaintance and friendship came about, we cannot say.";
 
     #[test_log::test(tokio::test)]
