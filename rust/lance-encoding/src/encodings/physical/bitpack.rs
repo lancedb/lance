@@ -28,18 +28,25 @@ use crate::{
     encoder::{BufferEncoder, EncodedBuffer},
 };
 
+#[derive(Debug)]
+pub struct BitpackParams {
+    pub num_bits: u64,
+
+    pub signed: bool,
+}
+
 // Compute the number of bits to use for each item, if this array can be encoded using
 // bitpacking encoding. Returns `None` if the type or array data is not supported.
-pub fn num_compressed_bits(arr: ArrayRef) -> Option<u64> {
+pub fn bitpack_params(arr: ArrayRef) -> Option<BitpackParams> {
     match arr.data_type() {
-        DataType::UInt8 => num_bits_for_type::<UInt8Type>(arr.as_primitive()),
-        DataType::UInt16 => num_bits_for_type::<UInt16Type>(arr.as_primitive()),
-        DataType::UInt32 => num_bits_for_type::<UInt32Type>(arr.as_primitive()),
-        DataType::UInt64 => num_bits_for_type::<UInt64Type>(arr.as_primitive()),
-        DataType::Int8 => num_bits_for_signed_type::<Int8Type>(arr.as_primitive()),
-        DataType::Int16 => num_bits_for_signed_type::<Int16Type>(arr.as_primitive()),
-        DataType::Int32 => num_bits_for_signed_type::<Int32Type>(arr.as_primitive()),
-        DataType::Int64 => num_bits_for_signed_type::<Int64Type>(arr.as_primitive()),
+        DataType::UInt8 => bitpack_params_for_type::<UInt8Type>(arr.as_primitive()),
+        DataType::UInt16 => bitpack_params_for_type::<UInt16Type>(arr.as_primitive()),
+        DataType::UInt32 => bitpack_params_for_type::<UInt32Type>(arr.as_primitive()),
+        DataType::UInt64 => bitpack_params_for_type::<UInt64Type>(arr.as_primitive()),
+        DataType::Int8 => bitpack_params_for_signed_type::<Int8Type>(arr.as_primitive()),
+        DataType::Int16 => bitpack_params_for_signed_type::<Int16Type>(arr.as_primitive()),
+        DataType::Int32 => bitpack_params_for_signed_type::<Int32Type>(arr.as_primitive()),
+        DataType::Int64 => bitpack_params_for_signed_type::<Int64Type>(arr.as_primitive()),
         // TODO -- eventually we could support temporal types as well
         _ => None,
     }
@@ -47,7 +54,7 @@ pub fn num_compressed_bits(arr: ArrayRef) -> Option<u64> {
 
 // Compute the number bits to to use for bitpacking generically.
 // returns None if the array is empty or all nulls
-fn num_bits_for_type<T>(arr: &PrimitiveArray<T>) -> Option<u64>
+fn bitpack_params_for_type<T>(arr: &PrimitiveArray<T>) -> Option<BitpackParams>
 where
     T: ArrowPrimitiveType,
     T::Native: PrimInt + AsPrimitive<u64>,
@@ -57,17 +64,24 @@ where
         max.map(|max| arr.data_type().byte_width() as u64 * 8 - max.leading_zeros() as u64);
 
     // we can't bitpack into 0 bits, so the minimum is 1
-    num_bits.map(|num_bits| num_bits.max(1))
+    num_bits
+        .map(|num_bits| num_bits.max(1))
+        .map(|bits| BitpackParams {
+            num_bits: bits,
+            signed: false,
+        })
 }
 
 /// determine the minimum number of bits that can be used to represent
 /// an array of signed values. It includes all the significant bits for
-/// the value + plus 1 bit to represent the sign
-fn num_bits_for_signed_type<T>(arr: &PrimitiveArray<T>) -> Option<u64>
+/// the value + plus 1 bit to represent the sign. If there are no negative values
+/// then it will not add a signed bit
+fn bitpack_params_for_signed_type<T>(arr: &PrimitiveArray<T>) -> Option<BitpackParams>
 where
     T: ArrowPrimitiveType,
     T::Native: PrimInt + AsPrimitive<i64>,
 {
+    let mut add_signed_bit = false;
     let mut min_leading_bits: Option<u64> = None;
     for val in arr.iter() {
         if val.is_none() {
@@ -80,14 +94,20 @@ where
 
         if val.to_i64().unwrap() < 0i64 {
             min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_ones() as u64));
+            add_signed_bit = true;
         } else {
             min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_zeros() as u64));
         }
     }
 
     return min_leading_bits
-        // +1 added here for the sign bit
-        .map(|leading_bits| arr.data_type().byte_width() as u64 * 8 - leading_bits + 1);
+        .map(|leading_bits| arr.data_type().byte_width() as u64 * 8 - leading_bits)
+        .map(|bits| bits + if add_signed_bit { 1 } else { 0 })
+        .map(|bits| bits.max(1)) // cannot bitpack into < 1 bit
+        .map(|bits| BitpackParams {
+            num_bits: bits,
+            signed: add_signed_bit,
+        });
 }
 #[derive(Debug)]
 pub struct BitpackingBufferEncoder {
@@ -602,7 +622,7 @@ pub mod test {
     use lance_datagen::{array::fill, gen, ArrayGenerator, ArrayGeneratorExt, RowCount};
 
     #[test]
-    fn test_num_compressed_bits() {
+    fn test_bitpack_params() {
         fn gen_array(generator: Box<dyn ArrayGenerator>) -> ArrayRef {
             let arr = gen()
                 .anon_col(generator)
@@ -624,8 +644,9 @@ pub mod test {
                 while arr.null_count() == arr.len() {
                     arr = gen_array(fill::<$data_type>(max).with_random_nulls($null_probability));
                 }
-                let result = num_compressed_bits(arr);
-                assert_eq!(Some($num_bits), result);
+                let result = bitpack_params(arr);
+                assert!(result.is_some());
+                assert_eq!($num_bits, result.unwrap().num_bits);
             };
         }
 
@@ -679,17 +700,28 @@ pub mod test {
 
         // test that it returns None for datatypes that don't support bitpacking
         let arr = Float64Array::from_iter_values(vec![0.1, 0.2, 0.3]);
-        let result = num_compressed_bits(Arc::new(arr));
-        assert_eq!(None, result);
+        let result = bitpack_params(Arc::new(arr));
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_num_compressed_bits_signed_types() {
         let values = Int32Array::from(vec![1, 2, -7]);
         let arr = Arc::new(values);
+        let result = bitpack_params(arr);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(4, result.num_bits);
+        assert!(result.signed);
 
-        let result = num_compressed_bits(arr);
-        assert_eq!(Some(4), result)
+        // check that it doesn't add a sign bit if it doesn't need to
+        let values = Int32Array::from(vec![1, 2, 7]);
+        let arr = Arc::new(values);
+        let result = bitpack_params(arr);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(3, result.num_bits);
+        assert!(!result.signed);
     }
 
     #[test]
