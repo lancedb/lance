@@ -367,7 +367,7 @@ impl Dataset {
 
     /// Load index metadata.
     ///
-    /// This call will opens the index and returns its concrete type.
+    /// This call will open the index and return its concrete index type.
     fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let index_metadata = RT
             .block_on(Some(self_.py()), self_.ds.load_indices())?
