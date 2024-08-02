@@ -9,7 +9,8 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from lance.file import LanceFileReader, LanceFileWriter
-from lance.tracing import trace_to_chrome
+
+# from lance.tracing import trace_to_chrome
 
 # trace_to_chrome(level="trace")
 
