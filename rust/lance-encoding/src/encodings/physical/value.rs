@@ -396,7 +396,7 @@ pub(crate) mod tests {
             ),
             (
                 DataType::Int16,
-                Arc::new(Int16Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 8])),
+                Arc::new(Int16Array::from_iter_values(vec![0, 1, 2, 3, -4, 5 << 8])),
                 12,
             ),
             (
@@ -705,6 +705,15 @@ pub(crate) mod tests {
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
                         // this range should always give 16 bits
                         Uniform::new(-120 << 8, 120 << 8),
+                    ),
+                ),
+            ),
+            // check that it works for all positive integers
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(10, 20),
                     ),
                 ),
             ),
