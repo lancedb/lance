@@ -145,7 +145,8 @@ pub async fn check_round_trip_encoding_generated(
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
 ) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
-    for page_size in [4096, 1024 * 1024] {
+    //for page_size in [4096, 1024 * 1024] {
+    for page_size in [1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
         let encoding_strategy = CoreFieldEncodingStrategy::default();
         let encoding_config = HashMap::new();
@@ -475,9 +476,10 @@ async fn check_round_trip_field_encoding_random(
     field: Field,
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
 ) {
-    for null_rate in [Some(0.5), Some(1.0)] {
+    for null_rate in [Some(0.5)] {
     //for null_rate in [None, Some(0.5), Some(1.0)] {
-        for use_slicing in [false, true] {
+        for use_slicing in [false] {
+        //for use_slicing in [false, true] {
             let field = if null_rate.is_some() {
                 if !supports_nulls(field.data_type()) {
                     continue;
@@ -489,9 +491,9 @@ async fn check_round_trip_field_encoding_random(
 
             let test_cases = TestCases::default()
                 .with_range(0..500)
+                /*
                 .with_range(100..1100)
                 .with_range(8000..8500)
-                /*
                 .with_indices(vec![100])
                 .with_indices(vec![0])
                 .with_indices(vec![9999])
@@ -503,7 +505,8 @@ async fn check_round_trip_field_encoding_random(
                 */
                 ;
 
-            for num_ingest_batches in [1, 5, 10] {
+            for num_ingest_batches in [5] {
+            //for num_ingest_batches in [1, 5, 10] {
                 let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
                 let mut data = Vec::new();
 

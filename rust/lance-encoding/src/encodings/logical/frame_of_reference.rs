@@ -39,6 +39,7 @@ impl ArrayEncoder for FrameOfReferenceEncoder {
 
         for opt in &frame_of_reference {
             if opt.is_none() {
+                println!("returning early");
                 return self.inner_encoder.encode(arrays, buffer_index);
             }
         }
@@ -46,14 +47,18 @@ impl ArrayEncoder for FrameOfReferenceEncoder {
         // TODO safe to unwrap?
         let frame_of_reference = frame_of_reference.iter().map(|e| e.unwrap()).min().unwrap();
             
+        let mut new_arrs = vec![];
+        for arr in arrays {
+            let tmp_arr = arr.clone();
+            let arr_as_u64: UInt64Array = downcast_array(tmp_arr.as_ref());
+            let frame_of_reference = UInt64Array::new_scalar(frame_of_reference);
+            let new_arr = arrow::compute::kernels::numeric::sub(
+                &arr_as_u64,
+                &frame_of_reference
+            ).unwrap(); // TODO safe to unwarp?
+            new_arrs.push(Arc::new(new_arr) as ArrayRef);
+        }
 
-        let tmp_arr = arrays[0].clone();
-        let tmp_as_u64: UInt64Array = downcast_array(tmp_arr.as_ref());
-
-        let g2 = UInt64Array::new_scalar(frame_of_reference);
-        let booby = arrow::compute::kernels::numeric::sub(&tmp_as_u64, &g2)?;
-
-        let new_arrs = vec![Arc::new(booby) as ArrayRef];
         let inner = self.inner_encoder.encode(&new_arrs, buffer_index)?;
 
         let array_encoding =
@@ -62,7 +67,7 @@ impl ArrayEncoder for FrameOfReferenceEncoder {
                 frame_of_reference: frame_of_reference as i64,
                 negative: false,
             }));
-
+        
         Ok(EncodedArray {
             buffers: inner.buffers,
             encoding: pb::ArrayEncoding {
