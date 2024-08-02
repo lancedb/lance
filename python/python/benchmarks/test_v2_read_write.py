@@ -11,7 +11,7 @@ import pyarrow.parquet as pq
 from lance.file import LanceFileReader, LanceFileWriter
 from lance.tracing import trace_to_chrome
 
-trace_to_chrome(level="trace")
+# trace_to_chrome(level="trace")
 
 """
 Data generation (in-memory)
@@ -227,9 +227,6 @@ def benchmark_tpch_encodings(
         orig_dataset = ds.dataset(PATH)
         orig_schema = orig_dataset.schema
 
-        # for field in orig_schema:
-        #     print(field.name, field.type)
-
         if encoding_type == "plain_numeric":
             target_types = [pa.int32(), pa.int64(), pa.float32(), pa.float64()]
         elif encoding_type == "plain_non_numeric":
@@ -240,7 +237,6 @@ def benchmark_tpch_encodings(
         target_columns = [
             field.name for field in orig_schema if field.type in target_types
         ]
-        print(target_columns)
         if len(target_columns) == 0:
             continue
 
