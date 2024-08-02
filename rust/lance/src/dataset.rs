@@ -54,7 +54,7 @@ mod write;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
-use self::refs::{check_valid_ref, tag_path, TagContents, Tags};
+use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
@@ -353,19 +353,8 @@ impl Dataset {
     }
 
     async fn checkout_by_tag(&self, tag: &str) -> Result<Self> {
-        check_valid_ref(tag)?;
-
-        let tag_file = tag_path(&self.base, tag);
-
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
-
-        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-
-        self.checkout_by_version_number(tag_contents.version).await
+        let version = self.tags.get_version(tag).await?;
+        self.checkout_by_version_number(version).await
     }
 
     async fn load_manifest(
