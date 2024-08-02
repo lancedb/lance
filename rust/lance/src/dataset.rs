@@ -3051,6 +3051,13 @@ mod tests {
 
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 1);
+
+        let first_ver = DatasetBuilder::from_uri(test_uri)
+            .with_tag("tag1")
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(first_ver.version().version, 1);
     }
 
     #[rstest]
