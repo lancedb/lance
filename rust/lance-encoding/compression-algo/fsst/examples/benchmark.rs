@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+
+use arrow_array::StringArray;
 use fsst::fsst::{compress, decompress, FSST_SYMBOL_TABLE_SIZE};
 use rand::Rng;
 
 const TEST_NUM: usize = 20;
 const BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
-use arrow::array::StringArray;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 fn read_random_8_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);

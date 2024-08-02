@@ -46,7 +46,7 @@ __all__ = [
 
 def dataset(
     uri: Union[str, Path],
-    version: Optional[int] = None,
+    version: Optional[int | str] = None,
     asof: Optional[ts_types] = None,
     block_size: Optional[int] = None,
     commit_lock: Optional[CommitLock] = None,
@@ -60,9 +60,9 @@ def dataset(
     ----------
     uri : str
         Address to the Lance dataset.
-    version : optional, int
+    version : optional, int | str
         If specified, load a specific version of the Lance dataset. Else, loads the
-        latest version.
+        latest version. A version number (`int`) or a tag (`str`) can be provided.
     asof : optional, datetime or str
         If specified, find the latest version created on or earlier than the given
         argument value. If a version is already specified, this arg is ignored.
