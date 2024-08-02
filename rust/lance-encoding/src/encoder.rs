@@ -22,6 +22,7 @@ use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::value::{parse_compression_scheme, CompressionScheme};
 use crate::{
+    data::EncodedDataBlock,
     decoder::{ColumnInfo, PageInfo},
     encodings::{
         logical::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder},
@@ -125,7 +126,7 @@ pub trait BufferEncoder: std::fmt::Debug + Send + Sync {
     /// This method may receive multiple chunks and should encode them all into
     /// a single EncodedBuffer (though that buffer may have multiple parts).  All
     /// parts will be written to the file as one contiguous block.
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)>;
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>>;
 }
 
 pub struct EncodedBufferMeta {

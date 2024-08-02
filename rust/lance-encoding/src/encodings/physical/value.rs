@@ -14,6 +14,7 @@ use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encoder::BufferEncodingStrategy;
 use crate::{
+    data::EncodedDataBlock,
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
@@ -252,7 +253,7 @@ impl ValueEncoder {
 }
 
 impl ArrayEncoder for ValueEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<Box<dyn EncodedDataBlock>> {
         let index = *buffer_index;
         *buffer_index += 1;
 

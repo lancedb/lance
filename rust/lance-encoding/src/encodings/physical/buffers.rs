@@ -10,7 +10,10 @@ use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
 use lance_core::Result;
 
-use crate::encoder::{BufferEncoder, EncodedBuffer, EncodedBufferMeta};
+use crate::{
+    data::{BlockEncodedDataBlock, EncodedDataBlock, FixedWidthEncodedDataBlock},
+    encoder::{BufferEncoder, EncodedBuffer, EncodedBufferMeta},
+};
 
 use super::value::CompressionScheme;
 
@@ -18,12 +21,17 @@ use super::value::CompressionScheme;
 pub struct FlatBufferEncoder {}
 
 impl BufferEncoder for FlatBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>> {
         let parts = arrays
             .iter()
             .map(|arr| arr.to_data().buffers()[0].clone())
             .collect::<Vec<_>>();
         let data_type = arrays[0].data_type();
+        Ok(Box::new(FixedWidthEncodedDataBlock {
+            data: parts,
+            bits_per_value: (data_type.byte_width() * 8) as u64,
+        }))
+        /*
         Ok((
             EncodedBuffer { parts },
             EncodedBufferMeta {
@@ -32,6 +40,7 @@ impl BufferEncoder for FlatBufferEncoder {
                 compression_scheme: None,
             },
         ))
+        */
     }
 }
 
@@ -94,7 +103,7 @@ impl CompressedBufferEncoder {
 }
 
 impl BufferEncoder for CompressedBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>> {
         let mut parts = Vec::with_capacity(arrays.len());
         for arr in arrays {
             let buffer = arr.to_data().buffers()[0].clone();
@@ -105,8 +114,13 @@ impl BufferEncoder for CompressedBufferEncoder {
             parts.push(Buffer::from(compressed));
         }
 
-        let data_type = arrays[0].data_type();
 
+        Ok(Box::new(BlockEncodedDataBlock {
+            data: parts,
+        }))
+
+        /*
+        let data_type = arrays[0].data_type();
         Ok((
             EncodedBuffer { parts },
             EncodedBufferMeta {
@@ -115,6 +129,7 @@ impl BufferEncoder for CompressedBufferEncoder {
                 compression_scheme: Some(CompressionScheme::Zstd),
             },
         ))
+        */
     }
 }
 
@@ -123,7 +138,7 @@ impl BufferEncoder for CompressedBufferEncoder {
 pub struct BitmapBufferEncoder {}
 
 impl BufferEncoder for BitmapBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>> {
         debug_assert!(arrays
             .iter()
             .all(|arr| *arr.data_type() == DataType::Boolean));
@@ -144,6 +159,13 @@ impl BufferEncoder for BitmapBufferEncoder {
         }
         let buffer = builder.finish().into_inner();
         let parts = vec![buffer];
+        
+        Ok(Box::new(FixedWidthEncodedDataBlock {
+            bits_per_value: 1,
+            data: parts,
+        }))
+
+        /*
         let buffer = EncodedBuffer { parts };
         Ok((
             buffer,
@@ -153,5 +175,6 @@ impl BufferEncoder for BitmapBufferEncoder {
                 compression_scheme: None,
             },
         ))
+        */
     }
 }

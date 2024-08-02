@@ -18,7 +18,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, FixedWidthDataBlock};
+use crate::data::{DataBlock, EncodedDataBlock, FixedWidthDataBlock, FixedWidthEncodedDataBlock};
 use crate::encoder::EncodedBufferMeta;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -65,7 +65,7 @@ impl BitpackingBufferEncoder {
 }
 
 impl BufferEncoder for BitpackingBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>> {
         // calculate the total number of bytes we need to allocate for the destination.
         // this will be the number of items in the source array times the number of bits.
         let count_items = arrays.iter().map(|arr| arr.len()).sum::<usize>();
@@ -84,6 +84,12 @@ impl BufferEncoder for BitpackingBufferEncoder {
             )?;
         }
 
+
+        Ok(Box::new(FixedWidthEncodedDataBlock {
+            data: vec![dst_buffer.into()],
+            bits_per_value: self.num_bits,
+        }))
+        /*
         let data_type = arrays[0].data_type();
         Ok((
             EncodedBuffer {
@@ -95,6 +101,7 @@ impl BufferEncoder for BitpackingBufferEncoder {
                 compression_scheme: None,
             },
         ))
+        */
     }
 }
 

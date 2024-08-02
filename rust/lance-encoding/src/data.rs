@@ -6,12 +6,13 @@
 use std::any::Any;
 
 use arrow::array::{ArrayData, ArrayDataBuilder};
+use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
-use crate::buffer::LanceBuffer;
+use crate::{buffer::LanceBuffer, encoder::EncodedArray};
 
 /// A DataBlock is a collection of buffers that represents an "array" of data in very generic terms
 ///
@@ -384,5 +385,75 @@ impl DataBlock for DictionaryDataBlock {
             indices: self.indices.try_clone()?,
             dictionary: self.dictionary.try_clone()?,
         }))
+    }
+}
+
+pub trait EncodedDataBlock: Any + std::fmt::Debug + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
+    fn as_any_box(self: Box<Self>) -> Box<dyn Any>;
+
+    fn into_parts(self: Box<Self>) -> Vec<Buffer>;
+}
+
+pub trait EncodedDataBlockExt {
+    fn try_into_layout<T: EncodedDataBlock>(self) -> Result<Box<T>>;
+}
+
+// TODO this could probably be combined into a single trait with DataBlockExt ?
+impl EncodedDataBlockExt for Box<dyn EncodedDataBlock> {
+    fn try_into_layout<T: EncodedDataBlock>(self) -> Result<Box<T>> {
+        self.as_any_box()
+            .downcast::<T>()
+            .map_err(|_| Error::Internal {
+                message: "Couldn't convert to expected layout".to_string(),
+                location: location!(),
+            })
+    }
+}
+
+/// TODO better comment
+/// Each item is encoded with a fixed width
+/// e.g. basic flat, bitpacked, bitmap, FSL
+#[derive(Debug)]
+pub struct FixedWidthEncodedDataBlock {
+  pub data: Vec<Buffer>, // TODO change this to data block
+
+  pub bits_per_value: u64,
+}
+
+impl EncodedDataBlock for FixedWidthEncodedDataBlock {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_box(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+
+    fn into_parts(self: Box<Self>) -> Vec<Buffer> {
+        self.data
+    }
+}
+
+/// TODO better comment
+/// Each item is encoded as a block of contiguous data
+/// e.g. general compression
+#[derive(Debug)]
+pub struct BlockEncodedDataBlock {
+    pub data: Vec<Buffer>,
+}
+
+impl EncodedDataBlock for BlockEncodedDataBlock {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_box(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+
+    fn into_parts(self: Box<Self>) -> Vec<Buffer> {
+        self.data
     }
 }
