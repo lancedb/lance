@@ -13,6 +13,8 @@ use lance_encoding::{
 
 use rand::Rng;
 
+const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
+
 const PRIMITIVE_TYPES: &[DataType] = &[
     DataType::Date32,
     DataType::Date64,
@@ -73,6 +75,7 @@ fn bench_decode(c: &mut Criterion) {
                 lance_schema,
                 &encoding_strategy,
                 1024 * 1024,
+                MAX_PAGE_BYTES,
             ))
             .unwrap();
         let func_name = format!("{:?}", data_type).to_lowercase();
@@ -112,6 +115,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                 lance_schema,
                 &encoding_strategy,
                 1024 * 1024,
+                MAX_PAGE_BYTES,
             ))
             .unwrap();
         let func_name = format!("{:?}", data_type).to_lowercase();
@@ -168,6 +172,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
             lance_schema,
             &encoding_strategy,
             1024 * 1024,
+            MAX_PAGE_BYTES,
         ))
         .unwrap();
     let func_name = format!("{:?}", data_type).to_lowercase();
@@ -237,6 +242,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
             lance_schema,
             &encoding_strategy,
             1024 * 1024,
+            MAX_PAGE_BYTES,
         ))
         .unwrap();
 

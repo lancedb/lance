@@ -496,8 +496,14 @@ impl ZoneMapsFieldEncoder {
         let zone_maps =
             RecordBatch::try_new(Arc::new(zone_map_schema), vec![mins, maxes, null_counts])?;
         let encoding_strategy = CoreFieldEncodingStrategy::default();
-        let encoded_zone_maps =
-            encode_batch(&zone_maps, Arc::new(schema), &encoding_strategy, u64::MAX).await?;
+        let encoded_zone_maps = encode_batch(
+            &zone_maps,
+            Arc::new(schema),
+            &encoding_strategy,
+            u64::MAX,
+            u64::MAX,
+        )
+        .await?;
         let zone_maps_buffer = encoded_zone_maps.try_to_mini_lance()?;
 
         Ok(EncodedBuffer {

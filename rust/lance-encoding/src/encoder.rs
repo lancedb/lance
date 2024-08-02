@@ -561,6 +561,7 @@ pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
         field: &Field,
         column_index: &mut ColumnIndexSequence,
         cache_bytes_per_column: u64,
+        max_page_bytes: u64,
         keep_original_array: bool,
         config: &HashMap<String, String>,
     ) -> Result<Box<dyn FieldEncoder>>;
@@ -626,6 +627,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
         field: &Field,
         column_index: &mut ColumnIndexSequence,
         cache_bytes_per_column: u64,
+        max_page_bytes: u64,
         keep_original_array: bool,
         _config: &HashMap<String, String>,
     ) -> Result<Box<dyn FieldEncoder>> {
@@ -633,6 +635,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
         if Self::is_primitive_type(&data_type) {
             Ok(Box::new(PrimitiveFieldEncoder::try_new(
                 cache_bytes_per_column,
+                max_page_bytes,
                 keep_original_array,
                 self.array_encoding_strategy.clone(),
                 column_index.next_column_index(field.id),
@@ -647,6 +650,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                         &field.children[0],
                         column_index,
                         cache_bytes_per_column,
+                        max_page_bytes,
                         keep_original_array,
                         child.metadata(),
                     )?;
@@ -674,6 +678,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                     {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             cache_bytes_per_column,
+                            max_page_bytes,
                             keep_original_array,
                             self.array_encoding_strategy.clone(),
                             column_index.next_column_index(field.id),
@@ -690,6 +695,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                                     field,
                                     column_index,
                                     cache_bytes_per_column,
+                                    max_page_bytes,
                                     keep_original_array,
                                     &field.metadata,
                                 )
@@ -706,6 +712,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                     if Self::is_primitive_type(&value_type) {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             cache_bytes_per_column,
+                            max_page_bytes,
                             keep_original_array,
                             self.array_encoding_strategy.clone(),
                             column_index.next_column_index(field.id),
@@ -738,6 +745,7 @@ impl BatchEncoder {
         schema: &Schema,
         strategy: &dyn FieldEncodingStrategy,
         cache_bytes_per_column: u64,
+        max_page_bytes: u64,
         keep_original_array: bool,
     ) -> Result<Self> {
         let mut col_idx = 0;
@@ -751,6 +759,7 @@ impl BatchEncoder {
                     field,
                     &mut col_idx_sequence,
                     cache_bytes_per_column,
+                    max_page_bytes,
                     keep_original_array,
                     &field.metadata,
                 )?;
@@ -811,6 +820,7 @@ pub async fn encode_batch(
     schema: Arc<Schema>,
     encoding_strategy: &dyn FieldEncodingStrategy,
     cache_bytes_per_column: u64,
+    max_page_bytes: u64,
 ) -> Result<EncodedBatch> {
     let mut data_buffer = BytesMut::new();
     let lance_schema = Schema::try_from(batch.schema().as_ref())?;
@@ -818,6 +828,7 @@ pub async fn encode_batch(
         &lance_schema,
         encoding_strategy,
         cache_bytes_per_column,
+        max_page_bytes,
         true,
     )?;
     let mut page_table = Vec::new();

@@ -28,6 +28,8 @@ use crate::{
     EncodingsIo,
 };
 
+const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
+
 pub(crate) struct SimulatedScheduler {
     data: Bytes,
 }
@@ -167,6 +169,7 @@ pub async fn check_round_trip_encoding_generated(
                     &lance_field,
                     &mut column_index_seq,
                     page_size,
+                    MAX_PAGE_BYTES,
                     true,
                     &encoding_config,
                 )
@@ -256,6 +259,7 @@ pub async fn check_round_trip_encoding_of_data(
                 &lance_field,
                 &mut column_index_seq,
                 page_size,
+                MAX_PAGE_BYTES,
                 true,
                 &encoding_config,
             )

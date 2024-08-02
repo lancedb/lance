@@ -1117,7 +1117,8 @@ pub mod tests {
             &data,
             lance_schema.clone(),
             &CoreFieldEncodingStrategy::default(),
-            4096,
+            /*cache_bytes_per_column=*/ 4096,
+            /*max_page_bytes=*/ 32 * 1024 * 1024,
         )
         .await
         .unwrap();

@@ -24,7 +24,7 @@ use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
-use lance_io::scheduler::ScanScheduler;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
 
@@ -32,6 +32,7 @@ use crate::dataset::fragment::{FileFragment, FragmentReader};
 use crate::dataset::scanner::DEFAULT_FRAGMENT_READAHEAD;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
+use crate::utils::default_deadlock_prevention_timeout;
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -92,6 +93,7 @@ impl LanceStream {
         read_size: usize,
         batch_readahead: usize,
         fragment_readahead: Option<usize>,
+        io_buffer_size: u64,
         with_row_id: bool,
         with_row_address: bool,
         with_make_deletions_null: bool,
@@ -112,6 +114,7 @@ impl LanceStream {
                 with_row_id,
                 with_row_address,
                 with_make_deletions_null,
+                io_buffer_size,
             )
         } else {
             Self::try_new_v1(
@@ -139,6 +142,7 @@ impl LanceStream {
         with_row_id: bool,
         with_row_address: bool,
         with_make_deletions_null: bool,
+        io_buffer_size: u64,
     ) -> Result<Self> {
         let project_schema = projection.clone();
         let io_parallelism = dataset.object_store.io_parallelism()?;
@@ -165,7 +169,13 @@ impl LanceStream {
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .collect::<Vec<_>>();
 
-        let scan_scheduler = ScanScheduler::new(dataset.object_store.clone());
+        let scan_scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig {
+                io_buffer_size_bytes: io_buffer_size,
+                deadlock_prevention_timeout: default_deadlock_prevention_timeout(),
+            },
+        );
 
         let batches = stream::iter(file_fragments)
             .map(move |file_fragment| {
@@ -361,6 +371,7 @@ pub struct LanceScanExec {
     read_size: usize,
     batch_readahead: usize,
     fragment_readahead: Option<usize>,
+    io_buffer_size: u64,
     with_row_id: bool,
     with_row_address: bool,
     with_make_deletions_null: bool,
@@ -403,6 +414,7 @@ impl LanceScanExec {
         read_size: usize,
         batch_readahead: usize,
         fragment_readahead: Option<usize>,
+        io_buffer_size: u64,
         with_row_id: bool,
         with_row_address: bool,
         with_make_deletions_null: bool,
@@ -432,6 +444,7 @@ impl LanceScanExec {
             read_size,
             batch_readahead,
             fragment_readahead,
+            io_buffer_size,
             with_row_id,
             with_row_address,
             with_make_deletions_null,
@@ -485,6 +498,7 @@ impl ExecutionPlan for LanceScanExec {
             self.read_size,
             self.batch_readahead,
             self.fragment_readahead,
+            self.io_buffer_size,
             self.with_row_id,
             self.with_row_address,
             self.with_make_deletions_null,

@@ -213,6 +213,7 @@
 //!    relation to the way the data is stored.
 
 use std::collections::VecDeque;
+use std::sync::Once;
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -224,7 +225,7 @@ use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
-use log::trace;
+use log::{trace, warn};
 use snafu::{location, Location};
 use tokio::sync::mpsc::{self, unbounded_channel};
 
@@ -239,6 +240,9 @@ use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructSched
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
 use crate::{BufferScheduler, EncodingsIo};
+
+// If users are getting batches over 10MiB large then it's time to reduce the batch size
+const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 
 /// Metadata describing a page in a file
 ///
@@ -1041,6 +1045,8 @@ pub struct ReadBatchTask {
     pub num_rows: u32,
 }
 
+static EMITTED_BATCH_SIZE_WARNING: Once = Once::new();
+
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct BatchDecodeStream {
     context: DecoderContext,
@@ -1167,7 +1173,17 @@ impl BatchDecodeStream {
     fn task_to_batch(task: NextDecodeTask) -> Result<RecordBatch> {
         let struct_arr = task.task.decode();
         match struct_arr {
-            Ok(struct_arr) => Ok(RecordBatch::from(struct_arr.as_struct())),
+            Ok(struct_arr) => {
+                let batch = RecordBatch::from(struct_arr.as_struct());
+                let size_bytes = batch.get_array_memory_size() as u64;
+                if size_bytes > BATCH_SIZE_BYTES_WARNING {
+                    EMITTED_BATCH_SIZE_WARNING.call_once(|| {
+                        let size_mb = size_bytes / 1024 / 1024;
+                        warn!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
+                    });
+                }
+                Ok(batch)
+            }
             Err(e) => {
                 let e = Error::Internal {
                     message: format!("Error decoding batch: {}", e),

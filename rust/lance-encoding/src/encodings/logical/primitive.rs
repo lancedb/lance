@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt::Debug, ops::Range, sync::Arc};
+use std::{fmt::Debug, ops::Range, sync::Arc, vec};
 
 use arrow_array::{make_array, ArrayRef};
+use arrow_buffer::bit_util;
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::deepcopy::deep_copy_array;
@@ -387,11 +388,13 @@ pub struct PrimitiveFieldEncoder {
     array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
     column_index: u32,
     field: Field,
+    max_page_bytes: u64,
 }
 
 impl PrimitiveFieldEncoder {
     pub fn try_new(
         cache_bytes: u64,
+        max_page_bytes: u64,
         keep_original_array: bool,
         array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
         column_index: u32,
@@ -404,13 +407,13 @@ impl PrimitiveFieldEncoder {
                 keep_original_array,
             ),
             column_index,
+            max_page_bytes,
             array_encoding_strategy,
             field,
         })
     }
 
-    // Creates an encode task, consuming all buffered data
-    fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<EncodeTask> {
+    fn create_encode_task(&mut self, arrays: Vec<ArrayRef>) -> Result<EncodeTask> {
         let encoder = self
             .array_encoding_strategy
             .create_array_encoder(&arrays, &self.field)?;
@@ -429,13 +432,48 @@ impl PrimitiveFieldEncoder {
         .map(|res_res| res_res.unwrap())
         .boxed())
     }
+
+    // Creates an encode task, consuming all buffered data
+    fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<Vec<EncodeTask>> {
+        if arrays.len() == 1 {
+            let array = arrays.into_iter().next().unwrap();
+            let size_bytes = array.get_buffer_memory_size();
+            let num_parts = bit_util::ceil(size_bytes, self.max_page_bytes as usize);
+            if num_parts == 1 {
+                // One part and it fits in a page
+                Ok(vec![self.create_encode_task(vec![array])?])
+            } else {
+                // One part and it needs to be sliced into multiple pages
+
+                // This isn't perfect (items in the array might not all have the same size)
+                // but it's a reasonable stab for now)
+                let mut tasks = Vec::with_capacity(num_parts);
+                let mut offset = 0;
+                let part_size = bit_util::ceil(array.len(), num_parts);
+                for _ in 0..num_parts {
+                    let avail = array.len() - part_size;
+                    let chunk_size = avail.min(part_size);
+                    let part = array.slice(offset, chunk_size);
+                    let task = self.create_encode_task(vec![part])?;
+                    tasks.push(task);
+                    offset += chunk_size;
+                }
+                Ok(tasks)
+            }
+        } else {
+            // Multiple parts that (presumably) all fit in a page
+            //
+            // TODO: Could check here if there are any jumbo parts in the mix that need splitting
+            Ok(vec![self.create_encode_task(arrays)?])
+        }
+    }
 }
 
 impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.insert(array) {
-            Ok(vec![self.do_flush(arrays)?])
+            Ok(self.do_flush(arrays)?)
         } else {
             Ok(vec![])
         }
@@ -444,7 +482,7 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.flush() {
-            Ok(vec![self.do_flush(arrays)?])
+            Ok(self.do_flush(arrays)?)
         } else {
             Ok(vec![])
         }

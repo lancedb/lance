@@ -171,6 +171,7 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
         field: &lance_core::datatypes::Field,
         column_index: &mut ColumnIndexSequence,
         cache_bytes_per_column: u64,
+        max_page_bytes: u64,
         keep_original_array: bool,
         config: &std::collections::HashMap<String, String>,
     ) -> lance_core::Result<Box<dyn lance_encoding::encoder::FieldEncoder>> {
@@ -187,6 +188,7 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
                 field,
                 column_index,
                 cache_bytes_per_column,
+                max_page_bytes,
                 keep_original_array,
                 config,
             )?;
@@ -201,6 +203,7 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
                 field,
                 column_index,
                 cache_bytes_per_column,
+                max_page_bytes,
                 keep_original_array,
                 config,
             )
