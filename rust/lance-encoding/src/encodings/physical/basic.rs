@@ -219,7 +219,9 @@ impl ArrayEncoder for BasicEncoder {
 
             let validity_buffer_index = *buffer_index;
             *buffer_index += 1;
-            let bitmap_data = BitmapBufferEncoder::default().encode(&validity_as_arrays)?;
+            let bitmap_data = BitmapBufferEncoder::default().encode(&validity_as_arrays, *buffer_index)?;
+            let validity_encoding = bitmap_data.array_encoding().as_ref().clone();
+            /*
             let validity_encoding = Box::new(pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
                     bits_per_value: 1,
@@ -230,10 +232,11 @@ impl ArrayEncoder for BasicEncoder {
                     compression: None,
                 })),
             });
+            */
 
             let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
             let encoding = pb::nullable::Nullability::SomeNulls(Box::new(pb::nullable::SomeNull {
-                validity: Some(validity_encoding),
+                validity: Some(Box::new(validity_encoding)),
                 values: Some(Box::new(arr_encoding.encoding)),
             }));
 

@@ -20,6 +20,7 @@ use lance_core::{Error, Result};
 use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, EncodedDataBlock, FixedWidthDataBlock, FixedWidthEncodedDataBlock};
 use crate::encoder::EncodedBufferMeta;
+use crate::format::pb;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{BufferEncoder, EncodedBuffer},
@@ -65,7 +66,7 @@ impl BitpackingBufferEncoder {
 }
 
 impl BufferEncoder for BitpackingBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>> {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: u32) -> Result<Box<dyn EncodedDataBlock>> {
         // calculate the total number of bytes we need to allocate for the destination.
         // this will be the number of items in the source array times the number of bits.
         let count_items = arrays.iter().map(|arr| arr.len()).sum::<usize>();
@@ -83,14 +84,25 @@ impl BufferEncoder for BitpackingBufferEncoder {
                 &mut dst_offset,
             )?;
         }
-
+        let data_type = arrays[0].data_type();
 
         Ok(Box::new(FixedWidthEncodedDataBlock {
+            encoding: Arc::new(pb::ArrayEncoding {
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::Bitpacked(
+                pb::Bitpacked {
+                    compressed_bits_per_value: self.num_bits,
+                    uncompressed_bits_per_value: ((data_type.byte_width() * 8) as u64),
+                    buffer: Some(pb::Buffer {
+                        buffer_index: buffer_index,
+                        buffer_type: pb::buffer::BufferType::Page as i32
+                    })
+                }
+            ))
+            }),
             data: vec![dst_buffer.into()],
             bits_per_value: self.num_bits,
         }))
         /*
-        let data_type = arrays[0].data_type();
         Ok((
             EncodedBuffer {
                 parts: vec![dst_buffer.into()],

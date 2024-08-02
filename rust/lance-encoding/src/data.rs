@@ -4,6 +4,7 @@
 //! Data layouts to represent encoded data in a sub-Arrow format
 
 use std::any::Any;
+use std::sync::Arc;
 
 use arrow::array::{ArrayData, ArrayDataBuilder};
 use arrow_buffer::Buffer;
@@ -12,7 +13,7 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
-use crate::{buffer::LanceBuffer, encoder::EncodedArray};
+use crate::{buffer::LanceBuffer, encoder::EncodedArray, format::pb};
 
 /// A DataBlock is a collection of buffers that represents an "array" of data in very generic terms
 ///
@@ -394,6 +395,8 @@ pub trait EncodedDataBlock: Any + std::fmt::Debug + Send + Sync {
     fn as_any_box(self: Box<Self>) -> Box<dyn Any>;
 
     fn into_parts(self: Box<Self>) -> Vec<Buffer>;
+
+    fn array_encoding(&self) -> Arc<pb::ArrayEncoding>;
 }
 
 pub trait EncodedDataBlockExt {
@@ -417,9 +420,11 @@ impl EncodedDataBlockExt for Box<dyn EncodedDataBlock> {
 /// e.g. basic flat, bitpacked, bitmap, FSL
 #[derive(Debug)]
 pub struct FixedWidthEncodedDataBlock {
-  pub data: Vec<Buffer>, // TODO change this to data block
+    pub encoding: Arc<pb::ArrayEncoding>,
 
-  pub bits_per_value: u64,
+    pub data: Vec<Buffer>, // TODO change this to data block?
+
+    pub bits_per_value: u64,
 }
 
 impl EncodedDataBlock for FixedWidthEncodedDataBlock {
@@ -434,6 +439,10 @@ impl EncodedDataBlock for FixedWidthEncodedDataBlock {
     fn into_parts(self: Box<Self>) -> Vec<Buffer> {
         self.data
     }
+
+    fn array_encoding(&self) -> Arc<pb::ArrayEncoding> {
+        self.encoding.clone()
+    }
 }
 
 /// TODO better comment
@@ -441,6 +450,8 @@ impl EncodedDataBlock for FixedWidthEncodedDataBlock {
 /// e.g. general compression
 #[derive(Debug)]
 pub struct BlockEncodedDataBlock {
+    pub encoding: Arc<pb::ArrayEncoding>,
+
     pub data: Vec<Buffer>,
 }
 
@@ -455,5 +466,9 @@ impl EncodedDataBlock for BlockEncodedDataBlock {
 
     fn into_parts(self: Box<Self>) -> Vec<Buffer> {
         self.data
+    }
+
+    fn array_encoding(&self) -> Arc<pb::ArrayEncoding> {
+        self.encoding.clone()
     }
 }

@@ -253,15 +253,16 @@ impl ValueEncoder {
 }
 
 impl ArrayEncoder for ValueEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<Box<dyn EncodedDataBlock>> {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let index = *buffer_index;
         *buffer_index += 1;
 
         let buffer_encoder = self
             .buffer_encoding_strategy
             .create_buffer_encoder(arrays)?;
-        let (encoded_buffer, encoded_buffer_meta) = buffer_encoder.encode(arrays)?;
+        let data = buffer_encoder.encode(arrays, *buffer_index)?;
 
+        /*
         let array_encoding =
             if let Some(bitpacked_bits_per_value) = encoded_buffer_meta.bitpacked_bits_per_value {
                 pb::array_encoding::ArrayEncoding::Bitpacked(pb::Bitpacked {
@@ -287,16 +288,17 @@ impl ArrayEncoder for ValueEncoder {
                 })
             };
 
+        */
+
+        let array_encoding = data.array_encoding().as_ref().clone();
         let array_bufs = vec![EncodedArrayBuffer {
-            parts: encoded_buffer.parts,
+            parts: data.into_parts(),
             index,
         }];
 
         Ok(EncodedArray {
             buffers: array_bufs,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(array_encoding),
-            },
+            encoding: array_encoding,
         })
     }
 }

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::io::{Cursor, Write};
+use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, ArrayRef};
 use arrow_buffer::{BooleanBufferBuilder, Buffer};
@@ -12,7 +13,7 @@ use lance_core::Result;
 
 use crate::{
     data::{BlockEncodedDataBlock, EncodedDataBlock, FixedWidthEncodedDataBlock},
-    encoder::{BufferEncoder, EncodedBuffer, EncodedBufferMeta},
+    encoder::{BufferEncoder, EncodedBuffer, EncodedBufferMeta}, format::pb,
 };
 
 use super::value::CompressionScheme;
@@ -21,15 +22,17 @@ use super::value::CompressionScheme;
 pub struct FlatBufferEncoder {}
 
 impl BufferEncoder for FlatBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>> {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: u32) -> Result<Box<dyn EncodedDataBlock>> {
         let parts = arrays
             .iter()
             .map(|arr| arr.to_data().buffers()[0].clone())
             .collect::<Vec<_>>();
         let data_type = arrays[0].data_type();
+        let bits_per_value = (data_type.byte_width() * 8) as u64; 
         Ok(Box::new(FixedWidthEncodedDataBlock {
+            encoding: Arc::new(flat_buffer_encoding(bits_per_value, None, buffer_index)),
             data: parts,
-            bits_per_value: (data_type.byte_width() * 8) as u64,
+            bits_per_value,
         }))
         /*
         Ok((
@@ -103,7 +106,7 @@ impl CompressedBufferEncoder {
 }
 
 impl BufferEncoder for CompressedBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>> {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: u32) -> Result<Box<dyn EncodedDataBlock>> {
         let mut parts = Vec::with_capacity(arrays.len());
         for arr in arrays {
             let buffer = arr.to_data().buffers()[0].clone();
@@ -115,12 +118,14 @@ impl BufferEncoder for CompressedBufferEncoder {
         }
 
 
+        let data_type = arrays[0].data_type();
+        let bits_per_value = (data_type.byte_width() * 8) as u64;
         Ok(Box::new(BlockEncodedDataBlock {
+            encoding: Arc::new(flat_buffer_encoding(bits_per_value, Some(CompressionScheme::Zstd), buffer_index)),
             data: parts,
         }))
 
         /*
-        let data_type = arrays[0].data_type();
         Ok((
             EncodedBuffer { parts },
             EncodedBufferMeta {
@@ -138,7 +143,7 @@ impl BufferEncoder for CompressedBufferEncoder {
 pub struct BitmapBufferEncoder {}
 
 impl BufferEncoder for BitmapBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>> {
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: u32) -> Result<Box<dyn EncodedDataBlock>> {
         debug_assert!(arrays
             .iter()
             .all(|arr| *arr.data_type() == DataType::Boolean));
@@ -161,6 +166,7 @@ impl BufferEncoder for BitmapBufferEncoder {
         let parts = vec![buffer];
         
         Ok(Box::new(FixedWidthEncodedDataBlock {
+            encoding: Arc::new(flat_buffer_encoding(1, None, buffer_index)),
             bits_per_value: 1,
             data: parts,
         }))
@@ -176,5 +182,25 @@ impl BufferEncoder for BitmapBufferEncoder {
             },
         ))
         */
+    }
+}
+
+// helper function for creating flat buffer encoder
+fn flat_buffer_encoding(
+    bits_per_value: u64,
+    compression: Option<CompressionScheme>,
+    buffer_index: u32,
+) -> pb::ArrayEncoding {
+    pb::ArrayEncoding{
+        array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
+            bits_per_value,
+            buffer: Some(pb::Buffer {
+                buffer_index,
+                buffer_type: pb::buffer::BufferType::Page as i32,
+            }),
+            compression: compression.map(|c| pb::Compression {
+                scheme: c.to_string()
+            })
+        }))
     }
 }

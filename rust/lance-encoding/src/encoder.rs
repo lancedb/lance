@@ -126,7 +126,7 @@ pub trait BufferEncoder: std::fmt::Debug + Send + Sync {
     /// This method may receive multiple chunks and should encode them all into
     /// a single EncodedBuffer (though that buffer may have multiple parts).  All
     /// parts will be written to the file as one contiguous block.
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<Box<dyn EncodedDataBlock>>;
+    fn encode(&self, arrays: &[ArrayRef], buffer_index: u32) -> Result<Box<dyn EncodedDataBlock>>;
 }
 
 pub struct EncodedBufferMeta {
