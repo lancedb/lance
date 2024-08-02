@@ -116,8 +116,10 @@ impl IndexReader for FileReader {
 
 #[async_trait]
 impl IndexReader for v2::reader::FileReader {
-    async fn read_record_batch(&self, _offset: u32) -> Result<RecordBatch> {
-        unimplemented!("v2 format removed the batch concept")
+    async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
+        let start = offset as usize * 4096;
+        let end = min(start + 4096, self.num_rows() as usize);
+        self.read_range(start..end).await
     }
 
     async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
@@ -134,8 +136,10 @@ impl IndexReader for v2::reader::FileReader {
         Ok(batches[0].clone())
     }
 
+    // V2 format has removed the row group concept,
+    // so here we assume each batch is with 4096 rows.
     async fn num_batches(&self) -> u32 {
-        unimplemented!("v2 format removed the batch concept")
+        (self.num_rows() as u32).div_ceil(4096)
     }
 
     fn num_rows(&self) -> usize {
