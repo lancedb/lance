@@ -14,6 +14,7 @@ use futures::TryStreamExt;
 use lance_core::{cache::FileMetadataCache, Error, Result};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2;
+use lance_file::writer::FileWriterOptions;
 use lance_file::{
     reader::FileReader,
     writer::{FileWriter, ManifestProvider},
@@ -21,6 +22,7 @@ use lance_file::{
 use lance_io::scheduler::ScanScheduler;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::format::SelfDescribingFileReader;
+use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 
 use super::{IndexReader, IndexStore, IndexWriter};
@@ -36,6 +38,7 @@ pub struct LanceIndexStore {
     index_dir: Path,
     metadata_cache: Option<FileMetadataCache>,
     scheduler: Arc<ScanScheduler>,
+    use_legacy_format: bool,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -60,7 +63,13 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
+            use_legacy_format: false,
         }
+    }
+
+    pub fn with_legacy_format(mut self, use_legacy_format: bool) -> Self {
+        self.use_legacy_format = use_legacy_format;
+        self
     }
 }
 
@@ -116,10 +125,8 @@ impl IndexReader for FileReader {
 
 #[async_trait]
 impl IndexReader for v2::reader::FileReader {
-    async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
-        let start = offset as usize * 4096;
-        let end = min(start + 4096, self.num_rows() as usize);
-        self.read_range(start..end).await
+    async fn read_record_batch(&self, _offset: u32) -> Result<RecordBatch> {
+        unimplemented!("v2 format has no concept of row groups")
     }
 
     async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
@@ -139,7 +146,7 @@ impl IndexReader for v2::reader::FileReader {
     // V2 format has removed the row group concept,
     // so here we assume each batch is with 4096 rows.
     async fn num_batches(&self) -> u32 {
-        (self.num_rows() as u32).div_ceil(4096)
+        unimplemented!("v2 format has no concept of row groups")
     }
 
     fn num_rows(&self) -> usize {
@@ -164,13 +171,24 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<Box<dyn IndexWriter>> {
         let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
-        let writer = self.object_store.create(&path).await?;
-        let writer = v2::writer::FileWriter::try_new(
-            writer,
-            schema,
-            v2::writer::FileWriterOptions::default(),
-        )?;
-        Ok(Box::new(writer))
+        if self.use_legacy_format {
+            let writer = FileWriter::<ManifestDescribing>::try_new(
+                &self.object_store,
+                &path,
+                schema,
+                &FileWriterOptions::default(),
+            )
+            .await?;
+            Ok(Box::new(writer))
+        } else {
+            let writer = self.object_store.create(&path).await?;
+            let writer = v2::writer::FileWriter::try_new(
+                writer,
+                schema,
+                v2::writer::FileWriterOptions::default(),
+            )?;
+            Ok(Box::new(writer))
+        }
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
@@ -270,6 +288,15 @@ mod tests {
         ))
     }
 
+    fn legacy_test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
+        let test_path: &Path = tempdir.path();
+        let (object_store, test_path) =
+            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
+        Arc::new(
+            LanceIndexStore::new(object_store, test_path.to_owned(), None).with_legacy_format(true),
+        )
+    }
+
     struct MockTrainingSource {
         data: SendableRecordBatchStream,
     }
@@ -308,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic_btree() {
         let tempdir = tempdir().unwrap();
-        let index_store = test_store(&tempdir);
+        let index_store = legacy_test_store(&tempdir);
         let data = gen()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
@@ -348,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn test_btree_update() {
         let index_dir = tempdir().unwrap();
-        let index_store = test_store(&index_dir);
+        let index_store = legacy_test_store(&index_dir);
         let data = gen()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
@@ -398,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn test_btree_with_gaps() {
         let tempdir = tempdir().unwrap();
-        let index_store = test_store(&tempdir);
+        let index_store = legacy_test_store(&tempdir);
         let batch_one = gen()
             .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
@@ -623,7 +650,7 @@ mod tests {
             // DataType::Duration(TimeUnit::Nanosecond),
         ] {
             let tempdir = tempdir().unwrap();
-            let index_store = test_store(&tempdir);
+            let index_store = legacy_test_store(&tempdir);
             let data: RecordBatch = gen()
                 .col("values", array::rand_type(data_type))
                 .col("row_ids", array::step::<UInt64Type>())
@@ -681,7 +708,7 @@ mod tests {
     #[tokio::test]
     async fn btree_reject_nan() {
         let tempdir = tempdir().unwrap();
-        let index_store = test_store(&tempdir);
+        let index_store = legacy_test_store(&tempdir);
         let batch = gen()
             .col("values", array::cycle::<Float32Type>(vec![0.0, f32::NAN]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1]))
@@ -707,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn btree_entire_null_page() {
         let tempdir = tempdir().unwrap();
-        let index_store = test_store(&tempdir);
+        let index_store = legacy_test_store(&tempdir);
         let batch = gen()
             .col(
                 "values",
