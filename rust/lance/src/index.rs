@@ -26,8 +26,10 @@ use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
 use lance_index::{
-    pb, scalar::ScalarIndexParams, vector::VectorIndex, DatasetIndexExt, Index, IndexType,
-    INDEX_FILE_NAME,
+    pb,
+    scalar::{ScalarIndexParams, LANCE_SCALAR_INDEX},
+    vector::VectorIndex,
+    DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME,
 };
 use lance_io::scheduler::ScanScheduler;
 use lance_io::traits::Reader;
@@ -59,7 +61,7 @@ use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
 
 use self::append::merge_indices;
-use self::scalar::{build_scalar_index, LANCE_SCALAR_INDEX};
+use self::scalar::build_scalar_index;
 use self::vector::{build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX};
 
 /// Builds index.

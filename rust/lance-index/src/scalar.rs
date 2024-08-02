@@ -31,7 +31,7 @@ pub mod inverted;
 pub mod label_list;
 pub mod lance_format;
 
-const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
+pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
 #[derive(Debug)]
 pub enum ScalarIndexType {

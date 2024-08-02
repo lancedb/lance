@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::scalar::{
     bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
@@ -22,14 +23,10 @@ use lance_index::scalar::{
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_core::{Error, Result};
-
 use crate::{
     dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
     Dataset,
 };
-
-pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
 struct TrainingRequest {
     dataset: Arc<Dataset>,
