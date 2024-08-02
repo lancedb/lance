@@ -4,14 +4,17 @@
 use std::sync::Arc;
 
 use arrow::array::ArrayData;
-use arrow::datatypes::{ArrowPrimitiveType, UInt16Type, UInt32Type, UInt64Type, UInt8Type};
+use arrow::datatypes::{
+    ArrowPrimitiveType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
+    UInt64Type, UInt8Type,
+};
 use arrow::util::bit_util::ceil;
 use arrow_array::{cast::AsArray, Array, ArrayRef, PrimitiveArray};
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
 use log::trace;
-use num_traits::{AsPrimitive, PrimInt};
+use num_traits::{AsPrimitive, PrimInt, ToPrimitive};
 use snafu::{location, Location};
 
 use lance_arrow::DataTypeExt;
@@ -19,7 +22,7 @@ use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock};
-use crate::encoder::EncodedBufferMeta;
+use crate::encoder::{BitpackingBufferMeta, EncodedBufferMeta};
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{BufferEncoder, EncodedBuffer},
@@ -33,7 +36,11 @@ pub fn num_compressed_bits(arr: ArrayRef) -> Option<u64> {
         DataType::UInt16 => num_bits_for_type::<UInt16Type>(arr.as_primitive()),
         DataType::UInt32 => num_bits_for_type::<UInt32Type>(arr.as_primitive()),
         DataType::UInt64 => num_bits_for_type::<UInt64Type>(arr.as_primitive()),
-        // TODO -- eventually we could support signed types as well
+        DataType::Int8 => num_bits_for_signed_type::<Int8Type>(arr.as_primitive()),
+        DataType::Int16 => num_bits_for_signed_type::<Int16Type>(arr.as_primitive()),
+        DataType::Int32 => num_bits_for_signed_type::<Int32Type>(arr.as_primitive()),
+        DataType::Int64 => num_bits_for_signed_type::<Int64Type>(arr.as_primitive()),
+        // TODO -- eventually we could support temporal types as well
         _ => None,
     }
 }
@@ -53,14 +60,47 @@ where
     num_bits.map(|num_bits| num_bits.max(1))
 }
 
+/// determine the minimum number of bits that can be used to represent
+/// an array of signed values. It includes all the significant bits for
+/// the value + plus 1 bit to represent the sign
+fn num_bits_for_signed_type<T>(arr: &PrimitiveArray<T>) -> Option<u64>
+where
+    T: ArrowPrimitiveType,
+    T::Native: PrimInt + AsPrimitive<i64>,
+{
+    let mut min_leading_bits: Option<u64> = None;
+    for val in arr.iter() {
+        if val.is_none() {
+            continue;
+        }
+        let val = val.unwrap();
+        if min_leading_bits.is_none() {
+            min_leading_bits = Some(u64::MAX);
+        }
+
+        if val.to_i64().unwrap() < 0i64 {
+            min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_ones() as u64));
+        } else {
+            min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_zeros() as u64));
+        }
+    }
+
+    return min_leading_bits
+        // +1 added here for the sign bit
+        .map(|leading_bits| arr.data_type().byte_width() as u64 * 8 - leading_bits + 1);
+}
 #[derive(Debug)]
 pub struct BitpackingBufferEncoder {
     num_bits: u64,
+    signed_type: bool,
 }
 
 impl BitpackingBufferEncoder {
-    pub fn new(num_bits: u64) -> Self {
-        Self { num_bits }
+    pub fn new(num_bits: u64, signed_type: bool) -> Self {
+        Self {
+            num_bits,
+            signed_type,
+        }
     }
 }
 
@@ -91,7 +131,10 @@ impl BufferEncoder for BitpackingBufferEncoder {
             },
             EncodedBufferMeta {
                 bits_per_value: (data_type.byte_width() * 8) as u64,
-                bitpacked_bits_per_value: Some(self.num_bits),
+                bitpacking: Some(BitpackingBufferMeta {
+                    bits_per_value: self.num_bits,
+                    signed: self.signed_type,
+                }),
                 compression_scheme: None,
             },
         ))
@@ -106,7 +149,14 @@ fn pack_array(
     dst_offset: &mut u8,
 ) -> Result<()> {
     match arr.data_type() {
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+        DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64 => {
             pack_buffers(
                 arr.to_data(),
                 num_bits,
@@ -215,14 +265,21 @@ pub struct BitpackedScheduler {
     bits_per_value: u64,
     uncompressed_bits_per_value: u64,
     buffer_offset: u64,
+    signed: bool,
 }
 
 impl BitpackedScheduler {
-    pub fn new(bits_per_value: u64, uncompressed_bits_per_value: u64, buffer_offset: u64) -> Self {
+    pub fn new(
+        bits_per_value: u64,
+        uncompressed_bits_per_value: u64,
+        buffer_offset: u64,
+        signed: bool,
+    ) -> Self {
         Self {
             bits_per_value,
             uncompressed_bits_per_value,
             buffer_offset,
+            signed,
         }
     }
 }
@@ -277,6 +334,7 @@ impl PageScheduler for BitpackedScheduler {
 
         let bits_per_value = self.bits_per_value;
         let uncompressed_bits_per_value = self.uncompressed_bits_per_value;
+        let signed = self.signed;
         async move {
             let bytes = bytes.await?;
             Ok(Box::new(BitpackedPageDecoder {
@@ -284,6 +342,7 @@ impl PageScheduler for BitpackedScheduler {
                 buffer_bit_end_offsets,
                 bits_per_value,
                 uncompressed_bits_per_value,
+                signed,
                 data: bytes,
             }) as Box<dyn PrimitivePageDecoder>)
         }
@@ -307,6 +366,9 @@ struct BitpackedPageDecoder {
 
     // number of bits in the uncompressed value. E.g. this will be 32 for u32
     uncompressed_bits_per_value: u64,
+
+    // whether or not to use the msb as a sign bit during decoding
+    signed: bool,
 
     data: Vec<Bytes>,
 }
@@ -359,6 +421,13 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                 // the offset within the current destination byte to write to
                 let mut dst_offset = 0;
 
+                let is_negative = is_encoded_item_negative(
+                    src,
+                    src_idx,
+                    src_offset,
+                    self.bits_per_value as usize,
+                );
+
                 while src_bits_written < self.bits_per_value {
                     // write bits from current source byte into destination
                     dest[dst_idx] += (curr_src >> src_offset) << dst_offset;
@@ -385,6 +454,16 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                     }
                 }
 
+                // if the type is signed, need to pad out the rest of the byte with 1s
+                let mut negative_padded_current_byte = false;
+                if self.signed && is_negative && dst_offset > 0 {
+                    negative_padded_current_byte = true;
+                    while dst_offset < 8 {
+                        dest[dst_idx] |= 1 << dst_offset;
+                        dst_offset += 1;
+                    }
+                }
+
                 // advance destination offset to the next location
                 // note that we don't need to do this if we wrote the full number of bits
                 // because source index would have been advanced by the inner loop above
@@ -407,7 +486,20 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                     if self.bits_per_value % 8 == 0 {
                         to_next_byte = 0;
                     }
-                    dst_idx += (byte_len - partial_bytes_written + to_next_byte) as usize;
+                    let next_dst_idx =
+                        dst_idx + (byte_len - partial_bytes_written + to_next_byte) as usize;
+
+                    // pad remaining bytes with 1 for negative signed numbers
+                    if self.signed && is_negative {
+                        if !negative_padded_current_byte {
+                            dest[dst_idx] = 0xFF;
+                        }
+                        for i in dest.iter_mut().take(next_dst_idx).skip(dst_idx + 1) {
+                            *i = 0xFF;
+                        }
+                    }
+
+                    dst_idx = next_dst_idx;
                 }
 
                 // If we've reached the last byte, there may be some extra bits from the
@@ -426,6 +518,22 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
             num_values: num_rows,
         }))
     }
+}
+
+fn is_encoded_item_negative(src: &Bytes, src_idx: usize, src_offset: u64, num_bits: usize) -> bool {
+    let mut last_byte_idx = src_idx + ((src_offset as usize + num_bits) / 8);
+    let shift_amount = (src_offset as usize + num_bits) % 8;
+    let shift_amount = if shift_amount == 0 {
+        last_byte_idx -= 1;
+        7
+    } else {
+        shift_amount - 1
+    };
+    let last_byte = src[last_byte_idx];
+    let sign_bit_mask = 1 << shift_amount;
+    let sign_bit = last_byte & sign_bit_mask;
+
+    sign_bit > 0
 }
 
 #[derive(Debug, PartialEq)]
@@ -504,7 +612,7 @@ pub mod test {
 
     use arrow_array::{
         types::{UInt16Type, UInt8Type},
-        Float64Array,
+        Float64Array, Int32Array,
     };
 
     use lance_datagen::{array::fill, gen, ArrayGenerator, ArrayGeneratorExt, RowCount};
@@ -589,6 +697,15 @@ pub mod test {
         let arr = Float64Array::from_iter_values(vec![0.1, 0.2, 0.3]);
         let result = num_compressed_bits(Arc::new(arr));
         assert_eq!(None, result);
+    }
+
+    #[test]
+    fn test_num_compressed_bits_signed_types() {
+        let values = Int32Array::from(vec![1, 2, -7]);
+        let arr = Arc::new(values);
+
+        let result = num_compressed_bits(arr);
+        assert_eq!(Some(4), result)
     }
 
     #[test]

@@ -155,7 +155,7 @@ class LanceDataset(pa.dataset.Dataset):
     def __init__(
         self,
         uri: Union[str, Path],
-        version: Optional[int] = None,
+        version: Optional[int | str] = None,
         block_size: Optional[int] = None,
         index_cache_size: Optional[int] = None,
         metadata_cache_size: Optional[int] = None,

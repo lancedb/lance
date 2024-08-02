@@ -283,8 +283,9 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
     fn new(
+        py: Python,
         uri: String,
-        version: Option<u64>,
+        version: Option<PyObject>,
         block_size: Option<usize>,
         index_cache_size: Option<usize>,
         metadata_cache_size: Option<usize>,
@@ -309,7 +310,17 @@ impl Dataset {
 
         let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
         if let Some(ver) = version {
-            builder = builder.with_version(ver);
+            if let Ok(i) = ver.downcast::<PyInt>(py) {
+                let v: u64 = i.extract()?;
+                builder = builder.with_version(v);
+            } else if let Ok(v) = ver.downcast::<PyString>(py) {
+                let t: &str = v.extract()?;
+                builder = builder.with_tag(t);
+            } else {
+                return Err(PyIOError::new_err(
+                    "version must be an integer or a string.",
+                ));
+            };
         }
         if let Some(storage_options) = storage_options {
             builder = builder.with_storage_options(storage_options);
