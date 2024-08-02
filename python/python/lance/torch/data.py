@@ -6,6 +6,7 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
+import json
 import math
 import warnings
 from pathlib import Path
@@ -30,15 +31,20 @@ __all__ = ["LanceDataset"]
 
 
 def _to_tensor(
-    batch: pa.RecordBatch, *, uint64_as_int64: bool = True
+    batch: pa.RecordBatch,
+    *,
+    uint64_as_int64: bool = True,
+    hf_converter: Optional[dict] = None,
 ) -> Union[dict[str, torch.Tensor], torch.Tensor]:
     """Convert a pyarrow RecordBatch to torch Tensor."""
     ret = {}
+
     for col in batch.schema.names:
         arr: pa.Array = batch[col]
         if pa.types.is_uint64(arr.type) and uint64_as_int64:
             arr = arr.cast(pa.int64())
 
+        tensor: torch.Tensor = None
         if (
             pa.types.is_fixed_size_list(arr.type)
             or isinstance(arr.type, pa.FixedShapeTensorType)
@@ -57,11 +63,15 @@ def _to_tensor(
             or pa.types.is_boolean(arr.type)
         ):
             tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False))
-        else:
+        elif hf_converter is not None:
+            tensor = hf_converter.to_pytorch(col, arr)
+
+        if tensor is None:
             raise ValueError(
                 "Only support FixedSizeList<f16/f32/f64> or "
                 + f"numeric values, got: {arr.type}"
             )
+
         del arr
         ret[col] = tensor
     if len(ret) == 1:
@@ -203,6 +213,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         if to_tensor_fn is None:
             to_tensor_fn = _to_tensor
         self._to_tensor_fn = to_tensor_fn
+        self._hf_converter = None
 
         # As Shared Dataset
         self.rank = rank
@@ -229,6 +240,13 @@ class LanceDataset(torch.utils.data.IterableDataset):
             raise ValueError("`filter` is not supported with `samples`")
 
         self.sampler: Sampler = sampler
+
+        # Dataset with huggingface metadata
+        if (hf_meta := dataset.schema.metadata.get(b"huggingface")) is not None:
+            from ..hf import HuggingFaceConverter
+
+            hf_ds_info = json.loads(hf_meta)
+            self._hf_converter = HuggingFaceConverter(hf_ds_info)
 
         self.cache = cache
         self.cached_ds: Optional[CachedDataset] = None
@@ -266,6 +284,6 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
         for batch in stream:
             if self._to_tensor_fn is not None:
-                batch = self._to_tensor_fn(batch)
+                batch = self._to_tensor_fn(batch, hf_converter=self._hf_converter)
             yield batch
             del batch
