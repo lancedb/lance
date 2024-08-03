@@ -204,7 +204,6 @@ impl ArrayEncoder for BasicEncoder {
                 }
             })
             .fold((0, 0), |acc, val| (acc.0 + val.0, acc.1 + val.1));
-        println!("null_count={} row_count={}", null_count, row_count);
         let (buffers, nullability) = if null_count == 0 {
             let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
             let encoding = pb::nullable::Nullability::NoNulls(Box::new(pb::nullable::NoNull {
