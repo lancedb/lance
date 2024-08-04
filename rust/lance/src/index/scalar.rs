@@ -39,19 +39,19 @@ impl TrainingSource for TrainingRequest {
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
-        self._scan_chunks(chunk_size, true).await
+        self.scan_chunks(chunk_size, true).await
     }
 
     async fn scan_unordered_chunks(
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
-        self._scan_chunks(chunk_size, false).await
+        self.scan_chunks(chunk_size, false).await
     }
 }
 
 impl TrainingRequest {
-    async fn _scan_chunks(
+    async fn scan_chunks(
         self: Box<Self>,
         chunk_size: u32,
         sort: bool,
