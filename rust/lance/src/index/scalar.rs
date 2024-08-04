@@ -54,11 +54,11 @@ impl TrainingRequest {
     async fn _scan_chunks(
         self: Box<Self>,
         chunk_size: u32,
-        order: bool,
+        sort: bool,
     ) -> Result<SendableRecordBatchStream> {
         let mut scan = self.dataset.scan();
 
-        let ordering = match order {
+        let ordering = match sort {
             true => Some(vec![ColumnOrdering::asc_nulls_first(self.column.clone())]),
             false => None,
         };
