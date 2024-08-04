@@ -282,6 +282,13 @@ impl TrainingSource for UnnestTrainingSource {
             source,
         )))
     }
+
+    async fn scan_unordered_chunks(
+        self: Box<Self>,
+        _chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        unimplemented!()
+    }
 }
 
 /// Trains a new label list index

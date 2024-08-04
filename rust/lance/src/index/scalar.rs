@@ -39,21 +39,42 @@ impl TrainingSource for TrainingRequest {
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
+        self._scan_chunks(chunk_size, true).await
+    }
+
+    async fn scan_unordered_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        self._scan_chunks(chunk_size, false).await
+    }
+}
+
+impl TrainingRequest {
+    async fn _scan_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+        order: bool,
+    ) -> Result<SendableRecordBatchStream> {
         let mut scan = self.dataset.scan();
+
+        let ordering = match order {
+            true => Some(vec![ColumnOrdering::asc_nulls_first(self.column.clone())]),
+            false => None,
+        };
+
         let scan = scan
             .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                self.column.clone(),
-            )]))?
+            .order_by(ordering)?
             .project(&[&self.column])?;
 
-        let ordered_batches = scan
+        let batches = scan
             .try_into_dfstream(LanceExecutionOptions {
                 use_spilling: true,
                 ..Default::default()
             })
             .await?;
-        Ok(chunk_concat_stream(ordered_batches, chunk_size as usize))
+        Ok(chunk_concat_stream(batches, chunk_size as usize))
     }
 }
 
