@@ -412,7 +412,8 @@ impl ScanScheduler {
                 }),
             };
             if self.io_submitter.try_send(task, Reverse(priority)).is_err() {
-                panic!("unable to submit I/O because the I/O thread has panic'd");
+                log::debug!("unable to submit I/O because the I/O thread has already closed");
+                break;
             }
         }
     }
