@@ -14,7 +14,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_encoding::encoder::{
     BatchEncoder, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch,
-    EncodedPage, FieldEncoder, FieldEncodingStrategy,
+    EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
 };
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_writer::ObjectWriter;
@@ -237,13 +237,13 @@ impl FileWriter {
             })
         });
 
-        let encoder = BatchEncoder::try_new(
-            &schema,
-            encoding_strategy.as_ref(),
+        let encoding_options = EncodingOptions {
             cache_bytes_per_column,
             max_page_bytes,
             keep_original_array,
-        )?;
+        };
+        let encoder =
+            BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
         self.num_columns = encoder.num_columns();
 
         self.column_writers = encoder.field_encoders;

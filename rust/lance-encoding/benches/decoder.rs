@@ -8,12 +8,10 @@ use arrow_select::take::take;
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance_encoding::{
     decoder::{DecoderMiddlewareChain, FilterExpression},
-    encoder::{encode_batch, CoreFieldEncodingStrategy},
+    encoder::{encode_batch, CoreFieldEncodingStrategy, EncodingOptions},
 };
 
 use rand::Rng;
-
-const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 const PRIMITIVE_TYPES: &[DataType] = &[
     DataType::Date32,
@@ -56,6 +54,12 @@ const PRIMITIVE_TYPES_FOR_FSL: &[DataType] = &[
     DataType::Float64,
 ];
 
+const ENCODING_OPTIONS: EncodingOptions = EncodingOptions {
+    cache_bytes_per_column: 1024 * 1024,
+    max_page_bytes: 32 * 1024 * 1024,
+    keep_original_array: true,
+};
+
 fn bench_decode(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
@@ -74,8 +78,7 @@ fn bench_decode(c: &mut Criterion) {
                 &data,
                 lance_schema,
                 &encoding_strategy,
-                1024 * 1024,
-                MAX_PAGE_BYTES,
+                &ENCODING_OPTIONS,
             ))
             .unwrap();
         let func_name = format!("{:?}", data_type).to_lowercase();
@@ -114,8 +117,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                 &data,
                 lance_schema,
                 &encoding_strategy,
-                1024 * 1024,
-                MAX_PAGE_BYTES,
+                &ENCODING_OPTIONS,
             ))
             .unwrap();
         let func_name = format!("{:?}", data_type).to_lowercase();
@@ -171,8 +173,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
             &data,
             lance_schema,
             &encoding_strategy,
-            1024 * 1024,
-            MAX_PAGE_BYTES,
+            &ENCODING_OPTIONS,
         ))
         .unwrap();
     let func_name = format!("{:?}", data_type).to_lowercase();
@@ -241,8 +242,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
             &data,
             lance_schema,
             &encoding_strategy,
-            1024 * 1024,
-            MAX_PAGE_BYTES,
+            &ENCODING_OPTIONS,
         ))
         .unwrap();
 

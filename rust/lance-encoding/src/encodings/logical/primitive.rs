@@ -18,7 +18,10 @@ use crate::{
         PageInfo, PageScheduler, PrimitivePageDecoder, ScheduledScanLine, SchedulerContext,
         SchedulingJob,
     },
-    encoder::{ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, FieldEncoder},
+    encoder::{
+        ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, EncodingOptions,
+        FieldEncoder,
+    },
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
 
@@ -393,21 +396,19 @@ pub struct PrimitiveFieldEncoder {
 
 impl PrimitiveFieldEncoder {
     pub fn try_new(
-        cache_bytes: u64,
-        max_page_bytes: u64,
-        keep_original_array: bool,
+        options: &EncodingOptions,
         array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
         column_index: u32,
         field: Field,
     ) -> Result<Self> {
         Ok(Self {
             accumulation_queue: AccumulationQueue::new(
-                cache_bytes,
+                options.cache_bytes_per_column,
                 column_index,
-                keep_original_array,
+                options.keep_original_array,
             ),
             column_index,
-            max_page_bytes,
+            max_page_bytes: options.max_page_bytes,
             array_encoding_strategy,
             field,
         })
