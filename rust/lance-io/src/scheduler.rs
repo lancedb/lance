@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use futures::channel::oneshot;
-use futures::stream::BoxStream;
+use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt, TryFutureExt};
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -199,49 +199,71 @@ impl BackpressureThrottle {
 
 struct IoTask {
     reader: Arc<dyn Reader>,
-    backpressure_throttle: Arc<BackpressureThrottle>,
     to_read: Range<u64>,
     when_done: Box<dyn FnOnce((Result<Bytes>, u64)) + Send>,
+    permits_to_realease: u64,
 }
 
 impl IoTask {
+    fn num_bytes(&self) -> u64 {
+        self.to_read.end - self.to_read.start
+    }
+
+    fn set_permits_to_release(&mut self, permits: u64) {
+        self.permits_to_realease = permits;
+    }
+
     async fn run(self) {
-        let num_bytes = self.to_read.end - self.to_read.start;
-        let permits_acquired = self.backpressure_throttle.acquire_permit(num_bytes).await;
         let bytes_fut = self
             .reader
             .get_range(self.to_read.start as usize..self.to_read.end as usize);
         let bytes = bytes_fut.await.map_err(Error::from);
-        (self.when_done)((bytes, permits_acquired));
+        (self.when_done)((bytes, self.permits_to_realease));
     }
-}
-
-fn receiver_to_stream<T: Send + 'static, P: Ord + Send + 'static>(
-    tasks: async_priority_channel::Receiver<T, P>,
-) -> BoxStream<'static, T> {
-    futures::stream::unfold(tasks, |state| async move {
-        match state.recv().await {
-            Ok(val) => Some((val.0, state)),
-            Err(async_priority_channel::RecvError) => None,
-        }
-    })
-    .boxed()
 }
 
 // Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
 // repeats endlessly until the scheduler is destroyed.
 async fn run_io_loop(
     tasks: async_priority_channel::Receiver<IoTask, Reverse<u128>>,
+    backpressure_throttle: Arc<BackpressureThrottle>,
     io_capacity: u32,
 ) {
-    let io_stream = receiver_to_stream(tasks);
-    let tokio_task_stream = io_stream.map(|task| tokio::spawn(task.run()));
-    let mut tokio_task_stream = tokio_task_stream.buffer_unordered(io_capacity as usize);
-    while tokio_task_stream.next().await.is_some() {
-        // We don't actually do anything with the results here, they are sent
-        // via the io tasks's when_done.  Instead we just keep chugging away
-        // indefinitely until the tasks receiver returns none (scheduler has
-        // been shut down)
+    let mut in_process = FuturesUnordered::new();
+
+    // First, prime the queue up to io_capacity
+    for _ in 0..io_capacity {
+        let next_task = tasks.recv().await;
+        match next_task {
+            Ok(task) => {
+                let mut task = task.0;
+                let permits_acquired = backpressure_throttle.acquire_permit(task.num_bytes()).await;
+                task.set_permits_to_release(permits_acquired);
+                let handle = tokio::spawn(task.run());
+                in_process.push(handle);
+            }
+            Err(async_priority_channel::RecvError) => {
+                // The sender has been dropped, we are done
+                return;
+            }
+        }
+    }
+    // Pop the first finished task off the queue and submit another until
+    // we are done
+    loop {
+        let res = in_process.next().await;
+        res.unwrap().unwrap();
+        let next_task = tasks.recv().await;
+        match next_task {
+            Ok(task) => {
+                let handle = tokio::spawn(task.0.run());
+                in_process.push(handle);
+            }
+            Err(async_priority_channel::RecvError) => {
+                // The sender has been dropped, we are done
+                return;
+            }
+        }
     }
 }
 
@@ -319,29 +341,22 @@ impl ScanScheduler {
     /// * object_store - the store to wrap
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
-        // TODO: we don't have any backpressure in place if the compute thread falls
-        // behind.  The scheduler thread will schedule ALL of the I/O and then the
-        // loaded data will eventually pile up.
-        //
-        // We could bound this channel but that wouldn't help.  If the decode thread
-        // was paused then the I/O loop would keep running and reading from this channel.
-        //
-        // Once the reader is finished we should revisit.  We will probably want to convert
-        // from `when_done` futures to delivering data into a queue.  That queue should fill
-        // up, causing the I/O loop to pause.
         let (reg_tx, reg_rx) = async_priority_channel::unbounded();
         let io_capacity = object_store.io_parallelism().unwrap();
+        let backpressure_throttle = Arc::new(BackpressureThrottle::new(
+            Semaphore::new(config.io_buffer_size_bytes as usize),
+            config.io_buffer_size_bytes,
+            config.deadlock_prevention_timeout,
+        ));
         let scheduler = Self {
             object_store,
             io_submitter: reg_tx,
             file_counter: Mutex::new(0),
-            backpressure_throttle: Arc::new(BackpressureThrottle::new(
-                Semaphore::new(config.io_buffer_size_bytes as usize),
-                config.io_buffer_size_bytes,
-                config.deadlock_prevention_timeout,
-            )),
+            backpressure_throttle: backpressure_throttle.clone(),
         };
-        tokio::task::spawn(async move { run_io_loop(reg_rx, io_capacity).await });
+        tokio::task::spawn(
+            async move { run_io_loop(reg_rx, backpressure_throttle, io_capacity).await },
+        );
         Arc::new(scheduler)
     }
 
@@ -384,7 +399,8 @@ impl ScanScheduler {
             let task = IoTask {
                 reader: reader.clone(),
                 to_read: iop,
-                backpressure_throttle: self.backpressure_throttle.clone(),
+                // This will be set by run_io_loop
+                permits_to_realease: 0,
                 when_done: Box::new(move |(data, permits_acquired)| {
                     let mut dest = dest.lock().unwrap();
                     let chunk = DataChunk {
@@ -726,13 +742,13 @@ mod tests {
             .await
             .unwrap();
 
-        let wait_for_idle = |target: usize| async move {
+        let wait_for_idle = || async move {
             let handle = Handle::current();
-            while handle.metrics().num_alive_tasks() != target {
+            while handle.metrics().num_alive_tasks() != 1 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        let wait_for_bytes_read_and_idle = |target_bytes: u64, target_tasks: usize| {
+        let wait_for_bytes_read_and_idle = |target_bytes: u64| {
             // We need to move `target` but don't want to move `bytes_read`
             let bytes_read = &bytes_read;
             async move {
@@ -740,7 +756,7 @@ mod tests {
                 while bytes_read_copy.load(Ordering::Acquire) < target_bytes {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                wait_for_idle(target_tasks).await;
+                wait_for_idle().await;
             }
         };
 
@@ -751,19 +767,19 @@ mod tests {
         // This read will be throttled
         let third_fut = file_scheduler.submit_single(0..3, 0);
         // Two tasks (third_fut and unit test)
-        wait_for_bytes_read_and_idle(10, 2).await;
+        wait_for_bytes_read_and_idle(10).await;
 
         assert_eq!(first_fut.await.unwrap().len(), 5);
         // One task (unit test)
-        wait_for_bytes_read_and_idle(13, 1).await;
+        wait_for_bytes_read_and_idle(13).await;
 
         // 2 bytes are ready but 5 bytes requested, read will be blocked
         let fourth_fut = file_scheduler.submit_single(0..5, 0);
-        wait_for_bytes_read_and_idle(13, 2).await;
+        wait_for_bytes_read_and_idle(13).await;
 
         // Out of order completion is ok, will unblock backpressure
         assert_eq!(third_fut.await.unwrap().len(), 3);
-        wait_for_bytes_read_and_idle(18, 1).await;
+        wait_for_bytes_read_and_idle(18).await;
 
         assert_eq!(second_fut.await.unwrap().len(), 5);
         // At this point there are 5 bytes available in backpressure queue
@@ -773,7 +789,7 @@ mod tests {
         // I'm actually not sure this behavior is great.  It's possible that we should just
         // block until we can fulfill the entire request.
         let fifth_fut = file_scheduler.submit_request(vec![0..3, 90000..90007], 0);
-        wait_for_bytes_read_and_idle(21, 1).await;
+        wait_for_bytes_read_and_idle(21).await;
 
         // Fifth future should eventually finish due to deadlock prevention
         let fifth_bytes = tokio::time::timeout(Duration::from_secs(10), fifth_fut)
@@ -786,7 +802,7 @@ mod tests {
 
         // And now let's just make sure that we can read the rest of the data
         assert_eq!(fourth_fut.await.unwrap().len(), 5);
-        wait_for_bytes_read_and_idle(28, 1).await;
+        wait_for_bytes_read_and_idle(28).await;
 
         // Ensure deadlock prevention timeout can be disabled
         let config = SchedulerConfig {
@@ -806,5 +822,35 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(first_fut.await.unwrap().len(), 10);
         assert_eq!(second_fut.await.unwrap().len(), 10);
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn stress_backpressure() {
+        // This test ensures that the backpressure mechanism works correctly with
+        // regards to priority.  In other words, as long as all requests are consumed
+        // in priority order then the backpressure mechanism should not deadlock
+        let some_path = Path::parse("foo").unwrap();
+        let obj_store = Arc::new(ObjectStore::memory());
+        obj_store
+            .put(&some_path, vec![0; 100000].as_slice())
+            .await
+            .unwrap();
+
+        // Only one request will be allowed in
+        let config = SchedulerConfig {
+            deadlock_prevention_timeout: Some(Duration::from_millis(1000)),
+            io_buffer_size_bytes: 1,
+        };
+        let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
+        let file_scheduler = scan_scheduler.open_file(&some_path).await.unwrap();
+
+        let mut futs = Vec::with_capacity(10000);
+        for idx in 0..10000 {
+            futs.push(file_scheduler.submit_single(idx..idx + 1, idx));
+        }
+
+        for fut in futs {
+            fut.await.unwrap();
+        }
     }
 }
