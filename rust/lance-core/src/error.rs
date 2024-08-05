@@ -133,7 +133,7 @@ impl Error {
         }
     }
 
-    pub fn versino_conflict(
+    pub fn version_conflict(
         message: impl Into<String>,
         major_version: u16,
         minor_version: u16,
