@@ -298,7 +298,7 @@ pub struct SchedulerConfig {
     /// This controls back pressure.  If data is not processed quickly enough then this
     /// buffer will fill up and the I/O loop will pause until the buffer is drained.
     pub io_buffer_size_bytes: u64,
-    /// The backpressure mechansim can potentially lead to deadlock if there are bugs.
+    /// The backpressure mechanism can potentially lead to deadlock if there are bugs.
     /// A complete hang is a pretty bad user experience so we log an error and panic
     /// if the I/O loop is paused for longer than this timeout.
     ///
