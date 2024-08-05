@@ -225,8 +225,9 @@ use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
-use log::{trace, warn};
+use log::{debug, trace, warn};
 use snafu::{location, Location};
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::{Error, Result};
@@ -917,7 +918,7 @@ impl DecodeBatchScheduler {
         ranges: &[Range<u64>],
         filter: &FilterExpression,
         io: Arc<dyn EncodingsIo>,
-        mut schedule_action: impl FnMut(Result<DecoderMessage>),
+        mut schedule_action: impl FnMut(Result<DecoderMessage>) -> bool,
     ) {
         let rows_requested = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         trace!(
@@ -952,10 +953,13 @@ impl DecodeBatchScheduler {
                 next_scan_line.rows_scheduled,
                 next_scan_line.decoders.len()
             );
-            schedule_action(Ok(DecoderMessage {
+            if !schedule_action(Ok(DecoderMessage {
                 scheduled_so_far: num_rows_scheduled,
                 decoders: next_scan_line.decoders,
-            }));
+            })) {
+                // Decoder has disconnected
+                return;
+            }
         }
 
         trace!("Finished scheduling {} ranges", ranges.len());
@@ -970,7 +974,10 @@ impl DecodeBatchScheduler {
         io: Arc<dyn EncodingsIo>,
     ) -> Result<Vec<DecoderMessage>> {
         let mut decode_messages = Vec::new();
-        self.do_schedule_ranges(ranges, filter, io, |msg| decode_messages.push(msg));
+        self.do_schedule_ranges(ranges, filter, io, |msg| {
+            decode_messages.push(msg);
+            true
+        });
         decode_messages.into_iter().collect::<Result<Vec<_>>>()
     }
 
@@ -992,7 +999,17 @@ impl DecodeBatchScheduler {
         scheduler: Arc<dyn EncodingsIo>,
     ) {
         self.do_schedule_ranges(ranges, filter, scheduler, |msg| {
-            sink.send(msg).unwrap();
+            match sink.send(msg) {
+                Ok(_) => true,
+                Err(SendError { .. }) => {
+                    // The receiver has gone away.  We can't do anything about it
+                    // so just ignore the error.
+                    debug!(
+                        "schedule_ranges aborting early since decoder appears to have been dropped"
+                    );
+                    false
+                }
+            }
         })
     }
 
