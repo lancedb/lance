@@ -244,6 +244,7 @@ def test_s3_ddb_distributed_commit(s3_bucket: str, ddb_table: str):
 
 @pytest.mark.integration
 @pytest.mark.skipif(not _RAY_AVAILABLE, reason="ray is not available")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_ray_committer(s3_bucket: str, ddb_table: str):
     from lance.ray.sink import write_lance
 
