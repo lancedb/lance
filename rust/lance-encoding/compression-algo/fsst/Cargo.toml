@@ -1,6 +1,6 @@
 [package]
 name = "fsst"
-version = "0.15.1"
+version = "0.16.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
