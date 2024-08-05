@@ -42,7 +42,7 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::DistanceType;
 use lance_table::format::{Fragment, Index};
 use log::debug;
 use roaring::RoaringBitmap;
@@ -508,7 +508,7 @@ impl Scanner {
             nprobes: 1,
             ef: None,
             refine_factor: None,
-            metric_type: MetricType::L2,
+            metric_type: DistanceType::L2,
             use_index: true,
         });
         Ok(self)
@@ -557,10 +557,10 @@ impl Scanner {
         self
     }
 
-    /// Change the distance [MetricType], i.e, L2 or Cosine distance.
-    pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
+    /// Change the distance [DistanceType], i.e, L2 or Cosine distance.
+    pub fn distance_metric(&mut self, distance_type: DistanceType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.metric_type = metric_type
+            q.metric_type = distance_type
         }
         self
     }
@@ -1775,7 +1775,7 @@ pub mod test_dataset {
         }
 
         pub async fn make_vector_index(&mut self) -> Result<()> {
-            let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2);
+            let params = VectorIndexParams::ivf_pq(2, 8, 2, DistanceType::L2, 2);
             self.dataset
                 .create_index(
                     &["vec"],
@@ -2722,9 +2722,9 @@ mod test {
         data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
         #[values(
-            VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(2, 8, 2, DistanceType::L2, 2),
             VectorIndexParams::with_ivf_hnsw_sq_params(
-                MetricType::L2,
+                DistanceType::L2,
                 IvfBuildParams::new(2),
                 HnswBuildParams::default(),
                 SQBuildParams::default()
@@ -3004,11 +3004,7 @@ mod test {
         data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
-        let vec_params = vec![
-            // TODO: re-enable diskann test when we can tune to get reproducible results.
-            // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
-            VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
-        ];
+        let vec_params = vec![VectorIndexParams::ivf_pq(4, 8, 2, DistanceType::L2, 2)];
         for params in vec_params {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
@@ -3411,7 +3407,7 @@ mod test {
                     &["vector"],
                     IndexType::Vector,
                     None,
-                    &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+                    &VectorIndexParams::ivf_pq(2, 8, 2, DistanceType::L2, 2),
                     false,
                 )
                 .await

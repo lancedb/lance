@@ -717,13 +717,18 @@ impl DatasetIndexInternalExt for Dataset {
 
 #[cfg(test)]
 mod tests {
-    use crate::dataset::builder::DatasetBuilder;
+    use std::collections::HashSet;
 
     use super::*;
+    use crate::dataset::builder::DatasetBuilder;
 
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        cast::AsArray, types::UInt64Type, FixedSizeListArray, RecordBatch, RecordBatchIterator,
+        StringArray,
+    };
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
+    use lance_core::ROW_ID;
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
@@ -1044,6 +1049,121 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_indices_with_cosine_distance() {
+        let dimensions = 512;
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create a schema with a vector column
+        let field = Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+
+        // Generate some sample data
+        let float_arr = generate_random_array(1024 * dimensions as usize);
+        let vectors = FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        // Write the dataset
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Create a vector index with cosine distance
+        let params = VectorIndexParams::ivf_pq(
+            2,  // num_partitions
+            8,  // num_bits
+            64, // num_sub_vector
+            DistanceType::Cosine,
+            10,
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Verify the index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "vector_idx");
+
+        // Insert new data to dataset
+        let float_arr = generate_random_array(512 * dimensions as usize);
+        let vectors = FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        dataset.append(reader, None).await.unwrap();
+
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        // Reopen it
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let idx = dataset.load_indices().await.unwrap();
+        println!("idx: {:?}", idx);
+        println!("Database version: {:?}", dataset.version().version);
+
+        const K: usize = 20;
+        let query_vec = generate_random_array(dimensions as usize);
+        let gt = dataset
+            .scan()
+            .nearest("vector", &query_vec, K)
+            .unwrap()
+            .use_index(false)
+            .distance_metric(DistanceType::Cosine)
+            .with_row_id()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(gt.len(), 1);
+
+        let rst = dataset
+            .scan()
+            .nearest("vector", &query_vec, K)
+            .unwrap()
+            .nprobs(2)
+            .with_row_id()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(rst.len(), 1);
+        let gt_row_ids: HashSet<u64> = gt[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .cloned()
+            .collect();
+        let rst_row_ids: HashSet<u64> = rst[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .cloned()
+            .collect();
+        println!("gt_row_ids: {:?}", gt_row_ids);
+        println!("rst_row_ids: {:?}", rst_row_ids);
+        let recall = gt_row_ids.intersection(&rst_row_ids).count() as f32 / gt_row_ids.len() as f32;
+        assert!(recall >= 0.7, "Recall is too low: {}", recall);
     }
 
     #[tokio::test]

@@ -337,18 +337,11 @@ pub async fn build_pq_model(
     dataset: &Dataset,
     column: &str,
     dim: usize,
-    metric_type: MetricType,
+    distance_type: DistanceType,
     params: &PQBuildParams,
     ivf: Option<&IvfModel>,
 ) -> Result<ProductQuantizer> {
     if let Some(codebook) = &params.codebook {
-        let dt = if metric_type == MetricType::Cosine {
-            info!("Normalize training data for PQ training: Cosine");
-            MetricType::L2
-        } else {
-            metric_type
-        };
-
         return match codebook.data_type() {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(ProductQuantizer::new(
                 params.num_sub_vectors,
@@ -358,7 +351,7 @@ pub async fn build_pq_model(
                     codebook.slice(0, codebook.len()),
                     dim as i32,
                 )?,
-                dt,
+                distance_type,
             )),
             _ => Err(Error::Index {
                 message: format!("Wrong codebook data type: {:?}", codebook.data_type()),
@@ -389,7 +382,7 @@ pub async fn build_pq_model(
         training_data.value_length()
     );
 
-    if metric_type == MetricType::Cosine {
+    if distance_type == DistanceType::Cosine {
         info!("Normalize training data for PQ training: Cosine");
         training_data = normalize_fsl(&training_data)?;
     }
