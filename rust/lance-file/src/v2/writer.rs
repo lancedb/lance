@@ -14,7 +14,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_encoding::encoder::{
     BatchEncoder, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch,
-    EncodedPage, FieldEncoder, FieldEncodingStrategy,
+    EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
 };
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_writer::ObjectWriter;
@@ -50,6 +50,12 @@ pub struct FileWriterOptions {
     /// The default will use 8MiB per column which should be reasonable for most cases.
     // TODO: Do we need to be able to set this on a per-column basis?
     pub data_cache_bytes: Option<u64>,
+    /// A hint to indicate the max size of a page
+    ///
+    /// This hint can't always be respected.  A single value could be larger than this value
+    /// and we never slice single values.  In addition, there are some cases where it can be
+    /// difficult to know size up-front and so we might not be able to respect this value.
+    pub max_page_bytes: Option<u64>,
     /// The file writer buffers columns until enough data has arrived to flush a page
     /// to disk.
     ///
@@ -211,6 +217,12 @@ impl FileWriter {
             8 * 1024 * 1024
         };
 
+        let max_page_bytes = if let Some(max_page_bytes) = self.options.max_page_bytes {
+            max_page_bytes
+        } else {
+            32 * 1024 * 1024
+        };
+
         schema.validate()?;
 
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
@@ -225,12 +237,13 @@ impl FileWriter {
             })
         });
 
-        let encoder = BatchEncoder::try_new(
-            &schema,
-            encoding_strategy.as_ref(),
+        let encoding_options = EncodingOptions {
             cache_bytes_per_column,
+            max_page_bytes,
             keep_original_array,
-        )?;
+        };
+        let encoder =
+            BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
         self.num_columns = encoder.num_columns();
 
         self.column_writers = encoder.field_encoders;

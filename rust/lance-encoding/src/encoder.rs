@@ -538,6 +538,22 @@ impl ColumnIndexSequence {
     }
 }
 
+/// Options that control the encoding process
+pub struct EncodingOptions {
+    /// How much data (in bytes) to cache in-memory before writing a page
+    ///
+    /// This cache is applied on a per-column basis
+    pub cache_bytes_per_column: u64,
+    /// The maximum size of a page in bytes, if a single array would create
+    /// a page larger than this then it will be split into multiple pages
+    pub max_page_bytes: u64,
+    /// If false (the default) then arrays will be copied (deeply) before
+    /// being cached.  This ensures any data kept alive by the array can
+    /// be discarded safely and helps avoid writer accumulation.  However,
+    /// there is an associated cost.
+    pub keep_original_array: bool,
+}
+
 /// A trait to pick which kind of field encoding to use for a field
 ///
 /// Unlike the ArrayEncodingStrategy, the field encoding strategy is
@@ -560,9 +576,7 @@ pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
         encoding_strategy_root: &dyn FieldEncodingStrategy,
         field: &Field,
         column_index: &mut ColumnIndexSequence,
-        cache_bytes_per_column: u64,
-        keep_original_array: bool,
-        config: &HashMap<String, String>,
+        options: &EncodingOptions,
     ) -> Result<Box<dyn FieldEncoder>>;
 }
 
@@ -625,30 +639,25 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
         encoding_strategy_root: &dyn FieldEncodingStrategy,
         field: &Field,
         column_index: &mut ColumnIndexSequence,
-        cache_bytes_per_column: u64,
-        keep_original_array: bool,
-        _config: &HashMap<String, String>,
+        options: &EncodingOptions,
     ) -> Result<Box<dyn FieldEncoder>> {
         let data_type = field.data_type();
         if Self::is_primitive_type(&data_type) {
             Ok(Box::new(PrimitiveFieldEncoder::try_new(
-                cache_bytes_per_column,
-                keep_original_array,
+                options,
                 self.array_encoding_strategy.clone(),
                 column_index.next_column_index(field.id),
                 field.clone(),
             )?))
         } else {
             match data_type {
-                DataType::List(child) => {
+                DataType::List(_child) => {
                     let list_idx = column_index.next_column_index(field.id);
                     let inner_encoding = encoding_strategy_root.create_field_encoder(
                         encoding_strategy_root,
                         &field.children[0],
                         column_index,
-                        cache_bytes_per_column,
-                        keep_original_array,
-                        child.metadata(),
+                        options,
                     )?;
                     let offsets_encoder = Arc::new(BasicEncoder::new(Box::new(
                         ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
@@ -660,8 +669,8 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                     Ok(Box::new(ListFieldEncoder::new(
                         inner_encoding,
                         offsets_encoder,
-                        cache_bytes_per_column,
-                        keep_original_array,
+                        options.cache_bytes_per_column,
+                        options.keep_original_array,
                         list_idx,
                     )))
                 }
@@ -673,8 +682,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                         .unwrap_or(false)
                     {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
-                            cache_bytes_per_column,
-                            keep_original_array,
+                            options,
                             self.array_encoding_strategy.clone(),
                             column_index.next_column_index(field.id),
                             field.clone(),
@@ -689,9 +697,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                                     encoding_strategy_root,
                                     field,
                                     column_index,
-                                    cache_bytes_per_column,
-                                    keep_original_array,
-                                    &field.metadata,
+                                    options,
                                 )
                             })
                             .collect::<Result<Vec<_>>>()?;
@@ -705,8 +711,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                     // A dictionary of primitive is, itself, primitive
                     if Self::is_primitive_type(&value_type) {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
-                            cache_bytes_per_column,
-                            keep_original_array,
+                            options,
                             self.array_encoding_strategy.clone(),
                             column_index.next_column_index(field.id),
                             field.clone(),
@@ -737,8 +742,7 @@ impl BatchEncoder {
     pub fn try_new(
         schema: &Schema,
         strategy: &dyn FieldEncodingStrategy,
-        cache_bytes_per_column: u64,
-        keep_original_array: bool,
+        options: &EncodingOptions,
     ) -> Result<Self> {
         let mut col_idx = 0;
         let mut col_idx_sequence = ColumnIndexSequence::default();
@@ -750,9 +754,7 @@ impl BatchEncoder {
                     strategy,
                     field,
                     &mut col_idx_sequence,
-                    cache_bytes_per_column,
-                    keep_original_array,
-                    &field.metadata,
+                    options,
                 )?;
                 col_idx += encoder.as_ref().num_columns();
                 Ok(encoder)
@@ -810,16 +812,15 @@ pub async fn encode_batch(
     batch: &RecordBatch,
     schema: Arc<Schema>,
     encoding_strategy: &dyn FieldEncodingStrategy,
-    cache_bytes_per_column: u64,
+    options: &EncodingOptions,
 ) -> Result<EncodedBatch> {
     let mut data_buffer = BytesMut::new();
     let lance_schema = Schema::try_from(batch.schema().as_ref())?;
-    let batch_encoder = BatchEncoder::try_new(
-        &lance_schema,
-        encoding_strategy,
-        cache_bytes_per_column,
-        true,
-    )?;
+    let options = EncodingOptions {
+        keep_original_array: true,
+        ..*options
+    };
+    let batch_encoder = BatchEncoder::try_new(&lance_schema, encoding_strategy, &options)?;
     let mut page_table = Vec::new();
     let mut col_idx_offset = 0;
     for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {

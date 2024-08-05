@@ -327,7 +327,10 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use tempfile::tempdir;
 
-    use crate::{dataset::WriteParams, io::exec::LanceScanExec};
+    use crate::{
+        dataset::{scanner::DEFAULT_IO_BUFFER_SIZE, WriteParams},
+        io::exec::LanceScanExec,
+    };
 
     async fn create_dataset() -> Arc<Dataset> {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -386,6 +389,7 @@ mod tests {
             10,
             10,
             Some(4),
+            DEFAULT_IO_BUFFER_SIZE,
             true,
             false,
             false,
@@ -420,6 +424,7 @@ mod tests {
             10,
             10,
             Some(4),
+            DEFAULT_IO_BUFFER_SIZE,
             true,
             false,
             false,
@@ -454,6 +459,7 @@ mod tests {
             10,
             10,
             Some(4),
+            DEFAULT_IO_BUFFER_SIZE,
             false,
             false,
             false,
@@ -473,6 +479,7 @@ mod tests {
             10,
             10,
             Some(4),
+            DEFAULT_IO_BUFFER_SIZE,
             true,
             false,
             false,

@@ -26,7 +26,7 @@ use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
 use lance_file::v2::reader::{CachedFileMetadata, ReaderProjection};
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::{FileScheduler, ScanScheduler};
+use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
@@ -46,6 +46,7 @@ use super::updater::Updater;
 use super::WriteParams;
 use crate::arrow::*;
 use crate::dataset::Dataset;
+use crate::utils::default_deadlock_prevention_timeout;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -539,8 +540,15 @@ impl FileFragment {
             Ok(None)
         } else {
             let path = self.dataset.data_dir().child(data_file.path.as_str());
-            let store_scheduler = scan_scheduler
-                .unwrap_or_else(|| ScanScheduler::new(self.dataset.object_store.clone()));
+            let store_scheduler = scan_scheduler.unwrap_or_else(|| {
+                ScanScheduler::new(
+                    self.dataset.object_store.clone(),
+                    SchedulerConfig {
+                        io_buffer_size_bytes: 256 * 1024 * 1024,
+                        deadlock_prevention_timeout: default_deadlock_prevention_timeout(),
+                    },
+                )
+            });
             let file_scheduler = store_scheduler.open_file(&path).await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let reader = Arc::new(

@@ -10,7 +10,9 @@ use lance_core::{
 };
 use lance_encoding::{
     decoder::{ColumnInfoIter, DecoderMiddlewareChainCursor, FieldDecoderStrategy, FieldScheduler},
-    encoder::{ColumnIndexSequence, CoreFieldEncodingStrategy, FieldEncodingStrategy},
+    encoder::{
+        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodingOptions, FieldEncodingStrategy,
+    },
     encodings::physical::FileBuffers,
 };
 use zone::{extract_zone_info, UnloadedPushdown, ZoneMapsFieldEncoder, ZoneMapsFieldScheduler};
@@ -170,9 +172,7 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
         encoding_strategy_root: &dyn FieldEncodingStrategy,
         field: &lance_core::datatypes::Field,
         column_index: &mut ColumnIndexSequence,
-        cache_bytes_per_column: u64,
-        keep_original_array: bool,
-        config: &std::collections::HashMap<String, String>,
+        options: &EncodingOptions,
     ) -> lance_core::Result<Box<dyn lance_encoding::encoder::FieldEncoder>> {
         let data_type = field.data_type();
         if data_type.is_primitive()
@@ -186,9 +186,7 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
                 &self.core,
                 field,
                 column_index,
-                cache_bytes_per_column,
-                keep_original_array,
-                config,
+                options,
             )?;
             Ok(Box::new(ZoneMapsFieldEncoder::try_new(
                 inner_encoder,
@@ -196,14 +194,8 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
                 self.rows_per_map,
             )?))
         } else {
-            self.core.create_field_encoder(
-                encoding_strategy_root,
-                field,
-                column_index,
-                cache_bytes_per_column,
-                keep_original_array,
-                config,
-            )
+            self.core
+                .create_field_encoder(encoding_strategy_root, field, column_index, options)
         }
     }
 }

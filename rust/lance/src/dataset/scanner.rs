@@ -72,6 +72,11 @@ pub const DEFAULT_BATCH_READAHEAD: usize = 16;
 // Same as pyarrow Dataset::scanner()
 pub const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 
+// We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
+// Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
+// So we want to support 256 * 8MiB ~= 2GiB of queued reads
+pub const DEFAULT_IO_BUFFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Defines an ordering for a single column
 ///
 /// Floats are sorted using the IEEE 754 total ordering
@@ -152,6 +157,9 @@ pub struct Scanner {
     /// Number of fragments to read concurrently
     fragment_readahead: Option<usize>,
 
+    /// Number of bytes to allow to queue up in the I/O buffer
+    io_buffer_size: Option<u64>,
+
     limit: Option<i64>,
     offset: Option<i64>,
 
@@ -214,6 +222,7 @@ impl Scanner {
             batch_size: None,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
             fragment_readahead: None,
+            io_buffer_size: None,
             limit: None,
             offset: None,
             ordering: None,
@@ -1391,6 +1400,10 @@ impl Scanner {
         }
     }
 
+    fn get_io_buffer_size(&self) -> u64 {
+        self.io_buffer_size.unwrap_or(DEFAULT_IO_BUFFER_SIZE)
+    }
+
     /// Create an Execution plan with a scan node
     ///
     /// Setting `with_make_deletions_null` will use the validity of the _rowid
@@ -1439,6 +1452,7 @@ impl Scanner {
             self.get_batch_size(),
             self.batch_readahead,
             self.fragment_readahead,
+            self.get_io_buffer_size(),
             with_row_id,
             with_row_address,
             with_make_deletions_null,

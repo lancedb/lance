@@ -27,7 +27,7 @@ use lance_file::reader::FileReader;
 use lance_file::v2::reader::FileReader as Lancev2FileReader;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::ScanScheduler;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
@@ -320,7 +320,10 @@ impl IvfShuffler {
                 let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
                 total_batches.push(reader.num_batches());
             } else {
-                let scheduler = ScanScheduler::new(object_store.into());
+                let scheduler = ScanScheduler::new(
+                    object_store.into(),
+                    SchedulerConfig::fast_and_not_too_ram_intensive(),
+                );
                 let file = scheduler.open_file(&path).await?;
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let num_batches = reader.metadata().num_rows / (SHUFFLE_BATCH_SIZE as u64);
@@ -333,7 +336,10 @@ impl IvfShuffler {
     async fn count_partition_size(&self, inputs: &[ShuffleInput]) -> Result<Vec<u64>> {
         let object_store = ObjectStore::local();
         let mut partition_sizes = vec![0; self.num_partitions as usize];
-        let scheduler = ScanScheduler::new(Arc::new(object_store.clone()));
+        let scheduler = ScanScheduler::new(
+            Arc::new(object_store.clone()),
+            SchedulerConfig::fast_and_not_too_ram_intensive(),
+        );
 
         for &ShuffleInput {
             file_idx,
@@ -472,7 +478,10 @@ impl IvfShuffler {
                     Self::process_batch_in_shuffle(batch, &mut partitioned_batches).await?;
                 }
             } else {
-                let scheduler = ScanScheduler::new(Arc::new(object_store));
+                let scheduler = ScanScheduler::new(
+                    Arc::new(object_store),
+                    SchedulerConfig::fast_and_not_too_ram_intensive(),
+                );
                 let file = scheduler.open_file(&path).await?;
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader

@@ -21,12 +21,14 @@ use crate::{
     },
     encoder::{
         ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedBuffer,
-        EncodedPage, FieldEncoder, FieldEncodingStrategy,
+        EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
     },
     encodings::logical::r#struct::SimpleStructDecoder,
     version::LanceFileVersion,
     EncodingsIo,
 };
+
+const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) struct SimulatedScheduler {
     data: Bytes,
@@ -158,17 +160,19 @@ pub async fn check_round_trip_encoding_generated(
             array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
             version,
         };
-        let encoding_config = HashMap::new();
         let encoder_factory = || {
             let mut column_index_seq = ColumnIndexSequence::default();
+            let encoding_options = EncodingOptions {
+                max_page_bytes: MAX_PAGE_BYTES,
+                cache_bytes_per_column: page_size,
+                keep_original_array: true,
+            };
             encoding_strategy
                 .create_field_encoder(
                     &encoding_strategy,
                     &lance_field,
                     &mut column_index_seq,
-                    page_size,
-                    true,
-                    &encoding_config,
+                    &encoding_options,
                 )
                 .unwrap()
         };
@@ -248,16 +252,18 @@ pub async fn check_round_trip_encoding_of_data(
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         let encoding_strategy = CoreFieldEncodingStrategy::default();
-        let encoding_config = HashMap::new();
         let mut column_index_seq = ColumnIndexSequence::default();
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column: page_size,
+            max_page_bytes: MAX_PAGE_BYTES,
+            keep_original_array: true,
+        };
         let encoder = encoding_strategy
             .create_field_encoder(
                 &encoding_strategy,
                 &lance_field,
                 &mut column_index_seq,
-                page_size,
-                true,
-                &encoding_config,
+                &encoding_options,
             )
             .unwrap();
         check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases).await

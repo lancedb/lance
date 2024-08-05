@@ -993,7 +993,7 @@ pub mod tests {
     use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
     use lance_encoding::{
         decoder::{decode_batch, DecoderMiddlewareChain, FilterExpression},
-        encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch},
+        encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodingOptions},
     };
     use lance_io::stream::RecordBatchStream;
     use log::debug;
@@ -1113,11 +1113,16 @@ pub mod tests {
 
         let lance_schema = Arc::new(Schema::try_from(data.schema().as_ref()).unwrap());
 
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column: 4096,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+        };
         let encoded_batch = encode_batch(
             &data,
             lance_schema.clone(),
             &CoreFieldEncodingStrategy::default(),
-            4096,
+            &encoding_options,
         )
         .await
         .unwrap();

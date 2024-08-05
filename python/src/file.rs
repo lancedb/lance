@@ -18,7 +18,10 @@ use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
-use lance::io::{ObjectStore, RecordBatchStream};
+use lance::{
+    io::{ObjectStore, RecordBatchStream},
+    utils::default_deadlock_prevention_timeout,
+};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::{
     v2::{
@@ -27,7 +30,10 @@ use lance_file::{
     },
     version::LanceFileVersion,
 };
-use lance_io::{scheduler::ScanScheduler, ReadBatchParams};
+use lance_io::{
+    scheduler::{ScanScheduler, SchedulerConfig},
+    ReadBatchParams,
+};
 use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
@@ -281,7 +287,13 @@ pub struct LanceFileReader {
 impl LanceFileReader {
     async fn open(uri_or_path: String) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
-        let scheduler = ScanScheduler::new(Arc::new(object_store));
+        let scheduler = ScanScheduler::new(
+            Arc::new(object_store),
+            SchedulerConfig {
+                io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
+                deadlock_prevention_timeout: default_deadlock_prevention_timeout(),
+            },
+        );
         let file = scheduler.open_file(&path).await.infer_error()?;
         let inner = FileReader::try_open(file, None, DecoderMiddlewareChain::default())
             .await
