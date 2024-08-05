@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt::Debug, pin::Pin, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion::execution::RecordBatchStream;
 use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
@@ -271,17 +272,31 @@ impl TrainingSource for UnnestTrainingSource {
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
         let source = self.source.scan_ordered_chunks(chunk_size).await?;
-        let unnest_schema = unnest_schema(source.schema().as_ref());
-        let unnest_schema_copy = unnest_schema.clone();
-        let source = source.try_filter_map(move |batch| {
-            std::future::ready(Some(unnest_batch(batch, unnest_schema.clone())).transpose())
-        });
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            unnest_schema_copy.clone(),
-            source,
-        )))
+        unnest_chunks(source)
     }
+
+    async fn scan_unordered_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        let source = self.source.scan_unordered_chunks(chunk_size).await?;
+        unnest_chunks(source)
+    }
+}
+
+fn unnest_chunks(
+    source: Pin<Box<dyn RecordBatchStream + Send>>,
+) -> Result<SendableRecordBatchStream> {
+    let unnest_schema = unnest_schema(source.schema().as_ref());
+    let unnest_schema_copy = unnest_schema.clone();
+    let source = source.try_filter_map(move |batch| {
+        std::future::ready(Some(unnest_batch(batch, unnest_schema.clone())).transpose())
+    });
+
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        unnest_schema_copy.clone(),
+        source,
+    )))
 }
 
 /// Trains a new label list index

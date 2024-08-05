@@ -336,6 +336,13 @@ mod tests {
         ) -> Result<SendableRecordBatchStream> {
             Ok(self.data)
         }
+
+        async fn scan_unordered_chunks(
+            self: Box<Self>,
+            _chunk_size: u32,
+        ) -> Result<SendableRecordBatchStream> {
+            Ok(self.data)
+        }
     }
 
     async fn train_index(
