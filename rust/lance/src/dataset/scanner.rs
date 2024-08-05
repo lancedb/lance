@@ -624,6 +624,10 @@ impl Scanner {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
 
+        if self.full_text_query.is_some() {
+            extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
+        }
+
         if self.with_row_id || in_projection {
             extra_columns.push(ROW_ID_FIELD.clone());
         }
@@ -664,6 +668,11 @@ impl Scanner {
         if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
             let vector_expr = expressions::col(DIST_COL, &physical_schema)?;
             output_expr.push((vector_expr, DIST_COL.to_string()));
+        }
+
+        if self.full_text_query.is_some() && output_expr.iter().all(|(_, name)| name != SCORE_COL) {
+            let score_expr = expressions::col(SCORE_COL, &physical_schema)?;
+            output_expr.push((score_expr, SCORE_COL.to_string()));
         }
 
         if self.with_row_id && output_expr.iter().all(|(_, name)| name != ROW_ID) {
