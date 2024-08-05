@@ -243,21 +243,24 @@ pub async fn object_store_from_uri_or_path(
     uri_or_path: impl AsRef<str>,
 ) -> PyResult<(ObjectStore, Path)> {
     if let Ok(mut url) = Url::parse(uri_or_path.as_ref()) {
-        let path = object_store::path::Path::parse(url.path())
-            .map_err(|e| PyIOError::new_err(format!("Invalid URL path `{}`: {}", url.path(), e)))?;
-        let (parent_path, filename) = path_to_parent(&path)?;
-        url.set_path(parent_path.as_ref());
+        if url.scheme().len() > 1 {
+            let path = object_store::path::Path::parse(url.path()).map_err(|e| {
+                PyIOError::new_err(format!("Invalid URL path `{}`: {}", url.path(), e))
+            })?;
+            let (parent_path, filename) = path_to_parent(&path)?;
+            url.set_path(parent_path.as_ref());
 
-        let (object_store, dir_path) = ObjectStore::from_uri(url.as_str()).await.infer_error()?;
-        let child_path = dir_path.child(filename);
-        Ok((object_store, child_path))
-    } else {
-        let path = Path::parse(uri_or_path.as_ref()).map_err(|e| {
-            PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path.as_ref(), e))
-        })?;
-        let object_store = ObjectStore::local();
-        Ok((object_store, path))
+            let (object_store, dir_path) =
+                ObjectStore::from_uri(url.as_str()).await.infer_error()?;
+            let child_path = dir_path.child(filename);
+            return Ok((object_store, child_path));
+        }
     }
+    let path = Path::parse(uri_or_path.as_ref()).map_err(|e| {
+        PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path.as_ref(), e))
+    })?;
+    let object_store = ObjectStore::local();
+    Ok((object_store, path))
 }
 
 #[pyclass]

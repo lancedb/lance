@@ -45,8 +45,9 @@ const UNSORTED_BUFFER: &str = "unsorted.lance";
 const SHUFFLE_BATCH_SIZE: usize = 1024;
 
 fn get_temp_dir() -> Result<Path> {
-    let dir = TempDir::new()?;
-    let tmp_dir_path = Path::from_filesystem_path(dir.path()).map_err(|e| Error::IO {
+    // Note: using into_path here means we will not delete this TempDir automatically
+    let dir = TempDir::new()?.into_path();
+    let tmp_dir_path = Path::from_filesystem_path(dir).map_err(|e| Error::IO {
         source: Box::new(e),
         location: location!(),
     })?;
@@ -192,13 +193,13 @@ pub async fn shuffle_dataset(
 
 pub async fn shuffle_vectors(
     filenames: Vec<String>,
-    dir_path: &str,
+    dir_path: Path,
     ivf_centroids: FixedSizeListArray,
 ) -> Result<Vec<String>> {
     let num_partitions = ivf_centroids.len() as u32;
     let shuffle_partition_batches = SHUFFLE_BATCH_SIZE * 10;
     let shuffle_partition_concurrency = 2;
-    let mut shuffler = IvfShuffler::try_new(num_partitions, Some(dir_path.into()), false)?;
+    let mut shuffler = IvfShuffler::try_new(num_partitions, Some(dir_path), false)?;
 
     unsafe {
         shuffler.set_unsorted_buffers(&filenames);
