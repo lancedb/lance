@@ -20,10 +20,11 @@ use crate::{
         DecoderMessage, DecoderMiddlewareChain, FilterExpression, PageInfo,
     },
     encoder::{
-        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodedBuffer, EncodedPage, FieldEncoder,
-        FieldEncodingStrategy,
+        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedBuffer,
+        EncodedPage, FieldEncoder, FieldEncodingStrategy,
     },
     encodings::logical::r#struct::SimpleStructDecoder,
+    version::LanceFileVersion,
     EncodingsIo,
 };
 
@@ -137,17 +138,26 @@ pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<St
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
     };
-    check_round_trip_encoding_generated(field, Box::new(array_generator_provider)).await;
+    check_round_trip_encoding_generated(
+        field,
+        Box::new(array_generator_provider),
+        LanceFileVersion::default_v2(),
+    )
+    .await;
 }
 
 pub async fn check_round_trip_encoding_generated(
     field: Field,
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
+    version: LanceFileVersion,
 ) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
-        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_strategy = CoreFieldEncodingStrategy {
+            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
+            version,
+        };
         let encoding_config = HashMap::new();
         let encoder_factory = || {
             let mut column_index_seq = ColumnIndexSequence::default();

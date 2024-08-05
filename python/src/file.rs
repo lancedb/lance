@@ -20,9 +20,12 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
-use lance_file::v2::{
-    reader::{BufferDescriptor, CachedFileMetadata, FileReader},
-    writer::{FileWriter, FileWriterOptions},
+use lance_file::{
+    v2::{
+        reader::{BufferDescriptor, CachedFileMetadata, FileReader},
+        writer::{FileWriter, FileWriterOptions},
+    },
+    version::LanceFileVersion,
 };
 use lance_io::{scheduler::ScanScheduler, ReadBatchParams};
 use object_store::path::Path;
@@ -174,6 +177,7 @@ impl LanceFileWriter {
         uri_or_path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
+        version: Option<String>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
@@ -181,6 +185,10 @@ impl LanceFileWriter {
         let options = FileWriterOptions {
             data_cache_bytes,
             keep_original_array,
+            format_version: version
+                .map(|v| v.parse::<LanceFileVersion>())
+                .transpose()
+                .infer_error()?,
             ..Default::default()
         };
         let inner = if let Some(schema) = schema {
@@ -202,12 +210,14 @@ impl LanceFileWriter {
         path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
+        version: Option<String>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
         RT.runtime.block_on(Self::open(
             path,
             schema,
             data_cache_bytes,
+            version,
             keep_original_array,
         ))
     }

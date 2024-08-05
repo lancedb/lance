@@ -9,7 +9,7 @@ use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::deepcopy::deep_copy_array;
 use log::{debug, trace};
 
-use lance_core::Result;
+use lance_core::{datatypes::Field, Result};
 
 use crate::{
     decoder::{
@@ -386,6 +386,7 @@ pub struct PrimitiveFieldEncoder {
     accumulation_queue: AccumulationQueue,
     array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
     column_index: u32,
+    field: Field,
 }
 
 impl PrimitiveFieldEncoder {
@@ -394,6 +395,7 @@ impl PrimitiveFieldEncoder {
         keep_original_array: bool,
         array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
         column_index: u32,
+        field: Field,
     ) -> Result<Self> {
         Ok(Self {
             accumulation_queue: AccumulationQueue::new(
@@ -403,12 +405,15 @@ impl PrimitiveFieldEncoder {
             ),
             column_index,
             array_encoding_strategy,
+            field,
         })
     }
 
     // Creates an encode task, consuming all buffered data
     fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<EncodeTask> {
-        let encoder = self.array_encoding_strategy.create_array_encoder(&arrays)?;
+        let encoder = self
+            .array_encoding_strategy
+            .create_array_encoder(&arrays, &self.field)?;
         let column_idx = self.column_index;
 
         Ok(tokio::task::spawn(async move {

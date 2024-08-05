@@ -11,7 +11,7 @@ mod manifest;
 
 pub use fragment::*;
 pub use index::Index;
-pub use manifest::{Manifest, SelfDescribingFileReader, WriterVersion};
+pub use manifest::{DataStorageFormat, Manifest, SelfDescribingFileReader, WriterVersion};
 
 use lance_core::{Error, Result};
 

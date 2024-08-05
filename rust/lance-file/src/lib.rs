@@ -7,3 +7,5 @@ pub mod page_table;
 pub mod reader;
 pub mod v2;
 pub mod writer;
+
+pub use lance_encoding::version;

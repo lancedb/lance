@@ -1671,6 +1671,7 @@ pub mod test_dataset {
 
     use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::ArrowError;
+    use lance_file::version::LanceFileVersion;
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use tempfile::{tempdir, TempDir};
 
@@ -1694,7 +1695,10 @@ pub mod test_dataset {
     }
 
     impl TestVectorDataset {
-        pub async fn new(use_legacy_format: bool, stable_row_ids: bool) -> Result<Self> {
+        pub async fn new(
+            data_storage_version: LanceFileVersion,
+            stable_row_ids: bool,
+        ) -> Result<Self> {
             let tmp_dir = tempdir()?;
             let path = tmp_dir.path().to_str().unwrap();
 
@@ -1741,7 +1745,7 @@ pub mod test_dataset {
             let params = WriteParams {
                 max_rows_per_group: 10,
                 max_rows_per_file: 200,
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 enable_move_stable_row_ids: stable_row_ids,
                 ..Default::default()
             };
@@ -1823,6 +1827,7 @@ mod test {
     use datafusion::logical_expr::{col, lit};
     use half::f16;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
+    use lance_file::version::LanceFileVersion;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
@@ -1944,7 +1949,7 @@ mod test {
 
     #[tokio::test]
     async fn test_filter_parsing() -> Result<()> {
-        let test_ds = TestVectorDataset::new(true, false).await?;
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
         let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
@@ -1977,8 +1982,11 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_limit(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
-        let test_ds = TestVectorDataset::new(use_legacy_format, false).await?;
+    async fn test_limit(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        let test_ds = TestVectorDataset::new(data_storage_version, false).await?;
         let dataset = &test_ds.dataset;
 
         let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
@@ -1996,11 +2004,12 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_knn_nodes(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
         for build_index in &[true, false] {
-            let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+            let mut test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
                 .await
                 .unwrap();
             if *build_index {
@@ -2057,10 +2066,11 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_knn_with_new_data(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
-        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+        let mut test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
             .await
             .unwrap();
         test_ds.make_vector_index().await.unwrap();
@@ -2142,10 +2152,11 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_knn_with_prefilter(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
-        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+        let mut test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
             .await
             .unwrap();
         test_ds.make_vector_index().await.unwrap();
@@ -2205,13 +2216,14 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_knn_filter_new_data(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
         // This test verifies that a filter (prefilter or postfilter) gets applied to the flat KNN results
         // in a combined KNN scan (a scan that combines results from an indexed ANN with an unindexed flat
         // search of new data)
-        let mut test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+        let mut test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
             .await
             .unwrap();
         test_ds.make_vector_index().await.unwrap();
@@ -2274,10 +2286,11 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_knn_with_filter(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
-        let test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+        let test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
@@ -2331,10 +2344,11 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_refine_factor(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
-        let test_ds = TestVectorDataset::new(use_legacy_format, stable_row_ids)
+        let test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
@@ -2386,8 +2400,11 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_only_row_id(#[values(false, true)] use_legacy_format: bool) {
-        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+    async fn test_only_row_id(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_ds = TestVectorDataset::new(data_storage_version, false)
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
@@ -2416,7 +2433,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
         // This test doesn't make sense for v2 files, there is no way to get an out-of-order scan
-        let test_ds = TestVectorDataset::new(/*use_legacy_format=*/ true, false)
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, false)
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
@@ -2466,7 +2483,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_scan_order(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_scan_order(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2490,7 +2510,7 @@ mod test {
 
         let params = WriteParams {
             mode: WriteMode::Append,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
 
@@ -2537,7 +2557,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_scan_sort(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_scan_sort(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2570,7 +2593,7 @@ mod test {
             data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -2624,7 +2647,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_sort_multi_columns(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_sort_multi_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2649,7 +2675,7 @@ mod test {
             data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -2678,7 +2704,8 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_ann_prefilter(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
         #[values(
             VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
@@ -2711,7 +2738,7 @@ mod test {
         .unwrap()];
 
         let write_params = WriteParams {
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
             enable_move_stable_row_ids: stable_row_ids,
             ..Default::default()
@@ -2758,7 +2785,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_filter_on_large_utf8(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_filter_on_large_utf8(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2777,7 +2807,7 @@ mod test {
         .unwrap()];
 
         let write_params = WriteParams {
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2811,7 +2841,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_filter_with_regex(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_filter_with_regex(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2830,7 +2863,7 @@ mod test {
         .unwrap()];
 
         let write_params = WriteParams {
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2899,7 +2932,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_legacy_format: true,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         Dataset::write(batches, test_uri, Some(write_params))
@@ -2953,7 +2986,8 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_ann_with_deletion(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
         let vec_params = vec![
@@ -2997,7 +3031,7 @@ mod test {
                 reader,
                 test_uri,
                 Some(WriteParams {
-                    use_legacy_format,
+                    data_storage_version: Some(data_storage_version),
                     enable_move_stable_row_ids: stable_row_ids,
                     ..Default::default()
                 }),
@@ -3098,7 +3132,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     mode: WriteMode::Append,
-                    use_legacy_format,
+                    data_storage_version: Some(data_storage_version),
                     ..Default::default()
                 }),
             )
@@ -3147,7 +3181,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_count_rows_with_filter(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_count_rows_with_filter(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen = BatchGenerator::new().col(Box::new(
@@ -3157,7 +3194,7 @@ mod test {
             data_gen.batch(32),
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3180,7 +3217,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_dynamic_projection(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_dynamic_projection(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen =
@@ -3189,7 +3229,7 @@ mod test {
             data_gen.batch(32),
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3225,7 +3265,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_column_casting_function(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_column_casting_function(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen =
@@ -3234,7 +3277,7 @@ mod test {
             data_gen.batch(32),
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3316,7 +3359,7 @@ mod test {
     }
 
     impl ScalarIndexTestFixture {
-        async fn new(use_legacy_format: bool, use_stable_row_ids: bool) -> Self {
+        async fn new(data_storage_version: LanceFileVersion, use_stable_row_ids: bool) -> Self {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
@@ -3341,7 +3384,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     max_rows_per_file: 500,
-                    use_legacy_format,
+                    data_storage_version: Some(data_storage_version),
                     enable_move_stable_row_ids: use_stable_row_ids,
                     ..Default::default()
                 }),
@@ -3393,7 +3436,7 @@ mod test {
                 .append(
                     RecordBatchIterator::new(vec![Ok(append_data)], data.schema()),
                     Some(WriteParams {
-                        use_legacy_format,
+                        data_storage_version: Some(data_storage_version),
                         ..Default::default()
                     }),
                 )
@@ -3716,10 +3759,11 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_secondary_index_scans(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] use_stable_row_ids: bool,
     ) {
-        let fixture = ScalarIndexTestFixture::new(use_legacy_format, use_stable_row_ids).await;
+        let fixture = ScalarIndexTestFixture::new(data_storage_version, use_stable_row_ids).await;
 
         for use_index in [false, true] {
             for use_projection in [false, true] {
@@ -3806,7 +3850,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_late_materialization(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_late_materialization(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
         let data = gen()
@@ -3827,7 +3874,7 @@ mod test {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3908,7 +3955,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_project_nested(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_project_nested(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         let struct_i_field = ArrowField::new("i", DataType::Int32, true);
         let struct_o_field = ArrowField::new("o", DataType::Utf8, true);
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -3949,7 +3999,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         Dataset::write(batches, test_uri, Some(write_params))
@@ -3976,16 +4026,17 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_plans(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_id: bool,
     ) -> Result<()> {
         // Create a vector dataset
-        let mut dataset = TestVectorDataset::new(use_legacy_format, stable_row_id).await?;
+        let mut dataset = TestVectorDataset::new(data_storage_version, stable_row_id).await?;
 
         // Scans
         // ---------------------------------------------------------------------
         // Experimental writer does not use LancePushdownScan
-        if use_legacy_format {
+        if data_storage_version == LanceFileVersion::Legacy {
             assert_plan_equals(
                 &dataset.dataset,
                 |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
@@ -4384,7 +4435,9 @@ mod test {
     #[tokio::test]
     async fn test_fast_search_plan() {
         // Create a vector dataset
-        let mut dataset = TestVectorDataset::new(false, true).await.unwrap();
+        let mut dataset = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
         dataset.make_vector_index().await.unwrap();
         dataset.append_new_data().await.unwrap();
 

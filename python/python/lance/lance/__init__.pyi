@@ -39,6 +39,7 @@ class LanceFileWriter:
         path: str,
         schema: Optional[pa.Schema],
         data_cache_bytes: Optional[int],
+        version: Optional[str],
         keep_original_array: Optional[bool],
     ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...

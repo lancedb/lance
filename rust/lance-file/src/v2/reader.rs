@@ -14,6 +14,7 @@ use lance_encoding::{
         FilterExpression, PageInfo, ReadBatchTask,
     },
     encoder::EncodedBatch,
+    version::LanceFileVersion,
     EncodingsIo,
 };
 use log::debug;
@@ -34,7 +35,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
-    format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION_NEXT},
+    format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION},
 };
 
 use super::io::LanceEncodingsIo;
@@ -82,6 +83,19 @@ impl DeepSizeOf for CachedFileMetadata {
                 .iter()
                 .map(|file_buffer| file_buffer.deep_size_of_children(context))
                 .sum::<usize>()
+    }
+}
+
+impl CachedFileMetadata {
+    pub fn version(&self) -> LanceFileVersion {
+        match (self.major_version, self.minor_version) {
+            (0, 3) => LanceFileVersion::V2_0,
+            (2, 1) => LanceFileVersion::V2_1,
+            _ => panic!(
+                "Unsupported version: {}.{}",
+                self.major_version, self.minor_version
+            ),
+        }
     }
 }
 
@@ -189,12 +203,9 @@ impl FileReader {
         let major_version = cursor.read_u16::<LittleEndian>()?;
         let minor_version = cursor.read_u16::<LittleEndian>()?;
 
-        if major_version != MAJOR_VERSION as u16 || minor_version != MINOR_VERSION_NEXT {
+        if major_version == MAJOR_VERSION as u16 && minor_version == MINOR_VERSION as u16 {
             return Err(Error::io(
-                format!(
-                    "Attempt to use the lance v0.2 reader to read a file with version {}.{}",
-                    major_version, minor_version
-                ),
+                "Attempt to use the lance v2 reader to read a legacy file".to_string(),
                 location!(),
             ));
         }
@@ -985,7 +996,6 @@ pub mod tests {
         encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch},
     };
     use lance_io::stream::RecordBatchStream;
-    use lance_testing::util::EnvVarGuard;
     use log::debug;
 
     use crate::v2::{
@@ -1262,8 +1272,6 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_compressing_buffer() {
         let fs = FsFixture::default();
-        // set env var temporarily to test compressed page
-        let _env_guard = EnvVarGuard::new("LANCE_PAGE_COMPRESSION", "zstd");
 
         let (schema, data) = create_some_file(&fs).await;
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
@@ -1277,7 +1285,12 @@ pub mod tests {
         .await
         .unwrap();
 
-        let projection = schema.project(&["score"]).unwrap();
+        let mut projection = schema.project(&["score"]).unwrap();
+        for field in projection.fields.iter_mut() {
+            field
+                .metadata
+                .insert("lance:compression".to_string(), "zstd".to_string());
+        }
         let projection = ReaderProjection {
             column_indices: projection.fields.iter().map(|f| f.id as u32).collect(),
             schema: Arc::new(projection),

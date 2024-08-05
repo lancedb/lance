@@ -2,4 +2,3 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod datagen;
-pub mod util;
