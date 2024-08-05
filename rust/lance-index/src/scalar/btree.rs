@@ -1170,6 +1170,7 @@ impl TrainingSource for BTreeUpdater {
         self: Box<Self>,
         _chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
+        // BTree indices will never use unordered scans
         unimplemented!()
     }
 }

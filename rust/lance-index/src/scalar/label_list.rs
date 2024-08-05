@@ -272,7 +272,7 @@ impl TrainingSource for UnnestTrainingSource {
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
         let source = self.source.scan_ordered_chunks(chunk_size).await?;
-        scan_chunks(source)
+        unnest_chunks(source)
     }
 
     async fn scan_unordered_chunks(
@@ -280,11 +280,11 @@ impl TrainingSource for UnnestTrainingSource {
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
         let source = self.source.scan_unordered_chunks(chunk_size).await?;
-        scan_chunks(source)
+        unnest_chunks(source)
     }
 }
 
-fn scan_chunks(
+fn unnest_chunks(
     source: Pin<Box<dyn RecordBatchStream + Send>>,
 ) -> Result<SendableRecordBatchStream> {
     let unnest_schema = unnest_schema(source.schema().as_ref());
