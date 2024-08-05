@@ -297,11 +297,14 @@ const LANCE_FORMAT_NAME: &str = "lance";
 
 impl DataStorageFormat {
     pub fn new(version: LanceFileVersion) -> Self {
-        let version_str = String::from(version.resolve());
         Self {
             file_format: LANCE_FORMAT_NAME.to_string(),
-            version: version_str,
+            version: version.resolve().to_string(),
         }
+    }
+
+    pub fn lance_file_version(&self) -> Result<LanceFileVersion> {
+        self.version.parse::<LanceFileVersion>()
     }
 }
 

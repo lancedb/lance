@@ -15,7 +15,6 @@ use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
@@ -527,8 +526,7 @@ impl Dataset {
                     },
                 )?;
                 // If appending, always use existing storage version
-                storage_version =
-                    LanceFileVersion::try_from(m.data_storage_format.version.as_str())?;
+                storage_version = m.data_storage_format.lance_file_version()?;
             }
         }
 
@@ -1507,6 +1505,7 @@ mod tests {
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_file::version::LanceFileVersion;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;

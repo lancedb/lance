@@ -41,11 +41,6 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
-use lance_file::version::LanceFileVersion;
-use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::FullTextSearchQuery;
-use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
@@ -1378,8 +1373,7 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         }
         if let Some(data_storage_version) = get_dict_opt::<String>(options, "data_storage_version")?
         {
-            p.data_storage_version =
-                Some(LanceFileVersion::try_from(data_storage_version).infer_error()?);
+            p.data_storage_version = Some(data_storage_version.parse().infer_error()?);
         }
         if let Some(progress) = get_dict_opt::<PyObject>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));

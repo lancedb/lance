@@ -222,9 +222,10 @@ pub async fn write_fragments_internal(
             // Append mode, so we need to check compatibility
             schema.check_compatible(dataset.schema(), &Default::default())?;
             // If appending use storage version from dataset
-            storage_version = LanceFileVersion::try_from(
-                dataset.manifest().data_storage_format.version.as_str(),
-            )?;
+            storage_version = dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_version()?;
             // Use the schema from the dataset, because it has the correct
             // field ids.
             dataset.schema()

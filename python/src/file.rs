@@ -186,7 +186,7 @@ impl LanceFileWriter {
             data_cache_bytes,
             keep_original_array,
             format_version: version
-                .map(|v| LanceFileVersion::try_from(v.as_str()))
+                .map(|v| v.parse::<LanceFileVersion>())
                 .transpose()
                 .infer_error()?,
             ..Default::default()

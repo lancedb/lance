@@ -648,9 +648,10 @@ impl MergeInsertJob {
                     // Also, because we already sorted by row address, the rows
                     // will be in the correct order.
 
-                    let data_storage_version = LanceFileVersion::try_from(
-                        dataset.manifest().data_storage_format.version.as_str(),
-                    )?;
+                    let data_storage_version = dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()?;
                     let mut writer = open_writer(
                         dataset.object_store(),
                         &write_schema,

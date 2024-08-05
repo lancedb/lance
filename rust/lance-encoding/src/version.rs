@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::str::FromStr;
+
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
@@ -43,26 +45,24 @@ impl LanceFileVersion {
 
 impl std::fmt::Display for LanceFileVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", String::from(*self))
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Legacy => LEGACY_FORMAT_VERSION,
+                Self::V2_0 => V2_FORMAT_2_0,
+                Self::V2_1 => V2_FORMAT_2_1,
+                Self::Stable => "stable",
+                Self::Next => "next",
+            }
+        )
     }
 }
 
-impl From<LanceFileVersion> for String {
-    fn from(version: LanceFileVersion) -> Self {
-        match version {
-            LanceFileVersion::Legacy => LEGACY_FORMAT_VERSION.to_string(),
-            LanceFileVersion::V2_0 => V2_FORMAT_2_0.to_string(),
-            LanceFileVersion::V2_1 => V2_FORMAT_2_1.to_string(),
-            LanceFileVersion::Stable => "stable".to_string(),
-            LanceFileVersion::Next => "next".to_string(),
-        }
-    }
-}
+impl FromStr for LanceFileVersion {
+    type Err = Error;
 
-impl TryFrom<&str> for LanceFileVersion {
-    type Error = Error;
-
-    fn try_from(value: &str) -> Result<Self> {
+    fn from_str(value: &str) -> Result<Self> {
         match value.to_lowercase().as_str() {
             LEGACY_FORMAT_VERSION => Ok(Self::Legacy),
             V2_FORMAT_2_0 => Ok(Self::V2_0),
@@ -76,13 +76,5 @@ impl TryFrom<&str> for LanceFileVersion {
                 location: location!(),
             }),
         }
-    }
-}
-
-impl TryFrom<String> for LanceFileVersion {
-    type Error = Error;
-
-    fn try_from(value: String) -> Result<Self> {
-        Self::try_from(value.as_str())
     }
 }
