@@ -487,6 +487,10 @@ async fn check_round_trip_field_encoding_random(
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
         for use_slicing in [false, true] {
+            if null_rate != Some(1.0) && matches!(field.data_type(), DataType::Null) {
+                continue;
+            }
+
             let field = if null_rate.is_some() {
                 if !supports_nulls(field.data_type()) {
                     continue;
@@ -520,7 +524,11 @@ async fn check_round_trip_field_encoding_random(
                 if use_slicing {
                     let mut generator = gen().anon_col(array_generator_provider.provide());
                     if let Some(null_rate) = null_rate {
-                        generator.with_random_nulls(null_rate);
+                        // The null generator is the only generator that already inserts nulls
+                        // and attempting to do so again makes arrow-rs grumpy
+                        if !matches!(field.data_type(), DataType::Null) {
+                            generator.with_random_nulls(null_rate);
+                        }
                     }
                     let all_data = generator
                         .into_batch_rows(RowCount::from(10000))
@@ -538,7 +546,11 @@ async fn check_round_trip_field_encoding_random(
                             .with_seed(Seed::from(i as u64))
                             .anon_col(array_generator_provider.provide());
                         if let Some(null_rate) = null_rate {
-                            generator.with_random_nulls(null_rate);
+                            // The null generator is the only generator that already inserts nulls
+                            // and attempting to do so again makes arrow-rs grumpy
+                            if !matches!(field.data_type(), DataType::Null) {
+                                generator.with_random_nulls(null_rate);
+                            }
                         }
                         let arr = generator
                             .into_batch_rows(RowCount::from(rows_per_batch as u64))

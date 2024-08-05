@@ -334,6 +334,7 @@ pub(crate) mod tests {
     };
 
     const PRIMITIVE_TYPES: &[DataType] = &[
+        DataType::Null,
         DataType::FixedSizeBinary(2),
         DataType::Date32,
         DataType::Date64,
