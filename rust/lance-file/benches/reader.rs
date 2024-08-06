@@ -10,7 +10,10 @@ use lance_file::v2::{
     reader::FileReader,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_io::{object_store::ObjectStore, scheduler::ScanScheduler};
+use lance_io::{
+    object_store::ObjectStore,
+    scheduler::{ScanScheduler, SchedulerConfig},
+};
 
 fn bench_reader(c: &mut Criterion) {
     let mut group = c.benchmark_group("reader");
@@ -44,7 +47,10 @@ fn bench_reader(c: &mut Criterion) {
             let file_path = &file_path;
             let data = &data;
             rt.block_on(async move {
-                let store_scheduler = ScanScheduler::new(Arc::new(object_store.clone()));
+                let store_scheduler = ScanScheduler::new(
+                    Arc::new(object_store.clone()),
+                    SchedulerConfig::default_for_testing(),
+                );
                 let scheduler = store_scheduler.open_file(file_path).await.unwrap();
                 let reader = FileReader::try_open(
                     scheduler.clone(),

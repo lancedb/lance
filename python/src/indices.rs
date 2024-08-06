@@ -5,12 +5,19 @@ use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use lance::index::vector::ivf::builder::write_vector_storage;
+use lance::io::ObjectStore;
+use lance_index::vector::ivf::shuffler::shuffle_vectors;
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
     pq::{PQBuildParams, ProductQuantizer},
 };
 use lance_linalg::distance::DistanceType;
-use pyo3::{pyfunction, types::PyModule, wrap_pyfunction, PyObject, PyResult, Python};
+use pyo3::exceptions::PyValueError;
+use pyo3::{
+    pyfunction,
+    types::{PyList, PyModule},
+    wrap_pyfunction, PyObject, PyResult, Python,
+};
 
 use crate::fragment::FileFragment;
 use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
@@ -220,11 +227,54 @@ pub fn transform_vectors(
     )?
 }
 
+async fn do_shuffle_transformed_vectors(
+    filenames: Vec<String>,
+    dir_path: &str,
+    ivf_centroids: FixedSizeListArray,
+) -> PyResult<Vec<String>> {
+    let (obj_store, path) = ObjectStore::from_path(dir_path).infer_error()?;
+    if !obj_store.is_local() {
+        return Err(PyValueError::new_err(
+            "shuffle_vectors input and output path is currently required to be local",
+        ));
+    }
+    let partition_files = shuffle_vectors(filenames, path, ivf_centroids)
+        .await
+        .infer_error()?;
+    Ok(partition_files)
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn shuffle_transformed_vectors(
+    py: Python<'_>,
+    filenames: Vec<String>,
+    dir_path: &str,
+    ivf_centroids: PyArrowType<ArrayData>,
+) -> PyResult<PyObject> {
+    let ivf_centroids = ivf_centroids.0;
+    let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
+
+    let result = RT.block_on(
+        None,
+        do_shuffle_transformed_vectors(filenames, dir_path, ivf_centroids),
+    )?;
+
+    match result {
+        Ok(partition_files) => {
+            let py_list = PyList::new(py, partition_files);
+            Ok(py_list.into())
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+    }
+}
+
 pub fn register_indices(py: Python, m: &PyModule) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
+    indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     m.add_submodule(indices)?;
     Ok(())
 }

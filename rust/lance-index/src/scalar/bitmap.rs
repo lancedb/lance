@@ -341,7 +341,7 @@ pub async fn train_bitmap_index(
     data_source: Box<dyn TrainingSource + Send>,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
-    let batches_source = data_source.scan_ordered_chunks(4096).await?;
+    let batches_source = data_source.scan_unordered_chunks(4096).await?;
 
     // mapping from item to list of the row ids where it is present
     let dictionary: HashMap<ScalarValue, RowIdTreeMap> = HashMap::new();

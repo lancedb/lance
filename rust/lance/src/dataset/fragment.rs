@@ -26,7 +26,7 @@ use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2;
 use lance_file::v2::reader::{CachedFileMetadata, ReaderProjection};
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::{FileScheduler, ScanScheduler};
+use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
@@ -46,6 +46,7 @@ use super::updater::Updater;
 use super::WriteParams;
 use crate::arrow::*;
 use crate::dataset::Dataset;
+use crate::utils::default_deadlock_prevention_timeout;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -539,8 +540,15 @@ impl FileFragment {
             Ok(None)
         } else {
             let path = self.dataset.data_dir().child(data_file.path.as_str());
-            let store_scheduler = scan_scheduler
-                .unwrap_or_else(|| ScanScheduler::new(self.dataset.object_store.clone()));
+            let store_scheduler = scan_scheduler.unwrap_or_else(|| {
+                ScanScheduler::new(
+                    self.dataset.object_store.clone(),
+                    SchedulerConfig {
+                        io_buffer_size_bytes: 256 * 1024 * 1024,
+                        deadlock_prevention_timeout: default_deadlock_prevention_timeout(),
+                    },
+                )
+            });
             let file_scheduler = store_scheduler.open_file(&path).await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let reader = Arc::new(
@@ -1709,6 +1717,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
+    use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStoreRegistry;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
@@ -1717,7 +1726,7 @@ mod tests {
     use super::*;
     use crate::dataset::transaction::Operation;
 
-    async fn create_dataset(test_uri: &str, use_legacy_format: bool) -> Dataset {
+    async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
             ArrowField::new("s", DataType::Utf8, true),
@@ -1741,7 +1750,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1772,7 +1781,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_legacy_format: false,
+            data_storage_version: Some(LanceFileVersion::Stable),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -1783,11 +1792,15 @@ mod tests {
         Dataset::open(test_uri).await.unwrap()
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_fragment_scan() {
+    async fn test_fragment_scan(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri, true).await;
+        let dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = &dataset.get_fragments()[2];
         let mut scanner = fragment.scan();
         let batches = scanner
@@ -1801,20 +1814,29 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(batches.len(), 3);
+        if data_storage_version == LanceFileVersion::Legacy {
+            assert_eq!(batches.len(), 3);
 
-        assert_eq!(
-            batches[0].column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from_iter_values(80..90)
-        );
-        assert_eq!(
-            batches[1].column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from_iter_values(90..100)
-        );
-        assert_eq!(
-            batches[2].column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from_iter_values(100..105)
-        );
+            assert_eq!(
+                batches[0].column_by_name("i").unwrap().as_ref(),
+                &Int32Array::from_iter_values(80..90)
+            );
+            assert_eq!(
+                batches[1].column_by_name("i").unwrap().as_ref(),
+                &Int32Array::from_iter_values(90..100)
+            );
+            assert_eq!(
+                batches[2].column_by_name("i").unwrap().as_ref(),
+                &Int32Array::from_iter_values(100..105)
+            );
+        } else {
+            assert_eq!(batches.len(), 1);
+
+            assert_eq!(
+                batches[0].column_by_name("i").unwrap().as_ref(),
+                &Int32Array::from_iter_values(80..105)
+            )
+        }
     }
 
     #[tokio::test]
@@ -1868,7 +1890,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         // Creates 400 rows in 10 fragments
-        let mut dataset = create_dataset(test_uri, true).await;
+        let mut dataset = create_dataset(test_uri, LanceFileVersion::Legacy).await;
         // Delete last 20 rows in first fragment
         dataset.delete("i >= 20").await.unwrap();
         // Last fragment has 20 rows but 40 addressible rows
@@ -1895,11 +1917,15 @@ mod tests {
         }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_fragment_scan_deletions() {
+    async fn test_fragment_scan_deletions(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri, true).await;
+        let mut dataset = create_dataset(test_uri, data_storage_version).await;
         dataset.delete("i >= 0 and i < 15").await.unwrap();
 
         let fragment = &dataset.get_fragments()[0];
@@ -1909,40 +1935,79 @@ mod tests {
             .unwrap();
         reader.with_make_deletions_null();
 
-        // Since the first batch is all deleted, it will return an empty batch.
-        let batch1 = reader
-            .legacy_read_batch_projected(0, .., dataset.schema())
-            .await
-            .unwrap();
-        assert_eq!(batch1.num_rows(), 0);
+        if data_storage_version == LanceFileVersion::Legacy {
+            // Since the first batch is all deleted, it will return an empty batch.
+            let batch1 = reader
+                .legacy_read_batch_projected(0, .., dataset.schema())
+                .await
+                .unwrap();
+            assert_eq!(batch1.num_rows(), 0);
 
-        // The second batch is partially deleted, so the deleted rows will be
-        // marked null with null row ids.
-        let batch2 = reader
-            .legacy_read_batch_projected(1, .., dataset.schema())
-            .await
-            .unwrap();
-        assert_eq!(
-            batch2.column_by_name(ROW_ID).unwrap().as_ref(),
-            &UInt64Array::from_iter((10..20).map(|v| if v < 15 { None } else { Some(v) }))
-        );
+            // The second batch is partially deleted, so the deleted rows will be
+            // marked null with null row ids.
+            let batch2 = reader
+                .legacy_read_batch_projected(1, .., dataset.schema())
+                .await
+                .unwrap();
+            assert_eq!(
+                batch2.column_by_name(ROW_ID).unwrap().as_ref(),
+                &UInt64Array::from_iter((10..20).map(|v| if v < 15 { None } else { Some(v) }))
+            );
 
-        // The final batch is not deleted, so it will be returned as-is.
-        let batch3 = reader
-            .legacy_read_batch_projected(2, .., dataset.schema())
-            .await
-            .unwrap();
-        assert_eq!(
-            batch3.column_by_name(ROW_ID).unwrap().as_ref(),
-            &UInt64Array::from_iter_values(20..30)
-        );
+            // The final batch is not deleted, so it will be returned as-is.
+            let batch3 = reader
+                .legacy_read_batch_projected(2, .., dataset.schema())
+                .await
+                .unwrap();
+            assert_eq!(
+                batch3.column_by_name(ROW_ID).unwrap().as_ref(),
+                &UInt64Array::from_iter_values(20..30)
+            );
+        } else {
+            let to_batches = |range: Range<u32>| {
+                let batch_size = range.len() as u32;
+                reader
+                    .read_range(range, batch_size)
+                    .unwrap()
+                    .buffered(1)
+                    .try_collect::<Vec<_>>()
+            };
+            // Since the first batch is all deleted, it will return an empty batch.
+            let batches = to_batches(0..10).await.unwrap();
+            assert_eq!(batches.len(), 1);
+            let batch = batches.into_iter().next().unwrap();
+            assert_eq!(batch.num_rows(), 0);
+
+            let batches = to_batches(10..20).await.unwrap();
+            assert_eq!(batches.len(), 1);
+            let batch = batches.into_iter().next().unwrap();
+            // The second batch is partially deleted, so the deleted rows will be
+            // marked null with null row ids.
+            assert_eq!(
+                batch.column_by_name(ROW_ID).unwrap().as_ref(),
+                &UInt64Array::from_iter((10..20).map(|v| if v < 15 { None } else { Some(v) }))
+            );
+
+            // The final batch is not deleted, so it will be returned as-is.
+            let batches = to_batches(20..30).await.unwrap();
+            assert_eq!(batches.len(), 1);
+            let batch = batches.into_iter().next().unwrap();
+            assert_eq!(
+                batch.column_by_name(ROW_ID).unwrap().as_ref(),
+                &UInt64Array::from_iter_values(20..30)
+            );
+        }
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_fragment_take_indices() {
+    async fn test_fragment_take_indices(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri, true).await;
+        let mut dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset
             .get_fragments()
             .into_iter()
@@ -1986,11 +2051,15 @@ mod tests {
         );
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_fragment_take_rows() {
+    async fn test_fragment_take_rows(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri, true).await;
+        let mut dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset
             .get_fragments()
             .into_iter()
@@ -2055,7 +2124,7 @@ mod tests {
     async fn test_recommit_from_file() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri, true).await;
+        let dataset = create_dataset(test_uri, LanceFileVersion::Legacy).await;
         let schema = dataset.schema();
         let dataset_rows = dataset.count_rows(None).await.unwrap();
 
@@ -2100,10 +2169,13 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_fragment_count(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_fragment_count(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri, use_legacy_format).await;
+        let dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset.get_fragments().pop().unwrap();
 
         assert_eq!(fragment.count_rows().await.unwrap(), 40);
@@ -2129,11 +2201,14 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_append_new_columns(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_append_new_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         for with_delete in [true, false] {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
-            let mut dataset = create_dataset(test_uri, use_legacy_format).await;
+            let mut dataset = create_dataset(test_uri, data_storage_version).await;
             dataset.validate().await.unwrap();
             assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 
@@ -2219,10 +2294,13 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_merge_fragment(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_merge_fragment(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri, use_legacy_format).await;
+        let mut dataset = create_dataset(test_uri, data_storage_version).await;
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
 
@@ -2375,6 +2453,7 @@ mod tests {
             None,
         )
         .await?;
+
         let fragment = dataset.get_fragments().pop().unwrap();
 
         // Write batch_s using add_columns

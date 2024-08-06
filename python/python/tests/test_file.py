@@ -61,6 +61,26 @@ def test_multiple_close(tmp_path):
     writer.close()
 
 
+def test_version(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+
+    with LanceFileWriter(str(path), schema) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    reader = LanceFileReader(str(path))
+    metadata = reader.metadata()
+    assert metadata.major_version == 0
+    assert metadata.minor_version == 3
+
+    path = tmp_path / "foo2.lance"
+    with LanceFileWriter(str(path), schema, version="2.1") as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    reader = LanceFileReader(str(path))
+    metadata = reader.metadata()
+    assert metadata.major_version == 2
+    assert metadata.minor_version == 1
+
+
 def test_take(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])

@@ -16,6 +16,7 @@ pub mod encodings;
 pub mod format;
 #[cfg(test)]
 pub mod testing;
+pub mod version;
 
 /// A trait for an I/O service
 ///

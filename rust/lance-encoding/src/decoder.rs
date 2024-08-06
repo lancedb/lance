@@ -213,6 +213,7 @@
 //!    relation to the way the data is stored.
 
 use std::collections::VecDeque;
+use std::sync::Once;
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -224,7 +225,7 @@ use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
-use log::trace;
+use log::{trace, warn};
 use snafu::{location, Location};
 use tokio::sync::mpsc::{self, unbounded_channel};
 
@@ -239,6 +240,9 @@ use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructSched
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
 use crate::{BufferScheduler, EncodingsIo};
+
+// If users are getting batches over 10MiB large then it's time to reduce the batch size
+const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 
 /// Metadata describing a page in a file
 ///
@@ -1011,7 +1015,7 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
+        debug_assert!(indices.windows(2).all(|w| w[0] <= w[1]));
         if indices.is_empty() {
             return;
         }
@@ -1050,6 +1054,7 @@ pub struct BatchDecodeStream {
     rows_scheduled: u64,
     rows_drained: u64,
     scheduler_exhuasted: bool,
+    emitted_batch_size_warning: Arc<Once>,
 }
 
 impl BatchDecodeStream {
@@ -1077,6 +1082,7 @@ impl BatchDecodeStream {
             rows_scheduled: 0,
             rows_drained: 0,
             scheduler_exhuasted: false,
+            emitted_batch_size_warning: Arc::new(Once::new()),
         }
     }
 
@@ -1164,10 +1170,23 @@ impl BatchDecodeStream {
     }
 
     #[instrument(level = "debug", skip_all)]
-    fn task_to_batch(task: NextDecodeTask) -> Result<RecordBatch> {
+    fn task_to_batch(
+        task: NextDecodeTask,
+        emitted_batch_size_warning: Arc<Once>,
+    ) -> Result<RecordBatch> {
         let struct_arr = task.task.decode();
         match struct_arr {
-            Ok(struct_arr) => Ok(RecordBatch::from(struct_arr.as_struct())),
+            Ok(struct_arr) => {
+                let batch = RecordBatch::from(struct_arr.as_struct());
+                let size_bytes = batch.get_array_memory_size() as u64;
+                if size_bytes > BATCH_SIZE_BYTES_WARNING {
+                    emitted_batch_size_warning.call_once(|| {
+                        let size_mb = size_bytes / 1024 / 1024;
+                        warn!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
+                    });
+                }
+                Ok(batch)
+            }
             Err(e) => {
                 let e = Error::Internal {
                     message: format!("Error decoding batch: {}", e),
@@ -1183,9 +1202,10 @@ impl BatchDecodeStream {
             let next_task = slf.next_batch_task().await;
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
+                let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
                 let task = tokio::spawn(async move {
                     let next_task = next_task?;
-                    Self::task_to_batch(next_task)
+                    Self::task_to_batch(next_task, emitted_batch_size_warning)
                 });
                 (task, num_rows)
             });

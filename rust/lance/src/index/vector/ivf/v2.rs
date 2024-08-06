@@ -39,6 +39,7 @@ use lance_index::{
     Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use lance_io::scheduler::SchedulerConfig;
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader, ReadBatchParams,
 };
@@ -110,7 +111,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         uuid: String,
         session: Weak<Session>,
     ) -> Result<Self> {
-        let scheduler = ScanScheduler::new(object_store);
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig::fast_and_not_too_ram_intensive(),
+        );
 
         let index_reader = FileReader::try_open(
             scheduler

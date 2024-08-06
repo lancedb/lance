@@ -63,6 +63,7 @@ def test_ray_sink(tmp_path: Path):
     assert ds.schema == schema
 
 
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_ray_committer(tmp_path: Path):
     schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
 
@@ -83,6 +84,7 @@ def test_ray_committer(tmp_path: Path):
     assert len(ds.get_fragments()) == 2
 
 
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_ray_write_lance(tmp_path: Path):
     schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
 

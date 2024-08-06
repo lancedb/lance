@@ -528,7 +528,7 @@ mod tests {
     use lance_core::datatypes::{Field, Schema};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
-    use lance_table::format::DataFile;
+    use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
     };
@@ -894,7 +894,7 @@ mod tests {
             },
         ];
 
-        let mut manifest = Manifest::new(schema, Arc::new(fragments));
+        let mut manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
 
         fix_schema(&mut manifest).unwrap();
 

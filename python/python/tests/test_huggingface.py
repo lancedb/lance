@@ -4,9 +4,12 @@
 from pathlib import Path
 
 import lance
+import lance.torch.data
+import numpy as np
 import pytest
 
 datasets = pytest.importorskip("datasets")
+pil = pytest.importorskip("PIL")
 
 
 def test_write_hf_dataset(tmp_path: Path):
@@ -21,3 +24,24 @@ def test_write_hf_dataset(tmp_path: Path):
     assert ds.count_rows() == 50
 
     assert ds.schema == hf_ds.features.arrow_schema
+
+
+def test_image_hf_dataset(tmp_path: Path):
+    ds = datasets.Dataset.from_dict(
+        {"i": [np.zeros(shape=(16, 16, 3), dtype=np.uint8)]},
+        features=datasets.Features({"i": datasets.Image()}),
+    )
+
+    ds = lance.write_dataset(ds, tmp_path)
+
+    dataset = lance.torch.data.LanceDataset(
+        ds,
+        columns=["i"],
+        batch_size=8,
+    )
+    batch = next(iter(dataset))
+    assert len(batch) == 1
+    assert all(
+        (isinstance(img, pil.Image.Image) and np.all(np.array(img) == 0))
+        for img in batch
+    )

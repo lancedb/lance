@@ -283,8 +283,9 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
     fn new(
+        py: Python,
         uri: String,
-        version: Option<u64>,
+        version: Option<PyObject>,
         block_size: Option<usize>,
         index_cache_size: Option<usize>,
         metadata_cache_size: Option<usize>,
@@ -309,7 +310,17 @@ impl Dataset {
 
         let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
         if let Some(ver) = version {
-            builder = builder.with_version(ver);
+            if let Ok(i) = ver.downcast::<PyInt>(py) {
+                let v: u64 = i.extract()?;
+                builder = builder.with_version(v);
+            } else if let Ok(v) = ver.downcast::<PyString>(py) {
+                let t: &str = v.extract()?;
+                builder = builder.with_tag(t);
+            } else {
+                return Err(PyIOError::new_err(
+                    "version must be an integer or a string.",
+                ));
+            };
         }
         if let Some(storage_options) = storage_options {
             builder = builder.with_storage_options(storage_options);
@@ -343,6 +354,11 @@ impl Dataset {
     #[getter(lance_schema)]
     fn lance_schema(self_: PyRef<'_, Self>) -> LanceSchema {
         LanceSchema(self_.ds.schema().clone())
+    }
+
+    #[getter(data_storage_version)]
+    fn data_storage_version(&self) -> PyResult<String> {
+        Ok(self.ds.manifest().data_storage_format.version.clone())
     }
 
     /// Get index statistics
@@ -1355,8 +1371,9 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(maybe_nbytes) = get_dict_opt::<usize>(options, "max_bytes_per_file")? {
             p.max_bytes_per_file = maybe_nbytes;
         }
-        if let Some(use_legacy_format) = get_dict_opt::<bool>(options, "use_legacy_format")? {
-            p.use_legacy_format = use_legacy_format;
+        if let Some(data_storage_version) = get_dict_opt::<String>(options, "data_storage_version")?
+        {
+            p.data_storage_version = Some(data_storage_version.parse().infer_error()?);
         }
         if let Some(progress) = get_dict_opt::<PyObject>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));

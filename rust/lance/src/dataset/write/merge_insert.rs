@@ -60,6 +60,7 @@ use lance_datafusion::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
     utils::reader_to_stream,
 };
+use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, Index};
 use log::info;
@@ -647,13 +648,15 @@ impl MergeInsertJob {
                     // Also, because we already sorted by row address, the rows
                     // will be in the correct order.
 
-                    let use_legacy_file = fragment.metadata.files[0].is_legacy_file();
-
+                    let data_storage_version = dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()?;
                     let mut writer = open_writer(
                         dataset.object_store(),
                         &write_schema,
                         &dataset.base,
-                        use_legacy_file,
+                        data_storage_version,
                     )
                     .await?;
 
@@ -668,7 +671,7 @@ impl MergeInsertJob {
                             Err(e) => Err(e),
                         })?;
 
-                    if use_legacy_file {
+                    if data_storage_version == LanceFileVersion::Legacy {
                         // Need to match the existing batch size exactly, otherwise
                         // we'll get errors.
                         let reader = fragment.open(dataset.schema(), false, true, None).await?;

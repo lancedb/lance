@@ -155,7 +155,7 @@ class LanceDataset(pa.dataset.Dataset):
     def __init__(
         self,
         uri: Union[str, Path],
-        version: Optional[int] = None,
+        version: Optional[int | str] = None,
         block_size: Optional[int] = None,
         index_cache_size: Optional[int] = None,
         metadata_cache_size: Optional[int] = None,
@@ -373,6 +373,13 @@ class LanceDataset(pa.dataset.Dataset):
         The LanceSchema for this dataset
         """
         return self._ds.lance_schema
+
+    @property
+    def data_storage_version(self) -> str:
+        """
+        The version of the data storage format this dataset is using
+        """
+        return self._ds.data_storage_version
 
     def to_table(
         self,
@@ -1196,10 +1203,9 @@ class LanceDataset(pa.dataset.Dataset):
             dataset = lance.dataset("/tmp/images.lance")
             my_table = dataset.scanner(filter="my_col != 7").to_table()
 
-        Scalar indices can also speed up scans containing a vector search and a
-        prefilter:
+        Vector search with pre-filers can also benefit from scalar indices. For example,
 
-        .. code-block::python
+        .. code-block:: python
 
             import lance
 
@@ -1214,44 +1220,25 @@ class LanceDataset(pa.dataset.Dataset):
                 prefilter=True
             )
 
-        Scalar indices can only speed up scans for basic filters using
-        equality, comparison, range (e.g. ``my_col BETWEEN 0 AND 100``), and set
-        membership (e.g. `my_col IN (0, 1, 2)`)
 
-        Scalar indices can be used if the filter contains multiple indexed columns and
-        the filter criteria are AND'd or OR'd together
-        (e.g. ``my_col < 0 AND other_col> 100``)
+        There are 4 types of scalar indices available today.
 
-        Scalar indices may be used if the filter contains non-indexed columns but,
-        depending on the structure of the filter, they may not be usable.  For example,
-        if the column ``not_indexed`` does not have a scalar index then the filter
-        ``my_col = 0 OR not_indexed = 1`` will not be able to use any scalar index on
-        ``my_col``.
-
-        To determine if a scan is making use of a scalar index you can use
-        ``explain_plan`` to look at the query plan that lance has created.  Queries
-        that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
-        ``MaterializeIndex`` operator.
-
-        There are 4 types of scalar indices available today.  The most common
-        type is ``BTREE``. This index is inspired by the btree data structure
-        although only the first few layers of the btree are cached in memory.  It iwll
-        perform well on columns with a large number of unique values and few rows per
-        value.
-
-        The other common index type is ``BITMAP``.  This index stores a bitmap for each
-        unique value in the column.  This index is useful for columns with a small
-        number of unique values and many rows per value.
-
-        The ``LABEL_LIST`` index type is a special index that is used to index list
-        columns whose values have small cardinality.  For example, a column that
-        contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
-        with a ``LABEL_LIST`` index.  This index can only speedup queries with
-        ``array_has_any`` or ``array_has_all`` filters.
-
-        The ``INVERTED`` index type is used to index document columns. This index
-        can conduct full-text searches. For example, a column that contains any word
-        of query string "hello world". The results will be ranked by BM25.
+        * ``BTREE``. The most common type is ``BTREE``. This index is inspired
+          by the btree data structure although only the first few layers of the btree
+          are cached in memory.  It will
+          perform well on columns with a large number of unique values and few rows per
+          value.
+        * ``BITMAP``. This index stores a bitmap for each unique value in the column.
+          This index is useful for columns with a small number of unique values and
+          many rows per value.
+        * ``LABEL_LIST``. A special index that is used to index list
+          columns whose values have small cardinality.  For example, a column that
+          contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
+          with a ``LABEL_LIST`` index.  This index can only speedup queries with
+          ``array_has_any`` or ``array_has_all`` filters.
+        * ``INVERTED``. It is used to index document columns. This index
+          can conduct full-text searches. For example, a column that contains any word
+          of query string "hello world". The results will be ranked by BM25.
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
@@ -1285,6 +1272,26 @@ class LanceDataset(pa.dataset.Dataset):
                 "category",
                 "BTREE",
             )
+
+        Scalar indices can only speed up scans for basic filters using
+        equality, comparison, range (e.g. ``my_col BETWEEN 0 AND 100``), and set
+        membership (e.g. `my_col IN (0, 1, 2)`)
+
+        Scalar indices can be used if the filter contains multiple indexed columns and
+        the filter criteria are AND'd or OR'd together
+        (e.g. ``my_col < 0 AND other_col> 100``)
+
+        Scalar indices may be used if the filter contains non-indexed columns but,
+        depending on the structure of the filter, they may not be usable.  For example,
+        if the column ``not_indexed`` does not have a scalar index then the filter
+        ``my_col = 0 OR not_indexed = 1`` will not be able to use any scalar index on
+        ``my_col``.
+
+        To determine if a scan is making use of a scalar index you can use
+        ``explain_plan`` to look at the query plan that lance has created.  Queries
+        that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
+        ``MaterializeIndex`` operator.
+
         """
         if isinstance(column, str):
             column = [column]
@@ -2641,7 +2648,8 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    use_legacy_format: bool = True,
+    data_storage_version: str = "legacy",
+    use_legacy_format: Optional[bool] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2681,10 +2689,25 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    use_legacy_format : optional, bool, default True
-        Use the Lance v1 writer to write Lance v1 files.  The default is currently
-        True but will change as we roll out the v2 format.
+    data_storage_version: optional, str, default "legacy"
+        The version of the data storage format to use. Newer versions are more
+        efficient but require newer versions of lance to read.  The default is
+        "legacy" which will use the legacy v1 version.  See the user guide
+        for more details.
+    use_legacy_format : optional, bool, default None
+        Deprecated method for setting the data storage version. Use the
+        `data_storage_version` parameter instead.
     """
+    if use_legacy_format is not None:
+        warnings.warn(
+            "use_legacy_format is deprecated, use data_storage_version instead",
+            DeprecationWarning,
+        )
+        if use_legacy_format:
+            data_storage_version = "legacy"
+        else:
+            data_storage_version = "stable"
+
     if _check_for_hugging_face(data_obj):
         # Huggingface datasets
         from .dependencies import datasets
@@ -2705,7 +2728,7 @@ def write_dataset(
         "max_bytes_per_file": max_bytes_per_file,
         "progress": progress,
         "storage_options": storage_options,
-        "use_legacy_format": use_legacy_format,
+        "data_storage_version": data_storage_version,
     }
 
     if commit_lock:

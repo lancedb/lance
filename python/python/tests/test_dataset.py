@@ -283,6 +283,12 @@ def test_tag(tmp_path: Path):
 
     assert ds.checkout_version("tag1").version == 1
 
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 1
+
+    with pytest.raises(ValueError):
+        lance.dataset(base_dir, "missing-tag")
+
 
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
@@ -1908,19 +1914,18 @@ def test_migrate_manifest(tmp_path: Path):
     assert not manifest_needs_migration(ds)
 
 
-def test_v2_dataset(tmp_path: Path):
+def test_legacy_dataset(tmp_path: Path):
     table = pa.table({"a": range(100), "b": range(100)})
-    dataset = lance.write_dataset(table, tmp_path, use_legacy_format=False)
+    dataset = lance.write_dataset(table, tmp_path, data_storage_version="stable")
     batches = list(dataset.to_batches())
     assert len(batches) == 1
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
     assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert dataset.data_storage_version == "2.0"
 
     # Append will write v2 if dataset was originally created with v2
-    dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=True, mode="append"
-    )
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
 
     assert len(dataset.get_fragments()) == 2
 
@@ -1928,14 +1933,16 @@ def test_v2_dataset(tmp_path: Path):
     assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
 
     dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=True, mode="overwrite"
+        table, tmp_path, data_storage_version="legacy", mode="overwrite"
     )
+    assert dataset.data_storage_version == "0.1"
+
     fragment = list(dataset.get_fragments())[0]
     assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
 
     # Append will write v1 if dataset was originally created with v1
     dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=False, mode="append"
+        table, tmp_path, data_storage_version="stable", mode="append"
     )
 
     fragment = list(dataset.get_fragments())[1]
@@ -1943,13 +1950,17 @@ def test_v2_dataset(tmp_path: Path):
 
     # Writing an empty table with v2 will put dataset in "v2 mode"
     dataset = lance.write_dataset(
-        [], tmp_path, schema=table.schema, use_legacy_format=False, mode="overwrite"
+        [],
+        tmp_path,
+        schema=table.schema,
+        data_storage_version="stable",
+        mode="overwrite",
     )
 
     assert len(dataset.get_fragments()) == 0
 
     dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=True, mode="append"
+        table, tmp_path, data_storage_version="legacy", mode="append"
     )
 
     fragment = list(dataset.get_fragments())[0]
@@ -1957,13 +1968,17 @@ def test_v2_dataset(tmp_path: Path):
 
     # Writing an empty table with v1 will put dataset in "v1 mode"
     dataset = lance.write_dataset(
-        [], tmp_path, schema=table.schema, use_legacy_format=True, mode="overwrite"
+        [],
+        tmp_path,
+        schema=table.schema,
+        data_storage_version="legacy",
+        mode="overwrite",
     )
 
     assert len(dataset.get_fragments()) == 0
 
     dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=False, mode="append"
+        table, tmp_path, data_storage_version="stable", mode="append"
     )
 
     fragment = list(dataset.get_fragments())[0]

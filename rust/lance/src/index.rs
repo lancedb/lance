@@ -31,7 +31,7 @@ use lance_index::{
     vector::VectorIndex,
     DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME,
 };
-use lance_io::scheduler::ScanScheduler;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
@@ -598,7 +598,10 @@ impl DatasetIndexInternalExt for Dataset {
             }
 
             (0, 3) => {
-                let scheduler = ScanScheduler::new(self.object_store.clone());
+                let scheduler = ScanScheduler::new(
+                    self.object_store.clone(),
+                    SchedulerConfig::fast_and_not_too_ram_intensive(),
+                );
                 let file = scheduler.open_file(&index_file).await?;
                 let reader =
                     v2::reader::FileReader::try_open(file, None, Default::default()).await?;

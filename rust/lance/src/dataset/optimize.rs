@@ -916,6 +916,7 @@ mod tests {
     use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
+    use lance_file::version::LanceFileVersion;
     use rstest::rstest;
     use tempfile::tempdir;
 
@@ -1116,7 +1117,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_compact_empty(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_compact_empty(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1128,7 +1132,7 @@ mod tests {
             reader,
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1150,7 +1154,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_compact_all_good(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_compact_all_good(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // Compact a table with nothing to do
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -1160,7 +1167,7 @@ mod tests {
         // Just one file
         let write_params = WriteParams {
             max_rows_per_file: 10_000,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1178,7 +1185,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 3_000,
             max_rows_per_group: 1_000,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             mode: WriteMode::Overwrite,
             ..Default::default()
         };
@@ -1233,7 +1240,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_compact_many(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_compact_many(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1243,7 +1253,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 1200))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 400,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         Dataset::write(reader, test_uri, Some(write_params))
@@ -1254,7 +1264,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(1200, 2000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -1272,7 +1282,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(3200, 600))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 300,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -1378,7 +1388,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_compact_data_files(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_compact_data_files(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1389,7 +1402,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 5_000,
             max_rows_per_group: 1_000,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1461,7 +1474,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_compact_deletions(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_compact_deletions(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // For files that have few rows, we don't want to compact just 1 since
         // that won't do anything. But if there are deletions to materialize,
         // we want to do groups of 1. This test checks that.
@@ -1474,7 +1490,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 1000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1514,7 +1530,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_compact_distributed(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_compact_distributed(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // Can run the tasks independently
         // Can provide subset of tasks to commit_compaction
         // Once committed, can't commit remaining tasks
@@ -1527,7 +1546,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
