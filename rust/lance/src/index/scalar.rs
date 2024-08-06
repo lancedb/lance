@@ -114,6 +114,9 @@ pub(super) async fn build_scalar_index(
             train_inverted_index(training_request, &index_store).await
         }
         _ => {
+            // The BTree index implementation leverages the legacy format's batch offset,
+            // which has been removed from new format, so keep using the legacy format for now.
+            let index_store = index_store.with_legacy_format(true);
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
             train_btree_index(training_request, &flat_index_trainer, &index_store).await
         }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lance_core::{Error, Result};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::IndexType;
 use lance_table::format::Index as IndexMetadata;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
@@ -95,8 +96,15 @@ pub async fn merge_indices<'a>(
 
             let new_uuid = Uuid::new_v4();
 
-            let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
-
+            // The BTree index implementation leverages the legacy format's batch offset,
+            // which has been removed from new format, so keep using the legacy format for now.
+            let new_store = match index.index_type() {
+                IndexType::Scalar | IndexType::BTree => {
+                    LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string())
+                        .with_legacy_format(true)
+                }
+                _ => LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string()),
+            };
             index.update(new_data_stream.into(), &new_store).await?;
 
             Ok((new_uuid, 1))

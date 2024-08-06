@@ -14,15 +14,16 @@ use futures::TryStreamExt;
 use lance_core::{cache::FileMetadataCache, Error, Result};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2;
+use lance_file::writer::FileWriterOptions;
 use lance_file::{
     reader::FileReader,
-    writer::{FileWriter, FileWriterOptions, ManifestProvider},
+    writer::{FileWriter, ManifestProvider},
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
-use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
+use lance_table::format::SelfDescribingFileReader;
+use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::{location, Location};
 
 use super::{IndexReader, IndexStore, IndexWriter};
 
@@ -37,6 +38,7 @@ pub struct LanceIndexStore {
     index_dir: Path,
     metadata_cache: Option<FileMetadataCache>,
     scheduler: Arc<ScanScheduler>,
+    use_legacy_format: bool,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -64,7 +66,13 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
+            use_legacy_format: false,
         }
+    }
+
+    pub fn with_legacy_format(mut self, use_legacy_format: bool) -> Self {
+        self.use_legacy_format = use_legacy_format;
+        self
     }
 }
 
@@ -121,7 +129,7 @@ impl IndexReader for FileReader {
 #[async_trait]
 impl IndexReader for v2::reader::FileReader {
     async fn read_record_batch(&self, _offset: u32) -> Result<RecordBatch> {
-        unimplemented!("v2 format removed the batch concept")
+        unimplemented!("v2 format has no concept of row groups")
     }
 
     async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
@@ -138,8 +146,10 @@ impl IndexReader for v2::reader::FileReader {
         Ok(batches[0].clone())
     }
 
+    // V2 format has removed the row group concept,
+    // so here we assume each batch is with 4096 rows.
     async fn num_batches(&self) -> u32 {
-        unimplemented!("v2 format removed the batch concept")
+        unimplemented!("v2 format has no concept of row groups")
     }
 
     fn num_rows(&self) -> usize {
@@ -164,53 +174,53 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<Box<dyn IndexWriter>> {
         let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
-        let writer = FileWriter::<ManifestDescribing>::try_new(
-            &self.object_store,
-            &path,
-            schema,
-            &FileWriterOptions::default(),
-        )
-        .await?;
-        Ok(Box::new(writer))
-    }
-
-    async fn new_index_file_v2(
-        &self,
-        name: &str,
-        schema: Arc<Schema>,
-    ) -> Result<Box<dyn IndexWriter>> {
-        let path = self.index_dir.child(name);
-        let schema = schema.as_ref().try_into()?;
-        let writer = self.object_store.create(&path).await?;
-        let writer = v2::writer::FileWriter::try_new(
-            writer,
-            schema,
-            v2::writer::FileWriterOptions::default(),
-        )?;
-        Ok(Box::new(writer))
+        if self.use_legacy_format {
+            let writer = FileWriter::<ManifestDescribing>::try_new(
+                &self.object_store,
+                &path,
+                schema,
+                &FileWriterOptions::default(),
+            )
+            .await?;
+            Ok(Box::new(writer))
+        } else {
+            let writer = self.object_store.create(&path).await?;
+            let writer = v2::writer::FileWriter::try_new(
+                writer,
+                schema,
+                v2::writer::FileWriterOptions::default(),
+            )?;
+            Ok(Box::new(writer))
+        }
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        let file_reader = FileReader::try_new_self_described(
-            &self.object_store,
-            &path,
-            self.metadata_cache.as_ref(),
-        )
-        .await?;
-        Ok(Arc::new(file_reader))
-    }
-
-    async fn open_index_file_v2(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        let path = self.index_dir.child(name);
         let file_scheduler = self.scheduler.open_file(&path).await?;
-        let file_reader = v2::reader::FileReader::try_open(
+        match v2::reader::FileReader::try_open(
             file_scheduler,
             None,
             DecoderMiddlewareChain::default(),
         )
-        .await?;
-        Ok(Arc::new(file_reader))
+        .await
+        {
+            Ok(reader) => Ok(Arc::new(reader)),
+            Err(e) => {
+                // If the error is a version conflict we can try to read the file with v1 reader
+                if let Error::VersionConflict { .. } = e {
+                    let path = self.index_dir.child(name);
+                    let file_reader = FileReader::try_new_self_described(
+                        &self.object_store,
+                        &path,
+                        self.metadata_cache.as_ref(),
+                    )
+                    .await?;
+                    Ok(Arc::new(file_reader))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
@@ -225,43 +235,8 @@ impl IndexStore for LanceIndexStore {
             self.object_store.copy(&path, &dest_path).await
         } else {
             let reader = self.open_index_file(name).await?;
-            let num_batches = reader.num_batches().await;
-            if num_batches == 0 {
-                return Err(Error::Internal {
-                    message:
-                        "Cannot copy an empty index file because the schema cannot be determined"
-                            .into(),
-                    location: location!(),
-                });
-            }
-            let first_batch = reader.read_record_batch(0).await?;
-            let schema = first_batch.schema();
-            let mut writer = dest_store.new_index_file(name, schema).await?;
-            writer.write_record_batch(first_batch).await?;
-            for batch_index in 1..num_batches {
-                writer
-                    .write_record_batch(reader.read_record_batch(batch_index).await?)
-                    .await?;
-            }
-            writer.finish().await?;
-            Ok(())
-        }
-    }
-
-    async fn copy_index_file_v2(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
-        let path = self.index_dir.child(name);
-
-        let other_store = dest_store.as_any().downcast_ref::<Self>();
-        if let Some(dest_lance_store) = other_store {
-            // If both this store and the destination are lance stores we can use object_store's copy
-            // This does blindly assume that both stores are using the same underlying object_store
-            // but there is no easy way to verify this and it happens to always be true at the moment
-            let dest_path = dest_lance_store.index_dir.child(name);
-            self.object_store.copy(&path, &dest_path).await
-        } else {
-            let reader = self.open_index_file_v2(name).await?;
             let mut writer = dest_store
-                .new_index_file_v2(name, Arc::new(reader.schema().into()))
+                .new_index_file(name, Arc::new(reader.schema().into()))
                 .await?;
 
             for offset in (0..reader.num_rows()).step_by(4096) {
@@ -316,6 +291,15 @@ mod tests {
         ))
     }
 
+    fn legacy_test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
+        let test_path: &Path = tempdir.path();
+        let (object_store, test_path) =
+            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
+        Arc::new(
+            LanceIndexStore::new(object_store, test_path.to_owned(), None).with_legacy_format(true),
+        )
+    }
+
     struct MockTrainingSource {
         data: SendableRecordBatchStream,
     }
@@ -361,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic_btree() {
         let tempdir = tempdir().unwrap();
-        let index_store = test_store(&tempdir);
+        let index_store = legacy_test_store(&tempdir);
         let data = gen()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
@@ -401,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn test_btree_update() {
         let index_dir = tempdir().unwrap();
-        let index_store = test_store(&index_dir);
+        let index_store = legacy_test_store(&index_dir);
         let data = gen()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
@@ -415,7 +399,7 @@ mod tests {
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = tempdir().unwrap();
-        let updated_index_store = test_store(&updated_index_dir);
+        let updated_index_store = legacy_test_store(&updated_index_dir);
         index
             .update(
                 lance_datafusion::utils::reader_to_stream(Box::new(data)),
@@ -451,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn test_btree_with_gaps() {
         let tempdir = tempdir().unwrap();
-        let index_store = test_store(&tempdir);
+        let index_store = legacy_test_store(&tempdir);
         let batch_one = gen()
             .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
@@ -676,7 +660,7 @@ mod tests {
             // DataType::Duration(TimeUnit::Nanosecond),
         ] {
             let tempdir = tempdir().unwrap();
-            let index_store = test_store(&tempdir);
+            let index_store = legacy_test_store(&tempdir);
             let data: RecordBatch = gen()
                 .col("values", array::rand_type(data_type))
                 .col("row_ids", array::step::<UInt64Type>())
@@ -734,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn btree_reject_nan() {
         let tempdir = tempdir().unwrap();
-        let index_store = test_store(&tempdir);
+        let index_store = legacy_test_store(&tempdir);
         let batch = gen()
             .col("values", array::cycle::<Float32Type>(vec![0.0, f32::NAN]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1]))
@@ -760,7 +744,7 @@ mod tests {
     #[tokio::test]
     async fn btree_entire_null_page() {
         let tempdir = tempdir().unwrap();
-        let index_store = test_store(&tempdir);
+        let index_store = legacy_test_store(&tempdir);
         let batch = gen()
             .col(
                 "values",
