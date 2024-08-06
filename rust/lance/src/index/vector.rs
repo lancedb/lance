@@ -10,7 +10,6 @@ use std::{any::Any, collections::HashMap};
 pub mod builder;
 pub mod ivf;
 pub mod pq;
-mod traits;
 mod utils;
 
 #[cfg(test)]
@@ -47,7 +46,6 @@ use self::{ivf::*, pq::PQIndex};
 
 use super::{pb, DatasetIndexInternalExt, IndexParams};
 use crate::{dataset::Dataset, index::pb::vector_index_stage::Stage, Error, Result};
-pub use traits::*;
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
 

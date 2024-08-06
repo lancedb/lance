@@ -54,6 +54,7 @@ use lance_index::{
 use lance_io::{
     encodings::plain::PlainEncoder,
     local::to_local_path,
+    object_store::ObjectStore,
     object_writer::ObjectWriter,
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
@@ -81,12 +82,7 @@ use super::{
 use crate::dataset::builder::DatasetBuilder;
 use crate::{
     dataset::Dataset,
-    index::{
-        pb,
-        prefilter::PreFilter,
-        vector::{ivf::io::write_pq_partitions, Transformer},
-        INDEX_FILE_NAME,
-    },
+    index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
     session::Session,
 };
 
@@ -1183,11 +1179,12 @@ pub async fn build_ivf_pq_index(
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
     write_ivf_pq_file(
-        dataset,
+        dataset.object_store(),
+        dataset.indices_dir(),
         column,
         index_name,
         uuid,
-        &[],
+        dataset.version().version,
         ivf_model,
         pq,
         metric_type,
@@ -1221,7 +1218,6 @@ pub async fn build_ivf_hnsw_pq_index(
         column,
         index_name,
         uuid,
-        &[],
         ivf_model,
         Quantizer::Product(pq),
         metric_type,
@@ -1360,22 +1356,22 @@ pub(crate) async fn remap_index_file(
 ///
 #[allow(clippy::too_many_arguments)]
 async fn write_ivf_pq_file(
-    dataset: &Dataset,
+    object_store: &ObjectStore,
+    index_dir: Path,
     column: &str,
     index_name: &str,
     uuid: &str,
-    transformers: &[Box<dyn Transformer>],
+    dataset_version: u64,
     mut ivf: IvfModel,
     pq: ProductQuantizer,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
-    let object_store = dataset.object_store();
-    let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
+    let path = index_dir.child(uuid).child(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
 
     let start = std::time::Instant::now();
@@ -1388,7 +1384,7 @@ async fn write_ivf_pq_file(
         pq.clone(),
         metric_type,
         0..num_partitions,
-        precomputed_partitons,
+        precomputed_partitions,
         shuffle_partition_batches,
         shuffle_partition_concurrency,
         precomputed_shuffle_buffers,
@@ -1396,22 +1392,15 @@ async fn write_ivf_pq_file(
     .await?;
     info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());
 
-    // Convert [`Transformer`] to metadata.
-    let mut transforms = vec![];
-    for t in transformers {
-        let t = t.save(&mut writer).await?;
-        transforms.push(t);
-    }
-
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),
         column: column.to_string(),
         dimension: pq.dimension as u32,
-        dataset_version: dataset.version().version,
+        dataset_version,
         metric_type,
         ivf,
         pq,
-        transforms,
+        transforms: vec![],
     };
 
     let metadata = pb::Index::try_from(&metadata)?;
@@ -1430,13 +1419,12 @@ async fn write_ivf_hnsw_file(
     column: &str,
     _index_name: &str,
     uuid: &str,
-    _transformers: &[Box<dyn Transformer>],
     mut ivf: IvfModel,
     quantizer: Quantizer,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     stream: impl RecordBatchStream + Unpin + 'static,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
@@ -1527,7 +1515,7 @@ async fn write_ivf_hnsw_file(
         distance_type,
         hnsw_params,
         0..num_partitions,
-        precomputed_partitons,
+        precomputed_partitions,
         shuffle_partition_batches,
         shuffle_partition_concurrency,
         precomputed_shuffle_buffers,
