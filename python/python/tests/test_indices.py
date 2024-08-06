@@ -178,12 +178,9 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
 def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     fragments = list(rand_dataset.get_fragments())
-    print("{} fragments".format(len(fragments)))
 
     fragments1 = fragments[:1]
-    print(fragments1)
     fragments2 = fragments[1:]
-    print(fragments2)
 
     builder = IndicesBuilder(rand_dataset, "vectors")
 
@@ -200,9 +197,10 @@ def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     )
 
     sorted_filenames = filenames1 + filenames2
-    print(sorted_filenames)
+    print("Sorted files stored in {}".format(sorted_filenames))
     builder.load_shuffled_vectors(sorted_filenames, str(tmpdir), rand_ivf, rand_pq)
 
     final_ds = lance.dataset(str(tmpdir / "dataset"))
     assert final_ds.has_index
-    assert final_ds.list_indices()[0]["fields"] == ["vector"]
+    assert final_ds.list_indices()[0]["fields"] == ["vectors"]
+    assert len(final_ds.list_indices()[0]["fragment_ids"]) == NUM_FRAGMENTS

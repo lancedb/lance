@@ -26,6 +26,7 @@ use lance_io::traits::WriteExt;
 use lance_file::format::MAGIC;
 use lance_index::pb::Index;
 use lance::index::vector::ivf::IvfPQIndexMetadata;
+use lance_index::DatasetIndexExt;
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -284,19 +285,18 @@ async fn do_load_shuffled_vectors(
     mut ivf_model: IvfModel,
     pq_model: ProductQuantizer,
 ) -> PyResult<()> {
-    let (obj_store, path) = object_store_from_uri_or_path(dir_path).await?;
+    let (_, path) = object_store_from_uri_or_path(dir_path).await?;
     let streams = load_partitioned_shuffles(path.clone(), filenames).await.infer_error()?;
 
     let obj_store = dataset.ds.object_store();
     let path = dataset.ds.indices_dir().child("shuffled_vectors.idx");
     let mut writer = obj_store.create(&path).await.infer_error()?;
-    println!("Path to write: {:?}", path);
-    write_pq_partitions(&mut writer, &mut ivf_model, Some(streams), None);
+    write_pq_partitions(&mut writer, &mut ivf_model, Some(streams), None).await.infer_error()?;
+    let index_name = "ivf_pq_index";
 
     let metadata = IvfPQIndexMetadata::new(
-        "ivf_pq_index".to_string(),
+        index_name.to_string(),
         column.to_string(),
-        ivf_model.dimension() as u32,
         dataset.ds.version().version,
         pq_model.distance_type,
         ivf_model,
@@ -309,13 +309,15 @@ async fn do_load_shuffled_vectors(
     writer.write_magics(pos, 0, 1, MAGIC).await.infer_error()?;
     writer.shutdown().await.infer_error()?;
 
+    let mut ds = dataset.ds.as_ref().clone();
+    ds.commit_existing_index(index_name, column).await.infer_error()?;
+
     Ok(())
 }
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn load_shuffled_vectors(
-    py: Python<'_>,
     filenames: Vec<String>,
     dir_path: &str,
     dataset: &Dataset,

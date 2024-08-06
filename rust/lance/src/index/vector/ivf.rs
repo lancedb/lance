@@ -914,13 +914,13 @@ impl IvfPQIndexMetadata {
     pub fn new(
         name: String,
         column: String,
-        dimension: u32,
         dataset_version: u64,
         metric_type: MetricType,
         ivf: IvfModel,
         pq: ProductQuantizer,
         transforms: Vec<pb::Transform>,
     ) -> Self {
+        let dimension = ivf.dimension() as u32;
         Self {
             name,
             column,

@@ -80,4 +80,6 @@ pub trait DatasetIndexExt {
     ///
     /// If the index does not exist, return Error.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
+
+    async fn commit_existing_index(&mut self, index_name: &str, column: &str) -> Result<()>;
 }

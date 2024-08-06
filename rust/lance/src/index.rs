@@ -336,6 +336,48 @@ impl DatasetIndexExt for Dataset {
         Ok(loaded_indices)
     }
 
+    async fn commit_existing_index(&mut self, index_name: &str, column: &str) -> Result<()> {
+        let index_id = Uuid::new_v4();
+
+        let Some(field) = self.schema().field(column) else {
+            return Err(Error::Index {
+                message: format!("CreateIndex: column '{column}' does not exist"),
+                location: location!(),
+            });
+        };
+
+        let new_idx = IndexMetadata {
+            uuid: index_id,
+            name: index_name.to_string(),
+            fields: vec![field.id],
+            dataset_version: self.manifest.version,
+            fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+        };
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let new_manifest = commit_transaction(
+            self,
+            self.object_store(),
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(new_manifest);
+
+        Ok(())
+    }
+
     async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>> {
         Ok(self
             .load_indices()

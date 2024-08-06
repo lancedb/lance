@@ -228,7 +228,6 @@ pub async fn load_partitioned_shuffles(
     for file in files {
         let object_store = ObjectStore::local();
         let path = output_dir.child(file);
-        println!("path: {:?}", path);
         let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
         let reader = Arc::new(reader);
 
@@ -533,7 +532,9 @@ impl IvfShuffler {
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader
                     .read_stream(
-                        lance_io::ReadBatchParams::Range((start * SHUFFLE_BATCH_SIZE)..(end * SHUFFLE_BATCH_SIZE)),
+                        lance_io::ReadBatchParams::Range(
+                            (start * SHUFFLE_BATCH_SIZE)..(end * SHUFFLE_BATCH_SIZE),
+                        ),
                         SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
@@ -568,7 +569,7 @@ impl IvfShuffler {
     ) -> Result<Vec<String>> {
         let num_batches = self.total_batches().await?;
         let total_batches = num_batches.iter().sum();
-        print!(
+        info!(
             "Sorting unsorted data into sorted chunks (batches_per_chunk={} concurrent_jobs={})",
             batches_per_partition, concurrent_jobs
         );
@@ -725,7 +726,9 @@ mod test {
                     (start_idx..end_idx).map(|_| idx as u32),
                 ));
 
-                let values = Arc::new(UInt8Array::from_iter((0..32 * SHUFFLE_BATCH_SIZE).map(|_| idx as u8)));
+                let values = Arc::new(UInt8Array::from_iter(
+                    (0..32 * SHUFFLE_BATCH_SIZE).map(|_| idx as u8),
+                ));
                 let pq_codes = Arc::new(
                     FixedSizeListArray::try_new_from_values(values as Arc<dyn Array>, 32).unwrap(),
                 );
