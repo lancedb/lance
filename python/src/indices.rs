@@ -7,7 +7,7 @@ use arrow_data::ArrayData;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::index::vector::ivf::io::write_pq_partitions;
 use lance::io::ObjectStore;
-use lance_index::vector::ivf::shuffler::{shuffle_vectors, load_partitioned_shuffles};
+use lance_index::vector::ivf::shuffler::{load_partitioned_shuffles, shuffle_vectors};
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
     pq::{PQBuildParams, ProductQuantizer},
@@ -17,16 +17,16 @@ use pyo3::exceptions::PyValueError;
 use pyo3::{
     pyfunction,
     types::{PyList, PyModule},
-    wrap_pyfunction, PyObject, PyResult, Python
+    wrap_pyfunction, PyObject, PyResult, Python,
 };
 
 use crate::fragment::FileFragment;
 use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
-use lance_io::traits::WriteExt;
+use lance::index::vector::ivf::IvfPQIndexMetadata;
 use lance_file::format::MAGIC;
 use lance_index::pb::Index;
-use lance::index::vector::ivf::IvfPQIndexMetadata;
 use lance_index::DatasetIndexExt;
+use lance_io::traits::WriteExt;
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -245,9 +245,14 @@ async fn do_shuffle_transformed_vectors(
             "shuffle_vectors input and output path is currently required to be local",
         ));
     }
-    let partition_files = shuffle_vectors(unsorted_filenames, path, ivf_centroids, shuffle_output_root_filename)
-        .await
-        .infer_error()?;
+    let partition_files = shuffle_vectors(
+        unsorted_filenames,
+        path,
+        ivf_centroids,
+        shuffle_output_root_filename,
+    )
+    .await
+    .infer_error()?;
     Ok(partition_files)
 }
 
@@ -265,7 +270,12 @@ pub fn shuffle_transformed_vectors(
 
     let result = RT.block_on(
         None,
-        do_shuffle_transformed_vectors(unsorted_filenames, dir_path, ivf_centroids, shuffle_output_root_filename),
+        do_shuffle_transformed_vectors(
+            unsorted_filenames,
+            dir_path,
+            ivf_centroids,
+            shuffle_output_root_filename,
+        ),
     )?;
 
     match result {
@@ -286,12 +296,16 @@ async fn do_load_shuffled_vectors(
     pq_model: ProductQuantizer,
 ) -> PyResult<()> {
     let (_, path) = object_store_from_uri_or_path(dir_path).await?;
-    let streams = load_partitioned_shuffles(path.clone(), filenames).await.infer_error()?;
+    let streams = load_partitioned_shuffles(path.clone(), filenames)
+        .await
+        .infer_error()?;
 
     let obj_store = dataset.ds.object_store();
     let path = dataset.ds.indices_dir().child("shuffled_vectors.idx");
     let mut writer = obj_store.create(&path).await.infer_error()?;
-    write_pq_partitions(&mut writer, &mut ivf_model, Some(streams), None).await.infer_error()?;
+    write_pq_partitions(&mut writer, &mut ivf_model, Some(streams), None)
+        .await
+        .infer_error()?;
     let index_name = "ivf_pq_index";
 
     let metadata = IvfPQIndexMetadata::new(
@@ -310,7 +324,9 @@ async fn do_load_shuffled_vectors(
     writer.shutdown().await.infer_error()?;
 
     let mut ds = dataset.ds.as_ref().clone();
-    ds.commit_existing_index(index_name, column).await.infer_error()?;
+    ds.commit_existing_index(index_name, column)
+        .await
+        .infer_error()?;
 
     Ok(())
 }
@@ -325,7 +341,7 @@ pub fn load_shuffled_vectors(
     ivf_centroids: PyArrowType<ArrayData>,
     pq_codebook: PyArrowType<ArrayData>,
     pq_dimension: usize,
-    num_subvectors: u32, 
+    num_subvectors: u32,
     distance_type: &str,
 ) -> PyResult<()> {
     let ivf_centroids = ivf_centroids.0;
