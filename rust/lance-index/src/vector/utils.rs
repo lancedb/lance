@@ -7,13 +7,9 @@ use arrow::{
 };
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_schema::{DataType, Field};
-use lance_arrow::{ArrowFloatType, FloatType};
 use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
-use lance_linalg::MatrixView;
 use prost::bytes;
-use rand::distributions::Standard;
-use rand::prelude::*;
 use snafu::{location, Location};
 use std::{ops::Range, sync::Arc};
 
@@ -70,15 +66,6 @@ pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
     }
 }
 
-fn to_pb_data_type<T: ArrowFloatType>() -> pb::tensor::DataType {
-    match T::FLOAT_TYPE {
-        FloatType::BFloat16 => pb::tensor::DataType::Bfloat16,
-        FloatType::Float16 => pb::tensor::DataType::Float16,
-        FloatType::Float32 => pb::tensor::DataType::Float32,
-        FloatType::Float64 => pb::tensor::DataType::Float64,
-    }
-}
-
 impl From<pb::tensor::DataType> for DataType {
     fn from(dt: pb::tensor::DataType) -> Self {
         match dt {
@@ -119,21 +106,6 @@ impl TryFrom<DataType> for pb::tensor::DataType {
 
     fn try_from(dt: DataType) -> Result<Self> {
         (&dt).try_into()
-    }
-}
-
-impl<T: ArrowFloatType> From<&MatrixView<T>> for pb::Tensor
-where
-    Standard: Distribution<<T as ArrowFloatType>::Native>,
-{
-    fn from(mat: &MatrixView<T>) -> Self {
-        let flat_array = mat.data().as_ref().clone();
-
-        Self {
-            data_type: to_pb_data_type::<T>() as i32,
-            shape: vec![mat.num_rows() as u32, mat.num_columns() as u32],
-            data: flat_array.into_data().buffers()[0].to_vec(),
-        }
     }
 }
 
@@ -198,44 +170,8 @@ mod tests {
 
     use arrow_array::{Float16Array, Float32Array, Float64Array};
     use half::f16;
-    use lance_arrow::bfloat16::BFloat16Type;
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
-
-    #[test]
-    fn test_to_pb_data_type() {
-        assert_eq!(
-            to_pb_data_type::<Float32Type>(),
-            pb::tensor::DataType::Float32
-        );
-        assert_eq!(
-            to_pb_data_type::<Float64Type>(),
-            pb::tensor::DataType::Float64
-        );
-        assert_eq!(
-            to_pb_data_type::<Float16Type>(),
-            pb::tensor::DataType::Float16
-        );
-        assert_eq!(
-            to_pb_data_type::<BFloat16Type>(),
-            pb::tensor::DataType::Bfloat16
-        );
-    }
-
-    #[test]
-    fn test_matrix_to_tensor() {
-        let mat = MatrixView::<Float32Type>::new(Arc::new(vec![0.0; 20].into()), 5);
-        let tensor = pb::Tensor::from(&mat);
-        assert_eq!(tensor.data_type, pb::tensor::DataType::Float32 as i32);
-        assert_eq!(tensor.shape, vec![4, 5]);
-        assert_eq!(tensor.data.len(), 20 * 4);
-
-        let mat = MatrixView::<Float64Type>::new(Arc::new(vec![0.0; 20].into()), 5);
-        let tensor = pb::Tensor::from(&mat);
-        assert_eq!(tensor.data_type, pb::tensor::DataType::Float64 as i32);
-        assert_eq!(tensor.shape, vec![4, 5]);
-        assert_eq!(tensor.data.len(), 20 * 8);
-    }
 
     #[test]
     fn test_fsl_to_tensor() {

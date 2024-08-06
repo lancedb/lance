@@ -25,8 +25,7 @@ use lance_io::{
     traits::{WriteExt, Writer},
     utils::read_message,
 };
-use lance_linalg::distance::L2;
-use lance_linalg::{distance::DistanceType, MatrixView};
+use lance_linalg::distance::{DistanceType, L2};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
 use prost::Message;
@@ -312,8 +311,7 @@ impl ProductQuantizationStorage {
     /// Write the PQ storage to disk.
     pub async fn write_full(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
         let pos = writer.object_writer.tell().await?;
-        let mat = MatrixView::<Float32Type>::try_from(&self.codebook)?;
-        let codebook_tensor = pb::Tensor::from(&mat);
+        let codebook_tensor = pb::Tensor::try_from(&self.codebook)?;
         writer
             .object_writer
             .write_protobuf(&codebook_tensor)
