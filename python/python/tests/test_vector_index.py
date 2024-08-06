@@ -447,6 +447,74 @@ def test_optimize_index(dataset, tmp_path):
     assert len(list(indices_dir.iterdir())) == 2
 
 
+def test_optimize_index_cosine(dataset, tmp_path):
+    dataset_uri = tmp_path / "dataset.lance"
+    assert not dataset.has_index
+    ds = lance.write_dataset(dataset.to_table(), dataset_uri)
+    ds = ds.create_index(
+        "vector",
+        metric="cosine",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=2,
+    )
+
+    assert len(ds) == 1000
+    assert ds.has_index
+
+    n_results_before_append = ds.to_table(
+        nearest={
+            "q": [0.1 for _ in range(128)],
+            "column": "vector",
+            "k": len(ds),
+            "nprobes": 1,
+        },
+        fast_search=True,
+    ).num_rows
+
+    # New data
+    tbl = create_table(nvec=200)
+    ds = lance.write_dataset(tbl, dataset_uri, mode="append")
+
+    assert len(ds) == 1200
+    assert ds.has_index
+
+    indices_dir = dataset_uri / "_indices"
+    assert len(list(indices_dir.iterdir())) == 1
+
+    # with fast search the index doesn't contain new data yet
+    assert (
+        ds.to_table(
+            nearest={
+                "q": [0.1 for _ in range(128)],
+                "column": "vector",
+                "k": len(ds),
+                "nprobes": 1,
+            },
+            fast_search=True,
+        ).num_rows
+        == n_results_before_append
+    )
+
+    ds.optimize.optimize_indices()
+    assert len(list(indices_dir.iterdir())) == 2
+
+    ds = lance.dataset(dataset_uri)
+
+    assert (
+        ds.to_table(
+            nearest={
+                "q": [0.1 for _ in range(128)],
+                "column": "vector",
+                "k": len(ds),
+                "nprobes": 1,
+            },
+            fast_search=True,
+        ).num_rows
+        > n_results_before_append
+    )
+
+
 def test_create_index_dot(dataset, tmp_path):
     dataset_uri = tmp_path / "dataset.lance"
     assert not dataset.has_index
