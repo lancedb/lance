@@ -54,6 +54,7 @@ use lance_index::{
 use lance_io::{
     encodings::plain::PlainEncoder,
     local::to_local_path,
+    object_store::ObjectStore,
     object_writer::ObjectWriter,
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
@@ -239,7 +240,8 @@ impl std::fmt::Debug for IVFIndex {
 ///
 /// Returns (new_uuid, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
-    dataset: Dataset,
+    object_store: &ObjectStore,
+    index_dir: Path,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
@@ -256,6 +258,7 @@ pub(crate) async fn optimize_vector_indices(
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
+        println!("IVF V2");
         return optimize_vector_indices_v2(
             &dataset,
             unindexed,
@@ -267,11 +270,7 @@ pub(crate) async fn optimize_vector_indices(
     }
 
     let new_uuid = Uuid::new_v4();
-    let object_store = dataset.object_store();
-    let index_file = dataset
-        .indices_dir()
-        .child(new_uuid.to_string())
-        .child(INDEX_FILE_NAME);
+    let index_file = index_dir.child(new_uuid.to_string()).child(INDEX_FILE_NAME);
     let writer = object_store.create(&index_file).await?;
 
     let first_idx = existing_indices[0]
@@ -299,8 +298,7 @@ pub(crate) async fn optimize_vector_indices(
         .as_any()
         .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
     {
-        let aux_file = dataset
-            .indices_dir()
+        let aux_file = index_dir
             .child(new_uuid.to_string())
             .child(INDEX_AUXILIARY_FILE_NAME);
         let aux_writer = object_store.create(&aux_file).await?;
@@ -440,8 +438,10 @@ async fn optimize_ivf_pq_indices(
         pq_index.pq.clone(),
         None,
     );
+    println!("Opitmize IVF ivf transform: {:?}", ivf);
 
     // Shuffled un-indexed data with partition.
+    println!("Opitmize IVF unindexed: {:?}", unindexed.is_some());
     let shuffled = match unindexed {
         Some(unindexed) => Some(
             shuffle_dataset(

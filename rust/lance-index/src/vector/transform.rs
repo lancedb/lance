@@ -55,6 +55,7 @@ impl NormalizeTransformer {
 
 impl Transformer for NormalizeTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        println!("NormalizeTransformer: {:?}", self.input_column);
         let arr = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::Index {

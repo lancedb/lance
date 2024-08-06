@@ -12,6 +12,7 @@ pub use builder::IvfBuildParams;
 use lance_core::Result;
 use lance_linalg::{
     distance::{DistanceType, MetricType},
+    kernels::normalize_fsl,
     kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array},
 };
 
@@ -145,7 +146,13 @@ impl IvfTransformer {
         }
     }
 
-    /// Create a IVF_PQ struct.
+    /// Create a [Transformer] for `IVF_PQ` index.
+    ///
+    /// Parameters:
+    /// - *centroids*: IVF KMeans centroids.
+    /// - *distance_type*: distance type to compute pair-wise vector distance.
+    /// - *vector_column*: column name of the vector data in the input batch.
+    /// - *pq*: [`ProductQuantizer`] to quantize the vector data.
     pub fn with_pq(
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
@@ -155,18 +162,21 @@ impl IvfTransformer {
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
-        let mt = if distance_type == MetricType::Cosine {
+        let (dt, centroids) = if distance_type == MetricType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
                 vector_column,
             )));
-            MetricType::L2
+            (
+                MetricType::L2,
+                normalize_fsl(&centroids).expect("Normalize centroids failed"),
+            )
         } else {
-            distance_type
+            (distance_type, centroids)
         };
 
         let partition_transform = Arc::new(PartitionTransformer::new(
             centroids.clone(),
-            mt,
+            dt,
             vector_column,
         ));
         transforms.push(partition_transform.clone());
