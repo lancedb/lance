@@ -217,16 +217,6 @@ pub async fn shuffle_vectors(
     Ok(partition_files)
 }
 
-// pub async fn load_ivf_pq(
-//     filenames: Vec<String>,
-//     dir_path: &str,
-// ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
-//     let stream = load_partitioned_shuffles(Path::parse(dir_path)?, filenames).await?;
-
-//     write_pq_partitions(writer, ivf, stream, None);
-//     Ok(stream)
-// }
-
 pub async fn load_partitioned_shuffles(
     output_dir: Path,
     files: Vec<String>,
@@ -533,7 +523,7 @@ impl IvfShuffler {
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader
                     .read_stream(
-                        lance_io::ReadBatchParams::Range(start..end),
+                        lance_io::ReadBatchParams::Range((start * SHUFFLE_BATCH_SIZE)..(end * SHUFFLE_BATCH_SIZE)),
                         SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
@@ -568,8 +558,7 @@ impl IvfShuffler {
     ) -> Result<Vec<String>> {
         let num_batches = self.total_batches().await?;
         let total_batches = num_batches.iter().sum();
-        println!("total_batches: {}", total_batches);
-        info!(
+        print!(
             "Sorting unsorted data into sorted chunks (batches_per_chunk={} concurrent_jobs={})",
             batches_per_partition, concurrent_jobs
         );
@@ -606,7 +595,6 @@ impl IvfShuffler {
                         start - cur_start
                     };
                     let local_end = std::cmp::min(end - cur_start, *partition_size);
-
                     input.push(ShuffleInput {
                         file_idx,
                         start: local_start,

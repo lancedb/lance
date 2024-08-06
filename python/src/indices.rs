@@ -20,6 +20,10 @@ use pyo3::{
 
 use crate::fragment::FileFragment;
 use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
+use lance_io::traits::WriteExt;
+use lance_file::format::MAGIC;
+use lance_index::pb::Index;
+use lance::index::vector::ivf::IvfPQIndexMetadata;
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -268,7 +272,9 @@ async fn do_load_shuffled_vectors(
     filenames: Vec<String>,
     dir_path: &str,
     dataset: &Dataset,
+    column: &str,
     mut ivf_model: IvfModel,
+    pq_model: ProductQuantizer,
 ) -> PyResult<()> {
     let (obj_store, path) = object_store_from_uri_or_path(dir_path).await?;
     let streams = load_partitioned_shuffles(path.clone(), filenames).await.infer_error()?;
@@ -277,9 +283,23 @@ async fn do_load_shuffled_vectors(
     let path = dataset.ds.indices_dir().child("shuffled_vectors.idx");
     let mut writer = obj_store.create(&path).await.infer_error()?;
     println!("Path to write: {:?}", path);
-    // let output_file = format!("sorted_{}.lance", i);
-    // let path = self.output_dir.child(output_file.clone());
     write_pq_partitions(&mut writer, &mut ivf_model, Some(streams), None);
+
+    let metadata = IvfPQIndexMetadata::new(
+        "ivf_pq_index".to_string(),
+        column.to_string(),
+        ivf_model.dimension() as u32,
+        dataset.ds.version().version,
+        pq_model.distance_type,
+        ivf_model,
+        pq_model,
+        vec![],
+    );
+
+    let metadata = Index::try_from(&metadata).infer_error()?;
+    let pos = writer.write_protobuf(&metadata).await.infer_error()?;
+    writer.write_magics(pos, 0, 1, MAGIC).await.infer_error()?;
+    writer.shutdown().await.infer_error()?;
 
     Ok(())
 }
@@ -291,7 +311,12 @@ pub fn load_shuffled_vectors(
     filenames: Vec<String>,
     dir_path: &str,
     dataset: &Dataset,
+    column: &str,
     ivf_centroids: PyArrowType<ArrayData>,
+    pq_codebook: PyArrowType<ArrayData>,
+    pq_dimension: usize,
+    num_subvectors: u32, 
+    distance_type: &str,
 ) -> PyResult<()> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
@@ -302,9 +327,21 @@ pub fn load_shuffled_vectors(
         lengths: vec![],
     };
 
+    let codebook = pq_codebook.0;
+    let codebook = FixedSizeListArray::from(codebook);
+
+    let distance_type = DistanceType::try_from(distance_type).unwrap();
+    let pq_model = ProductQuantizer::new(
+        num_subvectors as usize,
+        /*num_bits=*/ 8,
+        pq_dimension,
+        codebook,
+        distance_type,
+    );
+
     RT.block_on(
         None,
-        do_load_shuffled_vectors(filenames, dir_path, dataset, ivf_model),
+        do_load_shuffled_vectors(filenames, dir_path, dataset, column, ivf_model, pq_model),
     )?
 }
 

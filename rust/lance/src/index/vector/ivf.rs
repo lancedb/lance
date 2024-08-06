@@ -909,6 +909,31 @@ pub struct IvfPQIndexMetadata {
     transforms: Vec<pb::Transform>,
 }
 
+impl IvfPQIndexMetadata {
+    /// Create a new IvfPQIndexMetadata object
+    pub fn new(
+        name: String,
+        column: String,
+        dimension: u32,
+        dataset_version: u64,
+        metric_type: MetricType,
+        ivf: IvfModel,
+        pq: ProductQuantizer,
+        transforms: Vec<pb::Transform>,
+    ) -> Self {
+        Self {
+            name,
+            column,
+            dimension,
+            dataset_version,
+            metric_type,
+            ivf,
+            pq,
+            transforms,
+        }
+    }
+}
+
 /// Convert a IvfPQIndex to protobuf payload
 impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
     type Error = Error;

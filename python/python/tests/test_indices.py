@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import os
 
-import os
-
 import lance
 import numpy as np
 import pyarrow as pa
@@ -19,13 +17,18 @@ NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
 
 
-@pytest.fixture(params=[np.float16, 
-                        # np.float32, 
-                        # np.float64
-                        ], ids=["f16", 
-                                        #   "f32", 
-                                        #   "f64"
-                                          ])
+@pytest.fixture(
+    params=[
+        np.float16,
+        # np.float32,
+        # np.float64
+    ],
+    ids=[
+        "f16",
+        #   "f32",
+        #   "f64"
+    ],
+)
 def rand_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(request.param)
     vectors.shape = -1
@@ -172,6 +175,7 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
         full_path = str(tmpdir / fname)
         assert os.path.getsize(full_path) > 0
 
+
 def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     fragments = list(rand_dataset.get_fragments())
     print("{} fragments".format(len(fragments)))
@@ -197,4 +201,8 @@ def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     sorted_filenames = filenames1 + filenames2
     print(sorted_filenames)
-    builder.load_shuffled_vectors(sorted_filenames, str(tmpdir), rand_ivf)
+    builder.load_shuffled_vectors(sorted_filenames, str(tmpdir), rand_ivf, rand_pq)
+
+    final_ds = lance.dataset(str(tmpdir / "dataset"))
+    assert final_ds.has_index
+    assert final_ds.list_indices()[0]["fields"] == ["vector"]
