@@ -27,7 +27,7 @@ use lance_file::reader::FileReader;
 use lance_file::v2::reader::FileReader as Lancev2FileReader;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::ScanScheduler;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
@@ -45,8 +45,9 @@ const UNSORTED_BUFFER: &str = "unsorted.lance";
 const SHUFFLE_BATCH_SIZE: usize = 1024;
 
 fn get_temp_dir() -> Result<Path> {
-    let dir = TempDir::new()?;
-    let tmp_dir_path = Path::from_filesystem_path(dir.path()).map_err(|e| Error::IO {
+    // Note: using into_path here means we will not delete this TempDir automatically
+    let dir = TempDir::new()?.into_path();
+    let tmp_dir_path = Path::from_filesystem_path(dir).map_err(|e| Error::IO {
         source: Box::new(e),
         location: location!(),
     })?;
@@ -192,7 +193,7 @@ pub async fn shuffle_dataset(
 
 pub async fn shuffle_vectors(
     unsorted_filenames: Vec<String>,
-    dir_path: &str,
+    dir_path: Path,
     ivf_centroids: FixedSizeListArray,
     shuffle_output_root_filename: &str,
 ) -> Result<Vec<String>> {
@@ -201,7 +202,7 @@ pub async fn shuffle_vectors(
     let shuffle_partition_concurrency = 2;
     let mut shuffler = IvfShuffler::try_new(
         num_partitions,
-        Some(dir_path.into()),
+        Some(dir_path),
         false,
         Some(shuffle_output_root_filename.to_string()),
     )?;
@@ -366,7 +367,10 @@ impl IvfShuffler {
                 let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
                 total_batches.push(reader.num_batches());
             } else {
-                let scheduler = ScanScheduler::new(object_store.into());
+                let scheduler = ScanScheduler::new(
+                    object_store.into(),
+                    SchedulerConfig::fast_and_not_too_ram_intensive(),
+                );
                 let file = scheduler.open_file(&path).await?;
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let num_batches = reader.metadata().num_rows / (SHUFFLE_BATCH_SIZE as u64);
@@ -379,7 +383,10 @@ impl IvfShuffler {
     async fn count_partition_size(&self, inputs: &[ShuffleInput]) -> Result<Vec<u64>> {
         let object_store = ObjectStore::local();
         let mut partition_sizes = vec![0; self.num_partitions as usize];
-        let scheduler = ScanScheduler::new(Arc::new(object_store.clone()));
+        let scheduler = ScanScheduler::new(
+            Arc::new(object_store.clone()),
+            SchedulerConfig::fast_and_not_too_ram_intensive(),
+        );
 
         for &ShuffleInput {
             file_idx,
@@ -518,7 +525,10 @@ impl IvfShuffler {
                     Self::process_batch_in_shuffle(batch, &mut partitioned_batches).await?;
                 }
             } else {
-                let scheduler = ScanScheduler::new(Arc::new(object_store));
+                let scheduler = ScanScheduler::new(
+                    Arc::new(object_store),
+                    SchedulerConfig::fast_and_not_too_ram_intensive(),
+                );
                 let file = scheduler.open_file(&path).await?;
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader

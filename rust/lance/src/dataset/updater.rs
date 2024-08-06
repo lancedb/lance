@@ -125,14 +125,17 @@ impl Updater {
     ///
     /// Internal use only.
     async fn new_writer(&mut self, schema: Schema) -> Result<Box<dyn GenericWriter>> {
-        // Look at some file in the fragment to determine if it is a v2 file or not
-        let is_legacy = self.fragment.metadata.files[0].is_legacy_file();
+        let data_storage_version = self
+            .dataset()
+            .manifest()
+            .data_storage_format
+            .lance_file_version()?;
 
         open_writer(
             &self.fragment.dataset().object_store,
             &schema,
             &self.fragment.dataset().base,
-            is_legacy,
+            data_storage_version,
         )
         .await
     }

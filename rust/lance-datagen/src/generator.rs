@@ -11,8 +11,8 @@ use arrow::{
 use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
-    Array, FixedSizeBinaryArray, FixedSizeListArray, ListArray, PrimitiveArray, RecordBatch,
-    RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
+    Array, FixedSizeBinaryArray, FixedSizeListArray, ListArray, NullArray, PrimitiveArray,
+    RecordBatch, RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use futures::{stream::BoxStream, StreamExt};
@@ -959,6 +959,26 @@ impl ArrayGenerator for RandomListGenerator {
     }
 }
 
+struct NullArrayGenerator {}
+
+impl ArrayGenerator for NullArrayGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        _: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        Ok(Arc::new(NullArray::new(length.0 as usize)))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &DataType::Null
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        None
+    }
+}
+
 struct RandomStructGenerator {
     fields: Fields,
     data_type: DataType,
@@ -1681,6 +1701,10 @@ pub mod array {
         Box::new(RandomStructGenerator::new(fields, child_gens))
     }
 
+    pub fn null_type() -> Box<dyn ArrayGenerator> {
+        Box::new(NullArrayGenerator {})
+    }
+
     /// Create a generator of random values
     pub fn rand_type(data_type: &DataType) -> Box<dyn ArrayGenerator> {
         match data_type {
@@ -1724,6 +1748,7 @@ pub mod array {
             DataType::Time64(resolution) => rand_time64(resolution),
             DataType::Timestamp(_, _) => rand_timestamp(data_type),
             DataType::Struct(fields) => rand_struct(fields.clone()),
+            DataType::Null => null_type(),
             _ => unimplemented!("random generation of {}", data_type),
         }
     }

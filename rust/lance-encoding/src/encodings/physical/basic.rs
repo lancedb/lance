@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_buffer::BooleanBuffer;
+use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 
@@ -193,7 +194,15 @@ impl ArrayEncoder for BasicEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let (null_count, row_count) = arrays
             .iter()
-            .map(|arr| (arr.null_count() as u32, arr.len() as u32))
+            .map(|arr| {
+                if matches!(arr.data_type(), DataType::Null) {
+                    // Arrays with the null datatype report 0 as the null count so we
+                    // need special logic to get the correct null count
+                    (arr.len() as u32, arr.len() as u32)
+                } else {
+                    (arr.null_count() as u32, arr.len() as u32)
+                }
+            })
             .fold((0, 0), |acc, val| (acc.0 + val.0, acc.1 + val.1));
         let (buffers, nullability) = if null_count == 0 {
             let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;

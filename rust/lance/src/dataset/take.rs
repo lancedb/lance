@@ -403,6 +403,7 @@ fn check_row_addrs(row_ids: &[u64]) -> RowAddressStats {
 mod test {
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::DataType;
+    use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
 
@@ -435,14 +436,15 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_take(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] enable_move_stable_row_ids: bool,
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             enable_move_stable_row_ids,
             ..Default::default()
         };
@@ -490,12 +492,13 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_take_with_projection(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] enable_move_stable_row_ids: bool,
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             enable_move_stable_row_ids,
             ..Default::default()
         };
@@ -533,9 +536,12 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_take_rows_out_of_bound(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_take_rows_out_of_bound(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // a dataset with 1 fragment and 400 rows
-        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+        let test_ds = TestVectorDataset::new(data_storage_version, false)
             .await
             .unwrap();
         let ds = test_ds.dataset;
@@ -580,12 +586,15 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_take_rows(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_take_rows(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -648,13 +657,16 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn take_scan_dataset(#[values(false, true)] use_legacy_format: bool) {
+    async fn take_scan_dataset(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         use arrow::datatypes::Int32Type;
 
         let data = test_batch(1..5);
         let write_params = WriteParams {
             max_rows_per_group: 2,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -691,11 +703,14 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_take_rows_with_row_ids(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_take_rows_with_row_ids(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let data = test_batch(0..8);
         let write_params = WriteParams {
             max_rows_per_group: 2,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             enable_move_stable_row_ids: true,
             ..Default::default()
         };

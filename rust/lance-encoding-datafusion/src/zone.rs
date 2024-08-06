@@ -26,7 +26,7 @@ use lance_encoding::{
     },
     encoder::{
         encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodedBuffer, EncodedColumn,
-        FieldEncoder,
+        EncodingOptions, FieldEncoder,
     },
     format::pb,
     EncodingsIo,
@@ -496,8 +496,17 @@ impl ZoneMapsFieldEncoder {
         let zone_maps =
             RecordBatch::try_new(Arc::new(zone_map_schema), vec![mins, maxes, null_counts])?;
         let encoding_strategy = CoreFieldEncodingStrategy::default();
-        let encoded_zone_maps =
-            encode_batch(&zone_maps, Arc::new(schema), &encoding_strategy, u64::MAX).await?;
+        let encoded_zone_maps = encode_batch(
+            &zone_maps,
+            Arc::new(schema),
+            &encoding_strategy,
+            &EncodingOptions {
+                cache_bytes_per_column: u64::MAX,
+                max_page_bytes: u64::MAX,
+                keep_original_array: true,
+            },
+        )
+        .await?;
         let zone_maps_buffer = encoded_zone_maps.try_to_mini_lance()?;
 
         Ok(EncodedBuffer {

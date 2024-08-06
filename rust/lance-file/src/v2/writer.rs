@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use core::panic;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -12,9 +13,10 @@ use futures::StreamExt;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_encoding::encoder::{
-    BatchEncoder, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch, EncodedPage, FieldEncoder,
-    FieldEncodingStrategy,
+    BatchEncoder, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch,
+    EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
 };
+use lance_encoding::version::LanceFileVersion;
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
 use log::debug;
@@ -48,6 +50,12 @@ pub struct FileWriterOptions {
     /// The default will use 8MiB per column which should be reasonable for most cases.
     // TODO: Do we need to be able to set this on a per-column basis?
     pub data_cache_bytes: Option<u64>,
+    /// A hint to indicate the max size of a page
+    ///
+    /// This hint can't always be respected.  A single value could be larger than this value
+    /// and we never slice single values.  In addition, there are some cases where it can be
+    /// difficult to know size up-front and so we might not be able to respect this value.
+    pub max_page_bytes: Option<u64>,
     /// The file writer buffers columns until enough data has arrived to flush a page
     /// to disk.
     ///
@@ -67,6 +75,12 @@ pub struct FileWriterOptions {
     /// of that batch's data has been written to disk)
     pub keep_original_array: Option<bool>,
     pub encoding_strategy: Option<Arc<dyn FieldEncodingStrategy>>,
+    /// The format version to use when writing the file
+    ///
+    /// This controls which encodings will be used when encoding the data.  Newer
+    /// versions may have more efficient encodings.  However, newer format versions will
+    /// require more up-to-date readers to read the data.
+    pub format_version: Option<LanceFileVersion>,
 }
 
 pub struct FileWriter {
@@ -203,21 +217,33 @@ impl FileWriter {
             8 * 1024 * 1024
         };
 
+        let max_page_bytes = if let Some(max_page_bytes) = self.options.max_page_bytes {
+            max_page_bytes
+        } else {
+            32 * 1024 * 1024
+        };
+
         schema.validate()?;
 
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
-        let encoding_strategy = self
-            .options
-            .encoding_strategy
-            .clone()
-            .unwrap_or_else(|| Arc::new(CoreFieldEncodingStrategy::default()));
+        let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
+            let version = self
+                .options
+                .format_version
+                .unwrap_or(LanceFileVersion::default_v2());
+            Arc::new(CoreFieldEncodingStrategy {
+                array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
+                version,
+            })
+        });
 
-        let encoder = BatchEncoder::try_new(
-            &schema,
-            encoding_strategy.as_ref(),
+        let encoding_options = EncodingOptions {
             cache_bytes_per_column,
+            max_page_bytes,
             keep_original_array,
-        )?;
+        };
+        let encoder =
+            BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
         self.num_columns = encoder.num_columns();
 
         self.column_writers = encoder.field_encoders;
@@ -412,6 +438,20 @@ impl FileWriter {
         Ok(())
     }
 
+    /// Converts self.version (which is a mix of "software version" and
+    /// "format version" into a format version)
+    fn version_to_numbers(&self) -> (u16, u16) {
+        let version = self
+            .options
+            .format_version
+            .unwrap_or(LanceFileVersion::default_v2());
+        match version.resolve() {
+            LanceFileVersion::V2_0 => (0, 3),
+            LanceFileVersion::V2_1 => (2, 1),
+            _ => panic!("Unsupported version: {}", version),
+        }
+    }
+
     /// Finishes writing the file
     ///
     /// This method will wait until all data has been flushed to the file.  Then it
@@ -456,14 +496,15 @@ impl FileWriter {
             self.writer.write_u64_le(gbo_len).await?;
         }
 
+        let (major, minor) = self.version_to_numbers();
         // 7. write the footer
         self.writer.write_u64_le(column_metadata_start).await?;
         self.writer.write_u64_le(cmo_table_start).await?;
         self.writer.write_u64_le(gbo_table_start).await?;
         self.writer.write_u32_le(num_global_buffers).await?;
         self.writer.write_u32_le(self.num_columns).await?;
-        self.writer.write_u16_le(MAJOR_VERSION as u16).await?;
-        self.writer.write_u16_le(MINOR_VERSION_NEXT).await?;
+        self.writer.write_u16_le(major).await?;
+        self.writer.write_u16_le(minor).await?;
         self.writer.write_all(MAGIC).await?;
 
         // 7. close the writer

@@ -18,7 +18,7 @@ use lance_file::{
     reader::FileReader,
     writer::{FileWriter, FileWriterOptions, ManifestProvider},
 };
-use lance_io::scheduler::ScanScheduler;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
@@ -55,7 +55,10 @@ impl LanceIndexStore {
         metadata_cache: Option<FileMetadataCache>,
     ) -> Self {
         let object_store = Arc::new(object_store);
-        let scheduler = ScanScheduler::new(object_store.clone());
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::fast_and_not_too_ram_intensive(),
+        );
         Self {
             object_store,
             index_dir,
@@ -328,6 +331,13 @@ mod tests {
     #[async_trait]
     impl TrainingSource for MockTrainingSource {
         async fn scan_ordered_chunks(
+            self: Box<Self>,
+            _chunk_size: u32,
+        ) -> Result<SendableRecordBatchStream> {
+            Ok(self.data)
+        }
+
+        async fn scan_unordered_chunks(
             self: Box<Self>,
             _chunk_size: u32,
         ) -> Result<SendableRecordBatchStream> {

@@ -50,6 +50,13 @@ impl TrainingSource for BenchmarkDataSource {
     ) -> Result<SendableRecordBatchStream> {
         Ok(reader_to_stream(Box::new(Self::test_data())))
     }
+
+    async fn scan_unordered_chunks(
+        self: Box<Self>,
+        _chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        Ok(reader_to_stream(Box::new(Self::test_data())))
+    }
 }
 
 impl BenchmarkFixture {

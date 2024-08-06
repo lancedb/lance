@@ -18,13 +18,22 @@ use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
-use lance::io::{ObjectStore, RecordBatchStream};
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
-use lance_file::v2::{
-    reader::{BufferDescriptor, CachedFileMetadata, FileReader},
-    writer::{FileWriter, FileWriterOptions},
+use lance::{
+    io::{ObjectStore, RecordBatchStream},
+    utils::default_deadlock_prevention_timeout,
 };
-use lance_io::{scheduler::ScanScheduler, ReadBatchParams};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
+use lance_file::{
+    v2::{
+        reader::{BufferDescriptor, CachedFileMetadata, FileReader},
+        writer::{FileWriter, FileWriterOptions},
+    },
+    version::LanceFileVersion,
+};
+use lance_io::{
+    scheduler::{ScanScheduler, SchedulerConfig},
+    ReadBatchParams,
+};
 use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
@@ -174,6 +183,7 @@ impl LanceFileWriter {
         uri_or_path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
+        version: Option<String>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
@@ -181,6 +191,10 @@ impl LanceFileWriter {
         let options = FileWriterOptions {
             data_cache_bytes,
             keep_original_array,
+            format_version: version
+                .map(|v| v.parse::<LanceFileVersion>())
+                .transpose()
+                .infer_error()?,
             ..Default::default()
         };
         let inner = if let Some(schema) = schema {
@@ -202,12 +216,14 @@ impl LanceFileWriter {
         path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
+        version: Option<String>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
         RT.runtime.block_on(Self::open(
             path,
             schema,
             data_cache_bytes,
+            version,
             keep_original_array,
         ))
     }
@@ -243,21 +259,24 @@ pub async fn object_store_from_uri_or_path(
     uri_or_path: impl AsRef<str>,
 ) -> PyResult<(ObjectStore, Path)> {
     if let Ok(mut url) = Url::parse(uri_or_path.as_ref()) {
-        let path = object_store::path::Path::parse(url.path())
-            .map_err(|e| PyIOError::new_err(format!("Invalid URL path `{}`: {}", url.path(), e)))?;
-        let (parent_path, filename) = path_to_parent(&path)?;
-        url.set_path(parent_path.as_ref());
+        if url.scheme().len() > 1 {
+            let path = object_store::path::Path::parse(url.path()).map_err(|e| {
+                PyIOError::new_err(format!("Invalid URL path `{}`: {}", url.path(), e))
+            })?;
+            let (parent_path, filename) = path_to_parent(&path)?;
+            url.set_path(parent_path.as_ref());
 
-        let (object_store, dir_path) = ObjectStore::from_uri(url.as_str()).await.infer_error()?;
-        let child_path = dir_path.child(filename);
-        Ok((object_store, child_path))
-    } else {
-        let path = Path::parse(uri_or_path.as_ref()).map_err(|e| {
-            PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path.as_ref(), e))
-        })?;
-        let object_store = ObjectStore::local();
-        Ok((object_store, path))
+            let (object_store, dir_path) =
+                ObjectStore::from_uri(url.as_str()).await.infer_error()?;
+            let child_path = dir_path.child(filename);
+            return Ok((object_store, child_path));
+        }
     }
+    let path = Path::parse(uri_or_path.as_ref()).map_err(|e| {
+        PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path.as_ref(), e))
+    })?;
+    let object_store = ObjectStore::local();
+    Ok((object_store, path))
 }
 
 #[pyclass]
@@ -268,7 +287,13 @@ pub struct LanceFileReader {
 impl LanceFileReader {
     async fn open(uri_or_path: String) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
-        let scheduler = ScanScheduler::new(Arc::new(object_store));
+        let scheduler = ScanScheduler::new(
+            Arc::new(object_store),
+            SchedulerConfig {
+                io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
+                deadlock_prevention_timeout: default_deadlock_prevention_timeout(),
+            },
+        );
         let file = scheduler.open_file(&path).await.infer_error()?;
         let inner = FileReader::try_open(file, None, DecoderMiddlewareChain::default())
             .await

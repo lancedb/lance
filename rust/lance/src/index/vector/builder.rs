@@ -33,6 +33,7 @@ use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use lance_io::scheduler::SchedulerConfig;
 use lance_io::stream::RecordBatchStream;
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStreamAdapter,
@@ -471,7 +472,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap());
         let mut partition_storage_metadata = Vec::with_capacity(partition_sizes.len());
         let mut partition_index_metadata = Vec::with_capacity(partition_sizes.len());
-        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()));
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::local()),
+            SchedulerConfig::fast_and_not_too_ram_intensive(),
+        );
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
             log::info!("merging partition {}/{}", part_id, ivf.num_partitions());
             if storage_size == 0 {

@@ -182,6 +182,9 @@ message Bitpacked {
 
   // The items in the list
   Buffer buffer = 3;
+
+  // Whether or not a sign bit is included in the bitpacked value
+  bool signed = 4;
 }
 
 // An array encoding for shredded structs that will never be null

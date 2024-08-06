@@ -13,6 +13,7 @@ use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2::writer::FileWriterOptions;
+use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
@@ -144,7 +145,10 @@ impl<'a> FragmentCreateBuilder<'a> {
         let id = id.unwrap_or_default();
 
         let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
-        if !params.use_legacy_format {
+
+        let storage_version = params.storage_version_or_default();
+
+        if storage_version != LanceFileVersion::Legacy {
             return self.write_v2_impl(stream, schema, id).await;
         }
         let progress = params.progress.as_ref();

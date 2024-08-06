@@ -121,6 +121,22 @@ message Manifest {
   //
   // This is only used if the "move_stable_row_ids" feature flag is set.
   uint64 next_row_id = 14;
+
+  message DataStorageFormat {
+    // The format of the data files (e.g. "lance")
+    string file_format = 1;
+    // The max format version of the data files.
+    //
+    // This is the maximum version of the file format that the dataset will create.
+    // This may be lower than the maximum version that can be written in order to allow
+    // older readers to read the dataset.
+    string version = 2;
+  }
+
+  // The data storage format
+  //
+  // This specifies what format is used to store the data files.
+  DataStorageFormat data_format = 15;
 } // Manifest
 
 // Auxiliary Data attached to a version.

@@ -20,12 +20,15 @@ use crate::{
         DecoderMessage, DecoderMiddlewareChain, FilterExpression, PageInfo,
     },
     encoder::{
-        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodedBuffer, EncodedPage, FieldEncoder,
-        FieldEncodingStrategy,
+        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedBuffer,
+        EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
     },
     encodings::logical::r#struct::SimpleStructDecoder,
+    version::LanceFileVersion,
     EncodingsIo,
 };
+
+const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) struct SimulatedScheduler {
     data: Bytes,
@@ -137,28 +140,39 @@ pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<St
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
     };
-    check_round_trip_encoding_generated(field, Box::new(array_generator_provider)).await;
+    check_round_trip_encoding_generated(
+        field,
+        Box::new(array_generator_provider),
+        LanceFileVersion::default_v2(),
+    )
+    .await;
 }
 
 pub async fn check_round_trip_encoding_generated(
     field: Field,
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
+    version: LanceFileVersion,
 ) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
-        let encoding_strategy = CoreFieldEncodingStrategy::default();
-        let encoding_config = HashMap::new();
+        let encoding_strategy = CoreFieldEncodingStrategy {
+            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
+            version,
+        };
         let encoder_factory = || {
             let mut column_index_seq = ColumnIndexSequence::default();
+            let encoding_options = EncodingOptions {
+                max_page_bytes: MAX_PAGE_BYTES,
+                cache_bytes_per_column: page_size,
+                keep_original_array: true,
+            };
             encoding_strategy
                 .create_field_encoder(
                     &encoding_strategy,
                     &lance_field,
                     &mut column_index_seq,
-                    page_size,
-                    true,
-                    &encoding_config,
+                    &encoding_options,
                 )
                 .unwrap()
         };
@@ -238,16 +252,18 @@ pub async fn check_round_trip_encoding_of_data(
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         let encoding_strategy = CoreFieldEncodingStrategy::default();
-        let encoding_config = HashMap::new();
         let mut column_index_seq = ColumnIndexSequence::default();
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column: page_size,
+            max_page_bytes: MAX_PAGE_BYTES,
+            keep_original_array: true,
+        };
         let encoder = encoding_strategy
             .create_field_encoder(
                 &encoding_strategy,
                 &lance_field,
                 &mut column_index_seq,
-                page_size,
-                true,
-                &encoding_config,
+                &encoding_options,
             )
             .unwrap();
         check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases).await
@@ -477,6 +493,10 @@ async fn check_round_trip_field_encoding_random(
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
         for use_slicing in [false, true] {
+            if null_rate != Some(1.0) && matches!(field.data_type(), DataType::Null) {
+                continue;
+            }
+
             let field = if null_rate.is_some() {
                 if !supports_nulls(field.data_type()) {
                     continue;
@@ -510,7 +530,11 @@ async fn check_round_trip_field_encoding_random(
                 if use_slicing {
                     let mut generator = gen().anon_col(array_generator_provider.provide());
                     if let Some(null_rate) = null_rate {
-                        generator.with_random_nulls(null_rate);
+                        // The null generator is the only generator that already inserts nulls
+                        // and attempting to do so again makes arrow-rs grumpy
+                        if !matches!(field.data_type(), DataType::Null) {
+                            generator.with_random_nulls(null_rate);
+                        }
                     }
                     let all_data = generator
                         .into_batch_rows(RowCount::from(10000))
@@ -528,7 +552,11 @@ async fn check_round_trip_field_encoding_random(
                             .with_seed(Seed::from(i as u64))
                             .anon_col(array_generator_provider.provide());
                         if let Some(null_rate) = null_rate {
-                            generator.with_random_nulls(null_rate);
+                            // The null generator is the only generator that already inserts nulls
+                            // and attempting to do so again makes arrow-rs grumpy
+                            if !matches!(field.data_type(), DataType::Null) {
+                                generator.with_random_nulls(null_rate);
+                            }
                         }
                         let arr = generator
                             .into_batch_rows(RowCount::from(rows_per_batch as u64))
