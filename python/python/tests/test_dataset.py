@@ -1573,6 +1573,17 @@ def test_scan_with_batch_size(tmp_path: Path):
         df = batch.to_pandas()
         assert df["a"].iloc[0] == idx * 16
 
+    os.environ["LANCE_DEFAULT_BATCH_SIZE"] = "12"
+    batches = dataset.scanner(scan_in_order=True).to_batches()
+    for batch in batches:
+        # The last batch in each file has 4 rows
+        assert batch.num_rows == 12 or batch.num_rows == 4
+
+    del os.environ["LANCE_DEFAULT_BATCH_SIZE"]
+    batches = dataset.scanner(scan_in_order=True).to_batches()
+    for batch in batches:
+        assert batch.num_rows != 12
+
 
 def test_scan_no_columns(tmp_path: Path):
     base_dir = tmp_path / "dataset"
