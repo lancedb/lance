@@ -7,14 +7,15 @@
 use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::types::{Float16Type, Float64Type};
-use arrow_array::FixedSizeListArray;
-use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
+use arrow_array::{types::Float32Type, Array, ArrayRef, FixedSizeListArray};
 use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::{Error, Result};
-use lance_linalg::distance::{Dot, Normalize, L2};
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::{
+    distance::{DistanceType, Dot, Normalize, L2},
+    MatrixView,
+};
 use rand::SeedableRng;
 use snafu::{location, Location};
 
@@ -34,6 +35,9 @@ pub struct PQBuildParams {
     /// The max number of iterations for kmeans training.
     pub max_iters: usize,
 
+    /// Train KMeans for times and take the best result.
+    pub kmeans_redo: usize,
+
     /// User provided codebook.
     pub codebook: Option<ArrayRef>,
 
@@ -47,6 +51,7 @@ impl Default for PQBuildParams {
             num_sub_vectors: 16,
             num_bits: 8,
             max_iters: 50,
+            kmeans_redo: 1,
             codebook: None,
             sample_rate: 256,
         }
@@ -77,21 +82,19 @@ impl PQBuildParams {
         }
     }
 
-    pub async fn build_from_matrix<T: ArrowFloatType + 'static + ArrowPrimitiveType>(
+    async fn build_from_matrix<T: ArrowFloatType + 'static + ArrowPrimitiveType>(
         &self,
         data: &MatrixView<T>,
-        metric_type: MetricType,
+        distance_type: DistanceType,
     ) -> Result<ProductQuantizer>
     where
         <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
     {
         assert_ne!(
-            metric_type,
-            MetricType::Cosine,
+            distance_type,
+            DistanceType::Cosine,
             "PQ code does not support cosine"
         );
-
-        const REDOS: usize = 1;
 
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors)?;
         let num_centroids = 2_usize.pow(self.num_bits as u32);
@@ -106,9 +109,9 @@ impl PQBuildParams {
                     sub_vector_dimension,
                     num_centroids,
                     self.max_iters as u32,
-                    REDOS,
+                    self.kmeans_redo,
                     rng.clone(),
-                    metric_type,
+                    distance_type,
                     self.sample_rate,
                 )
                 .await
@@ -129,39 +132,32 @@ impl PQBuildParams {
             self.num_bits as u32,
             dimension,
             FixedSizeListArray::try_new_from_values(pd_centroids, dimension as i32)?,
-            metric_type,
+            distance_type,
         ))
     }
 
     /// Build a [ProductQuantizer] from the given data.
     ///
-    /// If the [MetricType] is [MetricType::Cosine], the input data will be normalized.
+    /// If the [DistanceType] is [DistanceType::Cosine], the input data will be normalized.
     pub async fn build(
         &self,
-        data: &dyn Array,
-        metric_type: MetricType,
+        fsl: &FixedSizeListArray,
+        distance_type: DistanceType,
     ) -> Result<ProductQuantizer> {
-        assert_eq!(data.null_count(), 0);
-        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "PQ builder: input is not a FixedSizeList: {}",
-                data.data_type()
-            ),
-            location: location!(),
-        })?;
+        assert_eq!(fsl.null_count(), 0);
         // TODO: support bf16 later.
         match fsl.value_type() {
             DataType::Float16 => {
                 let data = MatrixView::<Float16Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
+                self.build_from_matrix(&data, distance_type).await
             }
             DataType::Float32 => {
                 let data = MatrixView::<Float32Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
+                self.build_from_matrix(&data, distance_type).await
             }
             DataType::Float64 => {
                 let data = MatrixView::<Float64Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
+                self.build_from_matrix(&data, distance_type).await
             }
             _ => Err(Error::Index {
                 message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),

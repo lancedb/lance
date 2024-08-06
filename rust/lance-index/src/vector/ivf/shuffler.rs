@@ -63,7 +63,6 @@ fn get_temp_dir() -> Result<Path> {
 ///   *column*: column name of the vector column.
 ///   *ivf*: IVF model.
 ///   *num_partitions*: number of IVF partitions.
-///   *num_sub_vectors*: number of PQ sub-vectors.
 ///
 /// Returns
 /// -------
@@ -74,7 +73,7 @@ fn get_temp_dir() -> Result<Path> {
 ///
 #[allow(clippy::too_many_arguments)]
 pub async fn shuffle_dataset(
-    data: impl RecordBatchStream + Unpin + 'static,
+    data: Box<dyn RecordBatchStream + Unpin + 'static>,
     column: &str,
     ivf: Arc<IvfTransformer>,
     precomputed_partitions: Option<HashMap<u64, u32>>,

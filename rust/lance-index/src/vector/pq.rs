@@ -14,7 +14,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, DistanceType, Dot, L2};
-use lance_linalg::kmeans::compute_partition;
+use lance_linalg::{kernels::normalize_fsl, kmeans::compute_partition};
 use num_traits::Float;
 use prost::Message;
 use rayon::prelude::*;
@@ -61,6 +61,13 @@ impl ProductQuantizer {
         codebook: FixedSizeListArray,
         distance_type: DistanceType,
     ) -> Self {
+        let codebook = if distance_type == DistanceType::Cosine {
+            let fsl = codebook.values().as_fixed_size_list();
+            normalize_fsl(fsl).expect("Failed to normalize codebook")
+        } else {
+            codebook
+        };
+
         Self {
             num_bits,
             num_sub_vectors,
@@ -107,7 +114,18 @@ impl ProductQuantizer {
         let num_bits = self.num_bits;
         let codebook = self.codebook.values().as_primitive::<T>();
 
-        let distance_type = self.distance_type;
+        let (distance_type, fsl) = if self.distance_type == DistanceType::Cosine {
+            // PQ of cosine distance does not maintain the property of being the sum of
+            // the cosine distances from each individual sub-vector.
+            // Therefore, we need to normalize the vectors and use L2 distance instead.
+            //
+            // At this point, codebook is already normalized.
+            println!("Normalize fsl");
+
+            (DistanceType::L2, normalize_fsl(fsl)?)
+        } else {
+            (self.distance_type, fsl.clone())
+        };
 
         let flatten_data = fsl.values().as_primitive::<T>();
         let sub_dim = dim / num_sub_vectors;

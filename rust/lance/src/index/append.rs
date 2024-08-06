@@ -113,6 +113,7 @@ pub async fn merge_indices<'a>(
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
+                println!("Appending unindexed fragments: {:?}", unindexed);
                 let mut scanner = dataset.scan();
                 scanner
                     .with_fragments(unindexed)
@@ -122,7 +123,8 @@ pub async fn merge_indices<'a>(
             };
 
             optimize_vector_indices(
-                dataset.as_ref().clone(),
+                dataset.object_store(),
+                dataset.indices_dir(),
                 new_data_stream,
                 &column.name,
                 &indices,

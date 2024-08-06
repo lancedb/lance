@@ -60,6 +60,7 @@ impl PartitionTransformer {
             .into()
     }
 }
+
 impl Transformer for PartitionTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {

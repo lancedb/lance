@@ -64,6 +64,7 @@ pub(super) async fn build_partitions(
         });
     }
 
+    println!("pq: {:?}", metric_type);
     let ivf_transformer = lance_index::vector::ivf::IvfTransformer::with_pq(
         ivf.centroids.clone().unwrap(),
         metric_type,
