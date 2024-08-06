@@ -34,6 +34,10 @@ pub struct PQBuildParams {
     /// The max number of iterations for kmeans training.
     pub max_iters: usize,
 
+    /// Run kmeans `REDOS` times and take the best result.
+    /// Default to 1.
+    pub kmeans_redos: usize,
+
     /// User provided codebook.
     pub codebook: Option<ArrayRef>,
 
@@ -47,6 +51,7 @@ impl Default for PQBuildParams {
             num_sub_vectors: 16,
             num_bits: 8,
             max_iters: 50,
+            kmeans_redos: 1,
             codebook: None,
             sample_rate: 256,
         }
@@ -77,13 +82,13 @@ impl PQBuildParams {
         }
     }
 
-    pub async fn build_from_matrix<T: ArrowFloatType + 'static + ArrowPrimitiveType>(
+    async fn build_from_matrix<T: ArrowPrimitiveType>(
         &self,
-        data: &MatrixView<T>,
+        data: &FixedSizeListArray,
         metric_type: MetricType,
     ) -> Result<ProductQuantizer>
     where
-        <T as ArrowFloatType>::Native: Dot + L2 + Normalize,
+        T::Native: Dot + L2 + Normalize,
     {
         assert_ne!(
             metric_type,
@@ -91,22 +96,20 @@ impl PQBuildParams {
             "PQ code does not support cosine"
         );
 
-        const REDOS: usize = 1;
-
-        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors)?;
+        let sub_vectors = divide_to_subvectors::<T>(data, self.num_sub_vectors);
         let num_centroids = 2_usize.pow(self.num_bits as u32);
-        let dimension = data.num_columns();
+        let dimension = data.value_length() as usize;
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
         let d = stream::iter(sub_vectors.into_iter())
             .map(|sub_vec| async move {
                 let rng = rand::rngs::SmallRng::from_entropy();
                 train_kmeans::<T>(
-                    sub_vec.as_ref(),
+                    &sub_vec,
                     sub_vector_dimension,
                     num_centroids,
                     self.max_iters as u32,
-                    REDOS,
+                    self.kmeans_redos,
                     rng.clone(),
                     metric_type,
                     self.sample_rate,

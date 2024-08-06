@@ -1615,7 +1615,6 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
-    use lance_linalg::MatrixView;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
@@ -2411,16 +2410,23 @@ mod tests {
     }
 
     fn ground_truth(
-        mat: &MatrixView<Float32Type>,
+        fsl: &FixedSizeListArray,
         query: &[f32],
         k: usize,
         distance_type: DistanceType,
     ) -> Vec<(f32, u32)> {
-        let mut dists = vec![];
-        for i in 0..mat.num_rows() {
-            let dist = distance_type.func()(query, mat.row_ref(i).unwrap());
-            dists.push((dist, i as u32));
-        }
+        let dim = fsl.value_length() as usize;
+        let mut dists = fsl
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .chunks(dim)
+            .enumerate()
+            .map(|(i, vec)| {
+                let dist = distance_type.func()(query, vec);
+                (dist, i as u32)
+            })
+            .collect_vec();
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         dists.truncate(k);
         dists
@@ -2449,7 +2455,6 @@ mod tests {
             .await
             .unwrap();
 
-        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
         let query = vector_array.value(0);
         let query = query.as_primitive::<Float32Type>();
         let k = 100;
@@ -2487,7 +2492,7 @@ mod tests {
             .to_vec();
 
         let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, DistanceType::L2);
+        let gt = ground_truth(&vector_array, query.values(), k, DistanceType::L2);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
@@ -2532,7 +2537,6 @@ mod tests {
             .await
             .unwrap();
 
-        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
         let query = vector_array.value(0);
         let query = query.as_primitive::<Float32Type>();
         let k = 100;
@@ -2570,7 +2574,7 @@ mod tests {
             .to_vec();
 
         let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
-        let gt = ground_truth(&mat, query.values(), k, distance_type);
+        let gt = ground_truth(&vector_array, query.values(), k, distance_type);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();

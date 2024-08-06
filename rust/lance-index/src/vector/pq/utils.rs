@@ -1,50 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
-
-use lance_arrow::ArrowFloatType;
-use lance_core::{Error, Result};
-use lance_linalg::MatrixView;
-use snafu::{location, Location};
+use arrow_array::{cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeListArray};
 
 /// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.
-pub(super) fn divide_to_subvectors<T: ArrowFloatType>(
-    data: &MatrixView<T>,
+pub(super) fn divide_to_subvectors<T: ArrowPrimitiveType>(
+    fsl: &FixedSizeListArray,
     m: usize,
-) -> Result<Vec<Arc<T::ArrayType>>> {
-    assert!(!data.num_rows() > 0);
-    if data.num_columns() % m != 0 {
-        return Err(Error::invalid_input(
-            format!(
-                "num_sub_vectors must divide vector dimension {}, but got {}",
-                data.num_columns(),
-                m
-            ),
-            location!(),
-        ));
-    }
-
-    let sub_vector_length = data.num_columns() / m;
-    let capacity = data.num_rows() * sub_vector_length;
-    let mut subarrays = vec![];
+) -> Vec<Vec<T::Native>> {
+    let dim = fsl.value_length() as usize;
+    let sub_vector_length = dim / m;
+    let capacity = fsl.len() * sub_vector_length;
+    let mut subarrays = vec![Vec::with_capacity(capacity); m];
 
     // TODO: very intensive memory copy involved!!! But this is on the write path.
     // Optimize for memory copy later.
-    for i in 0..m {
-        let mut builder = Vec::with_capacity(capacity);
-        for j in 0..data.num_rows() {
-            let row = data.row_ref(j).unwrap();
-            let start = i * sub_vector_length;
-            builder.extend_from_slice(&row[start..start + sub_vector_length]);
-        }
-        let values = T::ArrayType::from(builder);
-        subarrays.push(Arc::new(values));
-    }
-    Ok(subarrays)
+    fsl.values()
+        .as_primitive::<T>()
+        .values()
+        .chunks(dim)
+        .for_each(|vec| {
+            for i in 0..m {
+                subarrays[i]
+                    .extend_from_slice(&vec[i * sub_vector_length..(i + 1) * sub_vector_length]);
+            }
+        });
+    subarrays
 }
 
 /// Number of PQ centroids, for the corresponding number of PQ bits.
