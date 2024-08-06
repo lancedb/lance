@@ -797,16 +797,6 @@ pub async fn commit_compaction(
             })
             .collect()
     } else {
-        // In absence of remapping, we did not reserve fragment ids as part of
-        // the individual rewrite tasks. This is partly to avoid the commit
-        // conflict bug described in https://github.com/lancedb/lance/issues/2397
-        // and partly because we don't need to reserve fragment ids if we're not
-        // remapping indices.
-        let new_fragments = rewrite_groups
-            .iter_mut()
-            .flat_map(|group| group.new_fragments.iter_mut())
-            .collect::<Vec<_>>();
-        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
         Vec::new()
     };
 

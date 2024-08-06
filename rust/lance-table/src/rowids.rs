@@ -152,7 +152,7 @@ impl RowIdSequence {
         self.0.extend_from_slice(remaining_segments);
     }
 
-    /// Mask
+    /// Delete row ids by position.
     pub fn mask(&mut self, positions: impl IntoIterator<Item = usize>) -> Result<()> {
         let row_ids = positions
             .into_iter()
