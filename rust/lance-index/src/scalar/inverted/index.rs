@@ -224,9 +224,9 @@ impl ScalarIndex for InvertedIndex {
     where
         Self: Sized,
     {
-        let token_reader = store.open_index_file_v2(TOKENS_FILE).await?;
-        let invert_list_reader = store.open_index_file_v2(INVERT_LIST_FILE).await?;
-        let docs_reader = store.open_index_file_v2(DOCS_FILE).await?;
+        let token_reader = store.open_index_file(TOKENS_FILE).await?;
+        let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
+        let docs_reader = store.open_index_file(DOCS_FILE).await?;
 
         let tokens = TokenSet::load(token_reader).await?;
         let inverted_list = InvertedListReader::new(invert_list_reader)?;

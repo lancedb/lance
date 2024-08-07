@@ -238,14 +238,7 @@ fn pack_bits(
         // note that we don't need to do this if we wrote the full number of bits
         // because source index would have been advanced by the inner loop above
         if bit_len != num_bits {
-            let mut partial_bytes_written = num_bits / 8;
-
-            // if we didn't write the full byte for the last byte, increment by one because
-            // we wrote a partial byte. Also increment by one if it's a partial byte where
-            // the num bits is < 8
-            if bit_len % num_bits != 0 || partial_bytes_written == 0 {
-                partial_bytes_written += 1;
-            }
+            let partial_bytes_written = ceil(num_bits as usize, 8);
 
             // we also want to the next location in src, unless we wrote something
             // byte-aligned in which case the logic above would have already advanced
@@ -254,7 +247,7 @@ fn pack_bits(
                 to_next_byte = 0;
             }
 
-            src_idx += (byte_len as u64 - partial_bytes_written + to_next_byte) as usize;
+            src_idx += byte_len - partial_bytes_written + to_next_byte;
         }
     }
 }
@@ -468,16 +461,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                 // note that we don't need to do this if we wrote the full number of bits
                 // because source index would have been advanced by the inner loop above
                 if self.uncompressed_bits_per_value != self.bits_per_value {
-                    let mut partial_bytes_written = self.bits_per_value / 8;
-
-                    // if we didn't write the full byte for the last byte, increment by one because
-                    // we wrote a partial byte. Also increment by one if it's a partial byte written where
-                    // num bits is less than 8
-                    if self.uncompressed_bits_per_value % self.bits_per_value != 0
-                        || partial_bytes_written == 0
-                    {
-                        partial_bytes_written += 1;
-                    }
+                    let partial_bytes_written = ceil(self.bits_per_value as usize, 8);
 
                     // we also want to move one location to the next location in destination,
                     // unless we wrote something byte-aligned in which case the logic above
@@ -487,7 +471,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                         to_next_byte = 0;
                     }
                     let next_dst_idx =
-                        dst_idx + (byte_len - partial_bytes_written + to_next_byte) as usize;
+                        dst_idx + byte_len as usize - partial_bytes_written + to_next_byte;
 
                     // pad remaining bytes with 1 for negative signed numbers
                     if self.signed && is_negative {

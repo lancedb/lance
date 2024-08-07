@@ -204,8 +204,10 @@ impl FileReader {
         let minor_version = cursor.read_u16::<LittleEndian>()?;
 
         if major_version == MAJOR_VERSION as u16 && minor_version == MINOR_VERSION as u16 {
-            return Err(Error::io(
+            return Err(Error::version_conflict(
                 "Attempt to use the lance v2 reader to read a legacy file".to_string(),
+                major_version,
+                minor_version,
                 location!(),
             ));
         }

@@ -63,14 +63,14 @@ impl InvertedIndexBuilder {
     async fn save(&self, dest_store: &dyn IndexStore) -> Result<()> {
         let token_set_batch = self.tokens.to_batch()?;
         let mut token_set_writer = dest_store
-            .new_index_file_v2(TOKENS_FILE, token_set_batch.schema())
+            .new_index_file(TOKENS_FILE, token_set_batch.schema())
             .await?;
         token_set_writer.write_record_batch(token_set_batch).await?;
         token_set_writer.finish().await?;
 
         let invert_list_batch = self.invert_list.to_batch()?;
         let mut invert_list_writer = dest_store
-            .new_index_file_v2(INVERT_LIST_FILE, invert_list_batch.schema())
+            .new_index_file(INVERT_LIST_FILE, invert_list_batch.schema())
             .await?;
         invert_list_writer
             .write_record_batch(invert_list_batch)
@@ -79,7 +79,7 @@ impl InvertedIndexBuilder {
 
         let docs_batch = self.docs.to_batch()?;
         let mut docs_writer = dest_store
-            .new_index_file_v2(DOCS_FILE, docs_batch.schema())
+            .new_index_file(DOCS_FILE, docs_batch.schema())
             .await?;
         docs_writer.write_record_batch(docs_batch).await?;
         docs_writer.finish().await?;

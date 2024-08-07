@@ -60,11 +60,19 @@ impl TrainingSource for BenchmarkDataSource {
 }
 
 impl BenchmarkFixture {
+    #[allow(dead_code)]
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
         Arc::new(LanceIndexStore::new(object_store, test_path, None))
+    }
+
+    fn legacy_test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
+        let test_path = tempdir.path();
+        let (object_store, test_path) =
+            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
+        Arc::new(LanceIndexStore::new(object_store, test_path, None).with_legacy_format(true))
     }
 
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {
@@ -90,7 +98,7 @@ impl BenchmarkFixture {
 
     async fn open() -> Self {
         let tempdir = tempfile::tempdir().unwrap();
-        let index_store = Self::test_store(&tempdir);
+        let index_store = Self::legacy_test_store(&tempdir);
         let baseline_dataset = Self::write_baseline_data(&tempdir).await;
         Self::train_scalar_index(&index_store).await;
 
