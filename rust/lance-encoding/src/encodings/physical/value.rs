@@ -647,6 +647,16 @@ pub(crate) mod tests {
                     ),
                 ),
             ),
+            // check byte aligned where the num bits doesn't divide evenly into the byte length
+            (
+                DataType::UInt64,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
+                        // this range should always give 24 hits
+                        Uniform::new(200 << 16, 250 << 16),
+                    ),
+                ),
+            ),
             // check that we can still encode an all-0 array
             (
                 DataType::UInt32,

@@ -257,12 +257,21 @@ impl Scanner {
         // 64KB, this is 16K rows. For local file systems, the default block size
         // is just 4K, which would mean only 1K rows, which might be a little small.
         // So we use a default minimum of 8K rows.
-        self.batch_size.unwrap_or_else(|| {
-            std::cmp::max(
-                self.dataset.object_store().block_size() / 4,
-                DEFAULT_BATCH_SIZE,
-            )
-        })
+        std::env::var("LANCE_DEFAULT_BATCH_SIZE")
+            .map(|bs| {
+                bs.parse().expect(&format!(
+                    "The value of LANCE_DEFAULT_BATCH_SIZE ({}) is not a valid batch size",
+                    bs
+                ))
+            })
+            .unwrap_or_else(|_| {
+                self.batch_size.unwrap_or_else(|| {
+                    std::cmp::max(
+                        self.dataset.object_store().block_size() / 4,
+                        DEFAULT_BATCH_SIZE,
+                    )
+                })
+            })
     }
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
