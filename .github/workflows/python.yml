@@ -218,14 +218,15 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.12"
+        python-version: "3.11" # TODO: upgrade when ray supports 3.12
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: python
         prefix-key: "manylinux2014"  # use this to flush the cache
     - uses: ./.github/workflows/build_linux_wheel
     - name: Install dependencies
-      run:
+      run: |
+        pip install ray[data]
         pip install torch --index-url https://download.pytorch.org/whl/cpu
     - uses: ./.github/workflows/run_integtests
     # Make sure wheels are not included in the Rust cache

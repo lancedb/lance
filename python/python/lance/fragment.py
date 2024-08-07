@@ -146,7 +146,8 @@ class LanceFragment(pa.dataset.Fragment):
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
         *,
-        use_legacy_format=True,
+        data_storage_version: str = "legacy",
+        use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
@@ -178,9 +179,13 @@ class LanceFragment(pa.dataset.Fragment):
             The write mode. If "append" is specified, the data will be checked
             against the existing dataset's schema. Otherwise, pass "create" or
             "overwrite" to assign new field ids to the schema.
-        use_legacy_format: bool, default True
-            Use the legacy format to write Lance files. The default is True
-            while the v2 format is still in beta.
+        data_storage_version: optional, str, default "legacy"
+            The version of the data storage format to use. Newer versions are more
+            efficient but require newer versions of lance to read.  The default is
+            "legacy" which will use the legacy v1 version.  See the user guide
+            for more details.
+        use_legacy_format: bool, default None
+            Deprecated parameter.  Use data_storage_version instead.
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
@@ -199,6 +204,16 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
+        if use_legacy_format is not None:
+            warnings.warn(
+                "use_legacy_format is deprecated, use data_storage_version instead",
+                DeprecationWarning,
+            )
+            if use_legacy_format:
+                data_storage_version = "legacy"
+            else:
+                data_storage_version = "stable"
+
         if _check_for_pandas(data) and isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
         elif isinstance(data, pa.Table):
@@ -222,7 +237,7 @@ class LanceFragment(pa.dataset.Fragment):
             max_rows_per_group=max_rows_per_group,
             progress=progress,
             mode=mode,
-            use_legacy_format=use_legacy_format,
+            data_storage_version=data_storage_version,
             storage_options=storage_options,
         )
         return FragmentMetadata(inner_meta.json())
@@ -512,7 +527,8 @@ def write_fragments(
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
-    use_legacy_format: bool = True,
+    data_storage_version: str = "legacy",
+    use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> List[FragmentMetadata]:
     """
@@ -550,9 +566,14 @@ def write_fragments(
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
-    use_legacy_format : optional, bool, default True
-        Use the Lance v1 writer to write Lance v1 files.  The default is currently
-        True while the v2 format is in beta.
+    data_storage_version: optional, str, default "legacy"
+        The version of the data storage format to use. Newer versions are more
+        efficient but require newer versions of lance to read.  The default is
+        "legacy" which will use the legacy v1 version.  See the user guide
+        for more details.
+    use_legacy_format : optional, bool, default None
+        Deprecated method for setting the data storage version. Use the
+        `data_storage_version` parameter instead.
     storage_options : Optional[Dict[str, str]]
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
@@ -578,6 +599,16 @@ def write_fragments(
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
 
+    if use_legacy_format is not None:
+        warnings.warn(
+            "use_legacy_format is deprecated, use data_storage_version instead",
+            DeprecationWarning,
+        )
+        if use_legacy_format:
+            data_storage_version = "legacy"
+        else:
+            data_storage_version = "stable"
+
     fragments = _write_fragments(
         dataset_uri,
         reader,
@@ -586,7 +617,7 @@ def write_fragments(
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,
         progress=progress,
-        use_legacy_format=use_legacy_format,
+        data_storage_version=data_storage_version,
         storage_options=storage_options,
     )
     return [FragmentMetadata.from_metadata(frag) for frag in fragments]

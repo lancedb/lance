@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Exec plan planner
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use crate::expr::safe_coerce_scalar;
+use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
@@ -18,17 +23,17 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, GetIndexedField, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
-use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
     Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
-    Function, FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, TimezoneInfo, UnaryOperator,
+    Value,
 };
 use datafusion::{
     common::Column,
@@ -40,39 +45,10 @@ use datafusion::{
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
-use lance_datafusion::expr::safe_coerce_scalar;
-use lance_index::scalar::expression::{
-    apply_scalar_indices, IndexInformationProvider, ScalarIndexExpr,
-};
+use lance_core::datatypes::Schema;
 use snafu::{location, Location};
 
-use crate::datafusion::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt};
-use crate::utils::sql::parse_sql_expr;
-use crate::{
-    datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
-    Result,
-};
-
-#[derive(Default, Debug)]
-pub struct FilterPlan {
-    pub index_query: Option<ScalarIndexExpr>,
-    pub refine_expr: Option<Expr>,
-    pub full_expr: Option<Expr>,
-}
-
-impl FilterPlan {
-    pub fn refine_columns(&self) -> Vec<String> {
-        self.refine_expr
-            .as_ref()
-            .map(Planner::column_names_in_expr)
-            .unwrap_or_default()
-    }
-
-    /// Return true if this has a refine step, regardless of the status of prefilter
-    pub fn has_refine(&self) -> bool {
-        self.refine_expr.is_some()
-    }
-}
+use lance_core::{Error, Result};
 
 #[derive(Debug, Clone)]
 struct CastListF16Udf {
@@ -229,15 +205,15 @@ impl ContextProvider for LanceContextProvider {
         &self.options
     }
 
-    fn udfs_names(&self) -> Vec<String> {
+    fn udf_names(&self) -> Vec<String> {
         self.state.scalar_functions().keys().cloned().collect()
     }
 
-    fn udafs_names(&self) -> Vec<String> {
+    fn udaf_names(&self) -> Vec<String> {
         self.state.aggregate_functions().keys().cloned().collect()
     }
 
-    fn udwfs_names(&self) -> Vec<String> {
+    fn udwf_names(&self) -> Vec<String> {
         self.state.window_functions().keys().cloned().collect()
     }
 }
@@ -259,9 +235,7 @@ impl Planner {
                     column,
                     Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone()))),
                 ],
-                func_def: datafusion::logical_expr::ScalarFunctionDefinition::UDF(Arc::new(
-                    ScalarUDF::new_from_impl(GetFieldFunc::default()),
-                )),
+                func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
             });
         }
         column
@@ -354,18 +328,13 @@ impl Planner {
         Ok(match value {
             Value::Number(v, _) => self.number(v.as_str())?,
             Value::SingleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
-            Value::DollarQuotedString(_) => todo!(),
-            Value::EscapedStringLiteral(_) => todo!(),
-            Value::NationalStringLiteral(_) => todo!(),
-            Value::HexStringLiteral(_) => todo!(),
+            Value::HexStringLiteral(hsl) => {
+                Expr::Literal(ScalarValue::Binary(Self::try_decode_hex_literal(hsl)))
+            }
             Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
             Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v))),
             Value::Null => Expr::Literal(ScalarValue::Null),
-            Value::Placeholder(_) => todo!(),
-            Value::UnQuotedString(_) => todo!(),
-            Value::SingleQuotedByteStringLiteral(_) => todo!(),
-            Value::DoubleQuotedByteStringLiteral(_) => todo!(),
-            Value::RawStringLiteral(_) => todo!(),
+            _ => todo!(),
         })
     }
 
@@ -386,15 +355,23 @@ impl Planner {
     // this is a function that comes from duckdb.  Datafusion does not consider is_valid to be a function
     // but rather an AST node (Expr::IsNotNull) and so we need to handle this case specially.
     fn legacy_parse_function(&self, func: &Function) -> Result<Expr> {
-        if func.args.len() != 1 {
-            return Err(Error::io(
-                format!("is_valid only support 1 args, got {}", func.args.len()),
+        match &func.args {
+            FunctionArguments::List(args) => {
+                if func.name.0.len() != 1 {
+                    return Err(Error::io(
+                        format!("Function name must have 1 part, got: {:?}", func.name.0),
+                        location!(),
+                    ));
+                }
+                Ok(Expr::IsNotNull(Box::new(
+                    self.parse_function_args(&args.args[0])?,
+                )))
+            }
+            _ => Err(Error::io(
+                format!("Unsupported function args: {:?}", &func.args),
                 location!(),
-            ));
+            )),
         }
-        Ok(Expr::IsNotNull(Box::new(
-            self.parse_function_args(&func.args[0])?,
-        )))
     }
 
     fn parse_function(&self, function: SQLExpr) -> Result<Expr> {
@@ -404,13 +381,20 @@ impl Planner {
             }
         }
         let context_provider = LanceContextProvider::default();
-        let sql_to_rel = SqlToRel::new_with_options(
+        let mut sql_to_rel = SqlToRel::new_with_options(
             &context_provider,
             ParserOptions {
                 parse_float_as_decimal: false,
                 enable_ident_normalization: false,
+                support_varchar_with_length: false,
             },
         );
+        // These planners are not automatically propagated.
+        // See: https://github.com/apache/datafusion/issues/11477
+        for planner in context_provider.state.expr_planners() {
+            sql_to_rel = sql_to_rel.with_user_defined_planner(planner.clone());
+        }
+
         let mut planner_context = PlannerContext::default();
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
         Ok(sql_to_rel.sql_to_expr(function, &schema, &mut planner_context)?)
@@ -620,7 +604,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                *escape_char,
+                escape_char.as_ref().and_then(|c| c.chars().next()),
                 true,
             ))),
             SQLExpr::Like {
@@ -632,7 +616,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                *escape_char,
+                escape_char.as_ref().and_then(|c| c.chars().next()),
                 false,
             ))),
             SQLExpr::Cast {
@@ -673,6 +657,42 @@ impl Planner {
         Ok(resolved)
     }
 
+    /// Try to decode bytes from hex literal string.
+    ///
+    /// Copied from datafusion because this is not public.
+    ///
+    /// TODO: use SqlToRel from Datafusion directly?
+    fn try_decode_hex_literal(s: &str) -> Option<Vec<u8>> {
+        let hex_bytes = s.as_bytes();
+        let mut decoded_bytes = Vec::with_capacity((hex_bytes.len() + 1) / 2);
+
+        let start_idx = hex_bytes.len() % 2;
+        if start_idx > 0 {
+            // The first byte is formed of only one char.
+            decoded_bytes.push(Self::try_decode_hex_char(hex_bytes[0])?);
+        }
+
+        for i in (start_idx..hex_bytes.len()).step_by(2) {
+            let high = Self::try_decode_hex_char(hex_bytes[i])?;
+            let low = Self::try_decode_hex_char(hex_bytes[i + 1])?;
+            decoded_bytes.push(high << 4 | low);
+        }
+
+        Some(decoded_bytes)
+    }
+
+    /// Try to decode a byte from a hex char.
+    ///
+    /// None will be returned if the input char is hex-invalid.
+    const fn try_decode_hex_char(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'0'..=b'9' => Some(c - b'0'),
+            _ => None,
+        }
+    }
+
     /// Optimize the filter expression and coerce data types.
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
@@ -685,7 +705,7 @@ impl Planner {
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
 
         let expr = simplifier.simplify(expr.clone())?;
-        let expr = simplifier.coerce(expr, df_schema.clone())?;
+        let expr = simplifier.coerce(expr, &df_schema)?;
 
         Ok(expr)
     }
@@ -712,42 +732,6 @@ impl Planner {
         expr.visit(&mut visitor).unwrap();
         visitor.columns.into_iter().collect()
     }
-
-    /// Determine how to apply a provided filter
-    ///
-    /// We parse the filter into a logical expression.  We then
-    /// split the logical expression into a portion that can be
-    /// satisfied by an index search (of one or more indices) and
-    /// a refine portion that must be applied after the index search
-    pub fn create_filter_plan(
-        &self,
-        filter: Expr,
-        index_info: &dyn IndexInformationProvider,
-        use_scalar_index: bool,
-    ) -> Result<FilterPlan> {
-        let logical_expr = self.optimize_expr(filter)?;
-        if use_scalar_index {
-            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info);
-            Ok(FilterPlan {
-                index_query: indexed_expr.scalar_query,
-                refine_expr: indexed_expr.refine_expr,
-                full_expr: Some(logical_expr),
-            })
-        } else {
-            Ok(FilterPlan {
-                index_query: None,
-                refine_expr: Some(logical_expr.clone()),
-                full_expr: Some(logical_expr),
-            })
-        }
-    }
-
-    pub fn get_physical_optimizer() -> PhysicalOptimizer {
-        PhysicalOptimizer::with_rules(vec![
-            Arc::new(crate::io::exec::optimizer::CoalesceTake),
-            Arc::new(crate::io::exec::optimizer::SimplifyProjection),
-        ])
-    }
 }
 
 struct ColumnCapturingVisitor {
@@ -756,7 +740,7 @@ struct ColumnCapturingVisitor {
     columns: BTreeSet<String>,
 }
 
-impl TreeNodeVisitor for ColumnCapturingVisitor {
+impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
     type Node = Expr;
 
     fn f_down(&mut self, node: &Self::Node) -> DFResult<TreeNodeRecursion> {
@@ -781,12 +765,6 @@ impl TreeNodeVisitor for ColumnCapturingVisitor {
                     self.current_path.clear();
                 }
             }
-            Expr::GetIndexedField(GetIndexedField {
-                expr: _,
-                field: GetFieldAccess::NamedStructField { name },
-            }) => {
-                self.current_path.push_front(name.to_string());
-            }
             _ => {
                 self.current_path.clear();
             }
@@ -799,7 +777,7 @@ impl TreeNodeVisitor for ColumnCapturingVisitor {
 #[cfg(test)]
 mod tests {
 
-    use crate::datafusion::logical_expr::tests::ExprExt;
+    use crate::logical_expr::ExprExt;
 
     use super::*;
 
@@ -809,7 +787,8 @@ mod tests {
         TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Fields, Schema};
-    use datafusion::logical_expr::{lit, Cast, ScalarFunctionDefinition};
+    use datafusion::logical_expr::{lit, Cast};
+    use datafusion_functions::core::expr_ext::FieldAccessor;
 
     #[test]
     fn test_parse_filter_simple() {
@@ -930,9 +909,7 @@ mod tests {
         assert_column_eq(&planner, "`s0`", &expected);
 
         let expected = Expr::ScalarFunction(ScalarFunction {
-            func_def: ScalarFunctionDefinition::UDF(Arc::new(ScalarUDF::new_from_impl(
-                GetFieldFunc::default(),
-            ))),
+            func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
             args: vec![
                 Expr::Column(Column {
                     relation: None,
@@ -946,14 +923,10 @@ mod tests {
         assert_column_eq(&planner, "st.`s1`", &expected);
 
         let expected = Expr::ScalarFunction(ScalarFunction {
-            func_def: ScalarFunctionDefinition::UDF(Arc::new(ScalarUDF::new_from_impl(
-                GetFieldFunc::default(),
-            ))),
+            func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
             args: vec![
                 Expr::ScalarFunction(ScalarFunction {
-                    func_def: ScalarFunctionDefinition::UDF(Arc::new(ScalarUDF::new_from_impl(
-                        GetFieldFunc::default(),
-                    ))),
+                    func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
                     args: vec![
                         Expr::Column(Column {
                             relation: None,
@@ -1383,5 +1356,22 @@ mod tests {
 
         let columns = Planner::column_names_in_expr(&expr);
         assert_eq!(columns, vec!["s0", "st.s1", "st.st.s2"]);
+    }
+
+    #[test]
+    fn test_parse_binary_expr() {
+        let bin_str = "x'616263'";
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "binary",
+            DataType::Binary,
+            true,
+        )]));
+        let planner = Planner::new(schema);
+        let expr = planner.parse_expr(bin_str).unwrap();
+        assert_eq!(
+            expr,
+            Expr::Literal(ScalarValue::Binary(Some(vec![b'a', b'b', b'c'])))
+        );
     }
 }

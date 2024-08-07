@@ -11,16 +11,16 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
-use lance_io::object_store::WrappingObjectStore;
+use lance_file::version::LanceFileVersion;
+use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore};
 use lance_table::format::Fragment;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore, PutOptions, PutResult,
-    Result as OSResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result as OSResult,
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
-use tokio::io::AsyncWrite;
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
@@ -35,19 +35,19 @@ use crate::Dataset;
 pub struct TestDatasetGenerator {
     seed: Option<u64>,
     data: Vec<RecordBatch>,
-    use_legacy_format: bool,
+    data_storage_version: LanceFileVersion,
 }
 
 impl TestDatasetGenerator {
     /// Create a new dataset generator with the given data.
     ///
     /// Each batch will become a separate fragment in the dataset.
-    pub fn new(data: Vec<RecordBatch>, use_legacy_format: bool) -> Self {
+    pub fn new(data: Vec<RecordBatch>, data_storage_version: LanceFileVersion) -> Self {
         assert!(!data.is_empty());
         Self {
             data,
             seed: None,
-            use_legacy_format,
+            data_storage_version,
         }
     }
 
@@ -112,7 +112,8 @@ impl TestDatasetGenerator {
 
         let operation = Operation::Overwrite { fragments, schema };
 
-        Dataset::commit(uri, operation, None, Default::default(), None)
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        Dataset::commit(uri, operation, None, Default::default(), None, registry)
             .await
             .unwrap()
     }
@@ -195,7 +196,7 @@ impl TestDatasetGenerator {
             let sub_frag = FragmentCreateBuilder::new(uri)
                 .schema(&file_schema)
                 .write_params(&WriteParams {
-                    use_legacy_format: self.use_legacy_format,
+                    data_storage_version: Some(self.data_storage_version),
                     ..Default::default()
                 })
                 .write(reader, None)
@@ -304,28 +305,25 @@ impl IoTrackingStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for IoTrackingStore {
-    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
+    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         self.target.put(location, bytes).await
     }
 
     async fn put_opts(
         &self,
         location: &Path,
-        bytes: Bytes,
+        bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         self.target.put_opts(location, bytes, opts).await
     }
 
-    async fn put_multipart(
+    async fn put_multipart_opts(
         &self,
         location: &Path,
-    ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
-        self.target.put_multipart(location).await
-    }
-
-    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
-        self.target.abort_multipart(location, multipart_id).await
+        opts: PutMultipartOpts,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -403,7 +401,10 @@ mod tests {
 
     #[rstest]
     #[test]
-    fn test_make_schema(#[values(false, true)] use_legacy_format: bool) {
+    fn test_make_schema(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new(
@@ -421,7 +422,7 @@ mod tests {
         ]));
         let data = vec![RecordBatch::new_empty(arrow_schema.clone())];
 
-        let generator = TestDatasetGenerator::new(data, use_legacy_format);
+        let generator = TestDatasetGenerator::new(data, data_storage_version);
         let schema = generator.make_schema(&mut rand::thread_rng());
 
         let roundtripped_schema = ArrowSchema::from(&schema);
@@ -445,7 +446,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_make_fragment(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_make_fragment(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let struct_fields: ArrowFields = vec![
@@ -475,7 +479,7 @@ mod tests {
         )
         .unwrap();
 
-        let generator = TestDatasetGenerator::new(vec![data.clone()], use_legacy_format);
+        let generator = TestDatasetGenerator::new(vec![data.clone()], data_storage_version);
         let mut rng = rand::thread_rng();
         for _ in 1..50 {
             let schema = generator.make_schema(&mut rng);
@@ -507,7 +511,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_make_hostile(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_make_hostile(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -537,7 +544,7 @@ mod tests {
         ];
 
         let seed = 42;
-        let generator = TestDatasetGenerator::new(data.clone(), use_legacy_format).seed(seed);
+        let generator = TestDatasetGenerator::new(data.clone(), data_storage_version).seed(seed);
 
         let path = tmp_dir.path().join("ds1");
         let dataset = generator.make_hostile(path.to_str().unwrap()).await;
@@ -559,7 +566,7 @@ mod tests {
                 .map(|rb| rb.project(&projection).unwrap())
                 .collect::<Vec<RecordBatch>>();
 
-            let generator = TestDatasetGenerator::new(data.clone(), use_legacy_format);
+            let generator = TestDatasetGenerator::new(data.clone(), data_storage_version);
             // Sample a few
             for i in 1..20 {
                 let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));

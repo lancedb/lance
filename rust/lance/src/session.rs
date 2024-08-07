@@ -63,12 +63,6 @@ impl Session {
         extension: Arc<dyn IndexExtension>,
     ) -> Result<()> {
         match extension.index_type() {
-            IndexType::Scalar => {
-                return Err(Error::invalid_input(
-                    "scalar index extension is not support yet".to_string(),
-                    location!(),
-                ));
-            }
             IndexType::Vector => {
                 if self
                     .index_extensions
@@ -89,6 +83,15 @@ impl Session {
                         location!(),
                     ));
                 }
+            }
+            _ => {
+                return Err(Error::invalid_input(
+                    format!(
+                        "scalar index extension is not support yet: {}",
+                        extension.index_type()
+                    ),
+                    location!(),
+                ));
             }
         }
 

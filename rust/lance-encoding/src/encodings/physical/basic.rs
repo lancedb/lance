@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_buffer::BooleanBuffer;
-use bytes::BytesMut;
+use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 
 use crate::{
+    data::{AllNullDataBlock, DataBlock, DataBlockExt, FixedWidthDataBlock, NullableDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
@@ -32,16 +33,6 @@ enum DataNullStatus {
     None(Box<dyn PrimitivePageDecoder>),
     // Validity and values
     Some(DataDecoders),
-}
-
-impl DataNullStatus {
-    fn values_decoder(&self) -> Option<&dyn PrimitivePageDecoder> {
-        match self {
-            Self::All => None,
-            Self::Some(decoders) => Some(decoders.values.as_ref()),
-            Self::None(values) => Some(values.as_ref()),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -169,46 +160,22 @@ struct BasicPageDecoder {
 }
 
 impl PrimitivePageDecoder for BasicPageDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u64,
-        num_rows: u64,
-        all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
-        let dest_buffers = match &self.mode {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+        match &self.mode {
             DataNullStatus::Some(decoders) => {
-                let mut buffers = decoders.validity.decode(rows_to_skip, num_rows, all_null)?; // buffer 0
-                let mut values_bytesmut =
-                    decoders.values.decode(rows_to_skip, num_rows, all_null)?; // buffer 1 onwards
-
-                buffers.append(&mut values_bytesmut);
-                buffers
+                let validity = decoders.validity.decode(rows_to_skip, num_rows)?;
+                let validity = validity.try_into_layout::<FixedWidthDataBlock>()?;
+                let values = decoders.values.decode(rows_to_skip, num_rows)?;
+                Ok(Box::new(NullableDataBlock {
+                    data: values,
+                    nulls: validity.data,
+                }))
             }
-            // Either dest_buffers[0] is empty, in which case these are no-ops, or one of the
-            // other pages needed the buffer, in which case we need to fill our section
-            DataNullStatus::All => {
-                let buffers = vec![BytesMut::default()];
-                *all_null = true;
-                buffers
-            }
-            DataNullStatus::None(values) => {
-                let mut dest_buffers = vec![BytesMut::default()];
-
-                let mut values_bytesmut = values.decode(rows_to_skip, num_rows, all_null)?;
-                dest_buffers.append(&mut values_bytesmut);
-                dest_buffers
-            }
-        };
-
-        Ok(dest_buffers)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        1 + self
-            .mode
-            .values_decoder()
-            .map(|val| val.num_buffers())
-            .unwrap_or(0)
+            DataNullStatus::All => Ok(Box::new(AllNullDataBlock {
+                num_values: num_rows,
+            })),
+            DataNullStatus::None(values) => values.decode(rows_to_skip, num_rows),
+        }
     }
 }
 
@@ -227,7 +194,15 @@ impl ArrayEncoder for BasicEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let (null_count, row_count) = arrays
             .iter()
-            .map(|arr| (arr.null_count() as u32, arr.len() as u32))
+            .map(|arr| {
+                if matches!(arr.data_type(), DataType::Null) {
+                    // Arrays with the null datatype report 0 as the null count so we
+                    // need special logic to get the correct null count
+                    (arr.len() as u32, arr.len() as u32)
+                } else {
+                    (arr.null_count() as u32, arr.len() as u32)
+                }
+            })
             .fold((0, 0), |acc, val| (acc.0 + val.0, acc.1 + val.1));
         let (buffers, nullability) = if null_count == 0 {
             let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
@@ -253,7 +228,7 @@ impl ArrayEncoder for BasicEncoder {
 
             let validity_buffer_index = *buffer_index;
             *buffer_index += 1;
-            let validity = BitmapBufferEncoder::default().encode(&validity_as_arrays)?;
+            let (validity, _) = BitmapBufferEncoder::default().encode(&validity_as_arrays)?;
             let validity_encoding = Box::new(pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
                     bits_per_value: 1,

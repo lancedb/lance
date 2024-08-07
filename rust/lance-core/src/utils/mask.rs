@@ -478,6 +478,7 @@ impl RowIdTreeMap {
     ///
     /// The serialization format is:
     /// * u32: num_entries
+    ///
     /// for each entry:
     ///   * u32: fragment_id
     ///   * u32: bitmap size
@@ -674,6 +675,32 @@ impl Extend<u64> for RowIdTreeMap {
 impl<'a> Extend<&'a u64> for RowIdTreeMap {
     fn extend<T: IntoIterator<Item = &'a u64>>(&mut self, iter: T) {
         self.extend(iter.into_iter().copied())
+    }
+}
+
+// Extending with RowIdTreeMap is basically a cumulative set union
+impl Extend<Self> for RowIdTreeMap {
+    fn extend<T: IntoIterator<Item = Self>>(&mut self, iter: T) {
+        for other in iter {
+            for (fragment, set) in other.inner {
+                match self.inner.get_mut(&fragment) {
+                    None => {
+                        self.inner.insert(fragment, set);
+                    }
+                    Some(RowIdSelection::Full) => {
+                        // If the fragment is already selected then there is nothing to do
+                    }
+                    Some(RowIdSelection::Partial(lhs_set)) => match set {
+                        RowIdSelection::Full => {
+                            self.inner.insert(fragment, RowIdSelection::Full);
+                        }
+                        RowIdSelection::Partial(rhs_set) => {
+                            *lhs_set |= rhs_set;
+                        }
+                    },
+                }
+            }
+        }
     }
 }
 

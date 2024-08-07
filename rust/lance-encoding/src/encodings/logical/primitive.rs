@@ -1,32 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt::Debug, ops::Range, sync::Arc};
+use std::{fmt::Debug, ops::Range, sync::Arc, vec};
 
-use arrow_array::{
-    new_null_array,
-    types::{
-        ArrowPrimitiveType, ByteArrayType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
-        DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
-        DurationSecondType, Float16Type, Float32Type, Float64Type, GenericBinaryType,
-        GenericStringType, Int16Type, Int32Type, Int64Type, Int8Type, IntervalDayTimeType,
-        IntervalMonthDayNanoType, IntervalYearMonthType, Time32MillisecondType, Time32SecondType,
-        Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
-        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
-        UInt32Type, UInt64Type, UInt8Type,
-    },
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, GenericByteArray,
-    PrimitiveArray,
-};
-use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, IntervalUnit, TimeUnit};
-use bytes::BytesMut;
+use arrow_array::{make_array, ArrayRef};
+use arrow_buffer::bit_util;
+use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::deepcopy::deep_copy_array;
 use log::{debug, trace};
-use snafu::{location, Location};
 
-use lance_core::{Error, Result};
+use lance_core::{datatypes::Field, Result};
 
 use crate::{
     decoder::{
@@ -34,7 +18,10 @@ use crate::{
         PageInfo, PageScheduler, PrimitivePageDecoder, ScheduledScanLine, SchedulerContext,
         SchedulingJob,
     },
-    encoder::{ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, FieldEncoder},
+    encoder::{
+        ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, EncodingOptions,
+        FieldEncoder,
+    },
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
 
@@ -58,10 +45,16 @@ pub struct PrimitiveFieldScheduler {
     data_type: DataType,
     page_schedulers: Vec<PrimitivePage>,
     num_rows: u64,
+    should_validate: bool,
 }
 
 impl PrimitiveFieldScheduler {
-    pub fn new(data_type: DataType, pages: Arc<[PageInfo]>, buffers: ColumnBuffers) -> Self {
+    pub fn new(
+        data_type: DataType,
+        pages: Arc<[PageInfo]>,
+        buffers: ColumnBuffers,
+        should_validate: bool,
+    ) -> Self {
         let page_schedulers = pages
             .iter()
             .map(|page| {
@@ -82,6 +75,7 @@ impl PrimitiveFieldScheduler {
             data_type,
             page_schedulers,
             num_rows,
+            should_validate,
         }
     }
 }
@@ -179,6 +173,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
             physical_decoder: None,
             rows_drained: 0,
             num_rows: num_rows_in_next,
+            should_validate: self.scheduler.should_validate,
         };
 
         let decoder = Box::new(logical_decoder);
@@ -216,6 +211,7 @@ pub struct PrimitiveFieldDecoder {
     data_type: DataType,
     unloaded_physical_decoder: Option<BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>>,
     physical_decoder: Option<Arc<dyn PrimitivePageDecoder>>,
+    should_validate: bool,
     num_rows: u64,
     rows_drained: u64,
 }
@@ -225,11 +221,13 @@ impl PrimitiveFieldDecoder {
         physical_decoder: Arc<dyn PrimitivePageDecoder>,
         data_type: DataType,
         num_rows: u64,
+        should_validate: bool,
     ) -> Self {
         Self {
             data_type,
             unloaded_physical_decoder: None,
             physical_decoder: Some(physical_decoder),
+            should_validate,
             num_rows,
             rows_drained: 0,
         }
@@ -249,295 +247,20 @@ impl Debug for PrimitiveFieldDecoder {
 struct PrimitiveFieldDecodeTask {
     rows_to_skip: u64,
     rows_to_take: u64,
+    should_validate: bool,
     physical_decoder: Arc<dyn PrimitivePageDecoder>,
     data_type: DataType,
 }
 
 impl DecodeArrayTask for PrimitiveFieldDecodeTask {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
-        let mut all_null = false;
+        let block = self
+            .physical_decoder
+            .decode(self.rows_to_skip, self.rows_to_take)?;
 
-        // The number of buffers needed is based on the data type.
-        // Most data types need two buffers but each layer of fixed-size-list, for
-        // example, adds another validity buffer.
-        let bufs =
-            self.physical_decoder
-                .decode(self.rows_to_skip, self.rows_to_take, &mut all_null)?;
-
-        if all_null {
-            return Ok(new_null_array(&self.data_type, self.rows_to_take as usize));
-        }
-
-        // Convert the two buffers into an Arrow array
-        Self::primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)
-    }
-}
-
-impl PrimitiveFieldDecodeTask {
-    // TODO: Does this capability exist upstream somewhere?  I couldn't find
-    // it from a simple scan but it seems the ability to convert two buffers
-    // into a primitive array is pretty fundamental.
-    fn new_primitive_array<T: ArrowPrimitiveType>(
-        buffers: Vec<BytesMut>,
-        num_rows: u64,
-        data_type: &DataType,
-    ) -> ArrayRef {
-        let mut buffer_iter = buffers.into_iter();
-        let null_buffer = buffer_iter.next().unwrap();
-        let null_buffer = if null_buffer.is_empty() {
-            None
-        } else {
-            let null_buffer = null_buffer.freeze().into();
-            Some(NullBuffer::new(BooleanBuffer::new(
-                Buffer::from_bytes(null_buffer),
-                0,
-                num_rows as usize,
-            )))
-        };
-
-        let data_buffer = buffer_iter.next().unwrap().freeze();
-        let data_buffer = Buffer::from_bytes(data_buffer.into());
-        let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
-
-        // The with_data_type is needed here to recover the parameters for types like Decimal/Timestamp
-        Arc::new(
-            PrimitiveArray::<T>::new(data_buffer, null_buffer).with_data_type(data_type.clone()),
-        )
-    }
-
-    fn new_generic_byte_array<T: ByteArrayType>(buffers: Vec<BytesMut>, num_rows: u64) -> ArrayRef {
-        // iterate over buffers to get offsets and then bytes
-        let mut buffer_iter = buffers.into_iter();
-
-        let null_buffer = buffer_iter.next().unwrap();
-        let null_buffer = if null_buffer.is_empty() {
-            None
-        } else {
-            let null_buffer = null_buffer.freeze().into();
-            Some(NullBuffer::new(BooleanBuffer::new(
-                Buffer::from_bytes(null_buffer),
-                0,
-                num_rows as usize,
-            )))
-        };
-
-        let indices_bytes = buffer_iter.next().unwrap().freeze();
-        let indices_buffer = Buffer::from_bytes(indices_bytes.into());
-        let indices_buffer =
-            ScalarBuffer::<T::Offset>::new(indices_buffer, 0, num_rows as usize + 1);
-
-        let offsets = OffsetBuffer::new(indices_buffer.clone());
-
-        // TODO - add NULL support
-        // Decoding the bytes creates 2 buffers, the first one is empty due to nulls.
-        buffer_iter.next().unwrap();
-
-        let bytes_buffer = buffer_iter.next().unwrap().freeze();
-        let bytes_buffer = Buffer::from_bytes(bytes_buffer.into());
-        let bytes_buffer_len = bytes_buffer.len();
-        let bytes_buffer = ScalarBuffer::<u8>::new(bytes_buffer, 0, bytes_buffer_len);
-
-        let bytes_array = Arc::new(
-            PrimitiveArray::<UInt8Type>::new(bytes_buffer, None).with_data_type(DataType::UInt8),
-        );
-
-        Arc::new(GenericByteArray::<T>::new(
-            offsets,
-            bytes_array.values().into(),
-            null_buffer,
+        Ok(make_array(
+            block.into_arrow(self.data_type, self.should_validate)?,
         ))
-    }
-
-    fn bytes_to_validity(bytes: BytesMut, num_rows: u64) -> Option<NullBuffer> {
-        if bytes.is_empty() {
-            None
-        } else {
-            let null_buffer = bytes.freeze().into();
-            Some(NullBuffer::new(BooleanBuffer::new(
-                Buffer::from_bytes(null_buffer),
-                0,
-                num_rows as usize,
-            )))
-        }
-    }
-
-    fn primitive_array_from_buffers(
-        data_type: &DataType,
-        buffers: Vec<BytesMut>,
-        num_rows: u64,
-    ) -> Result<ArrayRef> {
-        match data_type {
-            DataType::Boolean => {
-                let mut buffer_iter = buffers.into_iter();
-                let null_buffer = buffer_iter.next().unwrap();
-                let null_buffer = Self::bytes_to_validity(null_buffer, num_rows);
-
-                let data_buffer = buffer_iter.next().unwrap().freeze();
-                let data_buffer = Buffer::from(data_buffer);
-                let data_buffer = BooleanBuffer::new(data_buffer, 0, num_rows as usize);
-
-                Ok(Arc::new(BooleanArray::new(data_buffer, null_buffer)))
-            }
-            DataType::Date32 => Ok(Self::new_primitive_array::<Date32Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Date64 => Ok(Self::new_primitive_array::<Date64Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Decimal128(_, _) => Ok(Self::new_primitive_array::<Decimal128Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Decimal256(_, _) => Ok(Self::new_primitive_array::<Decimal256Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Duration(units) => Ok(match units {
-                TimeUnit::Second => {
-                    Self::new_primitive_array::<DurationSecondType>(buffers, num_rows, data_type)
-                }
-                TimeUnit::Microsecond => Self::new_primitive_array::<DurationMicrosecondType>(
-                    buffers, num_rows, data_type,
-                ),
-                TimeUnit::Millisecond => Self::new_primitive_array::<DurationMillisecondType>(
-                    buffers, num_rows, data_type,
-                ),
-                TimeUnit::Nanosecond => Self::new_primitive_array::<DurationNanosecondType>(
-                    buffers, num_rows, data_type,
-                ),
-            }),
-            DataType::Float16 => Ok(Self::new_primitive_array::<Float16Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Float32 => Ok(Self::new_primitive_array::<Float32Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Float64 => Ok(Self::new_primitive_array::<Float64Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Int16 => Ok(Self::new_primitive_array::<Int16Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Int32 => Ok(Self::new_primitive_array::<Int32Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Int64 => Ok(Self::new_primitive_array::<Int64Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Int8 => Ok(Self::new_primitive_array::<Int8Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::Interval(unit) => Ok(match unit {
-                IntervalUnit::DayTime => {
-                    Self::new_primitive_array::<IntervalDayTimeType>(buffers, num_rows, data_type)
-                }
-                IntervalUnit::MonthDayNano => {
-                    Self::new_primitive_array::<IntervalMonthDayNanoType>(
-                        buffers, num_rows, data_type,
-                    )
-                }
-                IntervalUnit::YearMonth => {
-                    Self::new_primitive_array::<IntervalYearMonthType>(buffers, num_rows, data_type)
-                }
-            }),
-            DataType::Null => Ok(new_null_array(data_type, num_rows as usize)),
-            DataType::Time32(unit) => match unit {
-                TimeUnit::Millisecond => Ok(Self::new_primitive_array::<Time32MillisecondType>(
-                    buffers, num_rows, data_type,
-                )),
-                TimeUnit::Second => Ok(Self::new_primitive_array::<Time32SecondType>(
-                    buffers, num_rows, data_type,
-                )),
-                _ => Err(Error::io(
-                    format!("invalid time unit {:?} for 32-bit time type", unit),
-                    location!(),
-                )),
-            },
-            DataType::Time64(unit) => match unit {
-                TimeUnit::Microsecond => Ok(Self::new_primitive_array::<Time64MicrosecondType>(
-                    buffers, num_rows, data_type,
-                )),
-                TimeUnit::Nanosecond => Ok(Self::new_primitive_array::<Time64NanosecondType>(
-                    buffers, num_rows, data_type,
-                )),
-                _ => Err(Error::io(
-                    format!("invalid time unit {:?} for 64-bit time type", unit),
-                    location!(),
-                )),
-            },
-            DataType::Timestamp(unit, _) => Ok(match unit {
-                TimeUnit::Microsecond => Self::new_primitive_array::<TimestampMicrosecondType>(
-                    buffers, num_rows, data_type,
-                ),
-                TimeUnit::Millisecond => Self::new_primitive_array::<TimestampMillisecondType>(
-                    buffers, num_rows, data_type,
-                ),
-                TimeUnit::Nanosecond => Self::new_primitive_array::<TimestampNanosecondType>(
-                    buffers, num_rows, data_type,
-                ),
-                TimeUnit::Second => {
-                    Self::new_primitive_array::<TimestampSecondType>(buffers, num_rows, data_type)
-                }
-            }),
-            DataType::UInt16 => Ok(Self::new_primitive_array::<UInt16Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::UInt32 => Ok(Self::new_primitive_array::<UInt32Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::UInt64 => Ok(Self::new_primitive_array::<UInt64Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::UInt8 => Ok(Self::new_primitive_array::<UInt8Type>(
-                buffers, num_rows, data_type,
-            )),
-            DataType::FixedSizeBinary(dimension) => {
-                let mut buffers_iter = buffers.into_iter();
-                let fsb_validity = buffers_iter.next().unwrap();
-                let fsb_nulls = Self::bytes_to_validity(fsb_validity, num_rows);
-
-                let fsb_values = buffers_iter.next().unwrap();
-                let fsb_values = Buffer::from_bytes(fsb_values.freeze().into());
-                Ok(Arc::new(FixedSizeBinaryArray::new(
-                    *dimension, fsb_values, fsb_nulls,
-                )))
-            }
-            DataType::FixedSizeList(items, dimension) => {
-                let mut buffers_iter = buffers.into_iter();
-                let fsl_validity = buffers_iter.next().unwrap();
-                let fsl_nulls = Self::bytes_to_validity(fsl_validity, num_rows);
-
-                let remaining_buffers = buffers_iter.collect::<Vec<_>>();
-                let items_array = Self::primitive_array_from_buffers(
-                    items.data_type(),
-                    remaining_buffers,
-                    num_rows * (*dimension as u64),
-                )?;
-                Ok(Arc::new(FixedSizeListArray::new(
-                    items.clone(),
-                    *dimension,
-                    items_array,
-                    fsl_nulls,
-                )))
-            }
-            DataType::Utf8 => Ok(Self::new_generic_byte_array::<GenericStringType<i32>>(
-                buffers, num_rows,
-            )),
-            DataType::LargeUtf8 => Ok(Self::new_generic_byte_array::<GenericStringType<i64>>(
-                buffers, num_rows,
-            )),
-            DataType::Binary => Ok(Self::new_generic_byte_array::<GenericBinaryType<i32>>(
-                buffers, num_rows,
-            )),
-            DataType::LargeBinary => Ok(Self::new_generic_byte_array::<GenericBinaryType<i64>>(
-                buffers, num_rows,
-            )),
-            _ => Err(Error::io(
-                format!(
-                    "The data type {} cannot be decoded from a primitive encoding",
-                    data_type
-                ),
-                location!(),
-            )),
-        }
     }
 }
 
@@ -562,6 +285,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         let task = Box::new(PrimitiveFieldDecodeTask {
             rows_to_skip,
             rows_to_take,
+            should_validate: self.should_validate,
             physical_decoder: self.physical_decoder.as_ref().unwrap().clone(),
             data_type: self.data_type.clone(),
         });
@@ -666,29 +390,34 @@ pub struct PrimitiveFieldEncoder {
     accumulation_queue: AccumulationQueue,
     array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
     column_index: u32,
+    field: Field,
+    max_page_bytes: u64,
 }
 
 impl PrimitiveFieldEncoder {
     pub fn try_new(
-        cache_bytes: u64,
-        keep_original_array: bool,
+        options: &EncodingOptions,
         array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
         column_index: u32,
+        field: Field,
     ) -> Result<Self> {
         Ok(Self {
             accumulation_queue: AccumulationQueue::new(
-                cache_bytes,
+                options.cache_bytes_per_column,
                 column_index,
-                keep_original_array,
+                options.keep_original_array,
             ),
             column_index,
+            max_page_bytes: options.max_page_bytes,
             array_encoding_strategy,
+            field,
         })
     }
 
-    // Creates an encode task, consuming all buffered data
-    fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<EncodeTask> {
-        let encoder = self.array_encoding_strategy.create_array_encoder(&arrays)?;
+    fn create_encode_task(&mut self, arrays: Vec<ArrayRef>) -> Result<EncodeTask> {
+        let encoder = self
+            .array_encoding_strategy
+            .create_array_encoder(&arrays, &self.field)?;
         let column_idx = self.column_index;
 
         Ok(tokio::task::spawn(async move {
@@ -704,13 +433,48 @@ impl PrimitiveFieldEncoder {
         .map(|res_res| res_res.unwrap())
         .boxed())
     }
+
+    // Creates an encode task, consuming all buffered data
+    fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<Vec<EncodeTask>> {
+        if arrays.len() == 1 {
+            let array = arrays.into_iter().next().unwrap();
+            let size_bytes = array.get_buffer_memory_size();
+            let num_parts = bit_util::ceil(size_bytes, self.max_page_bytes as usize);
+            if num_parts <= 1 {
+                // One part and it fits in a page
+                Ok(vec![self.create_encode_task(vec![array])?])
+            } else {
+                // One part and it needs to be sliced into multiple pages
+
+                // This isn't perfect (items in the array might not all have the same size)
+                // but it's a reasonable stab for now)
+                let mut tasks = Vec::with_capacity(num_parts);
+                let mut offset = 0;
+                let part_size = bit_util::ceil(array.len(), num_parts);
+                for _ in 0..num_parts {
+                    let avail = array.len() - part_size;
+                    let chunk_size = avail.min(part_size);
+                    let part = array.slice(offset, chunk_size);
+                    let task = self.create_encode_task(vec![part])?;
+                    tasks.push(task);
+                    offset += chunk_size;
+                }
+                Ok(tasks)
+            }
+        } else {
+            // Multiple parts that (presumably) all fit in a page
+            //
+            // TODO: Could check here if there are any jumbo parts in the mix that need splitting
+            Ok(vec![self.create_encode_task(arrays)?])
+        }
+    }
 }
 
 impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.insert(array) {
-            Ok(vec![self.do_flush(arrays)?])
+            Ok(self.do_flush(arrays)?)
         } else {
             Ok(vec![])
         }
@@ -719,7 +483,7 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.flush() {
-            Ok(vec![self.do_flush(arrays)?])
+            Ok(self.do_flush(arrays)?)
         } else {
             Ok(vec![])
         }

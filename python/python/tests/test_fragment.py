@@ -58,13 +58,13 @@ def test_write_fragment_two_phases(tmp_path: Path):
     )
 
 
-def test_write_v2_fragment(tmp_path: Path):
+def test_write_legacy_fragment(tmp_path: Path):
     tab = pa.table({"a": range(1024)})
-    frag = LanceFragment.create(tmp_path, tab, use_legacy_format=True)
+    frag = LanceFragment.create(tmp_path, tab, data_storage_version="legacy")
     assert "file_minor_version: 3" not in str(frag)
 
     tab = pa.table({"a": range(1024)})
-    frag = LanceFragment.create(tmp_path, tab, use_legacy_format=False)
+    frag = LanceFragment.create(tmp_path, tab, data_storage_version="stable")
     assert "file_minor_version: 3" in str(frag)
 
 
@@ -217,7 +217,6 @@ def test_dataset_progress(tmp_path: Path):
     with open(progress_uri / "fragment_1.in_progress") as f:
         progress_data = json.load(f)
     assert progress_data["fragment_id"] == 1
-    assert isinstance(progress_data["multipart_id"], str)
     # progress contains custom metadata
     assert progress_data["metadata"]["test_key"] == "test_value"
 
@@ -225,11 +224,6 @@ def test_dataset_progress(tmp_path: Path):
     with open(progress_uri / "fragment_1.json") as f:
         metadata = json.load(f)
     assert metadata["id"] == 1
-
-    progress.cleanup_partial_writes(str(dataset_uri))
-
-    assert not (progress_uri / "fragment_1.json").exists()
-    assert not (progress_uri / "fragment_1.in_progress").exists()
 
 
 def test_fragment_meta():
@@ -271,7 +265,7 @@ def test_fragment_v2(tmp_path):
     fragments = write_fragments(
         tab,
         tmp_path,
-        use_legacy_format=False,
+        data_storage_version="stable",
     )
     assert len(fragments) == 1
     ds = lance.dataset(dataset_uri)

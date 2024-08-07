@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
@@ -14,6 +15,32 @@ def test_file_writer(tmp_path):
     reader = LanceFileReader(str(path))
     metadata = reader.metadata()
     assert metadata.num_rows == 3
+
+
+def test_write_no_schema(tmp_path):
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    reader = LanceFileReader(str(path))
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+
+
+def test_no_schema_no_data(tmp_path):
+    path = tmp_path / "foo.lance"
+    with pytest.raises(
+        ValueError, match="Schema is unknown and file cannot be created"
+    ):
+        with LanceFileWriter(str(path)) as _:
+            pass
+
+
+def test_schema_only(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    with LanceFileWriter(str(path), schema=schema) as _:
+        pass
+    reader = LanceFileReader(str(path))
+    assert reader.metadata().schema == schema
 
 
 def test_aborted_write(tmp_path):
@@ -32,6 +59,26 @@ def test_multiple_close(tmp_path):
     writer.write_batch(pa.table({"a": [1, 2, 3]}))
     writer.close()
     writer.close()
+
+
+def test_version(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+
+    with LanceFileWriter(str(path), schema) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    reader = LanceFileReader(str(path))
+    metadata = reader.metadata()
+    assert metadata.major_version == 0
+    assert metadata.minor_version == 3
+
+    path = tmp_path / "foo2.lance"
+    with LanceFileWriter(str(path), schema, version="2.1") as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    reader = LanceFileReader(str(path))
+    metadata = reader.metadata()
+    assert metadata.major_version == 2
+    assert metadata.minor_version == 1
 
 
 def test_take(tmp_path):
@@ -61,12 +108,18 @@ def check_round_trip(tmp_path, table):
 
 
 def test_different_types(tmp_path):
+    dict_values = pa.array(["foo", "bar", "baz"], pa.string())
+    dict_indices = pa.array([2, 1, 0], pa.uint8())
+
     check_round_trip(
         tmp_path,
         pa.table(
             {
                 "large_string": pa.array(["foo", "bar", "baz"], pa.large_string()),
                 "large_binary": pa.array([b"foo", b"bar", b"baz"], pa.large_binary()),
+                "dict_string": pa.DictionaryArray.from_arrays(
+                    dict_indices, dict_values
+                ),
             }
         ),
     )
@@ -130,3 +183,85 @@ def test_metadata(tmp_path):
     assert page.buffers[0].size == 24
 
     assert len(page.encoding) > 0
+
+
+def test_round_trip_parquet(tmp_path):
+    pq_path = tmp_path / "foo.parquet"
+    table = pa.table({"int": [1, 2], "list_str": [["x", "yz", "abc"], ["foo", "bar"]]})
+    pq.write_table(table, str(pq_path))
+    table = pq.read_table(str(pq_path))
+
+    lance_path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(lance_path)) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(lance_path))
+    round_tripped = reader.read_all().to_table()
+    assert round_tripped == table
+
+
+def test_list_field_name(tmp_path):
+    weird_field = pa.field("why does this name even exist", pa.string())
+    weird_string_type = pa.list_(weird_field)
+    schema = pa.schema([pa.field("list_str", weird_string_type)])
+    table = pa.table({"list_str": [["x", "yz", "abc"], ["foo", "bar"]]}, schema=schema)
+
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(path))
+    round_tripped = reader.read_all().to_table()
+
+    assert round_tripped == table
+    assert round_tripped.schema.field("list_str").type == weird_string_type
+
+
+def test_dictionary(tmp_path):
+    # Basic round trip
+    dictionary = pa.array(["foo", "bar", "baz"], pa.string())
+    indices = pa.array([0, 1, 2, 0, 1, 2], pa.int32())
+    dict_arr = pa.DictionaryArray.from_arrays(indices, dictionary)
+
+    def round_trip(arr):
+        table = pa.table({"dict": arr})
+
+        path = tmp_path / "foo.lance"
+        with LanceFileWriter(str(path)) as writer:
+            writer.write_batch(table)
+
+        reader = LanceFileReader(str(path))
+        table2 = reader.read_all().to_table()
+        return table2.column("dict").chunk(0)
+
+    round_tripped = round_trip(dict_arr)
+
+    assert round_tripped == dict_arr
+    assert round_tripped.type == dict_arr.type
+
+    # Dictionary that doesn't use all values
+    dictionary = pa.array(["foo", "bar", "baz"], pa.string())
+    indices = pa.array([0, 0, 1, 1], pa.int32())
+    dict_arr = pa.DictionaryArray.from_arrays(indices, dictionary)
+
+    round_tripped = round_trip(dict_arr)
+
+    assert round_tripped.dictionary == dictionary
+
+    # different indices types
+    dictionary = pa.array(["foo", "bar", "baz"], pa.string())
+    for data_type in [
+        pa.uint8(),
+        pa.uint16(),
+        pa.uint32(),
+        pa.uint64(),
+        pa.int8(),
+        pa.int16(),
+        pa.int32(),
+        pa.int64(),
+    ]:
+        indices = pa.array([0, 1, 2, 0, 1, 2], data_type)
+        dict_arr = pa.DictionaryArray.from_arrays(indices, dictionary)
+        round_tripped = round_trip(dict_arr)
+        assert round_tripped == dict_arr
+        assert round_tripped.type == dict_arr.type

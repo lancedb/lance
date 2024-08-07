@@ -39,6 +39,7 @@ lance-linalg.workspace = true
 lance-table.workspace = true
 lazy_static.workspace = true
 log.workspace = true
+moka.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
@@ -49,10 +50,12 @@ rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
+tantivy.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
 crossbeam-queue.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
@@ -62,10 +65,10 @@ lance-datagen.workspace = true
 lance-testing.workspace = true
 tempfile.workspace = true
 datafusion-sql.workspace = true
+random_word = { version = "0.4.3", features = ["en"] }
 
 [build-dependencies]
 prost-build.workspace = true
-rustc_version.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
@@ -88,4 +91,8 @@ harness = false
 
 [[bench]]
 name = "sq"
+harness = false
+
+[[bench]]
+name = "inverted"
 harness = false

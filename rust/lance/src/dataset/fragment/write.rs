@@ -13,6 +13,7 @@ use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2::writer::FileWriterOptions;
+use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
@@ -80,19 +81,23 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
-        let (object_store, base_path) = ObjectStore::from_uri(self.dataset_uri).await?;
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            params.object_store_registry.clone(),
+            self.dataset_uri,
+            &params.store_params.clone().unwrap_or_default(),
+        )
+        .await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
         let mut writer = lance_file::v2::writer::FileWriter::try_new(
             obj_writer,
-            full_path.to_string(),
             schema,
             FileWriterOptions::default(),
         )?;
 
-        progress.begin(&fragment, writer.multipart_id()).await?;
+        progress.begin(&fragment).await?;
 
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
 
@@ -140,7 +145,10 @@ impl<'a> FragmentCreateBuilder<'a> {
         let id = id.unwrap_or_default();
 
         let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
-        if !params.use_legacy_format {
+
+        let storage_version = params.storage_version_or_default();
+
+        if storage_version != LanceFileVersion::Legacy {
             return self.write_v2_impl(stream, schema, id).await;
         }
         let progress = params.progress.as_ref();
@@ -148,6 +156,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            params.object_store_registry.clone(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )
@@ -163,7 +172,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         )
         .await?;
 
-        progress.begin(&fragment, writer.multipart_id()).await?;
+        progress.begin(&fragment).await?;
 
         let mut buffered_reader = chunk_stream(stream, params.max_rows_per_group);
         while let Some(batched_chunk) = buffered_reader.next().await {

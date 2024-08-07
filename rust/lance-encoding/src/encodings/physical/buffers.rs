@@ -1,25 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{cast::AsArray, ArrayRef};
 use std::io::{Cursor, Write};
 
+use arrow_array::{cast::AsArray, Array, ArrayRef};
 use arrow_buffer::{BooleanBufferBuilder, Buffer};
 use arrow_schema::DataType;
+
+use lance_arrow::DataTypeExt;
 use lance_core::Result;
 
-use crate::encoder::{BufferEncoder, EncodedBuffer};
+use crate::encoder::{BufferEncoder, EncodedBuffer, EncodedBufferMeta};
+
+use super::value::CompressionScheme;
 
 #[derive(Debug, Default)]
 pub struct FlatBufferEncoder {}
 
 impl BufferEncoder for FlatBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
         let parts = arrays
             .iter()
             .map(|arr| arr.to_data().buffers()[0].clone())
             .collect::<Vec<_>>();
-        Ok(EncodedBuffer { parts })
+        let data_type = arrays[0].data_type();
+        Ok((
+            EncodedBuffer { parts },
+            EncodedBufferMeta {
+                bits_per_value: (data_type.byte_width() * 8) as u64,
+                bitpacking: None,
+                compression_scheme: None,
+            },
+        ))
     }
 }
 
@@ -82,7 +94,7 @@ impl CompressedBufferEncoder {
 }
 
 impl BufferEncoder for CompressedBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
         let mut parts = Vec::with_capacity(arrays.len());
         for arr in arrays {
             let buffer = arr.to_data().buffers()[0].clone();
@@ -92,7 +104,17 @@ impl BufferEncoder for CompressedBufferEncoder {
             self.compressor.compress(buffer_data, &mut compressed)?;
             parts.push(Buffer::from(compressed));
         }
-        Ok(EncodedBuffer { parts })
+
+        let data_type = arrays[0].data_type();
+
+        Ok((
+            EncodedBuffer { parts },
+            EncodedBufferMeta {
+                bits_per_value: (data_type.byte_width() * 8) as u64,
+                bitpacking: None,
+                compression_scheme: Some(CompressionScheme::Zstd),
+            },
+        ))
     }
 }
 
@@ -101,7 +123,7 @@ impl BufferEncoder for CompressedBufferEncoder {
 pub struct BitmapBufferEncoder {}
 
 impl BufferEncoder for BitmapBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<EncodedBuffer> {
+    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
         debug_assert!(arrays
             .iter()
             .all(|arr| *arr.data_type() == DataType::Boolean));
@@ -123,6 +145,13 @@ impl BufferEncoder for BitmapBufferEncoder {
         let buffer = builder.finish().into_inner();
         let parts = vec![buffer];
         let buffer = EncodedBuffer { parts };
-        Ok(buffer)
+        Ok((
+            buffer,
+            EncodedBufferMeta {
+                bits_per_value: 1,
+                bitpacking: None,
+                compression_scheme: None,
+            },
+        ))
     }
 }

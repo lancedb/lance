@@ -40,6 +40,7 @@ use lance_index::{
     Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use lance_io::scheduler::SchedulerConfig;
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader, ReadBatchParams,
 };
@@ -54,7 +55,10 @@ use tracing::instrument;
 
 use crate::index::vector::builder::index_type_string;
 use crate::{
-    index::{vector::VectorIndex, PreFilter},
+    index::{
+        vector::{utils::PartitionLoadLock, VectorIndex},
+        PreFilter,
+    },
     session::Session,
 };
 
@@ -80,6 +84,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     /// Index in each partition.
     partition_cache: Cache<String, Arc<PartitionEntry<S, Q>>>,
+
+    partition_locks: PartitionLoadLock,
 
     distance_type: DistanceType,
 
@@ -107,7 +113,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         uuid: String,
         session: Weak<Session>,
     ) -> Result<Self> {
-        let scheduler = ScanScheduler::new(object_store, 16);
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig::fast_and_not_too_ram_intensive(),
+        );
 
         let index_reader = FileReader::try_open(
             scheduler
@@ -170,12 +179,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         .await?;
         let storage = IvfQuantizationStorage::try_new(storage_reader).await?;
 
+        let num_partitions = ivf.num_partitions();
         Ok(Self {
             uuid,
             ivf,
             reader: index_reader,
             storage,
             partition_cache: Cache::new(DEFAULT_INDEX_CACHE_SIZE as u64),
+            partition_locks: PartitionLoadLock::new(num_partitions),
             sub_index_metadata,
             distance_type,
             session,
@@ -204,38 +215,48 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 });
             }
 
-            let schema = Arc::new(self.reader.schema().as_ref().into());
-            let batch = match self.reader.metadata().num_rows {
-                0 => RecordBatch::new_empty(schema),
-                _ => {
-                    let batches = self
-                        .reader
-                        .read_stream(
-                            ReadBatchParams::Range(self.ivf.row_range(partition_id)),
-                            u32::MAX,
-                            1,
-                            FilterExpression::no_filter(),
-                        )?
-                        .try_collect::<Vec<_>>()
-                        .await?;
-                    concat_batches(&schema, batches.iter())?
+            let mtx = self.partition_locks.get_partition_mutex(partition_id);
+            let _guard = mtx.lock().await;
+
+            // check the cache again, as the partition may have been loaded by another
+            // thread that held the lock on loading the partition
+            if let Some(part_idx) = self.partition_cache.get(&cache_key) {
+                part_idx
+            } else {
+                let schema = Arc::new(self.reader.schema().as_ref().into());
+                let batch = match self.reader.metadata().num_rows {
+                    0 => RecordBatch::new_empty(schema),
+                    _ => {
+                        let batches = self
+                            .reader
+                            .read_stream(
+                                ReadBatchParams::Range(self.ivf.row_range(partition_id)),
+                                u32::MAX,
+                                1,
+                                FilterExpression::no_filter(),
+                            )?
+                            .try_collect::<Vec<_>>()
+                            .await?;
+                        concat_batches(&schema, batches.iter())?
+                    }
+                };
+                let batch = batch.add_metadata(
+                    S::metadata_key().to_owned(),
+                    self.sub_index_metadata[partition_id].clone(),
+                )?;
+                let idx = S::load(batch)?;
+                let storage = self.load_partition_storage(partition_id).await?;
+                let partition_entry = Arc::new(PartitionEntry {
+                    index: idx,
+                    storage,
+                });
+                if write_cache {
+                    self.partition_cache
+                        .insert(cache_key.clone(), partition_entry.clone());
                 }
-            };
-            let batch = batch.add_metadata(
-                S::metadata_key().to_owned(),
-                self.sub_index_metadata[partition_id].clone(),
-            )?;
-            let idx = S::load(batch)?;
-            let storage = self.load_partition_storage(partition_id).await?;
-            let partition_entry = Arc::new(PartitionEntry {
-                index: idx,
-                storage,
-            });
-            if write_cache {
-                self.partition_cache
-                    .insert(cache_key.clone(), partition_entry.clone());
+
+                partition_entry
             }
-            partition_entry
         };
 
         Ok(part_entry)
@@ -248,6 +269,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// preprocess the query vector given the partition id.
     ///
     /// Internal API with no stability guarantees.
+    #[instrument(level = "debug", skip(self))]
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         if Q::use_residual(self.distance_type) {
             let partition_centroids =
@@ -300,6 +322,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             0 => json!({}), // for FLAT index, the metadata is empty
             _ => serde_json::from_str(self.sub_index_metadata[0].as_str())?,
         };
+        let mut sub_index_stats: serde_json::Value =
+            if let Some(metadata) = self.sub_index_metadata.iter().find(|m| !m.is_empty()) {
+                serde_json::from_str(metadata)?
+            } else {
+                json!({})
+            };
         sub_index_stats["index_type"] = S::name().into();
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type,
@@ -325,7 +353,6 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
     for IVFIndex<S, Q>
 {
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
-        pre_filter.wait_for_ready().await?;
         let mut query = query.clone();
         if self.distance_type == DistanceType::Cosine {
             let key = normalize_arrow(&query.key)?;
@@ -383,6 +410,7 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
     //     )
     // }
 
+    #[instrument(level = "debug", skip(self, pre_filter))]
     async fn search_in_partition(
         &self,
         partition_id: usize,
@@ -390,6 +418,7 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true).await?;
+        pre_filter.wait_for_ready().await?;
 
         let query = self.preprocess_query(partition_id, query)?;
         let param = (&query).into();
@@ -494,7 +523,7 @@ mod tests {
         test_uri: &str,
         range: Range<f32>,
     ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range(1000 * DIM, range);
+        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
@@ -673,6 +702,49 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let nlist = 4;
+        let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::new(nlist);
+        let sq_params = SQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_index".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats = dataset.index_statistics("test_index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(stats.as_str()).unwrap();
+
+        assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+        for index in stats["indices"].as_array().unwrap() {
+            assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+            assert_eq!(
+                index["num_partitions"].as_number().unwrap(),
+                &serde_json::Number::from(nlist)
+            );
+            assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_stats_empty_partition() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let nlist = 1000;
         let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(nlist);

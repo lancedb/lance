@@ -47,7 +47,7 @@ pub struct DatasetPreFilter {
     pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowIdMask>>>>,
     pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
     // When the tasks are finished this is the combined filter
-    pub(super) final_mask: Mutex<OnceCell<RowIdMask>>,
+    pub(super) final_mask: Mutex<OnceCell<Arc<RowIdMask>>>,
 }
 
 impl DatasetPreFilter {
@@ -217,6 +217,7 @@ impl PreFilter for DatasetPreFilter {
     /// search is running.  When you are ready to use the prefilter you
     /// must first call this method to ensure it is fully loaded.  This
     /// allows `filter_row_ids` to be a synchronous method.
+    #[instrument(level = "debug", skip(self))]
     async fn wait_for_ready(&self) -> Result<()> {
         if let Some(filtered_ids) = &self.filtered_ids {
             filtered_ids.wait_ready().await?;
@@ -233,7 +234,7 @@ impl PreFilter for DatasetPreFilter {
             if let Some(deleted_ids) = &self.deleted_ids {
                 combined = combined & (*deleted_ids.get_ready()).clone();
             }
-            combined
+            Arc::new(combined)
         });
 
         Ok(())
@@ -241,6 +242,16 @@ impl PreFilter for DatasetPreFilter {
 
     fn is_empty(&self) -> bool {
         self.deleted_ids.is_none() && self.filtered_ids.is_none()
+    }
+
+    /// Get the row id mask for this prefilter
+    fn mask(&self) -> Arc<RowIdMask> {
+        self.final_mask
+            .lock()
+            .unwrap()
+            .get()
+            .expect("mask called without call to wait_for_ready")
+            .clone()
     }
 
     /// Check whether a slice of row ids should be included in a query.
@@ -251,11 +262,7 @@ impl PreFilter for DatasetPreFilter {
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        let final_mask = self.final_mask.lock().unwrap();
-        final_mask
-            .get()
-            .expect("filter_row_ids called without call to wait_for_ready")
-            .selected_indices(row_ids)
+        self.mask().selected_indices(row_ids)
     }
 }
 

@@ -16,7 +16,7 @@ use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
-    scheduler::ScanScheduler,
+    scheduler::{ScanScheduler, SchedulerConfig},
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
 };
 use object_store::path::Path;
@@ -159,7 +159,6 @@ impl Shuffler for IvfShuffler {
                             let writer = object_store.create(&part_path).await?;
                             FileWriter::try_new(
                                 writer,
-                                part_path.to_string(),
                                 lance_core::datatypes::Schema::try_from(schema.as_ref())?,
                                 Default::default(),
                             )
@@ -224,7 +223,10 @@ impl IvfShufflerReader {
         output_dir: Path,
         partition_sizes: Vec<usize>,
     ) -> Self {
-        let scheduler = ScanScheduler::new(object_store, 32);
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig::fast_and_not_too_ram_intensive(),
+        );
         Self {
             scheduler,
             output_dir,

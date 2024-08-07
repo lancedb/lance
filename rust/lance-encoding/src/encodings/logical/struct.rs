@@ -531,7 +531,7 @@ impl FieldEncoder for StructFieldEncoder {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
@@ -550,7 +550,7 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
         let field = Field::new("", data_type, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -564,7 +564,7 @@ mod tests {
             Field::new("outer_int", DataType::Int32, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -586,7 +586,7 @@ mod tests {
             Field::new("outer_binary", DataType::Binary, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -615,6 +615,7 @@ mod tests {
             .step_by(437)
             .map(|offset| struct_array.slice(offset, 437.min(10000 - offset)))
             .collect::<Vec<_>>();
-        check_round_trip_encoding_of_data(struct_arrays, &TestCases::default()).await;
+        check_round_trip_encoding_of_data(struct_arrays, &TestCases::default(), HashMap::new())
+            .await;
     }
 }

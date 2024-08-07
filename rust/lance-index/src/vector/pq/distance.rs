@@ -84,41 +84,13 @@ pub(super) fn compute_l2_distance<const C: usize, const V: usize>(
         for i in (0..num_sub_vectors).step_by(C) {
             for (vec_idx, sum) in sums.iter_mut().enumerate() {
                 let vec_start = vec_idx * num_sub_vectors;
-                #[cfg(all(feature = "nightly", target_feature = "avx512f"))]
-                {
-                    use std::arch::x86_64::*;
-                    if i + C <= num_sub_vectors {
-                        let mut offsets = [(i * num_centroids) as i32; C];
-                        for k in 0..C {
-                            offsets[k] += (k * num_centroids) as i32 + c[vec_start + k] as i32;
-                        }
-                        unsafe {
-                            let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
-                            let v = _mm512_i32gather_ps(
-                                simd_offsets,
-                                distance_table.as_ptr() as *const u8,
-                                4,
-                            );
-                            *sum += _mm512_reduce_add_ps(v);
-                        }
-                    } else {
-                        let mut s = 0.0;
-                        for k in 0..num_sub_vectors - i {
-                            *sum +=
-                                distance_table[(i + k) * num_centroids + c[vec_start + k] as usize];
-                        }
-                    }
-                }
-                #[cfg(not(all(feature = "nightly", target_feature = "avx512f")))]
-                {
-                    let s = c[vec_start + i..]
-                        .iter()
-                        .take(min(C, num_sub_vectors - i))
-                        .enumerate()
-                        .map(|(k, c)| distance_table[(i + k) * num_centroids + *c as usize])
-                        .sum::<f32>();
-                    *sum += s;
-                }
+                let s = c[vec_start + i..]
+                    .iter()
+                    .take(min(C, num_sub_vectors - i))
+                    .enumerate()
+                    .map(|(k, c)| distance_table[(i + k) * num_centroids + *c as usize])
+                    .sum::<f32>();
+                *sum += s;
             }
         }
         sums.into_iter()

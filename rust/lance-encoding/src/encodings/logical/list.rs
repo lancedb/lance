@@ -24,13 +24,7 @@ use crate::{
         LogicalPageDecoder, NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
-    encodings::{
-        logical::r#struct::SimpleStructScheduler,
-        physical::{
-            basic::BasicEncoder,
-            value::{CompressionScheme, ValueEncoder},
-        },
-    },
+    encodings::logical::r#struct::SimpleStructScheduler,
     format::pb,
     EncodingsIo,
 };
@@ -455,6 +449,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             item_decoder: None,
             rows_drained: 0,
             lists_available: 0,
+            item_field_name: self.scheduler.item_field_name.clone(),
             num_rows,
             unloaded: Some(indirect_fut),
             items_type: self.scheduler.items_type.clone(),
@@ -491,6 +486,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
 pub struct ListFieldScheduler {
     offsets_scheduler: Arc<dyn FieldScheduler>,
     items_scheduler: Arc<dyn FieldScheduler>,
+    item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
     list_type: DataType,
@@ -512,6 +508,7 @@ impl ListFieldScheduler {
     pub fn new(
         offsets_scheduler: Arc<dyn FieldScheduler>,
         items_scheduler: Arc<dyn FieldScheduler>,
+        item_field_name: String,
         items_type: DataType,
         // Should be int32 or int64
         offset_type: DataType,
@@ -529,6 +526,7 @@ impl ListFieldScheduler {
         Self {
             offsets_scheduler,
             items_scheduler,
+            item_field_name,
             items_type,
             offset_type,
             offset_page_info,
@@ -573,6 +571,7 @@ struct ListPageDecoder {
     lists_available: u64,
     num_rows: u64,
     rows_drained: u64,
+    item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
     data_type: DataType,
@@ -583,6 +582,7 @@ struct ListDecodeTask {
     validity: BooleanBuffer,
     // Will be None if there are no items (all empty / null lists)
     items: Option<Box<dyn DecodeArrayTask>>,
+    item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
 }
@@ -601,7 +601,11 @@ impl DecodeArrayTask for ListDecodeTask {
 
         // TODO: we default to nullable true here, should probably use the nullability given to
         // us from the input schema
-        let item_field = Arc::new(Field::new("item", self.items_type.clone(), true));
+        let item_field = Arc::new(Field::new(
+            self.item_field_name,
+            self.items_type.clone(),
+            true,
+        ));
 
         // The offsets are already decoded but they need to be shifted back to 0 and cast
         // to the appropriate type
@@ -756,6 +760,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             task: Box::new(ListDecodeTask {
                 offsets,
                 validity,
+                item_field_name: self.item_field_name.clone(),
                 items: item_decode,
                 items_type: self.items_type.clone(),
                 offset_type: self.offset_type.clone(),
@@ -826,16 +831,19 @@ struct ListOffsetsEncoder {
 }
 
 impl ListOffsetsEncoder {
-    fn new(cache_bytes: u64, keep_original_array: bool, column_index: u32) -> Self {
+    fn new(
+        cache_bytes: u64,
+        keep_original_array: bool,
+        column_index: u32,
+        inner_encoder: Arc<dyn ArrayEncoder>,
+    ) -> Self {
         Self {
             accumulation_queue: AccumulationQueue::new(
                 cache_bytes,
                 column_index,
                 keep_original_array,
             ),
-            inner_encoder: Arc::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(&DataType::Int64, CompressionScheme::None).unwrap(),
-            ))),
+            inner_encoder,
             column_index,
         }
     }
@@ -1086,6 +1094,7 @@ pub struct ListFieldEncoder {
 impl ListFieldEncoder {
     pub fn new(
         items_encoder: Box<dyn FieldEncoder>,
+        inner_offsets_encoder: Arc<dyn ArrayEncoder>,
         cache_bytes_per_columns: u64,
         keep_original_array: bool,
         column_index: u32,
@@ -1095,6 +1104,7 @@ impl ListFieldEncoder {
                 cache_bytes_per_columns,
                 keep_original_array,
                 column_index,
+                inner_offsets_encoder,
             ),
             items_encoder,
         }
@@ -1181,8 +1191,9 @@ impl FieldEncoder for ListFieldEncoder {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
+    use arrow::array::StringBuilder;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
         ArrayRef, BooleanArray, ListArray,
@@ -1201,13 +1212,13 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_list() {
         let field = Field::new("", make_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_list() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1219,7 +1230,7 @@ mod tests {
         )]));
 
         let field = Field::new("", make_list_type(struct_type), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1237,7 +1248,8 @@ mod tests {
             .with_range(0..3)
             .with_range(1..3)
             .with_indices(vec![1, 3]);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1256,10 +1268,16 @@ mod tests {
             let test_cases = TestCases::default()
                 .with_indices(vec![1])
                 .with_indices(vec![0])
-                .with_indices(vec![2]);
-            check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+                .with_indices(vec![2])
+                .with_indices(vec![0, 1]);
+            check_round_trip_encoding_of_data(
+                vec![list_array.clone()],
+                &test_cases,
+                HashMap::new(),
+            )
+            .await;
             let test_cases = test_cases.with_batch_size(1);
-            check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
+            check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
         }
 
         // Scenario 2: All lists are empty
@@ -1274,9 +1292,27 @@ mod tests {
         let list_array = Arc::new(list_builder.finish());
 
         let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
+            .await;
         let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+
+        // Scenario 2: All lists are empty (but now with strings)
+
+        // When encoding a list of empty lists there are no items to encode
+        // which is strange and we want to ensure we handle it
+        let items_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append(true);
+        list_builder.append_null();
+        list_builder.append(true);
+        let list_array = Arc::new(list_builder.finish());
+
+        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
+        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
+            .await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1297,6 +1333,6 @@ mod tests {
 
         // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
-        check_round_trip_encoding_of_data(arrs, &test_cases).await;
+        check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 }

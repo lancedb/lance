@@ -155,7 +155,7 @@ class LanceDataset(pa.dataset.Dataset):
     def __init__(
         self,
         uri: Union[str, Path],
-        version: Optional[int] = None,
+        version: Optional[int | str] = None,
         block_size: Optional[int] = None,
         index_cache_size: Optional[int] = None,
         metadata_cache_size: Optional[int] = None,
@@ -210,6 +210,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._uri
 
+    @property
+    def tags(self) -> Tags:
+        return Tags(self._ds)
+
     def list_indices(self) -> List[Dict[str, Any]]:
         if getattr(self, "_list_indices_res", None) is None:
             self._list_indices_res = self._ds.load_indices()
@@ -239,10 +243,12 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
         fragments: Optional[Iterable[LanceFragment]] = None,
+        full_text_query: Optional[Union[str, dict]] = None,
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        fast_search: bool = False,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -295,6 +301,18 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        full_text_query: str or dict, optional
+            query string to search for, the results will be ranked by BM25.
+            e.g. "hello world", would match documents containing "hello" or "world".
+            or a dictionary with the following keys:
+            - columns: list[str]
+                The columns to search,
+                currently only supports a single column in the columns list.
+            - query: str
+                The query string to search for.
+        fast_search:  bool, default False
+            If True, then the search will only be performed on the indexed data, which
+            yields faster search time.
 
         Notes
         -----
@@ -331,7 +349,13 @@ class LanceDataset(pa.dataset.Dataset):
             .with_fragments(fragments)
             .with_row_id(with_row_id)
             .use_stats(use_stats)
+            .fast_search(fast_search)
         )
+        if full_text_query is not None:
+            if isinstance(full_text_query, str):
+                builder = builder.full_text_search(full_text_query)
+            else:
+                builder = builder.full_text_search(**full_text_query)
         if nearest is not None:
             builder = builder.nearest(**nearest)
         return builder.to_scanner()
@@ -350,6 +374,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.lance_schema
 
+    @property
+    def data_storage_version(self) -> str:
+        """
+        The version of the data storage format this dataset is using
+        """
+        return self._ds.data_storage_version
+
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
@@ -365,6 +396,8 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        fast_search: bool = False,
+        full_text_query: Optional[Union[str, dict]] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -412,6 +445,15 @@ class LanceDataset(pa.dataset.Dataset):
             Return row ID.
         use_stats: bool, default True
             Use stats pushdown during filters.
+        full_text_query: str or dict, optional
+            query string to search for, the results will be ranked by BM25.
+            e.g. "hello world", would match documents contains "hello" or "world".
+            or a dictionary with the following keys:
+            - columns: list[str]
+                The columns to search,
+                currently only supports a single column in the columns list.
+            - query: str
+                The query string to search for.
 
         Notes
         -----
@@ -432,6 +474,8 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
             use_stats=use_stats,
+            fast_search=fast_search,
+            full_text_query=full_text_query,
         ).to_table()
 
     @property
@@ -481,6 +525,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        full_text_query: Optional[Union[str, dict]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -507,6 +552,7 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
             use_stats=use_stats,
+            full_text_query=full_text_query,
         ).to_batches()
 
     def sample(
@@ -564,7 +610,13 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        return pa.Table.from_batches([self._ds.take(indices, columns)])
+        columns_with_transform = None
+        if isinstance(columns, dict):
+            columns_with_transform = list(columns.items())
+            columns = None
+        return pa.Table.from_batches(
+            [self._ds.take(indices, columns, columns_with_transform)]
+        )
 
     def _take_rows(
         self,
@@ -591,7 +643,13 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        return pa.Table.from_batches([self._ds.take_rows(row_ids, columns)])
+        columns_with_transform = None
+        if isinstance(columns, dict):
+            columns_with_transform = list(columns.items())
+            columns = None
+        return pa.Table.from_batches(
+            [self._ds.take_rows(row_ids, columns, columns_with_transform)]
+        )
 
     def head(self, num_rows, **kwargs):
         """
@@ -665,10 +723,14 @@ class LanceDataset(pa.dataset.Dataset):
         list columns can be casted between their size variants. For example,
         string to large string, binary to large binary, and list to large list.
 
+        Columns that are renamed can keep any indices that are on them. However, if
+        the column is casted to a different type, it's indices will be dropped.
+
         Parameters
         ----------
         alterations : Iterable[Dict[str, Any]]
             A sequence of dictionaries, each with the following keys:
+
             - "path": str
                 The column path to alter. For a top-level column, this is the name.
                 For a nested column, this is the dot-separated path, e.g. "a.b.c".
@@ -852,16 +914,16 @@ class LanceDataset(pa.dataset.Dataset):
     def drop_columns(self, columns: List[str]):
         """Drop one or more columns from the dataset
 
+        This is a metadata-only operation and does not remove the data from the
+        underlying storage. In order to remove the data, you must subsequently
+        call ``compact_files`` to rewrite the data without the removed columns and
+        then call ``cleanup_old_versions`` to remove the old files.
+
         Parameters
         ----------
         columns : list of str
             The names of the columns to drop. These can be nested column references
             (e.g. "a.b.c") or top-level column names (e.g. "a").
-
-        This is a metadata-only operation and does not remove the data from the
-        underlying storage. In order to remove the data, you must subsequently
-        call ``compact_files`` to rewrite the data without the removed columns and
-        then call ``cleanup_files`` to remove the old files.
 
         Examples
         --------
@@ -1034,13 +1096,23 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
-    def checkout_version(self, version) -> "LanceDataset":
+    def checkout_version(self, version: int | str) -> "LanceDataset":
         """
         Load the given version of the dataset.
 
         Unlike the :func:`dataset` constructor, this will re-use the
         current cache.
         This is a no-op if the dataset is already at the given version.
+
+        Parameters
+        ----------
+        version: int | str,
+            The version to check out. A version number (`int`) or a tag
+            (`str`) can be provided.
+
+        Returns
+        -------
+        LanceDataset
         """
         ds = copy.copy(self)
         if version != ds.version:
@@ -1060,6 +1132,7 @@ class LanceDataset(pa.dataset.Dataset):
         older_than: Optional[timedelta] = None,
         *,
         delete_unverified: bool = False,
+        error_if_tagged_old_versions: bool = True,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -1088,17 +1161,30 @@ class LanceDataset(pa.dataset.Dataset):
             This should only be set to True if you can guarantee that no other process
             is currently working on this dataset.  Otherwise the dataset could be put
             into a corrupted state.
+
+        error_if_tagged_old_versions: bool, default True
+            Some versions may have tags associated with them. Tagged versions will
+            not be cleaned up, regardless of how old they are. If this argument
+            is set to `True` (the default), an exception will be raised if any
+            tagged versions match the parameters. Otherwise, tagged versions will
+            be ignored without any error and only untagged versions will be
+            cleaned up.
         """
         if older_than is None:
             older_than = timedelta(days=14)
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than), delete_unverified
+            td_to_micros(older_than), delete_unverified, error_if_tagged_old_versions
         )
 
     def create_scalar_index(
         self,
         column: str,
-        index_type: Literal["BTREE"],
+        index_type: Union[
+            Literal["BTREE"],
+            Literal["BITMAP"],
+            Literal["LABEL_LIST"],
+            Literal["INVERTED"],
+        ],
         name: Optional[str] = None,
         *,
         replace: bool = True,
@@ -1117,10 +1203,9 @@ class LanceDataset(pa.dataset.Dataset):
             dataset = lance.dataset("/tmp/images.lance")
             my_table = dataset.scanner(filter="my_col != 7").to_table()
 
-        Scalar indices can also speed up scans containing a vector search and a
-        prefilter:
+        Vector search with pre-filers can also benefit from scalar indices. For example,
 
-        .. code-block::python
+        .. code-block:: python
 
             import lance
 
@@ -1133,6 +1218,59 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 filter="my_col != 7",
                 prefilter=True
+            )
+
+
+        There are 4 types of scalar indices available today.
+
+        * ``BTREE``. The most common type is ``BTREE``. This index is inspired
+          by the btree data structure although only the first few layers of the btree
+          are cached in memory.  It will
+          perform well on columns with a large number of unique values and few rows per
+          value.
+        * ``BITMAP``. This index stores a bitmap for each unique value in the column.
+          This index is useful for columns with a small number of unique values and
+          many rows per value.
+        * ``LABEL_LIST``. A special index that is used to index list
+          columns whose values have small cardinality.  For example, a column that
+          contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
+          with a ``LABEL_LIST`` index.  This index can only speedup queries with
+          ``array_has_any`` or ``array_has_all`` filters.
+        * ``INVERTED``. It is used to index document columns. This index
+          can conduct full-text searches. For example, a column that contains any word
+          of query string "hello world". The results will be ranked by BM25.
+
+        Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
+        bypass spilling to disk. Setting this to true can avoid memory exhaustion
+        issues (see https://github.com/apache/datafusion/issues/10073 for more info).
+
+        **Experimental API**
+
+        Parameters
+        ----------
+        column : str
+            The column to be indexed.  Must be a boolean, integer, float,
+            or string column.
+        index_type : str
+            The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
+            ``"LABEL_LIST"`` or ``"INVERTED"``.
+        name : str, optional
+            The index name. If not provided, it will be generated from the
+            column name.
+        replace : bool, default True
+            Replace the existing index if it exists.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            dataset.create_index(
+                "category",
+                "BTREE",
             )
 
         Scalar indices can only speed up scans for basic filters using
@@ -1154,41 +1292,6 @@ class LanceDataset(pa.dataset.Dataset):
         that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
         ``MaterializeIndex`` operator.
 
-        Currently, the only type of scalar index available is ``BTREE``. This index
-        combines is inspired by the btree data structure although only the first few
-        layers of the btree are cached in memory.
-
-        Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
-        bypass spilling to disk. Setting this to true can avoid memory exhaustion
-        issues (see https://github.com/apache/datafusion/issues/10073 for more info).
-
-        **Experimental API**
-
-        Parameters
-        ----------
-        column : str
-            The column to be indexed.  Must be a boolean, integer, float,
-            or string column.
-        index_type : str
-            The type of the index.  Only ``"BTREE"`` is supported now.
-        name : str, optional
-            The index name. If not provided, it will be generated from the
-            column name.
-        replace : bool, default True
-            Replace the existing index if it exists.
-
-        Examples
-        --------
-
-        .. code-block:: python
-
-            import lance
-
-            dataset = lance.dataset("/tmp/images.lance")
-            dataset.create_index(
-                "category",
-                "BTREE",
-            )
         """
         if isinstance(column, str):
             column = [column]
@@ -1202,31 +1305,43 @@ class LanceDataset(pa.dataset.Dataset):
         if column not in self.schema.names:
             raise KeyError(f"{column} not found in schema")
 
-        field = self.schema.field(column)
-        if (
-            not pa.types.is_integer(field.type)
-            and not pa.types.is_floating(field.type)
-            and not pa.types.is_boolean(field.type)
-            and not pa.types.is_string(field.type)
-            and not pa.types.is_temporal(field.type)
-        ):
-            raise TypeError(
-                f"Scalar index column {column} must be int",
-                ", float, bool, str, or temporal",
+        index_type = index_type.upper()
+        if index_type not in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
+            raise NotImplementedError(
+                (
+                    'Only "BTREE", "LABEL_LIST", "INVERTED", '
+                    'or "BITMAP" are supported for '
+                    f"scalar columns.  Received {index_type}",
+                )
             )
+
+        field = self.schema.field(column)
+        if index_type in ["BTREE", "BITMAP"]:
+            if (
+                not pa.types.is_integer(field.type)
+                and not pa.types.is_floating(field.type)
+                and not pa.types.is_boolean(field.type)
+                and not pa.types.is_string(field.type)
+                and not pa.types.is_temporal(field.type)
+            ):
+                raise TypeError(
+                    f"BTREE/BITMAP index column {column} must be int",
+                    ", float, bool, str, or temporal",
+                )
+        elif index_type == "LABEL_LIST":
+            if not pa.types.is_list(field.type):
+                raise TypeError(f"LABEL_LIST index column {column} must be a list")
+        elif index_type == "INVERTED":
+            if not pa.types.is_string(field.type) and not pa.types.is_large_string(
+                field.type
+            ):
+                raise TypeError(
+                    f"INVERTED index column {column} must be string or large string"
+                )
 
         if pa.types.is_duration(field.type):
             raise TypeError(
                 f"Scalar index column {column} cannot currently be a duration"
-            )
-
-        index_type = index_type.upper()
-        if index_type != "BTREE":
-            raise NotImplementedError(
-                (
-                    'Only "BTREE" is supported for ',
-                    f"index_type.  Received {index_type}",
-                )
             )
 
         self._ds.create_index([column], index_type, name, replace)
@@ -1253,6 +1368,7 @@ class LanceDataset(pa.dataset.Dataset):
         # experimental parameters
         ivf_centroids_file: Optional[str] = None,
         precomputed_partiton_dataset: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1306,6 +1422,9 @@ class LanceDataset(pa.dataset.Dataset):
 
             By making this value smaller, this shuffle will consume less memory but will
             take longer to complete, and vice versa.
+        storage_options : optional, dict
+            Extra options that make sense for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1463,7 +1582,9 @@ class LanceDataset(pa.dataset.Dataset):
                     " precomputed_partiton_dataset is provided"
                 )
             if precomputed_partiton_dataset is not None:
-                precomputed_ds = LanceDataset(precomputed_partiton_dataset)
+                precomputed_ds = LanceDataset(
+                    precomputed_partiton_dataset, storage_options=storage_options
+                )
                 if len(precomputed_ds.get_fragments()) != 1:
                     raise ValueError(
                         "precomputed_partiton_dataset must have only one fragment"
@@ -1477,14 +1598,20 @@ class LanceDataset(pa.dataset.Dataset):
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids
-                from .vector import train_ivf_centroids_on_accelerator
+                from .vector import (
+                    compute_partitions,
+                    train_ivf_centroids_on_accelerator,
+                )
 
-                ivf_centroids, partitions_file = train_ivf_centroids_on_accelerator(
+                ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
                     num_partitions,
                     metric,
                     accelerator,
+                )
+                partitions_file = compute_partitions(
+                    self, column[0], kmeans, batch_size=20480
                 )
                 kwargs["precomputed_partitions_file"] = partitions_file
 
@@ -1560,7 +1687,9 @@ class LanceDataset(pa.dataset.Dataset):
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
-        self._ds.create_index(column, index_type, name, replace, kwargs)
+        self._ds.create_index(
+            column, index_type, name, replace, storage_options, kwargs
+        )
         return self
 
     def session(self) -> Session:
@@ -2004,6 +2133,8 @@ class ScannerBuilder:
         self._fragments = None
         self._with_row_id = False
         self._use_stats = True
+        self._fast_search = None
+        self._full_text_query = None
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -2142,6 +2273,7 @@ class ScannerBuilder:
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
         use_index: bool = True,
+        ef: Optional[int] = None,
     ) -> ScannerBuilder:
         q = _coerce_query_vector(q)
 
@@ -2168,6 +2300,10 @@ class ScannerBuilder:
             raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
         if refine_factor is not None and int(refine_factor) < 1:
             raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
+        if ef is not None and int(ef) <= 0:
+            # `ef` should be >= `k`, but `k` could be None so we can't check it here
+            # the rust code will check it
+            raise ValueError(f"ef must be > 0 but got {ef}")
         self._nearest = {
             "column": column,
             "q": q,
@@ -2176,7 +2312,31 @@ class ScannerBuilder:
             "nprobes": nprobes,
             "refine_factor": refine_factor,
             "use_index": use_index,
+            "ef": ef,
         }
+        return self
+
+    def fast_search(self, flag: bool) -> ScannerBuilder:
+        """Enable fast search, which only perform search on the indexed data.
+
+        Users can use `Table::optimize()` or `create_index()` to include the new data
+        into index, thus make new data searchable.
+        """
+        self.fast_search = flag
+        return self
+
+    def full_text_search(
+        self,
+        query: str,
+        columns: Optional[List[str]] = None,
+    ) -> ScannerBuilder:
+        """
+        Filter rows by full text searching. *Experimental API*,
+        may remove it after we support to do this within `filter` SQL-like expression
+
+        Must create inverted index on the given column before searching,
+        """
+        self._full_text_query = {"query": query, "columns": columns}
         return self
 
     def to_scanner(self) -> LanceScanner:
@@ -2196,6 +2356,8 @@ class ScannerBuilder:
             self._with_row_id,
             self._use_stats,
             self._substrait_filter,
+            self._fast_search,
+            self._full_text_query,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -2391,6 +2553,52 @@ class DatasetOptimizer:
         self._dataset._ds.optimize_indices(**kwargs)
 
 
+class Tags:
+    """
+    Dataset tag manager.
+    """
+
+    def __init__(self, dataset: _Dataset):
+        self._ds = dataset
+
+    def list(self) -> dict[str, int]:
+        """
+        List all dataset tags.
+
+        Returns
+        -------
+        dict[str, int]
+            A dictionary mapping tag names to version numbers.
+        """
+        return self._ds.tags()
+
+    def create(self, tag: str, version: int) -> None:
+        """
+        Create a tag for a given dataset version.
+
+        Parameters
+        ----------
+        tag: str,
+            The name of the tag to create. This name must be unique among all tag
+            names for the dataset.
+        version: int,
+            The dataset version to tag.
+        """
+        self._ds.create_tag(tag, version)
+
+    def delete(self, tag: str) -> None:
+        """
+        Delete tag from the dataset.
+
+        Parameters
+        ----------
+        tag: str,
+            The name of the tag to delete.
+
+        """
+        self._ds.delete_tag(tag)
+
+
 class DatasetStats(TypedDict):
     num_deleted_rows: int
     num_fragments: int
@@ -2440,7 +2648,8 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    use_legacy_format: bool = True,
+    data_storage_version: str = "legacy",
+    use_legacy_format: Optional[bool] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2480,10 +2689,25 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    use_legacy_format : optional, bool, default True
-        Use the Lance v1 writer to write Lance v1 files.  The default is currently
-        True but will change as we roll out the v2 format.
+    data_storage_version: optional, str, default "legacy"
+        The version of the data storage format to use. Newer versions are more
+        efficient but require newer versions of lance to read.  The default is
+        "legacy" which will use the legacy v1 version.  See the user guide
+        for more details.
+    use_legacy_format : optional, bool, default None
+        Deprecated method for setting the data storage version. Use the
+        `data_storage_version` parameter instead.
     """
+    if use_legacy_format is not None:
+        warnings.warn(
+            "use_legacy_format is deprecated, use data_storage_version instead",
+            DeprecationWarning,
+        )
+        if use_legacy_format:
+            data_storage_version = "legacy"
+        else:
+            data_storage_version = "stable"
+
     if _check_for_hugging_face(data_obj):
         # Huggingface datasets
         from .dependencies import datasets
@@ -2504,7 +2728,7 @@ def write_dataset(
         "max_bytes_per_file": max_bytes_per_file,
         "progress": progress,
         "storage_options": storage_options,
-        "use_legacy_format": use_legacy_format,
+        "data_storage_version": data_storage_version,
     }
 
     if commit_lock:

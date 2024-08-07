@@ -17,13 +17,13 @@ re-building.
 ## Running tests
 
 ```shell
-pytest python/tests
+make test
 ```
 
 To check the documentation examples, use
 
 ```shell
-pytest --doctest-modules python/lance
+make doctest
 ```
 
 ## Formatting and linting

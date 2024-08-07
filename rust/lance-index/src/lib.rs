@@ -9,11 +9,6 @@
 //! API stability is not guaranteed.
 //! </section>
 
-#![cfg_attr(
-    all(feature = "nightly", target_arch = "x86_64"),
-    feature(stdarch_x86_avx512)
-)]
-
 use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
@@ -72,7 +67,16 @@ pub trait Index: Send + Sync + DeepSizeOf {
 #[derive(Debug, PartialEq, Eq, Copy, Hash, Clone, DeepSizeOf)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
-    Scalar = 0,
+    Scalar = 0, // Legacy scalar index, alias to BTree
+
+    BTree = 1, // BTree
+
+    Bitmap = 2, // Bitmap
+
+    LabelList = 3, // LabelList
+
+    Inverted = 4, // Inverted
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100,
@@ -81,9 +85,25 @@ pub enum IndexType {
 impl std::fmt::Display for IndexType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::Scalar => write!(f, "Scalar"),
+            Self::Scalar | Self::BTree => write!(f, "BTree"),
+            Self::Bitmap => write!(f, "Bitmap"),
+            Self::LabelList => write!(f, "LabelList"),
+            Self::Inverted => write!(f, "Inverted"),
             Self::Vector => write!(f, "Vector"),
         }
+    }
+}
+
+impl IndexType {
+    pub fn is_scalar(&self) -> bool {
+        matches!(
+            self,
+            Self::Scalar | Self::BTree | Self::Bitmap | Self::LabelList | Self::Inverted
+        )
+    }
+
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Self::Vector)
     }
 }
 

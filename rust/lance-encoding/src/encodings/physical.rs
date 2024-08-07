@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::DataType;
+use fsst::FsstPageScheduler;
+use lance_arrow::DataTypeExt;
+use packed_struct::PackedStructPageScheduler;
 
 use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PageScheduler, format::pb};
@@ -9,14 +12,19 @@ use crate::{decoder::PageScheduler, format::pb};
 use self::value::parse_compression_scheme;
 use self::{
     basic::BasicPageScheduler, binary::BinaryPageScheduler, bitmap::DenseBitmapScheduler,
-    fixed_size_list::FixedListScheduler, value::ValuePageScheduler,
+    dictionary::DictionaryPageScheduler, fixed_size_list::FixedListScheduler,
+    value::ValuePageScheduler,
 };
 
 pub mod basic;
 pub mod binary;
 pub mod bitmap;
+pub mod bitpack;
 pub mod buffers;
+pub mod dictionary;
 pub mod fixed_size_list;
+pub mod fsst;
+pub mod packed_struct;
 pub mod value;
 
 /// These contain the file buffers shared across the entire file
@@ -77,6 +85,20 @@ fn get_buffer_decoder(encoding: &pb::Flat, buffers: &PageBuffers) -> Box<dyn Pag
     }
 }
 
+fn get_bitpacked_buffer_decoder(
+    encoding: &pb::Bitpacked,
+    buffers: &PageBuffers,
+) -> Box<dyn PageScheduler> {
+    let (buffer_offset, _buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
+
+    Box::new(bitpack::BitpackedScheduler::new(
+        encoding.compressed_bits_per_value,
+        encoding.uncompressed_bits_per_value,
+        buffer_offset,
+        encoding.signed,
+    ))
+}
+
 /// Convert a protobuf array encoding into a physical page scheduler
 pub fn decoder_from_array_encoding(
     encoding: &pb::ArrayEncoding,
@@ -112,6 +134,9 @@ pub fn decoder_from_array_encoding(
                 }
             }
         }
+        pb::array_encoding::ArrayEncoding::Bitpacked(bitpacked) => {
+            get_bitpacked_buffer_decoder(bitpacked, buffers)
+        }
         pb::array_encoding::ArrayEncoding::Flat(flat) => get_buffer_decoder(flat, buffers),
         pb::array_encoding::ArrayEncoding::FixedSizeList(fixed_size_list) => {
             let item_encoding = fixed_size_list.items.as_ref().unwrap();
@@ -145,6 +170,61 @@ pub fn decoder_from_array_encoding(
                 bytes_scheduler.into(),
                 offset_type,
                 binary.null_adjustment,
+            ))
+        }
+        pb::array_encoding::ArrayEncoding::Fsst(fsst) => {
+            let inner =
+                decoder_from_array_encoding(fsst.binary.as_ref().unwrap(), buffers, data_type);
+
+            Box::new(FsstPageScheduler::new(inner, fsst.symbol_table.clone()))
+        }
+        pb::array_encoding::ArrayEncoding::Dictionary(dictionary) => {
+            let indices_encoding = dictionary.indices.as_ref().unwrap();
+            let items_encoding = dictionary.items.as_ref().unwrap();
+            let num_dictionary_items = dictionary.num_dictionary_items;
+
+            let indices_scheduler =
+                decoder_from_array_encoding(indices_encoding, buffers, data_type);
+            let items_scheduler = decoder_from_array_encoding(items_encoding, buffers, data_type);
+
+            let should_decode_dict = !data_type.is_dictionary();
+
+            Box::new(DictionaryPageScheduler::new(
+                indices_scheduler.into(),
+                items_scheduler.into(),
+                num_dictionary_items,
+                should_decode_dict,
+            ))
+        }
+        pb::array_encoding::ArrayEncoding::PackedStruct(packed_struct) => {
+            let inner_encodings = &packed_struct.inner;
+            let fields = match data_type {
+                DataType::Struct(fields) => Some(fields),
+                _ => None,
+            }
+            .unwrap();
+
+            let inner_datatypes = fields
+                .iter()
+                .map(|field| field.data_type())
+                .collect::<Vec<_>>();
+
+            let mut inner_schedulers = Vec::with_capacity(fields.len());
+            for i in 0..fields.len() {
+                let inner_encoding = &inner_encodings[i];
+                let inner_datatype = inner_datatypes[i];
+                let inner_scheduler =
+                    decoder_from_array_encoding(inner_encoding, buffers, inner_datatype);
+                inner_schedulers.push(inner_scheduler);
+            }
+
+            let packed_buffer = packed_struct.buffer.as_ref().unwrap();
+            let (buffer_offset, _) = get_buffer(packed_buffer, buffers);
+
+            Box::new(PackedStructPageScheduler::new(
+                inner_schedulers,
+                data_type.clone(),
+                buffer_offset,
             ))
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column

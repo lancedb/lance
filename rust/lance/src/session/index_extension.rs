@@ -68,6 +68,7 @@ mod test {
     use arrow_array::{RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use deepsize::DeepSizeOf;
+    use lance_file::version::LanceFileVersion;
     use lance_file::writer::{FileWriter, FileWriterOptions};
     use lance_index::vector::ivf::storage::IvfModel;
     use lance_index::vector::quantizer::{QuantizationType, Quantizer};
@@ -299,9 +300,12 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_vector_index_extension_roundtrip(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_vector_index_extension_roundtrip(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // make dataset and index that is not supported natively
-        let test_ds = TestVectorDataset::new(use_legacy_format, false)
+        let test_ds = TestVectorDataset::new(data_storage_version, false)
             .await
             .unwrap();
         let idx = test_ds.dataset.load_indices().await.unwrap();

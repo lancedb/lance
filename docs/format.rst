@@ -1,5 +1,9 @@
-File Format
-===========
+Lance Formats
+=============
+
+The Lance project includes both a table format and a file format.  Lance typically refers
+to tables as "datasets".  A Lance dataset is designed to efficiently handle secondary indices,
+fast ingestion and modification of data, and a rich set of schema evolution features.
 
 Dataset Directory
 ------------------
@@ -53,31 +57,147 @@ File Structure
 
 Each ``.lance`` file is the container for the actual data.
 
-.. image:: file_struct.png
+.. image:: format_overview.png
 
-At the tail of the file, a `Metadata` protobuf block is used to describe the structure of the data file.
+At the tail of the file, `ColumnMetadata` protobuf blocks are used to describe the encoding of the columns
+in the file.
 
-.. literalinclude:: ../protos/file.proto
+.. literalinclude:: ../protos/file2.proto
    :language: protobuf
    :linenos:
-   :start-at: message Metadata {
-   :end-at: } // Metadata
+   :start-at: // ## Metadata
+   :end-at: } // Metadata-End
 
-Optionally, a ``Manifest`` block can be stored after the ``Metadata`` block, to make the lance file self-describable.
+A ``Footer`` describes the overall layout of the file.  The entire file layout is described here:
 
-In the end of the file, a ``Footer`` is written to indicate the closure of a file:
+.. literalinclude:: ../protos/file2.proto
+   :language: protobuf
+   :linenos:
+   :start-at: // ## File Layout
+   :end-at: // File Layout-End
 
-.. code-block::
+File Version
+------------
 
-    +---------------+----------------+
-    | 0 - 3 byte    | 4 - 7 byte     |
-    +===============+================+
-    | metadata position (uint64)     |
-    +---------------+----------------+
-    | major version | minor version  |
-    +---------------+----------------+
-    |   Magic number "LANC"          |
-    +--------------------------------+
+The Lance file format has gone through a number of changes including a breaking change
+from version 1 to version 2.  There are a number of APIs that allow the file version to
+be specified.  Using a newer version of the file format will lead to better compression
+and/or performance.  However, older software versions may not be able to read newer files.
+
+In addition, the latest version of the file format (next) is unstable and should not be
+used for production use cases.  Breaking changes could be made to unstable encodings and
+that would mean that files written with these encodings are no longer readable by any 
+newer versions of Lance.  The ``next`` version should only be used for experimentation
+and benchmarking upcoming features.
+
+The following values are supported:
+
+.. list-table: File Versions
+    :widths: 20 20 20 40
+    :header-rows: 1
+  
+    * - Version
+      - Minimal Lance Version
+      - Maximum Lance Version
+      - Description
+    * - 0.1
+      - Any
+      - Any
+      - This is the initial Lance format.
+    * - 2.0
+      - 0.15.0
+      - Any
+      - Rework of the Lance file format that removed row groups and introduced null
+        support for lists, fixed size lists, and primtives
+    * - 2.1 (unstable)
+      - None
+      - Any
+      - Adds FSST string compression and bit packing
+    * - legacy
+      - N/A
+      - N/A
+      - Alias for 0.1
+    * - stable
+      - N/A
+      - N/A
+      - Alias for the latest stable version (currently 2.0)
+    * - next
+      - N/A
+      - N/A
+      - Alias for the latest unstable version (currently 2.1)
+
+File Encodings
+--------------
+
+Lance supports a variety of encodings for different data types. The encodings
+are chosen to give both random access and scan performance. Encodings are added
+over time and may be extended in the future.  The manifest records a max format
+version which controls which encodings will be used.  This allows for a gradual
+migration to a new data format so that old readers can still read new data while
+a migration is in progress.
+
+Encodings are divided into "field encodings" and "array encodings".  Field encodings
+are consistent across an entire field of data, while array encodings are used for
+individual pages of data within a field.  Array encodings can nest other array
+encodings (e.g. a dictionary encoding can bitpack the indices) however array encodings
+cannot nest field encodings.  For this reason data types such as
+``Dictionary<UInt8, List<String>>`` are not yet supported (since there is no dictionary
+field encoding)
+
+.. list-table:: Encodings Available
+   :widths: 15 15 40 15 15
+   :header-rows: 1
+
+   * - Encoding Name
+     - Encoding Type
+     - What it does
+     - Supported Versions
+     - When it is applied
+   * - Basic struct
+     - Field encoding
+     - Encodes non-nullable struct data
+     - >= 2.0
+     - Default encoding for structs
+   * - List
+     - Field encoding
+     - Encodes lists (nullable or non-nullable)
+     - >= 2.0
+     - Default encoding for lists
+   * - Basic Primitive
+     - Field encoding
+     - Encodes primitive data types using separate validity array
+     - >= 2.0
+     - Default encoding for primitive data types
+   * - Value
+     - Array encoding
+     - Encodes a single vector of fixed-width values
+     - >= 2.0
+     - Fallback encoding for fixed-width types
+   * - Binary
+     - Array encoding
+     - Encodes a single vector of variable-width data
+     - >= 2.0
+     - Fallback encoding for variable-width types
+   * - Dictionary
+     - Array encoding
+     - Encodes data using a dictionary array and an indices array which is useful for large data types with few unique values
+     - >= 2.0
+     - Used on string pages with fewer than 100 unique elements
+   * - Packed struct
+     - Array encoding
+     - Encodes a struct with fixed-width fields in a row-major format making random access more efficient
+     - >= 2.0
+     - Only used on struct types if the field metadata attribute ``"packed"`` is set to ``"true"``
+   * - Fsst
+     - Array encoding
+     - Compresses binary data by identifying common substrings (of 8 bytes or less) and encoding them as symbols
+     - >= 2.1
+     - Used on string pages that are not dictionary encoded
+   * - Bitpacking
+     - Array encoding
+     - Encodes a single vector of fixed-width values using bitpacking which is useful for integral types that do not span the full range of values
+     - >= 2.1
+     - Used on integral types
 
 Feature Flags
 -------------
@@ -142,47 +262,6 @@ Would be represented as the following field list:
      - LEAF
      - 2
      - ``"int32"``
-
-Encodings
----------
-
-`Lance` uses encodings that can render good both point query and scan performance.
-Generally, it requires:
-
-1. It takes no more than 2 disk reads to access any data points.
-2. It takes sub-linear computation (``O(n)``) to locate one piece of data.
-
-Plain Encoding
-~~~~~~~~~~~~~~
-
-Plain encoding stores Arrow array with **fixed size** values, such as primitive values, in contiguous space on disk.
-Because the size of each value is fixed, the offset of a particular value can be computed directly.
-
-Null: TBD
-
-Variable-Length Binary Encoding
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For variable-length data types, i.e., ``(Large)Binary / (Large)String / (Large)List`` in Arrow, Lance uses variable-length
-encoding. Similar to Arrow in-memory layout, the on-disk layout include an offset array, and the actual data array.
-The offset array contains the **absolute offset** of each value appears in the file.
-
-.. code-block::
-
-    +---------------+----------------+
-    | offset array  | data array     |
-    +---------------+----------------+
-
-
-If ``offsets[i] == offsets[i + 1]``, we treat the ``i-th`` value as ``Null``.
-
-Dictionary Encoding
-~~~~~~~~~~~~~~~~~~~
-
-Directory encoding is a composite encoding for a
-`Arrow Dictionary Type <https://arrow.apache.org/docs/python/generated/pyarrow.DictionaryType.html#pyarrow.DictionaryType>`_,
-where Lance encodes the `key` and `value` separately using primitive encoding types,
-i.e., `key` are usually encoded with `Plain Encoding`_.
 
 
 Dataset Update and Schema Evolution

@@ -333,7 +333,7 @@ impl VectorIndex for PQIndex {
 /// - `metric_type`: The metric type of the vectors.
 /// - `params`: The parameters to train the PQ model.
 /// - `ivf`: If provided, the IVF model to compute the residual for PQ training.
-pub(super) async fn build_pq_model(
+pub async fn build_pq_model(
     dataset: &Dataset,
     column: &str,
     dim: usize,
@@ -408,6 +408,19 @@ pub(super) async fn build_pq_model(
     } else {
         training_data
     };
+
+    let num_codes = 2_usize.pow(params.num_bits as u32);
+    if training_data.len() < num_codes {
+        return Err(Error::Index {
+            message: format!(
+                "Not enough rows to train PQ. Requires {:?} rows but only {:?} available",
+                num_codes,
+                training_data.len()
+            ),
+            location: location!(),
+        });
+    }
+
     info!("Start train PQ: params={:#?}", params);
     let pq = ProductQuantizer::build(&training_data, DistanceType::L2, params)?;
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
@@ -456,7 +469,7 @@ mod tests {
         test_uri: &str,
         range: Range<f32>,
     ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range(1000 * DIM, range);
+        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
@@ -486,7 +499,7 @@ mod tests {
 
         let (dataset, _) = generate_dataset(test_uri, 100.0..120.0).await;
 
-        let centroids = generate_random_array_with_range(4 * DIM, -1.0..1.0);
+        let centroids = generate_random_array_with_range::<Float32Type>(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
         let ivf = IvfModel::new(fsl);
         let params = PQBuildParams::new(16, 8);

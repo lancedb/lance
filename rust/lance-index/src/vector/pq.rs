@@ -16,7 +16,6 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
-use lance_linalg::MatrixView;
 use num_traits::Float;
 use prost::Message;
 use rayon::prelude::*;
@@ -336,25 +335,7 @@ impl Quantization for ProductQuantizer {
             ));
         }
 
-        // TODO: support bf16 later.
-        match fsl.value_type() {
-            DataType::Float16 => {
-                let data = MatrixView::<Float16Type>::try_from(fsl)?;
-                params.build_from_matrix(&data, distance_type)
-            }
-            DataType::Float32 => {
-                let data = MatrixView::<Float32Type>::try_from(fsl)?;
-                params.build_from_matrix(&data, distance_type)
-            }
-            DataType::Float64 => {
-                let data = MatrixView::<Float64Type>::try_from(fsl)?;
-                params.build_from_matrix(&data, distance_type)
-            }
-            _ => Err(Error::Index {
-                message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
-                location: location!(),
-            }),
-        }
+        params.build(data, distance_type)
     }
 
     fn code_dim(&self) -> usize {

@@ -16,10 +16,10 @@ use arrow_array::{
     OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType};
-use lance_arrow::ArrowFloatType;
+use lance_arrow::FixedSizeListArrayExt;
 use num_traits::{bounds::Bounded, Float, Num};
 
-use crate::{Error, MatrixView, Result};
+use crate::{Error, Result};
 
 /// Argmax on a [PrimitiveArray].
 ///
@@ -141,19 +141,19 @@ pub fn normalize_arrow(v: &dyn Array) -> Result<ArrayRef> {
     }
 }
 
-fn do_normalize_fsl<T: ArrowPrimitiveType + ArrowFloatType>(
-    fsl: &FixedSizeListArray,
-) -> Result<FixedSizeListArray>
+fn do_normalize_fsl<T: ArrowPrimitiveType>(fsl: &FixedSizeListArray) -> Result<FixedSizeListArray>
 where
-    <T as ArrowPrimitiveType>::Native: Float + Sum,
+    T::Native: Float + Sum,
 {
-    let mat = MatrixView::<T>::try_from(fsl).map_err(|e| {
-        Error::SchemaError(format!("Convert FixedSizeList to MatrixView failed: {}", e))
-    })?;
-    let normalized = mat.normalize();
-    normalized.try_into().map_err(|e| {
-        Error::SchemaError(format!("Convert MatrixView to FixedSizeList failed: {}", e))
-    })
+    let dim = fsl.value_length() as usize;
+    let norm_arr = PrimitiveArray::<T>::from_iter_values(
+        fsl.values()
+            .as_primitive::<T>()
+            .values()
+            .chunks(dim)
+            .flat_map(normalize),
+    );
+    FixedSizeListArray::try_new_from_values(norm_arr, fsl.value_length())
 }
 
 /// L2 normalize a [FixedSizeListArray] (of vectors).

@@ -34,6 +34,7 @@ use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use lance_io::scheduler::SchedulerConfig;
 use lance_io::stream::RecordBatchStream;
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStreamAdapter,
@@ -47,6 +48,7 @@ use snafu::{location, Location};
 use tempfile::{tempdir, TempDir};
 use tracing::{span, Level};
 
+use crate::dataset::ProjectionRequest;
 use crate::Dataset;
 
 use super::utils;
@@ -427,7 +429,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             let writer = object_store.create(&path).await?;
             let mut writer = FileWriter::try_new(
                 writer,
-                path.to_string(),
                 storage.schema().as_ref().try_into()?,
                 Default::default(),
             )?;
@@ -447,7 +448,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             let index_batch = sub_index.to_batch()?;
             let mut writer = FileWriter::try_new(
                 writer,
-                path.to_string(),
                 index_batch.schema_ref().as_ref().try_into()?,
                 Default::default(),
             )?;
@@ -478,7 +478,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         let mut storage_writer = None;
         let mut index_writer = FileWriter::try_new(
             self.dataset.object_store().create(&index_path).await?,
-            index_path.to_string(),
             S::schema().as_ref().try_into()?,
             Default::default(),
         )?;
@@ -488,7 +487,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap());
         let mut partition_storage_metadata = Vec::with_capacity(partition_sizes.len());
         let mut partition_index_metadata = Vec::with_capacity(partition_sizes.len());
-        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), 64);
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::local()),
+            SchedulerConfig::fast_and_not_too_ram_intensive(),
+        );
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
             log::info!("merging partition {}/{}", part_id, ivf.num_partitions());
             if storage_size == 0 {
@@ -515,7 +517,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 if storage_writer.is_none() {
                     storage_writer = Some(FileWriter::try_new(
                         self.dataset.object_store().create(&storage_path).await?,
-                        storage_path.to_string(),
                         batch.schema_ref().as_ref().try_into()?,
                         Default::default(),
                     )?);
@@ -608,11 +609,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
     async fn take_vectors(&self, row_ids: &[u64]) -> Result<Vec<RecordBatch>> {
         let column = self.column.clone();
         let object_store = self.dataset.object_store().clone();
-        let projection = self.dataset.schema().project(&[column.as_str()])?;
+        let projection = Arc::new(self.dataset.schema().project(&[column.as_str()])?);
         // arrow uses i32 for index, so we chunk the row ids to avoid large batch causing overflow
         let mut batches = Vec::new();
         for chunk in row_ids.chunks(object_store.block_size()) {
-            let batch = self.dataset.take_rows(chunk, &projection).await?;
+            let batch = self
+                .dataset
+                .take_rows(chunk, ProjectionRequest::Schema(projection.clone()))
+                .await?;
             let batch = batch.try_with_column(
                 ROW_ID_FIELD.clone(),
                 Arc::new(UInt64Array::from(chunk.to_vec())),
@@ -645,6 +649,7 @@ pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: Quantization
 mod tests {
     use std::{collections::HashMap, ops::Range, sync::Arc};
 
+    use arrow::datatypes::Float32Type;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
@@ -672,7 +677,7 @@ mod tests {
         test_uri: &str,
         range: Range<f32>,
     ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range(1000 * DIM, range);
+        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();

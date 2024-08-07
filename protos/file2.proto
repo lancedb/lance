@@ -92,6 +92,8 @@ import "google/protobuf/empty.proto";
 // |   "LANC"                         |
 // ├──────────────────────────────────┤
 //
+// File Layout-End
+//
 // ## Data Pages
 //
 // A lot of flexiblity is provided in how data is stored.  Note that the file
@@ -196,7 +198,7 @@ message ColumnMetadata {
   // This field will have the same length as `buffer_offsets` and
   // may be empty.
   repeated uint64 buffer_sizes = 4;
-}
+} // Metadata-End
 
 // ## Where is the rest?
 //

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Union
+from typing import Optional, Union
 
 import pyarrow as pa
 
@@ -146,9 +146,10 @@ class LanceFileWriter:
     def __init__(
         self,
         path: str,
-        schema: pa.Schema,
+        schema: Optional[pa.Schema] = None,
         *,
-        data_cache_bytes: int = None,
+        data_cache_bytes: Optional[int] = None,
+        version: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -160,13 +161,19 @@ class LanceFileWriter:
             The path to write to.  Can be a pathname for local storage
             or a URI for remote storage.
         schema: pa.Schema
-            The schema of data that will be written
+            The schema of data that will be written.  If not specified then
+            the schema will be inferred from the first batch.  If the schema
+            is not specified and no data is written then the write will fail.
         data_cache_bytes: int
             How many bytes (per column) to cache before writing a page.  The
             default is an appropriate value based on the filesystem.
+        version: str
+            The version of the file format to write.  If not specified then
+            the latest stable version will be used.  Newer versions are more
+            efficient but may not be readable by older versions of the software.
         """
         self._writer = _LanceFileWriter(
-            path, schema, data_cache_bytes=data_cache_bytes, **kwargs
+            path, schema, data_cache_bytes=data_cache_bytes, version=version, **kwargs
         )
         self.closed = False
 

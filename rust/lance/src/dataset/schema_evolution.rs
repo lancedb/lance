@@ -482,7 +482,7 @@ pub(super) async fn alter_columns(
 /// This is a metadata-only operation and does not remove the data from the
 /// underlying storage. In order to remove the data, you must subsequently
 /// call `compact_files` to rewrite the data without the removed columns and
-/// then call `cleanup_files` to remove the old files.
+/// then call `cleanup_old_versions` to remove the old files.
 pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<()> {
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {
@@ -534,6 +534,7 @@ mod test {
     use super::*;
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::Fields as ArrowFields;
+    use lance_file::version::LanceFileVersion;
     use rstest::rstest;
 
     // Used to validate that futures returned are Send.
@@ -561,7 +562,7 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                use_legacy_format: true,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
@@ -622,7 +623,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_append_columns_udf(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_append_columns_udf(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         use arrow_array::Float64Array;
 
         let num_rows = 5;
@@ -644,7 +648,7 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -750,7 +754,7 @@ mod test {
             Some(WriteParams {
                 max_rows_per_file: 50,
                 max_rows_per_group: 25,
-                use_legacy_format: true,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
@@ -895,7 +899,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_rename_columns(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_rename_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         use std::collections::HashMap;
 
         use arrow_array::{ArrayRef, StructArray};
@@ -937,7 +944,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1009,18 +1016,21 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_cast_column(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_cast_column(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         // Create a table with 2 scalar columns, 1 vector column
 
         use arrow::datatypes::{Int32Type, Int64Type};
         use arrow_array::{Float16Array, Float32Array, Int64Array, ListArray};
         use half::f16;
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::{DatasetIndexExt, IndexType};
+        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
         use lance_linalg::distance::MetricType;
         use lance_testing::datagen::generate_random_array;
 
-        use crate::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
+        use crate::index::vector::VectorIndexParams;
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, false),
             ArrowField::new("f", DataType::Float32, false),
@@ -1061,7 +1071,7 @@ mod test {
             RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1212,7 +1222,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_drop_columns(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_drop_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         use std::collections::HashMap;
 
         use arrow_array::{ArrayRef, Float32Array, StructArray};
@@ -1261,7 +1274,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1306,7 +1319,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_drop_add_columns(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_drop_add_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -1323,7 +1339,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )

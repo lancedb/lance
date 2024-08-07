@@ -15,6 +15,7 @@ use datafusion_expr::{
     simplify::SimplifyContext,
     Accumulator, Expr,
 };
+use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
 use futures::{future::BoxFuture, FutureExt};
@@ -25,7 +26,7 @@ use lance_encoding::{
     },
     encoder::{
         encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodedBuffer, EncodedColumn,
-        FieldEncoder,
+        EncodingOptions, FieldEncoder,
     },
     format::pb,
     EncodingsIo,
@@ -110,6 +111,7 @@ impl<F: Fn(u64) -> bool> ZoneMapsFilter<F> {
 /// Substrait represents paths as a series of field indices
 ///
 /// This method converts that into a datafusion expression
+#[allow(unused)]
 fn path_to_expr(path: &VecDeque<u32>) -> Expr {
     let mut parts_iter = path.iter().map(|path_num| path_num.to_string());
     let mut expr = col(parts_iter.next().unwrap());
@@ -121,37 +123,38 @@ fn path_to_expr(path: &VecDeque<u32>) -> Expr {
 
 /// If a column has zone info in the encoding description then extract it
 pub(crate) fn extract_zone_info(
-    column_info: &mut ColumnInfo,
-    data_type: &DataType,
-    cur_path: &VecDeque<u32>,
+    _column_info: &ColumnInfo,
+    _data_type: &DataType,
+    _cur_path: &VecDeque<u32>,
 ) -> Option<(u32, UnloadedPushdown)> {
-    let encoding = column_info.encoding.column_encoding.take().unwrap();
-    match encoding {
-        pb::column_encoding::ColumnEncoding::ZoneIndex(mut zone_index) => {
-            let inner = zone_index.inner.take().unwrap();
-            let rows_per_zone = zone_index.rows_per_zone;
-            let zone_map_buffer = zone_index.zone_map_buffer.as_ref().unwrap().clone();
-            assert_eq!(
-                zone_map_buffer.buffer_type,
-                i32::from(pb::buffer::BufferType::Column)
-            );
-            let (position, size) =
-                column_info.buffer_offsets_and_sizes[zone_map_buffer.buffer_index as usize];
-            column_info.encoding = *inner;
-            let column = path_to_expr(cur_path);
-            let unloaded_pushdown = UnloadedPushdown {
-                data_type: data_type.clone(),
-                column,
-                position,
-                size,
-            };
-            Some((rows_per_zone, unloaded_pushdown))
-        }
-        _ => {
-            column_info.encoding.column_encoding = Some(encoding);
-            None
-        }
-    }
+    todo!()
+    // let encoding = column_info.encoding.column_encoding.take().unwrap();
+    // match encoding {
+    //     pb::column_encoding::ColumnEncoding::ZoneIndex(mut zone_index) => {
+    //         let inner = zone_index.inner.take().unwrap();
+    //         let rows_per_zone = zone_index.rows_per_zone;
+    //         let zone_map_buffer = zone_index.zone_map_buffer.as_ref().unwrap().clone();
+    //         assert_eq!(
+    //             zone_map_buffer.buffer_type,
+    //             i32::from(pb::buffer::BufferType::Column)
+    //         );
+    //         let (position, size) =
+    //             column_info.buffer_offsets_and_sizes[zone_map_buffer.buffer_index as usize];
+    //         column_info.encoding = *inner;
+    //         let column = path_to_expr(cur_path);
+    //         let unloaded_pushdown = UnloadedPushdown {
+    //             data_type: data_type.clone(),
+    //             column,
+    //             position,
+    //             size,
+    //         };
+    //         Some((rows_per_zone, unloaded_pushdown))
+    //     }
+    //     _ => {
+    //         column_info.encoding.column_encoding = Some(encoding);
+    //         None
+    //     }
+    // }
 }
 
 /// Extracted pushdown information obtained from the column encoding
@@ -493,9 +496,19 @@ impl ZoneMapsFieldEncoder {
         let zone_maps =
             RecordBatch::try_new(Arc::new(zone_map_schema), vec![mins, maxes, null_counts])?;
         let encoding_strategy = CoreFieldEncodingStrategy::default();
-        let encoded_zone_maps =
-            encode_batch(&zone_maps, Arc::new(schema), &encoding_strategy, u64::MAX).await?;
+        let encoded_zone_maps = encode_batch(
+            &zone_maps,
+            Arc::new(schema),
+            &encoding_strategy,
+            &EncodingOptions {
+                cache_bytes_per_column: u64::MAX,
+                max_page_bytes: u64::MAX,
+                keep_original_array: true,
+            },
+        )
+        .await?;
         let zone_maps_buffer = encoded_zone_maps.try_to_mini_lance()?;
+
         Ok(EncodedBuffer {
             parts: vec![Buffer::from(zone_maps_buffer)],
         })
@@ -582,6 +595,8 @@ mod tests {
     };
 
     #[test_log::test(tokio::test)]
+    #[ignore] // Stats currently disabled until https://github.com/lancedb/lance/issues/2605
+              // is addressed
     async fn test_basic_stats() {
         let data = lance_datagen::gen()
             .col("0", lance_datagen::array::step::<Int32Type>())
@@ -598,7 +613,7 @@ mod tests {
 
         let decoder_middleware = DecoderMiddlewareChain::new()
             .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy));
+            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
 
@@ -612,7 +627,7 @@ mod tests {
 
         let decoder_middleware = DecoderMiddlewareChain::new()
             .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy));
+            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
         let result = count_lance_file(
             &fs,
@@ -632,7 +647,7 @@ mod tests {
 
         let decoder_middleware = DecoderMiddlewareChain::new()
             .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy));
+            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
         let result = count_lance_file(
             &fs,

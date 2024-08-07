@@ -79,7 +79,7 @@ pub async fn merge_indices<'a>(
     });
 
     let (new_uuid, indices_merged) = match indices[0].index_type() {
-        IndexType::Scalar => {
+        it if it.is_scalar() => {
             let index = dataset
                 .open_scalar_index(&column.name, &old_indices[0].uuid.to_string())
                 .await?;
@@ -96,13 +96,20 @@ pub async fn merge_indices<'a>(
 
             let new_uuid = Uuid::new_v4();
 
-            let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
-
+            // The BTree index implementation leverages the legacy format's batch offset,
+            // which has been removed from new format, so keep using the legacy format for now.
+            let new_store = match index.index_type() {
+                IndexType::Scalar | IndexType::BTree => {
+                    LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string())
+                        .with_legacy_format(true)
+                }
+                _ => LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string()),
+            };
             index.update(new_data_stream.into(), &new_store).await?;
 
             Ok((new_uuid, 1))
         }
-        IndexType::Vector => {
+        it if it.is_vector() => {
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
@@ -123,6 +130,13 @@ pub async fn merge_indices<'a>(
             )
             .await
         }
+        _ => Err(Error::Index {
+            message: format!(
+                "Append index: invalid index type: {:?}",
+                indices[0].index_type()
+            ),
+            location: location!(),
+        }),
     }?;
 
     Ok(Some((
@@ -144,7 +158,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-        DatasetIndexExt,
+        DatasetIndexExt, IndexType,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
