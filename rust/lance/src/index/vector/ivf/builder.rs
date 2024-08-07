@@ -5,14 +5,21 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::FixedSizeListArray;
+use arrow::array::AsArray;
+use arrow::datatypes::UInt64Type;
+use arrow_array::{FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::{DataType, Field as ArrowField};
 use futures::{StreamExt, TryStreamExt};
+use lance_arrow::{RecordBatchExt, SchemaExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::FileWriter;
 use lance_index::vector::quantizer::Quantizer;
+use lance_index::vector::PART_ID_COLUMN;
 use lance_index::vector::{ivf::storage::IvfModel, transform::Transformer};
 use lance_io::object_writer::ObjectWriter;
+use lance_io::stream::RecordBatchStreamAdapter;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
@@ -28,7 +35,9 @@ use lance_index::vector::{
 use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::{DistanceType, MetricType};
 
+use crate::dataset::builder::DatasetBuilder;
 use crate::index::vector::ivf::io::write_pq_partitions;
+use crate::Dataset;
 
 use super::io::write_hnsw_quantization_index_partitions;
 
@@ -89,7 +98,101 @@ pub(super) async fn build_partitions(
     Ok(())
 }
 
+async fn load_precomputed_partitions(
+    src_dataset: &Dataset,
+    partitions_ds_uri: &str,
+) -> Result<Vec<Vec<i32>>> {
+    let builder = DatasetBuilder::from_uri(partitions_ds_uri);
+    let ds = builder.load().await?;
+    let stream = ds.scan().try_into_stream().await?;
+    let lookup = src_dataset
+        .fragments()
+        .iter()
+        .map(|frag| {
+            vec![
+                -1;
+                frag.physical_rows
+                    .expect("new index building API does not work with datasets this old")
+            ]
+        })
+        .collect::<Vec<_>>();
+    let partition_lookup = stream
+        .try_fold(lookup, |mut lookup, batch| {
+            let row_addrs: &UInt64Array = batch
+                .column_by_name("row_id")
+                .expect("malformed partition file: missing row_id column")
+                .as_primitive();
+            let partitions: &UInt32Array = batch
+                .column_by_name("partition")
+                .expect("malformed partition file: missing partition column")
+                .as_primitive();
+            row_addrs
+                .values()
+                .iter()
+                .zip(partitions.values().iter())
+                .for_each(|(row_id, partition)| {
+                    let addr = RowAddress::new_from_id(*row_id);
+                    lookup[addr.fragment_id() as usize][addr.row_id() as usize] = *partition as i32;
+                });
+            async move { Ok(lookup) }
+        })
+        .await?;
+    Ok(partition_lookup)
+}
+
+#[instrument(level = "debug", skip_all)]
+fn add_precomputed_partitions(
+    batch: RecordBatch,
+    partition_map: &Vec<Vec<i32>>,
+    part_id_field: &ArrowField,
+) -> Result<RecordBatch> {
+    let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
+        message: "column does not exist".to_string(),
+        location: location!(),
+    })?;
+    let part_ids = UInt32Array::from_iter_values(
+        row_ids
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .filter_map(|row_id| {
+                let addr = RowAddress::new_from_id(*row_id);
+                let part_id = partition_map[addr.fragment_id() as usize][addr.row_id() as usize];
+                if part_id < 0 {
+                    None
+                } else {
+                    Some(part_id as u32)
+                }
+            }),
+    );
+    let batch = batch
+        .try_with_column(part_id_field.clone(), Arc::new(part_ids.clone()))
+        .expect("failed to add part id column");
+    Ok(batch)
+}
+
+async fn apply_precomputed_partitions(
+    dataset: &Dataset,
+    data: impl RecordBatchStream + Unpin + 'static,
+    partitions_ds_uri: &str,
+) -> Result<impl RecordBatchStream + Unpin + 'static> {
+    let partition_map = load_precomputed_partitions(dataset, partitions_ds_uri).await?;
+    let part_id_field = ArrowField::new(PART_ID_COLUMN, DataType::UInt32, true);
+    let schema_with_part_id = Arc::new(
+        data.schema()
+            .as_ref()
+            .clone()
+            .try_with_column(part_id_field.clone())?,
+    );
+    let mapped = data.map(move |batch| {
+        let batch = batch?;
+        add_precomputed_partitions(batch, &partition_map, &part_id_field)
+    });
+    Ok(RecordBatchStreamAdapter::new(schema_with_part_id, mapped))
+}
+
 pub async fn write_vector_storage(
+    dataset: &Dataset,
     data: impl RecordBatchStream + Unpin + 'static,
     num_rows: u64,
     centroids: FixedSizeListArray,
@@ -97,6 +200,7 @@ pub async fn write_vector_storage(
     distance_type: DistanceType,
     column: &str,
     writer: ObjectWriter,
+    precomputed_partitions_ds_uri: Option<&str>,
 ) -> Result<()> {
     info!("Transforming {} vectors for storage", num_rows);
     let ivf_transformer = Arc::new(lance_index::vector::ivf::IvfTransformer::with_pq(
@@ -106,6 +210,14 @@ pub async fn write_vector_storage(
         pq,
         None,
     ));
+
+    let data = if let Some(partitions_ds_uri) = precomputed_partitions_ds_uri {
+        apply_precomputed_partitions(dataset, data, partitions_ds_uri)
+            .await?
+            .boxed()
+    } else {
+        data.boxed()
+    };
 
     let mut writer =
         lance_file::v2::writer::FileWriter::new_lazy(writer, FileWriterOptions::default());
