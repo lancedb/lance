@@ -797,6 +797,13 @@ pub async fn commit_compaction(
             })
             .collect()
     } else {
+        // We need to reserve fragment ids here so that the fragment bitmap
+        // can be updated for each index.
+        let new_fragments = rewrite_groups
+            .iter_mut()
+            .flat_map(|group| group.new_fragments.iter_mut())
+            .collect::<Vec<_>>();
+        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
         Vec::new()
     };
 
