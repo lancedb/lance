@@ -119,7 +119,7 @@ impl ProductQuantizer {
         let values = flatten_data
             .values()
             .chunks_exact(dim)
-            .map(|vector| {
+            .flat_map(|vector| {
                 vector
                     .chunks_exact(sub_dim)
                     .enumerate()
@@ -135,7 +135,6 @@ impl ProductQuantizer {
                     })
                     .collect::<Vec<_>>()
             })
-            .flatten()
             .collect::<Vec<_>>();
 
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
