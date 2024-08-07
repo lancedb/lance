@@ -91,7 +91,7 @@ pub async fn write_vector_storage(
     data: impl RecordBatchStream + Unpin + 'static,
     num_rows: u64,
     centroids: FixedSizeListArray,
-    pq: ProductQuantizer,
+    _pq: ProductQuantizer,
     distance_type: DistanceType,
     column: &str,
     writer: ObjectWriter,

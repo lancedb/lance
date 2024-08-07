@@ -10,7 +10,6 @@ use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
 use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
 use arrow_schema::DataType;
-use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;

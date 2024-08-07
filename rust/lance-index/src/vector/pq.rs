@@ -6,11 +6,10 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{self, ArrowPrimitiveType, Float16Type, Float32Type, Float64Type};
+use arrow::datatypes::{self, ArrowPrimitiveType};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::DataType;
-use datafusion::parquet::data_type::AsBytes;
 use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use lance_core::{Error, Result};
@@ -402,7 +401,7 @@ impl Quantization for ProductQuantizer {
         let codebook = match metadata.codebook.as_ref() {
             Some(fsl) => fsl.clone(),
             None => {
-                let tensor = pb::Tensor::decode(metadata.codebook_tensor.as_bytes())?;
+                let tensor = pb::Tensor::decode(metadata.codebook_tensor.as_ref())?;
                 FixedSizeListArray::try_from(&tensor)?
             }
         };

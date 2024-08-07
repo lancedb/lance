@@ -318,10 +318,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         let (sub_index_type, quantization_type) = self.sub_index_type();
         let index_type = index_type_string(sub_index_type, quantization_type);
-        let mut sub_index_stats: serde_json::Value = match self.sub_index_metadata[0].len() {
-            0 => json!({}), // for FLAT index, the metadata is empty
-            _ => serde_json::from_str(self.sub_index_metadata[0].as_str())?,
-        };
         let mut sub_index_stats: serde_json::Value =
             if let Some(metadata) = self.sub_index_metadata.iter().find(|m| !m.is_empty()) {
                 serde_json::from_str(metadata)?
