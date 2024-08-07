@@ -25,7 +25,10 @@ mod serde;
 use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
-use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
+use lance_core::{
+    utils::{deletion::DeletionVector, mask::RowIdTreeMap},
+    Error, Result,
+};
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
@@ -150,6 +153,33 @@ impl RowIdSequence {
 
         // Add the remaining segments.
         self.0.extend_from_slice(remaining_segments);
+    }
+
+    /// Delete row ids by position.
+    pub fn mask(&mut self, positions: &DeletionVector) -> Result<()> {
+        let mut local_positions = Vec::new();
+        let mut positions_iter = positions.iter();
+        let mut curr_position = positions_iter.next();
+        let mut cutoff = 0;
+
+        for segment in &mut self.0 {
+            // Make vector of local positions
+            cutoff += segment.len() as u32;
+            while let Some(position) = curr_position {
+                if position >= cutoff {
+                    break;
+                }
+                local_positions.push(position);
+                curr_position = positions_iter.next();
+            }
+
+            if !local_positions.is_empty() {
+                segment.mask(&local_positions);
+                local_positions.clear();
+            }
+        }
+
+        Ok(())
     }
 
     /// Find the row ids in the sequence.
