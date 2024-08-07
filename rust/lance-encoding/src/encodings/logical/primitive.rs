@@ -454,7 +454,7 @@ impl PrimitiveFieldEncoder {
                 let mut offset = 0;
                 let part_size = bit_util::ceil(array.len(), num_parts);
                 for _ in 0..num_parts {
-                    let avail = array.len() - part_size;
+                    let avail = array.len() - offset;
                     let chunk_size = avail.min(part_size);
                     let part = array.slice(offset, chunk_size);
                     let task = self.create_encode_task(vec![part])?;
