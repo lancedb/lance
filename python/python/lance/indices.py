@@ -470,12 +470,12 @@ class IndicesBuilder:
             raise ValueError("filenames must be a list of strings")
 
     def load_shuffled_vectors(
-        self, 
-        filenames: list[str], 
-        dir_path: str, 
+        self,
+        filenames: list[str],
+        dir_path: str,
         ivf: IvfModel,
-        pq: PqModel, 
-        index_name: Optional[str] = None
+        pq: PqModel,
+        index_name: Optional[str] = None,
     ):
         """
         Takes filenames of the sorted, transformed vector files as input. Loads

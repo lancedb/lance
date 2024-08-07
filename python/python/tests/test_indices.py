@@ -188,7 +188,6 @@ def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     )
 
     sorted_filenames = filenames1 + filenames2
-    print("Sorted files stored in {}".format(sorted_filenames))
     builder.load_shuffled_vectors(sorted_filenames, str(tmpdir), rand_ivf, rand_pq)
 
     final_ds = lance.dataset(str(tmpdir / "dataset"))
