@@ -4,7 +4,7 @@
 //! Flat Vector Index.
 //!
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
@@ -93,12 +93,9 @@ impl IvfSubIndex for FlatIndex {
                 )
                 .unzip(),
             false => {
-                let filtered_row_ids = prefilter
-                    .filter_row_ids(Box::new(storage.row_ids()))
-                    .into_iter()
-                    .collect::<HashSet<_>>();
+                let row_id_mask = prefilter.mask();
                 (0..storage.len())
-                    .filter(|&id| !filtered_row_ids.contains(&storage.row_id(id as u32)))
+                    .filter(|&id| row_id_mask.selected(storage.row_id(id as u32)))
                     .map(|id| OrderedNode {
                         id: id as u32,
                         dist: OrderedFloat(dist_calc.distance(id as u32)),
