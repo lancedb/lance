@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::{
     stream::{self, StreamExt},
-    TryStreamExt,
+    Stream, TryStreamExt,
 };
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
@@ -1443,6 +1443,41 @@ async fn write_ivf_pq_file(
     let pos = writer.write_protobuf(&metadata).await?;
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
+    writer.write_magics(pos, 0, 1, MAGIC).await?;
+    writer.shutdown().await?;
+
+    Ok(())
+}
+
+pub async fn write_ivf_pq_file_from_existing_index(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    index_id: Uuid,
+    mut ivf: IvfModel,
+    pq: ProductQuantizer,
+    streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
+) -> Result<()> {
+    let obj_store = dataset.object_store();
+    let path = dataset
+        .indices_dir()
+        .child(index_id.to_string())
+        .child("index.idx");
+    let mut writer = obj_store.create(&path).await?;
+    write_pq_partitions(&mut writer, &mut ivf, Some(streams), None).await?;
+
+    let metadata = IvfPQIndexMetadata::new(
+        index_name.to_string(),
+        column.to_string(),
+        dataset.version().version,
+        pq.distance_type,
+        ivf,
+        pq,
+        vec![],
+    );
+
+    let metadata = pb::Index::try_from(&metadata)?;
+    let pos = writer.write_protobuf(&metadata).await?;
     writer.write_magics(pos, 0, 1, MAGIC).await?;
     writer.shutdown().await?;
 

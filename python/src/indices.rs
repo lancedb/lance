@@ -5,7 +5,6 @@ use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use lance::index::vector::ivf::builder::write_vector_storage;
-use lance::index::vector::ivf::io::write_pq_partitions;
 use lance::io::ObjectStore;
 use lance_index::vector::ivf::shuffler::{load_partitioned_shuffles, shuffle_vectors};
 use lance_index::vector::{
@@ -22,11 +21,9 @@ use pyo3::{
 
 use crate::fragment::FileFragment;
 use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
-use lance::index::vector::ivf::IvfPQIndexMetadata;
-use lance_file::format::MAGIC;
-use lance_index::pb::Index;
+use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
 use lance_index::DatasetIndexExt;
-use lance_io::traits::WriteExt;
+use uuid::Uuid;
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -292,7 +289,8 @@ async fn do_load_shuffled_vectors(
     dir_path: &str,
     dataset: &Dataset,
     column: &str,
-    mut ivf_model: IvfModel,
+    index_name: &str,
+    ivf_model: IvfModel,
     pq_model: ProductQuantizer,
 ) -> PyResult<()> {
     let (_, path) = object_store_from_uri_or_path(dir_path).await?;
@@ -300,31 +298,22 @@ async fn do_load_shuffled_vectors(
         .await
         .infer_error()?;
 
-    let obj_store = dataset.ds.object_store();
-    let path = dataset.ds.indices_dir().child("shuffled_vectors.idx");
-    let mut writer = obj_store.create(&path).await.infer_error()?;
-    write_pq_partitions(&mut writer, &mut ivf_model, Some(streams), None)
-        .await
-        .infer_error()?;
-    let index_name = "ivf_pq_index";
+    let index_id = Uuid::new_v4();
 
-    let metadata = IvfPQIndexMetadata::new(
-        index_name.to_string(),
-        column.to_string(),
-        dataset.ds.version().version,
-        pq_model.distance_type,
+    write_ivf_pq_file_from_existing_index(
+        &dataset.ds,
+        column,
+        index_name,
+        index_id,
         ivf_model,
         pq_model,
-        vec![],
-    );
-
-    let metadata = Index::try_from(&metadata).infer_error()?;
-    let pos = writer.write_protobuf(&metadata).await.infer_error()?;
-    writer.write_magics(pos, 0, 1, MAGIC).await.infer_error()?;
-    writer.shutdown().await.infer_error()?;
+        streams,
+    )
+    .await
+    .infer_error()?;
 
     let mut ds = dataset.ds.as_ref().clone();
-    ds.commit_existing_index(index_name, column)
+    ds.commit_existing_index(index_name, column, index_id)
         .await
         .infer_error()?;
 
@@ -343,7 +332,11 @@ pub fn load_shuffled_vectors(
     pq_dimension: usize,
     num_subvectors: u32,
     distance_type: &str,
+    index_name: Option<&str>,
 ) -> PyResult<()> {
+    let default_idx_name = column.to_string() + "_idx";
+    let idx_name = index_name.unwrap_or(default_idx_name.as_str());
+
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
 
@@ -367,7 +360,9 @@ pub fn load_shuffled_vectors(
 
     RT.block_on(
         None,
-        do_load_shuffled_vectors(filenames, dir_path, dataset, column, ivf_model, pq_model),
+        do_load_shuffled_vectors(
+            filenames, dir_path, dataset, column, idx_name, ivf_model, pq_model,
+        ),
     )?
 }
 

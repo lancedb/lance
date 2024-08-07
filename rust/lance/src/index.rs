@@ -336,9 +336,12 @@ impl DatasetIndexExt for Dataset {
         Ok(loaded_indices)
     }
 
-    async fn commit_existing_index(&mut self, index_name: &str, column: &str) -> Result<()> {
-        let index_id = Uuid::new_v4();
-
+    async fn commit_existing_index(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        index_id: Uuid,
+    ) -> Result<()> {
         let Some(field) = self.schema().field(column) else {
             return Err(Error::Index {
                 message: format!("CreateIndex: column '{column}' does not exist"),

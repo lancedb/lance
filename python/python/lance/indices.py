@@ -380,7 +380,7 @@ class IndicesBuilder:
         ivf: IvfModel,
         pq: PqModel,
         dest_uri: str,
-        fragments: Optional[list[LanceFragment]],
+        fragments: Optional[list[LanceFragment]] = None,
         partition_ds_uri: Optional[str] = None,
     ):
         """
@@ -433,7 +433,7 @@ class IndicesBuilder:
         unsorted_filenames: list[str],
         dir_path: str,
         ivf: IvfModel,
-        shuffle_output_root_filename: Optional[str],
+        shuffle_output_root_filename: Optional[str] = "sorted",
     ) -> list[str]:
         """
         Take the transformed, unsorted vector files as input, and create sorted
@@ -470,7 +470,12 @@ class IndicesBuilder:
             raise ValueError("filenames must be a list of strings")
 
     def load_shuffled_vectors(
-        self, filenames: list[str], dir_path: str, ivf: IvfModel, pq: PqModel
+        self, 
+        filenames: list[str], 
+        dir_path: str, 
+        ivf: IvfModel,
+        pq: PqModel, 
+        index_name: Optional[str] = None
     ):
         """
         Takes filenames of the sorted, transformed vector files as input. Loads
@@ -482,10 +487,13 @@ class IndicesBuilder:
             The filenames of the sorted storage files.
         dir_path: str
             Path of the directory where all the files are located.
+        index_name: Optional[str]
+            The name of the index to be created. If not provided, the default name
+            will be "{column_name}_idx".
         ivf: IvfModel
-            The IVF model used for the transformations (e.g. partition assignment)
+            The IVF model used to create the inputs.
         pq: PqModel
-            The PQ model used for the transformations (e.g. quantization)
+            The PQ model used to create the inputs.
         """
 
         pq_dimension = self.dataset.schema.field(self.column[0]).type.list_size
@@ -503,6 +511,7 @@ class IndicesBuilder:
                 pq_dimension,
                 num_subvectors,
                 distance_type,
+                index_name,
             )
         else:
             raise ValueError("filenames must be a list of strings")

@@ -1088,7 +1088,7 @@ impl Dataset {
             .await
     }
 
-    pub fn object_store(&self) -> &ObjectStore {
+    pub(crate) fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
 
@@ -1102,7 +1102,7 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
-    pub fn indices_dir(&self) -> Path {
+    pub(crate) fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
     }
 

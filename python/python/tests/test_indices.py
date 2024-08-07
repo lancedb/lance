@@ -161,7 +161,6 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     filenames = builder.shuffle_transformed_vectors(
         ["transformed_shuffle"], str(tmpdir), rand_ivf, "sorted"
     )
-    print(filenames)
 
     for fname in filenames:
         full_path = str(tmpdir / fname)
