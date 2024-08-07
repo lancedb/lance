@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::{cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeListArray};
+use lance_core::{Error, Result};
+use snafu::{location, Location};
 
 /// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
 ///
@@ -10,8 +12,18 @@ use arrow_array::{cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeList
 pub(super) fn divide_to_subvectors<T: ArrowPrimitiveType>(
     fsl: &FixedSizeListArray,
     m: usize,
-) -> Vec<Vec<T::Native>> {
+) -> Result<Vec<Vec<T::Native>>> {
     let dim = fsl.value_length() as usize;
+    if dim % m != 0 {
+        return Err(Error::invalid_input(
+            format!(
+                "num_sub_vectors must divide vector dimension {}, but got {}",
+                dim, m
+            ),
+            location!(),
+        ));
+    };
+
     let sub_vector_length = dim / m;
     let capacity = fsl.len() * sub_vector_length;
     let mut subarrays = vec![Vec::with_capacity(capacity); m];
@@ -28,7 +40,7 @@ pub(super) fn divide_to_subvectors<T: ArrowPrimitiveType>(
                     .extend_from_slice(&vec[i * sub_vector_length..(i + 1) * sub_vector_length]);
             }
         });
-    subarrays
+    Ok(subarrays)
 }
 
 /// Number of PQ centroids, for the corresponding number of PQ bits.
@@ -70,7 +82,7 @@ mod tests {
         let values = Float32Array::from_iter((0..320).map(|v| v as f32));
         // A [10, 32] array.
         let mat = FixedSizeListArray::try_new_from_values(values, 32).unwrap();
-        let sub_vectors = divide_to_subvectors::<Float32Type>(&mat, 4);
+        let sub_vectors = divide_to_subvectors::<Float32Type>(&mat, 4).unwrap();
         assert_eq!(sub_vectors.len(), 4);
         assert_eq!(sub_vectors[0].len(), 10 * 8);
 
