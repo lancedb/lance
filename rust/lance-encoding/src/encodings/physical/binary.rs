@@ -416,7 +416,7 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
 }
 
 // Bytes computed across all string arrays, similar to indices above
-fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
+pub fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
     arrays
         .iter()
         .map(|arr| {

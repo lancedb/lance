@@ -22,6 +22,7 @@ pub mod bitmap;
 pub mod bitpack;
 pub mod buffers;
 pub mod dictionary;
+pub mod fixed_size_binary;
 pub mod fixed_size_list;
 pub mod fsst;
 pub mod packed_struct;
@@ -194,6 +195,15 @@ pub fn decoder_from_array_encoding(
                 items_scheduler.into(),
                 num_dictionary_items,
                 should_decode_dict,
+            ))
+        }
+        pb::array_encoding::ArrayEncoding::FixedSizeBinary(ref fixed_size_binary) => {
+            let bytes_encoding = fixed_size_binary.bytes.as_ref().unwrap();
+            let bytes_scheduler = decoder_from_array_encoding(bytes_encoding, buffers, data_type);
+
+            Box::new(fixed_size_binary::FixedSizeBinaryPageScheduler::new(
+                bytes_scheduler,
+                fixed_size_binary.byte_width,
             ))
         }
         pb::array_encoding::ArrayEncoding::PackedStruct(packed_struct) => {

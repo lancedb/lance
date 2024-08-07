@@ -218,6 +218,11 @@ message PackedStruct {
   Buffer buffer = 2;
 }
 
+message FixedSizeBinary {
+  uint32 byte_width = 1;
+  ArrayEncoding bytes = 2;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -231,6 +236,7 @@ message ArrayEncoding {
         Fsst fsst = 8;
         PackedStruct packed_struct = 9;
         Bitpacked bitpacked = 10;
+        FixedSizeBinary fixed_size_binary = 11;
     }
 }
 

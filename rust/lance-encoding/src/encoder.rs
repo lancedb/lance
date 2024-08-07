@@ -30,7 +30,8 @@ use crate::{
         logical::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder},
         physical::{
             basic::BasicEncoder, binary::BinaryEncoder, dictionary::DictionaryEncoder,
-            fixed_size_list::FslEncoder, value::ValueEncoder,
+            fixed_size_binary::FixedSizeBinaryEncoder, fixed_size_list::FslEncoder,
+            value::ValueEncoder,
         },
     },
     format::pb,
@@ -291,6 +292,7 @@ impl CoreArrayEncodingStrategy {
         data_type: &DataType,
         data_size: u64,
         use_dict_encoding: bool,
+        all_same_length: bool,
         version: LanceFileVersion,
         field_meta: Option<&HashMap<String, String>>,
     ) -> Result<Box<dyn ArrayEncoder>> {
@@ -301,6 +303,7 @@ impl CoreArrayEncodingStrategy {
                         inner.data_type(),
                         data_size,
                         use_dict_encoding,
+                        all_same_length,
                         version,
                         None,
                     )?,
@@ -308,10 +311,22 @@ impl CoreArrayEncodingStrategy {
                 )))))
             }
             DataType::Dictionary(key_type, value_type) => {
-                let key_encoder =
-                    Self::array_encoder_from_type(key_type, data_size, false, version, None)?;
-                let value_encoder =
-                    Self::array_encoder_from_type(value_type, data_size, false, version, None)?;
+                let key_encoder = Self::array_encoder_from_type(
+                    key_type,
+                    data_size,
+                    false,
+                    all_same_length,
+                    version,
+                    None,
+                )?;
+                let value_encoder = Self::array_encoder_from_type(
+                    value_type,
+                    data_size,
+                    false,
+                    all_same_length,
+                    version,
+                    None,
+                )?;
 
                 Ok(Box::new(AlreadyDictionaryEncoder::new(
                     key_encoder,
@@ -324,6 +339,7 @@ impl CoreArrayEncodingStrategy {
                         &DataType::UInt8,
                         data_size,
                         false,
+                        all_same_length,
                         version,
                         None,
                     )?;
@@ -331,6 +347,7 @@ impl CoreArrayEncodingStrategy {
                         &DataType::Utf8,
                         data_size,
                         false,
+                        all_same_length,
                         version,
                         None,
                     )?;
@@ -339,11 +356,26 @@ impl CoreArrayEncodingStrategy {
                         dict_indices_encoder,
                         dict_items_encoder,
                     )))
-                } else {
+                }
+                else if all_same_length {
+                        // use FixedSizeStringEncoder
+                        let bytes_encoder = Self::array_encoder_from_type(
+                            &DataType::UInt8,
+                            data_size,
+                            false,
+                            false,
+                            version,
+                            None,
+                        )?;
+
+                        Ok(Box::new(FixedSizeBinaryEncoder::new(bytes_encoder)))
+                } 
+                else {
                     let bin_indices_encoder = Self::array_encoder_from_type(
                         &DataType::UInt64,
                         data_size,
                         false,
+                        all_same_length,
                         version,
                         None,
                     )?;
@@ -351,6 +383,7 @@ impl CoreArrayEncodingStrategy {
                         &DataType::UInt8,
                         data_size,
                         false,
+                        all_same_length,
                         version,
                         None,
                     )?;
@@ -374,6 +407,7 @@ impl CoreArrayEncodingStrategy {
                         inner_datatype,
                         data_size,
                         use_dict_encoding,
+                        all_same_length,
                         version,
                         None,
                     )?;
@@ -443,10 +477,20 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
         let data_type = arrays[0].data_type();
         let use_dict_encoding = data_type == &DataType::Utf8
             && check_dict_encoding(arrays, get_dict_encoding_threshold());
+
+        // check if all arrays in arrays have the same length
+        let all_same_length = arrays
+            .iter()
+            .map(|arr| arr.len())
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|w| w[0] == w[1]);
+
         Self::array_encoder_from_type(
             data_type,
             data_size,
             use_dict_encoding,
+            all_same_length,
             self.version,
             Some(&field.metadata),
         )
