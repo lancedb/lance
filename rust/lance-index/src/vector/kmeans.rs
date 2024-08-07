@@ -27,7 +27,7 @@ pub async fn train_kmeans<T: ArrowPrimitiveType>(
 ) -> Result<ArrayRef>
 where
     T::Native: Dot + L2 + Normalize,
-    PrimitiveArray<T>: From<Vec<<T as ArrowPrimitiveType>::Native>>,
+    PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     let num_rows = array.len() / dimension;
     if num_rows < k {

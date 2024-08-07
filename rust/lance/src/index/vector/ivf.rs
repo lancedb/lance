@@ -12,8 +12,8 @@ use std::{
 use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_struct_array, AsArray},
-    types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, RecordBatch, StructArray, UInt32Array,
+    types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
+    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Schema};
@@ -1536,14 +1536,15 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-async fn do_train_ivf_model<T: ArrowFloatType + 'static>(
-    data: &T::ArrayType,
+async fn do_train_ivf_model<T: ArrowPrimitiveType>(
+    data: &[T::Native],
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<IvfModel>
 where
-    T::Native: Dot + L2 + Normalize,
+    <T as ArrowPrimitiveType>::Native: Dot + L2 + Normalize,
+    PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
@@ -1578,20 +1579,32 @@ async fn train_ivf_model(
     let dim = data.value_length() as usize;
     match (values.data_type(), distance_type) {
         (DataType::Float16, _) => {
-            do_train_ivf_model::<Float16Type>(values.as_primitive(), dim, distance_type, params)
-                .await
+            do_train_ivf_model::<Float16Type>(
+                values.as_primitive::<Float16Type>().values(),
+                dim,
+                distance_type,
+                params,
+            )
+            .await
         }
         (DataType::Float32, _) => {
-            do_train_ivf_model::<Float32Type>(values.as_primitive(), dim, distance_type, params)
-                .await
+            do_train_ivf_model::<Float32Type>(
+                values.as_primitive::<Float32Type>().values(),
+                dim,
+                distance_type,
+                params,
+            )
+            .await
         }
         (DataType::Float64, _) => {
-            do_train_ivf_model::<Float64Type>(values.as_primitive(), dim, distance_type, params)
-                .await
+            do_train_ivf_model::<Float64Type>(
+                values.as_primitive::<Float64Type>().values(),
+                dim,
+                distance_type,
+                params,
+            )
+            .await
         }
-        // (DataType::UInt8, DistanceType::Hamming) => {
-        //     do_train_ivf_model::<UInt8Type>(values.as_primitive(), dim, distance_type, params).await
-        // }
         _ => Err(Error::Index {
             message: "Unsupported data type".to_string(),
             location: location!(),

@@ -93,9 +93,9 @@ impl KMeansParams {
 /// KMeans implementation for Apache Arrow Arrays.
 #[derive(Debug, Clone)]
 pub struct KMeans {
-    /// Flattend array of centroids.
+    /// Flattened array of centroids.
     ///
-    /// k * dimension.
+    /// dimension * k of floating number.
     pub centroids: ArrayRef,
 
     /// The dimension of each vector.

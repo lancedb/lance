@@ -62,22 +62,23 @@ pub fn get_sub_vector_centroids<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{types::Float32Type, Float32Array};
+    use arrow_array::{types::Float32Type, FixedSizeListArray, Float32Array};
+    use lance_arrow::FixedSizeListArrayExt;
 
     #[test]
     fn test_divide_to_subvectors() {
         let values = Float32Array::from_iter((0..320).map(|v| v as f32));
         // A [10, 32] array.
-        let mat = MatrixView::new(values.into(), 32);
-        let sub_vectors = divide_to_subvectors::<Float32Type>(&mat, 4).unwrap();
+        let mat = FixedSizeListArray::try_new_from_values(values, 32).unwrap();
+        let sub_vectors = divide_to_subvectors::<Float32Type>(&mat, 4);
         assert_eq!(sub_vectors.len(), 4);
         assert_eq!(sub_vectors[0].len(), 10 * 8);
 
         assert_eq!(
-            sub_vectors[0].as_ref(),
-            &Float32Array::from_iter_values(
-                (0..10).flat_map(|i| (0..8).map(move |c| 32.0 * i as f32 + c as f32))
-            )
+            sub_vectors[0],
+            (0..10)
+                .flat_map(|i| (0..8).map(move |c| 32.0 * i as f32 + c as f32))
+                .collect::<Vec<_>>()
         );
     }
 }

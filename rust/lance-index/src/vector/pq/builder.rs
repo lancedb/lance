@@ -5,16 +5,16 @@
 //!
 
 use crate::vector::quantizer::QuantizerBuildParams;
-use arrow::datatypes::ArrowPrimitiveType;
+use arrow::array::PrimitiveBuilder;
 use arrow_array::types::{Float16Type, Float64Type};
-use arrow_array::FixedSizeListArray;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
+use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
 use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
+use lance_linalg::distance::MetricType;
 use lance_linalg::distance::{Dot, Normalize, L2};
-use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
 use snafu::{location, Location};
 
@@ -82,13 +82,14 @@ impl PQBuildParams {
         }
     }
 
-    async fn build_from_matrix<T: ArrowPrimitiveType>(
+    async fn build_from_fsl<T: ArrowNumericType>(
         &self,
         data: &FixedSizeListArray,
         metric_type: MetricType,
     ) -> Result<ProductQuantizer>
     where
         T::Native: Dot + L2 + Normalize,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
     {
         assert_ne!(
             metric_type,
@@ -119,13 +120,16 @@ impl PQBuildParams {
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
-        let mut codebook_builder = Vec::with_capacity(num_centroids * dimension);
+        let mut codebook_builder = PrimitiveBuilder::<T>::with_capacity(num_centroids * dimension);
         for centroid in d.iter() {
-            let c = centroid.as_any().downcast_ref::<T::ArrayType>().unwrap();
-            codebook_builder.extend_from_slice(c.as_slice());
+            let c = centroid
+                .as_any()
+                .downcast_ref::<PrimitiveArray<T>>()
+                .expect("failed to downcast to PrimitiveArray");
+            codebook_builder.append_slice(c.values());
         }
 
-        let pd_centroids = T::ArrayType::from(codebook_builder);
+        let pd_centroids = codebook_builder.finish();
 
         Ok(ProductQuantizer::new(
             self.num_sub_vectors,
@@ -154,18 +158,9 @@ impl PQBuildParams {
         })?;
         // TODO: support bf16 later.
         match fsl.value_type() {
-            DataType::Float16 => {
-                let data = MatrixView::<Float16Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
-            }
-            DataType::Float32 => {
-                let data = MatrixView::<Float32Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
-            }
-            DataType::Float64 => {
-                let data = MatrixView::<Float64Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
-            }
+            DataType::Float16 => self.build_from_fsl::<Float16Type>(&fsl, metric_type).await,
+            DataType::Float32 => self.build_from_fsl::<Float32Type>(&fsl, metric_type).await,
+            DataType::Float64 => self.build_from_fsl::<Float64Type>(&fsl, metric_type).await,
             _ => Err(Error::Index {
                 message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
                 location: location!(),
