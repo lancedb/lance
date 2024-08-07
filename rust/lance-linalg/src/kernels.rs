@@ -151,7 +151,7 @@ where
             .as_primitive::<T>()
             .values()
             .chunks(dim)
-            .flat_map(|vec| normalize(vec)),
+            .flat_map(normalize),
     );
     FixedSizeListArray::try_new_from_values(norm_arr, fsl.value_length())
 }

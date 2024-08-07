@@ -13,7 +13,7 @@ use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, Normalize, L2};
 use rand::SeedableRng;
 use snafu::{location, Location};
@@ -85,15 +85,15 @@ impl PQBuildParams {
     async fn build_from_fsl<T: ArrowNumericType>(
         &self,
         data: &FixedSizeListArray,
-        metric_type: MetricType,
+        distance_type: DistanceType,
     ) -> Result<ProductQuantizer>
     where
         T::Native: Dot + L2 + Normalize,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
         assert_ne!(
-            metric_type,
-            MetricType::Cosine,
+            distance_type,
+            DistanceType::Cosine,
             "PQ code does not support cosine"
         );
 
@@ -112,7 +112,7 @@ impl PQBuildParams {
                     self.max_iters as u32,
                     self.kmeans_redos,
                     rng.clone(),
-                    metric_type,
+                    distance_type,
                     self.sample_rate,
                 )
                 .await
@@ -136,7 +136,7 @@ impl PQBuildParams {
             self.num_bits as u32,
             dimension,
             FixedSizeListArray::try_new_from_values(pd_centroids, dimension as i32)?,
-            metric_type,
+            distance_type,
         ))
     }
 
@@ -146,7 +146,7 @@ impl PQBuildParams {
     pub async fn build(
         &self,
         data: &dyn Array,
-        metric_type: MetricType,
+        distance_type: DistanceType,
     ) -> Result<ProductQuantizer> {
         assert_eq!(data.null_count(), 0);
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
@@ -158,9 +158,9 @@ impl PQBuildParams {
         })?;
         // TODO: support bf16 later.
         match fsl.value_type() {
-            DataType::Float16 => self.build_from_fsl::<Float16Type>(&fsl, metric_type).await,
-            DataType::Float32 => self.build_from_fsl::<Float32Type>(&fsl, metric_type).await,
-            DataType::Float64 => self.build_from_fsl::<Float64Type>(&fsl, metric_type).await,
+            DataType::Float16 => self.build_from_fsl::<Float16Type>(fsl, distance_type).await,
+            DataType::Float32 => self.build_from_fsl::<Float32Type>(fsl, distance_type).await,
+            DataType::Float64 => self.build_from_fsl::<Float64Type>(fsl, distance_type).await,
             _ => Err(Error::Index {
                 message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
                 location: location!(),
