@@ -153,23 +153,29 @@ impl RowIdSequence {
     }
 
     /// Delete row ids by position.
-    pub fn mask(&mut self, positions: impl IntoIterator<Item = usize>) -> Result<()> {
-        let row_ids = positions
-            .into_iter()
-            .map(|pos| {
-                self.get(pos).ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "position out of bounds: {} on sequence of length {}",
-                            pos,
-                            self.len()
-                        ),
-                        location!(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.delete(row_ids);
+    pub fn mask(&mut self, positions: impl IntoIterator<Item = u32>) -> Result<()> {
+        let mut local_positions = Vec::new();
+        let mut positions_iter = positions.into_iter();
+        let mut curr_position = positions_iter.next();
+        let mut cutoff = 0;
+
+        for segment in &mut self.0 {
+            // Make vector of local positions
+            cutoff += segment.len() as u32;
+            while let Some(position) = curr_position {
+                if position >= cutoff {
+                    break;
+                }
+                local_positions.push(position);
+                curr_position = positions_iter.next();
+            }
+
+            if !local_positions.is_empty() {
+                segment.mask(&local_positions);
+                local_positions.clear();
+            }
+        }
+
         Ok(())
     }
 
