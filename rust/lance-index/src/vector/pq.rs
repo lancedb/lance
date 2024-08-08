@@ -73,6 +73,10 @@ impl ProductQuantizer {
     }
 
     pub fn from_proto(proto: &pb::Pq, distance_type: DistanceType) -> Result<Self> {
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
         let codebook = match proto.codebook_tensor.as_ref() {
             Some(tensor) => FixedSizeListArray::try_from(tensor)?,
             None => FixedSizeListArray::try_new_from_values(

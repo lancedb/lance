@@ -498,7 +498,19 @@ impl Transaction {
                     &mut fragment_id,
                     current_version,
                 )?;
-                Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+
+                if next_row_id.is_some() {
+                    // We can re-use indices, but need to rewrite the fragment bitmaps
+                    debug_assert!(rewritten_indices.is_empty());
+                    for index in final_indices.iter_mut() {
+                        if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                            *fragment_bitmap =
+                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
+                        }
+                    }
+                } else {
+                    Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                }
             }
             Operation::CreateIndex {
                 new_indices,

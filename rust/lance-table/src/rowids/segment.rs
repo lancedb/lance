@@ -390,8 +390,6 @@ impl U64Segment {
             })
         };
         let stats = Self::compute_stats(make_new_iter());
-
-        // Then just use Self::From_stats_and_sequence
         Self::from_stats_and_sequence(stats, make_new_iter())
     }
 }
