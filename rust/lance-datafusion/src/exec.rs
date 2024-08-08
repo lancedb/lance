@@ -173,7 +173,7 @@ const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
 
 impl fmt::Debug for LanceExecutionOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MyStruct")
+        f.debug_struct("LanceExecutionOptions")
             .field("use_spilling", &self.use_spilling)
             .field("mem_pool_size", &self.mem_pool_size)
             .finish()
