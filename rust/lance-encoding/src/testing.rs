@@ -200,6 +200,7 @@ pub struct TestCases {
     indices: Vec<Vec<u64>>,
     batch_size: u32,
     skip_validation: bool,
+    max_page_size: Option<u64>,
 }
 
 impl Default for TestCases {
@@ -209,6 +210,7 @@ impl Default for TestCases {
             ranges: Vec::new(),
             indices: Vec::new(),
             skip_validation: false,
+            max_page_size: None,
         }
     }
 }
@@ -233,6 +235,15 @@ impl TestCases {
         self.skip_validation = true;
         self
     }
+
+    pub fn with_max_page_size(mut self, max_page_size: u64) -> Self {
+        self.max_page_size = Some(max_page_size);
+        self
+    }
+
+    fn get_max_page_size(&self) -> u64 {
+        self.max_page_size.unwrap_or(MAX_PAGE_BYTES)
+    }
 }
 
 /// Given specific data and test cases we check round trip encoding and decoding
@@ -255,7 +266,7 @@ pub async fn check_round_trip_encoding_of_data(
         let mut column_index_seq = ColumnIndexSequence::default();
         let encoding_options = EncodingOptions {
             cache_bytes_per_column: page_size,
-            max_page_bytes: MAX_PAGE_BYTES,
+            max_page_bytes: test_cases.get_max_page_size(),
             keep_original_array: true,
         };
         let encoder = encoding_strategy

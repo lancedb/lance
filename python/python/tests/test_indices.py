@@ -17,7 +17,10 @@ NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
 
 
-@pytest.fixture(params=[np.float16, np.float32, np.float64], ids=["f16", "f32", "f64"])
+@pytest.fixture(
+    params=[np.float16, np.float32, np.float64],
+    ids=["f16", "f32", "f64"],
+)
 def rand_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(request.param)
     vectors.shape = -1
@@ -156,9 +159,38 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
 
     # test shuffle for transformed vectors
     filenames = builder.shuffle_transformed_vectors(
-        ["transformed_shuffle"], str(tmpdir), rand_ivf
+        ["transformed_shuffle"], str(tmpdir), rand_ivf, "sorted"
     )
 
     for fname in filenames:
         full_path = str(tmpdir / fname)
         assert os.path.getsize(full_path) > 0
+
+
+def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
+    fragments = list(rand_dataset.get_fragments())
+
+    fragments1 = fragments[:1]
+    fragments2 = fragments[1:]
+
+    builder = IndicesBuilder(rand_dataset, "vectors")
+
+    uri_1 = str(tmpdir / "transformed1")
+    builder.transform_vectors(rand_ivf, rand_pq, uri_1, fragments=fragments1)
+    filenames1 = builder.shuffle_transformed_vectors(
+        ["transformed1"], str(tmpdir), rand_ivf, "frags1_sorted"
+    )
+
+    uri_2 = str(tmpdir / "transformed2")
+    builder.transform_vectors(rand_ivf, rand_pq, uri_2, fragments=fragments2)
+    filenames2 = builder.shuffle_transformed_vectors(
+        ["transformed2"], str(tmpdir), rand_ivf, "frags2_sorted"
+    )
+
+    sorted_filenames = filenames1 + filenames2
+    builder.load_shuffled_vectors(sorted_filenames, str(tmpdir), rand_ivf, rand_pq)
+
+    final_ds = lance.dataset(str(tmpdir / "dataset"))
+    assert final_ds.has_index
+    assert final_ds.list_indices()[0]["fields"] == ["vectors"]
+    assert len(final_ds.list_indices()[0]["fragment_ids"]) == NUM_FRAGMENTS

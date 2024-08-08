@@ -2322,7 +2322,7 @@ class ScannerBuilder:
         Users can use `Table::optimize()` or `create_index()` to include the new data
         into index, thus make new data searchable.
         """
-        self.fast_search = flag
+        self._fast_search = flag
         return self
 
     def full_text_search(

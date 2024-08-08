@@ -440,6 +440,8 @@ impl PrimitiveFieldEncoder {
             let array = arrays.into_iter().next().unwrap();
             let size_bytes = array.get_buffer_memory_size();
             let num_parts = bit_util::ceil(size_bytes, self.max_page_bytes as usize);
+            // Can't slice it finer than 1 page per row
+            let num_parts = num_parts.min(array.len());
             if num_parts <= 1 {
                 // One part and it fits in a page
                 Ok(vec![self.create_encode_task(vec![array])?])
@@ -452,7 +454,7 @@ impl PrimitiveFieldEncoder {
                 let mut offset = 0;
                 let part_size = bit_util::ceil(array.len(), num_parts);
                 for _ in 0..num_parts {
-                    let avail = array.len() - part_size;
+                    let avail = array.len() - offset;
                     let chunk_size = avail.min(part_size);
                     let part = array.slice(offset, chunk_size);
                     let task = self.create_encode_task(vec![part])?;
