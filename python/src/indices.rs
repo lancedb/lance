@@ -151,6 +151,7 @@ fn train_pq_model(
     codebook.to_pyarrow(py)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_transform_vectors(
     dataset: &Dataset,
     column: &str,
