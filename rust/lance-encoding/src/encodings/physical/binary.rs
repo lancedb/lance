@@ -604,7 +604,7 @@ pub mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_few_rows_bigger_than_max_page_size() {
+    async fn test_bigger_than_max_page_size() {
         // Create an array with one single 32MiB string
         let big_string = String::from_iter((0..(32 * 1024 * 1024)).map(|_| '0'));
         let string_array = StringArray::from(vec![
@@ -621,6 +621,19 @@ pub mod tests {
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
+            HashMap::new(),
+        )
+        .await;
+
+        // This is a regression testing the case where a page with X rows is split into Y parts
+        // where the number of parts is not evenly divisible by the number of rows.  In this
+        // case we are splitting 90 rows into 4 parts.
+        let big_string = String::from_iter((0..(1000 * 1000)).map(|_| '0'));
+        let string_array = StringArray::from_iter_values((0..90).map(|_| big_string.clone()));
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &TestCases::default(),
             HashMap::new(),
         )
         .await;
