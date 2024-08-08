@@ -15,33 +15,40 @@
 package com.lancedb.lance.spark;
 
 import com.google.common.collect.ImmutableSet;
-import com.lancedb.lance.spark.internal.LanceConfig;
+
 import java.util.Set;
+
+import com.lancedb.lance.spark.read.LanceScanBuilder;
+import com.lancedb.lance.spark.write.SparkWrite;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
+import org.apache.spark.sql.connector.catalog.SupportsWrite;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableCapability;
 import org.apache.spark.sql.connector.read.ScanBuilder;
+import org.apache.spark.sql.connector.write.LogicalWriteInfo;
+import org.apache.spark.sql.connector.write.WriteBuilder;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 /**
- * Lance Spark Table.
+ * Lance Spark Dataset.
  */
-public class LanceTable implements Table, SupportsRead {
+public class LanceDataset implements Table, SupportsRead, SupportsWrite {
   private static final Set<TableCapability> CAPABILITIES =
     ImmutableSet.of(
-        TableCapability.BATCH_READ);
+        TableCapability.BATCH_READ,
+        TableCapability.BATCH_WRITE);
 
   LanceConfig options;
   private final StructType sparkSchema;
 
   /**
-   * Creates a spark table.
+   * Creates a Lance dataset.
    *
    * @param config read config
    * @param sparkSchema spark struct type
    */
-  public LanceTable(LanceConfig config, StructType sparkSchema) {
+  public LanceDataset(LanceConfig config, StructType sparkSchema) {
     this.options = config;
     this.sparkSchema = sparkSchema;
   }
@@ -53,16 +60,21 @@ public class LanceTable implements Table, SupportsRead {
 
   @Override
   public String name() {
-    return this.options.getTableName();
+    return this.options.getDatasetName();
   }
 
   @Override
   public StructType schema() {
-    return this.sparkSchema;
+    return sparkSchema;
   }
 
   @Override
   public Set<TableCapability> capabilities() {
     return CAPABILITIES;
+  }
+
+  @Override
+  public WriteBuilder newWriteBuilder(LogicalWriteInfo logicalWriteInfo) {
+    return new SparkWrite.SparkWriteBuilder(sparkSchema, options);
   }
 }

@@ -12,10 +12,9 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark;
+package com.lancedb.lance.spark.read;
 
-import com.lancedb.lance.spark.internal.LanceConfig;
-import com.lancedb.lance.spark.query.FilterPushDown;
+import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;

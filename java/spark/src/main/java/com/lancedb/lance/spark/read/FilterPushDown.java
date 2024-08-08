@@ -12,7 +12,7 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark.query;
+package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.sources.And;
