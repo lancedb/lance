@@ -49,6 +49,8 @@ impl PageScheduler for FixedSizeBinaryPageScheduler {
                 (range.start * self.byte_width as u64)..(range.end * self.byte_width as u64)
             })
             .collect::<Vec<_>>();
+            
+        println!("Expanded ranges: {:?}", expanded_ranges);
 
         let bytes_page_decoder =
             self.bytes_scheduler
@@ -154,7 +156,7 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{FixedSizeBinaryArray, StringArray};
+    use arrow_array::{Array, FixedSizeBinaryArray, StringArray};
     use arrow_buffer::Buffer;
     use arrow_schema::{DataType, Field};
 
@@ -162,18 +164,14 @@ mod tests {
         check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
     };
 
-    // #[test_log::test(tokio::test)]
-    // async fn test_fixed_size_utf8() {
-    //     for data_type in vec![DataType::Utf8] {
-    //         let inner_field = Field::new("item", data_type.clone(), true);
-    //         let data_type = DataType::Utf8(Arc::new(inner_field), 16);
-    //         let field = Field::new("", data_type, false);
-    //         check_round_trip_encoding_random(field, HashMap::new()).await;
-    //     }
-    // }
-
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_utf8() {
+        let field = Field::new("", DataType::Utf8, false);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_fixed_size_utf8() {
         let string_array = StringArray::from(vec![
             Some("abc"),
             Some("def"),
@@ -185,10 +183,6 @@ mod tests {
             "offsets: {:?}",
             string_array.offsets().inner().inner().clone()
         );
-        // let (_, values, nulls) = string_array.into_parts();
-        // println!("{:?}", values);
-        // let fixed_size_binary_array = FixedSizeBinaryArray::new(3, values, nulls);
-        // println!("{:?}", fixed_size_binary_array);
 
         let test_cases = TestCases::default()
             .with_range(0..2)
@@ -196,6 +190,41 @@ mod tests {
             .with_range(1..3)
             .with_indices(vec![0, 1, 3, 4]);
 
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_fixed_size_with_nulls_utf8() {
+        let string_array = StringArray::from(vec![
+            Some("abc"),
+            None,
+            Some("ghi"),
+            None,
+            Some("mno"),
+        ]);
+        // println!(
+        //     "offsets: {:?}",
+        //     string_array.offsets().inner().inner().clone()
+        // );
+        // println!("nulls: {:?}", string_array.nulls());
+        let (_, values, nulls) = string_array.clone().into_parts();
+        println!("{:?}", values);
+        println!("{:?}", nulls);
+        // let fixed_size_binary_array = FixedSizeBinaryArray::new(3, values, nulls);
+        // println!("{:?}", fixed_size_binary_array);
+
+        let test_cases = TestCases::default();
+            // .with_range(0..2)
+            // .with_range(0..3)
+            // .with_range(1..3)
+            // .with_indices(vec![0, 1, 3, 4]);
+
+        println!("Running test...");
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,

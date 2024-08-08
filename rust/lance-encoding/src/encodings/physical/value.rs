@@ -110,7 +110,7 @@ impl PageScheduler for ValuePageScheduler {
             }]
         };
 
-        trace!(
+        println!(
             "Scheduling I/O for {} ranges spread across byte range {}..{}",
             byte_ranges.len(),
             min,

@@ -197,7 +197,7 @@ pub fn decoder_from_array_encoding(
                 should_decode_dict,
             ))
         }
-        pb::array_encoding::ArrayEncoding::FixedSizeBinary(ref fixed_size_binary) => {
+        pb::array_encoding::ArrayEncoding::FixedSizeBinary(fixed_size_binary) => {
             let bytes_encoding = fixed_size_binary.bytes.as_ref().unwrap();
             let bytes_scheduler = decoder_from_array_encoding(bytes_encoding, buffers, data_type);
 

@@ -241,6 +241,7 @@ impl ArrayEncoder for BasicEncoder {
             });
 
             let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
+            println!("{:?}", arr_encoding.buffers[0].parts);
             let encoding = pb::nullable::Nullability::SomeNulls(Box::new(pb::nullable::SomeNull {
                 validity: Some(validity_encoding),
                 values: Some(Box::new(arr_encoding.encoding)),
