@@ -13,7 +13,6 @@ use crate::{
     data::{DataBlock, DataBlockExt, FixedWidthDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
-    encodings::physical::binary::get_bytes_from_string_arrays,
     format::pb,
     EncodingsIo,
 };
@@ -50,8 +49,6 @@ impl PageScheduler for FixedSizeBinaryPageScheduler {
             })
             .collect::<Vec<_>>();
             
-        println!("Expanded ranges: {:?}", expanded_ranges);
-
         let bytes_page_decoder =
             self.bytes_scheduler
                 .schedule_ranges(&expanded_ranges, scheduler, top_level_row);
@@ -80,7 +77,8 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
         let bytes = self.bytes_decoder.decode(rows_to_skip, num_bytes)?;
         let bytes = bytes.try_into_layout::<FixedWidthDataBlock>()?;
         debug_assert_eq!(bytes.bits_per_value, 8);
-        println!("{:?}", bytes.data);
+        println!("Bytes data: {:?}", bytes.data);
+        println!("Bits per value: {:?}", bytes.bits_per_value);
 
         let offsets_vec = (0..(num_rows as u32 + 1))
             .map(|i| i * self.byte_width as u32)
@@ -129,14 +127,86 @@ pub fn get_byte_width_from_binary_arrays(arrays: &[ArrayRef]) -> usize {
     }
 }
 
+pub fn get_bytes_from_binary_arrays(arrays: &[ArrayRef], byte_width: usize) -> Vec<ArrayRef> {
+    arrays
+    .iter()
+    .map(|arr| {
+        let values_buffer = if let Some(arr) = arr.as_string_opt::<i32>() {
+            let mut values_vec = Vec::with_capacity(arr.len() * byte_width);
+            for i in 0..arr.len() {
+                let start = arr.offsets()[i] as usize;
+                let end = arr.offsets()[i + 1] as usize;
+                if start == end {
+                    // Null value, add byte_width bytes
+                    values_vec.extend(std::iter::repeat(0).take(byte_width))
+                } else {
+                    values_vec.extend_from_slice(&arr.values()[start..end]);
+                }
+            }
+
+            values_vec
+        }
+        else if let Some(arr) = arr.as_string_opt::<i64>() {
+            let mut values_vec = Vec::with_capacity(arr.len() * byte_width);
+            for i in 0..arr.len() {
+                let start = arr.offsets()[i] as usize;
+                let end = arr.offsets()[i + 1] as usize;
+                if start == end {
+                    // Null value, add byte_width bytes
+                    values_vec.extend(std::iter::repeat(0).take(byte_width))
+                } else {
+                    values_vec.extend_from_slice(&arr.values()[start..end]);
+                }
+            }
+
+            values_vec
+        }
+        else if let Some(arr) = arr.as_binary_opt::<i32>() {
+            let mut values_vec = Vec::with_capacity(arr.len() * byte_width);
+            for i in 0..arr.len() {
+                let start = arr.offsets()[i] as usize;
+                let end = arr.offsets()[i + 1] as usize;
+                if start == end {
+                    // Null value, add byte_width bytes
+                    values_vec.extend(std::iter::repeat(0).take(byte_width))
+                } else {
+                    values_vec.extend_from_slice(&arr.values()[start..end]);
+                }
+            }
+
+            values_vec
+        }
+        else if let Some(arr) = arr.as_binary_opt::<i64>() {
+            let mut values_vec = Vec::with_capacity(arr.len() * byte_width);
+            for i in 0..arr.len() {
+                let start = arr.offsets()[i] as usize;
+                let end = arr.offsets()[i + 1] as usize;
+                if start == end {
+                    // Null value, add byte_width bytes
+                    values_vec.extend(std::iter::repeat(0).take(byte_width))
+                } else {
+                    values_vec.extend_from_slice(&arr.values()[start..end]);
+                }
+            }
+
+            values_vec
+        }
+        else {
+            panic!("Array is not a string / binary array");
+        };
+
+        let len_buffer = values_buffer.len();
+        let values = ScalarBuffer::new(Buffer::from(values_buffer), 0, len_buffer);
+        Arc::new(UInt8Array::new(values, None)) as ArrayRef
+    })
+    .collect()
+}
+
 impl ArrayEncoder for FixedSizeBinaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
         let byte_width = get_byte_width_from_binary_arrays(arrays);
-        let byte_arrays = get_bytes_from_string_arrays(arrays);
+        let byte_arrays = get_bytes_from_binary_arrays(arrays, byte_width);
         let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
-
-        println!("{:?}", byte_arrays);
-        println!("{:?}", byte_width);
 
         Ok(EncodedArray {
             buffers: encoded_bytes.buffers,
@@ -156,19 +226,13 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{Array, FixedSizeBinaryArray, StringArray};
+    use arrow_array::{Array, FixedSizeBinaryArray, LargeStringArray, StringArray};
     use arrow_buffer::Buffer;
     use arrow_schema::{DataType, Field};
 
     use crate::testing::{
         check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
     };
-
-    #[test_log::test(tokio::test)]
-    async fn test_fixed_size_utf8() {
-        let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
-    }
 
     #[test_log::test(tokio::test)]
     async fn test_simple_fixed_size_utf8() {
@@ -200,7 +264,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_simple_fixed_size_with_nulls_utf8() {
-        let string_array = StringArray::from(vec![
+        let string_array = LargeStringArray::from(vec![
             Some("abc"),
             None,
             Some("ghi"),
@@ -218,13 +282,30 @@ mod tests {
         // let fixed_size_binary_array = FixedSizeBinaryArray::new(3, values, nulls);
         // println!("{:?}", fixed_size_binary_array);
 
-        let test_cases = TestCases::default();
-            // .with_range(0..2)
-            // .with_range(0..3)
-            // .with_range(1..3)
-            // .with_indices(vec![0, 1, 3, 4]);
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(1..3)
+            .with_indices(vec![0, 1, 3, 4]);
 
         println!("Running test...");
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sliced_utf8() {
+        let string_array = StringArray::from(vec![Some("abc"), Some("def"), None, Some("fgh")]);
+        let string_array = string_array.slice(1, 3);
+
+        let test_cases = TestCases::default()
+            .with_range(0..1)
+            .with_range(0..2)
+            .with_range(1..2);
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
