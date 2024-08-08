@@ -43,7 +43,7 @@ use datafusion::{
 };
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::{chunker::chunk_stream, dataframe::DataFrameExt, exec::new_session_context};
+use lance_datafusion::{chunker::chunk_stream, dataframe::DataFrameExt};
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
@@ -515,13 +515,7 @@ impl MergeInsertJob {
             )
             .unwrap(),
         );
-        execute_plan(
-            joined,
-            LanceExecutionOptions {
-                use_spilling: true,
-                ..Default::default()
-            },
-        )
+        execute_plan(joined, LanceExecutionOptions::new(true, None))
     }
 
     // If the join keys are not indexed then we need to do a full scan of the table
@@ -592,10 +586,7 @@ impl MergeInsertJob {
     ) -> Result<Vec<Fragment>> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = new_session_context(LanceExecutionOptions {
-            use_spilling: true,
-            ..Default::default()
-        });
+        let session_ctx = LanceExecutionOptions::new(true, None).get_session_context();
         let mut group_stream = session_ctx
             .read_one_shot(source)?
             .sort(vec![col(ROW_ADDR).sort(true, true)])?

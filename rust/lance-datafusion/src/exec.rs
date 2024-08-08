@@ -3,7 +3,10 @@
 
 //! Utilities for working with datafusion execution plans
 
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
@@ -159,15 +162,33 @@ impl ExecutionPlan for OneShotExec {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
+    session_cache: Option<Arc<SessionContext>>,
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
 
+impl fmt::Debug for LanceExecutionOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MyStruct")
+            .field("use_spilling", &self.use_spilling)
+            .field("mem_pool_size", &self.mem_pool_size)
+            .finish()
+    }
+}
+
 impl LanceExecutionOptions {
+    pub fn new(use_spilling: bool, mem_pool_size: Option<u64>) -> Self {
+        Self {
+            use_spilling,
+            mem_pool_size,
+            session_cache: None,
+        }
+    }
+
     pub fn mem_pool_size(&self) -> u64 {
         self.mem_pool_size.unwrap_or_else(|| {
             std::env::var("LANCE_MEM_POOL_SIZE")
@@ -193,19 +214,25 @@ impl LanceExecutionOptions {
             })
             .unwrap_or(true)
     }
-}
 
-pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
-    let session_config = SessionConfig::new();
-    let mut runtime_config = RuntimeConfig::new();
-    if options.use_spilling() {
-        runtime_config.disk_manager = DiskManagerConfig::NewOs;
-        runtime_config.memory_pool = Some(Arc::new(FairSpillPool::new(
-            options.mem_pool_size() as usize
-        )));
+    pub fn get_session_context(&mut self) -> SessionContext {
+        if let Some(session_context) = self.session_cache.clone() {
+            return (*session_context).clone();
+        }
+
+        let session_config = SessionConfig::new();
+        let mut runtime_config = RuntimeConfig::new();
+        if self.use_spilling() {
+            runtime_config.disk_manager = DiskManagerConfig::NewOs;
+            runtime_config.memory_pool =
+                Some(Arc::new(FairSpillPool::new(self.mem_pool_size() as usize)));
+        }
+        let runtime_env = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
+        let session_context = SessionContext::new_with_config_rt(session_config, runtime_env);
+
+        self.session_cache = Some(Arc::new(session_context.clone()));
+        session_context
     }
-    let runtime_env = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
-    SessionContext::new_with_config_rt(session_config, runtime_env)
 }
 
 /// Executes a plan using default session & runtime configuration
@@ -213,9 +240,9 @@ pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
 /// Only executes a single partition.  Panics if the plan has more than one partition.
 pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
-    options: LanceExecutionOptions,
+    mut options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
-    let session_ctx = new_session_context(options);
+    let session_ctx = options.get_session_context();
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
