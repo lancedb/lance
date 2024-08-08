@@ -4,16 +4,22 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
+use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 
+use arrow_schema::DataType;
+use builder::SQBuildParams;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::*;
 use lance_core::{Error, Result};
+use lance_linalg::distance::DistanceType;
 use num_traits::*;
 use snafu::{location, Location};
+use storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage, SQ_METADATA_KEY};
 
-use super::quantizer::Quantizer;
+use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
+use super::SQ_CODE_COLUMN;
 
 pub mod builder;
 pub mod storage;
@@ -141,6 +147,88 @@ impl TryFrom<Quantizer> for ScalarQuantizer {
                 location: location!(),
             }),
         }
+    }
+}
+
+impl Quantization for ScalarQuantizer {
+    type BuildParams = SQBuildParams;
+    type Metadata = ScalarQuantizationMetadata;
+    type Storage = ScalarQuantizationStorage;
+
+    fn build(data: &dyn Array, _: DistanceType, params: &Self::BuildParams) -> Result<Self> {
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "SQ builder: input is not a FixedSizeList: {}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
+
+        match fsl.value_type() {
+            DataType::Float16 => {
+                quantizer.update_bounds::<Float16Type>(fsl)?;
+            }
+            DataType::Float32 => {
+                quantizer.update_bounds::<Float32Type>(fsl)?;
+            }
+            DataType::Float64 => {
+                quantizer.update_bounds::<Float64Type>(fsl)?;
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!("SQ builder: unsupported data type: {}", fsl.value_type()),
+                    location: location!(),
+                })
+            }
+        }
+
+        Ok(quantizer)
+    }
+
+    fn code_dim(&self) -> usize {
+        self.dim
+    }
+
+    fn column(&self) -> &'static str {
+        SQ_CODE_COLUMN
+    }
+
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        match vectors.as_fixed_size_list().value_type() {
+            DataType::Float16 => self.transform::<Float16Type>(vectors),
+            DataType::Float32 => self.transform::<Float32Type>(vectors),
+            DataType::Float64 => self.transform::<Float64Type>(vectors),
+            value_type => Err(Error::invalid_input(
+                format!("unsupported data type {} for scalar quantizer", value_type),
+                location!(),
+            )),
+        }
+    }
+
+    fn metadata_key() -> &'static str {
+        SQ_METADATA_KEY
+    }
+
+    fn quantization_type() -> QuantizationType {
+        QuantizationType::Scalar
+    }
+
+    fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(ScalarQuantizationMetadata {
+            dim: self.dim,
+            num_bits: self.num_bits(),
+            bounds: self.bounds(),
+        })?)
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, _: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::Scalar(Self::with_bounds(
+            metadata.num_bits,
+            metadata.dim,
+            metadata.bounds.clone(),
+        )))
     }
 }
 

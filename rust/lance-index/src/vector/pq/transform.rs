@@ -77,7 +77,7 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Float32Array, Int32Array};
     use arrow_schema::{DataType, Schema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_linalg::distance::MetricType;
+    use lance_linalg::distance::DistanceType;
 
     use crate::vector::pq::PQBuildParams;
 
@@ -87,7 +87,7 @@ mod tests {
         let dim = 16;
         let arr = Arc::new(FixedSizeListArray::try_new_from_values(values, 16).unwrap());
         let params = PQBuildParams::new(1, 8);
-        let pq = params.build(arr.as_ref(), MetricType::L2).await.unwrap();
+        let pq = ProductQuantizer::build(arr.as_ref(), DistanceType::L2, &params).unwrap();
 
         let schema = Schema::new(vec![
             Field::new(

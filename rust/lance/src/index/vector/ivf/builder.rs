@@ -10,6 +10,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::FileWriter;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantizer;
 use lance_index::vector::{ivf::storage::IvfModel, transform::Transformer};
 use lance_io::object_writer::ObjectWriter;
@@ -23,7 +24,6 @@ use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
     ivf::shuffler::shuffle_dataset,
-    pq::ProductQuantizer,
 };
 use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::{DistanceType, MetricType};
@@ -42,7 +42,6 @@ pub(super) async fn build_partitions(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: &mut IvfModel,
-    pq: ProductQuantizer,
     metric_type: MetricType,
     part_range: Range<u32>,
     precomputed_partitons: Option<HashMap<u64, u32>>,
@@ -68,7 +67,6 @@ pub(super) async fn build_partitions(
         ivf.centroids.clone().unwrap(),
         metric_type,
         column,
-        pq.clone(),
         Some(part_range),
     );
 
@@ -93,7 +91,7 @@ pub async fn write_vector_storage(
     data: impl RecordBatchStream + Unpin + 'static,
     num_rows: u64,
     centroids: FixedSizeListArray,
-    pq: ProductQuantizer,
+    _pq: ProductQuantizer,
     distance_type: DistanceType,
     column: &str,
     writer: ObjectWriter,
@@ -103,7 +101,6 @@ pub async fn write_vector_storage(
         centroids,
         distance_type,
         column,
-        pq,
         None,
     ));
 
