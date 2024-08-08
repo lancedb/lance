@@ -143,7 +143,7 @@ async fn load_precomputed_partitions(
 #[instrument(level = "debug", skip_all)]
 fn add_precomputed_partitions(
     batch: RecordBatch,
-    partition_map: &Vec<Vec<i32>>,
+    partition_map: &[Vec<i32>],
     part_id_field: &ArrowField,
 ) -> Result<RecordBatch> {
     let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
@@ -191,6 +191,7 @@ async fn apply_precomputed_partitions(
     Ok(RecordBatchStreamAdapter::new(schema_with_part_id, mapped))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn write_vector_storage(
     dataset: &Dataset,
     data: impl RecordBatchStream + Unpin + 'static,

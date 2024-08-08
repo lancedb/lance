@@ -340,7 +340,8 @@ pub fn load_shuffled_vectors(
     distance_type: &str,
     index_name: Option<&str>,
 ) -> PyResult<()> {
-    let default_idx_name = column.to_string() + "_idx";
+    let mut default_idx_name = column.to_string();
+    default_idx_name.push_str("_idx");
     let idx_name = index_name.unwrap_or(default_idx_name.as_str());
 
     let ivf_centroids = ivf_centroids.0;
