@@ -259,10 +259,12 @@ impl Scanner {
         // So we use a default minimum of 8K rows.
         std::env::var("LANCE_DEFAULT_BATCH_SIZE")
             .map(|bs| {
-                bs.parse().expect(&format!(
-                    "The value of LANCE_DEFAULT_BATCH_SIZE ({}) is not a valid batch size",
-                    bs
-                ))
+                bs.parse().unwrap_or_else(|_| {
+                    panic!(
+                        "The value of LANCE_DEFAULT_BATCH_SIZE ({}) is not a valid batch size",
+                        bs
+                    )
+                })
             })
             .unwrap_or_else(|_| {
                 self.batch_size.unwrap_or_else(|| {

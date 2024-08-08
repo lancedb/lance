@@ -125,7 +125,7 @@ impl RowIdSequence {
         self.0.extend(other.0);
     }
 
-    /// Mark a set of row ids as deleted. Their value will be replaced with tombstones.
+    /// Remove a set of row ids from the sequence.
     pub fn delete(&mut self, row_ids: impl IntoIterator<Item = u64>) {
         // Order the row ids by position in which they appear in the sequence.
         let (row_ids, offsets) = self.find_ids(row_ids);
@@ -150,6 +150,27 @@ impl RowIdSequence {
 
         // Add the remaining segments.
         self.0.extend_from_slice(remaining_segments);
+    }
+
+    /// Delete row ids by position.
+    pub fn mask(&mut self, positions: impl IntoIterator<Item = usize>) -> Result<()> {
+        let row_ids = positions
+            .into_iter()
+            .map(|pos| {
+                self.get(pos).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "position out of bounds: {} on sequence of length {}",
+                            pos,
+                            self.len()
+                        ),
+                        location!(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.delete(row_ids);
+        Ok(())
     }
 
     /// Find the row ids in the sequence.

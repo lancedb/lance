@@ -604,6 +604,29 @@ pub mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn test_few_rows_bigger_than_max_page_size() {
+        // Create an array with one single 32MiB string
+        let big_string = String::from_iter((0..(32 * 1024 * 1024)).map(|_| '0'));
+        let string_array = StringArray::from(vec![
+            Some(big_string),
+            Some("abc".to_string()),
+            None,
+            None,
+            Some("xyz".to_string()),
+        ]);
+
+        // Drop the max page size to 1MiB
+        let test_cases = TestCases::default().with_max_page_size(1024 * 1024);
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
     async fn test_empty_strings() {
         // Scenario 1: Some strings are empty
 
