@@ -380,7 +380,7 @@ class IndicesBuilder:
         ivf: IvfModel,
         pq: PqModel,
         dest_uri: str,
-        fragments: Optional[list[LanceFragment]],
+        fragments: Optional[list[LanceFragment]] = None,
         partition_ds_uri: Optional[str] = None,
     ):
         """
@@ -430,9 +430,10 @@ class IndicesBuilder:
 
     def shuffle_transformed_vectors(
         self,
-        filenames: list[str],
+        unsorted_filenames: list[str],
         dir_path: str,
         ivf: IvfModel,
+        shuffle_output_root_filename: Optional[str] = "sorted",
     ) -> list[str]:
         """
         Take the transformed, unsorted vector files as input, and create sorted
@@ -441,20 +442,76 @@ class IndicesBuilder:
 
         Parameters
         ----------
-        filenames: list[str]
+        unsorted_filenames: list[str]
             The filenames of the unsorted files.
         dir_path: str
             Directory where all the files are located, and where output files
             will be placed.
+        ivf: IvfModel
+            The IVF model used for the transformations (e.g. partition assignment)
+        shuffle_output_root_filename: Optional[str]
+            The root filename for the sorted output files. If not provided, the root
+            filename used will be `"sorted"`.
 
         Returns
         -------
         list[str]
-            The file paths of the sorted transformed vector files.
+            The file paths of the sorted transformed vector files. These will be of the
+            form `shuffle_output_root_filename_i.lance`.
         """
-        if isinstance(filenames, list):
+        if isinstance(unsorted_filenames, list):
             return indices.shuffle_transformed_vectors(
-                filenames, dir_path, ivf.centroids
+                unsorted_filenames,
+                dir_path,
+                ivf.centroids,
+                shuffle_output_root_filename,
+            )
+        else:
+            raise ValueError("filenames must be a list of strings")
+
+    def load_shuffled_vectors(
+        self,
+        filenames: list[str],
+        dir_path: str,
+        ivf: IvfModel,
+        pq: PqModel,
+        index_name: Optional[str] = None,
+    ):
+        """
+        Takes filenames of the sorted, transformed vector files as input. Loads
+        these sorted files and commits the index into the dataset.
+
+        Parameters
+        ----------
+        filenames: list[str]
+            The filenames of the sorted storage files.
+        dir_path: str
+            Path of the directory where all the files are located.
+        index_name: Optional[str]
+            The name of the index to be created. If not provided, the default name
+            will be "{column_name}_idx".
+        ivf: IvfModel
+            The IVF model used to create the inputs.
+        pq: PqModel
+            The PQ model used to create the inputs.
+        """
+
+        pq_dimension = self.dataset.schema.field(self.column[0]).type.list_size
+        num_subvectors = pq.num_subvectors
+        distance_type = ivf.distance_type
+
+        if isinstance(filenames, list):
+            return indices.load_shuffled_vectors(
+                filenames,
+                dir_path,
+                self.dataset._ds,
+                self.column[0],
+                ivf.centroids,
+                pq.codebook,
+                pq_dimension,
+                num_subvectors,
+                distance_type,
+                index_name,
             )
         else:
             raise ValueError("filenames must be a list of strings")

@@ -8,6 +8,7 @@ use lance_core::Result;
 
 use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
 use lance_table::format::Index;
+use uuid::Uuid;
 
 // Extends Lance Dataset with secondary index.
 #[async_trait]
@@ -80,4 +81,11 @@ pub trait DatasetIndexExt {
     ///
     /// If the index does not exist, return Error.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
+
+    async fn commit_existing_index(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        index_id: Uuid,
+    ) -> Result<()>;
 }

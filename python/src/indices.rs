@@ -6,7 +6,7 @@ use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::io::ObjectStore;
-use lance_index::vector::ivf::shuffler::shuffle_vectors;
+use lance_index::vector::ivf::shuffler::{load_partitioned_shuffles, shuffle_vectors};
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
     pq::{PQBuildParams, ProductQuantizer},
@@ -21,6 +21,9 @@ use pyo3::{
 
 use crate::fragment::FileFragment;
 use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
+use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
+use lance_index::DatasetIndexExt;
+use uuid::Uuid;
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -228,9 +231,10 @@ pub fn transform_vectors(
 }
 
 async fn do_shuffle_transformed_vectors(
-    filenames: Vec<String>,
+    unsorted_filenames: Vec<String>,
     dir_path: &str,
     ivf_centroids: FixedSizeListArray,
+    shuffle_output_root_filename: &str,
 ) -> PyResult<Vec<String>> {
     let (obj_store, path) = ObjectStore::from_path(dir_path).infer_error()?;
     if !obj_store.is_local() {
@@ -238,9 +242,14 @@ async fn do_shuffle_transformed_vectors(
             "shuffle_vectors input and output path is currently required to be local",
         ));
     }
-    let partition_files = shuffle_vectors(filenames, path, ivf_centroids)
-        .await
-        .infer_error()?;
+    let partition_files = shuffle_vectors(
+        unsorted_filenames,
+        path,
+        ivf_centroids,
+        shuffle_output_root_filename,
+    )
+    .await
+    .infer_error()?;
     Ok(partition_files)
 }
 
@@ -248,16 +257,22 @@ async fn do_shuffle_transformed_vectors(
 #[allow(clippy::too_many_arguments)]
 pub fn shuffle_transformed_vectors(
     py: Python<'_>,
-    filenames: Vec<String>,
+    unsorted_filenames: Vec<String>,
     dir_path: &str,
     ivf_centroids: PyArrowType<ArrayData>,
+    shuffle_output_root_filename: &str,
 ) -> PyResult<PyObject> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
 
     let result = RT.block_on(
         None,
-        do_shuffle_transformed_vectors(filenames, dir_path, ivf_centroids),
+        do_shuffle_transformed_vectors(
+            unsorted_filenames,
+            dir_path,
+            ivf_centroids,
+            shuffle_output_root_filename,
+        ),
     )?;
 
     match result {
@@ -269,12 +284,95 @@ pub fn shuffle_transformed_vectors(
     }
 }
 
+async fn do_load_shuffled_vectors(
+    filenames: Vec<String>,
+    dir_path: &str,
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    ivf_model: IvfModel,
+    pq_model: ProductQuantizer,
+) -> PyResult<()> {
+    let (_, path) = object_store_from_uri_or_path(dir_path).await?;
+    let streams = load_partitioned_shuffles(path.clone(), filenames)
+        .await
+        .infer_error()?;
+
+    let index_id = Uuid::new_v4();
+
+    write_ivf_pq_file_from_existing_index(
+        &dataset.ds,
+        column,
+        index_name,
+        index_id,
+        ivf_model,
+        pq_model,
+        streams,
+    )
+    .await
+    .infer_error()?;
+
+    let mut ds = dataset.ds.as_ref().clone();
+    ds.commit_existing_index(index_name, column, index_id)
+        .await
+        .infer_error()?;
+
+    Ok(())
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn load_shuffled_vectors(
+    filenames: Vec<String>,
+    dir_path: &str,
+    dataset: &Dataset,
+    column: &str,
+    ivf_centroids: PyArrowType<ArrayData>,
+    pq_codebook: PyArrowType<ArrayData>,
+    pq_dimension: usize,
+    num_subvectors: u32,
+    distance_type: &str,
+    index_name: Option<&str>,
+) -> PyResult<()> {
+    let default_idx_name = column.to_string() + "_idx";
+    let idx_name = index_name.unwrap_or(default_idx_name.as_str());
+
+    let ivf_centroids = ivf_centroids.0;
+    let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
+
+    let ivf_model = IvfModel {
+        centroids: Some(ivf_centroids),
+        offsets: vec![],
+        lengths: vec![],
+    };
+
+    let codebook = pq_codebook.0;
+    let codebook = FixedSizeListArray::from(codebook);
+
+    let distance_type = DistanceType::try_from(distance_type).unwrap();
+    let pq_model = ProductQuantizer::new(
+        num_subvectors as usize,
+        /*num_bits=*/ 8,
+        pq_dimension,
+        codebook,
+        distance_type,
+    );
+
+    RT.block_on(
+        None,
+        do_load_shuffled_vectors(
+            filenames, dir_path, dataset, column, idx_name, ivf_model, pq_model,
+        ),
+    )?
+}
+
 pub fn register_indices(py: Python, m: &PyModule) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
+    indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
     m.add_submodule(indices)?;
     Ok(())
 }
