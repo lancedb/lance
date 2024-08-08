@@ -156,12 +156,15 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
         DatasetIndexExt, IndexType,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
+    use rstest::rstest;
     use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -288,10 +291,21 @@ mod tests {
         assert_eq!(row_in_index, 2000);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_query_delta_indices() {
+    async fn test_query_delta_indices(
+        #[values(
+            VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                SQBuildParams::default()
+            )
+        )]
+        index_params: VectorIndexParams,
+    ) {
         const DIM: usize = 64;
-        const IVF_PARTITIONS: usize = 2;
         const TOTAL: usize = 1000;
 
         let test_dir = tempdir().unwrap();
@@ -323,20 +337,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
         dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                None,
-                &VectorIndexParams::with_ivf_pq_params(
-                    MetricType::L2,
-                    IvfBuildParams::new(IVF_PARTITIONS),
-                    PQBuildParams {
-                        num_sub_vectors: 2,
-                        ..Default::default()
-                    },
-                ),
-                true,
-            )
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, true)
             .await
             .unwrap();
         let stats: serde_json::Value =

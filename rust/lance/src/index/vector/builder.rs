@@ -146,7 +146,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         }
 
         // step 2. shuffle the dataset
-        if self.partition_sizes.is_empty() {
+        if self.shuffle_reader.is_none() {
             self.shuffle_dataset().await?;
         }
 
