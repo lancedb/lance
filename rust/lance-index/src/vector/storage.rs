@@ -81,7 +81,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
                 let row_ids = b.column(0).as_primitive::<UInt64Type>().values();
                 for (i, row_id) in row_ids.iter().enumerate() {
-                    match mapping.get(&row_id) {
+                    match mapping.get(row_id) {
                         Some(Some(new_id)) => {
                             indices.push(i as u32);
                             new_row_ids.push(*new_id);
