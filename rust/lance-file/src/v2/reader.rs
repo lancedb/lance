@@ -613,11 +613,20 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
-            "Reading range {:?} with batch_size {} from columns {:?}",
+            "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
             range,
             batch_size,
-            column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
+            num_rows,
+            column_infos.len(),
+            projection.schema.fields.len(),
         );
+
+        if range.is_empty() {
+            return Err(Error::InvalidInput {
+                source: format!("Cannot read empty range {:?} from file", range).into(),
+                location: location!(),
+            });
+        }
 
         let mut decode_scheduler = DecodeBatchScheduler::try_new(
             &projection.schema,
