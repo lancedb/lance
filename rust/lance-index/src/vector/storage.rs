@@ -3,10 +3,13 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
+use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
+use arrow::array::AsArray;
 use arrow::compute::concat_batches;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow::datatypes::UInt64Type;
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{Field, SchemaRef};
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
@@ -68,6 +71,43 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     fn schema(&self) -> &SchemaRef;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>>;
+
+    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        let batches = self
+            .to_batches()?
+            .map(|b| {
+                let mut indices = Vec::with_capacity(b.num_rows());
+                let mut new_row_ids = Vec::with_capacity(b.num_rows());
+
+                let row_ids = b.column(0).as_primitive::<UInt64Type>().values();
+                for (i, row_id) in row_ids.iter().enumerate() {
+                    match mapping.get(&row_id) {
+                        Some(Some(new_id)) => {
+                            indices.push(i as u32);
+                            new_row_ids.push(*new_id);
+                        }
+                        Some(None) => {}
+                        None => {
+                            indices.push(i as u32);
+                            new_row_ids.push(*row_id);
+                        }
+                    }
+                }
+
+                let indices = UInt32Array::from(indices);
+                let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+                let new_vectors = arrow::compute::take(b.column(1), &indices, None)?;
+
+                Ok(RecordBatch::try_new(
+                    self.schema().clone(),
+                    vec![new_row_ids.clone() as ArrayRef, new_vectors.clone()],
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let batch = concat_batches(self.schema(), batches.iter())?;
+        Self::try_from_batch(batch, self.distance_type())
+    }
 
     fn len(&self) -> usize;
 

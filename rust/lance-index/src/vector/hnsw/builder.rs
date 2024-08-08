@@ -746,6 +746,10 @@ impl IvfSubIndex for HNSW {
         Ok(hnsw)
     }
 
+    fn remap(&self, _mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        unimplemented!("HNSW remap is not supported yet");
+    }
+
     /// Encode the sub index into a record batch
     fn to_batch(&self) -> Result<RecordBatch> {
         let mut vector_id_builder = UInt32Builder::with_capacity(self.len());

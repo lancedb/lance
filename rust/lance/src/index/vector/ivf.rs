@@ -844,7 +844,7 @@ impl VectorIndex for IVFIndex {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
@@ -1258,7 +1258,7 @@ impl RemapPageTask {
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        page.remap(mapping)?;
+        page.remap(mapping).await?;
         self.page = Some(page);
         Ok(self)
     }

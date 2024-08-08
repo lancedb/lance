@@ -3,7 +3,6 @@
 
 //! IVF - Inverted File index.
 
-use core::fmt;
 use std::marker::PhantomData;
 use std::{
     any::Any,
@@ -92,7 +91,6 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     /// The session cache, used when fetching pages
     #[allow(dead_code)]
     session: Weak<Session>,
-
     _marker: PhantomData<Q>,
 }
 
@@ -353,9 +351,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 }
 
 #[async_trait]
-impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'static> VectorIndex
-    for IVFIndex<S, Q>
-{
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFIndex<S, Q> {
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
         if self.distance_type == DistanceType::Cosine {
@@ -460,7 +456,7 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
