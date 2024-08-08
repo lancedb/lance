@@ -100,14 +100,17 @@ where
         }
     }
 
-    return min_leading_bits
-        .map(|leading_bits| arr.data_type().byte_width() as u64 * 8 - leading_bits)
-        .map(|bits| bits + if add_signed_bit { 1 } else { 0 })
-        .map(|bits| bits.max(1)) // cannot bitpack into < 1 bit
-        .map(|bits| BitpackParams {
-            num_bits: bits,
-            signed: add_signed_bit,
-        });
+    let mut min_leading_bits = arr.data_type().byte_width() as u64 * 8 - min_leading_bits?;
+    if add_signed_bit {
+        // Need extra sign bit
+        min_leading_bits += 1;
+    }
+    // cannot bitpack into <1 bit
+    let num_bits = min_leading_bits.max(1);
+    Some(BitpackParams {
+        num_bits,
+        signed: add_signed_bit,
+    })
 }
 #[derive(Debug)]
 pub struct BitpackingBufferEncoder {
