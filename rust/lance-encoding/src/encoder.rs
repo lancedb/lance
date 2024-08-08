@@ -356,23 +356,21 @@ impl CoreArrayEncodingStrategy {
                         dict_indices_encoder,
                         dict_items_encoder,
                     )))
-                }
-                else if all_same_length {
-                        // use FixedSizeStringEncoder
-                        let bytes_encoder = Self::array_encoder_from_type(
-                            &DataType::UInt8,
-                            data_size,
-                            false,
-                            false,
-                            version,
-                            None,
-                        )?;
+                } else if all_same_length {
+                    // use FixedSizeBinaryEncoder
+                    let bytes_encoder = Self::array_encoder_from_type(
+                        &DataType::UInt8,
+                        data_size,
+                        false,
+                        false,
+                        version,
+                        None,
+                    )?;
 
-                        Ok(Box::new(BasicEncoder::new(
-                            Box::new(FixedSizeBinaryEncoder::new(bytes_encoder)))
-                        ))
-                } 
-                else {
+                    Ok(Box::new(BasicEncoder::new(Box::new(
+                        FixedSizeBinaryEncoder::new(bytes_encoder),
+                    ))))
+                } else {
                     let bin_indices_encoder = Self::array_encoder_from_type(
                         &DataType::UInt64,
                         data_size,

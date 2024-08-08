@@ -200,10 +200,16 @@ pub fn decoder_from_array_encoding(
         pb::array_encoding::ArrayEncoding::FixedSizeBinary(fixed_size_binary) => {
             let bytes_encoding = fixed_size_binary.bytes.as_ref().unwrap();
             let bytes_scheduler = decoder_from_array_encoding(bytes_encoding, buffers, data_type);
+            let bytes_per_offset = match data_type {
+                DataType::LargeBinary | DataType::LargeUtf8 => 8,
+                DataType::Binary | DataType::Utf8 => 4,
+                _ => panic!("FixedSizeBinary only supports binary and utf8 types"),
+            };
 
             Box::new(fixed_size_binary::FixedSizeBinaryPageScheduler::new(
                 bytes_scheduler,
                 fixed_size_binary.byte_width,
+                bytes_per_offset,
             ))
         }
         pb::array_encoding::ArrayEncoding::PackedStruct(packed_struct) => {

@@ -219,8 +219,8 @@ message PackedStruct {
 }
 
 message FixedSizeBinary {
-  uint32 byte_width = 1;
-  ArrayEncoding bytes = 2;
+  ArrayEncoding bytes = 1;
+  uint32 byte_width = 2;
 }
 
 // Encodings that decode into an Arrow array
