@@ -116,6 +116,10 @@ impl PageScheduler for ValuePageScheduler {
             min,
             max
         );
+        let num_bytes = byte_ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u64>();
         let bytes = scheduler.submit_request(byte_ranges, top_level_row);
         let bytes_per_value = self.bytes_per_value;
 
@@ -133,6 +137,7 @@ impl PageScheduler for ValuePageScheduler {
         };
 
         async move {
+            trace!("Waiting for {} bytes of value data", num_bytes);
             let bytes = bytes.await?;
 
             Ok(Box::new(ValuePageDecoder {

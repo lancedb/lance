@@ -443,7 +443,13 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
     ) -> Result<ChosenFieldScheduler<'a>> {
         self.path.push_back(child_idx);
         self.cur_idx = 0;
-        self.next(field, column_infos, buffers)
+        match self.next(field, column_infos, buffers) {
+            Ok(mut next) => {
+                next.0.path.pop_back();
+                Ok(next)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Starts the decoding process for a field
@@ -1100,10 +1106,15 @@ impl BatchDecodeStream {
             return Ok(self.rows_scheduled);
         }
         while self.rows_scheduled < scheduled_need {
+            log::debug!("Decoder waiting for scanline");
             let next_message = self.context.source.recv().await;
             match next_message {
                 Some(scan_line) => {
                     let scan_line = scan_line?;
+                    log::debug!(
+                        "Decoder received scanline with rows_scheudled={}",
+                        scan_line.scheduled_so_far
+                    );
                     self.rows_scheduled = scan_line.scheduled_so_far;
                     for decoder in scan_line.decoders {
                         self.accept_decoder(decoder)?;

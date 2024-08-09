@@ -59,7 +59,7 @@ impl LanceIndexStore {
         let object_store = Arc::new(object_store);
         let scheduler = ScanScheduler::new(
             object_store.clone(),
-            SchedulerConfig::fast_and_not_too_ram_intensive(),
+            SchedulerConfig::max_bandwidth(&object_store),
         );
         Self {
             object_store,

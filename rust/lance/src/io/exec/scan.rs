@@ -32,7 +32,6 @@ use crate::dataset::fragment::{FileFragment, FragmentReader};
 use crate::dataset::scanner::DEFAULT_FRAGMENT_READAHEAD;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
-use crate::utils::default_deadlock_prevention_timeout;
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -40,7 +39,7 @@ async fn open_file(
     with_row_id: bool,
     with_row_address: bool,
     with_make_deletions_null: bool,
-    scan_scheduler: Option<Arc<ScanScheduler>>,
+    scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
 ) -> Result<FragmentReader> {
     let mut reader = file_fragment
         .open(
@@ -146,17 +145,20 @@ impl LanceStream {
     ) -> Result<Self> {
         let project_schema = projection.clone();
         let io_parallelism = dataset.object_store.io_parallelism()?;
-        let frag_parallelism = fragment_parallelism.unwrap_or_else(|| {
-            // This is somewhat aggressive.  It assumes a single page per column.  If there are many pages per
-            // column then we probably don't need to read that many files.  It's a little tricky to get the right
-            // answer though and so we err on the side of speed over memory.  Users can tone down fragment_parallelism
-            // by hand if needed.
-            if projection.fields.is_empty() {
-                io_parallelism as usize
-            } else {
-                bit_util::ceil(io_parallelism as usize, projection.fields.len())
-            }
-        });
+        let frag_parallelism = fragment_parallelism
+            .unwrap_or_else(|| {
+                // This is somewhat aggressive.  It assumes a single page per column.  If there are many pages per
+                // column then we probably don't need to read that many files.  It's a little tricky to get the right
+                // answer though and so we err on the side of speed over memory.  Users can tone down fragment_parallelism
+                // by hand if needed.
+                if projection.fields.is_empty() {
+                    io_parallelism as usize
+                } else {
+                    bit_util::ceil(io_parallelism as usize, projection.fields.len())
+                }
+            })
+            // fragment_readhead=0 doesn't make sense so we just bump it to 1
+            .max(1);
         debug!(
             "Given io_parallelism={} and num_columns={} we will read {} fragments at once while scanning v2 dataset",
             io_parallelism,
@@ -173,12 +175,18 @@ impl LanceStream {
             dataset.object_store.clone(),
             SchedulerConfig {
                 io_buffer_size_bytes: io_buffer_size,
-                deadlock_prevention_timeout: default_deadlock_prevention_timeout(),
             },
         );
 
-        let batches = stream::iter(file_fragments)
-            .map(move |file_fragment| {
+        let mut priorities = Vec::with_capacity(file_fragments.len());
+        let mut current_priority = 0;
+        for frag in &file_fragments {
+            priorities.push(current_priority);
+            current_priority += frag.num_data_files();
+        }
+
+        let batches = stream::iter(file_fragments.into_iter().zip(priorities))
+            .map(move |(file_fragment, priority)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
                 #[allow(clippy::type_complexity)]
@@ -191,7 +199,7 @@ impl LanceStream {
                         with_row_id,
                         with_row_address,
                         with_make_deletions_null,
-                        Some(scan_scheduler),
+                        Some((scan_scheduler, priority as u64)),
                     )
                     .await?;
                     let batch_stream = reader.read_all(batch_size as u32)?.boxed();

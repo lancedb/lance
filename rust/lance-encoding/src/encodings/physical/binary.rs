@@ -8,6 +8,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, ScalarBuffer};
+use futures::TryFutureExt;
 use futures::{future::BoxFuture, FutureExt};
 
 use crate::decoder::LogicalPageDecoder;
@@ -109,6 +110,14 @@ impl BinaryPageScheduler {
     }
 }
 
+struct IndirectData {
+    decoded_indices: UInt64Array,
+    offsets_type: DataType,
+    validity: BooleanBuffer,
+    bytes_decoder_fut: BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>,
+    num_bytes: u64,
+}
+
 impl PageScheduler for BinaryPageScheduler {
     fn schedule_ranges(
         &self,
@@ -165,6 +174,7 @@ impl PageScheduler for BinaryPageScheduler {
             let mut indices_builder = IndicesNormalizer::new(num_rows, null_adjustment);
             let mut bytes_ranges = Vec::new();
             let mut curr_offset_index = 0;
+            let mut num_bytes = 0;
 
             for curr_row_range in ranges.iter() {
                 let row_start = curr_row_range.start;
@@ -191,6 +201,7 @@ impl PageScheduler for BinaryPageScheduler {
                     .normalize(*curr_indices.values().last().unwrap())
                     .1;
                 if first != last {
+                    num_bytes += last - first;
                     bytes_ranges.push(first..last);
                 }
 
@@ -200,21 +211,38 @@ impl PageScheduler for BinaryPageScheduler {
             let (indices, validity) = indices_builder.into_parts();
             let decoded_indices = UInt64Array::from(indices);
 
-            // Schedule the bytes for decoding
-            let bytes_page_decoder =
+            // In the indirect task we schedule the bytes, but we do not await them.  We don't want to
+            // await the bytes until the decoder is ready for them so that we don't release the backpressure
+            // too early
+            let bytes_decoder_fut =
                 copy_bytes_scheduler.schedule_ranges(&bytes_ranges, &copy_scheduler, top_level_row);
 
-            let bytes_decoder: Box<dyn PrimitivePageDecoder> = bytes_page_decoder.await?;
-
-            Ok(Box::new(BinaryPageDecoder {
+            log::info!("Done scheduling binary data");
+            Ok(IndirectData {
                 decoded_indices,
                 validity,
                 offsets_type,
-                bytes_decoder,
-            }) as Box<dyn PrimitivePageDecoder>)
+                bytes_decoder_fut,
+                num_bytes,
+            })
         })
         // Propagate join panic
         .map(|join_handle| join_handle.unwrap())
+        .and_then(|indirect_data| {
+            let num_bytes = indirect_data.num_bytes;
+            async move {
+                // Later, this will be called once the decoder actually starts polling.  At that point
+                // we await the bytes (releasing the backpressure)
+                log::info!("Waiting for binary data with {} bytes", num_bytes);
+                let bytes_decoder = indirect_data.bytes_decoder_fut.await?;
+                Ok(Box::new(BinaryPageDecoder {
+                    decoded_indices: indirect_data.decoded_indices,
+                    offsets_type: indirect_data.offsets_type,
+                    validity: indirect_data.validity,
+                    bytes_decoder,
+                }) as Box<dyn PrimitivePageDecoder>)
+            }
+        })
         .boxed()
     }
 }

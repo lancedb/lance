@@ -596,6 +596,8 @@ impl FileReader {
             column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
         );
 
+        log::trace!("Reading from {:?}", scheduler);
+
         let mut decode_scheduler = DecodeBatchScheduler::try_new(
             &projection.schema,
             &projection.column_indices,

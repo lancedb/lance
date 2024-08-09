@@ -20,7 +20,6 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
 use lance::{
     io::{ObjectStore, RecordBatchStream},
-    utils::default_deadlock_prevention_timeout,
 };
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::{
@@ -291,7 +290,6 @@ impl LanceFileReader {
             Arc::new(object_store),
             SchedulerConfig {
                 io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
-                deadlock_prevention_timeout: default_deadlock_prevention_timeout(),
             },
         );
         let file = scheduler.open_file(&path).await.infer_error()?;
