@@ -79,7 +79,12 @@ pub enum IndexType {
 
     // 100+ and up for vector index.
     /// Flat vector index.
-    Vector = 100,
+    Vector = 100, // Legacy vector index, alias to IvfPq
+    IvfFlat = 101,
+    IvfSq = 102,
+    IvfPq = 103,
+    IvfHnswSq = 104,
+    IvfHnswPq = 105,
 }
 
 impl std::fmt::Display for IndexType {
@@ -89,7 +94,11 @@ impl std::fmt::Display for IndexType {
             Self::Bitmap => write!(f, "Bitmap"),
             Self::LabelList => write!(f, "LabelList"),
             Self::Inverted => write!(f, "Inverted"),
-            Self::Vector => write!(f, "Vector"),
+            Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
+            Self::IvfFlat => write!(f, "IVF_FLAT"),
+            Self::IvfSq => write!(f, "IVF_SQ"),
+            Self::IvfHnswSq => write!(f, "IVF_HNSW_SQ"),
+            Self::IvfHnswPq => write!(f, "IVF_HNSW_PQ"),
         }
     }
 }
@@ -103,7 +112,10 @@ impl IndexType {
     }
 
     pub fn is_vector(&self) -> bool {
-        matches!(self, Self::Vector)
+        matches!(
+            self,
+            Self::Vector | Self::IvfPq | Self::IvfHnswSq | Self::IvfHnswPq
+        )
     }
 }
 
