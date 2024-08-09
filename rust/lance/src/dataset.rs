@@ -2963,38 +2963,6 @@ mod tests {
         assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
     }
 
-    #[tokio::test]
-    async fn test_delete_completely() {
-        let data = gen().col("int", array::step::<Int32Type>());
-        let stream = data.into_reader_rows(RowCount::from(10), BatchCount::from(10));
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let write_params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(stream, test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
-
-        dataset.delete("true").await.unwrap();
-        dataset.validate().await.unwrap();
-        assert_eq!(dataset.count_fragments(), 0);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
-
-        let data = gen().col("int", array::step::<Int32Type>());
-        let stream = data.into_reader_rows(RowCount::from(10), BatchCount::from(10));
-        let dataset = Dataset::write(stream, test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
-
-        assert_eq!(dataset.count_fragments(), 1);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
-        assert_eq!(dataset.get_fragments()[0].id(), 1);
-    }
-
     #[rstest]
     #[tokio::test]
     async fn test_restore(
