@@ -302,7 +302,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     fn index_type(&self) -> IndexType {
-        IndexType::Vector
+        match self.sub_index_type() {
+            (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
+            (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
+            (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
+            (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
+            (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
+            _ => IndexType::Vector,
+        }
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -314,18 +321,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
 
-        let index_type = match self.sub_index_type() {
-            (sub_index_type, QuantizationType::Flat) => format!("IVF_{}", sub_index_type), // ignore FLAT quantization
-            (sub_index_type, quantization_type) => {
-                if sub_index_type.to_string() == quantization_type.to_string() {
-                    // ignore redundant quantization type
-                    // e.g. IVF_PQ_PQ should be IVF_PQ
-                    format!("IVF_{}", sub_index_type)
-                } else {
-                    format!("IVF_{}_{}", sub_index_type, quantization_type)
-                }
-            }
-        };
+        let index_type = self.index_type().to_string();
         let mut sub_index_stats: serde_json::Value =
             if let Some(metadata) = self.sub_index_metadata.iter().find(|m| !m.is_empty()) {
                 serde_json::from_str(metadata)?
