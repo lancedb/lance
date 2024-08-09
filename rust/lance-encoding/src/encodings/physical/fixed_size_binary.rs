@@ -55,6 +55,9 @@ impl PageScheduler for FixedSizeBinaryPageScheduler {
             })
             .collect::<Vec<_>>();
 
+        println!("Byte width: {}", self.byte_width);
+        println!("expanded_ranges: {:?}", expanded_ranges);
+
         let bytes_page_decoder =
             self.bytes_scheduler
                 .schedule_ranges(&expanded_ranges, scheduler, top_level_row);
@@ -87,6 +90,7 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
         let bytes = self.bytes_decoder.decode(rows_to_skip, num_bytes)?;
         let bytes = bytes.try_into_layout::<FixedWidthDataBlock>()?;
         debug_assert_eq!(bytes.bits_per_value, 8);
+        println!("bytes: {:?}", bytes.data);
 
         let offsets_buffer = if self.bytes_per_offset == 8 {
             let offsets_vec = (0..(num_rows + 1))
@@ -114,28 +118,15 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
 #[derive(Debug)]
 pub struct FixedSizeBinaryEncoder {
     bytes_encoder: Box<dyn ArrayEncoder>,
+    byte_width: usize,
 }
 
 impl FixedSizeBinaryEncoder {
-    pub fn new(bytes_encoder: Box<dyn ArrayEncoder>) -> Self {
-        Self { bytes_encoder }
-    }
-}
-
-pub fn get_offset_info_from_binary_arrays(arrays: &[ArrayRef]) -> usize {
-    // TODO: add case here for when the first array in arrays is empty (or has only null values)
-    let arr = &arrays[0];
-
-    if let Some(arr) = arr.as_string_opt::<i32>() {
-        (arr.offsets()[1] - arr.offsets()[0]) as usize
-    } else if let Some(arr) = arr.as_string_opt::<i64>() {
-        (arr.offsets()[1] - arr.offsets()[0]) as usize
-    } else if let Some(arr) = arr.as_binary_opt::<i32>() {
-        (arr.offsets()[1] - arr.offsets()[0]) as usize
-    } else if let Some(arr) = arr.as_binary_opt::<i64>() {
-        (arr.offsets()[1] - arr.offsets()[0]) as usize
-    } else {
-        panic!("Array is not a string / binary array");
+    pub fn new(bytes_encoder: Box<dyn ArrayEncoder>, byte_width: usize) -> Self {
+        Self { 
+            bytes_encoder,
+            byte_width
+        }
     }
 }
 
@@ -212,8 +203,9 @@ pub fn get_bytes_from_binary_arrays(arrays: &[ArrayRef], byte_width: usize) -> V
 
 impl ArrayEncoder for FixedSizeBinaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let byte_width = get_offset_info_from_binary_arrays(arrays);
-        let byte_arrays = get_bytes_from_binary_arrays(arrays, byte_width);
+        println!("arrays to encode: {:?}", arrays);
+        // let byte_width = self.byte_width;
+        let byte_arrays = get_bytes_from_binary_arrays(arrays, self.byte_width);
         let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
 
         Ok(EncodedArray {
@@ -222,7 +214,7 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::FixedSizeBinary(
                     Box::new(pb::FixedSizeBinary {
                         bytes: Some(Box::new(encoded_bytes.encoding)),
-                        byte_width: byte_width as u32,
+                        byte_width: self.byte_width as u32,
                     }),
                 )),
             },

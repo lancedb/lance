@@ -3,7 +3,7 @@
 use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
@@ -294,6 +294,7 @@ impl CoreArrayEncodingStrategy {
         data_size: u64,
         use_dict_encoding: bool,
         use_fixed_size_encoding: bool,
+        byte_width: &u64,
         version: LanceFileVersion,
         field_meta: Option<&HashMap<String, String>>,
     ) -> Result<Box<dyn ArrayEncoder>> {
@@ -305,6 +306,7 @@ impl CoreArrayEncodingStrategy {
                         data_size,
                         use_dict_encoding,
                         use_fixed_size_encoding,
+                        byte_width,
                         version,
                         None,
                     )?,
@@ -317,6 +319,7 @@ impl CoreArrayEncodingStrategy {
                     data_size,
                     false,
                     use_fixed_size_encoding,
+                    byte_width,
                     version,
                     None,
                 )?;
@@ -325,6 +328,7 @@ impl CoreArrayEncodingStrategy {
                     data_size,
                     false,
                     use_fixed_size_encoding,
+                    byte_width,
                     version,
                     None,
                 )?;
@@ -341,6 +345,7 @@ impl CoreArrayEncodingStrategy {
                         data_size,
                         false,
                         use_fixed_size_encoding,
+                        byte_width,
                         version,
                         None,
                     )?;
@@ -349,6 +354,7 @@ impl CoreArrayEncodingStrategy {
                         data_size,
                         false,
                         use_fixed_size_encoding,
+                        byte_width,
                         version,
                         None,
                     )?;
@@ -364,12 +370,13 @@ impl CoreArrayEncodingStrategy {
                         data_size,
                         false,
                         false,
+                        byte_width,
                         version,
                         None,
                     )?;
 
                     Ok(Box::new(BasicEncoder::new(Box::new(
-                        FixedSizeBinaryEncoder::new(bytes_encoder),
+                        FixedSizeBinaryEncoder::new(bytes_encoder, *byte_width as usize),
                     ))))
                 } else {
                     let bin_indices_encoder = Self::array_encoder_from_type(
@@ -377,6 +384,7 @@ impl CoreArrayEncodingStrategy {
                         data_size,
                         false,
                         use_fixed_size_encoding,
+                        byte_width,
                         version,
                         None,
                     )?;
@@ -385,6 +393,7 @@ impl CoreArrayEncodingStrategy {
                         data_size,
                         false,
                         use_fixed_size_encoding,
+                        byte_width,
                         version,
                         None,
                     )?;
@@ -409,6 +418,7 @@ impl CoreArrayEncodingStrategy {
                         data_size,
                         use_dict_encoding,
                         use_fixed_size_encoding,
+                        byte_width,
                         version,
                         None,
                     )?;
@@ -465,7 +475,7 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     true
 }
 
-fn check_fixed_size_encoding(arrays: &[ArrayRef]) -> bool {
+fn check_fixed_size_encoding(arrays: &[ArrayRef], byte_width: &mut u64) -> bool {
     // check if all arrays in arrays have the same length
     if arrays.is_empty() {
         return false;
@@ -531,6 +541,9 @@ fn check_fixed_size_encoding(arrays: &[ArrayRef]) -> bool {
         {
             return false;
         }
+
+        // set the byte width
+        *byte_width = lengths[first_non_zero];
     } else {
         // all arrays have null values
         return false;
@@ -559,14 +572,17 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
             DataType::Binary,
             DataType::LargeBinary,
         ];
+
+        let byte_width = &mut 0;
         let use_fixed_size_encoding =
-            binary_datatypes.contains(data_type) && check_fixed_size_encoding(arrays);
+            binary_datatypes.contains(data_type) && check_fixed_size_encoding(arrays, byte_width);
 
         Self::array_encoder_from_type(
             data_type,
             data_size,
             use_dict_encoding,
             use_fixed_size_encoding,
+            byte_width,
             self.version,
             Some(&field.metadata),
         )
@@ -1055,7 +1071,7 @@ pub mod tests {
             final_arrays.push(arr);
         }
 
-        check_fixed_size_encoding(&final_arrays.clone())
+        check_fixed_size_encoding(&final_arrays.clone(), &mut 0)
     }
 
     #[test]
