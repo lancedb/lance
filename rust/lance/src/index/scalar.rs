@@ -69,10 +69,7 @@ impl TrainingRequest {
             .project(&[&self.column])?;
 
         let batches = scan
-            .try_into_dfstream(LanceExecutionOptions {
-                use_spilling: true,
-                ..Default::default()
-            })
+            .try_into_dfstream(LanceExecutionOptions::new(true, None))
             .await?;
         Ok(chunk_concat_stream(batches, chunk_size as usize))
     }
