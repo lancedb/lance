@@ -452,6 +452,7 @@ impl Transaction {
                         }
                     }
                 });
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Update {
                 removed_fragment_ids,
@@ -475,6 +476,7 @@ impl Transaction {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
                 final_fragments.extend(new_fragments);
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Overwrite { ref fragments, .. } => {
                 let mut new_fragments =
@@ -535,7 +537,7 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema)
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -556,7 +558,7 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema)
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Restore { .. } => {
                 unreachable!()
@@ -606,7 +608,7 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
-    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema) {
+    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
@@ -616,6 +618,17 @@ impl Transaction {
                 .fields
                 .iter()
                 .all(|field_id| field_ids.contains(field_id))
+        });
+
+        // We might have also removed all fragments that an index was covering, so
+        // we should remove those indices as well.
+        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
+        indices.retain(|existing_index| {
+            existing_index
+                .fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
+                .unwrap_or(true)
         });
     }
 
