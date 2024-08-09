@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, env, sync::Arc};
 
+use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
@@ -292,7 +293,7 @@ impl CoreArrayEncodingStrategy {
         data_type: &DataType,
         data_size: u64,
         use_dict_encoding: bool,
-        all_same_length: bool,
+        use_fixed_size_encoding: bool,
         version: LanceFileVersion,
         field_meta: Option<&HashMap<String, String>>,
     ) -> Result<Box<dyn ArrayEncoder>> {
@@ -303,7 +304,7 @@ impl CoreArrayEncodingStrategy {
                         inner.data_type(),
                         data_size,
                         use_dict_encoding,
-                        all_same_length,
+                        use_fixed_size_encoding,
                         version,
                         None,
                     )?,
@@ -315,7 +316,7 @@ impl CoreArrayEncodingStrategy {
                     key_type,
                     data_size,
                     false,
-                    all_same_length,
+                    use_fixed_size_encoding,
                     version,
                     None,
                 )?;
@@ -323,7 +324,7 @@ impl CoreArrayEncodingStrategy {
                     value_type,
                     data_size,
                     false,
-                    all_same_length,
+                    use_fixed_size_encoding,
                     version,
                     None,
                 )?;
@@ -339,7 +340,7 @@ impl CoreArrayEncodingStrategy {
                         &DataType::UInt8,
                         data_size,
                         false,
-                        all_same_length,
+                        use_fixed_size_encoding,
                         version,
                         None,
                     )?;
@@ -347,7 +348,7 @@ impl CoreArrayEncodingStrategy {
                         &DataType::Utf8,
                         data_size,
                         false,
-                        all_same_length,
+                        use_fixed_size_encoding,
                         version,
                         None,
                     )?;
@@ -356,7 +357,7 @@ impl CoreArrayEncodingStrategy {
                         dict_indices_encoder,
                         dict_items_encoder,
                     )))
-                } else if all_same_length {
+                } else if use_fixed_size_encoding {
                     // use FixedSizeBinaryEncoder
                     let bytes_encoder = Self::array_encoder_from_type(
                         &DataType::UInt8,
@@ -375,7 +376,7 @@ impl CoreArrayEncodingStrategy {
                         &DataType::UInt64,
                         data_size,
                         false,
-                        all_same_length,
+                        use_fixed_size_encoding,
                         version,
                         None,
                     )?;
@@ -383,7 +384,7 @@ impl CoreArrayEncodingStrategy {
                         &DataType::UInt8,
                         data_size,
                         false,
-                        all_same_length,
+                        use_fixed_size_encoding,
                         version,
                         None,
                     )?;
@@ -407,7 +408,7 @@ impl CoreArrayEncodingStrategy {
                         inner_datatype,
                         data_size,
                         use_dict_encoding,
-                        all_same_length,
+                        use_fixed_size_encoding,
                         version,
                         None,
                     )?;
@@ -464,6 +465,83 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     true
 }
 
+fn check_fixed_size_encoding(arrays: &[ArrayRef]) -> bool {
+    // check if all arrays in arrays have the same length
+    if arrays.is_empty() {
+        return false
+    }
+
+    // make sure no array has an empty string
+    if !arrays.iter().all(|arr| {
+        if let Some(arr) = arr.as_string_opt::<i32>() {
+            arr.iter().flatten().all(|s| !s.is_empty())
+        }
+        else if let Some(arr) = arr.as_binary_opt::<i32>() {
+            arr.iter().flatten().all(|s| !s.is_empty())
+        }
+        else if let Some(arr) = arr.as_string_opt::<i64>() {
+            arr.iter().flatten().all(|s| !s.is_empty())
+        }
+        else if let Some(arr) = arr.as_binary_opt::<i64>() {
+            arr.iter().flatten().all(|s| !s.is_empty())
+        }
+        else {
+            panic!("wrong dtype");
+        }
+    }) {
+        return false;
+    }
+
+    let lengths = arrays.iter().flat_map(|arr| {
+        if let Some(arr) = arr.as_string_opt::<i32>() {
+            let offsets = arr.offsets().inner();
+            offsets.windows(2).map(|w| {
+                let strlen = (w[1] - w[0]) as u64;
+                strlen
+            }).collect::<Vec<_>>()
+        }
+        else if let Some(arr) = arr.as_binary_opt::<i32>() {
+            let offsets = arr.offsets().inner();
+            offsets.windows(2).map(|w| {
+                let strlen = (w[1] - w[0]) as u64;
+                strlen
+            }).collect::<Vec<_>>()
+        }
+        else if let Some(arr) = arr.as_string_opt::<i64>() {
+            let offsets = arr.offsets().inner();
+            offsets.windows(2).map(|w| {
+                let strlen = (w[1] - w[0]) as u64;
+                strlen
+            }).collect::<Vec<_>>()
+        }
+        else if let Some(arr) = arr.as_binary_opt::<i64>() {
+            let offsets = arr.offsets().inner();
+            offsets.windows(2).map(|w| {
+                let strlen = (w[1] - w[0]) as u64;
+                strlen
+            }).collect::<Vec<_>>()
+        }
+        else {
+            panic!("wrong dtype");
+        }
+    }).collect::<Vec<_>>();
+
+    // find first non-zero value in lengths
+    let first_non_zero = lengths.iter().position(|&x| x != 0);
+    if first_non_zero.is_none() {
+        // all arrays have null values
+        return false;
+    }
+    else {
+        // make sure all lengths are equal to first_non_zero length or zero
+        if !lengths.iter().all(|&x| x == 0 || x == lengths[first_non_zero.unwrap()]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     fn create_array_encoder(
         &self,
@@ -477,20 +555,15 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
         let data_type = arrays[0].data_type();
         let use_dict_encoding = data_type == &DataType::Utf8
             && check_dict_encoding(arrays, get_dict_encoding_threshold());
-
-        // check if all arrays in arrays have the same length
-        let all_same_length = arrays
-            .iter()
-            .map(|arr| arr.len())
-            .collect::<Vec<_>>()
-            .windows(2)
-            .all(|w| w[0] == w[1]);
+        
+        let binary_datatypes = vec![DataType::Utf8, DataType::LargeUtf8, DataType::Binary, DataType::LargeBinary];
+        let use_fixed_size_encoding = binary_datatypes.contains(data_type) && check_fixed_size_encoding(arrays);
 
         Self::array_encoder_from_type(
             data_type,
             data_size,
             use_dict_encoding,
-            all_same_length,
+            use_fixed_size_encoding,
             self.version,
             Some(&field.metadata),
         )
@@ -929,6 +1002,7 @@ pub mod tests {
     use std::sync::Arc;
 
     use super::check_dict_encoding;
+    use super::check_fixed_size_encoding;
 
     fn is_dict_encoding_applicable(arr: Vec<Option<&str>>, threshold: u64) -> bool {
         let arr = StringArray::from(arr);
@@ -968,5 +1042,89 @@ pub mod tests {
     #[test]
     fn test_dict_encoding_should_not_be_applied_for_smaller_than_threshold_arrays() {
         assert!(!is_dict_encoding_applicable(vec![Some("a"), Some("a")], 3));
+    }
+
+    fn is_fixed_size_encoding_applicable(arrays: Vec<Vec<Option<&str>>>) -> bool {
+        let mut final_arrays = Vec::new();
+        for arr in arrays {
+            let arr = StringArray::from(arr);
+            let arr = Arc::new(arr) as ArrayRef;
+            final_arrays.push(arr);
+        }
+
+        check_fixed_size_encoding(&final_arrays.clone())
+    }
+
+    #[test]
+    fn test_fixed_size_binary_encoding_applicable() {
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![]])
+        );
+
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("a"), Some("b")]])
+        );
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("abc"), Some("de")]])
+        );
+
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("pqr"), None]])
+        );
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("pqr"), Some("")]])
+        );
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some(""), Some("")]])
+        );
+    }
+
+    #[test]
+    fn test_fixed_size_binary_encoding_applicable_multiple_arrays() {
+
+        assert!(is_fixed_size_encoding_applicable(
+            vec![
+                vec![Some("a"), Some("b")],
+                vec![Some("c"), Some("d")]
+            ])
+        );
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![
+                vec![Some("ab"), Some("bc")],
+                vec![Some("c"), Some("d")]
+            ])
+        );
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![
+                vec![Some("ab"), None],
+                vec![None, Some("d")]
+            ])
+        );
+
+        assert!(is_fixed_size_encoding_applicable(
+            vec![
+                vec![Some("a"), None],
+                vec![None, Some("d")]
+            ])
+        );
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![
+                vec![Some(""), None],
+                vec![None, Some("")]
+            ])
+        );
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![
+                vec![None, None],
+                vec![None, None]
+            ])
+        );
     }
 }
