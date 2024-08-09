@@ -17,9 +17,7 @@ use crate::{
     EncodingsIo,
 };
 
-/// A scheduler for fixed size lists of primitive values
-///
-/// This scheduler is, itself, primitive
+/// A scheduler for fixed size binary data
 #[derive(Debug)]
 pub struct FixedSizeBinaryPageScheduler {
     bytes_scheduler: Box<dyn PageScheduler>,
@@ -55,21 +53,18 @@ impl PageScheduler for FixedSizeBinaryPageScheduler {
             })
             .collect::<Vec<_>>();
 
-        println!("Byte width: {}", self.byte_width);
-        println!("expanded_ranges: {:?}", expanded_ranges);
-
         let bytes_page_decoder =
             self.bytes_scheduler
                 .schedule_ranges(&expanded_ranges, scheduler, top_level_row);
 
-        let byte_width = self.byte_width;
+        let byte_width = self.byte_width as u64;
         let bytes_per_offset = self.bytes_per_offset;
 
         async move {
             let bytes_decoder = bytes_page_decoder.await?;
             Ok(Box::new(FixedSizeBinaryDecoder {
                 bytes_decoder,
-                byte_width: byte_width as u64,
+                byte_width,
                 bytes_per_offset,
             }) as Box<dyn PrimitivePageDecoder>)
         }
@@ -90,18 +85,21 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
         let bytes = self.bytes_decoder.decode(rows_to_skip, num_bytes)?;
         let bytes = bytes.try_into_layout::<FixedWidthDataBlock>()?;
         debug_assert_eq!(bytes.bits_per_value, 8);
-        println!("bytes: {:?}", bytes.data);
 
-        let offsets_buffer = if self.bytes_per_offset == 8 {
-            let offsets_vec = (0..(num_rows + 1))
-                .map(|i| i * self.byte_width)
-                .collect::<Vec<_>>();
-            Buffer::from_slice_ref(offsets_vec)
-        } else {
-            let offsets_vec = (0..(num_rows as u32 + 1))
-                .map(|i| i * self.byte_width as u32)
-                .collect::<Vec<_>>();
-            Buffer::from_slice_ref(offsets_vec)
+        let offsets_buffer = match self.bytes_per_offset {
+            8 => {
+                let offsets_vec = (0..(num_rows + 1))
+                    .map(|i| i * self.byte_width)
+                    .collect::<Vec<_>>();
+                Buffer::from_slice_ref(offsets_vec)
+            }
+            4 => {
+                let offsets_vec = (0..(num_rows as u32 + 1))
+                    .map(|i| i * self.byte_width as u32)
+                    .collect::<Vec<_>>();
+                Buffer::from_slice_ref(offsets_vec)
+            }
+            _ => panic!("Unsupported offsets type"),
         };
 
         let string_data = Box::new(VariableWidthBlock {
@@ -140,7 +138,7 @@ pub fn get_bytes_from_binary_arrays(arrays: &[ArrayRef], byte_width: usize) -> V
                     let start = arr.offsets()[i] as usize;
                     let end = arr.offsets()[i + 1] as usize;
                     if start == end {
-                        // Null value, add byte_width bytes
+                        // Null value, add byte_width bytes of zeroes
                         values_vec.extend(std::iter::repeat(0).take(byte_width))
                     } else {
                         values_vec.extend_from_slice(&arr.values()[start..end]);
@@ -154,7 +152,7 @@ pub fn get_bytes_from_binary_arrays(arrays: &[ArrayRef], byte_width: usize) -> V
                     let start = arr.offsets()[i] as usize;
                     let end = arr.offsets()[i + 1] as usize;
                     if start == end {
-                        // Null value, add byte_width bytes
+                        // Null value, add byte_width bytes of zeroes
                         values_vec.extend(std::iter::repeat(0).take(byte_width))
                     } else {
                         values_vec.extend_from_slice(&arr.values()[start..end]);
@@ -168,7 +166,7 @@ pub fn get_bytes_from_binary_arrays(arrays: &[ArrayRef], byte_width: usize) -> V
                     let start = arr.offsets()[i] as usize;
                     let end = arr.offsets()[i + 1] as usize;
                     if start == end {
-                        // Null value, add byte_width bytes
+                        // Null value, add byte_width bytes of zeroes
                         values_vec.extend(std::iter::repeat(0).take(byte_width))
                     } else {
                         values_vec.extend_from_slice(&arr.values()[start..end]);
@@ -182,7 +180,7 @@ pub fn get_bytes_from_binary_arrays(arrays: &[ArrayRef], byte_width: usize) -> V
                     let start = arr.offsets()[i] as usize;
                     let end = arr.offsets()[i + 1] as usize;
                     if start == end {
-                        // Null value, add byte_width bytes
+                        // Null value, add byte_width bytes of zeroes
                         values_vec.extend(std::iter::repeat(0).take(byte_width))
                     } else {
                         values_vec.extend_from_slice(&arr.values()[start..end]);
@@ -203,8 +201,6 @@ pub fn get_bytes_from_binary_arrays(arrays: &[ArrayRef], byte_width: usize) -> V
 
 impl ArrayEncoder for FixedSizeBinaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        println!("arrays to encode: {:?}", arrays);
-        // let byte_width = self.byte_width;
         let byte_arrays = get_bytes_from_binary_arrays(arrays, self.byte_width);
         let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
 
