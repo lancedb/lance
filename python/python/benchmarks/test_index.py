@@ -193,9 +193,7 @@ def test_shuffle_vectors(test_large_dataset, tmpdir, benchmark):
     transformed_uri = str(tmpdir / "output.lance")
     part_ids_path = str(tmpdir / "part_ids")
     gen_rand_part_ids(test_large_dataset, part_ids_path)
-    print("Transforming vectors")
     builder.transform_vectors(ivf, pq, transformed_uri, None, part_ids_path)
-    print("Shuffling")
     shuffle_out = str(tmpdir)
     benchmark.pedantic(
         builder.shuffle_transformed_vectors,
