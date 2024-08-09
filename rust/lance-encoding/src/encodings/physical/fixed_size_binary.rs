@@ -123,9 +123,9 @@ pub struct FixedSizeBinaryEncoder {
 
 impl FixedSizeBinaryEncoder {
     pub fn new(bytes_encoder: Box<dyn ArrayEncoder>, byte_width: usize) -> Self {
-        Self { 
+        Self {
             bytes_encoder,
-            byte_width
+            byte_width,
         }
     }
 }
