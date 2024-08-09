@@ -84,7 +84,6 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
         let rows_to_skip = rows_to_skip * self.byte_width;
         let num_bytes = num_rows * self.byte_width;
-        println!("Decoding...");
         let bytes = self.bytes_decoder.decode(rows_to_skip, num_bytes)?;
         let bytes = bytes.try_into_layout::<FixedWidthDataBlock>()?;
         debug_assert_eq!(bytes.bits_per_value, 8);
@@ -93,12 +92,12 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
             let offsets_vec = (0..(num_rows + 1))
                 .map(|i| i * self.byte_width)
                 .collect::<Vec<_>>();
-            Buffer::from_slice_ref(&offsets_vec)
+            Buffer::from_slice_ref(offsets_vec)
         } else {
             let offsets_vec = (0..(num_rows as u32 + 1))
                 .map(|i| i * self.byte_width as u32)
                 .collect::<Vec<_>>();
-            Buffer::from_slice_ref(&offsets_vec)
+            Buffer::from_slice_ref(offsets_vec)
         };
 
         let string_data = Box::new(VariableWidthBlock {
@@ -213,11 +212,9 @@ pub fn get_bytes_from_binary_arrays(arrays: &[ArrayRef], byte_width: usize) -> V
 
 impl ArrayEncoder for FixedSizeBinaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        println!("Using fixed size encoding");
         let byte_width = get_offset_info_from_binary_arrays(arrays);
         let byte_arrays = get_bytes_from_binary_arrays(arrays, byte_width);
         let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
-        println!("Encoded.");
 
         Ok(EncodedArray {
             buffers: encoded_bytes.buffers,
@@ -237,10 +234,8 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{
-        Array, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
-    };
-    use arrow_buffer::Buffer;
+    use arrow::array::LargeStringBuilder;
+    use arrow_array::{ArrayRef, LargeStringArray, StringArray};
     use arrow_schema::{DataType, Field};
 
     use crate::testing::{
@@ -368,7 +363,6 @@ mod tests {
         .await;
     }
 
-
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_empty_strings() {
         // All strings are empty
@@ -382,5 +376,25 @@ mod tests {
             .await;
         let test_cases = test_cases.with_batch_size(1);
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    #[ignore] // This test is quite slow in debug mode
+    async fn test_jumbo_string() {
+        // This is an overflow test.  We have a list of lists where each list
+        // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
+        // offsets range
+        let mut string_builder = LargeStringBuilder::new();
+        // a 1 MiB string
+        let giant_string = String::from_iter((0..(1024 * 1024)).map(|_| '0'));
+        for _ in 0..5000 {
+            string_builder.append_option(Some(&giant_string));
+        }
+        let giant_array = Arc::new(string_builder.finish()) as ArrayRef;
+        let arrs = vec![giant_array];
+
+        // // We can't validate because our validation relies on concatenating all input arrays
+        let test_cases = TestCases::default().without_validation();
+        check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 }

@@ -3,7 +3,7 @@
 use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray};
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
@@ -468,78 +468,75 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
 fn check_fixed_size_encoding(arrays: &[ArrayRef]) -> bool {
     // check if all arrays in arrays have the same length
     if arrays.is_empty() {
-        return false
+        return false;
     }
 
     // make sure no array has an empty string
     if !arrays.iter().all(|arr| {
         if let Some(arr) = arr.as_string_opt::<i32>() {
             arr.iter().flatten().all(|s| !s.is_empty())
-        }
-        else if let Some(arr) = arr.as_binary_opt::<i32>() {
+        } else if let Some(arr) = arr.as_binary_opt::<i32>() {
             arr.iter().flatten().all(|s| !s.is_empty())
-        }
-        else if let Some(arr) = arr.as_string_opt::<i64>() {
+        } else if let Some(arr) = arr.as_string_opt::<i64>() {
             arr.iter().flatten().all(|s| !s.is_empty())
-        }
-        else if let Some(arr) = arr.as_binary_opt::<i64>() {
+        } else if let Some(arr) = arr.as_binary_opt::<i64>() {
             arr.iter().flatten().all(|s| !s.is_empty())
-        }
-        else {
+        } else {
             panic!("wrong dtype");
         }
     }) {
         return false;
     }
 
-    let lengths = arrays.iter().flat_map(|arr| {
-        if let Some(arr) = arr.as_string_opt::<i32>() {
-            let offsets = arr.offsets().inner();
-            offsets.windows(2).map(|w| {
-                let strlen = (w[1] - w[0]) as u64;
-                strlen
-            }).collect::<Vec<_>>()
-        }
-        else if let Some(arr) = arr.as_binary_opt::<i32>() {
-            let offsets = arr.offsets().inner();
-            offsets.windows(2).map(|w| {
-                let strlen = (w[1] - w[0]) as u64;
-                strlen
-            }).collect::<Vec<_>>()
-        }
-        else if let Some(arr) = arr.as_string_opt::<i64>() {
-            let offsets = arr.offsets().inner();
-            offsets.windows(2).map(|w| {
-                let strlen = (w[1] - w[0]) as u64;
-                strlen
-            }).collect::<Vec<_>>()
-        }
-        else if let Some(arr) = arr.as_binary_opt::<i64>() {
-            let offsets = arr.offsets().inner();
-            offsets.windows(2).map(|w| {
-                let strlen = (w[1] - w[0]) as u64;
-                strlen
-            }).collect::<Vec<_>>()
-        }
-        else {
-            panic!("wrong dtype");
-        }
-    }).collect::<Vec<_>>();
+    let lengths = arrays
+        .iter()
+        .flat_map(|arr| {
+            if let Some(arr) = arr.as_string_opt::<i32>() {
+                let offsets = arr.offsets().inner();
+                offsets
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]) as u64)
+                    .collect::<Vec<_>>()
+            } else if let Some(arr) = arr.as_binary_opt::<i32>() {
+                let offsets = arr.offsets().inner();
+                offsets
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]) as u64)
+                    .collect::<Vec<_>>()
+            } else if let Some(arr) = arr.as_string_opt::<i64>() {
+                let offsets = arr.offsets().inner();
+                offsets
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]) as u64)
+                    .collect::<Vec<_>>()
+            } else if let Some(arr) = arr.as_binary_opt::<i64>() {
+                let offsets = arr.offsets().inner();
+                offsets
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]) as u64)
+                    .collect::<Vec<_>>()
+            } else {
+                panic!("wrong dtype");
+            }
+        })
+        .collect::<Vec<_>>();
 
     // find first non-zero value in lengths
     let first_non_zero = lengths.iter().position(|&x| x != 0);
-    if first_non_zero.is_none() {
+    if let Some(first_non_zero) = first_non_zero {
+        // make sure all lengths are equal to first_non_zero length or zero
+        if !lengths
+            .iter()
+            .all(|&x| x == 0 || x == lengths[first_non_zero])
+        {
+            return false;
+        }
+    } else {
         // all arrays have null values
         return false;
     }
-    else {
-        // make sure all lengths are equal to first_non_zero length or zero
-        if !lengths.iter().all(|&x| x == 0 || x == lengths[first_non_zero.unwrap()]) {
-            return false;
-        }
-    }
 
-    return true;
+    true
 }
 
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
@@ -555,9 +552,15 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
         let data_type = arrays[0].data_type();
         let use_dict_encoding = data_type == &DataType::Utf8
             && check_dict_encoding(arrays, get_dict_encoding_threshold());
-        
-        let binary_datatypes = vec![DataType::Utf8, DataType::LargeUtf8, DataType::Binary, DataType::LargeBinary];
-        let use_fixed_size_encoding = binary_datatypes.contains(data_type) && check_fixed_size_encoding(arrays);
+
+        let binary_datatypes = [
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+        ];
+        let use_fixed_size_encoding =
+            binary_datatypes.contains(data_type) && check_fixed_size_encoding(arrays);
 
         Self::array_encoder_from_type(
             data_type,
@@ -1057,74 +1060,64 @@ pub mod tests {
 
     #[test]
     fn test_fixed_size_binary_encoding_applicable() {
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![]])
-        );
+        assert!(!is_fixed_size_encoding_applicable(vec![vec![]]));
 
-        assert!(is_fixed_size_encoding_applicable(
-            vec![vec![Some("a"), Some("b")]])
-        );
+        assert!(is_fixed_size_encoding_applicable(vec![vec![
+            Some("a"),
+            Some("b")
+        ]]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![Some("abc"), Some("de")]])
-        );
+        assert!(!is_fixed_size_encoding_applicable(vec![vec![
+            Some("abc"),
+            Some("de")
+        ]]));
 
-        assert!(is_fixed_size_encoding_applicable(
-            vec![vec![Some("pqr"), None]])
-        );
+        assert!(is_fixed_size_encoding_applicable(vec![vec![
+            Some("pqr"),
+            None
+        ]]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![Some("pqr"), Some("")]])
-        );
+        assert!(!is_fixed_size_encoding_applicable(vec![vec![
+            Some("pqr"),
+            Some("")
+        ]]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![Some(""), Some("")]])
-        );
+        assert!(!is_fixed_size_encoding_applicable(vec![vec![
+            Some(""),
+            Some("")
+        ]]));
     }
 
     #[test]
     fn test_fixed_size_binary_encoding_applicable_multiple_arrays() {
+        assert!(is_fixed_size_encoding_applicable(vec![
+            vec![Some("a"), Some("b")],
+            vec![Some("c"), Some("d")]
+        ]));
 
-        assert!(is_fixed_size_encoding_applicable(
-            vec![
-                vec![Some("a"), Some("b")],
-                vec![Some("c"), Some("d")]
-            ])
-        );
+        assert!(!is_fixed_size_encoding_applicable(vec![
+            vec![Some("ab"), Some("bc")],
+            vec![Some("c"), Some("d")]
+        ]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![
-                vec![Some("ab"), Some("bc")],
-                vec![Some("c"), Some("d")]
-            ])
-        );
+        assert!(!is_fixed_size_encoding_applicable(vec![
+            vec![Some("ab"), None],
+            vec![None, Some("d")]
+        ]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![
-                vec![Some("ab"), None],
-                vec![None, Some("d")]
-            ])
-        );
+        assert!(is_fixed_size_encoding_applicable(vec![
+            vec![Some("a"), None],
+            vec![None, Some("d")]
+        ]));
 
-        assert!(is_fixed_size_encoding_applicable(
-            vec![
-                vec![Some("a"), None],
-                vec![None, Some("d")]
-            ])
-        );
+        assert!(!is_fixed_size_encoding_applicable(vec![
+            vec![Some(""), None],
+            vec![None, Some("")]
+        ]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![
-                vec![Some(""), None],
-                vec![None, Some("")]
-            ])
-        );
-
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![
-                vec![None, None],
-                vec![None, None]
-            ])
-        );
+        assert!(!is_fixed_size_encoding_applicable(vec![
+            vec![None, None],
+            vec![None, None]
+        ]));
     }
 }

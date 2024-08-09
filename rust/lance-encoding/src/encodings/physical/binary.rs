@@ -455,7 +455,6 @@ fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
 
 impl ArrayEncoder for BinaryEncoder {
     fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        println!("Using fixed size encoding");
         let (index_array, null_adjustment) = get_indices_from_string_arrays(arrays);
         let encoded_indices = self.indices_encoder.encode(&[index_array], buffer_index)?;
 
