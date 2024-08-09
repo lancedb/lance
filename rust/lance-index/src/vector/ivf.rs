@@ -14,6 +14,7 @@ use lance_linalg::{
     distance::{DistanceType, MetricType},
     kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array},
 };
+use tracing::instrument;
 
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::{
@@ -262,6 +263,7 @@ impl IvfTransformer {
 }
 
 impl Transformer for IvfTransformer {
+    #[instrument(name = "IvfTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut batch = batch.clone();
         for transform in self.transforms.as_slice() {

@@ -152,6 +152,43 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)
 
 
+@pytest.mark.cuda
+def test_vector_transform_with_precomputed_partitions(
+    tmpdir, rand_dataset, rand_ivf, rand_pq
+):
+    fragments = list(rand_dataset.get_fragments())
+    builder = IndicesBuilder(rand_dataset, "vectors")
+
+    partitions = builder.assign_ivf_partitions(rand_ivf, accelerator="cuda")
+
+    uri = str(tmpdir / "transformed")
+    builder.transform_vectors(
+        rand_ivf, rand_pq, uri, fragments=fragments, partition_ds_uri=partitions
+    )
+
+    reader = LanceFileReader(uri)
+    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * len(fragments))
+    data = next(reader.read_all(batch_size=10000).to_batches())
+
+    row_id = data.column("_rowid")
+    assert row_id.type == pa.uint64()
+
+    pq_code = data.column("__pq_code")
+    assert pq_code.type == pa.list_(pa.uint8(), 8)
+
+    part_id = data.column("__ivf_part_id")
+    assert part_id.type == pa.uint32()
+
+    # We need to close the file to be able to overwrite it on Windows.
+    del reader
+
+    # test when fragments = None
+    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
+    reader = LanceFileReader(uri)
+
+    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)
+
+
 def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     builder = IndicesBuilder(rand_dataset, "vectors")
     uri = str(tmpdir / "transformed_shuffle")
