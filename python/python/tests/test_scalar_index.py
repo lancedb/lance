@@ -60,7 +60,7 @@ def data_table(indexed_dataset: lance.LanceDataset):
 
 def test_load_indices(indexed_dataset: lance.LanceDataset):
     indices = indexed_dataset.list_indices()
-    vec_idx = next(idx for idx in indices if idx["type"] == "Vector")
+    vec_idx = next(idx for idx in indices if idx["type"] == "IVF_PQ")
     scalar_idx = next(idx for idx in indices if idx["type"] == "BTree")
     assert vec_idx is not None
     assert scalar_idx is not None

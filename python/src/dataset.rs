@@ -458,6 +458,7 @@ impl Dataset {
         scan_in_order: Option<bool>,
         fragments: Option<Vec<FileFragment>>,
         with_row_id: Option<bool>,
+        with_row_address: Option<bool>,
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
@@ -544,6 +545,10 @@ impl Dataset {
 
         if with_row_id.unwrap_or(false) {
             scanner.with_row_id();
+        }
+
+        if with_row_address.unwrap_or(false) {
+            scanner.with_row_address();
         }
 
         if let Some(use_stats) = use_stats {

@@ -383,7 +383,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     if platform.system() == "Windows":
         expected_filepath = expected_filepath.replace("\\", "/")
     expected_statistics = {
-        "index_type": "IVF",
+        "index_type": "IVF_PQ",
         "uuid": index_uuid,
         "uri": expected_filepath,
         "metric_type": "l2",

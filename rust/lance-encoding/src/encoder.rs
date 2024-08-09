@@ -14,7 +14,7 @@ use lance_core::{Error, Result};
 use snafu::{location, Location};
 
 use crate::encodings::logical::r#struct::StructFieldEncoder;
-use crate::encodings::physical::bitpack::{num_compressed_bits, BitpackingBufferEncoder};
+use crate::encodings::physical::bitpack::{bitpack_params, BitpackingBufferEncoder};
 use crate::encodings::physical::buffers::{
     BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder,
 };
@@ -612,9 +612,13 @@ impl CoreBufferEncodingStrategy {
 
         // calculate the number of bits to compress array items into
         let mut num_bits = 0;
+        let mut signed = false;
         for arr in arrays {
-            match num_compressed_bits(arr.clone()) {
-                Some(arr_max) => num_bits = num_bits.max(arr_max),
+            match bitpack_params(arr.clone()) {
+                Some(params) => {
+                    num_bits = num_bits.max(params.num_bits);
+                    signed |= params.signed;
+                }
                 None => return None,
             }
         }
@@ -627,10 +631,7 @@ impl CoreBufferEncodingStrategy {
             return None;
         }
 
-        Some(BitpackingBufferEncoder::new(
-            num_bits,
-            !data_type.is_unsigned_integer(),
-        ))
+        Some(BitpackingBufferEncoder::new(num_bits, signed))
     }
 }
 

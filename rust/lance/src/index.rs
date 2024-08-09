@@ -502,6 +502,7 @@ impl DatasetIndexExt for Dataset {
             .map(|idx| idx.statistics())
             .collect::<Result<Vec<_>>>()?;
 
+        let index_type = indices[0].index_type().to_string();
         let unindexed_fragments = self.unindexed_fragments(index_name).await?;
         let mut num_unindexed_rows = 0;
         for f in unindexed_fragments.iter() {
@@ -515,7 +516,7 @@ impl DatasetIndexExt for Dataset {
         let num_indexed_rows = self.count_rows(None).await? - num_unindexed_rows;
 
         let stats = json!({
-            "index_type": indices_stats[0]["index_type"],
+            "index_type": index_type,
             "name": index_name,
             "num_indices": metadatas.len(),
             "indices": indices_stats,

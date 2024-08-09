@@ -397,8 +397,14 @@ pub(crate) mod tests {
                 4,
             ),
             (
+                // check it will not pack with signed bit if all values of signed type are positive
+                DataType::Int8,
+                Arc::new(Int8Array::from_iter_values(vec![0, 2, 3, 4, 5])),
+                3,
+            ),
+            (
                 DataType::Int16,
-                Arc::new(Int16Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 8])),
+                Arc::new(Int16Array::from_iter_values(vec![0, 1, 2, 3, -4, 5 << 8])),
                 12,
             ),
             (
@@ -718,6 +724,15 @@ pub(crate) mod tests {
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
                         // this range should always give 16 bits
                         Uniform::new(-120 << 8, 120 << 8),
+                    ),
+                ),
+            ),
+            // check that it works for all positive integers even if type is signed
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(10, 20),
                     ),
                 ),
             ),
