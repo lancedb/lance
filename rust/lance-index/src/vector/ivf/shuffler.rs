@@ -354,7 +354,8 @@ pub async fn shuffle_dataset(
 
     // step 3: load the sorted chunks, consumers are expect to be responsible for merging the streams
     let start = std::time::Instant::now();
-    let stream = shuffler.load_partitioned_shuffles(partition_files).await?;
+    let stream =
+        IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files).await?;
     info!("merged partitioned shuffles in {:?}", start.elapsed());
 
     Ok(stream)
@@ -781,7 +782,7 @@ impl IvfShuffler {
     }
 
     pub async fn load_partitioned_shuffles(
-        &self,
+        basedir: &Path,
         files: Vec<String>,
     ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
         // impl RecordBatchStream
@@ -789,7 +790,7 @@ impl IvfShuffler {
 
         for file in files {
             let object_store = Arc::new(ObjectStore::local());
-            let path = self.output_dir.child(file);
+            let path = basedir.child(file);
             let scan_scheduler = ScanScheduler::new(
                 object_store,
                 SchedulerConfig::fast_and_not_too_ram_intensive(),
@@ -954,10 +955,10 @@ mod test {
 
         assert_eq!(partition_files.len(), 1);
 
-        let mut result_stream = shuffler
-            .load_partitioned_shuffles(partition_files)
-            .await
-            .unwrap();
+        let mut result_stream =
+            IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files)
+                .await
+                .unwrap();
 
         let mut num_batches = 0;
         let mut stream = result_stream.pop().unwrap();
@@ -979,10 +980,10 @@ mod test {
 
         assert_eq!(partition_files.len(), 1);
 
-        let mut result_stream = shuffler
-            .load_partitioned_shuffles(partition_files)
-            .await
-            .unwrap();
+        let mut result_stream =
+            IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files)
+                .await
+                .unwrap();
 
         let mut num_batches = 0;
         let mut stream = result_stream.pop().unwrap();
@@ -1004,10 +1005,10 @@ mod test {
 
         assert_eq!(partition_files.len(), 100);
 
-        let mut result_stream = shuffler
-            .load_partitioned_shuffles(partition_files)
-            .await
-            .unwrap();
+        let mut result_stream =
+            IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files)
+                .await
+                .unwrap();
 
         let mut num_batches = 0;
         result_stream.reverse();
@@ -1034,10 +1035,10 @@ mod test {
 
         assert_eq!(partition_files.len(), 1);
 
-        let mut result_stream = shuffler
-            .load_partitioned_shuffles(partition_files)
-            .await
-            .unwrap();
+        let mut result_stream =
+            IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files)
+                .await
+                .unwrap();
 
         let mut num_batches = 0;
         result_stream.reverse();
@@ -1063,10 +1064,10 @@ mod test {
         let partition_files = shuffler.write_partitioned_shuffles(1, 32).await.unwrap();
         assert_eq!(partition_files.len(), 200);
 
-        let mut result_stream = shuffler
-            .load_partitioned_shuffles(partition_files)
-            .await
-            .unwrap();
+        let mut result_stream =
+            IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files)
+                .await
+                .unwrap();
 
         let mut num_batches = 0;
         result_stream.reverse();
@@ -1141,10 +1142,10 @@ mod test {
 
         assert_eq!(partition_files.len(), expected_num_part_files as usize);
 
-        let mut result_stream = shuffler
-            .load_partitioned_shuffles(partition_files)
-            .await
-            .unwrap();
+        let mut result_stream =
+            IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files)
+                .await
+                .unwrap();
 
         let mut num_batches = 0;
         result_stream.reverse();
