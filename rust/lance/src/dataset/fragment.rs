@@ -722,7 +722,7 @@ impl FileFragment {
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
         let reader = self
-            .open_reader(&some_file, None, None, 0)
+            .open_reader(some_file, None, None, 0)
             .await?
             .ok_or_else(|| Error::Internal {
                 message: format!(

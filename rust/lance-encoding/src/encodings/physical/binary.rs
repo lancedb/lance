@@ -115,7 +115,6 @@ struct IndirectData {
     offsets_type: DataType,
     validity: BooleanBuffer,
     bytes_decoder_fut: BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>,
-    num_bytes: u64,
 }
 
 impl PageScheduler for BinaryPageScheduler {
@@ -174,7 +173,6 @@ impl PageScheduler for BinaryPageScheduler {
             let mut indices_builder = IndicesNormalizer::new(num_rows, null_adjustment);
             let mut bytes_ranges = Vec::new();
             let mut curr_offset_index = 0;
-            let mut num_bytes = 0;
 
             for curr_row_range in ranges.iter() {
                 let row_start = curr_row_range.start;
@@ -201,7 +199,6 @@ impl PageScheduler for BinaryPageScheduler {
                     .normalize(*curr_indices.values().last().unwrap())
                     .1;
                 if first != last {
-                    num_bytes += last - first;
                     bytes_ranges.push(first..last);
                 }
 
@@ -217,23 +214,19 @@ impl PageScheduler for BinaryPageScheduler {
             let bytes_decoder_fut =
                 copy_bytes_scheduler.schedule_ranges(&bytes_ranges, &copy_scheduler, top_level_row);
 
-            log::info!("Done scheduling binary data");
             Ok(IndirectData {
                 decoded_indices,
                 validity,
                 offsets_type,
                 bytes_decoder_fut,
-                num_bytes,
             })
         })
         // Propagate join panic
         .map(|join_handle| join_handle.unwrap())
         .and_then(|indirect_data| {
-            let num_bytes = indirect_data.num_bytes;
             async move {
                 // Later, this will be called once the decoder actually starts polling.  At that point
                 // we await the bytes (releasing the backpressure)
-                log::info!("Waiting for binary data with {} bytes", num_bytes);
                 let bytes_decoder = indirect_data.bytes_decoder_fut.await?;
                 Ok(Box::new(BinaryPageDecoder {
                     decoded_indices: indirect_data.decoded_indices,

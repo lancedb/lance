@@ -1106,15 +1106,10 @@ impl BatchDecodeStream {
             return Ok(self.rows_scheduled);
         }
         while self.rows_scheduled < scheduled_need {
-            log::debug!("Decoder waiting for scanline");
             let next_message = self.context.source.recv().await;
             match next_message {
                 Some(scan_line) => {
                     let scan_line = scan_line?;
-                    log::debug!(
-                        "Decoder received scanline with rows_scheudled={}",
-                        scan_line.scheduled_so_far
-                    );
                     self.rows_scheduled = scan_line.scheduled_so_far;
                     for decoder in scan_line.decoders {
                         self.accept_decoder(decoder)?;

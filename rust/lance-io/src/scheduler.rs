@@ -25,6 +25,14 @@ const BACKPRESSURE_MIN: u64 = 5;
 // Don't log backpressure warnings more than once / minute
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
 
+// We want to allow requests that have a lower priority than any
+// currently in-flight request.  This helps avoid potential deadlocks
+// related to backpressure.  Unfortunately, it is quite expensive to
+// keep track of which priorities are in-flight.
+//
+// TODO: At some point it would be nice if we can optimize this away but
+// in_flight should remain relatively small (generally less than 256 items)
+// and has not shown itself to be a bottleneck yet.
 struct PrioritiesInFlight {
     in_flight: Vec<u128>,
 }
@@ -66,10 +74,13 @@ struct IoQueueState {
     bytes_avail: i64,
     // Pending I/O requests
     pending_requests: BinaryHeap<IoTask>,
+    // Priorities of in-flight requests
     priorities_in_flight: PrioritiesInFlight,
     // Set when the scheduler is finished to notify the I/O loop to shut down
     closed: bool,
+    // Time when the scheduler started
     start: Instant,
+    // Last time we warned about backpressure
     last_warn: AtomicU64,
 }
 
@@ -123,7 +134,7 @@ impl IoQueueState {
             self.bytes_avail -= task.num_bytes() as i64;
             if self.bytes_avail < 0 {
                 // This can happen when we admit special priority requests
-                log::info!(
+                log::debug!(
                     "Backpressure throttle temporarily exceeded by {} bytes due to priority I/O",
                     -self.bytes_avail
                 );
@@ -138,6 +149,7 @@ impl IoQueueState {
 // This is modeled after the MPSC queue described here: https://docs.rs/tokio/latest/tokio/sync/struct.Notify.html
 //
 // However, it only needs to be SPSC since there is only one "scheduler thread"
+// and one I/O loop.
 struct IoQueue {
     // Queue state
     state: Mutex<IoQueueState>,
