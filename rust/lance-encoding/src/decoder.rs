@@ -736,6 +736,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
                     .page_infos
                     .iter()
+                    .filter(|offsets_page| offsets_page.num_rows > 0)
                     .map(|offsets_page| {
                         if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
                             &offsets_page.encoding.array_encoding
