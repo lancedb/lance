@@ -57,6 +57,8 @@ impl PrimitiveFieldScheduler {
     ) -> Self {
         let page_schedulers = pages
             .iter()
+            // Buggy versions of Lance could sometimes create empty pages
+            .filter(|page| page.num_rows > 0)
             .map(|page| {
                 let page_buffers = PageBuffers {
                     column_buffers: buffers,
