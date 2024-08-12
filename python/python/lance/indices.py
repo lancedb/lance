@@ -426,6 +426,7 @@ class IndicesBuilder:
             pq.codebook,
             dest_uri,
             fragments,
+            partition_ds_uri,
         )
 
     def shuffle_transformed_vectors(

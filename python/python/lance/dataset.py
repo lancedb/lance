@@ -247,6 +247,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         use_stats: bool = True,
         fast_search: bool = False,
     ) -> LanceScanner:
@@ -348,6 +349,7 @@ class LanceDataset(pa.dataset.Dataset):
             .scan_in_order(scan_in_order)
             .with_fragments(fragments)
             .with_row_id(with_row_id)
+            .with_row_address(with_row_address)
             .use_stats(use_stats)
             .fast_search(fast_search)
         )
@@ -395,6 +397,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         use_stats: bool = True,
         fast_search: bool = False,
         full_text_query: Optional[Union[str, dict]] = None,
@@ -443,6 +446,8 @@ class LanceDataset(pa.dataset.Dataset):
             Run filter before the vector search.
         with_row_id: bool, default False
             Return row ID.
+        with_row_address: bool, default False
+            Return row address
         use_stats: bool, default True
             Use stats pushdown during filters.
         full_text_query: str or dict, optional
@@ -473,6 +478,7 @@ class LanceDataset(pa.dataset.Dataset):
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
             use_stats=use_stats,
             fast_search=fast_search,
             full_text_query=full_text_query,
@@ -524,6 +530,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         use_stats: bool = True,
         full_text_query: Optional[Union[str, dict]] = None,
         **kwargs,
@@ -551,6 +558,7 @@ class LanceDataset(pa.dataset.Dataset):
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
             use_stats=use_stats,
             full_text_query=full_text_query,
         ).to_batches()
@@ -2132,6 +2140,7 @@ class ScannerBuilder:
         self._scan_in_order = True
         self._fragments = None
         self._with_row_id = False
+        self._with_row_address = False
         self._use_stats = True
         self._fast_search = None
         self._full_text_query = None
@@ -2234,6 +2243,19 @@ class ScannerBuilder:
     def with_row_id(self, with_row_id: bool = True) -> ScannerBuilder:
         """Enable returns with row IDs."""
         self._with_row_id = with_row_id
+        return self
+
+    def with_row_address(self, with_row_address: bool = True) -> ScannerBuilder:
+        """
+        Enables returns with row addresses.
+
+        Row addresses are a unique but unstable identifier for each row in the
+        dataset that consists of the fragment id (upper 32 bits) and the row
+        offset in the fragment (lower 32 bits).  Row IDs are generally preferred
+        since they do not change when a row is modified or compacted.  However,
+        row addresses may be useful in some advanced use cases.
+        """
+        self._with_row_address = with_row_address
         return self
 
     def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
@@ -2354,6 +2376,7 @@ class ScannerBuilder:
             self._scan_in_order,
             self._fragments,
             self._with_row_id,
+            self._with_row_address,
             self._use_stats,
             self._substrait_filter,
             self._fast_search,

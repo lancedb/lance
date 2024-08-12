@@ -715,7 +715,25 @@ impl Index for IVFIndex {
     }
 
     fn index_type(&self) -> IndexType {
-        IndexType::Vector
+        if self.sub_index.as_any().downcast_ref::<PQIndex>().is_some() {
+            IndexType::IvfPq
+        } else if self
+            .sub_index
+            .as_any()
+            .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
+            .is_some()
+        {
+            IndexType::IvfHnswSq
+        } else if self
+            .sub_index
+            .as_any()
+            .downcast_ref::<HNSWIndex<ProductQuantizer>>()
+            .is_some()
+        {
+            IndexType::IvfHnswPq
+        } else {
+            IndexType::Vector
+        }
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -728,7 +746,7 @@ impl Index for IVFIndex {
         let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
 
         Ok(serde_json::to_value(IvfIndexStatistics {
-            index_type: "IVF".to_string(),
+            index_type: self.index_type().to_string(),
             uuid: self.uuid.clone(),
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),

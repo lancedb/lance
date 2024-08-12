@@ -189,7 +189,7 @@ impl Index for InvertedIndex {
     }
 
     fn index_type(&self) -> crate::IndexType {
-        crate::IndexType::Scalar
+        crate::IndexType::Inverted
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {

@@ -2491,7 +2491,7 @@ mod tests {
             serde_json::from_str(&dataset.index_statistics("embeddings_idx").await.unwrap())
                 .unwrap();
         let actual_statistics = actual_statistics.as_object().unwrap();
-        assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF");
+        assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF_PQ");
 
         let deltas = actual_statistics["indices"].as_array().unwrap();
         assert_eq!(deltas.len(), 1);
