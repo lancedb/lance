@@ -394,6 +394,13 @@ impl U64Segment {
     }
 
     pub fn mask(&mut self, positions: &[u32]) {
+        if positions.is_empty() {
+            return;
+        }
+        if positions.len() == self.len() {
+            *self = Self::Range(0..0);
+            return;
+        }
         let count = (self.len() - positions.len()) as u64;
         let sorted = match self {
             Self::Range(_) => true,

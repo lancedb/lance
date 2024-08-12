@@ -745,6 +745,18 @@ async fn rechunk_stable_row_ids(
         })
         .await?;
 
+    debug_assert_eq!(
+        { old_sequences.iter().map(|(_, seq)| seq.len()).sum::<u64>() },
+        {
+            new_fragments
+                .iter()
+                .map(|frag| frag.physical_rows.unwrap() as u64)
+                .sum::<u64>()
+        },
+        "{:?}",
+        old_sequences
+    );
+
     let new_sequences = lance_table::rowids::rechunk_sequences(
         old_sequences
             .into_iter()
