@@ -18,9 +18,7 @@ use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use futures::stream::StreamExt;
-use lance::{
-    io::{ObjectStore, RecordBatchStream},
-};
+use lance::io::{ObjectStore, RecordBatchStream};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::{
     v2::{
