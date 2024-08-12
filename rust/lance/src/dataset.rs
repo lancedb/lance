@@ -1494,9 +1494,11 @@ mod tests {
     use arrow::array::as_struct_array;
     use arrow::compute::concat_batches;
     use arrow_array::{
-        builder::StringDictionaryBuilder, cast::as_string_array, types::Int32Type, ArrayRef,
-        DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
-        RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
+        builder::StringDictionaryBuilder,
+        cast::as_string_array,
+        types::{Float32Type, Int32Type},
+        ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
+        Int8DictionaryArray, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
     use arrow_array::{FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
     use arrow_ord::sort::sort_to_indices;
@@ -1504,7 +1506,7 @@ mod tests {
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
@@ -3192,28 +3194,11 @@ mod tests {
         #[values(false, true)] use_stable_row_id: bool,
     ) {
         // Create a table
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "vec",
-            DataType::FixedSizeList(
-                Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                128,
-            ),
-            false,
-        )]));
-
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let vectors = Arc::new(
-            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
-                Float32Array::from_iter_values((0..128).map(|_| 0.1_f32)),
-                128,
-            )
-            .unwrap(),
-        );
-
-        let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
-        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let data = gen().col("vec", array::rand_vec::<Float32Type>(Dimension::from(32)));
+        let reader = data.into_reader_rows(RowCount::from(1000), BatchCount::from(10));
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -3225,7 +3210,18 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
         dataset.delete("true").await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        // Indices should be gone if it's fragments are deleted
+        assert_eq!(indices.len(), 0);
 
         let mut stream = dataset
             .scan()
