@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -914,6 +915,22 @@ impl Scanner {
             FilterPlan::default()
         };
 
+        let scan_range = if filter_plan.has_any_filter() {
+            // If there is a filter we can't pushdown limit / offset
+            None
+        } else {
+            match (self.limit, self.offset) {
+                (None, None) => None,
+                (Some(limit), None) => Some(0..limit as u64),
+                (None, Some(offset)) => {
+                    let num_rows = self.dataset.count_all_rows().await?;
+                    Some(offset as u64..num_rows as u64)
+                }
+                (Some(limit), Some(offset)) => Some(offset as u64..(offset + limit) as u64),
+            }
+        };
+        let mut use_limit_node = true;
+
         // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
         let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
             (Some(_), None) => {
@@ -974,7 +991,19 @@ impl Scanner {
                         } else {
                             self.projection_plan.physical_schema.clone()
                         };
-                        self.scan(with_row_id, self.with_row_address, false, schema)
+                        if !self.dataset.is_legacy_storage() {
+                            // If this is a v2 dataset then we can pushdown limit/offset (via
+                            // scan_range and we zero out limit/offset so we don't apply it
+                            // twice)
+                            use_limit_node = false;
+                        }
+                        self.scan(
+                            with_row_id,
+                            self.with_row_address,
+                            false,
+                            scan_range,
+                            schema,
+                        )
                     }
                 }
             }
@@ -1050,7 +1079,7 @@ impl Scanner {
         }
 
         // Stage 4: limit / offset
-        if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
+        if use_limit_node && (self.limit.unwrap_or(0) > 0 || self.offset.is_some()) {
             plan = self.limit_node(plan);
         }
 
@@ -1231,7 +1260,7 @@ impl Scanner {
                 self.scalar_indexed_scan(&vector_scan_projection, index_query)
                     .await?
             } else {
-                self.scan(true, false, true, vector_scan_projection)
+                self.scan(true, false, true, None, vector_scan_projection)
             };
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 let planner = Planner::new(plan.schema());
@@ -1276,6 +1305,8 @@ impl Scanner {
                 true,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),
+                // Can't pushdown limit/offset in an ANN search
+                None,
                 // We are re-ordering anyways, so no need to get data in data
                 // in a deterministic order.
                 false,
@@ -1414,6 +1445,8 @@ impl Scanner {
                 false,
                 Arc::new(schema.clone()),
                 missing_frags.into(),
+                // No pushdown of limit/offset when doing scalar indexed scan
+                None,
                 false,
             );
             let filtered = Arc::new(FilterExec::try_new(physical_refine_expr, new_data_scan)?);
@@ -1448,6 +1481,7 @@ impl Scanner {
         with_row_id: bool,
         with_row_address: bool,
         with_make_deletions_null: bool,
+        range: Option<Range<u64>>,
         projection: Arc<Schema>,
     ) -> Arc<dyn ExecutionPlan> {
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
@@ -1467,10 +1501,12 @@ impl Scanner {
             with_make_deletions_null,
             projection,
             fragments,
+            range,
             ordered,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_fragments(
         &self,
         with_row_id: bool,
@@ -1478,11 +1514,13 @@ impl Scanner {
         with_make_deletions_null: bool,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
+        range: Option<Range<u64>>,
         ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
             fragments,
+            range,
             projection,
             self.get_batch_size(),
             self.batch_readahead,
@@ -1620,7 +1658,7 @@ impl Scanner {
                 // of the filter columns to determine the valid row ids.
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-                let filter_input = self.scan(true, false, true, filter_schema);
+                let filter_input = self.scan(true, false, true, None, filter_schema);
                 let planner = Planner::new(filter_input.schema());
                 let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
                 let filtered_row_ids =

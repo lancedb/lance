@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::any::Any;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -23,10 +24,11 @@ use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
+use snafu::{location, Location};
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
 use crate::dataset::scanner::DEFAULT_FRAGMENT_READAHEAD;
@@ -56,6 +58,11 @@ async fn open_file(
     Ok(reader)
 }
 
+struct FragmentWithRange {
+    fragment: FileFragment,
+    range: Option<Range<u32>>,
+}
+
 /// Dataset Scan Node.
 pub struct LanceStream {
     inner_stream: stream::BoxStream<'static, Result<RecordBatch>>,
@@ -74,6 +81,8 @@ impl LanceStream {
     /// Parameters
     ///
     ///  - ***dataset***: The source dataset.
+    ///  - ***fragments***: The fragments to scan.
+    ///  - ***offsets***: The range of offsets to scan (scan all rows if None).
     ///  - ***projection***: the projection [Schema].
     ///  - ***filter***: filter [`PhysicalExpr`], optional.
     ///  - ***read_size***: the number of rows to read for each request.
@@ -88,6 +97,7 @@ impl LanceStream {
     pub fn try_new(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         read_size: usize,
         batch_readahead: usize,
@@ -107,6 +117,7 @@ impl LanceStream {
             Self::try_new_v2(
                 dataset,
                 fragments,
+                offsets,
                 projection,
                 read_size,
                 fragment_readahead,
@@ -135,6 +146,7 @@ impl LanceStream {
     pub fn try_new_v2(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         batch_size: usize,
         fragment_parallelism: Option<usize>,
@@ -166,10 +178,57 @@ impl LanceStream {
             frag_parallelism
         );
 
-        let file_fragments = fragments
+        let mut file_fragments = fragments
             .iter()
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
+            .map(|fragment| FragmentWithRange {
+                fragment,
+                range: None,
+            })
             .collect::<Vec<_>>();
+
+        if let Some(offsets) = offsets {
+            let mut rows_to_skip = offsets.start;
+            let mut rows_to_take = offsets.end - offsets.start;
+            let mut filtered_fragments = Vec::with_capacity(file_fragments.len());
+
+            let mut frags_iter = file_fragments.into_iter();
+            while rows_to_take > 0 {
+                if let Some(next_frag) = frags_iter.next() {
+                    let num_rows_in_frag = next_frag
+                        .fragment
+                        .count_rows()
+                        // count_rows should be a fast operation in v2 files
+                        .now_or_never()
+                        .ok_or(Error::Internal {
+                            message: "Encountered fragment without row count metadata in v2 file"
+                                .to_string(),
+                            location: location!(),
+                        })??;
+                    if rows_to_skip >= num_rows_in_frag as u64 {
+                        rows_to_skip -= num_rows_in_frag as u64;
+                    } else {
+                        let rows_to_take_in_frag =
+                            (num_rows_in_frag as u64 - rows_to_skip).min(rows_to_take);
+                        let range =
+                            Some(rows_to_skip as u32..(rows_to_skip + rows_to_take_in_frag) as u32);
+                        filtered_fragments.push(FragmentWithRange {
+                            fragment: next_frag.fragment,
+                            range,
+                        });
+                        rows_to_skip = 0;
+                        rows_to_take -= rows_to_take_in_frag;
+                    }
+                } else {
+                    log::warn!(
+                        "Ran out of fragments before we were done scanning for range: {:?}",
+                        offsets
+                    );
+                    rows_to_take = 0;
+                }
+            }
+            file_fragments = filtered_fragments;
+        }
 
         let scan_scheduler = ScanScheduler::new(
             dataset.object_store.clone(),
@@ -182,7 +241,7 @@ impl LanceStream {
         let mut current_priority = 0;
         for frag in &file_fragments {
             priorities.push(current_priority);
-            current_priority += frag.num_data_files();
+            current_priority += frag.fragment.num_data_files();
         }
 
         let batches = stream::iter(file_fragments.into_iter().zip(priorities))
@@ -194,7 +253,7 @@ impl LanceStream {
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
                 > = tokio::spawn(async move {
                     let reader = open_file(
-                        file_fragment,
+                        file_fragment.fragment,
                         project_schema,
                         with_row_id,
                         with_row_address,
@@ -202,7 +261,11 @@ impl LanceStream {
                         Some((scan_scheduler, priority as u64)),
                     )
                     .await?;
-                    let batch_stream = reader.read_all(batch_size as u32)?.boxed();
+                    let batch_stream = if let Some(range) = file_fragment.range {
+                        reader.read_range(range, batch_size as u32)?.boxed()
+                    } else {
+                        reader.read_all(batch_size as u32)?.boxed()
+                    };
                     let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
                         batch_stream
                             .map(|fut| {
@@ -375,6 +438,7 @@ impl Stream for LanceStream {
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,
     fragments: Arc<Vec<Fragment>>,
+    range: Option<Range<u64>>,
     projection: Arc<Schema>,
     read_size: usize,
     batch_readahead: usize,
@@ -418,6 +482,7 @@ impl LanceScanExec {
     pub fn new(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        range: Option<Range<u64>>,
         projection: Arc<Schema>,
         read_size: usize,
         batch_readahead: usize,
@@ -448,6 +513,7 @@ impl LanceScanExec {
         Self {
             dataset,
             fragments,
+            range,
             projection,
             read_size,
             batch_readahead,
@@ -502,6 +568,7 @@ impl ExecutionPlan for LanceScanExec {
         Ok(Box::pin(LanceStream::try_new(
             self.dataset.clone(),
             self.fragments.clone(),
+            self.range.clone(),
             self.projection.clone(),
             self.read_size,
             self.batch_readahead,
