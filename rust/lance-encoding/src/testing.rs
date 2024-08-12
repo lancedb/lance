@@ -30,6 +30,7 @@ use crate::{
 
 const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
 
+#[derive(Debug)]
 pub(crate) struct SimulatedScheduler {
     data: Bytes,
 }

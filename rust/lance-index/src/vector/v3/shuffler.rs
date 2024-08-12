@@ -223,10 +223,8 @@ impl IvfShufflerReader {
         output_dir: Path,
         partition_sizes: Vec<usize>,
     ) -> Self {
-        let scheduler = ScanScheduler::new(
-            object_store,
-            SchedulerConfig::fast_and_not_too_ram_intensive(),
-        );
+        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+        let scheduler = ScanScheduler::new(object_store, scheduler_config);
         Self {
             scheduler,
             output_dir,

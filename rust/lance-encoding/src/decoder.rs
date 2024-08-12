@@ -443,7 +443,13 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
     ) -> Result<ChosenFieldScheduler<'a>> {
         self.path.push_back(child_idx);
         self.cur_idx = 0;
-        self.next(field, column_infos, buffers)
+        match self.next(field, column_infos, buffers) {
+            Ok(mut next) => {
+                next.0.path.pop_back();
+                Ok(next)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Starts the decoding process for a field

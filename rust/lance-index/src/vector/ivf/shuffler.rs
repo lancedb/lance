@@ -366,10 +366,8 @@ impl IvfShuffler {
                 let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
                 total_batches.push(reader.num_batches());
             } else {
-                let scheduler = ScanScheduler::new(
-                    object_store.into(),
-                    SchedulerConfig::fast_and_not_too_ram_intensive(),
-                );
+                let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+                let scheduler = ScanScheduler::new(object_store.into(), scheduler_config);
                 let file = scheduler.open_file(&path).await?;
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let num_batches = reader.metadata().num_rows / (SHUFFLE_BATCH_SIZE as u64);
@@ -384,7 +382,7 @@ impl IvfShuffler {
         let mut partition_sizes = vec![0; self.num_partitions as usize];
         let scheduler = ScanScheduler::new(
             Arc::new(object_store.clone()),
-            SchedulerConfig::fast_and_not_too_ram_intensive(),
+            SchedulerConfig::max_bandwidth(&object_store),
         );
 
         for &ShuffleInput {
@@ -524,10 +522,8 @@ impl IvfShuffler {
                     Self::process_batch_in_shuffle(batch, &mut partitioned_batches).await?;
                 }
             } else {
-                let scheduler = ScanScheduler::new(
-                    Arc::new(object_store),
-                    SchedulerConfig::fast_and_not_too_ram_intensive(),
-                );
+                let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+                let scheduler = ScanScheduler::new(Arc::new(object_store), scheduler_config);
                 let file = scheduler.open_file(&path).await?;
                 let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
                 let mut stream = reader

@@ -646,7 +646,7 @@ impl DatasetIndexInternalExt for Dataset {
             (0, 3) => {
                 let scheduler = ScanScheduler::new(
                     self.object_store.clone(),
-                    SchedulerConfig::fast_and_not_too_ram_intensive(),
+                    SchedulerConfig::max_bandwidth(&self.object_store),
                 );
                 let file = scheduler.open_file(&index_file).await?;
                 let reader =
