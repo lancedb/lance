@@ -101,15 +101,21 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 mod test {
     use std::ops::Range;
 
-    use crate::dataset::{builder::DatasetBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::{
+        dataset::{builder::DatasetBuilder, UpdateBuilder, WriteMode, WriteParams},
+        index::vector::VectorIndexParams,
+    };
 
     use super::*;
 
+    use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
     use lance_core::{utils::address::RowAddress, ROW_ADDR, ROW_ID};
+    use lance_datagen::{array, gen, Dimension, RowCount};
     use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+    use lance_linalg::distance::MetricType;
 
     fn sequence_batch(values: Range<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -396,24 +402,50 @@ mod test {
     #[tokio::test]
     async fn test_row_ids_update() {
         // Updated fragments get fresh row ids.
-        let num_rows = 5u64;
-        let batch = sequence_batch(0..num_rows as i32);
+        let num_rows = 5_000u64;
+        let batch = gen()
+            .col("int", array::step::<Int32Type>())
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(32)))
+            .into_batch_rows(RowCount::from(num_rows))
+            .unwrap();
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_stable_row_ids: true,
             ..Default::default()
         };
-        let dataset = Dataset::write(reader, "memory://", Some(write_params))
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest().next_row_id, num_rows);
+
+        // Create scalar and vector indices
+        dataset
+            .create_index(
+                &["int"],
+                IndexType::BTree,
+                Some("int_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                false,
+            )
             .await
             .unwrap();
 
-        assert_eq!(dataset.manifest().next_row_id, num_rows);
-
         let dataset = UpdateBuilder::new(Arc::new(dataset))
-            .update_where("id = 3")
+            .update_where("int = 3")
             .unwrap()
-            .set("id", "100")
+            .set("int", "100")
             .unwrap()
             .build()
             .unwrap()
@@ -424,9 +456,35 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_some());
         // Old address is still there.
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(0, 3)));
+        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(0, 2)));
         // New location is there.
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(1, 0)));
+        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(1, 0)));
+
+        // int should not contain the new fragment in it's bitmap
+        let index = dataset
+            .load_indices_by_name("name")
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            index.fragment_bitmap.unwrap().iter().collect::<Vec<_>>(),
+            vec![0],
+        );
+
+        // vec should contain the new fragment in it's bitmap
+        let index = dataset
+            .load_indices_by_name("vec_idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            index.fragment_bitmap.unwrap().iter().collect::<Vec<_>>(),
+            vec![0, 1],
+        );
     }
 
     // TODO: query / scan / take after deletion, compaction, then deletion
