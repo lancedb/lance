@@ -157,6 +157,7 @@ impl RowIdSequence {
         let mut local_positions = Vec::new();
         let mut positions_iter = positions.into_iter();
         let mut curr_position = positions_iter.next();
+        let mut offset = 0;
         let mut cutoff = 0;
 
         for segment in &mut self.0 {
@@ -166,7 +167,7 @@ impl RowIdSequence {
                 if position >= cutoff {
                     break;
                 }
-                local_positions.push(position);
+                local_positions.push(position - offset);
                 curr_position = positions_iter.next();
             }
 
@@ -174,6 +175,7 @@ impl RowIdSequence {
                 segment.mask(&local_positions);
                 local_positions.clear();
             }
+            offset = cutoff;
         }
 
         Ok(())
@@ -798,11 +800,15 @@ mod test {
         sequence.mask(positions_to_remove).unwrap();
         let expected = RowIdSequence(vec![
             U64Segment::Range(0..4),
-            U64Segment::RangeWithHoles {
-                range: 53..60,
-                holes: vec![53, 54, 55].into(),
+            U64Segment::RangeWithBitmap {
+                range: 50..60,
+                bitmap: [
+                    true, true, true, false, false, false, true, true, true, true,
+                ]
+                .as_slice()
+                .into(),
             },
-            U64Segment::SortedArray(vec![9].into()),
+            U64Segment::Range(9..10),
             U64Segment::RangeWithBitmap {
                 range: 10..15,
                 bitmap: [true, false, false, false, true].as_slice().into(),
