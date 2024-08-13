@@ -91,13 +91,15 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
                 let offsets_vec = (0..(num_rows + 1))
                     .map(|i| i * self.byte_width)
                     .collect::<Vec<_>>();
-                Buffer::from_slice_ref(offsets_vec)
+
+                ScalarBuffer::from(offsets_vec).into_inner()
             }
             4 => {
                 let offsets_vec = (0..(num_rows as u32 + 1))
                     .map(|i| i * self.byte_width as u32)
                     .collect::<Vec<_>>();
-                Buffer::from_slice_ref(offsets_vec)
+
+                ScalarBuffer::from(offsets_vec).into_inner()
             }
             _ => panic!("Unsupported offsets type"),
         };
