@@ -230,9 +230,9 @@ pub fn execute_plan(
     let session_ctx: SessionContext;
     if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
         if options.use_spilling() {
-            session_ctx = DEFAULT_SESSION_CONTEXT.clone();
-        } else {
             session_ctx = DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone();
+        } else {
+            session_ctx = DEFAULT_SESSION_CONTEXT.clone();
         }
     } else {
         session_ctx = new_session_context(options)
