@@ -227,17 +227,17 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
-    let session_ctx = match options {
-        LanceExecutionOptions {
-            use_spilling: false,
-            mem_pool_size: None,
-        } => DEFAULT_SESSION_CONTEXT.clone(),
-        LanceExecutionOptions {
-            use_spilling: true,
-            mem_pool_size: None,
-        } => DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone(),
-        _ => new_session_context(options),
-    };
+    let session_ctx: SessionContext;
+    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
+        if options.use_spilling() {
+            session_ctx = DEFAULT_SESSION_CONTEXT.clone();
+        } else {
+            session_ctx = DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone();
+        }
+    } else {
+        session_ctx = new_session_context(options)
+    }
+
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
