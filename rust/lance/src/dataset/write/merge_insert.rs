@@ -43,9 +43,7 @@ use datafusion::{
 };
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::{
-    chunker::chunk_stream, dataframe::DataFrameExt, exec::DEFAULT_SESSION_CONTEXT_WITH_SPILLING,
-};
+use lance_datafusion::{chunker::chunk_stream, dataframe::DataFrameExt, exec::get_session_context};
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
@@ -594,7 +592,10 @@ impl MergeInsertJob {
     ) -> Result<Vec<Fragment>> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone();
+        let session_ctx = get_session_context(LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        });
         let mut group_stream = session_ctx
             .read_one_shot(source)?
             .sort(vec![col(ROW_ADDR).sort(true, true)])?

@@ -220,13 +220,7 @@ lazy_static! {
     };
 }
 
-/// Executes a plan using default session & runtime configuration
-///
-/// Only executes a single partition.  Panics if the plan has more than one partition.
-pub fn execute_plan(
-    plan: Arc<dyn ExecutionPlan>,
-    options: LanceExecutionOptions,
-) -> Result<SendableRecordBatchStream> {
+pub fn get_session_context(options: LanceExecutionOptions) -> SessionContext {
     let session_ctx: SessionContext;
     if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
         if options.use_spilling() {
@@ -237,6 +231,17 @@ pub fn execute_plan(
     } else {
         session_ctx = new_session_context(options)
     }
+    session_ctx
+}
+
+/// Executes a plan using default session & runtime configuration
+///
+/// Only executes a single partition.  Panics if the plan has more than one partition.
+pub fn execute_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+) -> Result<SendableRecordBatchStream> {
+    let session_ctx = get_session_context(options);
 
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
