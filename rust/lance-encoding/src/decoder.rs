@@ -637,6 +637,7 @@ impl CoreFieldDecoderStrategy {
             positions_and_sizes: &column.buffer_offsets_and_sizes,
         };
         Ok(Arc::new(PrimitiveFieldScheduler::new(
+            column.index,
             data_type.clone(),
             column.page_infos.clone(),
             column_buffers,
@@ -769,6 +770,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     })
                     .unzip();
                 let inner = Arc::new(PrimitiveFieldScheduler::new(
+                    offsets_column.index,
                     DataType::UInt64,
                     Arc::from(inner_infos.into_boxed_slice()),
                     offsets_column_buffers,

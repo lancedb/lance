@@ -679,20 +679,11 @@ impl LogicalPageDecoder for ListPageDecoder {
             self.lists_available = 0;
             let offset_wait_start = self.rows_drained + self.lists_available;
             let item_start = self.offsets[offset_wait_start as usize];
-            let mut items_needed =
+            let items_needed =
                 self.offsets[offset_wait_start as usize + num_rows as usize] - item_start;
             if items_needed > 0 {
-                // First discount any already available items
-                let items_already_available = self.item_decoder.as_mut().unwrap().avail();
-                trace!(
-                    "List's items decoder needs {} items and already has {} items available",
-                    items_needed,
-                    items_already_available,
-                );
-                items_needed = items_needed.saturating_sub(items_already_available);
-                if items_needed > 0 {
-                    self.item_decoder.as_mut().unwrap().wait(items_needed).await?;
-                }
+                trace!("Waiting on list items page for {} items", items_needed);
+                self.item_decoder.as_mut().unwrap().wait(items_needed).await?;
             }
             // This is technically undercounting a little.  It's possible that we loaded a big items
             // page with many items and then only needed a few of them for the requested lists.  However,
