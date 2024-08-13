@@ -36,6 +36,66 @@ def test_dataset_optimize(tmp_path: Path):
     assert dataset.version == 3
 
 
+def test_optimize_max_bytes(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    arr = pa.array(range(4 * 1024 * 1024))
+    arr = pa.FixedSizeListArray.from_arrays(arr, 1024)
+    data = pa.table({"a": arr})
+
+    dataset = lance.write_dataset(
+        data, base_dir, max_rows_per_file=2 * 1024, data_storage_version="stable"
+    )
+    assert dataset.version == 1
+    assert len(dataset.get_fragments()) == 2
+
+    # max_bytes_per_file is too small and we get tiny files
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=100 * 1024,
+        materialize_deletions=False,
+        max_bytes_per_file=1000,
+        batch_size=128,
+    )
+
+    # We get 4 fragments here because we don't actually write any data to the file
+    # until we've accumulated 8MiB for a page.
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 4
+    assert metrics.files_removed == 2
+    assert metrics.files_added == 4
+
+    assert dataset.version == 3
+
+    num_frags = len(dataset.get_fragments())
+    assert num_frags == 4
+
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=2 * 1024,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    # max_bytes_per_file is still too small but the batch size
+    # is so large we read the entire input in a single batch
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=100 * 1024,
+        materialize_deletions=False,
+        max_bytes_per_file=1000,
+        batch_size=2 * 1024,
+    )
+
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 2
+    assert metrics.files_removed == 2
+    assert metrics.files_added == 2
+
+    assert dataset.version == 6
+
+    num_frags = len(dataset.get_fragments())
+    assert num_frags == 2
+
+
 def create_table(min, max, nvec, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     tbl = vec_to_table(data=mat)
