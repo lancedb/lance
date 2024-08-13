@@ -282,6 +282,13 @@ fn get_compression_scheme(field_meta: Option<&HashMap<String, String>>) -> Compr
         .unwrap_or(CompressionScheme::None)
 }
 
+const BINARY_DATATYPES: [DataType; 4] = [
+    DataType::Binary,
+    DataType::LargeBinary,
+    DataType::Utf8,
+    DataType::LargeUtf8,
+];
+
 impl CoreArrayEncodingStrategy {
     fn can_use_fsst(data_type: &DataType, data_size: u64, version: LanceFileVersion) -> bool {
         version >= LanceFileVersion::V2_1
@@ -289,24 +296,41 @@ impl CoreArrayEncodingStrategy {
             && data_size > 4 * 1024 * 1024
     }
 
-    fn array_encoder_from_type(
+    fn default_binary_encoder(
+        arrays: &[ArrayRef],
+        data_type: &DataType,
+        data_size: u64,
+        version: LanceFileVersion,
+    ) -> Result<Box<dyn ArrayEncoder>> {
+        let bin_indices_encoder =
+            Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, version, None)?;
+        let bin_bytes_encoder =
+            Self::choose_array_encoder(arrays, &DataType::UInt8, data_size, false, version, None)?;
+
+        let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
+        if Self::can_use_fsst(data_type, data_size, version) {
+            Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+        } else {
+            Ok(bin_encoder)
+        }
+    }
+
+    fn choose_array_encoder(
+        arrays: &[ArrayRef],
         data_type: &DataType,
         data_size: u64,
         use_dict_encoding: bool,
-        use_fixed_size_encoding: bool,
-        byte_width: &u64,
         version: LanceFileVersion,
         field_meta: Option<&HashMap<String, String>>,
     ) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
-                    Self::array_encoder_from_type(
+                    Self::choose_array_encoder(
+                        arrays,
                         inner.data_type(),
                         data_size,
                         use_dict_encoding,
-                        use_fixed_size_encoding,
-                        byte_width,
                         version,
                         None,
                     )?,
@@ -314,23 +338,10 @@ impl CoreArrayEncodingStrategy {
                 )))))
             }
             DataType::Dictionary(key_type, value_type) => {
-                let key_encoder = Self::array_encoder_from_type(
-                    key_type,
-                    data_size,
-                    false,
-                    use_fixed_size_encoding,
-                    byte_width,
-                    version,
-                    None,
-                )?;
-                let value_encoder = Self::array_encoder_from_type(
-                    value_type,
-                    data_size,
-                    false,
-                    use_fixed_size_encoding,
-                    byte_width,
-                    version,
-                    None,
+                let key_encoder =
+                    Self::choose_array_encoder(arrays, key_type, data_size, false, version, None)?;
+                let value_encoder = Self::choose_array_encoder(
+                    arrays, value_type, data_size, false, version, None,
                 )?;
 
                 Ok(Box::new(AlreadyDictionaryEncoder::new(
@@ -340,21 +351,19 @@ impl CoreArrayEncodingStrategy {
             }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
-                    let dict_indices_encoder = Self::array_encoder_from_type(
+                    let dict_indices_encoder = Self::choose_array_encoder(
+                        arrays,
                         &DataType::UInt8,
                         data_size,
                         false,
-                        use_fixed_size_encoding,
-                        byte_width,
                         version,
                         None,
                     )?;
-                    let dict_items_encoder = Self::array_encoder_from_type(
+                    let dict_items_encoder = Self::choose_array_encoder(
+                        arrays,
                         &DataType::Utf8,
                         data_size,
                         false,
-                        use_fixed_size_encoding,
-                        byte_width,
                         version,
                         None,
                     )?;
@@ -363,48 +372,29 @@ impl CoreArrayEncodingStrategy {
                         dict_indices_encoder,
                         dict_items_encoder,
                     )))
-                } else if use_fixed_size_encoding {
-                    // use FixedSizeBinaryEncoder
-                    let bytes_encoder = Self::array_encoder_from_type(
-                        &DataType::UInt8,
-                        data_size,
-                        false,
-                        false,
-                        byte_width,
-                        version,
-                        None,
-                    )?;
+                }
+                // The parent datatype should be binary or utf8
+                // The variable 'data_type' is different here
+                else if BINARY_DATATYPES.contains(arrays[0].data_type()) {
+                    if let Some(byte_width) = check_fixed_size_encoding(arrays) {
+                        // use FixedSizeBinaryEncoder
+                        let bytes_encoder = Self::choose_array_encoder(
+                            arrays,
+                            &DataType::UInt8,
+                            data_size,
+                            false,
+                            version,
+                            None,
+                        )?;
 
-                    Ok(Box::new(BasicEncoder::new(Box::new(
-                        FixedSizeBinaryEncoder::new(bytes_encoder, *byte_width as usize),
-                    ))))
-                } else {
-                    let bin_indices_encoder = Self::array_encoder_from_type(
-                        &DataType::UInt64,
-                        data_size,
-                        false,
-                        use_fixed_size_encoding,
-                        byte_width,
-                        version,
-                        None,
-                    )?;
-                    let bin_bytes_encoder = Self::array_encoder_from_type(
-                        &DataType::UInt8,
-                        data_size,
-                        false,
-                        use_fixed_size_encoding,
-                        byte_width,
-                        version,
-                        None,
-                    )?;
-
-                    let bin_encoder =
-                        Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
-                    if Self::can_use_fsst(data_type, data_size, version) {
-                        Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+                        Ok(Box::new(BasicEncoder::new(Box::new(
+                            FixedSizeBinaryEncoder::new(bytes_encoder, byte_width as usize),
+                        ))))
                     } else {
-                        Ok(bin_encoder)
+                        Self::default_binary_encoder(arrays, data_type, data_size, version)
                     }
+                } else {
+                    Self::default_binary_encoder(arrays, data_type, data_size, version)
                 }
             }
             DataType::Struct(fields) => {
@@ -413,12 +403,11 @@ impl CoreArrayEncodingStrategy {
 
                 for i in 0..num_fields {
                     let inner_datatype = fields[i].data_type();
-                    let inner_encoder = Self::array_encoder_from_type(
+                    let inner_encoder = Self::choose_array_encoder(
+                        arrays,
                         inner_datatype,
                         data_size,
                         use_dict_encoding,
-                        use_fixed_size_encoding,
-                        byte_width,
                         version,
                         None,
                     )?;
@@ -475,10 +464,10 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     true
 }
 
-fn check_fixed_size_encoding(arrays: &[ArrayRef], byte_width: &mut u64) -> bool {
-    // check if all arrays in arrays have the same length
+fn check_fixed_size_encoding(arrays: &[ArrayRef]) -> Option<u64> {
+    // check if all items in arrays have the same length
     if arrays.is_empty() {
-        return false;
+        return None;
     }
 
     // make sure no array has an empty string
@@ -495,7 +484,7 @@ fn check_fixed_size_encoding(arrays: &[ArrayRef], byte_width: &mut u64) -> bool 
             panic!("wrong dtype");
         }
     }) {
-        return false;
+        return None;
     }
 
     let lengths = arrays
@@ -539,17 +528,15 @@ fn check_fixed_size_encoding(arrays: &[ArrayRef], byte_width: &mut u64) -> bool 
             .iter()
             .all(|&x| x == 0 || x == lengths[first_non_zero])
         {
-            return false;
+            return None;
         }
 
         // set the byte width
-        *byte_width = lengths[first_non_zero];
-    } else {
-        // all arrays have null values
-        return false;
+        Some(lengths[first_non_zero])
     }
-
-    true
+    else {
+        None
+    }
 }
 
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
@@ -563,26 +550,15 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
             .map(|arr| arr.get_buffer_memory_size() as u64)
             .sum::<u64>();
         let data_type = arrays[0].data_type();
+
         let use_dict_encoding = data_type == &DataType::Utf8
             && check_dict_encoding(arrays, get_dict_encoding_threshold());
 
-        let binary_datatypes = [
-            DataType::Utf8,
-            DataType::LargeUtf8,
-            DataType::Binary,
-            DataType::LargeBinary,
-        ];
-
-        let byte_width = &mut 0;
-        let use_fixed_size_encoding =
-            binary_datatypes.contains(data_type) && check_fixed_size_encoding(arrays, byte_width);
-
-        Self::array_encoder_from_type(
+        Self::choose_array_encoder(
+            arrays,
             data_type,
             data_size,
             use_dict_encoding,
-            use_fixed_size_encoding,
-            byte_width,
             self.version,
             Some(&field.metadata),
         )
@@ -1072,7 +1048,7 @@ pub mod tests {
             final_arrays.push(arr);
         }
 
-        check_fixed_size_encoding(&final_arrays.clone(), &mut 0)
+        check_fixed_size_encoding(&final_arrays.clone()).is_some()
     }
 
     #[test]
