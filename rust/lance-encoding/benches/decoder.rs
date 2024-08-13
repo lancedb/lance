@@ -261,12 +261,60 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
     });
 }
 
+
+fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("decode_primitive");
+    let data_type = DataType::Utf8;
+    // generate string column with 20 rows
+    let string_data = lance_datagen::gen()
+        .anon_col(lance_datagen::array::rand_type(&DataType::Utf8))
+        .into_batch_rows(lance_datagen::RowCount::from(10000))
+        .unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "string",
+        DataType::Utf8,
+        false,
+    )]));
+
+    let data = RecordBatch::try_new(schema, string_data.columns().to_vec()).unwrap();
+
+    let lance_schema =
+        Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
+    let input_bytes = data.get_array_memory_size();
+    group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
+    let encoding_strategy = CoreFieldEncodingStrategy::default();
+    let encoded = rt
+        .block_on(encode_batch(
+            &data,
+            lance_schema,
+            &encoding_strategy,
+            &ENCODING_OPTIONS,
+        ))
+        .unwrap();
+    let func_name = "fixed-utf8".to_string();
+    group.bench_function(func_name, |b| {
+        b.iter(|| {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded,
+                    &FilterExpression::no_filter(),
+                    &DecoderMiddlewareChain::default(),
+                ))
+                .unwrap();
+            assert_eq!(data.num_rows(), batch.num_rows());
+        })
+    });
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
-    targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct);
+    // targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct);
+    targets = bench_decode_str_with_fixed_size_binary_encoding);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
