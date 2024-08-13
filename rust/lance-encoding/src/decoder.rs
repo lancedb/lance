@@ -920,7 +920,13 @@ impl DecodeBatchScheduler {
         mut schedule_action: impl FnMut(Result<DecoderMessage>),
     ) {
         let rows_requested = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        trace!("Scheduling ranges {:?} ({} rows)", ranges, rows_requested);
+        trace!(
+            "Scheduling {} ranges across {}..{} ({} rows)",
+            ranges.len(),
+            ranges.first().unwrap().start,
+            ranges.last().unwrap().end,
+            rows_requested
+        );
 
         let mut context = SchedulerContext::new(io);
         let maybe_root_job = self.root_scheduler.schedule_ranges(ranges, filter);
