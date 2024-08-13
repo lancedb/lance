@@ -2506,9 +2506,11 @@ class DatasetOptimizer:
         *,
         target_rows_per_fragment: int = 1024 * 1024,
         max_rows_per_group: int = 1024,
+        max_bytes_per_file: Optional[int] = None,
         materialize_deletions: bool = True,
         materialize_deletions_threshold: float = 0.1,
         num_threads: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -2532,6 +2534,13 @@ class DatasetOptimizer:
         max_rows_per_group: int, default 1024
             Max number of rows per group. This does not affect which fragments
             need compaction, but does affect how they are re-written if selected.
+        max_bytes_per_file: Optional[int], default None
+            Max number of bytes in a single file.  This does not affect which
+            fragments need compaction, but does affect how they are re-written if
+            selected.  If this value is too small you may end up with fragments
+            that are smaller than `target_rows_per_fragment`.
+
+            The default will use the default from ``write_dataset``.
         materialize_deletions: bool, default True
             Whether to compact fragments with soft deleted rows so they are no
             longer present in the file.
@@ -2541,6 +2550,11 @@ class DatasetOptimizer:
         num_threads: int, optional
             The number of threads to use when performing compaction. If not
             specified, defaults to the number of cores on the machine.
+        batch_size: int, optional
+            The batch size to use when scanning input fragments.  You may want
+            to reduce this if you are running out of memory during compaction.
+
+            The default will use the same default from ``scanner``.
 
         Returns
         -------
@@ -2554,9 +2568,11 @@ class DatasetOptimizer:
         opts = dict(
             target_rows_per_fragment=target_rows_per_fragment,
             max_rows_per_group=max_rows_per_group,
+            max_bytes_per_file=max_bytes_per_file,
             materialize_deletions=materialize_deletions,
             materialize_deletions_threshold=materialize_deletions_threshold,
             num_threads=num_threads,
+            batch_size=batch_size,
         )
         return Compaction.execute(self._dataset, opts)
 
