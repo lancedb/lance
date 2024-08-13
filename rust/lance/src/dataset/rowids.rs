@@ -70,7 +70,7 @@ pub fn load_row_id_sequences<'a>(
 pub async fn get_row_id_index(
     dataset: &Dataset,
 ) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
-    if dataset.manifest.uses_move_stable_row_ids() {
+    if dataset.manifest.uses_stable_row_ids() {
         // The path here isn't real, it's just used to prevent collisions in the cache.
         let path = dataset
             .base
@@ -129,14 +129,14 @@ mod test {
         let schema = sequence_batch(0..0).schema();
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))
             .await
             .unwrap();
 
-        assert!(dataset.manifest.uses_move_stable_row_ids());
+        assert!(dataset.manifest.uses_stable_row_ids());
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
@@ -153,17 +153,17 @@ mod test {
         let reader =
             RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: false,
+            enable_stable_row_ids: false,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, tmp_path, Some(write_params))
             .await
             .unwrap();
-        assert!(!dataset.manifest().uses_move_stable_row_ids());
+        assert!(!dataset.manifest().uses_stable_row_ids());
 
         // Trying to append without stable row ids should fail.
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -182,7 +182,7 @@ mod test {
         let batch = sequence_batch(0..num_rows as i32);
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 10,
             ..Default::default()
         };
@@ -214,7 +214,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let temp_dir = tempfile::tempdir().unwrap();
@@ -250,7 +250,7 @@ mod test {
             *start += 10;
             let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
             let write_params = WriteParams {
-                enable_move_stable_row_ids: true,
+                enable_stable_row_ids: true,
                 mode: WriteMode::Append,
                 ..Default::default()
             };
@@ -288,7 +288,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 2,
             ..Default::default()
         };
@@ -350,7 +350,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 2,
             ..Default::default()
         };
@@ -401,7 +401,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))

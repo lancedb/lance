@@ -83,8 +83,7 @@ message Manifest {
   //
   // Known flags:
   // * 1: deletion files are present
-  // * 2: move_stable_row_ids: row IDs are tracked and stable after move operations
-  //       (such as compaction), but not updates.
+  // * 2: row ids are stable and stored as part of the fragment metadata.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.

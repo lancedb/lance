@@ -571,7 +571,7 @@ impl Dataset {
         );
 
         let manifest_config = ManifestWriteConfig {
-            use_move_stable_row_ids: params.enable_move_stable_row_ids,
+            use_move_stable_row_ids: params.enable_stable_row_ids,
             storage_format: Some(DataStorageFormat::new(storage_version)),
             ..Default::default()
         };
@@ -2552,7 +2552,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )
@@ -2663,7 +2663,7 @@ mod tests {
         let write_params = WriteParams {
             mode: WriteMode::Append,
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
 
@@ -2776,7 +2776,7 @@ mod tests {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         Dataset::write(data, test_uri, Some(write_params.clone()))
@@ -3218,7 +3218,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )

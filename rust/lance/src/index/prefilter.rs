@@ -212,7 +212,7 @@ impl DatasetPreFilter {
         }
         if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
             None
-        } else if dataset.manifest.uses_move_stable_row_ids() {
+        } else if dataset.manifest.uses_stable_row_ids() {
             Some(Self::do_create_deletion_mask_row_id(dataset.clone()).boxed())
         } else {
             Some(
@@ -304,7 +304,7 @@ mod test {
             "memory://test",
             Some(WriteParams {
                 max_rows_per_file: 3,
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )

@@ -382,7 +382,7 @@ impl Transaction {
     ) -> Result<(Manifest, Vec<Index>)> {
         if config.use_move_stable_row_ids
             && current_manifest
-                .map(|m| !m.uses_move_stable_row_ids())
+                .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
         {
             return Err(Error::NotSupported {
