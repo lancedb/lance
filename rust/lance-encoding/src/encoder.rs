@@ -533,8 +533,7 @@ fn check_fixed_size_encoding(arrays: &[ArrayRef]) -> Option<u64> {
 
         // set the byte width
         Some(lengths[first_non_zero])
-    }
-    else {
+    } else {
         None
     }
 }
