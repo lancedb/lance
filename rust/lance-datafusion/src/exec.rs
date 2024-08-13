@@ -210,9 +210,9 @@ pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
 }
 
 lazy_static! {
-    static ref DEFAULT_SESSION_CONTEXT: SessionContext =
+    pub static ref DEFAULT_SESSION_CONTEXT: SessionContext =
         new_session_context(LanceExecutionOptions::default());
-    static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
+    pub static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
         new_session_context(LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
