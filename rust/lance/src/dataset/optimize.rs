@@ -83,16 +83,18 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::Error;
 use lance_index::DatasetIndexExt;
 use lance_table::io::deletion::read_deletion_file;
-use roaring::{RoaringBitmap, RoaringTreemap};
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
+use snafu::{location, Location};
 
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Dataset;
@@ -669,12 +671,12 @@ async fn rewrite_files(
     scanner
         .with_fragments(fragments.clone())
         .scan_in_order(true);
-    let (row_ids, reader) = if needs_remapping {
-        let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
+    let (row_ids_rx, reader) = if needs_remapping {
         scanner.with_row_id();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        let data_no_row_ids = make_rowid_capture_stream(row_ids.clone(), data)?;
-        (Some(row_ids), data_no_row_ids)
+        let (data_no_row_ids, row_ids_rx) =
+            make_rowid_capture_stream(data, dataset.manifest().uses_stable_row_ids())?;
+        (Some(row_ids_rx), data_no_row_ids)
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         (None, data)
@@ -713,12 +715,13 @@ async fn rewrite_files(
     .await?;
 
     log::info!("Compaction task {}: file written", task_id);
-
-    let row_id_map = if let Some(row_ids) = row_ids {
-        let row_ids = Arc::try_unwrap(row_ids)
-            .expect("Row ids lock still owned")
-            .into_inner()
-            .expect("Row ids mutex still locked");
+    let row_id_map = if let Some(row_ids_rx) = row_ids_rx {
+        let captured_ids = row_ids_rx.try_recv().map_err(|err| Error::Internal {
+            message: format!("Failed to receive row ids: {}", err),
+            location: location!(),
+        })?;
+        // This code path is only when we use address style ids.
+        let row_addrs = captured_ids.row_addrs(None).into_owned();
 
         log::info!(
             "Compaction task {}: reserving fragment ids and transposing row ids",
@@ -726,7 +729,7 @@ async fn rewrite_files(
         );
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
 
-        remapping::transpose_row_ids(row_ids, &fragments, &new_fragments)
+        remapping::transpose_row_ids(row_addrs, &fragments, &new_fragments)
     } else {
         log::info!("Compaction task {}: rechunking stable row ids", task_id);
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;

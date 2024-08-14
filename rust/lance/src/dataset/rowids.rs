@@ -412,6 +412,7 @@ mod test {
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_stable_row_ids: true,
+            max_rows_per_file: 2_500,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
@@ -458,7 +459,7 @@ mod test {
         // Old address is still there.
         assert_eq!(index.get(2), Some(RowAddress::new_from_parts(0, 2)));
         // New location is there.
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(1, 0)));
+        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(2, 0)));
 
         // int should not contain the new fragment in it's bitmap
         let index = dataset
@@ -470,7 +471,7 @@ mod test {
             .unwrap();
         assert_eq!(
             index.fragment_bitmap.unwrap().iter().collect::<Vec<_>>(),
-            vec![0],
+            vec![0, 1],
         );
 
         // vec should contain the new fragment in it's bitmap
@@ -483,7 +484,7 @@ mod test {
             .unwrap();
         assert_eq!(
             index.fragment_bitmap.unwrap().iter().collect::<Vec<_>>(),
-            vec![0, 1],
+            vec![0, 1, 2],
         );
     }
 
