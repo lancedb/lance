@@ -10,6 +10,7 @@ use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use std::cell::RefCell;
 
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
@@ -378,13 +379,13 @@ impl HnswBuilder {
         )
     }
 
-    /// Insert one node.
-    fn insert(
+    /// Insert one node, forward edges only
+    fn insert_forward(
         &self,
         node: u32,
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
-    ) {
+    ) -> (u16, Vec<(u32, u16, OrderedFloat, u32)>) {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
         let mut ep = OrderedNode::new(
@@ -405,9 +406,7 @@ impl HnswBuilder {
             let cur_level = HnswLevelView::new(level, nodes);
             ep = greedy_search(&cur_level, ep, &dist_calc);
         }
-
-        let mut pruned_neighbors_per_level: Vec<Vec<_>> =
-            vec![Vec::new(); (target_level + 1) as usize];
+        let mut rev_edges: Vec<(u32, u16, OrderedFloat, u32)> = Vec::new();
         {
             let mut current_node = nodes[node as usize].write().unwrap();
             for level in (0..=target_level).rev() {
@@ -418,14 +417,27 @@ impl HnswBuilder {
                     current_node.add_neighbor(neighbor.id, neighbor.dist, level);
                 }
                 self.prune(storage, &mut current_node, level);
-                pruned_neighbors_per_level[level as usize]
-                    .clone_from(&current_node.level_neighbors_ranked[level as usize]);
+
+                for ordered_node in &current_node.level_neighbors_ranked[level as usize] {
+                    rev_edges.push((ordered_node.id, level, ordered_node.dist, node));
+                }
 
                 ep = neighbors[0].clone();
             }
         }
-        for (level, pruned_neighbors) in pruned_neighbors_per_level.iter().enumerate() {
-            let _: Vec<_> = pruned_neighbors
+        (target_level, rev_edges)
+    }
+
+    fn insert_backward(
+        &self,
+        node: u32,
+        unpruned_neighbors_per_level_rev: Vec<Vec<OrderedNode>>,
+        storage: &impl VectorStore,
+    ) {
+        let nodes = &self.nodes;
+        for (level, unpruned_neighbors) in unpruned_neighbors_per_level_rev.iter().enumerate() {
+            let mut current_node = nodes[node as usize].write().unwrap();
+            let _: Vec<_> = unpruned_neighbors
                 .iter()
                 .map(|unpruned_edge| {
                     let level = level as u16;
@@ -439,12 +451,11 @@ impl HnswBuilder {
                             .unwrap()
                             .cutoff(level, m_max)
                     {
-                        let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
-                        chosen_node.add_neighbor(node, unpruned_edge.dist, level);
-                        self.prune(storage, &mut chosen_node, level);
+                        current_node.add_neighbor(unpruned_edge.id, unpruned_edge.dist, level);
                     }
                 })
                 .collect();
+            self.prune(storage, &mut current_node, level as u16);
         }
     }
 
@@ -733,14 +744,119 @@ impl IvfSubIndex for HNSW {
             storage.distance_type(),
         );
 
+        let chunk_size = hnsw.inner.params.ef_construction;
+
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
-        (1..len).into_par_iter().for_each_init(
-            || VisitedGenerator::new(len),
-            |visited_generator, node| {
-                hnsw.inner.insert(node as u32, visited_generator, storage);
-            },
-        );
+
+        thread_local! {
+            static VISITED_GENERATOR: RefCell<Option<VisitedGenerator>> = RefCell::new(None);
+        }
+
+        (1..len)
+            .collect::<Vec<_>>()
+            .chunks(chunk_size) // Split the range into chunks of the specified size
+            .for_each(|chunk| {
+                // Phase I: Create all outgoing edges for new vertices
+                let forward_results: Vec<(u16, Vec<(u32, u16, OrderedFloat, u32)>)> = chunk
+                    .into_par_iter()
+                    .map(|&node| {
+                        VISITED_GENERATOR.with(|visited_gen| {
+                            let mut visited_gen = visited_gen.borrow_mut();
+                            if visited_gen.is_none() {
+                                *visited_gen = Some(VisitedGenerator::new(len));
+                            }
+                            hnsw.inner.insert_forward(
+                                node as u32,
+                                visited_gen.as_mut().unwrap(),
+                                storage,
+                            )
+                        })
+                    })
+                    .collect();
+                let local_levels: Vec<u16> = forward_results
+                    .iter()
+                    .map(|(max_level, _)| *max_level)
+                    .collect();
+
+                // Phase II: Obtain an additional clique of edges within each chunk
+                let additional_edges: Vec<Vec<(u32, u16, OrderedFloat, u32)>> = chunk
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(index, &node)| {
+                        let dist_calc = storage.dist_calculator_from_id(node as u32);
+                        let node_level = local_levels[index];
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(other_index, &other_node)| {
+                                if index != other_index {
+                                    let distance: OrderedFloat =
+                                        dist_calc.distance(other_node as u32).into();
+                                    let other_node_level = local_levels[other_index];
+                                    let max_shared_level = node_level.min(other_node_level);
+
+                                    Some((0..=max_shared_level).map(move |level| {
+                                        (node as u32, level, distance, other_node as u32)
+                                    }))
+                                } else {
+                                    None
+                                }
+                            })
+                            .flatten()
+                            .collect()
+                    })
+                    .collect();
+
+                // Phase III: Combine both Phase I and II results, and perform a sort on the
+                // reversed edges (flattened)
+                let mut edges: Vec<&(u32, u16, OrderedFloat, u32)> = forward_results
+                    .iter()
+                    .flat_map(|(_, vec)| vec.iter())
+                    .chain(additional_edges.iter().flat_map(|vec| vec.iter()))
+                    .collect();
+
+                edges.par_sort_unstable();
+
+                // Phase IV: Identify contiguous subarrays of the sorted results
+                let start_indices: Vec<usize> = edges
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, edge)| {
+                        if index == 0 || edge.0 != edges[index - 1].0 {
+                            Some(index)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Phase V: Process each contiguous subarray in parallel
+                start_indices.into_par_iter().for_each(|start_index| {
+                    let node = edges[start_index].0;
+                    let end_index = edges[start_index..]
+                        .iter()
+                        .position(|edge| edge.0 != node)
+                        .map_or(edges.len(), |rel_idx| start_index + rel_idx);
+
+                    let mut unpruned_neighbors_per_level_rev: Vec<Vec<OrderedNode>> = Vec::new();
+                    let mut current_level = edges[start_index].1;
+                    let mut level_edges: Vec<OrderedNode> = Vec::new();
+
+                    for &&(_, level, dist, neighbor) in &edges[start_index..end_index] {
+                        if level != current_level {
+                            unpruned_neighbors_per_level_rev.push(level_edges);
+                            level_edges = Vec::new();
+                            current_level = level;
+                        }
+                        level_edges.push(OrderedNode { dist, id: neighbor });
+                    }
+                    unpruned_neighbors_per_level_rev.push(level_edges); // Push the last level's edges
+
+                    hnsw.inner
+                        .insert_backward(node, unpruned_neighbors_per_level_rev, storage);
+                });
+            });
 
         assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
         Ok(hnsw)
