@@ -264,7 +264,9 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
 fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
-    // generate string column with 20 rows
+    // generate string column with 10k rows
+    // Currently the generator generates fixed size strings by default
+    // This function will need to be updated once that changes.
     let string_data = lance_datagen::gen()
         .anon_col(lance_datagen::array::rand_type(&DataType::Utf8))
         .into_batch_rows(lance_datagen::RowCount::from(10000))
