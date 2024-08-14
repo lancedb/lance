@@ -752,7 +752,48 @@ impl IvfSubIndex for HNSW {
             .collect::<Vec<_>>()
             .chunks(chunk_size) // Split the range into chunks of the specified size
             .for_each(|chunk| {
-                // Phase I: Create all outgoing edges for new vertices
+                // Phase I: Obtain a clique of candidate edges within each chunk at each level
+                let local_levels: Vec<u16> = chunk
+                    .into_par_iter()
+                    .map(|&node| {
+                        hnsw.inner.nodes[node as usize]
+                            .read()
+                            .unwrap()
+                            .level_neighbors
+                            .len() as u16
+                            - 1
+                    })
+                    .collect();
+                chunk
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(index, &node)| {
+                        let dist_calc = storage.dist_calculator_from_id(node as u32);
+                        let node_level = local_levels[index];
+                        let mut current_node = hnsw.inner.nodes[node as usize].write().unwrap();
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .for_each(|(other_index, &other_node)| {
+                                if index != other_index {
+                                    let distance: OrderedFloat =
+                                        dist_calc.distance(other_node as u32).into();
+                                    let other_node_level = local_levels[other_index];
+                                    let max_shared_level = node_level.min(other_node_level);
+
+                                    (0..=max_shared_level).for_each(|level| {
+                                        current_node.add_neighbor(
+                                            other_node as u32,
+                                            distance,
+                                            level,
+                                        );
+                                    });
+                                }
+                            });
+                    });
+
+                // Phase II: Perform queries on the structure before this chunk to get more
+                // candidate edges, and perform edge pruning
                 let forward_results: Vec<(u16, Vec<(u32, u16, OrderedFloat, u32)>)> = chunk
                     .into_par_iter()
                     .map(|&node| {
@@ -769,46 +810,11 @@ impl IvfSubIndex for HNSW {
                         })
                     })
                     .collect();
-                let local_levels: Vec<u16> = forward_results
-                    .iter()
-                    .map(|(max_level, _)| *max_level)
-                    .collect();
 
-                // Phase II: Obtain an additional clique of edges within each chunk
-                let additional_edges: Vec<Vec<(u32, u16, OrderedFloat, u32)>> = chunk
-                    .into_par_iter()
-                    .enumerate()
-                    .map(|(index, &node)| {
-                        let dist_calc = storage.dist_calculator_from_id(node as u32);
-                        let node_level = local_levels[index];
-                        chunk
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(other_index, &other_node)| {
-                                if index != other_index {
-                                    let distance: OrderedFloat =
-                                        dist_calc.distance(other_node as u32).into();
-                                    let other_node_level = local_levels[other_index];
-                                    let max_shared_level = node_level.min(other_node_level);
-
-                                    Some((0..=max_shared_level).map(move |level| {
-                                        (node as u32, level, distance, other_node as u32)
-                                    }))
-                                } else {
-                                    None
-                                }
-                            })
-                            .flatten()
-                            .collect()
-                    })
-                    .collect();
-
-                // Phase III: Combine both Phase I and II results, and perform a sort on the
-                // reversed edges (flattened)
+                // Phase III: Flatten and perform a sort on the pruned and reversed edges
                 let mut edges: Vec<&(u32, u16, OrderedFloat, u32)> = forward_results
                     .iter()
                     .flat_map(|(_, vec)| vec.iter())
-                    .chain(additional_edges.iter().flat_map(|vec| vec.iter()))
                     .collect();
 
                 edges.par_sort_unstable();
@@ -838,9 +844,18 @@ impl IvfSubIndex for HNSW {
                     let mut current_level = edges[start_index].1;
                     let mut level_edges: Vec<OrderedNode> = Vec::new();
 
+                    for _ in 0..current_level {
+                        unpruned_neighbors_per_level_rev.push(Vec::new());
+                    }
+
                     for &&(_, level, dist, neighbor) in &edges[start_index..end_index] {
                         if level != current_level {
                             unpruned_neighbors_per_level_rev.push(level_edges);
+                            // Push empty vectors for skipped levels
+                            while current_level + 1 < level {
+                                unpruned_neighbors_per_level_rev.push(Vec::new());
+                                current_level += 1;
+                            }
                             level_edges = Vec::new();
                             current_level = level;
                         }
