@@ -445,12 +445,7 @@ impl HnswBuilder {
                         0 => self.params.m * 2,
                         _ => self.params.m,
                     };
-                    if unpruned_edge.dist
-                        < nodes[unpruned_edge.id as usize]
-                            .read()
-                            .unwrap()
-                            .cutoff(level, m_max)
-                    {
+                    if unpruned_edge.dist < current_node.cutoff(level, m_max) {
                         current_node.add_neighbor(unpruned_edge.id, unpruned_edge.dist, level);
                     }
                 })
