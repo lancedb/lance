@@ -373,10 +373,10 @@ impl CoreArrayEncodingStrategy {
                         dict_items_encoder,
                     )))
                 }
-                // The parent datatype should be binary or utf8
-                // The variable 'data_type' is different here
+                // The parent datatype should be binary or utf8 to use the fixed size encoding
+                // The variable 'data_type' is passed through recursion so comparing with it would be incorrect
                 else if BINARY_DATATYPES.contains(arrays[0].data_type()) {
-                    if let Some(byte_width) = check_fixed_size_encoding(arrays) {
+                    if let Some(byte_width) = check_fixed_size_encoding(arrays, version) {
                         // use FixedSizeBinaryEncoder
                         let bytes_encoder = Self::choose_array_encoder(
                             arrays,
@@ -464,9 +464,8 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     true
 }
 
-fn check_fixed_size_encoding(arrays: &[ArrayRef]) -> Option<u64> {
-    // check if all items in arrays have the same length
-    if arrays.is_empty() {
+fn check_fixed_size_encoding(arrays: &[ArrayRef], version: LanceFileVersion) -> Option<u64> {
+    if version < LanceFileVersion::V2_1 || arrays.is_empty() {
         return None;
     }
 
@@ -996,6 +995,8 @@ pub mod tests {
     use arrow_array::{ArrayRef, StringArray};
     use std::sync::Arc;
 
+    use crate::version::LanceFileVersion;
+
     use super::check_dict_encoding;
     use super::check_fixed_size_encoding;
 
@@ -1039,7 +1040,10 @@ pub mod tests {
         assert!(!is_dict_encoding_applicable(vec![Some("a"), Some("a")], 3));
     }
 
-    fn is_fixed_size_encoding_applicable(arrays: Vec<Vec<Option<&str>>>) -> bool {
+    fn is_fixed_size_encoding_applicable(
+        arrays: Vec<Vec<Option<&str>>>,
+        version: LanceFileVersion,
+    ) -> bool {
         let mut final_arrays = Vec::new();
         for arr in arrays {
             let arr = StringArray::from(arr);
@@ -1047,69 +1051,72 @@ pub mod tests {
             final_arrays.push(arr);
         }
 
-        check_fixed_size_encoding(&final_arrays.clone()).is_some()
+        check_fixed_size_encoding(&final_arrays.clone(), version).is_some()
     }
 
     #[test]
     fn test_fixed_size_binary_encoding_applicable() {
-        assert!(!is_fixed_size_encoding_applicable(vec![vec![]]));
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(is_fixed_size_encoding_applicable(vec![vec![
-            Some("a"),
-            Some("b")
-        ]]));
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("a"), Some("b")]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(!is_fixed_size_encoding_applicable(vec![vec![
-            Some("abc"),
-            Some("de")
-        ]]));
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("abc"), Some("de")]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(is_fixed_size_encoding_applicable(vec![vec![
-            Some("pqr"),
-            None
-        ]]));
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("pqr"), None]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(!is_fixed_size_encoding_applicable(vec![vec![
-            Some("pqr"),
-            Some("")
-        ]]));
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("pqr"), Some("")]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(!is_fixed_size_encoding_applicable(vec![vec![
-            Some(""),
-            Some("")
-        ]]));
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some(""), Some("")]],
+            LanceFileVersion::V2_1
+        ));
     }
 
     #[test]
     fn test_fixed_size_binary_encoding_applicable_multiple_arrays() {
-        assert!(is_fixed_size_encoding_applicable(vec![
-            vec![Some("a"), Some("b")],
-            vec![Some("c"), Some("d")]
-        ]));
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("a"), Some("b")], vec![Some("c"), Some("d")]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(!is_fixed_size_encoding_applicable(vec![
-            vec![Some("ab"), Some("bc")],
-            vec![Some("c"), Some("d")]
-        ]));
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("ab"), Some("bc")], vec![Some("c"), Some("d")]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(!is_fixed_size_encoding_applicable(vec![
-            vec![Some("ab"), None],
-            vec![None, Some("d")]
-        ]));
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("ab"), None], vec![None, Some("d")]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(is_fixed_size_encoding_applicable(vec![
-            vec![Some("a"), None],
-            vec![None, Some("d")]
-        ]));
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("a"), None], vec![None, Some("d")]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(!is_fixed_size_encoding_applicable(vec![
-            vec![Some(""), None],
-            vec![None, Some("")]
-        ]));
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some(""), None], vec![None, Some("")]],
+            LanceFileVersion::V2_1
+        ));
 
-        assert!(!is_fixed_size_encoding_applicable(vec![
-            vec![None, None],
-            vec![None, None]
-        ]));
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![None, None], vec![None, None]],
+            LanceFileVersion::V2_1
+        ));
     }
 }
