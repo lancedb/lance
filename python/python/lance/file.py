@@ -115,7 +115,7 @@ class LanceFileReader:
         Parameters
         ----------
         indices: List[int]
-            The indices of the rows to read from the file
+            The indices of the rows to read from the file in ascending order
         batch_size: int, default 1024
             The file will be read in batches.  This parameter controls
             how many rows will be in each batch (except the final batch)
@@ -123,6 +123,11 @@ class LanceFileReader:
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
         """
+        for i in range(len(indices) - 1):
+            if indices[i] > indices[i + 1]:
+                raise ValueError(f"Indices must be sorted in ascending order for \
+                                 file API, got {indices[i]} > {indices[i+1]}")
+
         return ReaderResults(
             self._reader.take_rows(indices, batch_size, batch_readahead)
         )
