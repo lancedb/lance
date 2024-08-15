@@ -445,9 +445,7 @@ impl HnswBuilder {
                         0 => self.params.m * 2,
                         _ => self.params.m,
                     };
-                    if unpruned_edge.dist < current_node.cutoff(level, m_max) {
-                        current_node.add_neighbor(unpruned_edge.id, unpruned_edge.dist, level);
-                    }
+                    current_node.add_neighbor(unpruned_edge.id, unpruned_edge.dist, level);
                 })
                 .collect();
             self.prune(storage, &mut current_node, level as u16);
@@ -821,7 +819,7 @@ impl IvfSubIndex for HNSW {
 
                 // Phase IV: Identify contiguous subarrays of the sorted results
                 let start_indices: Vec<usize> = edges
-                    .iter()
+                    .par_iter()
                     .enumerate()
                     .filter_map(|(index, edge)| {
                         if index == 0 || edge.0 != edges[index - 1].0 {
