@@ -791,10 +791,8 @@ impl IvfShuffler {
         for file in files {
             let object_store = Arc::new(ObjectStore::local());
             let path = basedir.child(file);
-            let scan_scheduler = ScanScheduler::new(
-                object_store,
-                SchedulerConfig::fast_and_not_too_ram_intensive(),
-            );
+            let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+            let scan_scheduler = ScanScheduler::new(object_store, scheduler_config);
             let file_scheduler = scan_scheduler.open_file(&path).await?;
             let reader = lance_file::v2::reader::FileReader::try_open(
                 file_scheduler,
@@ -1118,7 +1116,7 @@ mod test {
     }
 
     // Change NUM_BATCHES = 1000 * 1024 and NUM_PARTITIONS to 35000 to test 1B shuffle
-    const NUM_BATCHES: u32 = 1 * 100;
+    const NUM_BATCHES: u32 = 100;
     const NUM_PARTITIONS: u32 = 1000;
     const PQ_DIM: u32 = 48;
     const BATCHES_PER_PARTITION: u32 = 10200;
@@ -1151,7 +1149,7 @@ mod test {
         result_stream.reverse();
 
         while let Some(mut stream) = result_stream.pop() {
-            while let Some(_) = stream.next().await {
+            while (stream.next().await).is_some() {
                 num_batches += 1
             }
         }
