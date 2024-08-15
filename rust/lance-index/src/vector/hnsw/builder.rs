@@ -453,6 +453,7 @@ impl HnswBuilder {
             let mut current_node = nodes[node as usize].write().unwrap();
             unpruned_neighbors.iter().for_each(|unpruned_edge| {
                 let level = level as u16;
+                debug_assert!(unpruned_edge.id != node, "Bad edge generated");
                 current_node.add_neighbor(unpruned_edge.id, unpruned_edge.dist, level);
             });
             self.prune(storage, &mut current_node, level as u16);
@@ -764,10 +765,6 @@ impl IvfSubIndex for HNSW {
         while start < len {
             let end = (start + current_chunk_size).min(len);
 
-            //(1..len)
-            //.collect::<Vec<_>>()
-            //.chunks(chunk_size) // Split the range into chunks of the specified size
-            //.for_each(|chunk| {
             // Phase I: Obtain a clique of candidate edges within each chunk at each level
             let local_levels: Vec<u16> = (start..end)
                 .into_par_iter()
@@ -781,7 +778,6 @@ impl IvfSubIndex for HNSW {
                     let node_level = local_levels[index];
                     let mut current_node = hnsw.inner.nodes[node].write().unwrap();
                     (start..end)
-                        //.iter()
                         .enumerate()
                         .for_each(|(other_index, other_node)| {
                             if index != other_index {
@@ -877,7 +873,6 @@ impl IvfSubIndex for HNSW {
                     hnsw.inner
                         .insert_backward(node, unpruned_neighbors_per_level_rev, storage);
                 });
-            //});
 
             start = end;
             current_chunk_size = (current_chunk_size * 2).min(chunk_size);
