@@ -1942,14 +1942,14 @@ mod test {
                 // If there is a filter then a late materialization pass is added
                 // and that uses coalesce batches which can yield slightly larger
                 // than requested batch sizes.
-                dbg!(vec![8, 10, 10, 10, 10, 10, 10])
+                vec![8, 10, 10, 10, 10, 10, 10]
             } else {
-                dbg!(vec![8, 2, 8, 2, 8, 2, 8, 2, 8, 2])
+                vec![8, 2, 8, 2, 8, 2, 8, 2, 8, 2]
             };
             let mut stream = builder.try_into_stream().await.unwrap();
             for expected_len in expected_lens {
                 assert_eq!(
-                    dbg!(stream.next().await.unwrap().unwrap().num_rows()),
+                    stream.next().await.unwrap().unwrap().num_rows(),
                     expected_len as usize
                 );
             }

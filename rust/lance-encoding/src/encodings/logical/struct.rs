@@ -5,7 +5,6 @@ use std::{
     collections::{BinaryHeap, VecDeque},
     ops::Range,
     sync::Arc,
-    u64,
 };
 
 use arrow_array::{cast::AsArray, ArrayRef, StructArray};
