@@ -295,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_delta_indices(
         #[values(
-            VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(2, 8, 32, MetricType::L2, 2),
             VectorIndexParams::with_ivf_hnsw_sq_params(
                 MetricType::L2,
                 IvfBuildParams::new(2),
