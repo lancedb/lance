@@ -451,13 +451,10 @@ impl HnswBuilder {
         let nodes = &self.nodes;
         for (level, unpruned_neighbors) in unpruned_neighbors_per_level_rev.iter().enumerate() {
             let mut current_node = nodes[node as usize].write().unwrap();
-            let _: Vec<_> = unpruned_neighbors
-                .iter()
-                .map(|unpruned_edge| {
-                    let level = level as u16;
-                    current_node.add_neighbor(unpruned_edge.id, unpruned_edge.dist, level);
-                })
-                .collect();
+            unpruned_neighbors.iter().for_each(|unpruned_edge| {
+                let level = level as u16;
+                current_node.add_neighbor(unpruned_edge.id, unpruned_edge.dist, level);
+            });
             self.prune(storage, &mut current_node, level as u16);
         }
     }
