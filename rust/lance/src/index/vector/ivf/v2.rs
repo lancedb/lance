@@ -223,17 +223,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 let batch = match self.reader.metadata().num_rows {
                     0 => RecordBatch::new_empty(schema),
                     _ => {
-                        let batches = self
-                            .reader
-                            .read_stream(
-                                ReadBatchParams::Range(self.ivf.row_range(partition_id)),
-                                u32::MAX,
-                                1,
-                                FilterExpression::no_filter(),
-                            )?
-                            .try_collect::<Vec<_>>()
-                            .await?;
-                        concat_batches(&schema, batches.iter())?
+                        let row_range = self.ivf.row_range(partition_id);
+                        if row_range.is_empty() {
+                            RecordBatch::new_empty(schema)
+                        } else {
+                            let batches = self
+                                .reader
+                                .read_stream(
+                                    ReadBatchParams::Range(row_range),
+                                    u32::MAX,
+                                    1,
+                                    FilterExpression::no_filter(),
+                                )?
+                                .try_collect::<Vec<_>>()
+                                .await?;
+                            concat_batches(&schema, batches.iter())?
+                        }
                     }
                 };
                 let batch = batch.add_metadata(
