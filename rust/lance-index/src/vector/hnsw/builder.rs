@@ -832,7 +832,7 @@ impl IvfSubIndex for HNSW {
                         None
                     }
                 })
-                .chain(std::iter::once(len).par_bridge())
+                .chain(std::iter::once(edges.len()).par_bridge())
                 .collect::<Vec<_>>()
                 .par_windows(2)
                 .map(|window| (window[0], window[1]))
@@ -863,13 +863,10 @@ impl IvfSubIndex for HNSW {
                             level_edges = Vec::new();
                             current_level = edge.level;
                         }
-                        // no need to reverse edges entirely within the chunk
-                        if (edge.origin as usize) < start || (edge.destination as usize) < start {
-                            level_edges.push(OrderedNode {
-                                dist: edge.distance,
-                                id: edge.destination,
-                            });
-                        }
+                        level_edges.push(OrderedNode {
+                            dist: edge.distance,
+                            id: edge.destination,
+                        });
                     }
                     unpruned_neighbors_per_level_rev.push(level_edges); // Push the last level's edges
 
