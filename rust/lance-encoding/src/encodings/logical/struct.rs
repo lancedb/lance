@@ -291,12 +291,13 @@ impl ChildState {
                 // before we can start decoding.
                 next_decoder.wait(rows_to_wait).await?;
                 let newly_avail = next_decoder.avail() - previously_avail;
-                trace!(
-                    "Struct child {} await loaded {} rows",
-                    self.field_index,
-                    newly_avail
-                );
                 self.rows_available += newly_avail;
+                trace!(
+                    "Struct child {} await loaded {} rows and now {} are available",
+                    self.field_index,
+                    newly_avail,
+                    self.rows_available
+                );
                 self.rows_unawaited = self.rows_unawaited.checked_sub(newly_avail).unwrap();
                 remaining -= rows_to_wait;
                 if remaining == 0 || self.rows_unawaited < awaited_limit {
